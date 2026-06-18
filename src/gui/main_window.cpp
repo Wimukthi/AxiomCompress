@@ -2,8 +2,11 @@
 #include "axiom/archive.hpp"
 #include "axiom/axiom.hpp"
 #include "gui/app.hpp"
+#include "gui/archive_dialogs.hpp"
 #include "gui/browser_model.hpp"
+#include "gui/directory_watcher.hpp"
 #include "gui/operation_runner.hpp"
+#include "gui/settings_store.hpp"
 
 #include <windows.h>
 #include <windowsx.h>
@@ -17,7 +20,6 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
-#include <ctime>
 #include <exception>
 #include <filesystem>
 #include <functional>
@@ -47,31 +49,21 @@ constexpr UINT kTableSelectionChangedMessage = WM_APP + 4;
 constexpr UINT kBrowserLoadedMessage = WM_APP + 5;
 constexpr UINT kTableParentMessage = WM_APP + 6;
 constexpr UINT kTableSortMessage = WM_APP + 7;
+constexpr UINT kDirectoryChangedMessage = WM_APP + 8;
+constexpr UINT_PTR kDirectoryRefreshTimer = 41;
 
 #ifndef DWMWA_USE_IMMERSIVE_DARK_MODE
 constexpr DWORD DWMWA_USE_IMMERSIVE_DARK_MODE = 20;
 #endif
 
 enum ControlId : int {
-    kArchiveEdit = 1001,
-    kArchiveBrowse = 1002,
-    kOutputEdit = 1003,
-    kOutputBrowse = 1004,
     kAddFiles = 1005,
-    kAddFolder = 1006,
-    kClear = 1007,
     kOpenArchive = 1008,
-    kCompress = 1009,
     kExtract = 1010,
     kTest = 1011,
-    kLevelDown = 1012,
-    kThreadsEdit = 1013,
-    kOverwriteCheck = 1014,
     kList = 1015,
     kProgress = 1016,
     kStatus = 1017,
-    kLevelValue = 1018,
-    kLevelUp = 1019,
     kPauseOperation = 1020,
     kCancelOperation = 1021,
     kNavigateBack = 1022,
@@ -186,6 +178,19 @@ std::wstring format_size(std::uint64_t size) {
     return stream.str();
 }
 
+std::wstring format_duration(std::uint64_t seconds) {
+    const std::uint64_t hours = seconds / 3600;
+    const std::uint64_t minutes = (seconds % 3600) / 60;
+    const std::uint64_t remaining = seconds % 60;
+    wchar_t text[32]{};
+    if (hours != 0) {
+        swprintf_s(text, L"%llu:%02llu:%02llu", hours, minutes, remaining);
+    } else {
+        swprintf_s(text, L"%02llu:%02llu", minutes, remaining);
+    }
+    return text;
+}
+
 std::wstring format_crc32(const std::optional<std::uint32_t>& crc) {
     if (!crc) return {};
     wchar_t text[9]{};
@@ -254,37 +259,6 @@ std::wstring format_progress_text(const axiom::OperationProgress& progress) {
     return stream.str();
 }
 
-std::wstring format_time(std::int64_t seconds) {
-    if (seconds == 0) {
-        return L"-";
-    }
-
-    const auto value = static_cast<std::time_t>(seconds);
-    std::tm parts{};
-    if (localtime_s(&parts, &value) != 0) {
-        return L"-";
-    }
-
-    wchar_t buffer[32]{};
-    if (std::wcsftime(buffer, sizeof(buffer) / sizeof(buffer[0]), L"%Y-%m-%d %H:%M", &parts) == 0) {
-        return L"-";
-    }
-    return buffer;
-}
-
-std::wstring format_file_time(const fs::path& path) {
-    std::error_code error;
-    const auto write_time = fs::last_write_time(path, error);
-    if (error) {
-        return L"-";
-    }
-
-    const auto system_time = std::chrono::time_point_cast<std::chrono::system_clock::duration>(
-        write_time - fs::file_time_type::clock::now() + std::chrono::system_clock::now());
-    const auto seconds = std::chrono::system_clock::to_time_t(system_time);
-    return format_time(static_cast<std::int64_t>(seconds));
-}
-
 std::uint64_t file_size_or_zero(const fs::path& path) {
     std::error_code error;
     const auto size = fs::file_size(path, error);
@@ -345,29 +319,6 @@ std::vector<fs::path> pick_files(HWND owner) {
     return paths;
 }
 
-std::optional<fs::path> pick_folder(HWND owner, const wchar_t* title) {
-    ComPtr<IFileOpenDialog> dialog;
-    if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER,
-                                IID_PPV_ARGS(dialog.put())))) {
-        return std::nullopt;
-    }
-
-    DWORD options = 0;
-    dialog->GetOptions(&options);
-    dialog->SetOptions(options | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST);
-    dialog->SetTitle(title);
-
-    if (FAILED(dialog->Show(owner))) {
-        return std::nullopt;
-    }
-
-    ComPtr<IShellItem> item;
-    if (FAILED(dialog->GetResult(item.put()))) {
-        return std::nullopt;
-    }
-    return shell_item_path(item.get());
-}
-
 std::optional<fs::path> pick_open_archive(HWND owner) {
     ComPtr<IFileOpenDialog> dialog;
     if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER,
@@ -379,27 +330,6 @@ std::optional<fs::path> pick_open_archive(HWND owner) {
     dialog->GetOptions(&options);
     dialog->SetOptions(options | FOS_FORCEFILESYSTEM | FOS_FILEMUSTEXIST);
     set_axar_filter(dialog.get());
-
-    if (FAILED(dialog->Show(owner))) {
-        return std::nullopt;
-    }
-
-    ComPtr<IShellItem> item;
-    if (FAILED(dialog->GetResult(item.put()))) {
-        return std::nullopt;
-    }
-    return shell_item_path(item.get());
-}
-
-std::optional<fs::path> pick_save_archive(HWND owner) {
-    ComPtr<IFileSaveDialog> dialog;
-    if (FAILED(CoCreateInstance(CLSID_FileSaveDialog, nullptr, CLSCTX_INPROC_SERVER,
-                                IID_PPV_ARGS(dialog.put())))) {
-        return std::nullopt;
-    }
-
-    set_axar_filter(dialog.get());
-    dialog->SetFileName(L"archive.axar");
 
     if (FAILED(dialog->Show(owner))) {
         return std::nullopt;
@@ -557,18 +487,10 @@ void set_dark_title_bar(HWND hwnd, bool dark) {
 
 bool is_button_id(UINT id) {
     switch (id) {
-        case kArchiveBrowse:
-        case kOutputBrowse:
         case kAddFiles:
-        case kAddFolder:
-        case kClear:
         case kOpenArchive:
-        case kCompress:
         case kExtract:
         case kTest:
-        case kLevelDown:
-        case kLevelValue:
-        case kLevelUp:
         case kPauseOperation:
         case kCancelOperation:
         case kNavigateBack:
@@ -580,7 +502,6 @@ bool is_button_id(UINT id) {
         case kDelete:
         case kInfo:
         case kSettings:
-        case kOverwriteCheck:
             return true;
         default:
             return false;
@@ -1209,6 +1130,7 @@ public:
             pulse_ = 0;
             fraction_ = 0.0;
             determinate_ = false;
+            text_.clear();
         }
         invalidate();
     }
@@ -1216,9 +1138,12 @@ public:
     void set_progress(std::uint64_t completed, std::uint64_t total) {
         if (total == 0) {
             determinate_ = false;
+            text_.clear();
         } else {
             determinate_ = true;
             fraction_ = std::clamp(static_cast<double>(completed) / static_cast<double>(total), 0.0, 1.0);
+            const auto percent = static_cast<unsigned>(fraction_ * 100.0 + 0.5);
+            text_ = std::to_wstring(percent) + L"%  " + format_size(completed);
         }
         invalidate();
     }
@@ -1281,16 +1206,31 @@ private:
                     fill_solid_rect(dc, clip, theme_.selection);
                 }
             }
+            if (!text_.empty()) {
+                HFONT font = font_ != nullptr
+                    ? font_
+                    : static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
+                HGDIOBJ old_font = SelectObject(dc, font);
+                SetBkMode(dc, TRANSPARENT);
+                SetTextColor(dc, theme_.selection_text);
+                DrawTextW(dc, text_.c_str(), -1, &rect,
+                          DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+                SelectObject(dc, old_font);
+            }
         }
         EndPaint(hwnd_, &paint);
     }
 
-    LRESULT handle_message(UINT message, WPARAM, LPARAM) {
+    LRESULT handle_message(UINT message, WPARAM wparam, LPARAM) {
         switch (message) {
             case WM_ERASEBKGND:
                 return 1;
             case WM_PAINT:
                 on_paint();
+                return 0;
+            case WM_SETFONT:
+                font_ = reinterpret_cast<HFONT>(wparam);
+                invalidate();
                 return 0;
             case WM_TIMER:
                 pulse_ += scale(5);
@@ -1324,6 +1264,8 @@ private:
     bool determinate_ = false;
     double fraction_ = 0.0;
     int pulse_ = 0;
+    HFONT font_ = nullptr;
+    std::wstring text_;
 };
 
 class MainWindow {
@@ -1335,7 +1277,14 @@ public:
 
     bool create(HINSTANCE instance, int show_command, std::wstring initial_path) {
         instance_ = instance;
-        initial_path_ = std::move(initial_path);
+        persisted_settings_ = axiom::gui::load_gui_settings();
+        application_options_ = persisted_settings_.application;
+        selected_level_ = application_options_.default_level;
+        selected_thread_count_ = application_options_.default_thread_count;
+        sort_column_ = persisted_settings_.sort_column;
+        sort_ascending_ = persisted_settings_.sort_ascending;
+        initial_path_ = initial_path.empty() ? persisted_settings_.last_location
+                                             : std::move(initial_path);
         const UINT system_dpi = GetDpiForSystem();
         const int initial_width = MulDiv(1080, static_cast<int>(system_dpi), USER_DEFAULT_SCREEN_DPI);
         const int initial_height = MulDiv(720, static_cast<int>(system_dpi), USER_DEFAULT_SCREEN_DPI);
@@ -1361,7 +1310,16 @@ public:
             return false;
         }
 
-        ShowWindow(hwnd_, show_command);
+        if (persisted_settings_.has_placement) {
+            if (persisted_settings_.placement.showCmd == SW_SHOWMINIMIZED) {
+                persisted_settings_.placement.showCmd = SW_SHOWNORMAL;
+            }
+            SetWindowPlacement(hwnd_, &persisted_settings_.placement);
+        }
+
+        ShowWindow(hwnd_, persisted_settings_.has_placement
+                              ? persisted_settings_.placement.showCmd
+                              : show_command);
         UpdateWindow(hwnd_);
         return true;
     }
@@ -1398,9 +1356,7 @@ private:
 
     void apply_fonts() {
         HWND controls[] = {
-            archive_edit_, archive_browse_, output_edit_, output_browse_,
-            add_files_, add_folder_, clear_, open_archive_, compress_, extract_, test_,
-            level_down_, level_value_, level_up_, threads_edit_, overwrite_,
+            add_files_, open_archive_, extract_, test_,
             pause_operation_, cancel_operation_, list_, progress_, status_,
             navigate_back_, navigate_forward_, navigate_up_, navigate_refresh_,
             address_edit_, address_go_, view_, delete_, info_, settings_,
@@ -1462,9 +1418,7 @@ private:
         set_dark_title_bar(hwnd_, theme_.dark);
 
         HWND controls[] = {
-            archive_edit_, archive_browse_, output_edit_, output_browse_,
-            add_files_, add_folder_, clear_, open_archive_, compress_, extract_, test_,
-            level_down_, level_value_, level_up_, threads_edit_, overwrite_,
+            add_files_, open_archive_, extract_, test_,
             pause_operation_, cancel_operation_, list_, progress_, status_,
             navigate_back_, navigate_forward_, navigate_up_, navigate_refresh_,
             address_edit_, address_go_, view_, delete_, info_, settings_,
@@ -1512,72 +1466,37 @@ private:
         DeleteObject(brush);
     }
 
-    void draw_check_mark(HDC dc, RECT rect, COLORREF color) const {
-        HPEN pen = CreatePen(PS_SOLID, std::max(1, scale(2)), color);
-        HGDIOBJ old_pen = SelectObject(dc, pen);
-        const int left = rect.left + scale(4);
-        const int mid_y = rect.top + ((rect.bottom - rect.top) / 2);
-        MoveToEx(dc, left, mid_y, nullptr);
-        LineTo(dc, left + scale(4), mid_y + scale(4));
-        LineTo(dc, left + scale(11), mid_y - scale(5));
-        SelectObject(dc, old_pen);
-        DeleteObject(pen);
-    }
-
     void draw_owner_button(const DRAWITEMSTRUCT& draw) const {
         if (!is_button_id(draw.CtlID)) {
             return;
         }
 
-        const bool checkbox = draw.CtlID == kOverwriteCheck;
         const bool disabled = (draw.itemState & ODS_DISABLED) != 0;
         const bool pressed = (draw.itemState & ODS_SELECTED) != 0;
         const bool hot = (draw.itemState & ODS_HOTLIGHT) != 0;
         const bool focused = (draw.itemState & ODS_FOCUS) != 0;
-        const bool checked = checkbox && SendMessageW(draw.hwndItem, BM_GETCHECK, 0, 0) == BST_CHECKED;
 
         RECT rect = draw.rcItem;
         const COLORREF button_color = pressed ? theme_.button_pressed :
             (hot ? theme_.button_hot : theme_.button);
-        fill_rect(draw.hDC, rect, checkbox ? theme_.window : button_color);
+        fill_rect(draw.hDC, rect, button_color);
 
         HFONT font = ui_font_ != nullptr ? ui_font_ : static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
         HGDIOBJ old_font = SelectObject(draw.hDC, font);
         SetBkMode(draw.hDC, TRANSPARENT);
         SetTextColor(draw.hDC, disabled ? theme_.muted_text : theme_.text);
 
-        if (checkbox) {
-            const int box_size = scale(16);
-            RECT box{
-                rect.left,
-                rect.top + ((rect.bottom - rect.top - box_size) / 2),
-                rect.left + box_size,
-                rect.top + ((rect.bottom - rect.top - box_size) / 2) + box_size,
-            };
-            fill_rect(draw.hDC, box, theme_.edit);
-            frame_rect(draw.hDC, box, focused ? theme_.button_hot : theme_.border);
-            if (checked) {
-                draw_check_mark(draw.hDC, box, disabled ? theme_.muted_text : theme_.text);
-            }
+        // Buttons communicate focus through a restrained border; a blue focus
+        // ring is visually too loud in the compact dark toolbar.
+        const COLORREF border = (focused || hot || pressed) ? theme_.button_hot : theme_.border;
+        frame_rect(draw.hDC, rect, border);
 
-            std::wstring text = get_text(draw.hwndItem);
-            RECT text_rect = rect;
-            text_rect.left += box_size + scale(7);
-            DrawTextW(draw.hDC, text.c_str(), -1, &text_rect,
-                      DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-        } else {
-            // Buttons communicate focus through a restrained border; a blue focus
-            // ring is visually too loud in the compact dark toolbar.
-            const COLORREF border = (focused || hot || pressed) ? theme_.button_hot : theme_.border;
-            frame_rect(draw.hDC, rect, border);
-
-            std::wstring text = get_text(draw.hwndItem);
-            if (pressed) {
-                OffsetRect(&rect, scale(1), scale(1));
-            }
-            DrawTextW(draw.hDC, text.c_str(), -1, &rect,
-                      DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        std::wstring text = get_text(draw.hwndItem);
+        if (pressed) {
+            OffsetRect(&rect, scale(1), scale(1));
         }
+        DrawTextW(draw.hDC, text.c_str(), -1, &rect,
+                  DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
 
         SelectObject(draw.hDC, old_font);
     }
@@ -1594,11 +1513,8 @@ private:
 
     void apply_edit_margins() const {
         const LPARAM margins = MAKELPARAM(scale(2), scale(2));
-        HWND edits[] = {archive_edit_, output_edit_, threads_edit_, address_edit_};
-        for (HWND edit : edits) {
-            if (edit != nullptr) {
-                SendMessageW(edit, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, margins);
-            }
+        if (address_edit_ != nullptr) {
+            SendMessageW(address_edit_, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, margins);
         }
     }
 
@@ -1626,44 +1542,17 @@ private:
     void paint_shell() {
         PAINTSTRUCT paint{};
         HDC dc = BeginPaint(hwnd_, &paint);
-        draw_edit_frame(dc, archive_edit_, archive_edit_frame_);
-        draw_edit_frame(dc, output_edit_, output_edit_frame_);
-        draw_edit_frame(dc, threads_edit_, threads_edit_frame_);
         draw_edit_frame(dc, address_edit_, address_edit_frame_);
         EndPaint(hwnd_, &paint);
-    }
-
-    void update_level_label() {
-        if (level_value_ != nullptr) {
-            set_text(level_value_, L"Level " + std::to_wstring(selected_level_));
-            InvalidateRect(level_value_, nullptr, TRUE);
-        }
-    }
-
-    void adjust_level(int delta) {
-        selected_level_ = std::clamp(selected_level_ + delta, 1, 9);
-        update_level_label();
     }
 
     void on_create() {
         update_dpi(GetDpiForWindow(hwnd_));
 
-        archive_edit_ = make_control(L"EDIT", L"", WS_TABSTOP | ES_AUTOHSCROLL,
-                                     kArchiveEdit);
-        archive_browse_ = make_control(L"BUTTON", L"...", WS_TABSTOP | BS_OWNERDRAW, kArchiveBrowse);
-        output_edit_ = make_control(L"EDIT", L"", WS_TABSTOP | ES_AUTOHSCROLL,
-                                    kOutputEdit);
-        output_browse_ = make_control(L"BUTTON", L"...", WS_TABSTOP | BS_OWNERDRAW, kOutputBrowse);
-
         add_files_ = make_control(L"BUTTON", L"Add", WS_TABSTOP | BS_OWNERDRAW, kAddFiles);
-        add_folder_ = make_control(L"BUTTON", L"Add folder", WS_TABSTOP | BS_OWNERDRAW, kAddFolder);
-        clear_ = make_control(L"BUTTON", L"Clear", WS_TABSTOP | BS_OWNERDRAW, kClear);
         open_archive_ = make_control(L"BUTTON", L"Open archive", WS_TABSTOP | BS_OWNERDRAW, kOpenArchive);
-        compress_ = make_control(L"BUTTON", L"Compress", WS_TABSTOP | BS_OWNERDRAW, kCompress);
         extract_ = make_control(L"BUTTON", L"Extract", WS_TABSTOP | BS_OWNERDRAW, kExtract);
         test_ = make_control(L"BUTTON", L"Test", WS_TABSTOP | BS_OWNERDRAW, kTest);
-        overwrite_ = make_control(L"BUTTON", L"Overwrite on extract",
-                                  WS_TABSTOP | BS_AUTOCHECKBOX | BS_OWNERDRAW, kOverwriteCheck);
         pause_operation_ = make_control(L"BUTTON", L"Pause", WS_TABSTOP | BS_OWNERDRAW, kPauseOperation);
         cancel_operation_ = make_control(L"BUTTON", L"Cancel", WS_TABSTOP | BS_OWNERDRAW, kCancelOperation);
 
@@ -1678,14 +1567,6 @@ private:
         delete_ = make_control(L"BUTTON", L"Delete", WS_TABSTOP | BS_OWNERDRAW, kDelete);
         info_ = make_control(L"BUTTON", L"Info", WS_TABSTOP | BS_OWNERDRAW, kInfo);
         settings_ = make_control(L"BUTTON", L"Settings", WS_TABSTOP | BS_OWNERDRAW, kSettings);
-
-        level_down_ = make_control(L"BUTTON", L"-", WS_TABSTOP | BS_OWNERDRAW, kLevelDown);
-        level_value_ = make_control(L"BUTTON", L"", WS_TABSTOP | BS_OWNERDRAW, kLevelValue);
-        level_up_ = make_control(L"BUTTON", L"+", WS_TABSTOP | BS_OWNERDRAW, kLevelUp);
-        update_level_label();
-
-        threads_edit_ = make_control(L"EDIT", L"0", WS_TABSTOP | ES_NUMBER,
-                                     kThreadsEdit);
 
         table_.create(hwnd_, instance_, kList);
         list_ = table_.hwnd();
@@ -1702,6 +1583,10 @@ private:
         progress_view_.create(hwnd_, instance_, kProgress);
         progress_ = progress_view_.hwnd();
         status_ = make_control(L"STATIC", L"Ready", SS_LEFT, kStatus);
+        // Custom controls do not expose painted content to accessibility tools, so give
+        // each HWND a stable semantic name for UI Automation and screen readers.
+        SetWindowTextW(list_, L"Files and archive contents");
+        SetWindowTextW(progress_, L"Operation progress");
 
         apply_edit_margins();
         apply_fonts();
@@ -1732,16 +1617,6 @@ private:
             DestroyWindow(child);
         }
         transient_labels_.clear();
-
-        HWND legacy_controls[] = {
-            archive_edit_, archive_browse_, output_edit_, output_browse_,
-            add_folder_, clear_, compress_, level_down_, level_value_, level_up_,
-            threads_edit_, overwrite_,
-        };
-        for (HWND control : legacy_controls) ShowWindow(control, SW_HIDE);
-        SetRectEmpty(&archive_edit_frame_);
-        SetRectEmpty(&output_edit_frame_);
-        SetRectEmpty(&threads_edit_frame_);
 
         int x = margin;
         auto place = [&](HWND child, int logical_width) {
@@ -1777,7 +1652,7 @@ private:
         y += edit_height + gap;
 
         const int bottom_height = scale(28);
-        const int progress_width = scale(170);
+        const int progress_width = scale(250);
         const int operation_button_width = scale(70);
         const int list_height = std::max(scale(80), static_cast<int>(client.bottom) - y - bottom_height - margin);
         MoveWindow(list_, margin, y, width - 2 * margin,
@@ -1803,24 +1678,11 @@ private:
     void set_busy(bool busy) {
         busy_ = busy;
         EnableWindow(add_files_, !busy);
-        EnableWindow(add_folder_, !busy);
-        EnableWindow(clear_, !busy);
         EnableWindow(open_archive_, !busy);
-        EnableWindow(compress_, !busy);
         EnableWindow(extract_, !busy);
         EnableWindow(test_, !busy);
-        EnableWindow(archive_browse_, !busy);
-        EnableWindow(output_browse_, !busy);
-        EnableWindow(level_down_, !busy);
-        EnableWindow(level_value_, !busy);
-        EnableWindow(level_up_, !busy);
-        EnableWindow(threads_edit_, !busy);
-        EnableWindow(overwrite_, !busy);
         EnableWindow(pause_operation_, busy);
         EnableWindow(cancel_operation_, busy);
-        EnableWindow(add_files_, !busy);
-        EnableWindow(extract_, !busy);
-        EnableWindow(test_, !busy);
         EnableWindow(delete_, !busy);
         EnableWindow(settings_, !busy);
         set_text(pause_operation_, L"Pause");
@@ -1832,22 +1694,10 @@ private:
         return selected_level_;
     }
 
-    std::size_t selected_threads() const {
-        const auto text = get_text(threads_edit_);
-        if (text.empty()) {
-            return 0;
-        }
-        try {
-            return static_cast<std::size_t>(std::stoull(text));
-        } catch (...) {
-            return 0;
-        }
-    }
-
     axiom::CompressionOptions compression_options() const {
         axiom::CompressionOptions options;
         apply_level(options, selected_level());
-        options.thread_count = selected_threads();
+        options.thread_count = selected_thread_count_;
         return options;
     }
 
@@ -1888,6 +1738,8 @@ private:
     }
 
     void navigate_to(axiom::gui::BrowserLocation location, bool record_history = true) {
+        directory_watcher_.stop();
+        KillTimer(hwnd_, kDirectoryRefreshTimer);
         if (record_history) history_.navigate(location);
         update_navigation_buttons();
         set_text(address_edit_, location.display_name());
@@ -1983,11 +1835,21 @@ private:
 
         if (result->archive_catalog) archive_catalog_ = std::move(result->archive_catalog);
         browser_items_ = std::move(result->snapshot.items);
+        if (!application_options_.show_hidden) {
+            std::erase_if(browser_items_, [](const auto& item) {
+                return item.attributes.find(L'H') != std::wstring::npos ||
+                       item.attributes.find(L'S') != std::wstring::npos;
+            });
+        }
         populate_browser_table();
         if (!result->snapshot.error.empty()) {
             set_status(L"Cannot read location: " + result->snapshot.error);
         } else {
             set_status(quote_count(browser_items_.size(), L"item", L"items"));
+            if (result->snapshot.location.kind == axiom::gui::BrowserLocationKind::filesystem) {
+                directory_watcher_.start(result->snapshot.location.filesystem_path, hwnd_,
+                                         kDirectoryChangedMessage);
+            }
         }
         update_navigation_buttons();
     }
@@ -2082,15 +1944,29 @@ private:
         }
     }
 
+    void create_archive_from_paths(std::vector<fs::path> paths) {
+        if (paths.empty()) return;
+
+        axiom::gui::CreateArchiveDialogOptions dialog_options;
+        dialog_options.level = application_options_.default_level;
+        dialog_options.thread_count = application_options_.default_thread_count;
+        const fs::path base = history_.current().kind == axiom::gui::BrowserLocationKind::filesystem
+            ? history_.current().filesystem_path
+            : paths.front().parent_path();
+        dialog_options.archive_path = base / L"Archive.axar";
+        if (!axiom::gui::show_create_archive_dialog(hwnd_, paths.size(), dialog_options)) return;
+
+        inputs_ = std::move(paths);
+        selected_level_ = dialog_options.level;
+        selected_thread_count_ = dialog_options.thread_count;
+        pending_archive_path_ = std::move(dialog_options.archive_path);
+        on_compress();
+    }
+
     void on_add_to_archive() {
         auto paths = selected_filesystem_paths();
         if (paths.empty()) paths = pick_files(hwnd_);
-        if (paths.empty()) return;
-        const auto archive = pick_save_archive(hwnd_);
-        if (!archive) return;
-        inputs_ = std::move(paths);
-        set_text(archive_edit_, archive->wstring());
-        on_compress();
+        create_archive_from_paths(std::move(paths));
     }
 
     void on_view() {
@@ -2107,7 +1983,8 @@ private:
         const std::wstring prompt = L"Move " +
             quote_count(paths.size(), L"selected item", L"selected items") +
             L" to the Recycle Bin?";
-        if (MessageBoxW(hwnd_, prompt.c_str(), L"Axiom", MB_YESNO | MB_ICONWARNING) != IDYES) return;
+        if (application_options_.confirm_delete &&
+            MessageBoxW(hwnd_, prompt.c_str(), L"Axiom", MB_YESNO | MB_ICONWARNING) != IDYES) return;
 
         ComPtr<IFileOperation> operation;
         HRESULT result = CoCreateInstance(CLSID_FileOperation, nullptr, CLSCTX_INPROC_SERVER,
@@ -2145,97 +2022,17 @@ private:
     }
 
     void on_settings() {
-        std::wstring message = L"Compression level: " + std::to_wstring(selected_level_) +
-            L"\nThreads: " + std::to_wstring(selected_threads()) +
-            L" (0 uses all available threads)\n\n"
-            L"Archive-specific options will appear here as their provider capabilities become available.";
-        MessageBoxW(hwnd_, message.c_str(), L"Axiom settings", MB_ICONINFORMATION);
-    }
-
-    void refresh_input_list() {
-        table_.clear();
-        for (const auto& path : inputs_) {
-            std::error_code error;
-            const bool is_dir = fs::is_directory(path, error);
-            const std::wstring type = is_dir ? L"Folder" : L"File";
-            const std::wstring size = is_dir ? L"" : format_size(file_size_or_zero(path));
-            table_.append_row({
-                path.filename().wstring(),
-                type,
-                size,
-                format_file_time(path),
-                path.wstring(),
-            });
-        }
-        set_status(quote_count(inputs_.size(), L"input selected", L"inputs selected"));
-    }
-
-    void add_inputs(std::vector<fs::path> paths) {
-        for (auto& path : paths) {
-            if (std::find(inputs_.begin(), inputs_.end(), path) == inputs_.end()) {
-                inputs_.push_back(std::move(path));
-            }
-        }
-        refresh_input_list();
-    }
-
-    void show_archive_entries(const fs::path& archive_path,
-                              const std::vector<axiom::ArchiveEntry>& entries) {
-        table_.clear();
-        for (const auto& entry : entries) {
-            const std::wstring path = widen(entry.path);
-            const fs::path display_path(path);
-            table_.append_row({
-                display_path.filename().wstring().empty() ? path : display_path.filename().wstring(),
-                entry.is_directory ? L"Folder" : L"File",
-                entry.is_directory ? L"" : format_size(entry.size),
-                format_time(entry.mtime),
-                path,
-            });
-        }
-        set_text(archive_edit_, archive_path.wstring());
-        set_status(L"Opened " + quote_count(entries.size(), L"entry", L"entries"));
-    }
-
-    fs::path archive_path_from_edit() const {
-        return fs::path(get_text(archive_edit_));
-    }
-
-    fs::path output_path_from_edit() const {
-        return fs::path(get_text(output_edit_));
-    }
-
-    void on_archive_browse() {
-        if (auto path = pick_save_archive(hwnd_)) {
-            set_text(archive_edit_, path->wstring());
-        }
-    }
-
-    void on_output_browse() {
-        if (auto path = pick_folder(hwnd_, L"Choose extraction folder")) {
-            set_text(output_edit_, path->wstring());
+        if (axiom::gui::show_application_settings_dialog(hwnd_, application_options_)) {
+            selected_level_ = application_options_.default_level;
+            selected_thread_count_ = application_options_.default_thread_count;
+            save_current_settings();
+            on_navigate_refresh();
         }
     }
 
     void on_open_archive() {
         auto path = pick_open_archive(hwnd_);
         if (path) navigate_to(axiom::gui::BrowserLocation::archive(*path));
-    }
-
-    void on_add_files() {
-        add_inputs(pick_files(hwnd_));
-    }
-
-    void on_add_folder() {
-        if (auto path = pick_folder(hwnd_, L"Choose folder to add")) {
-            add_inputs({*path});
-        }
-    }
-
-    void on_clear() {
-        inputs_.clear();
-        table_.clear();
-        set_status(L"Ready");
     }
 
     void on_drop_files(HDROP drop) {
@@ -2250,7 +2047,22 @@ private:
             paths.emplace_back(std::move(path));
         }
         DragFinish(drop);
-        add_inputs(std::move(paths));
+        if (paths.size() == 1 && axiom::gui::is_axiom_archive(paths.front())) {
+            navigate_to(axiom::gui::BrowserLocation::archive(std::move(paths.front())));
+            return;
+        }
+        create_archive_from_paths(std::move(paths));
+    }
+
+    void save_current_settings() {
+        persisted_settings_.application = application_options_;
+        persisted_settings_.sort_column = sort_column_;
+        persisted_settings_.sort_ascending = sort_ascending_;
+        persisted_settings_.last_location = history_.current().display_name();
+        persisted_settings_.placement.length = sizeof(WINDOWPLACEMENT);
+        persisted_settings_.has_placement =
+            GetWindowPlacement(hwnd_, &persisted_settings_.placement) != FALSE;
+        axiom::gui::save_gui_settings(persisted_settings_);
     }
 
     void start_operation(std::wstring running,
@@ -2261,6 +2073,7 @@ private:
         }
 
         set_busy(true);
+        operation_started_ = std::chrono::steady_clock::now();
         set_status(running);
         if (!operation_runner_.start(hwnd_, kOperationDoneMessage, kOperationProgressMessage,
                                      std::move(running), std::move(success), std::move(work))) {
@@ -2275,7 +2088,7 @@ private:
             return;
         }
 
-        const auto archive = archive_path_from_edit();
+        const auto archive = pending_archive_path_;
         if (archive.empty()) {
             MessageBoxW(hwnd_, L"Choose an output .axar archive path.", L"Axiom", MB_ICONINFORMATION);
             return;
@@ -2283,6 +2096,7 @@ private:
 
         const auto inputs = inputs_;
         const auto options = compression_options();
+        operation_archive_output_ = archive;
         start_operation(L"Compressing...",
                         L"Archive created: " + archive.wstring(),
                         [inputs, archive, options](std::shared_ptr<axiom::OperationControl> operation) mutable {
@@ -2299,20 +2113,22 @@ private:
                         L"Axiom", MB_ICONINFORMATION);
             return;
         }
-        const auto output = pick_folder(hwnd_, L"Extract archive to");
-        if (!output) return;
-        set_text(archive_edit_, archive->wstring());
-        set_text(output_edit_, output->wstring());
+        axiom::gui::ExtractArchiveDialogOptions dialog_options;
+        dialog_options.thread_count = application_options_.default_thread_count;
+        dialog_options.destination = archive->parent_path() / archive->stem();
+        if (!axiom::gui::show_extract_archive_dialog(hwnd_, *archive, dialog_options)) return;
 
         axiom::ExtractOptions options;
-        options.thread_count = selected_threads();
-        options.overwrite = SendMessageW(overwrite_, BM_GETCHECK, 0, 0) == BST_CHECKED
+        options.thread_count = dialog_options.thread_count;
+        options.restore_mtime = dialog_options.restore_mtime;
+        options.overwrite = dialog_options.overwrite
             ? axiom::ExtractOptions::Overwrite::overwrite
             : axiom::ExtractOptions::Overwrite::fail;
 
+        operation_archive_output_.clear();
         start_operation(L"Extracting...",
-                        L"Extracted to: " + output->wstring(),
-                        [archive = *archive, output = *output, options](std::shared_ptr<axiom::OperationControl> operation) mutable {
+                        L"Extracted to: " + dialog_options.destination.wstring(),
+                        [archive = *archive, output = dialog_options.destination, options](std::shared_ptr<axiom::OperationControl> operation) mutable {
                             auto run_options = options;
                             run_options.operation = std::move(operation);
                             axiom::extract_archive(archive, output, run_options);
@@ -2327,7 +2143,8 @@ private:
         }
 
         axiom::DecompressionOptions options;
-        options.thread_count = selected_threads();
+        options.thread_count = application_options_.default_thread_count;
+        operation_archive_output_.clear();
         start_operation(L"Testing archive...",
                         L"Archive integrity test passed.",
                         [archive = *archive, options](std::shared_ptr<axiom::OperationControl> operation) mutable {
@@ -2347,11 +2164,37 @@ private:
             return;
         }
         progress_view_.set_progress(progress->completed_bytes, progress->total_bytes);
-        if (operation_paused_) {
-            set_status(L"Paused. " + format_progress_text(*progress));
-        } else {
-            set_status(format_progress_text(*progress));
+        std::wstring status = format_progress_text(*progress);
+        const double elapsed = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - operation_started_).count();
+        if (elapsed >= 0.25 && progress->completed_bytes != 0) {
+            const auto bytes_per_second = static_cast<std::uint64_t>(
+                static_cast<double>(progress->completed_bytes) / elapsed);
+            status += L" | " + format_size(bytes_per_second) + L"/s";
+            if (progress->total_bytes > progress->completed_bytes && bytes_per_second != 0) {
+                const auto remaining = (progress->total_bytes - progress->completed_bytes) /
+                                       bytes_per_second;
+                status += L" | ETA " + format_duration(remaining);
+            }
         }
+        if (!operation_archive_output_.empty()) {
+            fs::path temporary = operation_archive_output_;
+            temporary += L".tmp";
+            const std::uint64_t output_bytes = file_size_or_zero(temporary);
+            if (output_bytes != 0) {
+                status += L" | Output " + format_size(output_bytes);
+                if (progress->completed_bytes != 0) {
+                    std::wstringstream ratio;
+                    ratio.setf(std::ios::fixed);
+                    ratio.precision(2);
+                    ratio << static_cast<double>(progress->completed_bytes) /
+                                 static_cast<double>(output_bytes);
+                    status += L" | " + ratio.str() + L"x";
+                }
+            }
+        }
+        if (operation_paused_) status = L"Paused. " + status;
+        set_status(status);
     }
 
     void on_pause_operation() {
@@ -2380,6 +2223,7 @@ private:
             reinterpret_cast<axiom::gui::OperationResult*>(lparam));
         operation_runner_.finish();
         set_busy(false);
+        operation_archive_output_.clear();
         set_status(result->message);
         on_navigate_refresh();
         if (result->cancelled) {
@@ -2439,22 +2283,21 @@ private:
             case WM_DROPFILES:
                 on_drop_files(reinterpret_cast<HDROP>(wparam));
                 return 0;
+            case WM_TIMER:
+                if (wparam == kDirectoryRefreshTimer) {
+                    KillTimer(hwnd_, kDirectoryRefreshTimer);
+                    on_navigate_refresh();
+                    return 0;
+                }
+                break;
             case WM_COMMAND:
                 switch (LOWORD(wparam)) {
-                    case kArchiveBrowse: on_archive_browse(); return 0;
-                    case kOutputBrowse: on_output_browse(); return 0;
                     case kOpenArchive: on_open_archive(); return 0;
                     case kAddFiles: on_add_to_archive(); return 0;
-                    case kAddFolder: on_add_folder(); return 0;
-                    case kClear: on_clear(); return 0;
-                    case kCompress: on_compress(); return 0;
                     case kExtract: on_extract(); return 0;
                     case kTest: on_test(); return 0;
                     case kPauseOperation: on_pause_operation(); return 0;
                     case kCancelOperation: on_cancel_operation(); return 0;
-                    case kLevelDown: adjust_level(-1); return 0;
-                    case kLevelValue: adjust_level(selected_level_ == 9 ? -8 : 1); return 0;
-                    case kLevelUp: adjust_level(1); return 0;
                     case kNavigateBack: on_navigate_back(); return 0;
                     case kNavigateForward: on_navigate_forward(); return 0;
                     case kNavigateUp: on_navigate_up(); return 0;
@@ -2464,20 +2307,9 @@ private:
                     case kDelete: on_delete_selected(); return 0;
                     case kInfo: on_info(); return 0;
                     case kSettings: on_settings(); return 0;
-                    case kArchiveEdit:
-                    case kOutputEdit:
-                    case kThreadsEdit:
                     case kAddressEdit:
                         if (HIWORD(wparam) == EN_SETFOCUS || HIWORD(wparam) == EN_KILLFOCUS) {
                             InvalidateRect(hwnd_, nullptr, FALSE);
-                            return 0;
-                        }
-                        break;
-                    case kOverwriteCheck:
-                        if (HIWORD(wparam) == BN_CLICKED) {
-                            const auto checked = SendMessageW(overwrite_, BM_GETCHECK, 0, 0) == BST_CHECKED;
-                            SendMessageW(overwrite_, BM_SETCHECK, checked ? BST_UNCHECKED : BST_CHECKED, 0);
-                            InvalidateRect(overwrite_, nullptr, TRUE);
                             return 0;
                         }
                         break;
@@ -2504,13 +2336,24 @@ private:
             case kTableSortMessage:
                 on_table_sort(static_cast<int>(wparam));
                 return 0;
+            case kDirectoryChangedMessage:
+                // Coalesce bursts from file copies and archive creation into one reload.
+                KillTimer(hwnd_, kDirectoryRefreshTimer);
+                SetTimer(hwnd_, kDirectoryRefreshTimer, 300, nullptr);
+                return 0;
             case WM_GETMINMAXINFO: {
                 auto* limits = reinterpret_cast<MINMAXINFO*>(lparam);
                 limits->ptMinTrackSize.x = scale(760);
                 limits->ptMinTrackSize.y = scale(480);
                 return 0;
             }
+            case WM_CLOSE:
+                save_current_settings();
+                DestroyWindow(hwnd_);
+                return 0;
             case WM_DESTROY:
+                KillTimer(hwnd_, kDirectoryRefreshTimer);
+                directory_watcher_.stop();
                 browser_thread_.request_stop();
                 operation_runner_.cancel();
                 PostQuitMessage(0);
@@ -2538,22 +2381,10 @@ private:
 
     HINSTANCE instance_ = nullptr;
     HWND hwnd_ = nullptr;
-    HWND archive_edit_ = nullptr;
-    HWND archive_browse_ = nullptr;
-    HWND output_edit_ = nullptr;
-    HWND output_browse_ = nullptr;
     HWND add_files_ = nullptr;
-    HWND add_folder_ = nullptr;
-    HWND clear_ = nullptr;
     HWND open_archive_ = nullptr;
-    HWND compress_ = nullptr;
     HWND extract_ = nullptr;
     HWND test_ = nullptr;
-    HWND level_down_ = nullptr;
-    HWND level_value_ = nullptr;
-    HWND level_up_ = nullptr;
-    HWND threads_edit_ = nullptr;
-    HWND overwrite_ = nullptr;
     HWND pause_operation_ = nullptr;
     HWND cancel_operation_ = nullptr;
     HWND navigate_back_ = nullptr;
@@ -2581,20 +2412,24 @@ private:
     bool busy_ = false;
     bool operation_paused_ = false;
     axiom::gui::OperationRunner operation_runner_;
-    RECT archive_edit_frame_{};
-    RECT output_edit_frame_{};
-    RECT threads_edit_frame_{};
+    std::chrono::steady_clock::time_point operation_started_{};
+    fs::path operation_archive_output_;
     RECT address_edit_frame_{};
     std::vector<HWND> transient_labels_;
     std::vector<fs::path> inputs_;
     axiom::gui::NavigationHistory history_;
     std::vector<axiom::gui::BrowserItem> browser_items_;
     std::shared_ptr<const axiom::gui::ArchiveCatalog> archive_catalog_;
+    axiom::gui::DirectoryWatcher directory_watcher_;
     std::jthread browser_thread_;
     std::uint64_t browser_generation_ = 0;
     int sort_column_ = 0;
     bool sort_ascending_ = true;
     std::wstring initial_path_;
+    axiom::gui::ApplicationDialogOptions application_options_;
+    axiom::gui::PersistedGuiSettings persisted_settings_;
+    std::size_t selected_thread_count_ = 0;
+    fs::path pending_archive_path_;
 };
 
 }  // namespace

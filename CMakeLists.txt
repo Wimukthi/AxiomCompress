@@ -55,6 +55,9 @@ if(WIN32)
     add_executable(axiom_gui WIN32
         src/gui/main.cpp
         src/gui/main_window.cpp
+        src/gui/archive_dialogs.cpp
+        src/gui/directory_watcher.cpp
+        src/gui/settings_store.cpp
         src/gui/browser_model.cpp
         src/gui/operation_runner.cpp)
     target_link_libraries(axiom_gui PRIVATE axiom Comctl32 Dwmapi Ole32 Shell32 Uxtheme)

@@ -97,7 +97,10 @@ per-monitor DPI aware, and has a dark-mode foundation (system theme detection,
 dark title bar, custom dark-painted table/progress controls, and scaled
 layout/fonts). Operations run on a worker thread so the window stays responsive;
 create/test/extract report byte progress to the status strip and progress bar,
-and can be paused or cancelled cooperatively.
+including throughput, ETA, output size, and live compression ratio when available.
+Operations can be paused or cancelled cooperatively. Archive creation, extraction,
+and application settings use native dark, DPI-scaled dialogs rather than the old
+form-style controls.
 
 The main window is a file-manager browser with drive and directory navigation,
 an editable address bar, history, shell icons, multi-selection, sortable and
@@ -105,6 +108,10 @@ resizable columns, and hierarchical archive browsing. Archive presentation is
 isolated behind a provider/catalog layer with explicit capability flags, so
 packed-size, encryption, recovery, volume, comment, authenticity, and archive
 mutation features can be enabled as their public archive APIs become available.
+Filesystem folders refresh automatically through `ReadDirectoryChangesW`; dropped
+archives open in the browser, while dropped files and folders enter the create
+archive workflow. Window placement, the last location, sorting, and application
+defaults persist per user under `HKCU\Software\AxiomCompress\GUI`.
 
 ### Effort levels (`--level 1..9`, default 5)
 
