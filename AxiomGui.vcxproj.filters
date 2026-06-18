@@ -20,6 +20,9 @@
     <ClCompile Include="src\gui\custom_menu.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="src\gui\toolbar_icons.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="src\gui\archive_dialogs.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -35,12 +38,21 @@
     <ClCompile Include="src\gui\operation_runner.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="src\gui\operation_progress_window.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="src\gui\browser_model.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="src\gui\custom_menu.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\gui\toolbar_icons.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\gui\toolbar_icon_masks.inc">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="src\gui\app.hpp">
@@ -56,6 +68,9 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="src\gui\operation_runner.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\gui\operation_progress_window.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>

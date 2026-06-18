@@ -57,7 +57,7 @@
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
-      <AdditionalDependencies>Comctl32.lib;Dwmapi.lib;Ole32.lib;Shell32.lib;Uxtheme.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>Comctl32.lib;Dwmapi.lib;Msimg32.lib;Ole32.lib;Shell32.lib;Uxtheme.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
@@ -75,27 +75,32 @@
       <SubSystem>Windows</SubSystem>
       <EnableCOMDATFolding>true</EnableCOMDATFolding>
       <OptimizeReferences>true</OptimizeReferences>
-      <AdditionalDependencies>Comctl32.lib;Dwmapi.lib;Ole32.lib;Shell32.lib;Uxtheme.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>Comctl32.lib;Dwmapi.lib;Msimg32.lib;Ole32.lib;Shell32.lib;Uxtheme.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="src\gui\main.cpp" />
     <ClCompile Include="src\gui\main_window.cpp" />
     <ClCompile Include="src\gui\custom_menu.cpp" />
+    <ClCompile Include="src\gui\toolbar_icons.cpp" />
     <ClCompile Include="src\gui\archive_dialogs.cpp" />
     <ClCompile Include="src\gui\directory_watcher.cpp" />
     <ClCompile Include="src\gui\settings_store.cpp" />
     <ClCompile Include="src\gui\browser_model.cpp" />
     <ClCompile Include="src\gui\operation_runner.cpp" />
+    <ClCompile Include="src\gui\operation_progress_window.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="src\gui\browser_model.hpp" />
     <ClInclude Include="src\gui\custom_menu.hpp" />
+    <ClInclude Include="src\gui\toolbar_icons.hpp" />
+    <ClInclude Include="src\gui\toolbar_icon_masks.inc" />
     <ClInclude Include="src\gui\app.hpp" />
     <ClInclude Include="src\gui\archive_dialogs.hpp" />
     <ClInclude Include="src\gui\directory_watcher.hpp" />
     <ClInclude Include="src\gui\settings_store.hpp" />
     <ClInclude Include="src\gui\operation_runner.hpp" />
+    <ClInclude Include="src\gui\operation_progress_window.hpp" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="AxiomLib.vcxproj">

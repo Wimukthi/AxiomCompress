@@ -56,12 +56,14 @@ if(WIN32)
         src/gui/main.cpp
         src/gui/main_window.cpp
         src/gui/custom_menu.cpp
+        src/gui/toolbar_icons.cpp
         src/gui/archive_dialogs.cpp
         src/gui/directory_watcher.cpp
         src/gui/settings_store.cpp
         src/gui/browser_model.cpp
-        src/gui/operation_runner.cpp)
-    target_link_libraries(axiom_gui PRIVATE axiom Comctl32 Dwmapi Ole32 Shell32 Uxtheme)
+        src/gui/operation_runner.cpp
+        src/gui/operation_progress_window.cpp)
+    target_link_libraries(axiom_gui PRIVATE axiom Comctl32 Dwmapi Msimg32 Ole32 Shell32 Uxtheme)
 endif()
 
 enable_testing()

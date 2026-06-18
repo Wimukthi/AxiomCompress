@@ -7,7 +7,9 @@
 #include "gui/custom_menu.hpp"
 #include "gui/directory_watcher.hpp"
 #include "gui/operation_runner.hpp"
+#include "gui/operation_progress_window.hpp"
 #include "gui/settings_store.hpp"
+#include "gui/toolbar_icons.hpp"
 
 #include <windows.h>
 #include <windowsx.h>
@@ -19,7 +21,6 @@
 
 #include <algorithm>
 #include <atomic>
-#include <chrono>
 #include <cstdint>
 #include <exception>
 #include <filesystem>
@@ -63,10 +64,7 @@ enum ControlId : int {
     kExtract = 1010,
     kTest = 1011,
     kList = 1015,
-    kProgress = 1016,
     kStatus = 1017,
-    kPauseOperation = 1020,
-    kCancelOperation = 1021,
     kNavigateBack = 1022,
     kNavigateForward = 1023,
     kNavigateUp = 1024,
@@ -187,19 +185,6 @@ std::wstring format_size(std::uint64_t size) {
     return stream.str();
 }
 
-std::wstring format_duration(std::uint64_t seconds) {
-    const std::uint64_t hours = seconds / 3600;
-    const std::uint64_t minutes = (seconds % 3600) / 60;
-    const std::uint64_t remaining = seconds % 60;
-    wchar_t text[32]{};
-    if (hours != 0) {
-        swprintf_s(text, L"%llu:%02llu:%02llu", hours, minutes, remaining);
-    } else {
-        swprintf_s(text, L"%02llu:%02llu", minutes, remaining);
-    }
-    return text;
-}
-
 std::wstring format_crc32(const std::optional<std::uint32_t>& crc) {
     if (!crc) return {};
     wchar_t text[9]{};
@@ -266,12 +251,6 @@ std::wstring format_progress_text(const axiom::OperationProgress& progress) {
         stream << L"  " << widen(progress.current_path);
     }
     return stream.str();
-}
-
-std::uint64_t file_size_or_zero(const fs::path& path) {
-    std::error_code error;
-    const auto size = fs::file_size(path, error);
-    return error ? 0 : static_cast<std::uint64_t>(size);
 }
 
 std::optional<fs::path> shell_item_path(IShellItem* item) {
@@ -485,6 +464,22 @@ ThemePalette make_theme() {
     return theme;
 }
 
+axiom::gui::OperationWindowTheme make_operation_window_theme(const ThemePalette& theme) {
+    return {
+        theme.dark,
+        theme.window,
+        theme.panel,
+        theme.text,
+        theme.muted_text,
+        theme.border,
+        theme.button,
+        theme.button_hot,
+        theme.button_pressed,
+        theme.edit,
+        theme.selection,
+    };
+}
+
 void set_dark_title_bar(HWND hwnd, bool dark) {
     BOOL value = dark ? TRUE : FALSE;
     if (FAILED(DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE,
@@ -500,8 +495,6 @@ bool is_button_id(UINT id) {
         case kOpenArchive:
         case kExtract:
         case kTest:
-        case kPauseOperation:
-        case kCancelOperation:
         case kNavigateBack:
         case kNavigateForward:
         case kNavigateUp:
@@ -515,6 +508,31 @@ bool is_button_id(UINT id) {
         default:
             return false;
     }
+}
+
+axiom::gui::ToolbarIcon toolbar_icon_for_button(UINT id) {
+    using axiom::gui::ToolbarIcon;
+    switch (id) {
+        case kAddFiles: return ToolbarIcon::archive;
+        case kOpenArchive: return ToolbarIcon::open;
+        case kExtract: return ToolbarIcon::extract;
+        case kTest: return ToolbarIcon::test;
+        case kNavigateBack: return ToolbarIcon::back;
+        case kNavigateForward: return ToolbarIcon::forward;
+        case kNavigateUp: return ToolbarIcon::up;
+        case kNavigateRefresh: return ToolbarIcon::refresh;
+        case kAddressGo: return ToolbarIcon::forward;
+        case kView: return ToolbarIcon::view;
+        case kDelete: return ToolbarIcon::delete_item;
+        case kInfo: return ToolbarIcon::info;
+        case kSettings: return ToolbarIcon::settings;
+        default: return ToolbarIcon::none;
+    }
+}
+
+bool is_icon_only_button(UINT id) {
+    return id == kNavigateBack || id == kNavigateForward ||
+           id == kNavigateUp || id == kNavigateRefresh;
 }
 
 int scale_for_dpi(UINT dpi, int value) {
@@ -1118,191 +1136,6 @@ private:
     int resize_start_width_ = 0;
 };
 
-class DarkProgressView {
-public:
-    ~DarkProgressView() {
-        set_busy(false);
-    }
-
-    bool create(HWND parent, HINSTANCE instance, int id) {
-        if (!register_class(instance)) {
-            return false;
-        }
-
-        hwnd_ = CreateWindowExW(0, class_name(), L"",
-                                WS_CHILD | WS_VISIBLE,
-                                0, 0, 0, 0,
-                                parent,
-                                reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),
-                                instance,
-                                this);
-        return hwnd_ != nullptr;
-    }
-
-    HWND hwnd() const {
-        return hwnd_;
-    }
-
-    void set_dpi(UINT dpi) {
-        dpi_ = dpi == 0 ? USER_DEFAULT_SCREEN_DPI : dpi;
-        invalidate();
-    }
-
-    void set_theme(const ThemePalette& theme) {
-        theme_ = theme;
-        invalidate();
-    }
-
-    void set_busy(bool busy) {
-        busy_ = busy;
-        if (hwnd_ == nullptr) {
-            return;
-        }
-        if (busy_) {
-            SetTimer(hwnd_, kTimerId, 33, nullptr);
-        } else {
-            KillTimer(hwnd_, kTimerId);
-            pulse_ = 0;
-            fraction_ = 0.0;
-            determinate_ = false;
-            text_.clear();
-        }
-        invalidate();
-    }
-
-    void set_progress(std::uint64_t completed, std::uint64_t total) {
-        if (total == 0) {
-            determinate_ = false;
-            text_.clear();
-        } else {
-            determinate_ = true;
-            fraction_ = std::clamp(static_cast<double>(completed) / static_cast<double>(total), 0.0, 1.0);
-            const auto percent = static_cast<unsigned>(fraction_ * 100.0 + 0.5);
-            text_ = std::to_wstring(percent) + L"%  " + format_size(completed);
-        }
-        invalidate();
-    }
-
-private:
-    static constexpr UINT_PTR kTimerId = 1;
-
-    static const wchar_t* class_name() {
-        return L"AxiomDarkProgressView";
-    }
-
-    static bool register_class(HINSTANCE instance) {
-        static ATOM atom = 0;
-        if (atom != 0) {
-            return true;
-        }
-
-        WNDCLASSEXW wc{};
-        wc.cbSize = sizeof(wc);
-        wc.hInstance = instance;
-        wc.lpfnWndProc = &DarkProgressView::window_proc;
-        wc.lpszClassName = class_name();
-        wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-        atom = RegisterClassExW(&wc);
-        return atom != 0 || GetLastError() == ERROR_CLASS_ALREADY_EXISTS;
-    }
-
-    int scale(int value) const {
-        return scale_for_dpi(dpi_, value);
-    }
-
-    void invalidate() const {
-        if (hwnd_ != nullptr) {
-            InvalidateRect(hwnd_, nullptr, TRUE);
-        }
-    }
-
-    void on_paint() {
-        PAINTSTRUCT paint{};
-        HDC dc = BeginPaint(hwnd_, &paint);
-        RECT rect{};
-        GetClientRect(hwnd_, &rect);
-        fill_solid_rect(dc, rect, theme_.edit);
-        frame_solid_rect(dc, rect, theme_.border);
-        if (busy_) {
-            RECT inner = rect;
-            InflateRect(&inner, -scale(2), -scale(2));
-            const int width = inner.right - inner.left;
-            if (determinate_) {
-                RECT filled = inner;
-                filled.right = filled.left + static_cast<int>(static_cast<double>(width) * fraction_);
-                fill_solid_rect(dc, filled, theme_.selection);
-            } else {
-                const int block_width = std::max(scale(28), width / 4);
-                const int travel = width + block_width;
-                const int offset = travel == 0 ? 0 : (pulse_ % travel) - block_width;
-                RECT block{inner.left + offset, inner.top, inner.left + offset + block_width, inner.bottom};
-                RECT clip{};
-                if (IntersectRect(&clip, &inner, &block)) {
-                    fill_solid_rect(dc, clip, theme_.selection);
-                }
-            }
-            if (!text_.empty()) {
-                HFONT font = font_ != nullptr
-                    ? font_
-                    : static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
-                HGDIOBJ old_font = SelectObject(dc, font);
-                SetBkMode(dc, TRANSPARENT);
-                SetTextColor(dc, theme_.selection_text);
-                DrawTextW(dc, text_.c_str(), -1, &rect,
-                          DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-                SelectObject(dc, old_font);
-            }
-        }
-        EndPaint(hwnd_, &paint);
-    }
-
-    LRESULT handle_message(UINT message, WPARAM wparam, LPARAM) {
-        switch (message) {
-            case WM_ERASEBKGND:
-                return 1;
-            case WM_PAINT:
-                on_paint();
-                return 0;
-            case WM_SETFONT:
-                font_ = reinterpret_cast<HFONT>(wparam);
-                invalidate();
-                return 0;
-            case WM_TIMER:
-                pulse_ += scale(5);
-                invalidate();
-                return 0;
-        }
-        return DefWindowProcW(hwnd_, message, 0, 0);
-    }
-
-    static LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam) {
-        DarkProgressView* view = nullptr;
-        if (message == WM_NCCREATE) {
-            const auto* create = reinterpret_cast<CREATESTRUCTW*>(lparam);
-            view = static_cast<DarkProgressView*>(create->lpCreateParams);
-            view->hwnd_ = hwnd;
-            SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(view));
-        } else {
-            view = reinterpret_cast<DarkProgressView*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
-        }
-
-        if (view != nullptr) {
-            return view->handle_message(message, wparam, lparam);
-        }
-        return DefWindowProcW(hwnd, message, wparam, lparam);
-    }
-
-    HWND hwnd_ = nullptr;
-    ThemePalette theme_ = make_theme();
-    UINT dpi_ = USER_DEFAULT_SCREEN_DPI;
-    bool busy_ = false;
-    bool determinate_ = false;
-    double fraction_ = 0.0;
-    int pulse_ = 0;
-    HFONT font_ = nullptr;
-    std::wstring text_;
-};
-
 class MainWindow {
 public:
     ~MainWindow() {
@@ -1396,9 +1229,10 @@ private:
     void apply_fonts() {
         HWND controls[] = {
             add_files_, open_archive_, extract_, test_,
-            pause_operation_, cancel_operation_, list_, progress_, status_,
+            list_, status_,
             navigate_back_, navigate_forward_, navigate_up_, navigate_refresh_,
             address_edit_, address_go_, view_, delete_, info_, settings_,
+            tooltip_,
         };
         for (HWND control : controls) {
             set_control_font(control);
@@ -1418,7 +1252,6 @@ private:
         rebuild_font();
         menu_bar_.set_dpi(dpi_);
         table_.set_dpi(dpi_);
-        progress_view_.set_dpi(dpi_);
         apply_fonts();
         apply_edit_margins();
     }
@@ -1460,9 +1293,10 @@ private:
 
         HWND controls[] = {
             add_files_, open_archive_, extract_, test_,
-            pause_operation_, cancel_operation_, list_, progress_, status_,
+            list_, status_,
             navigate_back_, navigate_forward_, navigate_up_, navigate_refresh_,
             address_edit_, address_go_, view_, delete_, info_, settings_,
+            tooltip_,
         };
         for (HWND control : controls) {
             apply_theme_to_control(control);
@@ -1477,7 +1311,7 @@ private:
             theme_.dark ? RGB(54, 54, 54) : RGB(210, 210, 210),
         });
         table_.set_theme(theme_);
-        progress_view_.set_theme(theme_);
+        operation_window_.set_theme(make_operation_window_theme(theme_));
 
         InvalidateRect(hwnd_, nullptr, TRUE);
     }
@@ -1544,8 +1378,29 @@ private:
         if (pressed) {
             OffsetRect(&rect, scale(1), scale(1));
         }
-        DrawTextW(draw.hDC, text.c_str(), -1, &rect,
-                  DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+
+        const auto icon = toolbar_icon_for_button(draw.CtlID);
+        const COLORREF content_color = disabled ? theme_.muted_text : theme_.text;
+        if (icon == axiom::gui::ToolbarIcon::none) {
+            DrawTextW(draw.hDC, text.c_str(), -1, &rect,
+                      DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        } else if (is_icon_only_button(draw.CtlID)) {
+            axiom::gui::draw_toolbar_icon(draw.hDC, icon, rect, content_color, dpi_);
+        } else {
+            SIZE text_size{};
+            GetTextExtentPoint32W(draw.hDC, text.c_str(), static_cast<int>(text.size()), &text_size);
+            const int icon_size = scale(18);
+            const int gap = scale(5);
+            const int content_width = icon_size + gap + static_cast<int>(text_size.cx);
+            const int content_left = rect.left + (rect.right - rect.left - content_width) / 2;
+            RECT icon_rect{content_left, rect.top, content_left + icon_size, rect.bottom};
+            axiom::gui::draw_toolbar_icon(draw.hDC, icon, icon_rect, content_color, dpi_);
+
+            RECT text_rect{icon_rect.right + gap, rect.top,
+                           icon_rect.right + gap + static_cast<int>(text_size.cx), rect.bottom};
+            DrawTextW(draw.hDC, text.c_str(), -1, &text_rect,
+                      DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        }
 
         SelectObject(draw.hDC, old_font);
     }
@@ -1586,6 +1441,17 @@ private:
         fill_rect(dc, frame, theme_.edit);
         const bool focused = GetFocus() == edit;
         frame_rect(dc, frame, focused ? theme_.focus : theme_.border);
+    }
+
+    void add_tooltip(HWND control, const wchar_t* text) const {
+        if (tooltip_ == nullptr || control == nullptr) return;
+        TOOLINFOW tool{};
+        tool.cbSize = sizeof(tool);
+        tool.uFlags = TTF_IDISHWND | TTF_SUBCLASS;
+        tool.hwnd = hwnd_;
+        tool.uId = reinterpret_cast<UINT_PTR>(control);
+        tool.lpszText = const_cast<wchar_t*>(text);
+        SendMessageW(tooltip_, TTM_ADDTOOLW, 0, reinterpret_cast<LPARAM>(&tool));
     }
 
     std::vector<axiom::gui::CustomMenuItem> menu_items(UINT menu_id) const {
@@ -1666,8 +1532,6 @@ private:
         open_archive_ = make_control(L"BUTTON", L"Open archive", WS_TABSTOP | BS_OWNERDRAW, kOpenArchive);
         extract_ = make_control(L"BUTTON", L"Extract", WS_TABSTOP | BS_OWNERDRAW, kExtract);
         test_ = make_control(L"BUTTON", L"Test", WS_TABSTOP | BS_OWNERDRAW, kTest);
-        pause_operation_ = make_control(L"BUTTON", L"Pause", WS_TABSTOP | BS_OWNERDRAW, kPauseOperation);
-        cancel_operation_ = make_control(L"BUTTON", L"Cancel", WS_TABSTOP | BS_OWNERDRAW, kCancelOperation);
 
         navigate_back_ = make_control(L"BUTTON", L"<", WS_TABSTOP | BS_OWNERDRAW, kNavigateBack);
         navigate_forward_ = make_control(L"BUTTON", L">", WS_TABSTOP | BS_OWNERDRAW, kNavigateForward);
@@ -1681,6 +1545,15 @@ private:
         info_ = make_control(L"BUTTON", L"Info", WS_TABSTOP | BS_OWNERDRAW, kInfo);
         settings_ = make_control(L"BUTTON", L"Settings", WS_TABSTOP | BS_OWNERDRAW, kSettings);
 
+        tooltip_ = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, nullptr,
+                                   WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX,
+                                   CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
+                                   hwnd_, nullptr, instance_, nullptr);
+        add_tooltip(navigate_back_, L"Back");
+        add_tooltip(navigate_forward_, L"Forward");
+        add_tooltip(navigate_up_, L"Up one level");
+        add_tooltip(navigate_refresh_, L"Refresh");
+
         table_.create(hwnd_, instance_, kList);
         list_ = table_.hwnd();
         table_.set_columns({
@@ -1693,13 +1566,10 @@ private:
             {L"Attributes", 90},
         });
 
-        progress_view_.create(hwnd_, instance_, kProgress);
-        progress_ = progress_view_.hwnd();
         status_ = make_control(L"STATIC", L"Ready", SS_LEFT, kStatus);
         // Custom controls do not expose painted content to accessibility tools, so give
         // each HWND a stable semantic name for UI Automation and screen readers.
         SetWindowTextW(list_, L"Files and archive contents");
-        SetWindowTextW(progress_, L"Operation progress");
 
         apply_edit_margins();
         apply_fonts();
@@ -1755,8 +1625,8 @@ private:
         x = margin;
         place(navigate_back_, 36);
         place(navigate_forward_, 36);
-        place(navigate_up_, 48);
-        place(navigate_refresh_, 72);
+        place(navigate_up_, 36);
+        place(navigate_refresh_, 36);
         const int go_width = scale(48);
         const int address_x = x;
         const int address_width = std::max(scale(100), right - go_width - gap - address_x);
@@ -1768,22 +1638,11 @@ private:
         y += edit_height + gap;
 
         const int bottom_height = scale(28);
-        const int progress_width = scale(250);
-        const int operation_button_width = scale(70);
         const int list_height = std::max(scale(80), static_cast<int>(client.bottom) - y - bottom_height - margin);
         MoveWindow(list_, margin, y, width - 2 * margin,
                    list_height, TRUE);
         const int bottom_y = client.bottom - bottom_height;
-        const int cancel_x = right - operation_button_width;
-        const int pause_x = cancel_x - gap - operation_button_width;
-        MoveWindow(progress_, margin, bottom_y, progress_width, scale(18), TRUE);
-        MoveWindow(pause_operation_, pause_x, bottom_y - scale(2),
-                   operation_button_width, button_height, TRUE);
-        MoveWindow(cancel_operation_, cancel_x, bottom_y - scale(2),
-                   operation_button_width, button_height, TRUE);
-        const int status_width = std::max(scale(80), pause_x - margin - progress_width - (2 * gap));
-        MoveWindow(status_, margin + progress_width + gap, bottom_y + scale(2),
-                   status_width, scale(20), TRUE);
+        MoveWindow(status_, margin, bottom_y + scale(2), width - margin * 2, scale(20), TRUE);
         InvalidateRect(hwnd_, nullptr, TRUE);
     }
 
@@ -1797,13 +1656,9 @@ private:
         EnableWindow(open_archive_, !busy);
         EnableWindow(extract_, !busy);
         EnableWindow(test_, !busy);
-        EnableWindow(pause_operation_, busy);
-        EnableWindow(cancel_operation_, busy);
         EnableWindow(delete_, !busy);
         EnableWindow(settings_, !busy);
-        set_text(pause_operation_, L"Pause");
         operation_paused_ = false;
-        progress_view_.set_busy(busy);
     }
 
     int selected_level() const {
@@ -2199,10 +2054,28 @@ private:
         }
 
         set_busy(true);
-        operation_started_ = std::chrono::steady_clock::now();
         set_status(running);
+        if (!operation_window_.create(
+                hwnd_, instance_, running, operation_archive_output_,
+                make_operation_window_theme(theme_),
+                [this](bool paused) {
+                    if (!busy_ || !operation_runner_.running()) return;
+                    operation_paused_ = paused;
+                    operation_runner_.set_paused(paused);
+                    set_status(paused ? L"Operation paused." : L"Operation resumed.");
+                },
+                [this] {
+                    if (!busy_ || !operation_runner_.running()) return;
+                    operation_runner_.cancel();
+                    set_status(L"Cancelling operation...");
+                })) {
+            set_busy(false);
+            set_status(L"Could not create the operation progress window.");
+            return;
+        }
         if (!operation_runner_.start(hwnd_, kOperationDoneMessage, kOperationProgressMessage,
                                      std::move(running), std::move(success), std::move(work))) {
+            operation_window_.close();
             set_busy(false);
             set_status(L"Another operation is already running.");
         }
@@ -2289,65 +2162,15 @@ private:
         if (!busy_) {
             return;
         }
-        progress_view_.set_progress(progress->completed_bytes, progress->total_bytes);
-        std::wstring status = format_progress_text(*progress);
-        const double elapsed = std::chrono::duration<double>(
-            std::chrono::steady_clock::now() - operation_started_).count();
-        if (elapsed >= 0.25 && progress->completed_bytes != 0) {
-            const auto bytes_per_second = static_cast<std::uint64_t>(
-                static_cast<double>(progress->completed_bytes) / elapsed);
-            status += L" | " + format_size(bytes_per_second) + L"/s";
-            if (progress->total_bytes > progress->completed_bytes && bytes_per_second != 0) {
-                const auto remaining = (progress->total_bytes - progress->completed_bytes) /
-                                       bytes_per_second;
-                status += L" | ETA " + format_duration(remaining);
-            }
-        }
-        if (!operation_archive_output_.empty()) {
-            fs::path temporary = operation_archive_output_;
-            temporary += L".tmp";
-            const std::uint64_t output_bytes = file_size_or_zero(temporary);
-            if (output_bytes != 0) {
-                status += L" | Output " + format_size(output_bytes);
-                if (progress->completed_bytes != 0) {
-                    std::wstringstream ratio;
-                    ratio.setf(std::ios::fixed);
-                    ratio.precision(2);
-                    ratio << static_cast<double>(progress->completed_bytes) /
-                                 static_cast<double>(output_bytes);
-                    status += L" | " + ratio.str() + L"x";
-                }
-            }
-        }
-        if (operation_paused_) status = L"Paused. " + status;
-        set_status(status);
-    }
-
-    void on_pause_operation() {
-        if (!busy_ || !operation_runner_.running()) {
-            return;
-        }
-        operation_paused_ = !operation_paused_;
-        operation_runner_.set_paused(operation_paused_);
-        set_text(pause_operation_, operation_paused_ ? L"Resume" : L"Pause");
-        InvalidateRect(pause_operation_, nullptr, TRUE);
-        set_status(operation_paused_ ? L"Paused." : L"Resuming...");
-    }
-
-    void on_cancel_operation() {
-        if (!busy_ || !operation_runner_.running()) {
-            return;
-        }
-        operation_runner_.cancel();
-        EnableWindow(cancel_operation_, FALSE);
-        EnableWindow(pause_operation_, FALSE);
-        set_status(L"Cancelling...");
+        operation_window_.set_progress(*progress);
+        set_status((operation_paused_ ? L"Paused. " : L"") + format_progress_text(*progress));
     }
 
     void on_operation_done(LPARAM lparam) {
         std::unique_ptr<axiom::gui::OperationResult> result(
             reinterpret_cast<axiom::gui::OperationResult*>(lparam));
         operation_runner_.finish();
+        operation_window_.close();
         set_busy(false);
         operation_archive_output_.clear();
         set_status(result->message);
@@ -2430,8 +2253,6 @@ private:
                     case kAddFiles: on_add_to_archive(); return 0;
                     case kExtract: on_extract(); return 0;
                     case kTest: on_test(); return 0;
-                    case kPauseOperation: on_pause_operation(); return 0;
-                    case kCancelOperation: on_cancel_operation(); return 0;
                     case kNavigateBack: on_navigate_back(); return 0;
                     case kNavigateForward: on_navigate_forward(); return 0;
                     case kNavigateUp: on_navigate_up(); return 0;
@@ -2523,8 +2344,6 @@ private:
     HWND open_archive_ = nullptr;
     HWND extract_ = nullptr;
     HWND test_ = nullptr;
-    HWND pause_operation_ = nullptr;
-    HWND cancel_operation_ = nullptr;
     HWND navigate_back_ = nullptr;
     HWND navigate_forward_ = nullptr;
     HWND navigate_up_ = nullptr;
@@ -2535,11 +2354,11 @@ private:
     HWND delete_ = nullptr;
     HWND info_ = nullptr;
     HWND settings_ = nullptr;
+    HWND tooltip_ = nullptr;
     HWND list_ = nullptr;
-    HWND progress_ = nullptr;
     HWND status_ = nullptr;
     DarkTableView table_;
-    DarkProgressView progress_view_;
+    axiom::gui::OperationProgressWindow operation_window_;
     ThemePalette theme_;
     HBRUSH window_brush_ = nullptr;
     HBRUSH panel_brush_ = nullptr;
@@ -2550,7 +2369,6 @@ private:
     bool busy_ = false;
     bool operation_paused_ = false;
     axiom::gui::OperationRunner operation_runner_;
-    std::chrono::steady_clock::time_point operation_started_{};
     fs::path operation_archive_output_;
     RECT address_edit_frame_{};
     std::vector<HWND> transient_labels_;
