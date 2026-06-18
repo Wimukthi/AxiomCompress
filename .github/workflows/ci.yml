@@ -1,0 +1,85 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+  schedule:
+    - cron: "0 6 * * *"   # nightly: longer fuzzing run
+
+permissions:
+  contents: read
+
+jobs:
+  # Build with CMake (toolset-agnostic; the checked-in .sln pins MSVC v145 which
+  # hosted runners do not have) and run the full test suite, which itself
+  # includes roundtrip, safety, and in-process mutation-fuzz checks.
+  build-and-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+      - name: Build
+        run: cmake --build build --config Release
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure
+
+  # Coverage-guided libFuzzer under AddressSanitizer over the untrusted decode
+  # surfaces: the single-stream decoder and the archive container parser.
+  fuzz-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Pick fuzz duration
+        id: dur
+        run: echo "seconds=${{ github.event_name == 'schedule' && 600 || 60 }}" >> "$GITHUB_OUTPUT"
+      - name: Build fuzz targets (clang + libFuzzer + ASan)
+        run: |
+          set -euo pipefail
+          srcs="src/archive/container.cpp src/codec/block.cpp src/codec/lz77.cpp \
+                src/codec/lz77_split.cpp src/core/archive.cpp src/core/checksum.cpp \
+                src/entropy/huffman.cpp src/entropy/range.cpp"
+          for target in fuzz_decompress fuzz_archive; do
+            clang++ -std=c++20 -O1 -g -fsanitize=fuzzer,address \
+              -Iinclude -Isrc $srcs fuzz/$target.cpp -o $target
+          done
+      - name: Fuzz decode surfaces
+        run: |
+          set -euo pipefail
+          secs="${{ steps.dur.outputs.seconds }}"
+          ASAN_OPTIONS=allocator_may_return_null=1 ./fuzz_decompress -max_total_time=$secs -rss_limit_mb=2048
+          ASAN_OPTIONS=allocator_may_return_null=1 ./fuzz_archive    -max_total_time=$secs -rss_limit_mb=2048
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crashes
+          path: |
+            crash-*
+            oom-*
+            timeout-*
+          if-no-files-found: ignore
+
+  # On Windows the toolset's bundled libFuzzer is driven through the helper
+  # scripts (cl /fsanitize=fuzzer /fsanitize=address).
+  fuzz-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build axiomc (for seed corpus)
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --config Release
+          Copy-Item build/Release/axiomc.exe out/Release/axiomc.exe -Force -ErrorAction SilentlyContinue
+        shell: pwsh
+      - name: Build fuzz targets
+        run: ./tools/build_fuzz.ps1 -Target all
+        shell: pwsh
+      - name: Fuzz
+        run: ./tools/run_fuzz.ps1 -Seconds ${{ github.event_name == 'schedule' && 600 || 60 }} -Target all
+        shell: pwsh

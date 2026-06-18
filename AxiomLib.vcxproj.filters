@@ -1,0 +1,90 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <Filter Include="Public Headers">
+      <UniqueIdentifier>{E7754A43-E76D-4ED8-91C8-57D7E6CA22F0}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Codec">
+      <UniqueIdentifier>{668B14FC-C57F-4838-BEB5-A5B3209DBF81}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Core">
+      <UniqueIdentifier>{E4A014D2-1F39-47B0-B69B-D82E645EE472}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Archive">
+      <UniqueIdentifier>{83F15417-FF37-44CE-9C20-E3EE011F7A4B}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Entropy">
+      <UniqueIdentifier>{E481C8D1-A7C9-406E-89BB-D35E2B23328D}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="include\axiom\axiom.hpp">
+      <Filter>Public Headers</Filter>
+    </ClInclude>
+    <ClInclude Include="include\axiom\archive.hpp">
+      <Filter>Public Headers</Filter>
+    </ClInclude>
+    <ClInclude Include="src\codec\lz77.hpp">
+      <Filter>Codec</Filter>
+    </ClInclude>
+    <ClInclude Include="src\codec\block.hpp">
+      <Filter>Codec</Filter>
+    </ClInclude>
+    <ClInclude Include="src\codec\fast_lz.hpp">
+      <Filter>Codec</Filter>
+    </ClInclude>
+    <ClInclude Include="src\codec\lz77_split.hpp">
+      <Filter>Codec</Filter>
+    </ClInclude>
+    <ClInclude Include="src\codec\varint.hpp">
+      <Filter>Codec</Filter>
+    </ClInclude>
+    <ClInclude Include="src\core\archive.hpp">
+      <Filter>Core</Filter>
+    </ClInclude>
+    <ClInclude Include="src\core\checksum.hpp">
+      <Filter>Core</Filter>
+    </ClInclude>
+    <ClInclude Include="src\core\cpu.hpp">
+      <Filter>Core</Filter>
+    </ClInclude>
+    <ClInclude Include="src\entropy\huffman.hpp">
+      <Filter>Entropy</Filter>
+    </ClInclude>
+    <ClInclude Include="src\entropy\range.hpp">
+      <Filter>Entropy</Filter>
+    </ClInclude>
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="src\archive\container.cpp">
+      <Filter>Archive</Filter>
+    </ClCompile>
+    <ClCompile Include="src\codec\lz77.cpp">
+      <Filter>Codec</Filter>
+    </ClCompile>
+    <ClCompile Include="src\codec\block.cpp">
+      <Filter>Codec</Filter>
+    </ClCompile>
+    <ClCompile Include="src\codec\fast_lz.cpp">
+      <Filter>Codec</Filter>
+    </ClCompile>
+    <ClCompile Include="src\codec\lz77_split.cpp">
+      <Filter>Codec</Filter>
+    </ClCompile>
+    <ClCompile Include="src\core\archive.cpp">
+      <Filter>Core</Filter>
+    </ClCompile>
+    <ClCompile Include="src\core\checksum.cpp">
+      <Filter>Core</Filter>
+    </ClCompile>
+    <ClCompile Include="src\core\cpu.cpp">
+      <Filter>Core</Filter>
+    </ClCompile>
+    <ClCompile Include="src\entropy\huffman.cpp">
+      <Filter>Entropy</Filter>
+    </ClCompile>
+    <ClCompile Include="src\entropy\range.cpp">
+      <Filter>Entropy</Filter>
+    </ClCompile>
+  </ItemGroup>
+</Project>

@@ -1,0 +1,800 @@
+#include "axiom/archive.hpp"
+#include "axiom/axiom.hpp"
+#include "codec/block.hpp"
+#include "codec/fast_lz.hpp"
+#include "codec/lz77.hpp"
+#include "codec/lz77_split.hpp"
+#include "core/checksum.hpp"
+#include "core/cpu.hpp"
+#include "core/hash.hpp"
+#include "entropy/huffman.hpp"
+#include "entropy/range.hpp"
+
+#include "check.hpp"
+
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
+#include <algorithm>
+#include <chrono>
+#include <cstdint>
+#include <filesystem>
+#include <fstream>
+#include <iostream>
+#include <iterator>
+#include <memory>
+#include <random>
+#include <string>
+#include <vector>
+
+namespace {
+
+std::vector<std::uint8_t> bytes_from_string(const std::string& text) {
+    return {text.begin(), text.end()};
+}
+
+void expect_roundtrip(const std::vector<std::uint8_t>& input) {
+    const auto archive = axiom::compress(input);
+    const auto restored = axiom::decompress(archive);
+    AXIOM_CHECK(restored == input);
+}
+
+void expect_huffman_roundtrip(const std::vector<std::uint8_t>& input) {
+    const auto encoded = axiom::entropy::encode_huffman(input);
+    AXIOM_CHECK(encoded.has_value());
+
+    const auto restored = axiom::entropy::decode_huffman(*encoded, input.size());
+    AXIOM_CHECK(restored == input);
+}
+
+void expect_order1_roundtrip(const std::vector<std::uint8_t>& input) {
+    const auto encoded = axiom::entropy::encode_order1(input);
+    AXIOM_CHECK(encoded.has_value());
+
+    const auto restored = axiom::entropy::decode_order1(*encoded, input.size());
+    AXIOM_CHECK(restored == input);
+}
+
+void expect_rans_roundtrip(const std::vector<std::uint8_t>& input) {
+    const auto encoded = axiom::entropy::encode_rans(input);
+    AXIOM_CHECK(encoded.has_value());
+
+    const auto restored = axiom::entropy::decode_rans(*encoded, input.size());
+    AXIOM_CHECK(restored == input);
+}
+
+void expect_parallel_block_roundtrip(const std::vector<std::uint8_t>& input) {
+    axiom::CompressionOptions options;
+    options.block_size = 1024;
+    options.thread_count = 4;
+
+    const auto encoded = axiom::codec::encode_parallel_blocks(input, options);
+    const auto restored = axiom::codec::decode_parallel_blocks(encoded, input.size(), options.thread_count);
+    AXIOM_CHECK(restored == input);
+}
+
+void expect_fast_lz_roundtrip(const std::vector<std::uint8_t>& input) {
+    axiom::CompressionOptions options;
+    options.use_fast_lz = true;
+    options.nice_length = 64;
+
+    const auto encoded = axiom::codec::encode_fast_lz(input, options);
+    AXIOM_CHECK(axiom::codec::decode_fast_lz(encoded, input.size()) == input);
+
+    const auto lz77 = axiom::codec::encode_fast_lz77(input, options);
+    AXIOM_CHECK(axiom::codec::decode_lz77(lz77, input.size()) == input);
+
+    const auto archive = axiom::compress(input, options);
+    AXIOM_CHECK(axiom::decompress(archive) == input);
+}
+
+void expect_split_stream_roundtrip(const std::vector<std::uint8_t>& input) {
+    const auto lz77 = axiom::codec::encode_lz77(input, {});
+    const auto split = axiom::codec::encode_lz77_split_streams(lz77);
+    const auto restored = axiom::codec::decode_lz77_split_streams(split, input.size());
+    AXIOM_CHECK(restored == input);
+}
+
+void expect_slot_split_stream_roundtrip(const std::vector<std::uint8_t>& input) {
+    const auto lz77 = axiom::codec::encode_lz77(input, {});
+    const auto slots = axiom::codec::encode_lz77_split_streams_slots(lz77);
+    AXIOM_CHECK(slots.has_value());
+
+    const auto restored = axiom::codec::decode_lz77_split_streams_slots(*slots, input.size());
+    AXIOM_CHECK(restored == input);
+}
+
+// The fast entropy chooser must produce archives that decode identically; only
+// the encoder's coder selection differs from the full bake-off.
+void expect_fast_entropy_roundtrip(const std::vector<std::uint8_t>& input) {
+    const auto lz77 = axiom::codec::encode_lz77(input, {});
+
+    const auto split = axiom::codec::encode_lz77_split_streams(lz77, /*fast=*/true);
+    AXIOM_CHECK(axiom::codec::decode_lz77_split_streams(split, input.size()) == input);
+
+    if (auto slots = axiom::codec::encode_lz77_split_streams_slots(lz77, /*fast=*/true)) {
+        AXIOM_CHECK(axiom::codec::decode_lz77_split_streams_slots(*slots, input.size()) == input);
+    }
+}
+
+// End-to-end through compress()/decompress() with the fast speed knobs engaged.
+void expect_fast_archive_roundtrip(const std::vector<std::uint8_t>& input) {
+    axiom::CompressionOptions options;
+    options.fast_entropy = true;
+    options.lazy_matching = true;
+    options.max_chain_depth = 16;
+    const auto archive = axiom::compress(input, options);
+    AXIOM_CHECK(axiom::decompress(archive) == input);
+}
+
+void expect_tree_lz77_roundtrip(const std::vector<std::uint8_t>& input) {
+    axiom::CompressionOptions options;
+    options.use_tree_matcher = true;
+    const auto lz77 = axiom::codec::encode_lz77(input, options);
+    const auto restored = axiom::codec::decode_lz77(lz77, input.size());
+    AXIOM_CHECK(restored == input);
+}
+
+// Drive the cyclic-window tree matcher with a window much smaller than the input
+// so the cyclic buffer wraps many times and node deletion is exercised. Any
+// tree-logic bug surfaces as a decode mismatch (matches are byte-validated, so a
+// bad match cannot corrupt the stream — only fail to round-trip if reps drift).
+void expect_tree_lz77_windowed_roundtrip(const std::vector<std::uint8_t>& input,
+                                         std::size_t window_size) {
+    axiom::CompressionOptions options;
+    options.use_tree_matcher = true;
+    options.window_size = window_size;
+    const auto lz77 = axiom::codec::encode_lz77(input, options);
+    const auto restored = axiom::codec::decode_lz77(lz77, input.size());
+    AXIOM_CHECK(restored == input);
+}
+
+void expect_lazy_lz77_roundtrip(const std::vector<std::uint8_t>& input) {
+    axiom::CompressionOptions options;
+    options.lazy_matching = true;
+    options.max_chain_depth = 16;  // shallow chain is where lazy matters most
+    const auto lz77 = axiom::codec::encode_lz77(input, options);
+    const auto restored = axiom::codec::decode_lz77(lz77, input.size());
+    AXIOM_CHECK(restored == input);
+}
+
+void expect_optimal_lz77_roundtrip(const std::vector<std::uint8_t>& input) {
+    axiom::CompressionOptions options;
+    options.optimal_chain_depth = 2;
+    options.max_parser_candidates = 2;
+
+    const auto lz77 = axiom::codec::encode_lz77_optimal(input, options);
+    const auto restored = axiom::codec::decode_lz77(lz77, input.size());
+    AXIOM_CHECK(restored == input);
+}
+
+// Reference one-byte-per-step reflected CRC-32, independent of the production
+// slice-by-8 tables, so a table-generation bug is caught.
+std::uint32_t crc32_reference(const std::vector<std::uint8_t>& data) {
+    std::uint32_t state = 0xFFFFFFFFu;
+    for (const auto byte : data) {
+        state ^= byte;
+        for (int bit = 0; bit < 8; ++bit) {
+            state = (state & 1u) ? (0xEDB88320u ^ (state >> 1)) : (state >> 1);
+        }
+    }
+    return state ^ 0xFFFFFFFFu;
+}
+
+// The interleaved rANS must round-trip at every length near the lane boundary,
+// for a single-symbol stream (degenerate frequency table), and for skewed data.
+void test_rans_edges() {
+    for (std::size_t len = 0; len <= 40; ++len) {
+        std::vector<std::uint8_t> single(len, 0xABu);
+        if (auto e = axiom::entropy::encode_rans(single)) {
+            AXIOM_CHECK(axiom::entropy::decode_rans(*e, len) == single);
+        }
+
+        std::mt19937 rng(static_cast<unsigned>(len) * 2654435761u);
+        std::vector<std::uint8_t> skewed(len);
+        for (auto& byte : skewed) {
+            byte = static_cast<std::uint8_t>((rng() % 4 == 0) ? rng() : 65);  // mostly 'A'
+        }
+        if (auto e = axiom::entropy::encode_rans(skewed)) {
+            AXIOM_CHECK(axiom::entropy::decode_rans(*e, len) == skewed);
+        }
+    }
+}
+
+std::string to_hex(std::span<const std::uint8_t> bytes) {
+    static const char* digits = "0123456789abcdef";
+    std::string out;
+    for (const auto b : bytes) {
+        out += digits[b >> 4];
+        out += digits[b & 0x0F];
+    }
+    return out;
+}
+
+void test_blake3() {
+    // Official BLAKE3 known-answer vectors — confirms the vendored library is
+    // really BLAKE3, not just internally self-consistent.
+    AXIOM_CHECK(to_hex(axiom::core::Blake3::hash({})) ==
+                "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262");
+    const std::vector<std::uint8_t> abc = {'a', 'b', 'c'};
+    AXIOM_CHECK(to_hex(axiom::core::Blake3::hash(abc)) ==
+                "6437b3ac38465133ffb63b75273a8db548c558465d79db03fd359c6cd5bd9d85");
+
+    // Incremental hashing must equal one-shot, across the 1 KiB chunk boundary.
+    std::vector<std::uint8_t> data(5000);
+    std::mt19937 rng(0xB3u);
+    for (auto& byte : data) {
+        byte = static_cast<std::uint8_t>(rng());
+    }
+    axiom::core::Blake3 hasher;
+    hasher.update(std::span(data).subspan(0, 1500));
+    hasher.update(std::span(data).subspan(1500));
+    AXIOM_CHECK(hasher.finalize() == axiom::core::Blake3::hash(data));
+}
+
+void test_crc32() {
+    // Standard check value: CRC-32/ISO-HDLC of "123456789" is 0xCBF43926.
+    const std::vector<std::uint8_t> check = {'1', '2', '3', '4', '5', '6', '7', '8', '9'};
+    AXIOM_CHECK(axiom::core::crc32(check) == 0xCBF43926u);
+
+    // The slice-by-8 kernel must match the reference at every length boundary
+    // (the 8-byte stride, its tail, and the empty input).
+    std::mt19937 rng(0xC0FFEEu);
+    std::vector<std::uint8_t> data;
+    for (std::size_t len = 0; len <= 600; ++len) {
+        data.resize(len);
+        for (auto& byte : data) {
+            byte = static_cast<std::uint8_t>(rng());
+        }
+        AXIOM_CHECK(axiom::core::crc32(data) == crc32_reference(data));
+    }
+
+    // Incremental updates must equal a single pass over the concatenation.
+    data.resize(500);
+    for (auto& byte : data) {
+        byte = static_cast<std::uint8_t>(rng());
+    }
+    auto state = axiom::core::crc32_init();
+    state = axiom::core::crc32_update(state, std::span(data).subspan(0, 123));
+    state = axiom::core::crc32_update(state, std::span(data).subspan(123));
+    AXIOM_CHECK(axiom::core::crc32_final(state) == axiom::core::crc32(data));
+
+    const auto left = std::span(data).subspan(0, 177);
+    const auto right = std::span(data).subspan(177);
+    const auto combined = axiom::core::crc32_combine(
+        axiom::core::crc32(left), axiom::core::crc32(right), right.size());
+    AXIOM_CHECK(combined == axiom::core::crc32(data));
+
+    // CPU detection must at least run and return a string (content is host-specific).
+    AXIOM_CHECK(axiom::core::cpu_features_string() != nullptr);
+}
+
+// ---- multi-file archive tests ----------------------------------------------
+
+namespace fs = std::filesystem;
+
+std::vector<std::uint8_t> read_all(const fs::path& path) {
+    std::ifstream stream(path, std::ios::binary);
+    return {std::istreambuf_iterator<char>(stream), std::istreambuf_iterator<char>()};
+}
+
+void write_all(const fs::path& path, const std::vector<std::uint8_t>& bytes) {
+    std::ofstream stream(path, std::ios::binary | std::ios::trunc);
+    stream.write(reinterpret_cast<const char*>(bytes.data()),
+                 static_cast<std::streamsize>(bytes.size()));
+}
+
+fs::path make_temp_dir() {
+    static int counter = 0;
+    const auto stamp = std::chrono::high_resolution_clock::now().time_since_epoch().count();
+    const auto dir = fs::temp_directory_path() /
+                     ("axiom_test_" + std::to_string(stamp) + "_" + std::to_string(counter++));
+    fs::create_directories(dir);
+    return dir;
+}
+
+template <typename Fn>
+void expect_throws(Fn&& fn) {
+    bool threw = false;
+    try {
+        fn();
+    } catch (const std::exception&) {
+        threw = true;
+    }
+    AXIOM_CHECK(threw);
+}
+
+std::size_t find_bytes(const std::vector<std::uint8_t>& haystack, const std::string& needle) {
+    const auto* first = reinterpret_cast<const std::uint8_t*>(needle.data());
+    auto it = std::search(haystack.begin(), haystack.end(), first, first + needle.size());
+    AXIOM_CHECK(it != haystack.end());
+    return static_cast<std::size_t>(it - haystack.begin());
+}
+
+void test_archive_roundtrip() {
+    const auto root = make_temp_dir();
+    const auto src = root / "src";
+    fs::create_directories(src / "sub" / "deep");
+    fs::create_directories(src / "emptydir");
+
+    const auto text = bytes_from_string(std::string("hello world\n") + std::string(5000, 'a'));
+    std::vector<std::uint8_t> binary(40000);
+    for (std::size_t i = 0; i < binary.size(); ++i) {
+        binary[i] = static_cast<std::uint8_t>((i * 37 + (i >> 6)) & 0xFF);
+    }
+    write_all(src / "readme.txt", text);
+    write_all(src / "sub" / "data.bin", binary);
+    write_all(src / "sub" / "deep" / "note.md", bytes_from_string("# note\n"));
+    write_all(src / "empty.dat", {});
+
+    const auto archive = root / "out.axar";
+    axiom::CompressionOptions options;
+    options.block_size = 16 * 1024;  // small, to force the big file to span blocks
+    axiom::create_archive({src}, archive, options);
+
+    const auto entries = axiom::list_archive(archive);
+    // 4 directories (src, src/sub, src/sub/deep, src/emptydir) + 4 files.
+    AXIOM_CHECK(entries.size() == 8);
+    axiom::test_archive(archive);
+
+    const auto dest = root / "out";
+    axiom::extract_archive(archive, dest, {});
+
+    AXIOM_CHECK(read_all(dest / "src" / "readme.txt") == text);
+    AXIOM_CHECK(read_all(dest / "src" / "sub" / "data.bin") == binary);
+    AXIOM_CHECK(read_all(dest / "src" / "sub" / "deep" / "note.md") == bytes_from_string("# note\n"));
+    AXIOM_CHECK(fs::exists(dest / "src" / "empty.dat"));
+    AXIOM_CHECK(fs::file_size(dest / "src" / "empty.dat") == 0);
+    AXIOM_CHECK(fs::is_directory(dest / "src" / "emptydir"));
+
+    std::error_code ec;
+    fs::remove_all(root, ec);
+}
+
+// Symlinks are archived as links (target stored, not followed) and recreated on
+// extract. Creating a symlink can require privilege (Windows without Developer
+// Mode), so the test skips itself when the OS refuses rather than failing.
+void test_archive_symlinks() {
+    const auto root = make_temp_dir();
+    const auto src = root / "src";
+    fs::create_directories(src);
+    write_all(src / "real.txt", bytes_from_string("the real file"));
+
+    std::error_code ec;
+    fs::create_symlink("real.txt", src / "link.txt", ec);
+    if (ec) {
+        // No privilege to create symlinks here; nothing to test.
+        fs::remove_all(root, ec);
+        return;
+    }
+
+    const auto archive = root / "links.axar";
+    axiom::create_archive({src}, archive, {});
+
+    const auto entries = axiom::list_archive(archive);
+    bool saw_link = false;
+    for (const auto& entry : entries) {
+        if (entry.path == "src/link.txt") {
+            saw_link = true;
+            AXIOM_CHECK(entry.is_symlink);
+            AXIOM_CHECK(!entry.is_directory);
+            AXIOM_CHECK(entry.symlink_target == "real.txt");
+        }
+    }
+    AXIOM_CHECK(saw_link);
+    axiom::test_archive(archive);  // a symlink entry must not break verification
+
+    const auto dest = root / "out";
+    axiom::extract_archive(archive, dest, {});
+    const auto extracted = dest / "src" / "link.txt";
+    AXIOM_CHECK(fs::is_symlink(fs::symlink_status(extracted, ec)));
+    AXIOM_CHECK(fs::read_symlink(extracted, ec) == fs::path("real.txt"));
+    // The link still resolves to the real content beside it.
+    AXIOM_CHECK(read_all(extracted) == bytes_from_string("the real file"));
+
+    fs::remove_all(root, ec);
+}
+
+void test_archive_operation_control() {
+    const auto root = make_temp_dir();
+    const auto src = root / "src";
+    fs::create_directories(src);
+
+    std::vector<std::uint8_t> payload(256 * 1024);
+    for (std::size_t i = 0; i < payload.size(); ++i) {
+        payload[i] = static_cast<std::uint8_t>('A' + (i % 19));
+    }
+    write_all(src / "payload.bin", payload);
+
+    const auto archive = root / "progress.axar";
+    auto control = std::make_shared<axiom::OperationControl>();
+    std::uint64_t max_completed = 0;
+    std::uint64_t reported_total = 0;
+    bool saw_final = false;
+    control->set_progress_callback([&](const axiom::OperationProgress& progress) {
+        max_completed = std::max(max_completed, progress.completed_bytes);
+        if (progress.total_bytes > 0) {
+            reported_total = progress.total_bytes;
+        }
+        if (progress.stage == axiom::OperationStage::finalizing &&
+            progress.completed_bytes == progress.total_bytes) {
+            saw_final = true;
+        }
+    });
+
+    axiom::CompressionOptions options;
+    options.block_size = 16 * 1024;
+    options.operation = control;
+    axiom::create_archive({src}, archive, options);
+    AXIOM_CHECK(fs::exists(archive));
+    AXIOM_CHECK(reported_total == payload.size());
+    AXIOM_CHECK(max_completed == payload.size());
+    AXIOM_CHECK(saw_final);
+
+    const auto cancelled_archive = root / "cancelled.axar";
+    auto cancelled = std::make_shared<axiom::OperationControl>();
+    cancelled->request_cancel();
+    options.operation = cancelled;
+    expect_throws([&] { axiom::create_archive({src}, cancelled_archive, options); });
+    AXIOM_CHECK(!fs::exists(cancelled_archive));
+    AXIOM_CHECK(!fs::exists(fs::path(cancelled_archive).concat(".tmp")));
+
+    std::error_code ec;
+    fs::remove_all(root, ec);
+}
+
+#if defined(_WIN32)
+// Windows file attributes and full-precision timestamps must survive a round-trip.
+void test_windows_metadata() {
+    const auto root = make_temp_dir();
+    const auto src = root / "src";
+    fs::create_directories(src);
+    const auto file = src / "ro.txt";
+    write_all(file, bytes_from_string("read-only hidden content"));
+
+    SetFileAttributesW(file.c_str(), FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_HIDDEN);
+    SYSTEMTIME system_time{};
+    system_time.wYear = 2021;
+    system_time.wMonth = 6;
+    system_time.wDay = 15;
+    system_time.wHour = 12;
+    FILETIME write_time{};
+    SystemTimeToFileTime(&system_time, &write_time);
+    {
+        const HANDLE handle = CreateFileW(file.c_str(), FILE_WRITE_ATTRIBUTES,
+                                          FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                                          OPEN_EXISTING, 0, nullptr);
+        AXIOM_CHECK(handle != INVALID_HANDLE_VALUE);
+        SetFileTime(handle, nullptr, nullptr, &write_time);
+        CloseHandle(handle);
+    }
+
+    const auto archive = root / "meta.axar";
+    axiom::create_archive({src}, archive, {});
+    const auto dest = root / "out";
+    axiom::extract_archive(archive, dest, {});
+
+    const auto extracted = dest / "src" / "ro.txt";
+    WIN32_FILE_ATTRIBUTE_DATA data{};
+    AXIOM_CHECK(GetFileAttributesExW(extracted.c_str(), GetFileExInfoStandard, &data));
+    AXIOM_CHECK((data.dwFileAttributes & FILE_ATTRIBUTE_READONLY) != 0);
+    AXIOM_CHECK((data.dwFileAttributes & FILE_ATTRIBUTE_HIDDEN) != 0);
+    AXIOM_CHECK(data.ftLastWriteTime.dwLowDateTime == write_time.dwLowDateTime &&
+                data.ftLastWriteTime.dwHighDateTime == write_time.dwHighDateTime);
+
+    // Clear read-only so the temp tree can be removed.
+    SetFileAttributesW(file.c_str(), FILE_ATTRIBUTE_NORMAL);
+    SetFileAttributesW(extracted.c_str(), FILE_ATTRIBUTE_NORMAL);
+    std::error_code ec;
+    fs::remove_all(root, ec);
+}
+#endif
+
+void test_archive_safety() {
+    const auto root = make_temp_dir();
+    const auto src = root / "s";
+    fs::create_directories(src);
+    write_all(src / "AAAA", bytes_from_string("payload contents that are long enough to fill a block a bit"));
+
+    const auto archive = root / "ok.axar";
+    axiom::create_archive({src}, archive, {});
+    axiom::test_archive(archive);  // sanity: intact archive passes
+
+    const auto good = read_all(archive);
+    const auto bad = root / "bad.axar";
+
+    // Truncated archive.
+    {
+        auto bytes = good;
+        bytes.resize(bytes.size() / 2);
+        write_all(bad, bytes);
+        expect_throws([&] { (void)axiom::list_archive(bad); });
+    }
+    // Corrupted header magic.
+    {
+        auto bytes = good;
+        bytes[0] ^= 0xFFu;
+        write_all(bad, bytes);
+        expect_throws([&] { (void)axiom::list_archive(bad); });
+    }
+    // Corrupted footer magic.
+    {
+        auto bytes = good;
+        bytes.back() ^= 0xFFu;
+        write_all(bad, bytes);
+        expect_throws([&] { (void)axiom::list_archive(bad); });
+    }
+    // Path traversal (zip-slip): patch "s/AAAA" -> equal-length "../zzz".
+    {
+        auto bytes = good;
+        const auto at = find_bytes(bytes, "s/AAAA");
+        const std::string evil = "../zzz";
+        for (std::size_t i = 0; i < evil.size(); ++i) {
+            bytes[at + i] = static_cast<std::uint8_t>(evil[i]);
+        }
+        write_all(bad, bytes);
+        expect_throws([&] { axiom::extract_archive(bad, root / "x", {}); });
+        AXIOM_CHECK(!fs::exists(root / "zzz"));  // nothing escaped the destination
+    }
+    // Corrupted block payload must fail integrity (inner CRC / structure).
+    {
+        auto bytes = good;
+        if (bytes.size() > 40) {
+            bytes[40] ^= 0xFFu;
+        }
+        write_all(bad, bytes);
+        expect_throws([&] { axiom::test_archive(bad); });
+    }
+
+    std::error_code ec;
+    fs::remove_all(root, ec);
+}
+
+// A tiny archive that declares an enormous original size must be rejected before
+// the decoder tries to expand it (decompression bomb).
+void test_decompress_bomb() {
+    auto archive = axiom::compress(bytes_from_string(std::string(64, 'a')));
+    AXIOM_CHECK(archive.size() > 20);
+    // original_size is the u64 at offset 12 (after magic[8], version u16, codec, flags).
+    for (int i = 0; i < 8; ++i) {
+        archive[12 + i] = 0xFFu;  // ~2^64 declared output
+    }
+    expect_throws([&] { (void)axiom::decompress(archive); });
+    // Decoding never started, so peak memory stayed tiny.
+}
+
+// ---- mutation fuzzing ------------------------------------------------------
+
+void mutate(std::vector<std::uint8_t>& bytes, std::mt19937& rng) {
+    if (bytes.empty()) {
+        bytes.push_back(static_cast<std::uint8_t>(rng()));
+        return;
+    }
+    const int operations = 1 + static_cast<int>(rng() % 4);
+    for (int i = 0; i < operations; ++i) {
+        switch (rng() % 4) {
+            case 0:
+                bytes[rng() % bytes.size()] ^= static_cast<std::uint8_t>(1u << (rng() % 8));
+                break;
+            case 1:
+                bytes[rng() % bytes.size()] = static_cast<std::uint8_t>(rng());
+                break;
+            case 2:
+                if (bytes.size() > 1) {
+                    bytes.resize(1 + rng() % bytes.size());
+                }
+                break;
+            default:
+                bytes.insert(bytes.begin() + (rng() % (bytes.size() + 1)),
+                             static_cast<std::uint8_t>(rng()));
+                break;
+        }
+    }
+}
+
+// Feed mutated single-stream archives to the decoder. The contract: it returns a
+// value or throws std::exception. It must never crash, read out of bounds, or
+// hang. (Run under a Debug build or a sanitizer to catch OOB that would not
+// otherwise fault.)
+void fuzz_decompress(unsigned iterations) {
+    std::vector<std::vector<std::uint8_t>> seeds;
+    seeds.push_back(axiom::compress(bytes_from_string(std::string(3000, 'a'))));
+    {
+        std::string s;
+        for (int i = 0; i < 400; ++i) {
+            s += "the quick brown fox jumps over ";
+        }
+        seeds.push_back(axiom::compress(bytes_from_string(s)));
+    }
+    {
+        std::vector<std::uint8_t> v(4000);
+        std::mt19937 r(7);
+        std::generate(v.begin(), v.end(), [&] { return static_cast<std::uint8_t>(r()); });
+        seeds.push_back(axiom::compress(v));
+    }
+    {
+        axiom::CompressionOptions options;
+        options.enable_optimal_parser = true;
+        seeds.push_back(axiom::compress(bytes_from_string(std::string(2000, 'x') + "tail"), options));
+    }
+    // A small output cap keeps the fuzz itself bounded and exercises the
+    // decompression-bomb guard on every iteration.
+    constexpr std::size_t kFuzzOutputCap = std::size_t{8} << 20;  // 8 MiB
+    axiom::DecompressionOptions options;
+    options.max_output_size = kFuzzOutputCap;
+    for (const auto& seed : seeds) {
+        AXIOM_CHECK(!seed.empty());
+        (void)axiom::decompress(seed, options);  // valid seeds must decode
+    }
+
+    std::mt19937 rng(0xF02Du);
+    for (unsigned i = 0; i < iterations; ++i) {
+        auto candidate = seeds[rng() % seeds.size()];
+        mutate(candidate, rng);
+        try {
+            (void)axiom::decompress(candidate, options);
+        } catch (const std::exception&) {
+            // expected: malformed input is rejected, not crashed on
+        }
+    }
+}
+
+// Feed mutated archive containers to the directory parser and block decoder.
+void fuzz_archive(unsigned iterations) {
+    const auto root = make_temp_dir();
+    const auto src = root / "s";
+    fs::create_directories(src / "sub");
+    write_all(src / "a.txt", bytes_from_string(std::string(800, 'q') + "data"));
+    std::vector<std::uint8_t> bin(2500);
+    for (std::size_t i = 0; i < bin.size(); ++i) {
+        bin[i] = static_cast<std::uint8_t>((i * 11) & 0xFF);
+    }
+    write_all(src / "sub" / "b.bin", bin);
+
+    const auto archive = root / "seed.axar";
+    axiom::create_archive({src}, archive, {});
+    const auto seed = read_all(archive);
+    AXIOM_CHECK(!seed.empty());
+
+    const auto bad = root / "fuzz.axar";
+    std::mt19937 rng(0xA17Cu);
+    for (unsigned i = 0; i < iterations; ++i) {
+        auto candidate = seed;
+        mutate(candidate, rng);
+        write_all(bad, candidate);
+        try {
+            (void)axiom::list_archive(bad);
+        } catch (const std::exception&) {
+        }
+        if (i % 3 == 0) {
+            try {
+                axiom::test_archive(bad);
+            } catch (const std::exception&) {
+            }
+        }
+    }
+
+    std::error_code ec;
+    fs::remove_all(root, ec);
+}
+
+}  // namespace
+
+int main() {
+    expect_roundtrip({});
+
+    std::string repeated;
+    for (int i = 0; i < 2000; ++i) {
+        repeated += "function compressBlock(input, context) { return input + context; }\n";
+    }
+    expect_roundtrip(bytes_from_string(repeated));
+    expect_huffman_roundtrip(bytes_from_string(repeated));
+    expect_order1_roundtrip(bytes_from_string(repeated));
+    expect_rans_roundtrip(bytes_from_string(repeated));
+    expect_optimal_lz77_roundtrip(bytes_from_string(repeated));
+    expect_lazy_lz77_roundtrip(bytes_from_string(repeated));
+    expect_tree_lz77_roundtrip(bytes_from_string(repeated));
+    // Windows far smaller than the input force the cyclic buffer to wrap and
+    // delete nodes repeatedly, covering the slid-window descent and splice paths.
+    expect_tree_lz77_windowed_roundtrip(bytes_from_string(repeated), 256);
+    expect_tree_lz77_windowed_roundtrip(bytes_from_string(repeated), 1024);
+    expect_tree_lz77_windowed_roundtrip(bytes_from_string(repeated), 4099);  // non-power-of-two
+    expect_split_stream_roundtrip(bytes_from_string(repeated));
+    expect_parallel_block_roundtrip(bytes_from_string(repeated));
+    expect_fast_lz_roundtrip(bytes_from_string(repeated));
+
+    std::vector<std::uint8_t> binary;
+    for (int i = 0; i < 4096; ++i) {
+        binary.push_back(static_cast<std::uint8_t>((i * 31) & 0xFF));
+    }
+    expect_roundtrip(binary);
+    expect_huffman_roundtrip(binary);
+    expect_order1_roundtrip(binary);
+    expect_rans_roundtrip(binary);
+    expect_optimal_lz77_roundtrip(binary);
+    expect_tree_lz77_roundtrip(binary);
+    expect_split_stream_roundtrip(binary);
+    expect_slot_split_stream_roundtrip(binary);
+    expect_fast_lz_roundtrip(binary);
+
+    // Interleave several recurring substrings so the parser sees a handful of
+    // distinct distances that cycle, exercising rep0..rep3 selection and MTF.
+    std::string rep_heavy;
+    for (int i = 0; i < 1500; ++i) {
+        rep_heavy += "alpha_token_one ";
+        rep_heavy += "beta_token_two_is_longer ";
+        if (i % 2 == 0) rep_heavy += "gamma_three ";
+        if (i % 3 == 0) rep_heavy += "delta_four_variant ";
+    }
+    expect_roundtrip(bytes_from_string(rep_heavy));
+    expect_split_stream_roundtrip(bytes_from_string(rep_heavy));
+    expect_slot_split_stream_roundtrip(bytes_from_string(rep_heavy));
+    expect_fast_lz_roundtrip(bytes_from_string(rep_heavy));
+    expect_optimal_lz77_roundtrip(bytes_from_string(rep_heavy));
+    expect_tree_lz77_roundtrip(bytes_from_string(rep_heavy));
+
+    std::mt19937 rng(0xA710CAFEu);
+    std::vector<std::uint8_t> random(8192);
+    std::generate(random.begin(), random.end(), [&] {
+        return static_cast<std::uint8_t>(rng() & 0xFF);
+    });
+    expect_roundtrip(random);
+    expect_order1_roundtrip(random);
+    expect_rans_roundtrip(random);
+    expect_tree_lz77_roundtrip(random);
+    expect_tree_lz77_windowed_roundtrip(random, 512);
+    expect_tree_lz77_windowed_roundtrip(bytes_from_string(rep_heavy), 300);
+    expect_tree_lz77_windowed_roundtrip(binary, 128);
+    expect_lazy_lz77_roundtrip(random);
+    expect_lazy_lz77_roundtrip(binary);
+    expect_lazy_lz77_roundtrip(bytes_from_string(rep_heavy));
+    expect_fast_entropy_roundtrip(bytes_from_string(repeated));
+    expect_fast_entropy_roundtrip(binary);
+    expect_fast_entropy_roundtrip(random);
+    expect_fast_entropy_roundtrip(bytes_from_string(rep_heavy));
+    expect_fast_archive_roundtrip(bytes_from_string(repeated));
+    expect_fast_archive_roundtrip(binary);
+    expect_fast_archive_roundtrip(random);
+
+    std::vector<std::uint8_t> long_distance;
+    long_distance.reserve((96u << 10) * 2);
+    for (std::size_t i = 0; i < (96u << 10); ++i) {
+        long_distance.push_back(static_cast<std::uint8_t>('A' + (i % 23)));
+    }
+    long_distance.insert(long_distance.end(), long_distance.begin(), long_distance.end());
+    expect_fast_lz_roundtrip(long_distance);
+
+    auto archive = axiom::compress(bytes_from_string("checksum validation"));
+    archive.back() ^= 0x55u;
+
+    bool failed = false;
+    try {
+        (void)axiom::decompress(archive);
+    } catch (const axiom::FormatError&) {
+        failed = true;
+    }
+    AXIOM_CHECK(failed);
+
+    test_crc32();
+    test_blake3();
+    test_rans_edges();
+    test_archive_roundtrip();
+    test_archive_operation_control();
+#if defined(_WIN32)
+    test_windows_metadata();
+#endif
+    test_archive_safety();
+    test_decompress_bomb();
+    fuzz_decompress(20000);
+    fuzz_archive(1500);
+
+    std::cout << "all tests passed (codec + archive + safety + fuzz)\n";
+    return 0;
+}
