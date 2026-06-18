@@ -81,6 +81,7 @@
   <ItemGroup>
     <ClCompile Include="src\gui\main.cpp" />
     <ClCompile Include="src\gui\main_window.cpp" />
+    <ClCompile Include="src\gui\custom_menu.cpp" />
     <ClCompile Include="src\gui\archive_dialogs.cpp" />
     <ClCompile Include="src\gui\directory_watcher.cpp" />
     <ClCompile Include="src\gui\settings_store.cpp" />
@@ -89,6 +90,7 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="src\gui\browser_model.hpp" />
+    <ClInclude Include="src\gui\custom_menu.hpp" />
     <ClInclude Include="src\gui\app.hpp" />
     <ClInclude Include="src\gui\archive_dialogs.hpp" />
     <ClInclude Include="src\gui\directory_watcher.hpp" />

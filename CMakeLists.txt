@@ -55,6 +55,7 @@ if(WIN32)
     add_executable(axiom_gui WIN32
         src/gui/main.cpp
         src/gui/main_window.cpp
+        src/gui/custom_menu.cpp
         src/gui/archive_dialogs.cpp
         src/gui/directory_watcher.cpp
         src/gui/settings_store.cpp
