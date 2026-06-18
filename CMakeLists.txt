@@ -52,7 +52,9 @@ add_executable(axiomc src/cli/main.cpp)
 target_link_libraries(axiomc PRIVATE axiom)
 
 if(WIN32)
-    add_executable(axiom_gui WIN32 src/gui/main.cpp)
+    add_executable(axiom_gui WIN32
+        src/gui/main.cpp
+        src/gui/operation_runner.cpp)
     target_link_libraries(axiom_gui PRIVATE axiom Comctl32 Dwmapi Ole32 Shell32 Uxtheme)
 endif()
 

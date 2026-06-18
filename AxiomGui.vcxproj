@@ -80,6 +80,10 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="src\gui\main.cpp" />
+    <ClCompile Include="src\gui\operation_runner.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="src\gui\operation_runner.hpp" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="AxiomLib.vcxproj">

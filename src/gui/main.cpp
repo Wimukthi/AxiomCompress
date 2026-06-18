@@ -1,6 +1,7 @@
 #define NOMINMAX
 #include "axiom/archive.hpp"
 #include "axiom/axiom.hpp"
+#include "gui/operation_runner.hpp"
 
 #include <windows.h>
 #include <windowsx.h>
@@ -23,7 +24,6 @@
 #include <sstream>
 #include <string>
 #include <string_view>
-#include <thread>
 #include <utility>
 #include <vector>
 
@@ -434,13 +434,6 @@ void apply_level(axiom::CompressionOptions& options, int level) {
             break;
     }
 }
-
-struct OperationResult {
-    bool ok = false;
-    bool cancelled = false;
-    std::wstring title;
-    std::wstring message;
-};
 
 struct ThemePalette {
     bool dark = false;
@@ -1772,43 +1765,13 @@ private:
             return;
         }
 
-        current_operation_ = std::make_shared<axiom::OperationControl>();
-        current_operation_->set_progress_callback([target = hwnd_](const axiom::OperationProgress& progress) {
-            auto* copy = new axiom::OperationProgress(progress);
-            if (!PostMessageW(target, kOperationProgressMessage, 0, reinterpret_cast<LPARAM>(copy))) {
-                delete copy;
-            }
-        });
-
         set_busy(true);
         set_status(running);
-
-        HWND target = hwnd_;
-        auto operation = current_operation_;
-        std::thread([target,
-                     operation,
-                     running = std::move(running),
-                     success = std::move(success),
-                     work = std::move(work)]() mutable {
-            auto* result = new OperationResult;
-            result->title = running;
-            try {
-                work(operation);
-                result->ok = true;
-                result->message = success;
-            } catch (const axiom::OperationCancelled&) {
-                result->ok = false;
-                result->cancelled = true;
-                result->message = L"Operation cancelled.";
-            } catch (const std::exception& error) {
-                result->ok = false;
-                result->message = widen(error.what());
-            } catch (...) {
-                result->ok = false;
-                result->message = L"Unknown failure.";
-            }
-            PostMessageW(target, kOperationDoneMessage, 0, reinterpret_cast<LPARAM>(result));
-        }).detach();
+        if (!operation_runner_.start(hwnd_, kOperationDoneMessage, kOperationProgressMessage,
+                                     std::move(running), std::move(success), std::move(work))) {
+            set_busy(false);
+            set_status(L"Another operation is already running.");
+        }
     }
 
     void on_compress() {
@@ -1893,30 +1856,31 @@ private:
     }
 
     void on_pause_operation() {
-        if (!busy_ || !current_operation_) {
+        if (!busy_ || !operation_runner_.running()) {
             return;
         }
         operation_paused_ = !operation_paused_;
-        current_operation_->set_paused(operation_paused_);
+        operation_runner_.set_paused(operation_paused_);
         set_text(pause_operation_, operation_paused_ ? L"Resume" : L"Pause");
         InvalidateRect(pause_operation_, nullptr, TRUE);
         set_status(operation_paused_ ? L"Paused." : L"Resuming...");
     }
 
     void on_cancel_operation() {
-        if (!busy_ || !current_operation_) {
+        if (!busy_ || !operation_runner_.running()) {
             return;
         }
-        current_operation_->request_cancel();
+        operation_runner_.cancel();
         EnableWindow(cancel_operation_, FALSE);
         EnableWindow(pause_operation_, FALSE);
         set_status(L"Cancelling...");
     }
 
     void on_operation_done(LPARAM lparam) {
-        std::unique_ptr<OperationResult> result(reinterpret_cast<OperationResult*>(lparam));
+        std::unique_ptr<axiom::gui::OperationResult> result(
+            reinterpret_cast<axiom::gui::OperationResult*>(lparam));
+        operation_runner_.finish();
         set_busy(false);
-        current_operation_.reset();
         set_status(result->message);
         if (result->cancelled) {
             return;
@@ -2016,9 +1980,7 @@ private:
                 on_operation_progress(lparam);
                 return 0;
             case WM_DESTROY:
-                if (current_operation_) {
-                    current_operation_->request_cancel();
-                }
+                operation_runner_.cancel();
                 PostQuitMessage(0);
                 return 0;
         }
@@ -2076,7 +2038,7 @@ private:
     int selected_level_ = 5;
     bool busy_ = false;
     bool operation_paused_ = false;
-    std::shared_ptr<axiom::OperationControl> current_operation_;
+    axiom::gui::OperationRunner operation_runner_;
     RECT archive_edit_frame_{};
     RECT output_edit_frame_{};
     RECT threads_edit_frame_{};
