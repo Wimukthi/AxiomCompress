@@ -16,6 +16,9 @@
     <Filter Include="Entropy">
       <UniqueIdentifier>{E481C8D1-A7C9-406E-89BB-D35E2B23328D}</UniqueIdentifier>
     </Filter>
+    <Filter Include="Third Party">
+      <UniqueIdentifier>{C7F2A5BD-29C0-4CCB-86DA-2E82B70815EE}</UniqueIdentifier>
+    </Filter>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="include\axiom\axiom.hpp">
@@ -48,11 +51,20 @@
     <ClInclude Include="src\core\cpu.hpp">
       <Filter>Core</Filter>
     </ClInclude>
+    <ClInclude Include="src\core\file_meta.hpp">
+      <Filter>Core</Filter>
+    </ClInclude>
     <ClInclude Include="src\entropy\huffman.hpp">
       <Filter>Entropy</Filter>
     </ClInclude>
     <ClInclude Include="src\entropy\range.hpp">
       <Filter>Entropy</Filter>
+    </ClInclude>
+    <ClInclude Include="src\third_party\blake3\blake3.h">
+      <Filter>Third Party</Filter>
+    </ClInclude>
+    <ClInclude Include="src\third_party\blake3\blake3_impl.h">
+      <Filter>Third Party</Filter>
     </ClInclude>
   </ItemGroup>
   <ItemGroup>
@@ -80,11 +92,23 @@
     <ClCompile Include="src\core\cpu.cpp">
       <Filter>Core</Filter>
     </ClCompile>
+    <ClCompile Include="src\core\file_meta.cpp">
+      <Filter>Core</Filter>
+    </ClCompile>
     <ClCompile Include="src\entropy\huffman.cpp">
       <Filter>Entropy</Filter>
     </ClCompile>
     <ClCompile Include="src\entropy\range.cpp">
       <Filter>Entropy</Filter>
+    </ClCompile>
+    <ClCompile Include="src\third_party\blake3\blake3.c">
+      <Filter>Third Party</Filter>
+    </ClCompile>
+    <ClCompile Include="src\third_party\blake3\blake3_dispatch.c">
+      <Filter>Third Party</Filter>
+    </ClCompile>
+    <ClCompile Include="src\third_party\blake3\blake3_portable.c">
+      <Filter>Third Party</Filter>
     </ClCompile>
   </ItemGroup>
 </Project>
