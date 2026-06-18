@@ -108,6 +108,9 @@ resizable columns, and hierarchical archive browsing. Archive presentation is
 isolated behind a provider/catalog layer with explicit capability flags, so
 packed-size, encryption, recovery, volume, comment, authenticity, and archive
 mutation features can be enabled as their public archive APIs become available.
+Its owner-drawn dark menu bar exposes File, Commands, Tools, Options, and Help
+menus without falling back to a light system menu, and routes menu and keyboard
+commands through the same command IDs used by the toolbar.
 Filesystem folders refresh automatically through `ReadDirectoryChangesW`; dropped
 archives open in the browser, while dropped files and folders enter the create
 archive workflow. Window placement, the last location, sorting, and application

@@ -76,6 +76,22 @@ enum ControlId : int {
     kDelete = 1029,
     kInfo = 1030,
     kSettings = 1031,
+    kMenuFile = 1100,
+    kMenuCommands = 1101,
+    kMenuTools = 1102,
+    kMenuOptions = 1103,
+    kMenuHelp = 1104,
+    kExitApplication = 1110,
+    kSelectAll = 1111,
+    kAbout = 1112,
+};
+
+struct PopupMenuItem {
+    UINT command = 0;
+    std::wstring label;
+    std::wstring shortcut;
+    bool enabled = true;
+    bool separator = false;
 };
 
 template <typename T>
@@ -502,10 +518,19 @@ bool is_button_id(UINT id) {
         case kDelete:
         case kInfo:
         case kSettings:
+        case kMenuFile:
+        case kMenuCommands:
+        case kMenuTools:
+        case kMenuOptions:
+        case kMenuHelp:
             return true;
         default:
             return false;
     }
+}
+
+bool is_menu_bar_id(UINT id) {
+    return id >= kMenuFile && id <= kMenuHelp;
 }
 
 int scale_for_dpi(UINT dpi, int value) {
@@ -622,6 +647,14 @@ public:
 
     int focused_index() const {
         return selected_row_;
+    }
+
+    void select_all() {
+        std::fill(selected_.begin(), selected_.end(), true);
+        selected_row_ = selected_.empty() ? -1 : 0;
+        selection_anchor_ = selected_row_;
+        notify_parent(kTableSelectionChangedMessage);
+        invalidate();
     }
 
 private:
@@ -1356,6 +1389,7 @@ private:
 
     void apply_fonts() {
         HWND controls[] = {
+            menu_file_, menu_commands_, menu_tools_, menu_options_, menu_help_,
             add_files_, open_archive_, extract_, test_,
             pause_operation_, cancel_operation_, list_, progress_, status_,
             navigate_back_, navigate_forward_, navigate_up_, navigate_refresh_,
@@ -1418,6 +1452,7 @@ private:
         set_dark_title_bar(hwnd_, theme_.dark);
 
         HWND controls[] = {
+            menu_file_, menu_commands_, menu_tools_, menu_options_, menu_help_,
             add_files_, open_archive_, extract_, test_,
             pause_operation_, cancel_operation_, list_, progress_, status_,
             navigate_back_, navigate_forward_, navigate_up_, navigate_refresh_,
@@ -1475,10 +1510,11 @@ private:
         const bool pressed = (draw.itemState & ODS_SELECTED) != 0;
         const bool hot = (draw.itemState & ODS_HOTLIGHT) != 0;
         const bool focused = (draw.itemState & ODS_FOCUS) != 0;
+        const bool menu_button = is_menu_bar_id(draw.CtlID);
 
         RECT rect = draw.rcItem;
         const COLORREF button_color = pressed ? theme_.button_pressed :
-            (hot ? theme_.button_hot : theme_.button);
+            (hot ? theme_.button_hot : (menu_button ? theme_.window : theme_.button));
         fill_rect(draw.hDC, rect, button_color);
 
         HFONT font = ui_font_ != nullptr ? ui_font_ : static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
@@ -1488,8 +1524,10 @@ private:
 
         // Buttons communicate focus through a restrained border; a blue focus
         // ring is visually too loud in the compact dark toolbar.
-        const COLORREF border = (focused || hot || pressed) ? theme_.button_hot : theme_.border;
-        frame_rect(draw.hDC, rect, border);
+        if (!menu_button || focused || hot || pressed) {
+            const COLORREF border = (focused || hot || pressed) ? theme_.button_hot : theme_.border;
+            frame_rect(draw.hDC, rect, border);
+        }
 
         std::wstring text = get_text(draw.hwndItem);
         if (pressed) {
@@ -1539,15 +1577,136 @@ private:
         frame_rect(dc, frame, focused ? theme_.focus : theme_.border);
     }
 
+    void measure_popup_menu_item(MEASUREITEMSTRUCT& measure) const {
+        const auto* item = reinterpret_cast<const PopupMenuItem*>(measure.itemData);
+        if (item == nullptr) return;
+        measure.itemWidth = static_cast<UINT>(scale(230));
+        measure.itemHeight = static_cast<UINT>(scale(item->separator ? 9 : 30));
+    }
+
+    void draw_popup_menu_item(const DRAWITEMSTRUCT& draw) const {
+        const auto* item = reinterpret_cast<const PopupMenuItem*>(draw.itemData);
+        if (item == nullptr) return;
+
+        const bool selected = (draw.itemState & ODS_SELECTED) != 0 && item->enabled;
+        const COLORREF background = selected ? theme_.selection : theme_.panel;
+        fill_rect(draw.hDC, draw.rcItem, background);
+        if (item->separator) {
+            const int y = (draw.rcItem.top + draw.rcItem.bottom) / 2;
+            RECT line{draw.rcItem.left + scale(34), y,
+                      draw.rcItem.right - scale(8), y + std::max(1, scale(1))};
+            fill_rect(draw.hDC, line, theme_.border);
+            return;
+        }
+
+        HFONT font = ui_font_ != nullptr
+            ? ui_font_
+            : static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
+        HGDIOBJ old_font = SelectObject(draw.hDC, font);
+        SetBkMode(draw.hDC, TRANSPARENT);
+        SetTextColor(draw.hDC, item->enabled
+            ? (selected ? theme_.selection_text : theme_.text)
+            : theme_.muted_text);
+
+        const UINT prefix_flag = (draw.itemState & ODS_NOACCEL) != 0 ? DT_HIDEPREFIX : 0;
+        RECT label_rect = draw.rcItem;
+        label_rect.left += scale(38);  // Reserved for the shared toolbar/menu icon set.
+        label_rect.right -= scale(10);
+        DrawTextW(draw.hDC, item->label.c_str(), -1, &label_rect,
+                  DT_LEFT | DT_VCENTER | DT_SINGLELINE | prefix_flag);
+        if (!item->shortcut.empty()) {
+            DrawTextW(draw.hDC, item->shortcut.c_str(), -1, &label_rect,
+                      DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        }
+        SelectObject(draw.hDC, old_font);
+    }
+
+    void show_popup_menu(HWND anchor, UINT menu_id) {
+        const bool has_selection = !selected_browser_indices().empty();
+        const bool has_archive = active_archive_path().has_value();
+        std::vector<PopupMenuItem> items;
+        switch (menu_id) {
+            case kMenuFile:
+                items = {
+                    {kOpenArchive, L"&Open archive...", L"Ctrl+O", !busy_},
+                    {0, L"", L"", false, true},
+                    {kExitApplication, L"E&xit", L"Alt+F4"},
+                };
+                break;
+            case kMenuCommands:
+                items = {
+                    {kAddFiles, L"&Add to archive...", L"Ctrl+N", !busy_},
+                    {kExtract, L"&Extract...", L"Ctrl+E", !busy_ && has_archive},
+                    {kTest, L"&Test archive", L"Ctrl+T", !busy_ && has_archive},
+                    {0, L"", L"", false, true},
+                    {kView, L"&View", L"Enter", has_selection},
+                    {kDelete, L"&Delete", L"Delete", !busy_ && has_selection},
+                    {kSelectAll, L"Select &all", L"Ctrl+A", !browser_items_.empty()},
+                };
+                break;
+            case kMenuTools:
+                items = {{kInfo, L"Archive &information", L"Ctrl+I"}};
+                break;
+            case kMenuOptions:
+                items = {{kSettings, L"&Settings...", L"", !busy_}};
+                break;
+            case kMenuHelp:
+                items = {{kAbout, L"&About Axiom", L"F1"}};
+                break;
+            default:
+                return;
+        }
+
+        HMENU menu = CreatePopupMenu();
+        if (menu == nullptr) return;
+        HBRUSH background = CreateSolidBrush(theme_.panel);
+        MENUINFO menu_info{};
+        menu_info.cbSize = sizeof(menu_info);
+        menu_info.fMask = MIM_BACKGROUND;
+        menu_info.hbrBack = background;
+        SetMenuInfo(menu, &menu_info);
+
+        for (std::size_t index = 0; index < items.size(); ++index) {
+            MENUITEMINFOW info{};
+            info.cbSize = sizeof(info);
+            info.fMask = MIIM_FTYPE | MIIM_ID | MIIM_STATE | MIIM_DATA;
+            info.fType = MFT_OWNERDRAW;
+            info.wID = items[index].command;
+            info.fState = items[index].enabled ? MFS_ENABLED : MFS_DISABLED;
+            info.dwItemData = reinterpret_cast<ULONG_PTR>(&items[index]);
+            InsertMenuItemW(menu, static_cast<UINT>(index), TRUE, &info);
+        }
+
+        RECT anchor_rect{};
+        GetWindowRect(anchor, &anchor_rect);
+        SetForegroundWindow(hwnd_);
+        const UINT command = TrackPopupMenuEx(
+            menu, TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN | TPM_LEFTBUTTON,
+            anchor_rect.left, anchor_rect.bottom, hwnd_, nullptr);
+        DestroyMenu(menu);
+        DeleteObject(background);
+        if (command != 0) SendMessageW(hwnd_, WM_COMMAND, MAKEWPARAM(command, 0), 0);
+    }
+
     void paint_shell() {
         PAINTSTRUCT paint{};
         HDC dc = BeginPaint(hwnd_, &paint);
+        if (menu_separator_y_ > 0) {
+            RECT separator{0, menu_separator_y_, scale(10000), menu_separator_y_ + 1};
+            fill_rect(dc, separator, theme_.border);
+        }
         draw_edit_frame(dc, address_edit_, address_edit_frame_);
         EndPaint(hwnd_, &paint);
     }
 
     void on_create() {
         update_dpi(GetDpiForWindow(hwnd_));
+
+        menu_file_ = make_control(L"BUTTON", L"File", BS_OWNERDRAW, kMenuFile);
+        menu_commands_ = make_control(L"BUTTON", L"Commands", BS_OWNERDRAW, kMenuCommands);
+        menu_tools_ = make_control(L"BUTTON", L"Tools", BS_OWNERDRAW, kMenuTools);
+        menu_options_ = make_control(L"BUTTON", L"Options", BS_OWNERDRAW, kMenuOptions);
+        menu_help_ = make_control(L"BUTTON", L"Help", BS_OWNERDRAW, kMenuHelp);
 
         add_files_ = make_control(L"BUTTON", L"Add", WS_TABSTOP | BS_OWNERDRAW, kAddFiles);
         open_archive_ = make_control(L"BUTTON", L"Open archive", WS_TABSTOP | BS_OWNERDRAW, kOpenArchive);
@@ -1609,7 +1768,6 @@ private:
         const int button_height = scale(30);
         const int edit_height = scale(30);
         const int gap = scale(6);
-        int y = margin;
         const int width = client.right - client.left;
         const int right = width - margin;
 
@@ -1618,6 +1776,22 @@ private:
         }
         transient_labels_.clear();
 
+        const int menu_height = scale(29);
+        const int menu_button_height = scale(26);
+        int menu_x = scale(4);
+        auto place_menu = [&](HWND child, int logical_width) {
+            const int width_px = scale(logical_width);
+            MoveWindow(child, menu_x, scale(1), width_px, menu_button_height, TRUE);
+            menu_x += width_px;
+        };
+        place_menu(menu_file_, 44);
+        place_menu(menu_commands_, 78);
+        place_menu(menu_tools_, 48);
+        place_menu(menu_options_, 62);
+        place_menu(menu_help_, 46);
+        menu_separator_y_ = menu_height - 1;
+
+        int y = menu_height + margin;
         int x = margin;
         auto place = [&](HWND child, int logical_width) {
             const int width_px = scale(logical_width);
@@ -2021,6 +2195,16 @@ private:
         MessageBoxW(hwnd_, message.c_str(), L"Information", MB_ICONINFORMATION);
     }
 
+    void on_about() {
+        MessageBoxW(hwnd_,
+                    L"Axiom\n\nNative Windows archive manager and compression frontend.",
+                    L"About Axiom", MB_OK | MB_ICONINFORMATION);
+    }
+
+    void on_select_all() {
+        table_.select_all();
+    }
+
     void on_settings() {
         if (axiom::gui::show_application_settings_dialog(hwnd_, application_options_)) {
             selected_level_ = application_options_.default_level;
@@ -2272,11 +2456,25 @@ private:
             case WM_CTLCOLORBTN:
             case WM_CTLCOLORLISTBOX:
                 return paint_control_background(reinterpret_cast<HWND>(lparam),
-                                                reinterpret_cast<HDC>(wparam),
-                                                message);
+                                                 reinterpret_cast<HDC>(wparam),
+                                                 message);
+            case WM_MEASUREITEM:
+                if (lparam != 0) {
+                    auto& measure = *reinterpret_cast<MEASUREITEMSTRUCT*>(lparam);
+                    if (measure.CtlType == ODT_MENU) {
+                        measure_popup_menu_item(measure);
+                        return TRUE;
+                    }
+                }
+                break;
             case WM_DRAWITEM:
                 if (lparam != 0) {
-                    draw_owner_button(*reinterpret_cast<DRAWITEMSTRUCT*>(lparam));
+                    const auto& draw = *reinterpret_cast<DRAWITEMSTRUCT*>(lparam);
+                    if (draw.CtlType == ODT_MENU) {
+                        draw_popup_menu_item(draw);
+                    } else {
+                        draw_owner_button(draw);
+                    }
                     return TRUE;
                 }
                 break;
@@ -2292,6 +2490,11 @@ private:
                 break;
             case WM_COMMAND:
                 switch (LOWORD(wparam)) {
+                    case kMenuFile: show_popup_menu(menu_file_, kMenuFile); return 0;
+                    case kMenuCommands: show_popup_menu(menu_commands_, kMenuCommands); return 0;
+                    case kMenuTools: show_popup_menu(menu_tools_, kMenuTools); return 0;
+                    case kMenuOptions: show_popup_menu(menu_options_, kMenuOptions); return 0;
+                    case kMenuHelp: show_popup_menu(menu_help_, kMenuHelp); return 0;
                     case kOpenArchive: on_open_archive(); return 0;
                     case kAddFiles: on_add_to_archive(); return 0;
                     case kExtract: on_extract(); return 0;
@@ -2307,6 +2510,9 @@ private:
                     case kDelete: on_delete_selected(); return 0;
                     case kInfo: on_info(); return 0;
                     case kSettings: on_settings(); return 0;
+                    case kSelectAll: on_select_all(); return 0;
+                    case kAbout: on_about(); return 0;
+                    case kExitApplication: SendMessageW(hwnd_, WM_CLOSE, 0, 0); return 0;
                     case kAddressEdit:
                         if (HIWORD(wparam) == EN_SETFOCUS || HIWORD(wparam) == EN_KILLFOCUS) {
                             InvalidateRect(hwnd_, nullptr, FALSE);
@@ -2381,6 +2587,11 @@ private:
 
     HINSTANCE instance_ = nullptr;
     HWND hwnd_ = nullptr;
+    HWND menu_file_ = nullptr;
+    HWND menu_commands_ = nullptr;
+    HWND menu_tools_ = nullptr;
+    HWND menu_options_ = nullptr;
+    HWND menu_help_ = nullptr;
     HWND add_files_ = nullptr;
     HWND open_archive_ = nullptr;
     HWND extract_ = nullptr;
@@ -2414,6 +2625,7 @@ private:
     axiom::gui::OperationRunner operation_runner_;
     std::chrono::steady_clock::time_point operation_started_{};
     fs::path operation_archive_output_;
+    int menu_separator_y_ = 0;
     RECT address_edit_frame_{};
     std::vector<HWND> transient_labels_;
     std::vector<fs::path> inputs_;
@@ -2458,8 +2670,24 @@ int run_axiom_gui(HINSTANCE instance, int show_command, std::wstring initial_pat
 
     MSG message{};
     while (GetMessageW(&message, nullptr, 0, 0) > 0) {
+        if (message.message == WM_SYSKEYDOWN && (GetKeyState(VK_MENU) & 0x8000) != 0) {
+            HWND root = GetAncestor(message.hwnd, GA_ROOT);
+            UINT menu_command = 0;
+            switch (message.wParam) {
+                case 'F': menu_command = kMenuFile; break;
+                case 'C': menu_command = kMenuCommands; break;
+                case 'T': menu_command = kMenuTools; break;
+                case 'O': menu_command = kMenuOptions; break;
+                case 'H': menu_command = kMenuHelp; break;
+            }
+            if (menu_command != 0) {
+                SendMessageW(root, WM_COMMAND, MAKEWPARAM(menu_command, BN_CLICKED), 0);
+                continue;
+            }
+        }
         if (message.message == WM_KEYDOWN) {
             HWND root = GetAncestor(message.hwnd, GA_ROOT);
+            const bool control = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
             if (message.wParam == VK_RETURN && GetDlgCtrlID(message.hwnd) == kAddressEdit) {
                 SendMessageW(root, WM_COMMAND, MAKEWPARAM(kAddressGo, BN_CLICKED), 0);
                 continue;
@@ -2476,10 +2704,29 @@ int run_axiom_gui(HINSTANCE instance, int show_command, std::wstring initial_pat
                 SendMessageW(root, WM_COMMAND, MAKEWPARAM(kNavigateForward, BN_CLICKED), 0);
                 continue;
             }
-            if ((GetKeyState(VK_CONTROL) & 0x8000) != 0 && message.wParam == 'L') {
+            if (control && message.wParam == 'L') {
                 HWND address = GetDlgItem(root, kAddressEdit);
                 SetFocus(address);
                 SendMessageW(address, EM_SETSEL, 0, -1);
+                continue;
+            }
+            UINT command = 0;
+            if (control) {
+                switch (message.wParam) {
+                    case 'A': command = kSelectAll; break;
+                    case 'E': command = kExtract; break;
+                    case 'I': command = kInfo; break;
+                    case 'N': command = kAddFiles; break;
+                    case 'O': command = kOpenArchive; break;
+                    case 'T': command = kTest; break;
+                }
+            } else if (message.wParam == VK_DELETE) {
+                command = kDelete;
+            } else if (message.wParam == VK_F1) {
+                command = kAbout;
+            }
+            if (command != 0) {
+                SendMessageW(root, WM_COMMAND, MAKEWPARAM(command, 0), 0);
                 continue;
             }
         }
