@@ -99,6 +99,13 @@ layout/fonts). Operations run on a worker thread so the window stays responsive;
 create/test/extract report byte progress to the status strip and progress bar,
 and can be paused or cancelled cooperatively.
 
+The main window is a file-manager browser with drive and directory navigation,
+an editable address bar, history, shell icons, multi-selection, sortable and
+resizable columns, and hierarchical archive browsing. Archive presentation is
+isolated behind a provider/catalog layer with explicit capability flags, so
+packed-size, encryption, recovery, volume, comment, authenticity, and archive
+mutation features can be enabled as their public archive APIs become available.
+
 ### Effort levels (`--level 1..9`, default 5)
 
 One knob trades speed for ratio. `--fast` = 1, `--max` = 9. **Level 1** is the

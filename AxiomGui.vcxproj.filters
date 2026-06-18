@@ -5,9 +5,19 @@
       <UniqueIdentifier>{6BA6AC73-09A9-4B8B-9442-2168DB2D88DB}</UniqueIdentifier>
       <Extensions>cpp;c;cc;cxx</Extensions>
     </Filter>
+    <Filter Include="Header Files">
+      <UniqueIdentifier>{D42D1C1F-3ED5-45DF-AE74-91EAB406DCEA}</UniqueIdentifier>
+      <Extensions>h;hpp;hxx</Extensions>
+    </Filter>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="src\gui\main.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\gui\main_window.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\gui\browser_model.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="src\gui\operation_runner.cpp">
@@ -15,6 +25,12 @@
     </ClCompile>
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="src\gui\browser_model.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\gui\app.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="src\gui\operation_runner.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
