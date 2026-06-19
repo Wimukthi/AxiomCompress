@@ -32,6 +32,7 @@ add_library(axiom STATIC
     src/core/cpu.cpp
     src/core/crypto.cpp
     src/core/file_meta.cpp
+    src/core/reed_solomon.cpp
     src/entropy/huffman.cpp
     src/entropy/range.cpp
     ${BLAKE3_SOURCES}

@@ -41,6 +41,7 @@ $libSources = @(
     "src\core\cpu.cpp",
     "src\core\crypto.cpp",
     "src\core\file_meta.cpp",
+    "src\core\reed_solomon.cpp",
     "src\entropy\huffman.cpp",
     "src\entropy\range.cpp",
     "src\third_party\blake3\blake3.c",

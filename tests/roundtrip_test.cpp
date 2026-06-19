@@ -7,6 +7,7 @@
 #include "core/checksum.hpp"
 #include "core/cpu.hpp"
 #include "core/hash.hpp"
+#include "core/reed_solomon.hpp"
 #include "entropy/huffman.hpp"
 #include "entropy/range.hpp"
 
@@ -191,6 +192,58 @@ std::uint32_t crc32_reference(const std::vector<std::uint8_t>& data) {
 
 // The interleaved rANS must round-trip at every length near the lane boundary,
 // for a single-symbol stream (degenerate frequency table), and for skewed data.
+// Reed-Solomon erasure coding: any up to `parity` erased shards reconstruct exactly,
+// and erasing more than that is reported unrecoverable.
+void test_reed_solomon() {
+    std::mt19937 rng(0x9E3779B9u);
+    for (int trial = 0; trial < 150; ++trial) {
+        const int d = 1 + static_cast<int>(rng() % 16);
+        const int p = 1 + static_cast<int>(rng() % 6);
+        const std::size_t len = 1 + (rng() % 128);
+        axiom::core::ReedSolomon rs(d, p);
+        const int total = d + p;
+
+        std::vector<std::vector<std::uint8_t>> shards(total, std::vector<std::uint8_t>(len));
+        for (int i = 0; i < d; ++i) {
+            for (auto& b : shards[static_cast<std::size_t>(i)]) {
+                b = static_cast<std::uint8_t>(rng() & 0xFF);
+            }
+        }
+        std::vector<std::span<const std::uint8_t>> dv;
+        for (int i = 0; i < d; ++i) {
+            dv.emplace_back(shards[static_cast<std::size_t>(i)]);
+        }
+        std::vector<std::span<std::uint8_t>> pv;
+        for (int i = 0; i < p; ++i) {
+            pv.emplace_back(shards[static_cast<std::size_t>(d + i)]);
+        }
+        rs.encode(dv, pv);
+        const auto original = shards;
+
+        std::vector<int> idx(static_cast<std::size_t>(total));
+        for (int i = 0; i < total; ++i) {
+            idx[static_cast<std::size_t>(i)] = i;
+        }
+        std::shuffle(idx.begin(), idx.end(), rng);
+        const int erasures = static_cast<int>(rng() % static_cast<unsigned>(p + 1));
+        std::vector<bool> present(static_cast<std::size_t>(total), true);
+        for (int e = 0; e < erasures; ++e) {
+            present[static_cast<std::size_t>(idx[static_cast<std::size_t>(e)])] = false;
+            shards[static_cast<std::size_t>(idx[static_cast<std::size_t>(e)])].assign(len, 0);
+        }
+        AXIOM_CHECK(rs.reconstruct(shards, present));
+        AXIOM_CHECK(shards == original);
+    }
+
+    // Losing more shards than there is parity (and dropping below `data` survivors)
+    // is unrecoverable.
+    axiom::core::ReedSolomon rs(6, 2);
+    std::vector<std::vector<std::uint8_t>> shards(8, std::vector<std::uint8_t>(10, 1));
+    std::vector<bool> present(8, true);
+    present[0] = present[1] = present[2] = false;  // 5 survive < 6 data shards
+    AXIOM_CHECK(!rs.reconstruct(shards, present));
+}
+
 void test_rans_edges() {
     for (std::size_t len = 0; len <= 40; ++len) {
         std::vector<std::uint8_t> single(len, 0xABu);
@@ -1300,6 +1353,7 @@ int main() {
 
     test_crc32();
     test_blake3();
+    test_reed_solomon();
     test_rans_edges();
     test_archive_roundtrip();
     test_archive_symlinks();
