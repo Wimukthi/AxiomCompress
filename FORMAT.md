@@ -108,9 +108,12 @@ u8[]     key_check         a fixed plaintext sealed under the key (salt as AD)
 - **Wrong-password check:** `key_check` is a known constant sealed under the key; a
   reader re-derives the key and opens it first, rejecting a wrong password before any
   block is read.
+- **Editing:** encrypted archives can be edited with the password — `add`/`update`/
+  `sync` copy the existing sealed blocks verbatim and seal new ones under the same
+  key; `delete`/`repack` decrypt the surviving blocks and re-seal them. A wrong
+  password is rejected (via the key-check) before anything is written.
 - **Scope:** block *contents* are encrypted; the central directory (file names, sizes,
-  hashes) is **not** encrypted yet, and encrypted archives cannot yet be *edited*
-  (add/update/delete/repack refuse). Both are planned follow-ups.
+  hashes) is **not** encrypted yet — that (RAR's `-hp`) is a planned follow-up.
 
 `BlockRec`:
 
@@ -262,8 +265,8 @@ What the format and the current implementation do and do not handle:
 - **No special files** (devices, FIFOs, sockets) — only regular files,
   directories, symlinks, and hard links are stored; everything else is skipped.
 - **Encryption** covers block *contents* only — the central directory (names, sizes,
-  hashes) is still plaintext, and an encrypted archive cannot yet be *edited*
-  (add/update/delete/repack refuse). Encrypted-directory mode and editing are planned.
+  hashes) is still plaintext. Encrypted archives *can* be edited with the password.
+  Encrypted-directory mode (hidden names) is planned.
 - Editing (`add`/replace/`delete`/`repack`) rewrites the whole file via a temp +
   atomic rename; there is no true zero-copy in-place append yet. Writing needs a
   seekable output (the directory and footer are written last).

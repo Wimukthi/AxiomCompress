@@ -1032,10 +1032,13 @@ void rebuild_archive_keeping(const fs::path& archive_path,
     if (index.meta.locked) {
         throw std::runtime_error("archive is locked (read-only)");
     }
+    // For an encrypted archive, derive the key once: it both decrypts the surviving
+    // blocks (via BlockSource) and re-seals the freshly written ones.
+    std::optional<core::CryptoKey> key;
     if (index.meta.encryption.enabled) {
-        throw std::runtime_error("editing an encrypted archive is not yet supported");
+        key = derive_archive_key(index.meta.encryption, options.password);
     }
-    BlockSource source(bytes, index, 0, operation);
+    BlockSource source(bytes, index, 0, operation, key);
 
     // Paths surviving the filter — used to drop hardlinks whose target is removed.
     std::unordered_set<std::string> kept_paths;
@@ -1082,7 +1085,10 @@ void rebuild_archive_keeping(const fs::path& archive_path,
         }
         report_operation(operation, OperationStage::compressing, completed_bytes, total_bytes,
                          completed_items, total_items);
-        const auto compressed = compress(buffer, options);
+        auto compressed = compress(buffer, options);
+        if (key) {
+            compressed = core::aead_seal(*key, compressed, block_associated_data(new_blocks.size()));
+        }
         operation_checkpoint(operation);
         new_blocks.push_back({written, static_cast<std::uint64_t>(compressed.size()),
                               static_cast<std::uint64_t>(buffer.size())});
@@ -1141,6 +1147,9 @@ void rebuild_archive_keeping(const fs::path& archive_path,
         }
     }
     temp_guard.dismiss();
+    if (key) {
+        core::secure_wipe(*key);
+    }
     report_operation(operation, OperationStage::finalizing, total_bytes, total_bytes,
                      total_items, total_items);
 }
@@ -1167,9 +1176,14 @@ void append_items_to_archive(const fs::path& archive_path, const std::vector<Sca
     if (existing.meta.locked) {
         throw std::runtime_error("archive is locked (read-only)");
     }
-    if (existing.meta.encryption.enabled) {
-        throw std::runtime_error("editing an encrypted archive is not yet supported");
+    // Encrypted archives: existing blocks are copied verbatim (still sealed), so only
+    // a change that writes *new* blocks needs the key. Derive it then, sealing new
+    // blocks with the same key; a comment/lock-only rewrite (no items) needs no key.
+    std::optional<core::CryptoKey> key;
+    if (existing.meta.encryption.enabled && !items.empty()) {
+        key = derive_archive_key(existing.meta.encryption, options.password);
     }
+    const core::CryptoKey* key_ptr = key ? &*key : nullptr;
     const ArchiveMeta result_meta = meta_override ? *meta_override : existing.meta;
     std::uint64_t block_region_end = kHeaderSize;
     if (!existing.blocks.empty()) {
@@ -1234,7 +1248,10 @@ void append_items_to_archive(const fs::path& archive_path, const std::vector<Sca
     std::uint64_t written = block_region_end;
 
     compress_items_into(out, written, blocks, entries, items, options, block_size, operation,
-                        total_bytes, total_items, completed_bytes, completed_items);
+                        total_bytes, total_items, completed_bytes, completed_items, key_ptr);
+    if (key) {
+        core::secure_wipe(*key);
+    }
 
     report_operation(operation, OperationStage::finalizing, completed_bytes, total_bytes,
                      completed_items, total_items);
@@ -1482,9 +1499,16 @@ void sync_archive(const std::vector<std::filesystem::path>& inputs,
 
 void set_archive_comment(const std::filesystem::path& archive_path, const std::string& comment,
                          const CompressionOptions& options) {
+    // Start from the existing metadata so the encryption record (and anything else)
+    // is preserved; only the comment changes.
     ArchiveMeta meta;
+    {
+        std::uint64_t file_size = 0;
+        auto in = open_archive(archive_path, file_size);
+        const ByteSource source(in, file_size);
+        meta = read_index(source).meta;
+    }
     meta.comment = comment;
-    meta.locked = false;  // unlocked archives stay unlocked (locked ones are refused below)
     append_items_to_archive(archive_path, {}, options, &meta);
 }
 

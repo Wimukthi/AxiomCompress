@@ -102,9 +102,10 @@ chosen for clean two-compiler portability; provides XChaCha20-Poly1305 + Argon2i
 - ✅ CLI `-p`/`--password`; wired through extract/test; edits on encrypted archives
   refuse (for now). *Verified:* roundtrip, wrong-password, tamper (AEAD failure), and
   no-plaintext-on-disk tests; archive parser fuzzed with the encryption record.
+- ✅ **Editing encrypted archives** — add/update/sync seal new blocks under the same
+  key; delete/repack decrypt + re-seal; wrong password rejected before writing.
 - ⬜ **Header/filename encryption:** optionally encrypt the central directory so
-  names/sizes are hidden.
-- ⬜ **Editing encrypted archives** (add/update/delete/repack with the password).
+  names/sizes are hidden (RAR `-hp`).
 
 ## Phase 4 — Recovery records & multi-volume (ISA-L)
 

@@ -717,11 +717,54 @@ void test_archive_encryption() {
         expect_throws([&] { axiom::test_archive(bad, d); });
     }
 
-    // Editing an encrypted archive is refused in this slice.
+    // Editing an encrypted archive: add a file (re-sealed under the same key) with the
+    // right password works; a wrong password is rejected before writing.
     {
+        write_all(src / "added.txt", bytes_from_string("added under encryption"));
         axiom::CompressionOptions a;
+        a.password = "totally wrong";
+        expect_throws([&] { axiom::add_to_archive({src / "added.txt"}, archive, a); });
+
         a.password = opt.password;
-        expect_throws([&] { axiom::add_to_archive({src}, archive, a); });
+        axiom::add_to_archive({src / "added.txt"}, archive, a);
+        AXIOM_CHECK(axiom::archive_is_encrypted(archive));
+
+        axiom::DecompressionOptions d;
+        d.password = opt.password;
+        axiom::test_archive(archive, d);  // old and new blocks both verify
+        axiom::ExtractOptions x;
+        x.password = opt.password;
+        const auto dest = root / "out2";
+        axiom::extract_archive(archive, dest, x);
+        AXIOM_CHECK(read_all(dest / "added.txt") == bytes_from_string("added under encryption"));
+        AXIOM_CHECK(read_all(dest / "src" / "secret.txt") == secret);  // original intact
+    }
+
+    // A comment change preserves the encryption metadata (would otherwise orphan the
+    // still-encrypted blocks).
+    {
+        axiom::set_archive_comment(archive, "encrypted backup");
+        AXIOM_CHECK(axiom::archive_is_encrypted(archive));
+        AXIOM_CHECK(axiom::archive_comment(archive) == "encrypted backup");
+        axiom::DecompressionOptions d;
+        d.password = opt.password;
+        axiom::test_archive(archive, d);
+    }
+
+    // Repack rebuilds and re-seals; the archive stays encrypted and readable.
+    {
+        axiom::CompressionOptions r;
+        r.password = opt.password;
+        axiom::repack_archive(archive, r);
+        axiom::DecompressionOptions d;
+        d.password = opt.password;
+        axiom::test_archive(archive, d);
+        axiom::ExtractOptions x;
+        x.password = opt.password;
+        const auto dest = root / "out3";
+        axiom::extract_archive(archive, dest, x);
+        AXIOM_CHECK(read_all(dest / "src" / "secret.txt") == secret);
+        AXIOM_CHECK(read_all(dest / "added.txt") == bytes_from_string("added under encryption"));
     }
 
     std::error_code ec;
