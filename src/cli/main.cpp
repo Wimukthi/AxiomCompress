@@ -36,8 +36,9 @@ void print_usage() {
         "  axiomc d [options] <input.axc> <output>         decompress one stream\n"
         "\n"
         "Encryption:\n"
-        "  -p, --password STR  encrypt blocks on 'a' (create); supply to read 'x'/'t'\n"
+        "  -p, --password STR  encrypt blocks on 'a' (create); supply to read 'x'/'t'/'l'\n"
         "                      (XChaCha20-Poly1305 per block, Argon2id key derivation)\n"
+        "  --encrypt-names     with -p, also encrypt the directory (hide names; 'l' needs -p)\n"
         "\n"
         "Compression options (a, c):\n"
         "  --level N           1=fastest .. 9=max ratio (default 5)\n"
@@ -163,6 +164,8 @@ bool take_compression_flags(std::vector<std::string>& args, axiom::CompressionOp
             options.thread_count = parse_size(next("--threads"));
         } else if (arg == "-p" || arg == "--password") {
             options.password = next(arg.c_str());
+        } else if (arg == "--encrypt-names" || arg == "--encrypt-header") {
+            options.encrypt_header = true;
         } else if (arg == "--block-size") {
             options.block_size = parse_size(next("--block-size"));
             options.auto_block_size_for_threads = false;
@@ -397,22 +400,39 @@ int run_extract(std::vector<std::string> args) {
 }
 
 int run_list(const std::vector<std::string>& args) {
-    if (args.size() != 1) {
+    std::string password;
+    std::vector<std::string> positionals;
+    for (std::size_t i = 0; i < args.size(); ++i) {
+        if (args[i] == "-p" || args[i] == "--password") {
+            if (i + 1 >= args.size()) {
+                print_usage();
+                return 2;
+            }
+            password = args[++i];
+        } else if (args[i].rfind("--", 0) == 0) {
+            std::cerr << "axiomc: unknown option " << args[i] << '\n';
+            return 2;
+        } else {
+            positionals.push_back(args[i]);
+        }
+    }
+    if (positionals.size() != 1) {
         print_usage();
         return 2;
     }
-    const auto entries = axiom::list_archive(args[0]);
+    const fs::path archive = positionals[0];
 
-    const std::string comment = axiom::archive_comment(args[0]);
+    const std::string comment = axiom::archive_comment(archive, password);
     if (!comment.empty()) {
         std::cout << "Comment: " << comment << '\n';
     }
-    if (axiom::archive_is_locked(args[0])) {
+    if (axiom::archive_is_locked(archive, password)) {
         std::cout << "[locked: read-only]\n";
     }
-    if (axiom::archive_is_encrypted(args[0])) {
+    if (axiom::archive_is_encrypted(archive)) {
         std::cout << "[encrypted: password required to extract]\n";
     }
+    const auto entries = axiom::list_archive(archive, password);
 
     std::uint64_t total_bytes = 0;
     for (const auto& entry : entries) {

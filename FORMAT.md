@@ -40,7 +40,7 @@ the archive file unless stated otherwise.
 |-----------|----------|--------------------------------------|
 | magic     | u8[8]    | `"AXIOMAR\0"`                        |
 | version   | u16      | format version, currently `4`        |
-| flags     | u16      | required-feature flags (see below), `0` today; a reader rejects any bit it does not understand |
+| flags     | u16      | required-feature flags; bit `0x0001` = encrypted directory (a plaintext encryption preamble follows the header). A reader rejects any bit it does not understand |
 | reserved  | u32      | must be `0`                          |
 
 ### Solid blocks
@@ -108,9 +108,19 @@ u8[]     key_check         a fixed plaintext sealed under the key (salt as AD)
 - **Wrong-password check:** `key_check` is a known constant sealed under the key; a
   reader re-derives the key and opens it first, rejecting a wrong password before any
   block is read.
-- **Scope:** block *contents* are encrypted; the central directory (file names, sizes,
-  hashes) is **not** encrypted yet, and encrypted archives cannot yet be *edited*
-  (add/update/delete/repack refuse). Both are planned follow-ups.
+- **Editing:** block-only encrypted archives can be edited with the password —
+  `add`/`update`/`sync` copy the existing sealed blocks verbatim and seal new ones
+  under the same key; `delete`/`repack` decrypt the surviving blocks and re-seal them.
+  A wrong password is rejected (via the key-check) before anything is written.
+- **Encrypted directory (`--encrypt-names`, RAR's `-hp`):** the whole central
+  directory is additionally sealed, hiding names, sizes, and hashes — listing then
+  needs the password. The header `flags` set bit `0x0001`, and the KDF parameters move
+  to a **plaintext preamble** right after the 16-byte header (a `u32` length then the
+  vint-encoded `kdf params + salt + key_check`), since they must be read before the
+  sealed directory can be opened. The directory blob at `directory_offset` is then
+  `nonce ‖ tag ‖ ciphertext` with a fixed `"AXDIR"` associated-data tag, and it
+  carries no `encryption` archive-extra (the preamble has the parameters). Editing a
+  directory-encrypted archive is not supported yet.
 
 `BlockRec`:
 
@@ -261,9 +271,10 @@ What the format and the current implementation do and do not handle:
   ownership are not yet stored (a later phase).
 - **No special files** (devices, FIFOs, sockets) — only regular files,
   directories, symlinks, and hard links are stored; everything else is skipped.
-- **Encryption** covers block *contents* only — the central directory (names, sizes,
-  hashes) is still plaintext, and an encrypted archive cannot yet be *edited*
-  (add/update/delete/repack refuse). Encrypted-directory mode and editing are planned.
+- **Encryption**: block contents are always sealed; with `--encrypt-names` the
+  central directory is sealed too (names/sizes hidden, listing needs the password).
+  Block-only encrypted archives can be edited with the password; editing a
+  directory-encrypted one is not supported yet.
 - Editing (`add`/replace/`delete`/`repack`) rewrites the whole file via a temp +
   atomic rename; there is no true zero-copy in-place append yet. Writing needs a
   seekable output (the directory and footer are written last).

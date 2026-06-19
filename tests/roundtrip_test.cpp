@@ -7,6 +7,7 @@
 #include "core/checksum.hpp"
 #include "core/cpu.hpp"
 #include "core/hash.hpp"
+#include "core/reed_solomon.hpp"
 #include "entropy/huffman.hpp"
 #include "entropy/range.hpp"
 
@@ -191,6 +192,58 @@ std::uint32_t crc32_reference(const std::vector<std::uint8_t>& data) {
 
 // The interleaved rANS must round-trip at every length near the lane boundary,
 // for a single-symbol stream (degenerate frequency table), and for skewed data.
+// Reed-Solomon erasure coding: any up to `parity` erased shards reconstruct exactly,
+// and erasing more than that is reported unrecoverable.
+void test_reed_solomon() {
+    std::mt19937 rng(0x9E3779B9u);
+    for (int trial = 0; trial < 150; ++trial) {
+        const int d = 1 + static_cast<int>(rng() % 16);
+        const int p = 1 + static_cast<int>(rng() % 6);
+        const std::size_t len = 1 + (rng() % 128);
+        axiom::core::ReedSolomon rs(d, p);
+        const int total = d + p;
+
+        std::vector<std::vector<std::uint8_t>> shards(total, std::vector<std::uint8_t>(len));
+        for (int i = 0; i < d; ++i) {
+            for (auto& b : shards[static_cast<std::size_t>(i)]) {
+                b = static_cast<std::uint8_t>(rng() & 0xFF);
+            }
+        }
+        std::vector<std::span<const std::uint8_t>> dv;
+        for (int i = 0; i < d; ++i) {
+            dv.emplace_back(shards[static_cast<std::size_t>(i)]);
+        }
+        std::vector<std::span<std::uint8_t>> pv;
+        for (int i = 0; i < p; ++i) {
+            pv.emplace_back(shards[static_cast<std::size_t>(d + i)]);
+        }
+        rs.encode(dv, pv);
+        const auto original = shards;
+
+        std::vector<int> idx(static_cast<std::size_t>(total));
+        for (int i = 0; i < total; ++i) {
+            idx[static_cast<std::size_t>(i)] = i;
+        }
+        std::shuffle(idx.begin(), idx.end(), rng);
+        const int erasures = static_cast<int>(rng() % static_cast<unsigned>(p + 1));
+        std::vector<bool> present(static_cast<std::size_t>(total), true);
+        for (int e = 0; e < erasures; ++e) {
+            present[static_cast<std::size_t>(idx[static_cast<std::size_t>(e)])] = false;
+            shards[static_cast<std::size_t>(idx[static_cast<std::size_t>(e)])].assign(len, 0);
+        }
+        AXIOM_CHECK(rs.reconstruct(shards, present));
+        AXIOM_CHECK(shards == original);
+    }
+
+    // Losing more shards than there is parity (and dropping below `data` survivors)
+    // is unrecoverable.
+    axiom::core::ReedSolomon rs(6, 2);
+    std::vector<std::vector<std::uint8_t>> shards(8, std::vector<std::uint8_t>(10, 1));
+    std::vector<bool> present(8, true);
+    present[0] = present[1] = present[2] = false;  // 5 survive < 6 data shards
+    AXIOM_CHECK(!rs.reconstruct(shards, present));
+}
+
 void test_rans_edges() {
     for (std::size_t len = 0; len <= 40; ++len) {
         std::vector<std::uint8_t> single(len, 0xABu);
@@ -717,11 +770,113 @@ void test_archive_encryption() {
         expect_throws([&] { axiom::test_archive(bad, d); });
     }
 
-    // Editing an encrypted archive is refused in this slice.
+    // Editing an encrypted archive: add a file (re-sealed under the same key) with the
+    // right password works; a wrong password is rejected before writing.
     {
+        write_all(src / "added.txt", bytes_from_string("added under encryption"));
         axiom::CompressionOptions a;
+        a.password = "totally wrong";
+        expect_throws([&] { axiom::add_to_archive({src / "added.txt"}, archive, a); });
+
         a.password = opt.password;
-        expect_throws([&] { axiom::add_to_archive({src}, archive, a); });
+        axiom::add_to_archive({src / "added.txt"}, archive, a);
+        AXIOM_CHECK(axiom::archive_is_encrypted(archive));
+
+        axiom::DecompressionOptions d;
+        d.password = opt.password;
+        axiom::test_archive(archive, d);  // old and new blocks both verify
+        axiom::ExtractOptions x;
+        x.password = opt.password;
+        const auto dest = root / "out2";
+        axiom::extract_archive(archive, dest, x);
+        AXIOM_CHECK(read_all(dest / "added.txt") == bytes_from_string("added under encryption"));
+        AXIOM_CHECK(read_all(dest / "src" / "secret.txt") == secret);  // original intact
+    }
+
+    // A comment change preserves the encryption metadata (would otherwise orphan the
+    // still-encrypted blocks).
+    {
+        axiom::set_archive_comment(archive, "encrypted backup");
+        AXIOM_CHECK(axiom::archive_is_encrypted(archive));
+        AXIOM_CHECK(axiom::archive_comment(archive) == "encrypted backup");
+        axiom::DecompressionOptions d;
+        d.password = opt.password;
+        axiom::test_archive(archive, d);
+    }
+
+    // Repack rebuilds and re-seals; the archive stays encrypted and readable.
+    {
+        axiom::CompressionOptions r;
+        r.password = opt.password;
+        axiom::repack_archive(archive, r);
+        axiom::DecompressionOptions d;
+        d.password = opt.password;
+        axiom::test_archive(archive, d);
+        axiom::ExtractOptions x;
+        x.password = opt.password;
+        const auto dest = root / "out3";
+        axiom::extract_archive(archive, dest, x);
+        AXIOM_CHECK(read_all(dest / "src" / "secret.txt") == secret);
+        AXIOM_CHECK(read_all(dest / "added.txt") == bytes_from_string("added under encryption"));
+    }
+
+    std::error_code ec;
+    fs::remove_all(root, ec);
+}
+
+// Directory encryption (--encrypt-names): the whole central directory is sealed, so
+// names/sizes are hidden and even listing needs the password.
+void test_archive_encrypted_directory() {
+    const auto root = make_temp_dir();
+    const auto src = root / "src";
+    fs::create_directories(src);
+    const auto secret = bytes_from_string("hidden payload " + std::string(2000, 'H'));
+    write_all(src / "secret_name.txt", secret);
+
+    axiom::CompressionOptions opt;
+    opt.block_size = 1024;
+    opt.password = "directory pass word";
+    opt.encrypt_header = true;
+    const auto archive = root / "hp.axar";
+    axiom::create_archive({src}, archive, opt);
+
+    AXIOM_CHECK(axiom::archive_is_encrypted(archive));  // detectable without a password
+
+    // Listing is refused without (or with a wrong) password — the directory is sealed.
+    expect_throws([&] { (void)axiom::list_archive(archive); });
+    expect_throws([&] { (void)axiom::list_archive(archive, "wrong"); });
+
+    {
+        const auto entries = axiom::list_archive(archive, opt.password);
+        bool found = false;
+        for (const auto& e : entries) {
+            found = found || e.path == "src/secret_name.txt";
+        }
+        AXIOM_CHECK(found);
+    }
+
+    // The file name must not appear in plaintext anywhere in the archive.
+    {
+        const auto raw = read_all(archive);
+        const std::string marker = "secret_name.txt";
+        const auto* needle = reinterpret_cast<const std::uint8_t*>(marker.data());
+        AXIOM_CHECK(std::search(raw.begin(), raw.end(), needle, needle + marker.size()) == raw.end());
+    }
+
+    // Test + extract need the password and reproduce the bytes; wrong password fails.
+    {
+        axiom::DecompressionOptions d;
+        d.password = opt.password;
+        axiom::test_archive(archive, d);
+        axiom::ExtractOptions x;
+        x.password = opt.password;
+        const auto dest = root / "out";
+        axiom::extract_archive(archive, dest, x);
+        AXIOM_CHECK(read_all(dest / "src" / "secret_name.txt") == secret);
+
+        axiom::DecompressionOptions bad;
+        bad.password = "nope";
+        expect_throws([&] { axiom::test_archive(archive, bad); });
     }
 
     std::error_code ec;
@@ -1198,6 +1353,7 @@ int main() {
 
     test_crc32();
     test_blake3();
+    test_reed_solomon();
     test_rans_edges();
     test_archive_roundtrip();
     test_archive_symlinks();
@@ -1207,6 +1363,7 @@ int main() {
     test_archive_update_sync();
     test_archive_comment_lock();
     test_archive_encryption();
+    test_archive_encrypted_directory();
     test_archive_operation_control();
 #if defined(_WIN32)
     test_windows_metadata();
