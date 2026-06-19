@@ -35,7 +35,7 @@ The codec currently implements:
   and far higher decode speed.)
 - A threaded independent-block codec, and a multi-file `.axar` container of solid
   blocks with a central directory (see [FORMAT.md](FORMAT.md)).
-- Two front-ends — a CLI (`axiomc`) and a Windows GUI (`axiom_gui`) — over the
+- Two front-ends — a CLI (`axiomc`) and a Windows GUI (`Axiom.exe`) — over the
   same library. Long operations report progress and honor cooperative
   pause/cancel through an `OperationControl` passed in the option structs;
   cancellation throws `OperationCancelled` and leaves no partial output (writes

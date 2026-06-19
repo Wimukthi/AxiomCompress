@@ -9,6 +9,10 @@
       <UniqueIdentifier>{D42D1C1F-3ED5-45DF-AE74-91EAB406DCEA}</UniqueIdentifier>
       <Extensions>h;hpp;hxx</Extensions>
     </Filter>
+    <Filter Include="Resource Files">
+      <UniqueIdentifier>{A7A357A9-2954-4B9C-9D9E-67286F9E8C75}</UniqueIdentifier>
+      <Extensions>rc;ico;cur;bmp;dlg;rc2;rct;bin;rgs;gif;jpg;jpeg;jpe;resx;tiff;tif;png;wav</Extensions>
+    </Filter>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="src\gui\main.cpp">
@@ -26,6 +30,7 @@
     <ClCompile Include="src\gui\archive_dialogs.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="src\gui\archive_feature_dialogs.cpp"><Filter>Source Files</Filter></ClCompile>
     <ClCompile Include="src\gui\directory_watcher.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -41,6 +46,10 @@
     <ClCompile Include="src\gui\operation_progress_window.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="src\gui\dialog_support.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="src\gui\message_dialog.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="src\gui\about_dialog.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="src\gui\update_checker.cpp"><Filter>Source Files</Filter></ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="src\gui\browser_model.hpp">
@@ -61,6 +70,8 @@
     <ClInclude Include="src\gui\archive_dialogs.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="src\gui\archive_feature_dialogs.hpp"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="src\gui\archive_feature_options.hpp"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="src\gui\directory_watcher.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
@@ -73,5 +84,13 @@
     <ClInclude Include="src\gui\operation_progress_window.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="src\gui\dialog_support.hpp"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="src\gui\message_dialog.hpp"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="src\gui\about_dialog.hpp"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="src\gui\update_checker.hpp"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="src\gui\resource.hpp"><Filter>Header Files</Filter></ClInclude>
+  </ItemGroup>
+  <ItemGroup>
+    <ResourceCompile Include="src\gui\axiom_gui.rc"><Filter>Resource Files</Filter></ResourceCompile>
   </ItemGroup>
 </Project>

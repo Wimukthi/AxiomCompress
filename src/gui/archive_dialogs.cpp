@@ -1,5 +1,7 @@
 #define NOMINMAX
 #include "gui/archive_dialogs.hpp"
+#include "gui/archive_feature_dialogs.hpp"
+#include "gui/message_dialog.hpp"
 
 #include <dwmapi.h>
 #include <shobjidl.h>
@@ -24,6 +26,7 @@ constexpr int kOverwrite = 2007;
 constexpr int kRestoreTime = 2008;
 constexpr int kConfirmDelete = 2009;
 constexpr int kShowHidden = 2010;
+constexpr int kAdvancedFeatures = 2011;
 constexpr int kAccept = IDOK;
 constexpr int kCancel = IDCANCEL;
 
@@ -244,6 +247,8 @@ private:
             path_label_ = label(mode_ == DialogMode::create_archive ? L"Archive path" : L"Destination");
             path_edit_ = control(L"EDIT", L"", WS_TABSTOP | ES_AUTOHSCROLL, kPathEdit);
             browse_ = control(L"BUTTON", L"Browse...", WS_TABSTOP | BS_OWNERDRAW, kBrowse);
+            advanced_features_ = control(L"BUTTON", L"Advanced features...",
+                                         WS_TABSTOP | BS_OWNERDRAW, kAdvancedFeatures);
         }
         level_label_ = label(L"Compression level");
         level_down_ = control(L"BUTTON", L"-", WS_TABSTOP | BS_OWNERDRAW, kLevelDown);
@@ -345,6 +350,9 @@ private:
         }
         const int button_width = scale(86);
         const int button_y = client.bottom - margin - row_height;
+        if (advanced_features_ != nullptr) {
+            MoveWindow(advanced_features_, margin, button_y, scale(154), row_height, TRUE);
+        }
         MoveWindow(cancel_, client.right - margin - button_width, button_y, button_width, row_height, TRUE);
         MoveWindow(accept_, client.right - margin - button_width * 2 - scale(8),
                    button_y, button_width, row_height, TRUE);
@@ -372,7 +380,9 @@ private:
 
     void accept() {
         if (mode_ != DialogMode::settings && window_text(path_edit_).empty()) {
-            MessageBoxW(window_, L"Choose a path first.", L"Axiom", MB_ICONINFORMATION);
+            show_message_dialog(window_, instance_, dpi_, palette_.dark,
+                                L"Axiom", L"Choose a path first.",
+                                MessageDialogIcon::information);
             return;
         }
         if (mode_ == DialogMode::create_archive) {
@@ -392,6 +402,22 @@ private:
         }
         accepted_ = true;
         DestroyWindow(window_);
+    }
+
+    void show_advanced_features() {
+        ArchiveFeatureOptions archive_features = create_options.features;
+        ExtractFeatureOptions extract_features = extract_options.features;
+        const ArchiveFeatureDialogContext context = mode_ == DialogMode::create_archive
+            ? ArchiveFeatureDialogContext::create_or_update
+            : ArchiveFeatureDialogContext::extract;
+        if (show_archive_feature_options_dialog(
+                window_, context, archive_features, extract_features,
+                mode_ == DialogMode::create_archive
+                    ? create_options.feature_availability
+                    : extract_options.feature_availability)) {
+            create_options.features = std::move(archive_features);
+            extract_options.features = std::move(extract_features);
+        }
     }
 
     bool checkbox_checked(int id) const {
@@ -487,6 +513,7 @@ private:
             case WM_COMMAND:
                 switch (LOWORD(wparam)) {
                     case kBrowse: browse(); return 0;
+                    case kAdvancedFeatures: show_advanced_features(); return 0;
                     case kLevelDown: level_ = std::max(1, level_ - 1); update_level(); return 0;
                     case kLevelUp: level_ = std::min(9, level_ + 1); update_level(); return 0;
                     case kAccept: accept(); return 0;
@@ -535,6 +562,7 @@ private:
     HWND path_label_ = nullptr;
     HWND path_edit_ = nullptr;
     HWND browse_ = nullptr;
+    HWND advanced_features_ = nullptr;
     HWND level_label_ = nullptr;
     HWND level_down_ = nullptr;
     HWND level_value_ = nullptr;

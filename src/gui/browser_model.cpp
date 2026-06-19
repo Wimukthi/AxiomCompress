@@ -245,7 +245,17 @@ bool BrowserItem::is_container() const {
 bool BrowserItem::is_parent() const { return kind == BrowserItemKind::parent; }
 
 ArchiveCatalog::ArchiveCatalog(fs::path path, std::vector<ArchiveEntry> entries)
-    : path_(std::move(path)), entries_(std::move(entries)) {}
+    : path_(std::move(path)), entries_(std::move(entries)) {
+    capabilities_.selective_extract = true;
+    capabilities_.update = true;
+    capabilities_.encryption = true;
+    capabilities_.comments = true;
+    capabilities_.lock = true;
+    capabilities_.metadata = true;
+    capabilities_.links = true;
+    capabilities_.locked = archive_is_locked(path_);
+    capabilities_.encrypted = archive_is_encrypted(path_);
+}
 
 std::shared_ptr<const ArchiveCatalog> ArchiveCatalog::load(const fs::path& path) {
     return std::shared_ptr<const ArchiveCatalog>(new ArchiveCatalog(path, list_archive(path)));
@@ -283,6 +293,9 @@ BrowserSnapshot ArchiveCatalog::list(const BrowserLocation& location, std::stop_
         } else if (entry.is_symlink) {
             item.kind = BrowserItemKind::symlink;
             item.type = L"Symbolic link";
+        } else if (entry.is_hardlink) {
+            item.kind = BrowserItemKind::hardlink;
+            item.type = L"Hard link";
         } else {
             item.kind = BrowserItemKind::file;
             item.type = extension_type(fs::path(item.name), false);

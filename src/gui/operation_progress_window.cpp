@@ -95,6 +95,7 @@ void apply_dark_title_bar(HWND hwnd, bool dark) {
 
 OperationProgressWindow::~OperationProgressWindow() {
     close();
+    release_back_buffer();
     if (font_ != nullptr && font_ != GetStockObject(DEFAULT_GUI_FONT)) DeleteObject(font_);
 }
 
@@ -117,13 +118,15 @@ bool OperationProgressWindow::create(HWND owner,
     paused_ = false;
     cancelling_ = false;
     has_progress_ = false;
+    progress_dirty_ = false;
     pulse_ = 0;
     dpi_ = owner != nullptr ? GetDpiForWindow(owner) : GetDpiForSystem();
     if (!register_class()) return false;
 
+    constexpr DWORD kWindowStyle = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU |
+                                   WS_MINIMIZEBOX | WS_CLIPCHILDREN;
     RECT window_rect{0, 0, scale(590), scale(250)};
-    AdjustWindowRectExForDpi(&window_rect, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
-                             FALSE, 0, dpi_);
+    AdjustWindowRectExForDpi(&window_rect, kWindowStyle, FALSE, 0, dpi_);
     const int width = window_rect.right - window_rect.left;
     const int height = window_rect.bottom - window_rect.top;
     RECT owner_rect{};
@@ -132,7 +135,7 @@ bool OperationProgressWindow::create(HWND owner,
     const int y = owner_rect.top + (owner_rect.bottom - owner_rect.top - height) / 2;
     const std::wstring caption = title_ + L" - Axiom";
     hwnd_ = CreateWindowExW(WS_EX_TOOLWINDOW, kWindowClass, caption.c_str(),
-                            WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
+                            kWindowStyle,
                             x, y, width, height, owner, nullptr, instance, this);
     if (hwnd_ == nullptr) return false;
     ShowWindow(hwnd_, SW_SHOWNORMAL);
@@ -209,7 +212,54 @@ void OperationProgressWindow::layout() {
 void OperationProgressWindow::set_progress(const OperationProgress& progress) {
     progress_ = progress;
     has_progress_ = true;
-    InvalidateRect(hwnd_, nullptr, FALSE);
+    progress_dirty_ = true;
+}
+
+void OperationProgressWindow::invalidate_progress_area() {
+    if (hwnd_ == nullptr) return;
+    RECT client{};
+    GetClientRect(hwnd_, &client);
+    RECT progress_area{0, 0, client.right,
+                       std::min(client.bottom, static_cast<LONG>(scale(170)))};
+    InvalidateRect(hwnd_, &progress_area, FALSE);
+}
+
+void OperationProgressWindow::release_back_buffer() {
+    if (back_buffer_dc_ != nullptr && back_buffer_old_bitmap_ != nullptr) {
+        SelectObject(back_buffer_dc_, back_buffer_old_bitmap_);
+    }
+    if (back_buffer_bitmap_ != nullptr) DeleteObject(back_buffer_bitmap_);
+    if (back_buffer_dc_ != nullptr) DeleteDC(back_buffer_dc_);
+    back_buffer_dc_ = nullptr;
+    back_buffer_bitmap_ = nullptr;
+    back_buffer_old_bitmap_ = nullptr;
+    back_buffer_size_ = {};
+}
+
+bool OperationProgressWindow::ensure_back_buffer(HDC reference, int width, int height) {
+    width = std::max(1, width);
+    height = std::max(1, height);
+    if (back_buffer_dc_ != nullptr && back_buffer_bitmap_ != nullptr &&
+        back_buffer_size_.cx == width && back_buffer_size_.cy == height) {
+        return true;
+    }
+
+    release_back_buffer();
+    back_buffer_dc_ = CreateCompatibleDC(reference);
+    if (back_buffer_dc_ == nullptr) return false;
+    back_buffer_bitmap_ = CreateCompatibleBitmap(reference, width, height);
+    if (back_buffer_bitmap_ == nullptr) {
+        release_back_buffer();
+        return false;
+    }
+    back_buffer_old_bitmap_ = SelectObject(back_buffer_dc_, back_buffer_bitmap_);
+    if (back_buffer_old_bitmap_ == nullptr || back_buffer_old_bitmap_ == HGDI_ERROR) {
+        back_buffer_old_bitmap_ = nullptr;
+        release_back_buffer();
+        return false;
+    }
+    back_buffer_size_ = SIZE{width, height};
+    return true;
 }
 
 void OperationProgressWindow::set_cancelling() {
@@ -277,9 +327,14 @@ void OperationProgressWindow::draw_button(const DRAWITEMSTRUCT& draw) const {
 
 void OperationProgressWindow::paint() {
     PAINTSTRUCT paint_info{};
-    HDC dc = BeginPaint(hwnd_, &paint_info);
+    HDC paint_dc = BeginPaint(hwnd_, &paint_info);
     RECT client{};
     GetClientRect(hwnd_, &client);
+
+    const bool buffered = ensure_back_buffer(
+        paint_dc, static_cast<int>(client.right), static_cast<int>(client.bottom));
+    HDC dc = buffered ? back_buffer_dc_ : paint_dc;
+
     fill_rect(dc, client, theme_.background);
     HGDIOBJ old_font = SelectObject(dc, font_);
     SetBkMode(dc, TRANSPARENT);
@@ -376,6 +431,12 @@ void OperationProgressWindow::paint() {
     DrawTextW(dc, details.c_str(), -1, &details_rect, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
 
     SelectObject(dc, old_font);
+    if (buffered) {
+        const RECT& dirty = paint_info.rcPaint;
+        BitBlt(paint_dc, dirty.left, dirty.top,
+               dirty.right - dirty.left, dirty.bottom - dirty.top,
+               back_buffer_dc_, dirty.left, dirty.top, SRCCOPY);
+    }
     EndPaint(hwnd_, &paint_info);
 }
 
@@ -411,7 +472,11 @@ LRESULT OperationProgressWindow::handle_message(UINT message, WPARAM wparam, LPA
         case WM_TIMER:
             if (!has_progress_ || progress_.total_bytes == 0) {
                 pulse_ += scale(5);
-                InvalidateRect(hwnd_, nullptr, FALSE);
+                progress_dirty_ = true;
+            }
+            if (progress_dirty_) {
+                progress_dirty_ = false;
+                invalidate_progress_area();
             }
             return 0;
         case WM_DRAWITEM:
@@ -424,7 +489,10 @@ LRESULT OperationProgressWindow::handle_message(UINT message, WPARAM wparam, LPA
         case WM_SETTINGCHANGE:
         case WM_THEMECHANGED: apply_theme(); return 0;
         case WM_CLOSE: request_cancel(); return 0;
-        case WM_DESTROY: KillTimer(hwnd_, kAnimationTimer); return 0;
+        case WM_DESTROY:
+            KillTimer(hwnd_, kAnimationTimer);
+            release_back_buffer();
+            return 0;
         case WM_NCDESTROY:
             hwnd_ = nullptr;
             pause_button_ = nullptr;

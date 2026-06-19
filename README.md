@@ -16,7 +16,7 @@ What it does today:
   order-0 rANS**, and an adaptive **order-1** coder — chosen per substream.
 - **Threaded** independent-block compression and decompression, with progress
   reporting and cooperative pause/cancel (`OperationControl`).
-- **CLI** (`axiomc`) and a **Windows GUI** (`axiom_gui`).
+- **CLI** (`axiomc`) and a **Windows GUI** (`Axiom.exe`).
 - Coverage-guided libFuzzer+ASan targets and a Release-mode test suite.
 
 It does not yet match 7-Zip's ratio — the open gap is the entropy stage (a
@@ -90,7 +90,7 @@ axiomc d output.axc restored.bin
 
 ## GUI
 
-`out\Release\axiom_gui.exe` is a native Win32 frontend for `.axar` archives. It
+`out\Release\Axiom.exe` is a native Win32 frontend for `.axar` archives. It
 supports adding files/folders, creating archives, opening/listing archives,
 testing integrity, and extracting to a chosen folder. The GUI is Windows-only,
 per-monitor DPI aware, and has a dark-mode foundation (system theme detection,

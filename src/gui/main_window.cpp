@@ -1,15 +1,20 @@
 #define NOMINMAX
 #include "axiom/archive.hpp"
 #include "axiom/axiom.hpp"
+#include "gui/about_dialog.hpp"
 #include "gui/app.hpp"
 #include "gui/archive_dialogs.hpp"
+#include "gui/archive_feature_dialogs.hpp"
 #include "gui/browser_model.hpp"
 #include "gui/custom_menu.hpp"
+#include "gui/dialog_support.hpp"
 #include "gui/directory_watcher.hpp"
+#include "gui/message_dialog.hpp"
 #include "gui/operation_runner.hpp"
 #include "gui/operation_progress_window.hpp"
 #include "gui/settings_store.hpp"
 #include "gui/toolbar_icons.hpp"
+#include "gui/update_checker.hpp"
 
 #include <windows.h>
 #include <windowsx.h>
@@ -83,6 +88,19 @@ enum ControlId : int {
     kExitApplication = 1110,
     kSelectAll = 1111,
     kAbout = 1112,
+    kCheckUpdates = 1113,
+    kArchiveFeatures = 1120,
+    kUpdateArchive = 1121,
+    kSynchronizeArchive = 1122,
+    kDeleteArchiveEntries = 1123,
+    kRepackArchive = 1124,
+    kEditArchiveComment = 1125,
+    kLockArchive = 1126,
+    kRepairArchive = 1127,
+    kCreateRecoveryVolumes = 1128,
+    kVerifyArchiveSignature = 1129,
+    kCreateSfx = 1130,
+    kFreshenArchive = 1131,
 };
 
 template <typename T>
@@ -143,6 +161,26 @@ std::wstring widen(std::string_view text, UINT code_page = CP_UTF8) {
     MultiByteToWideChar(code_page, flags, text.data(), static_cast<int>(text.size()),
                         output.data(), needed);
     return output;
+}
+
+std::string utf8(std::wstring_view text) {
+    if (text.empty()) return {};
+    const int needed = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS,
+                                            text.data(), static_cast<int>(text.size()),
+                                            nullptr, 0, nullptr, nullptr);
+    if (needed <= 0) return {};
+    std::string output(static_cast<std::size_t>(needed), '\0');
+    WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS,
+                        text.data(), static_cast<int>(text.size()),
+                        output.data(), needed, nullptr, nullptr);
+    return output;
+}
+
+void secure_clear(std::wstring& text) {
+    if (!text.empty()) {
+        SecureZeroMemory(text.data(), text.size() * sizeof(wchar_t));
+        text.clear();
+    }
 }
 
 std::wstring get_text(HWND hwnd) {
@@ -214,43 +252,6 @@ ShellIconRef shell_icon_for_item(const axiom::gui::BrowserItem& item) {
     const auto image_list = reinterpret_cast<HIMAGELIST>(
         SHGetFileInfoW(query.c_str(), attributes, &info, sizeof(info), flags));
     return {image_list, image_list != nullptr ? info.iIcon : -1};
-}
-
-std::wstring stage_text(axiom::OperationStage stage) {
-    switch (stage) {
-        case axiom::OperationStage::scanning: return L"Scanning";
-        case axiom::OperationStage::reading: return L"Reading";
-        case axiom::OperationStage::compressing: return L"Compressing";
-        case axiom::OperationStage::writing: return L"Writing";
-        case axiom::OperationStage::testing: return L"Testing";
-        case axiom::OperationStage::extracting: return L"Extracting";
-        case axiom::OperationStage::finalizing: return L"Finalizing";
-        default: return L"Working";
-    }
-}
-
-std::wstring format_progress_text(const axiom::OperationProgress& progress) {
-    std::wstringstream stream;
-    stream << stage_text(progress.stage);
-    if (progress.total_bytes > 0) {
-        const double percent =
-            (static_cast<double>(progress.completed_bytes) * 100.0) /
-            static_cast<double>(progress.total_bytes);
-        stream.setf(std::ios::fixed);
-        stream.precision(1);
-        stream << L"... " << percent << L"% ("
-               << format_size(progress.completed_bytes) << L" / "
-               << format_size(progress.total_bytes) << L')';
-    } else {
-        stream << L"...";
-    }
-    if (progress.total_items > 0) {
-        stream << L"  " << progress.completed_items << L"/" << progress.total_items;
-    }
-    if (!progress.current_path.empty()) {
-        stream << L"  " << widen(progress.current_path);
-    }
-    return stream.str();
 }
 
 std::optional<fs::path> shell_item_path(IShellItem* item) {
@@ -416,6 +417,9 @@ struct ThemePalette {
     COLORREF selection = GetSysColor(COLOR_HIGHLIGHT);
     COLORREF selection_text = GetSysColor(COLOR_HIGHLIGHTTEXT);
     COLORREF focus = GetSysColor(COLOR_HOTLIGHT);
+    COLORREF scrollbar_track = GetSysColor(COLOR_BTNFACE);
+    COLORREF scrollbar_thumb = GetSysColor(COLOR_BTNSHADOW);
+    COLORREF scrollbar_thumb_pressed = GetSysColor(COLOR_3DDKSHADOW);
 };
 
 bool high_contrast_enabled() {
@@ -460,6 +464,9 @@ ThemePalette make_theme() {
         theme.selection = RGB(55, 78, 112);
         theme.selection_text = RGB(255, 255, 255);
         theme.focus = RGB(78, 115, 158);
+        theme.scrollbar_track = RGB(45, 45, 48);
+        theme.scrollbar_thumb = RGB(92, 92, 96);
+        theme.scrollbar_thumb_pressed = RGB(122, 122, 126);
     }
     return theme;
 }
@@ -607,6 +614,7 @@ public:
 
     void set_columns(std::vector<TableColumn> columns) {
         columns_ = std::move(columns);
+        clamp_scroll();
         invalidate();
     }
 
@@ -628,6 +636,7 @@ public:
         selected_row_ = -1;
         selection_anchor_ = -1;
         scroll_y_ = 0;
+        scroll_x_ = 0;
         invalidate();
     }
 
@@ -697,14 +706,73 @@ private:
         return scale(8);
     }
 
+    int scrollbar_gap() const {
+        return scale(2);
+    }
+
     int content_height() const {
         return row_height() * static_cast<int>(rows_.size());
+    }
+
+    int requested_content_width() const {
+        int width = 0;
+        for (const auto& column : columns_) {
+            width += scale(column.logical_width);
+        }
+        return width;
+    }
+
+    struct ScrollbarVisibility {
+        bool vertical = false;
+        bool horizontal = false;
+    };
+
+    ScrollbarVisibility scrollbar_visibility(const RECT& client) const {
+        ScrollbarVisibility visibility;
+        const int base_width = std::max(
+            0, static_cast<int>(client.right - client.left) - scale(2));
+        const int base_height = std::max(
+            0, static_cast<int>(client.bottom - client.top) - header_height() - scale(1));
+
+        // Each scrollbar consumes space that can make the other one necessary.
+        for (int pass = 0; pass < 3; ++pass) {
+            const int width = std::max(
+                0, base_width - (visibility.vertical
+                                      ? scrollbar_width() + scrollbar_gap()
+                                      : 0));
+            if (requested_content_width() > width) {
+                visibility.horizontal = true;
+            }
+
+            const int height = std::max(
+                0, base_height - (visibility.horizontal
+                                       ? scrollbar_width() + scrollbar_gap()
+                                       : 0));
+            if (content_height() > height) {
+                visibility.vertical = true;
+            }
+        }
+        return visibility;
+    }
+
+    int rows_bottom(const RECT& client) const {
+        const auto visibility = scrollbar_visibility(client);
+        int bottom = client.bottom - scale(1);
+        if (visibility.horizontal) {
+            bottom -= scrollbar_width() + scrollbar_gap();
+        }
+        return std::max(static_cast<int>(client.top) + header_height(), bottom);
+    }
+
+    int viewport_height(const RECT& client) const {
+        return std::max(0, rows_bottom(client) -
+                               (static_cast<int>(client.top) + header_height()));
     }
 
     int viewport_height() const {
         RECT client{};
         GetClientRect(hwnd_, &client);
-        return std::max(0, static_cast<int>(client.bottom - client.top) - header_height());
+        return viewport_height(client);
     }
 
     int max_scroll() const {
@@ -713,6 +781,7 @@ private:
 
     void clamp_scroll() {
         scroll_y_ = std::clamp(scroll_y_, 0, max_scroll());
+        scroll_x_ = std::clamp(scroll_x_, 0, max_scroll_x());
     }
 
     void invalidate() const {
@@ -737,11 +806,65 @@ private:
         return widths;
     }
 
+    int table_left(const RECT& client) const {
+        return client.left + scale(1);
+    }
+
+    int table_right(const RECT& client) const {
+        int right = client.right - scale(1);
+        if (scrollbar_visibility(client).vertical) {
+            right -= scrollbar_width() + scrollbar_gap();
+        }
+        return std::max(table_left(client), right);
+    }
+
+    std::vector<int> column_widths(const RECT& client) const {
+        return column_widths(std::max(0, table_right(client) - table_left(client)));
+    }
+
+    int max_scroll_x(const RECT& client) const {
+        const auto widths = column_widths(client);
+        int content_width = 0;
+        for (const int width : widths) {
+            content_width += width;
+        }
+        return std::max(0, content_width - (table_right(client) - table_left(client)));
+    }
+
+    int max_scroll_x() const {
+        RECT client{};
+        GetClientRect(hwnd_, &client);
+        return max_scroll_x(client);
+    }
+
+    int column_separator_at(POINT point, const RECT& client) const {
+        if (point.y < client.top + scale(1) ||
+            point.y >= client.top + header_height()) {
+            return -1;
+        }
+
+        const int right = table_right(client);
+        const auto widths = column_widths(client);
+        int x = table_left(client) - scroll_x_;
+        for (int column = 0; column < static_cast<int>(widths.size()); ++column) {
+            const int next_x = x + widths[static_cast<std::size_t>(column)];
+            if (next_x >= table_left(client) && next_x < right &&
+                std::abs(point.x - next_x) <= scale(5)) {
+                return column;
+            }
+            x = next_x;
+            if (x >= right) {
+                break;
+            }
+        }
+        return -1;
+    }
+
     RECT scrollbar_track_rect(const RECT& client) const {
         return RECT{client.right - scrollbar_width() - scale(1),
                     client.top + header_height() + scale(1),
                     client.right - scale(1),
-                    client.bottom - scale(1)};
+                    rows_bottom(client)};
     }
 
     RECT scrollbar_thumb_rect(const RECT& client) const {
@@ -758,6 +881,30 @@ private:
         const int travel = std::max(0, track_height - thumb_height);
         const int top = track.top + (max_scroll() == 0 ? 0 : MulDiv(scroll_y_, travel, max_scroll()));
         return RECT{track.left, top, track.right, top + thumb_height};
+    }
+
+    RECT horizontal_scrollbar_track_rect(const RECT& client) const {
+        return RECT{table_left(client),
+                    rows_bottom(client) + scrollbar_gap(),
+                    table_right(client),
+                    client.bottom - scale(1)};
+    }
+
+    RECT horizontal_scrollbar_thumb_rect(const RECT& client) const {
+        const RECT track = horizontal_scrollbar_track_rect(client);
+        const int track_width = std::max(0, static_cast<int>(track.right - track.left));
+        const int viewport = std::max(0, table_right(client) - table_left(client));
+        const int maximum = max_scroll_x(client);
+        const int content = viewport + maximum;
+        if (maximum <= 0 || track_width <= 0 || content <= 0) {
+            return RECT{track.left, track.top, track.left, track.bottom};
+        }
+
+        const int thumb_width = std::clamp(
+            MulDiv(viewport, track_width, content), scale(24), track_width);
+        const int travel = std::max(0, track_width - thumb_width);
+        const int left = track.left + MulDiv(scroll_x_, travel, maximum);
+        return RECT{left, track.top, left + thumb_width, track.bottom};
     }
 
     bool point_in_rect(POINT point, const RECT& rect) const {
@@ -778,8 +925,27 @@ private:
         invalidate();
     }
 
+    void set_horizontal_scroll_from_thumb(POINT point, const RECT& client) {
+        const RECT track = horizontal_scrollbar_track_rect(client);
+        const RECT thumb = horizontal_scrollbar_thumb_rect(client);
+        const int thumb_width = thumb.right - thumb.left;
+        const int travel = std::max(1, static_cast<int>(track.right - track.left) - thumb_width);
+        const int thumb_left = std::clamp(static_cast<int>(point.x) - drag_offset_x_,
+                                          static_cast<int>(track.left),
+                                          static_cast<int>(track.right) - thumb_width);
+        scroll_x_ = MulDiv(thumb_left - track.left, max_scroll_x(client), travel);
+        clamp_scroll();
+        invalidate();
+    }
+
     void scroll_by(int pixels) {
         scroll_y_ += pixels;
+        clamp_scroll();
+        invalidate();
+    }
+
+    void scroll_horizontally_by(int pixels) {
+        scroll_x_ += pixels;
         clamp_scroll();
         invalidate();
     }
@@ -837,35 +1003,42 @@ private:
         HGDIOBJ old_font = SelectObject(dc, font);
         SetBkMode(dc, TRANSPARENT);
 
-        RECT header{client.left + scale(1), client.top + scale(1),
+        const auto visibility = scrollbar_visibility(client);
+        const int content_left = table_left(client);
+        const int content_right = table_right(client);
+        RECT header{content_left, client.top + scale(1),
                     client.right - scale(1), client.top + header_height()};
         fill_solid_rect(dc, header, theme_.panel);
 
-        const int table_right = client.right - scale(1) -
-                                (content_height() > viewport_height() ? scrollbar_width() + scale(2) : 0);
-        const auto widths = column_widths(table_right - client.left - scale(1));
-        int x = client.left + scale(1);
+        const auto widths = column_widths(client);
+        const int saved_header_dc = SaveDC(dc);
+        IntersectClipRect(dc, content_left, header.top, content_right, header.bottom);
+        int x = content_left - scroll_x_;
         for (std::size_t i = 0; i < columns_.size(); ++i) {
-            const int next_x = std::min(table_right, x + widths[i]);
-            RECT cell{x + scale(7), header.top, next_x - scale(7), header.bottom};
-            SetTextColor(dc, theme_.text);
-            std::wstring title = columns_[i].title;
-            if (static_cast<int>(i) == sort_column_) title += sort_ascending_ ? L"  ^" : L"  v";
-            DrawTextW(dc, title.c_str(), -1, &cell,
-                      DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
-            draw_solid_line(dc, next_x, header.top, next_x, client.bottom - scale(1), theme_.border);
+            const int next_x = x + widths[i];
+            if (next_x > content_left && x < content_right) {
+                RECT cell{x + scale(7), header.top, next_x - scale(7), header.bottom};
+                SetTextColor(dc, theme_.text);
+                std::wstring title = columns_[i].title;
+                if (static_cast<int>(i) == sort_column_) {
+                    title += sort_ascending_ ? L"  ^" : L"  v";
+                }
+                DrawTextW(dc, title.c_str(), -1, &cell,
+                          DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+                draw_solid_line(dc, next_x, header.top, next_x, header.bottom, theme_.border);
+            }
             x = next_x;
-            if (x >= table_right) {
+            if (x >= content_right) {
                 break;
             }
         }
-        draw_solid_line(dc, client.left + scale(1), header.bottom - scale(1),
-                        client.right - scale(1), header.bottom - scale(1), theme_.border);
+        RestoreDC(dc, saved_header_dc);
+        draw_solid_line(dc, content_left, header.bottom - scale(1),
+                        content_right, header.bottom - scale(1), theme_.border);
 
-        RECT rows_clip{client.left + scale(1), header.bottom, table_right, client.bottom - scale(1)};
-        HRGN clip = CreateRectRgn(rows_clip.left, rows_clip.top, rows_clip.right, rows_clip.bottom);
-        SelectClipRgn(dc, clip);
-        DeleteObject(clip);
+        RECT rows_clip{content_left, header.bottom, content_right, rows_bottom(client)};
+        const int saved_rows_dc = SaveDC(dc);
+        IntersectClipRect(dc, rows_clip.left, rows_clip.top, rows_clip.right, rows_clip.bottom);
 
         const int row_h = row_height();
         const int first_row = row_h > 0 ? scroll_y_ / row_h : 0;
@@ -875,25 +1048,29 @@ private:
             const bool selected = row < static_cast<int>(selected_.size()) && selected_[row];
             fill_solid_rect(dc, row_rect, selected ? theme_.selection : theme_.edit);
 
-            x = rows_clip.left;
+            x = content_left - scroll_x_;
             for (std::size_t col = 0; col < columns_.size(); ++col) {
-                const int next_x = std::min(static_cast<int>(rows_clip.right), x + widths[col]);
-                RECT cell{x + scale(7), row_rect.top, next_x - scale(7), row_rect.bottom};
-                if (col == 0 && image_list_ != nullptr &&
-                    row < static_cast<int>(icon_indices_.size()) && icon_indices_[row] >= 0) {
-                    int icon_width = 0;
-                    int icon_height = 0;
-                    ImageList_GetIconSize(image_list_, &icon_width, &icon_height);
-                    const int icon_y = row_rect.top + std::max(0, (row_h - icon_height) / 2);
-                    ImageList_Draw(image_list_, icon_indices_[row], dc, cell.left, icon_y, ILD_TRANSPARENT);
-                    cell.left += icon_width + scale(5);
+                const int next_x = x + widths[col];
+                if (next_x > rows_clip.left && x < rows_clip.right) {
+                    RECT cell{x + scale(7), row_rect.top, next_x - scale(7), row_rect.bottom};
+                    if (col == 0 && image_list_ != nullptr &&
+                        row < static_cast<int>(icon_indices_.size()) && icon_indices_[row] >= 0) {
+                        int icon_width = 0;
+                        int icon_height = 0;
+                        ImageList_GetIconSize(image_list_, &icon_width, &icon_height);
+                        const int icon_y = row_rect.top + std::max(0, (row_h - icon_height) / 2);
+                        ImageList_Draw(image_list_, icon_indices_[row], dc, cell.left, icon_y,
+                                       ILD_TRANSPARENT);
+                        cell.left += icon_width + scale(5);
+                    }
+                    const std::wstring empty;
+                    const std::wstring& text =
+                        col < rows_[row].size() ? rows_[row][col] : empty;
+                    SetTextColor(dc, selected ? theme_.selection_text : theme_.text);
+                    DrawTextW(dc, text.c_str(), -1, &cell,
+                              DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS |
+                                  DT_NOPREFIX);
                 }
-                const std::wstring empty;
-                const std::wstring& text =
-                    col < rows_[row].size() ? rows_[row][col] : empty;
-                SetTextColor(dc, selected ? theme_.selection_text : theme_.text);
-                DrawTextW(dc, text.c_str(), -1, &cell,
-                          DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
                 x = next_x;
                 if (x >= rows_clip.right) {
                     break;
@@ -904,19 +1081,43 @@ private:
             y += row_h;
         }
 
-        SelectClipRgn(dc, nullptr);
-
-        if (content_height() > viewport_height()) {
-            RECT track = scrollbar_track_rect(client);
-            RECT thumb = scrollbar_thumb_rect(client);
-            fill_solid_rect(dc, track, theme_.panel);
-            fill_solid_rect(dc, thumb, dragging_scrollbar_ ? theme_.focus : theme_.selection);
+        // Draw grid lines last so they remain continuous across selection fills and
+        // the empty area below the final row.
+        x = content_left - scroll_x_;
+        for (const int width : widths) {
+            const int next_x = x + width;
+            if (next_x > rows_clip.left && next_x <= rows_clip.right) {
+                draw_solid_line(dc, next_x, rows_clip.top, next_x, rows_clip.bottom,
+                                theme_.border);
+            }
+            x = next_x;
+            if (x >= rows_clip.right) {
+                break;
+            }
         }
+        RestoreDC(dc, saved_rows_dc);
 
-        if (GetFocus() == hwnd_) {
-            RECT focus = client;
-            InflateRect(&focus, -scale(2), -scale(2));
-            frame_solid_rect(dc, focus, theme_.focus);
+        if (visibility.vertical) {
+            const RECT track = scrollbar_track_rect(client);
+            const RECT thumb = scrollbar_thumb_rect(client);
+            fill_solid_rect(dc, track, theme_.scrollbar_track);
+            fill_solid_rect(dc, thumb, dragging_scrollbar_
+                                           ? theme_.scrollbar_thumb_pressed
+                                           : theme_.scrollbar_thumb);
+        }
+        if (visibility.horizontal) {
+            const RECT track = horizontal_scrollbar_track_rect(client);
+            const RECT thumb = horizontal_scrollbar_thumb_rect(client);
+            fill_solid_rect(dc, track, theme_.scrollbar_track);
+            fill_solid_rect(dc, thumb, dragging_horizontal_scrollbar_
+                                           ? theme_.scrollbar_thumb_pressed
+                                           : theme_.scrollbar_thumb);
+        }
+        if (visibility.vertical && visibility.horizontal) {
+            RECT corner{table_right(client) + scrollbar_gap(),
+                        rows_bottom(client) + scrollbar_gap(),
+                        client.right - scale(1), client.bottom - scale(1)};
+            fill_solid_rect(dc, corner, theme_.scrollbar_track);
         }
 
         SelectObject(dc, old_font);
@@ -959,28 +1160,41 @@ private:
                 invalidate();
                 return 0;
             case WM_MOUSEWHEEL:
-                scroll_by(-GET_WHEEL_DELTA_WPARAM(wparam) / WHEEL_DELTA * row_height() * 3);
+                if ((GET_KEYSTATE_WPARAM(wparam) & MK_SHIFT) != 0) {
+                    scroll_horizontally_by(
+                        -GET_WHEEL_DELTA_WPARAM(wparam) / WHEEL_DELTA * scale(96));
+                } else {
+                    scroll_by(-GET_WHEEL_DELTA_WPARAM(wparam) / WHEEL_DELTA * row_height() * 3);
+                }
+                return 0;
+            case WM_MOUSEHWHEEL:
+                scroll_horizontally_by(
+                    GET_WHEEL_DELTA_WPARAM(wparam) / WHEEL_DELTA * scale(96));
                 return 0;
             case WM_LBUTTONDOWN: {
                 SetFocus(hwnd_);
                 RECT client{};
                 GetClientRect(hwnd_, &client);
                 POINT point{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
-                if (point.y < header_height()) {
-                    const int table_width = std::max(0, static_cast<int>(client.right - client.left));
-                    const auto widths = column_widths(table_width);
-                    int boundary = 0;
+                if (point.y < client.top + header_height() &&
+                    point.x >= table_left(client) && point.x < table_right(client)) {
+                    const int separator = column_separator_at(point, client);
+                    if (separator >= 0) {
+                        resizing_column_ = separator;
+                        resize_start_x_ = point.x;
+                        resize_start_width_ =
+                            columns_[static_cast<std::size_t>(separator)].logical_width;
+                        SetCapture(hwnd_);
+                        SetCursor(LoadCursorW(nullptr, IDC_SIZEWE));
+                        return 0;
+                    }
+
+                    const auto widths = column_widths(client);
+                    int boundary = table_left(client) - scroll_x_;
                     for (int column = 0; column < static_cast<int>(widths.size()); ++column) {
+                        const int left = boundary;
                         boundary += widths[column];
-                        if (column + 1 < static_cast<int>(widths.size()) &&
-                            std::abs(point.x - boundary) <= scale(4)) {
-                            resizing_column_ = column;
-                            resize_start_x_ = point.x;
-                            resize_start_width_ = columns_[column].logical_width;
-                            SetCapture(hwnd_);
-                            return 0;
-                        }
-                        if (point.x < boundary) {
+                        if (point.x >= left && point.x < boundary) {
                             SendMessageW(GetParent(hwnd_), kTableSortMessage,
                                          static_cast<WPARAM>(column), 0);
                             break;
@@ -988,7 +1202,8 @@ private:
                     }
                     return 0;
                 }
-                if (content_height() > viewport_height()) {
+                const auto visibility = scrollbar_visibility(client);
+                if (visibility.vertical) {
                     const RECT thumb = scrollbar_thumb_rect(client);
                     const RECT track = scrollbar_track_rect(client);
                     if (point_in_rect(point, thumb)) {
@@ -1003,6 +1218,25 @@ private:
                         return 0;
                     }
                 }
+                if (visibility.horizontal) {
+                    const RECT thumb = horizontal_scrollbar_thumb_rect(client);
+                    const RECT track = horizontal_scrollbar_track_rect(client);
+                    if (point_in_rect(point, thumb)) {
+                        dragging_horizontal_scrollbar_ = true;
+                        drag_offset_x_ = point.x - thumb.left;
+                        SetCapture(hwnd_);
+                        return 0;
+                    }
+                    if (point_in_rect(point, track)) {
+                        drag_offset_x_ = (thumb.right - thumb.left) / 2;
+                        set_horizontal_scroll_from_thumb(point, client);
+                        return 0;
+                    }
+                }
+                if (point.x < table_left(client) || point.x >= table_right(client) ||
+                    point.y >= rows_bottom(client)) {
+                    return 0;
+                }
                 const int y = point.y - header_height() + scroll_y_;
                 const int row = row_height() > 0 ? y / row_height() : -1;
                 select_row(row >= 0 && row < static_cast<int>(rows_.size()) ? row : -1,
@@ -1010,12 +1244,26 @@ private:
                            (GetKeyState(VK_CONTROL) & 0x8000) != 0);
                 return 0;
             }
-            case WM_LBUTTONDBLCLK:
+            case WM_LBUTTONDBLCLK: {
+                RECT client{};
+                GetClientRect(hwnd_, &client);
+                const POINT point{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
+                if (point.y < header_height() || point.y >= rows_bottom(client) ||
+                    point.x < table_left(client) || point.x >= table_right(client)) {
+                    return 0;
+                }
                 notify_parent(kTableActivateMessage);
                 return 0;
+            }
             case WM_RBUTTONDOWN: {
                 SetFocus(hwnd_);
+                RECT client{};
+                GetClientRect(hwnd_, &client);
                 POINT point{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
+                if (point.y < header_height() || point.y >= rows_bottom(client) ||
+                    point.x < table_left(client) || point.x >= table_right(client)) {
+                    return 0;
+                }
                 const int y = point.y - header_height() + scroll_y_;
                 const int row = row_height() > 0 ? y / row_height() : -1;
                 if (row >= 0 && row < static_cast<int>(rows_.size()) &&
@@ -1034,11 +1282,14 @@ private:
             case WM_MOUSEMOVE:
                 if (resizing_column_ >= 0) {
                     POINT point{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
-                    const int logical_delta = MulDiv(point.x - resize_start_x_,
-                                                     USER_DEFAULT_SCREEN_DPI,
-                                                     static_cast<int>(dpi_));
-                    columns_[resizing_column_].logical_width =
-                        std::max(48, resize_start_width_ + logical_delta);
+                    const int requested = scale(resize_start_width_) +
+                                          point.x - resize_start_x_;
+                    const int width = std::max(requested, scale(48));
+                    columns_[static_cast<std::size_t>(resizing_column_)].logical_width =
+                        std::max(48, MulDiv(width, USER_DEFAULT_SCREEN_DPI,
+                                           static_cast<int>(dpi_)));
+                    clamp_scroll();
+                    SetCursor(LoadCursorW(nullptr, IDC_SIZEWE));
                     invalidate();
                     return 0;
                 }
@@ -1048,6 +1299,26 @@ private:
                     POINT point{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
                     set_scroll_from_thumb(point, client);
                     return 0;
+                }
+                if (dragging_horizontal_scrollbar_) {
+                    RECT client{};
+                    GetClientRect(hwnd_, &client);
+                    POINT point{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
+                    set_horizontal_scroll_from_thumb(point, client);
+                    return 0;
+                }
+                break;
+            case WM_SETCURSOR:
+                if (LOWORD(lparam) == HTCLIENT) {
+                    POINT point{};
+                    GetCursorPos(&point);
+                    ScreenToClient(hwnd_, &point);
+                    RECT client{};
+                    GetClientRect(hwnd_, &client);
+                    if (resizing_column_ >= 0 || column_separator_at(point, client) >= 0) {
+                        SetCursor(LoadCursorW(nullptr, IDC_SIZEWE));
+                        return TRUE;
+                    }
                 }
                 break;
             case WM_LBUTTONUP:
@@ -1059,6 +1330,12 @@ private:
                 }
                 if (dragging_scrollbar_) {
                     dragging_scrollbar_ = false;
+                    ReleaseCapture();
+                    invalidate();
+                    return 0;
+                }
+                if (dragging_horizontal_scrollbar_) {
+                    dragging_horizontal_scrollbar_ = false;
                     ReleaseCapture();
                     invalidate();
                     return 0;
@@ -1094,6 +1371,21 @@ private:
                     return 0;
                 }
                 break;
+            case WM_CANCELMODE:
+                if (GetCapture() == hwnd_) {
+                    ReleaseCapture();
+                }
+                resizing_column_ = -1;
+                dragging_scrollbar_ = false;
+                dragging_horizontal_scrollbar_ = false;
+                invalidate();
+                return 0;
+            case WM_CAPTURECHANGED:
+                resizing_column_ = -1;
+                dragging_scrollbar_ = false;
+                dragging_horizontal_scrollbar_ = false;
+                invalidate();
+                return 0;
         }
         return DefWindowProcW(hwnd_, message, wparam, lparam);
     }
@@ -1120,10 +1412,13 @@ private:
     HFONT font_ = nullptr;
     UINT dpi_ = USER_DEFAULT_SCREEN_DPI;
     int scroll_y_ = 0;
+    int scroll_x_ = 0;
     int selected_row_ = -1;
     int selection_anchor_ = -1;
     bool dragging_scrollbar_ = false;
+    bool dragging_horizontal_scrollbar_ = false;
     int drag_offset_y_ = 0;
+    int drag_offset_x_ = 0;
     std::vector<TableColumn> columns_;
     std::vector<std::vector<std::wstring>> rows_;
     std::vector<bool> selected_;
@@ -1163,8 +1458,7 @@ public:
         wc.lpfnWndProc = &MainWindow::window_proc;
         wc.lpszClassName = L"AxiomGuiWindow";
         wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-        wc.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
-        wc.hIconSm = LoadIconW(nullptr, IDI_APPLICATION);
+        axiom::gui::assign_axiom_window_class_icons(wc, instance);
         wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
 
         if (RegisterClassExW(&wc) == 0) {
@@ -1177,6 +1471,7 @@ public:
         if (hwnd_ == nullptr) {
             return false;
         }
+        axiom::gui::apply_axiom_window_icons(hwnd_, instance);
 
         if (persisted_settings_.has_placement) {
             if (persisted_settings_.placement.showCmd == SW_SHOWMINIMIZED) {
@@ -1454,9 +1749,24 @@ private:
         SendMessageW(tooltip_, TTM_ADDTOOLW, 0, reinterpret_cast<LPARAM>(&tool));
     }
 
+    int show_app_message(
+        std::wstring_view message,
+        axiom::gui::MessageDialogIcon icon,
+        std::wstring_view title = L"Axiom",
+        axiom::gui::MessageDialogButtons buttons = axiom::gui::MessageDialogButtons::ok,
+        int default_result = IDOK) const {
+        return axiom::gui::show_message_dialog(
+            hwnd_, instance_, dpi_, theme_.dark, title, message, icon, buttons, default_result);
+    }
+
     std::vector<axiom::gui::CustomMenuItem> menu_items(UINT menu_id) const {
         const bool has_selection = !selected_browser_indices().empty();
         const bool has_archive = active_archive_path().has_value();
+        const bool browsing_archive =
+            history_.current().kind == axiom::gui::BrowserLocationKind::archive;
+        const axiom::gui::ArchiveCapabilities capabilities = active_archive_capabilities();
+        const bool archive_editable = capabilities.update && !capabilities.locked &&
+                                      !capabilities.encrypted;
         switch (menu_id) {
             case kMenuFile:
                 return {
@@ -1466,20 +1776,54 @@ private:
                 };
             case kMenuCommands:
                 return {
-                    {kAddFiles, L"&Add to archive...", L"Ctrl+N", !busy_},
+                    {kAddFiles, L"&Add to archive...", L"Ctrl+N",
+                     !busy_ && (!browsing_archive || archive_editable)},
                     {kExtract, L"&Extract...", L"Ctrl+E", !busy_ && has_archive},
                     {kTest, L"&Test archive", L"Ctrl+T", !busy_ && has_archive},
                     {0, L"", L"", false, true},
+                    {kUpdateArchive, L"&Update archive...", L"",
+                      !busy_ && has_archive && archive_editable},
+                    {kFreshenArchive, L"&Freshen archive...", L"",
+                     !busy_ && has_archive && archive_editable},
+                    {kSynchronizeArchive, L"S&ynchronize archive...", L"",
+                      !busy_ && has_archive && archive_editable},
+                    {kDeleteArchiveEntries, L"Delete from archive...", L"",
+                      !busy_ && browsing_archive && has_selection && archive_editable},
+                    {kRepackArchive, L"&Repack archive...", L"",
+                      !busy_ && has_archive && archive_editable},
+                    {0, L"", L"", false, true},
                     {kView, L"&View", L"Enter", has_selection},
-                    {kDelete, L"&Delete", L"Delete", !busy_ && has_selection},
+                    {kDelete, browsing_archive ? L"&Delete from archive" : L"&Delete",
+                     L"Delete", !busy_ && has_selection &&
+                          (!browsing_archive || archive_editable)},
                     {kSelectAll, L"Select &all", L"Ctrl+A", !browser_items_.empty()},
                 };
             case kMenuTools:
-                return {{kInfo, L"Archive &information", L"Ctrl+I"}};
+                return {
+                    {kInfo, L"Archive &information", L"Ctrl+I"},
+                    {kArchiveFeatures, L"Archive &features...", L"", has_archive},
+                    {0, L"", L"", false, true},
+                    {kEditArchiveComment, L"Edit archive &comment...", L"",
+                      !busy_ && has_archive && capabilities.comments && archive_editable},
+                    {kLockArchive, L"&Lock archive...", L"",
+                      !busy_ && has_archive && capabilities.lock && archive_editable},
+                    {kRepairArchive, L"&Repair archive...", L"",
+                     !busy_ && has_archive && capabilities.recovery_records},
+                    {kCreateRecoveryVolumes, L"Create recovery &volumes...", L"",
+                     !busy_ && has_archive && capabilities.recovery_records &&
+                         capabilities.multi_volume},
+                    {kVerifyArchiveSignature, L"Verify &signature...", L"",
+                     !busy_ && has_archive && capabilities.authenticity},
+                    {kCreateSfx, L"Create &self-extracting archive...", L"", false},
+                };
             case kMenuOptions:
                 return {{kSettings, L"&Settings...", L"", !busy_}};
             case kMenuHelp:
-                return {{kAbout, L"&About Axiom", L"F1"}};
+                return {
+                    {kCheckUpdates, L"Check for &Updates...", L""},
+                    {0, L"", L"", false, true},
+                    {kAbout, L"&About Axiom", L"F1"},
+                };
             default:
                 return {};
         }
@@ -1488,6 +1832,11 @@ private:
     void show_browser_context_menu(POINT point) {
         const bool has_selection = !selected_browser_indices().empty();
         const bool has_archive = active_archive_path().has_value();
+        const bool browsing_archive =
+            history_.current().kind == axiom::gui::BrowserLocationKind::archive;
+        const axiom::gui::ArchiveCapabilities capabilities = active_archive_capabilities();
+        const bool archive_editable = capabilities.update && !capabilities.locked &&
+                                      !capabilities.encrypted;
         if (point.x == -1 && point.y == -1) {
             RECT list_rect{};
             GetWindowRect(list_, &list_rect);
@@ -1496,11 +1845,13 @@ private:
         std::vector<axiom::gui::CustomMenuItem> items{
             {kView, L"&View", L"Enter", has_selection},
             {0, L"", L"", false, true},
-            {kAddFiles, L"&Add to archive...", L"Ctrl+N", !busy_ && has_selection},
+            {kAddFiles, L"&Add to archive...", L"Ctrl+N",
+             !busy_ && has_selection && (!browsing_archive || archive_editable)},
             {kExtract, L"&Extract...", L"Ctrl+E", !busy_ && has_archive},
             {kTest, L"&Test archive", L"Ctrl+T", !busy_ && has_archive},
             {0, L"", L"", false, true},
-            {kDelete, L"&Delete", L"Delete", !busy_ && has_selection},
+            {kDelete, browsing_archive ? L"&Delete from archive" : L"&Delete", L"Delete",
+             !busy_ && has_selection && (!browsing_archive || archive_editable)},
             {kInfo, L"&Information", L"Ctrl+I", has_selection || has_archive},
             {kSelectAll, L"Select &all", L"Ctrl+A", !browser_items_.empty()},
         };
@@ -1583,6 +1934,7 @@ private:
             set_text(address_edit_, initial_path_);
             on_address_go();
         }
+        maybe_start_automatic_update_check();
     }
 
     void layout() {
@@ -1706,6 +2058,28 @@ private:
             if (item.kind == axiom::gui::BrowserItemKind::archive) return item.filesystem_path;
         }
         return std::nullopt;
+    }
+
+    axiom::gui::ArchiveCapabilities active_archive_capabilities() const {
+        const auto archive = active_archive_path();
+        if (archive && archive_catalog_ && archive_catalog_->path() == *archive) {
+            return archive_catalog_->capabilities();
+        }
+        return {};
+    }
+
+    static axiom::gui::ArchiveFeatureAvailability implemented_feature_availability() {
+        axiom::gui::ArchiveFeatureAvailability availability;
+        // Metadata, ADS, and links are automatic; the API does not expose per-item toggles.
+        availability.metadata = false;
+        availability.update = true;
+        availability.comments = true;
+        availability.lock = true;
+        availability.encryption = true;
+        // Header encryption and custom KDF presets are not exposed by the current API.
+        availability.header_encryption = false;
+        availability.kdf_presets = false;
+        return availability;
     }
 
     void navigate_to(axiom::gui::BrowserLocation location, bool record_history = true) {
@@ -1869,8 +2243,8 @@ private:
         } else if (fs::is_directory(path, error)) {
             navigate_to(axiom::gui::BrowserLocation::filesystem(path));
         } else {
-            MessageBoxW(hwnd_, L"The location does not exist or cannot be opened.",
-                        L"Axiom", MB_ICONWARNING);
+            show_app_message(L"The location does not exist or cannot be opened.",
+                             axiom::gui::MessageDialogIcon::warning);
             set_text(address_edit_, history_.current().display_name());
         }
     }
@@ -1894,8 +2268,9 @@ private:
             ShellExecuteW(hwnd_, L"open", item.filesystem_path.c_str(), nullptr,
                           item.filesystem_path.parent_path().c_str(), SW_SHOWNORMAL);
         } else {
-            MessageBoxW(hwnd_, L"Viewing a file directly from an archive requires selective extraction.",
-                        L"Axiom", MB_ICONINFORMATION);
+            show_app_message(
+                L"Viewing a file directly from an archive requires selective extraction.",
+                axiom::gui::MessageDialogIcon::information);
         }
     }
 
@@ -1915,47 +2290,238 @@ private:
         }
     }
 
-    void create_archive_from_paths(std::vector<fs::path> paths) {
+    void create_archive_from_paths(
+        std::vector<fs::path> paths,
+        std::optional<fs::path> target_archive = std::nullopt,
+        axiom::gui::ArchiveUpdateMode update_mode =
+            axiom::gui::ArchiveUpdateMode::create_new) {
         if (paths.empty()) return;
 
         axiom::gui::CreateArchiveDialogOptions dialog_options;
         dialog_options.level = application_options_.default_level;
         dialog_options.thread_count = application_options_.default_thread_count;
+        dialog_options.feature_availability = implemented_feature_availability();
+        dialog_options.features.update_mode = update_mode;
         const fs::path base = history_.current().kind == axiom::gui::BrowserLocationKind::filesystem
             ? history_.current().filesystem_path
             : paths.front().parent_path();
-        dialog_options.archive_path = base / L"Archive.axar";
+        dialog_options.archive_path = target_archive.value_or(base / L"Archive.axar");
+        if (target_archive) {
+            try {
+                dialog_options.features.comment = widen(axiom::archive_comment(*target_archive));
+            } catch (...) {
+                // The operation itself will report a precise archive error if necessary.
+            }
+        }
         if (!axiom::gui::show_create_archive_dialog(hwnd_, paths.size(), dialog_options)) return;
 
         inputs_ = std::move(paths);
         selected_level_ = dialog_options.level;
         selected_thread_count_ = dialog_options.thread_count;
         pending_archive_path_ = std::move(dialog_options.archive_path);
+        pending_archive_features_ = std::move(dialog_options.features);
         on_compress();
     }
 
     void on_add_to_archive() {
+        if (history_.current().kind == axiom::gui::BrowserLocationKind::archive) {
+            const auto archive = active_archive_path();
+            const auto capabilities = active_archive_capabilities();
+            if (!archive || capabilities.locked || capabilities.encrypted) {
+                show_app_message(
+                    capabilities.locked
+                        ? L"This archive is locked and cannot be changed."
+                        : L"Editing encrypted archives is not supported yet.",
+                    axiom::gui::MessageDialogIcon::information);
+                return;
+            }
+            auto paths = pick_files(hwnd_);
+            if (!paths.empty()) {
+                create_archive_from_paths(std::move(paths), *archive,
+                                          axiom::gui::ArchiveUpdateMode::add_or_replace);
+            }
+            return;
+        }
         auto paths = selected_filesystem_paths();
         if (paths.empty()) paths = pick_files(hwnd_);
         create_archive_from_paths(std::move(paths));
+    }
+
+    void on_update_archive(axiom::gui::ArchiveUpdateMode mode) {
+        const auto archive = active_archive_path();
+        const auto capabilities = active_archive_capabilities();
+        if (!archive) {
+            show_app_message(L"Open an archive first.",
+                             axiom::gui::MessageDialogIcon::information);
+            return;
+        }
+        if (capabilities.locked || capabilities.encrypted) {
+            show_app_message(
+                capabilities.locked
+                    ? L"This archive is locked and cannot be changed."
+                    : L"Editing encrypted archives is not supported yet.",
+                axiom::gui::MessageDialogIcon::information);
+            return;
+        }
+        if (mode == axiom::gui::ArchiveUpdateMode::synchronize &&
+            show_app_message(
+                L"Synchronize will mirror the selected source into the archive.\n\n"
+                L"Archived entries missing from the source will be permanently removed. Continue?",
+                axiom::gui::MessageDialogIcon::warning, L"Synchronize archive",
+                axiom::gui::MessageDialogButtons::yes_no, IDNO) != IDYES) {
+            return;
+        }
+        auto paths = pick_files(hwnd_);
+        if (!paths.empty()) create_archive_from_paths(std::move(paths), *archive, mode);
+    }
+
+    bool active_archive_is_editable() {
+        const auto capabilities = active_archive_capabilities();
+        if (!capabilities.locked && !capabilities.encrypted) return true;
+        show_app_message(
+            capabilities.locked
+                ? L"This archive is locked and cannot be changed."
+                : L"Editing encrypted archives is not supported yet.",
+            axiom::gui::MessageDialogIcon::information);
+        return false;
     }
 
     void on_view() {
         on_table_activate();
     }
 
+    void on_delete_from_archive() {
+        const auto archive = active_archive_path();
+        if (!archive || history_.current().kind != axiom::gui::BrowserLocationKind::archive) {
+            show_app_message(L"Open an archive and select entries to delete.",
+                             axiom::gui::MessageDialogIcon::information);
+            return;
+        }
+        if (!active_archive_is_editable()) return;
+        std::vector<std::string> paths;
+        for (const int index : selected_browser_indices()) {
+            const auto& item = browser_items_[static_cast<std::size_t>(index)];
+            if (!item.is_parent() && !item.archive_path.empty()) {
+                paths.push_back(item.archive_path);
+            }
+        }
+        if (paths.empty()) {
+            show_app_message(L"Select one or more archive entries to delete.",
+                             axiom::gui::MessageDialogIcon::information);
+            return;
+        }
+        const std::wstring prompt = L"Permanently remove " +
+            quote_count(paths.size(), L"selected archive entry", L"selected archive entries") +
+            L"?\n\nThe archive will be rebuilt to reclaim their stored data.";
+        if (show_app_message(prompt, axiom::gui::MessageDialogIcon::warning,
+                             L"Delete from archive",
+                             axiom::gui::MessageDialogButtons::yes_no, IDNO) != IDYES) {
+            return;
+        }
+        const auto options = compression_options();
+        operation_archive_output_ = *archive;
+        start_operation(
+            L"Deleting archive entries...", L"Selected entries were removed.",
+            [archive = *archive, paths = std::move(paths), options](
+                std::shared_ptr<axiom::OperationControl> operation) mutable {
+                auto run_options = options;
+                run_options.operation = std::move(operation);
+                axiom::delete_from_archive(archive, paths, run_options);
+            });
+    }
+
+    void on_repack_archive() {
+        const auto archive = active_archive_path();
+        if (!archive) return;
+        if (!active_archive_is_editable()) return;
+        if (show_app_message(
+                L"Rebuild this archive to reclaim dead space?\n\n"
+                L"All live files will be recompressed into fresh solid blocks.",
+                axiom::gui::MessageDialogIcon::question, L"Repack archive",
+                axiom::gui::MessageDialogButtons::yes_no, IDNO) != IDYES) {
+            return;
+        }
+        const auto options = compression_options();
+        operation_archive_output_ = *archive;
+        start_operation(
+            L"Repacking archive...", L"Archive repacked successfully.",
+            [archive = *archive, options](
+                std::shared_ptr<axiom::OperationControl> operation) mutable {
+                auto run_options = options;
+                run_options.operation = std::move(operation);
+                axiom::repack_archive(archive, run_options);
+            });
+    }
+
+    void on_edit_archive_comment() {
+        const auto archive = active_archive_path();
+        if (!archive) return;
+        if (!active_archive_is_editable()) return;
+        std::wstring comment;
+        try {
+            comment = widen(axiom::archive_comment(*archive));
+        } catch (const std::exception& error) {
+            show_app_message(widen(error.what()), axiom::gui::MessageDialogIcon::error,
+                             L"Archive comment");
+            return;
+        }
+        if (!axiom::gui::show_archive_comment_dialog(hwnd_, comment)) return;
+        const auto options = compression_options();
+        const std::string encoded_comment = utf8(comment);
+        operation_archive_output_ = *archive;
+        start_operation(
+            L"Updating archive comment...", L"Archive comment updated.",
+            [archive = *archive, encoded_comment, options](
+                std::shared_ptr<axiom::OperationControl> operation) mutable {
+                auto run_options = options;
+                run_options.operation = std::move(operation);
+                axiom::set_archive_comment(archive, encoded_comment, run_options);
+            });
+    }
+
+    void on_lock_archive() {
+        const auto archive = active_archive_path();
+        if (!archive) return;
+        if (!active_archive_is_editable()) return;
+        if (show_app_message(
+                L"Lock this archive permanently?\n\n"
+                L"A locked archive remains readable, but it cannot be updated, deleted from, "
+                L"repacked, commented, or unlocked.",
+                axiom::gui::MessageDialogIcon::warning, L"Lock archive",
+                axiom::gui::MessageDialogButtons::yes_no, IDNO) != IDYES) {
+            return;
+        }
+        const auto options = compression_options();
+        operation_archive_output_ = *archive;
+        start_operation(
+            L"Locking archive...", L"Archive locked successfully.",
+            [archive = *archive, options](
+                std::shared_ptr<axiom::OperationControl> operation) mutable {
+                auto run_options = options;
+                run_options.operation = std::move(operation);
+                axiom::lock_archive(archive, run_options);
+            });
+    }
+
     void on_delete_selected() {
+        if (history_.current().kind == axiom::gui::BrowserLocationKind::archive) {
+            on_delete_from_archive();
+            return;
+        }
         const auto paths = selected_filesystem_paths();
         if (paths.empty()) {
-            MessageBoxW(hwnd_, L"Select one or more filesystem items to delete.",
-                        L"Axiom", MB_ICONINFORMATION);
+            show_app_message(L"Select one or more filesystem items to delete.",
+                             axiom::gui::MessageDialogIcon::information);
             return;
         }
         const std::wstring prompt = L"Move " +
             quote_count(paths.size(), L"selected item", L"selected items") +
             L" to the Recycle Bin?";
         if (application_options_.confirm_delete &&
-            MessageBoxW(hwnd_, prompt.c_str(), L"Axiom", MB_YESNO | MB_ICONWARNING) != IDYES) return;
+            show_app_message(prompt, axiom::gui::MessageDialogIcon::warning, L"Axiom",
+                             axiom::gui::MessageDialogButtons::yes_no, IDNO) != IDYES) {
+            return;
+        }
 
         ComPtr<IFileOperation> operation;
         HRESULT result = CoCreateInstance(CLSID_FileOperation, nullptr, CLSCTX_INPROC_SERVER,
@@ -1973,8 +2539,8 @@ private:
             if (SUCCEEDED(result)) result = operation->PerformOperations();
         }
         if (FAILED(result)) {
-            MessageBoxW(hwnd_, L"Windows could not move the selected items to the Recycle Bin.",
-                        L"Delete failed", MB_ICONERROR);
+            show_app_message(L"Windows could not move the selected items to the Recycle Bin.",
+                             axiom::gui::MessageDialogIcon::error, L"Delete failed");
         }
         on_navigate_refresh();
     }
@@ -1988,14 +2554,154 @@ private:
             ? quote_count(browser_items_.size(), L"item", L"items")
             : quote_count(indices.size(), L"selected item", L"selected items");
         if (bytes != 0) message += L"\nSize: " + format_size(bytes);
-        if (const auto archive = active_archive_path()) message += L"\nArchive: " + archive->wstring();
-        MessageBoxW(hwnd_, message.c_str(), L"Information", MB_ICONINFORMATION);
+        if (const auto archive = active_archive_path()) {
+            message += L"\nArchive: " + archive->wstring();
+            try {
+                message += axiom::archive_is_encrypted(*archive)
+                    ? L"\nEncryption: File data encrypted"
+                    : L"\nEncryption: None";
+                message += axiom::archive_is_locked(*archive)
+                    ? L"\nState: Locked (read-only)"
+                    : L"\nState: Editable";
+                const std::wstring comment = widen(axiom::archive_comment(*archive));
+                if (!comment.empty()) message += L"\nComment: " + comment;
+            } catch (...) {
+                message += L"\nState: Could not read archive metadata";
+            }
+        }
+        show_app_message(message, axiom::gui::MessageDialogIcon::information, L"Information");
+    }
+
+    void on_archive_features() {
+        const auto archive = active_archive_path();
+        if (!archive) {
+            show_app_message(L"Open or select an Axiom archive first.",
+                             axiom::gui::MessageDialogIcon::information);
+            return;
+        }
+        const axiom::gui::ArchiveCapabilities capabilities = active_archive_capabilities();
+        axiom::gui::show_archive_feature_summary_dialog(hwnd_, *archive, capabilities);
+    }
+
+    void on_pending_archive_command(std::wstring_view feature) {
+        show_app_message(
+            std::wstring(feature) +
+                L" is represented in the GUI but is waiting for the archive API connection.",
+            axiom::gui::MessageDialogIcon::information,
+            L"Archive feature");
     }
 
     void on_about() {
-        MessageBoxW(hwnd_,
-                    L"Axiom\n\nNative Windows archive manager and compression frontend.",
-                    L"About Axiom", MB_OK | MB_ICONINFORMATION);
+        axiom::gui::show_about_dialog(hwnd_, instance_, dpi_, theme_.dark, kCheckUpdates);
+    }
+
+    void maybe_start_automatic_update_check() {
+        if (axiom::gui::automatic_update_check_due()) {
+            begin_update_check(axiom::gui::UpdateCheckKind::automatic);
+        }
+    }
+
+    void begin_update_check(axiom::gui::UpdateCheckKind kind) {
+        if (update_check_in_progress_) {
+            if (kind == axiom::gui::UpdateCheckKind::manual) {
+                show_app_message(L"An update check is already running.",
+                                 axiom::gui::MessageDialogIcon::information);
+            }
+            return;
+        }
+        update_check_in_progress_ = true;
+        if (kind == axiom::gui::UpdateCheckKind::manual) {
+            SetCursor(LoadCursorW(nullptr, IDC_WAIT));
+        }
+        axiom::gui::start_update_check(hwnd_, instance_, kind);
+    }
+
+    void begin_update_download(const axiom::gui::UpdateInfo& update) {
+        if (update_download_in_progress_) {
+            show_app_message(L"An update download is already running.",
+                             axiom::gui::MessageDialogIcon::information);
+            return;
+        }
+        update_download_in_progress_ = true;
+        show_app_message(L"Axiom will download the installer in the background.",
+                         axiom::gui::MessageDialogIcon::information,
+                         L"Axiom Update");
+        axiom::gui::start_update_download(hwnd_, update);
+    }
+
+    void on_update_check_complete(LPARAM lparam) {
+        std::unique_ptr<axiom::gui::UpdateCheckResult> result(
+            reinterpret_cast<axiom::gui::UpdateCheckResult*>(lparam));
+        update_check_in_progress_ = false;
+        SetCursor(LoadCursorW(nullptr, IDC_ARROW));
+        if (!result) return;
+
+        const bool manual = result->kind == axiom::gui::UpdateCheckKind::manual;
+        if (!result->success) {
+            if (manual) {
+                show_app_message(L"Could not check for updates:\n\n" + result->message,
+                                 axiom::gui::MessageDialogIcon::error,
+                                 L"Axiom Update");
+            }
+            return;
+        }
+        if (!result->update_available) {
+            if (manual) {
+                show_app_message(
+                    L"Axiom is up to date.\n\nInstalled version: " +
+                        axiom::gui::current_executable_version(instance_),
+                    axiom::gui::MessageDialogIcon::information,
+                    L"Axiom Update");
+            }
+            return;
+        }
+
+        std::wstring message = L"Axiom " + result->update.version +
+                               L" is available.\n\nDownload and install it now?";
+        if (show_app_message(message, axiom::gui::MessageDialogIcon::question,
+                             L"Axiom Update", axiom::gui::MessageDialogButtons::yes_no,
+                             IDYES) == IDYES) {
+            begin_update_download(result->update);
+        }
+    }
+
+    void on_update_download_complete(LPARAM lparam) {
+        std::unique_ptr<axiom::gui::UpdateDownloadResult> result(
+            reinterpret_cast<axiom::gui::UpdateDownloadResult*>(lparam));
+        update_download_in_progress_ = false;
+        if (!result) return;
+        if (!result->success) {
+            show_app_message(L"Could not download the Axiom update:\n\n" + result->message,
+                             axiom::gui::MessageDialogIcon::error,
+                             L"Axiom Update");
+            return;
+        }
+        if (busy_) {
+            show_app_message(
+                L"The update was downloaded to:\n\n" + result->installer_path +
+                    L"\n\nFinish or cancel the active archive operation before running it.",
+                axiom::gui::MessageDialogIcon::information,
+                L"Axiom Update");
+            return;
+        }
+        const std::wstring message = L"Axiom " + result->update.version +
+            L" has been downloaded.\n\nRun the installer now? Axiom will close if it starts successfully.";
+        if (show_app_message(message, axiom::gui::MessageDialogIcon::question,
+                             L"Axiom Update", axiom::gui::MessageDialogButtons::yes_no,
+                             IDYES) != IDYES) {
+            return;
+        }
+        SetLastError(ERROR_SUCCESS);
+        const auto launch = reinterpret_cast<INT_PTR>(ShellExecuteW(
+            hwnd_, L"runas", result->installer_path.c_str(), nullptr, nullptr, SW_SHOWNORMAL));
+        if (launch <= 32) {
+            show_app_message(L"Could not launch the installer:\n\n" +
+                                 axiom::gui::last_error_text(),
+                             axiom::gui::MessageDialogIcon::error,
+                             L"Axiom Update");
+            return;
+        }
+        SendMessageW(hwnd_, WM_CLOSE, 0, 0);
     }
 
     void on_select_all() {
@@ -2053,6 +2759,10 @@ private:
             return;
         }
 
+        // The archive engine writes its temporary output in the browsed directory.
+        // Suppress any refresh already queued for those writes; completion performs
+        // one authoritative reload after success, failure, or cancellation.
+        KillTimer(hwnd_, kDirectoryRefreshTimer);
         set_busy(true);
         set_status(running);
         if (!operation_window_.create(
@@ -2073,49 +2783,132 @@ private:
             set_status(L"Could not create the operation progress window.");
             return;
         }
+        // The operation's temporary output can generate thousands of directory
+        // notifications. Completion reloads the current location and restarts the
+        // watcher, so keeping it active here only consumes I/O and UI resources.
+        directory_watcher_.stop();
         if (!operation_runner_.start(hwnd_, kOperationDoneMessage, kOperationProgressMessage,
                                      std::move(running), std::move(success), std::move(work))) {
             operation_window_.close();
             set_busy(false);
             set_status(L"Another operation is already running.");
+            on_navigate_refresh();
         }
     }
 
     void on_compress() {
         if (inputs_.empty()) {
-            MessageBoxW(hwnd_, L"Add at least one file or folder first.", L"Axiom", MB_ICONINFORMATION);
+            show_app_message(L"Add at least one file or folder first.",
+                             axiom::gui::MessageDialogIcon::information);
             return;
         }
 
         const auto archive = pending_archive_path_;
         if (archive.empty()) {
-            MessageBoxW(hwnd_, L"Choose an output .axar archive path.", L"Axiom", MB_ICONINFORMATION);
+            show_app_message(L"Choose an output .axar archive path.",
+                             axiom::gui::MessageDialogIcon::information);
             return;
         }
 
         const auto inputs = inputs_;
-        const auto options = compression_options();
+        auto options = compression_options();
+        const auto mode = pending_archive_features_.update_mode;
+        options.password = pending_archive_features_.encrypt_data
+            ? utf8(pending_archive_features_.password)
+            : std::string{};
+        const std::string comment = utf8(pending_archive_features_.comment);
+        const bool set_comment = mode != axiom::gui::ArchiveUpdateMode::create_new ||
+                                 !comment.empty();
+        const bool repack_after = pending_archive_features_.repack_after_update &&
+                                  mode != axiom::gui::ArchiveUpdateMode::create_new;
+        const bool lock_after = pending_archive_features_.lock_archive;
+        secure_clear(pending_archive_features_.password);
+
+        std::wstring running = L"Compressing...";
+        std::wstring success = L"Archive created: " + archive.wstring();
+        switch (mode) {
+            case axiom::gui::ArchiveUpdateMode::add_or_replace:
+                running = L"Adding to archive...";
+                success = L"Archive updated: " + archive.wstring();
+                break;
+            case axiom::gui::ArchiveUpdateMode::update_newer:
+                running = L"Updating archive...";
+                success = L"Archive updated: " + archive.wstring();
+                break;
+            case axiom::gui::ArchiveUpdateMode::fresh_existing:
+                running = L"Freshening archive...";
+                success = L"Archive freshened: " + archive.wstring();
+                break;
+            case axiom::gui::ArchiveUpdateMode::synchronize:
+                running = L"Synchronizing archive...";
+                success = L"Archive synchronized: " + archive.wstring();
+                break;
+            default:
+                break;
+        }
         operation_archive_output_ = archive;
-        start_operation(L"Compressing...",
-                        L"Archive created: " + archive.wstring(),
-                        [inputs, archive, options](std::shared_ptr<axiom::OperationControl> operation) mutable {
+        start_operation(std::move(running), std::move(success),
+                        [inputs, archive, options, mode, comment, set_comment,
+                         repack_after, lock_after](
+                            std::shared_ptr<axiom::OperationControl> operation) mutable {
                             auto run_options = options;
-                            run_options.operation = std::move(operation);
-                            axiom::create_archive(inputs, archive, run_options);
+                            run_options.operation = operation;
+                            switch (mode) {
+                                case axiom::gui::ArchiveUpdateMode::add_or_replace:
+                                    axiom::add_to_archive(inputs, archive, run_options);
+                                    break;
+                                case axiom::gui::ArchiveUpdateMode::update_newer:
+                                    axiom::update_archive(inputs, archive, run_options, false);
+                                    break;
+                                case axiom::gui::ArchiveUpdateMode::fresh_existing:
+                                    axiom::update_archive(inputs, archive, run_options, true);
+                                    break;
+                                case axiom::gui::ArchiveUpdateMode::synchronize:
+                                    axiom::sync_archive(inputs, archive, run_options);
+                                    break;
+                                default:
+                                    axiom::create_archive(inputs, archive, run_options);
+                                    break;
+                            }
+                            if (set_comment) {
+                                axiom::set_archive_comment(archive, comment, run_options);
+                            }
+                            if (repack_after) {
+                                axiom::repack_archive(archive, run_options);
+                            }
+                            if (lock_after) {
+                                axiom::lock_archive(archive, run_options);
+                            }
                         });
     }
 
     void on_extract() {
         const auto archive = active_archive_path();
         if (!archive) {
-            MessageBoxW(hwnd_, L"Open or select an Axiom archive first.",
-                        L"Axiom", MB_ICONINFORMATION);
+            show_app_message(L"Open or select an Axiom archive first.",
+                             axiom::gui::MessageDialogIcon::information);
             return;
         }
         axiom::gui::ExtractArchiveDialogOptions dialog_options;
         dialog_options.thread_count = application_options_.default_thread_count;
         dialog_options.destination = archive->parent_path() / archive->stem();
+        dialog_options.feature_availability = implemented_feature_availability();
+        bool encrypted = false;
+        try {
+            encrypted = axiom::archive_is_encrypted(*archive);
+        } catch (const std::exception& error) {
+            show_app_message(widen(error.what()), axiom::gui::MessageDialogIcon::error,
+                             L"Open archive");
+            return;
+        }
+        dialog_options.feature_availability.encryption = encrypted;
         if (!axiom::gui::show_extract_archive_dialog(hwnd_, *archive, dialog_options)) return;
+
+        if (encrypted && dialog_options.features.password.empty() &&
+            !axiom::gui::show_archive_password_dialog(
+                hwnd_, dialog_options.features.password)) {
+            return;
+        }
 
         axiom::ExtractOptions options;
         options.thread_count = dialog_options.thread_count;
@@ -2123,6 +2916,8 @@ private:
         options.overwrite = dialog_options.overwrite
             ? axiom::ExtractOptions::Overwrite::overwrite
             : axiom::ExtractOptions::Overwrite::fail;
+        options.password = utf8(dialog_options.features.password);
+        secure_clear(dialog_options.features.password);
 
         operation_archive_output_.clear();
         start_operation(L"Extracting...",
@@ -2137,12 +2932,25 @@ private:
     void on_test() {
         const auto archive = active_archive_path();
         if (!archive) {
-            MessageBoxW(hwnd_, L"Open or select an Axiom archive first.", L"Axiom", MB_ICONINFORMATION);
+            show_app_message(L"Open or select an Axiom archive first.",
+                             axiom::gui::MessageDialogIcon::information);
             return;
         }
 
         axiom::DecompressionOptions options;
         options.thread_count = application_options_.default_thread_count;
+        try {
+            if (axiom::archive_is_encrypted(*archive)) {
+                std::wstring password;
+                if (!axiom::gui::show_archive_password_dialog(hwnd_, password)) return;
+                options.password = utf8(password);
+                secure_clear(password);
+            }
+        } catch (const std::exception& error) {
+            show_app_message(widen(error.what()), axiom::gui::MessageDialogIcon::error,
+                             L"Open archive");
+            return;
+        }
         operation_archive_output_.clear();
         start_operation(L"Testing archive...",
                         L"Archive integrity test passed.",
@@ -2159,11 +2967,19 @@ private:
         if (!progress) {
             return;
         }
+
+        // Keep only the newest worker update already waiting in the UI queue.
+        // Every payload is heap-owned, so replacing the unique_ptr also releases
+        // each stale update without changing the worker's progress cadence.
+        MSG queued{};
+        while (PeekMessageW(&queued, hwnd_, kOperationProgressMessage,
+                            kOperationProgressMessage, PM_REMOVE)) {
+            progress.reset(reinterpret_cast<axiom::OperationProgress*>(queued.lParam));
+        }
         if (!busy_) {
             return;
         }
         operation_window_.set_progress(*progress);
-        set_status((operation_paused_ ? L"Paused. " : L"") + format_progress_text(*progress));
     }
 
     void on_operation_done(LPARAM lparam) {
@@ -2172,14 +2988,19 @@ private:
         operation_runner_.finish();
         operation_window_.close();
         set_busy(false);
+        const bool archive_changed = !operation_archive_output_.empty();
         operation_archive_output_.clear();
+        if (archive_changed) archive_catalog_.reset();
         set_status(result->message);
         on_navigate_refresh();
         if (result->cancelled) {
             return;
         }
-        MessageBoxW(hwnd_, result->message.c_str(), result->ok ? L"Axiom" : L"Axiom error",
-                    result->ok ? MB_ICONINFORMATION : MB_ICONERROR);
+        show_app_message(
+            result->message,
+            result->ok ? axiom::gui::MessageDialogIcon::information
+                       : axiom::gui::MessageDialogIcon::error,
+            result->ok ? L"Axiom" : L"Axiom error");
     }
 
     LRESULT handle_message(UINT message, WPARAM wparam, LPARAM lparam) {
@@ -2243,7 +3064,7 @@ private:
             case WM_TIMER:
                 if (wparam == kDirectoryRefreshTimer) {
                     KillTimer(hwnd_, kDirectoryRefreshTimer);
-                    on_navigate_refresh();
+                    if (!busy_) on_navigate_refresh();
                     return 0;
                 }
                 break;
@@ -2261,9 +3082,30 @@ private:
                     case kView: on_view(); return 0;
                     case kDelete: on_delete_selected(); return 0;
                     case kInfo: on_info(); return 0;
+                    case kArchiveFeatures: on_archive_features(); return 0;
+                    case kUpdateArchive:
+                        on_update_archive(axiom::gui::ArchiveUpdateMode::update_newer);
+                        return 0;
+                    case kFreshenArchive:
+                        on_update_archive(axiom::gui::ArchiveUpdateMode::fresh_existing);
+                        return 0;
+                    case kSynchronizeArchive:
+                        on_update_archive(axiom::gui::ArchiveUpdateMode::synchronize);
+                        return 0;
+                    case kDeleteArchiveEntries: on_delete_from_archive(); return 0;
+                    case kRepackArchive: on_repack_archive(); return 0;
+                    case kEditArchiveComment: on_edit_archive_comment(); return 0;
+                    case kLockArchive: on_lock_archive(); return 0;
+                    case kRepairArchive: on_pending_archive_command(L"Archive repair"); return 0;
+                    case kCreateRecoveryVolumes: on_pending_archive_command(L"Recovery volumes"); return 0;
+                    case kVerifyArchiveSignature: on_pending_archive_command(L"Signature verification"); return 0;
+                    case kCreateSfx: on_pending_archive_command(L"Self-extracting archives"); return 0;
                     case kSettings: on_settings(); return 0;
                     case kSelectAll: on_select_all(); return 0;
                     case kAbout: on_about(); return 0;
+                    case kCheckUpdates:
+                        begin_update_check(axiom::gui::UpdateCheckKind::manual);
+                        return 0;
                     case kExitApplication: SendMessageW(hwnd_, WM_CLOSE, 0, 0); return 0;
                     case kAddressEdit:
                         if (HIWORD(wparam) == EN_SETFOCUS || HIWORD(wparam) == EN_KILLFOCUS) {
@@ -2278,6 +3120,12 @@ private:
                 return 0;
             case kOperationProgressMessage:
                 on_operation_progress(lparam);
+                return 0;
+            case axiom::gui::kUpdateCheckCompleteMessage:
+                on_update_check_complete(lparam);
+                return 0;
+            case axiom::gui::kUpdateDownloadCompleteMessage:
+                on_update_download_complete(lparam);
                 return 0;
             case kBrowserLoadedMessage:
                 on_browser_loaded(lparam);
@@ -2296,6 +3144,9 @@ private:
                 return 0;
             case kDirectoryChangedMessage:
                 // Coalesce bursts from file copies and archive creation into one reload.
+                // While an archive operation is active, its growing output would otherwise
+                // rebuild the entire browser repeatedly and visibly flash the main window.
+                if (busy_) return 0;
                 KillTimer(hwnd_, kDirectoryRefreshTimer);
                 SetTimer(hwnd_, kDirectoryRefreshTimer, 300, nullptr);
                 return 0;
@@ -2368,6 +3219,8 @@ private:
     int selected_level_ = 5;
     bool busy_ = false;
     bool operation_paused_ = false;
+    bool update_check_in_progress_ = false;
+    bool update_download_in_progress_ = false;
     axiom::gui::OperationRunner operation_runner_;
     fs::path operation_archive_output_;
     RECT address_edit_frame_{};
@@ -2386,6 +3239,7 @@ private:
     axiom::gui::PersistedGuiSettings persisted_settings_;
     std::size_t selected_thread_count_ = 0;
     fs::path pending_archive_path_;
+    axiom::gui::ArchiveFeatureOptions pending_archive_features_;
 };
 
 }  // namespace
@@ -2402,7 +3256,10 @@ int run_axiom_gui(HINSTANCE instance, int show_command, std::wstring initial_pat
 
     const HRESULT com = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
     if (FAILED(com)) {
-        MessageBoxW(nullptr, L"Failed to initialize COM.", L"Axiom", MB_ICONERROR);
+        axiom::gui::show_message_dialog(
+            nullptr, instance, GetDpiForSystem(), system_prefers_dark_mode(),
+            L"Axiom", L"Failed to initialize COM.",
+            axiom::gui::MessageDialogIcon::error);
         return 1;
     }
 

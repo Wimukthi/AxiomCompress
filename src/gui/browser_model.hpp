@@ -29,7 +29,7 @@ struct BrowserLocation {
     bool operator==(const BrowserLocation& other) const;
 };
 
-enum class BrowserItemKind { parent, drive, directory, file, archive, symlink };
+enum class BrowserItemKind { parent, drive, directory, file, archive, symlink, hardlink };
 
 struct BrowserItem {
     std::uint64_t id = 0;
@@ -63,7 +63,12 @@ struct ArchiveCapabilities {
     bool recovery_records = false;
     bool multi_volume = false;
     bool comments = false;
+    bool lock = false;
+    bool metadata = false;
+    bool links = false;
     bool authenticity = false;
+    bool locked = false;
+    bool encrypted = false;
 };
 
 class ArchiveCatalog {

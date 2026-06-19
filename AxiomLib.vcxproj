@@ -79,11 +79,13 @@
     <ClInclude Include="src\core\archive.hpp" />
     <ClInclude Include="src\core\checksum.hpp" />
     <ClInclude Include="src\core\cpu.hpp" />
+    <ClInclude Include="src\core\crypto.hpp" />
     <ClInclude Include="src\core\file_meta.hpp" />
     <ClInclude Include="src\entropy\huffman.hpp" />
     <ClInclude Include="src\entropy\range.hpp" />
     <ClInclude Include="src\third_party\blake3\blake3.h" />
     <ClInclude Include="src\third_party\blake3\blake3_impl.h" />
+    <ClInclude Include="src\third_party\monocypher\monocypher.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="src\archive\container.cpp" />
@@ -94,6 +96,7 @@
     <ClCompile Include="src\core\archive.cpp" />
     <ClCompile Include="src\core\checksum.cpp" />
     <ClCompile Include="src\core\cpu.cpp" />
+    <ClCompile Include="src\core\crypto.cpp" />
     <ClCompile Include="src\core\file_meta.cpp" />
     <ClCompile Include="src\entropy\huffman.cpp" />
     <ClCompile Include="src\entropy\range.cpp" />
@@ -106,6 +109,10 @@
       <WarningLevel>TurnOffAllWarnings</WarningLevel>
     </ClCompile>
     <ClCompile Include="src\third_party\blake3\blake3_portable.c">
+      <CompileAs>CompileAsC</CompileAs>
+      <WarningLevel>TurnOffAllWarnings</WarningLevel>
+    </ClCompile>
+    <ClCompile Include="src\third_party\monocypher\monocypher.c">
       <CompileAs>CompileAsC</CompileAs>
       <WarningLevel>TurnOffAllWarnings</WarningLevel>
     </ClCompile>

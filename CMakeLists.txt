@@ -69,12 +69,19 @@ if(WIN32)
         src/gui/custom_menu.cpp
         src/gui/toolbar_icons.cpp
         src/gui/archive_dialogs.cpp
+        src/gui/archive_feature_dialogs.cpp
         src/gui/directory_watcher.cpp
         src/gui/settings_store.cpp
         src/gui/browser_model.cpp
         src/gui/operation_runner.cpp
-        src/gui/operation_progress_window.cpp)
-    target_link_libraries(axiom_gui PRIVATE axiom Comctl32 Dwmapi Msimg32 Ole32 Shell32 Uxtheme)
+        src/gui/operation_progress_window.cpp
+        src/gui/dialog_support.cpp
+        src/gui/message_dialog.cpp
+        src/gui/about_dialog.cpp
+        src/gui/update_checker.cpp
+        src/gui/axiom_gui.rc)
+    target_link_libraries(axiom_gui PRIVATE axiom Bcrypt Comctl32 Dwmapi Msimg32 Ole32 Shell32 Uxtheme Version Winhttp)
+    set_target_properties(axiom_gui PROPERTIES OUTPUT_NAME "Axiom")
 endif()
 
 enable_testing()

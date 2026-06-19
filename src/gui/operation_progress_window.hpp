@@ -60,7 +60,10 @@ private:
     void rebuild_font();
     void apply_theme();
     void layout();
+    void invalidate_progress_area();
     void paint();
+    bool ensure_back_buffer(HDC reference, int width, int height);
+    void release_back_buffer();
     void draw_button(const DRAWITEMSTRUCT& draw) const;
     void toggle_pause();
     void request_cancel();
@@ -72,6 +75,10 @@ private:
     HWND cancel_button_{};
     HINSTANCE instance_{};
     HFONT font_{};
+    HDC back_buffer_dc_{};
+    HBITMAP back_buffer_bitmap_{};
+    HGDIOBJ back_buffer_old_bitmap_{};
+    SIZE back_buffer_size_{};
     UINT dpi_{USER_DEFAULT_SCREEN_DPI};
     OperationWindowTheme theme_{};
     PauseHandler pause_handler_;
@@ -80,6 +87,7 @@ private:
     std::filesystem::path output_path_;
     OperationProgress progress_{};
     bool has_progress_{false};
+    bool progress_dirty_{false};
     bool paused_{false};
     bool cancelling_{false};
     int pulse_{};

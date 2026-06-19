@@ -79,14 +79,14 @@ The checked-in Visual Studio projects currently target `v145`, C++20, and x64.
 Expected GUI executable:
 
 ```text
-out\Release\axiom_gui.exe
+out\Release\Axiom.exe
 ```
 
 Before making changes in a new session:
 
 1. Run `git status --short --branch` and inspect recent commits.
 2. Build and run the Release tests once to establish that machine's baseline.
-3. Launch `out\Release\axiom_gui.exe` and inspect both themes and at least two
+3. Launch `out\Release\Axiom.exe` and inspect both themes and at least two
    display scale factors before changing layout or painting code.
 4. Re-run the build and tests after each coherent change.
 

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "gui/archive_feature_options.hpp"
+
 #include <windows.h>
 
 #include <cstddef>
@@ -11,6 +13,8 @@ struct CreateArchiveDialogOptions {
     std::filesystem::path archive_path;
     int level = 5;
     std::size_t thread_count = 0;
+    ArchiveFeatureOptions features;
+    ArchiveFeatureAvailability feature_availability;
 };
 
 struct ExtractArchiveDialogOptions {
@@ -18,6 +22,8 @@ struct ExtractArchiveDialogOptions {
     std::size_t thread_count = 0;
     bool overwrite = false;
     bool restore_mtime = true;
+    ExtractFeatureOptions features;
+    ArchiveFeatureAvailability feature_availability;
 };
 
 struct ApplicationDialogOptions {

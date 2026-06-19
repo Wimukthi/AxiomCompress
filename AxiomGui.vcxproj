@@ -44,7 +44,7 @@
   <PropertyGroup>
     <OutDir>$(SolutionDir)out\$(Configuration)\</OutDir>
     <IntDir>$(SolutionDir)build\msvc\$(ProjectName)\$(Configuration)\</IntDir>
-    <TargetName>axiom_gui</TargetName>
+    <TargetName>Axiom</TargetName>
   </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <ClCompile>
@@ -57,7 +57,7 @@
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
-      <AdditionalDependencies>Comctl32.lib;Dwmapi.lib;Msimg32.lib;Ole32.lib;Shell32.lib;Uxtheme.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>Bcrypt.lib;Comctl32.lib;Dwmapi.lib;Msimg32.lib;Ole32.lib;Shell32.lib;Uxtheme.lib;Version.lib;Winhttp.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
@@ -75,7 +75,7 @@
       <SubSystem>Windows</SubSystem>
       <EnableCOMDATFolding>true</EnableCOMDATFolding>
       <OptimizeReferences>true</OptimizeReferences>
-      <AdditionalDependencies>Comctl32.lib;Dwmapi.lib;Msimg32.lib;Ole32.lib;Shell32.lib;Uxtheme.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>Bcrypt.lib;Comctl32.lib;Dwmapi.lib;Msimg32.lib;Ole32.lib;Shell32.lib;Uxtheme.lib;Version.lib;Winhttp.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
@@ -84,11 +84,16 @@
     <ClCompile Include="src\gui\custom_menu.cpp" />
     <ClCompile Include="src\gui\toolbar_icons.cpp" />
     <ClCompile Include="src\gui\archive_dialogs.cpp" />
+    <ClCompile Include="src\gui\archive_feature_dialogs.cpp" />
     <ClCompile Include="src\gui\directory_watcher.cpp" />
     <ClCompile Include="src\gui\settings_store.cpp" />
     <ClCompile Include="src\gui\browser_model.cpp" />
     <ClCompile Include="src\gui\operation_runner.cpp" />
     <ClCompile Include="src\gui\operation_progress_window.cpp" />
+    <ClCompile Include="src\gui\dialog_support.cpp" />
+    <ClCompile Include="src\gui\message_dialog.cpp" />
+    <ClCompile Include="src\gui\about_dialog.cpp" />
+    <ClCompile Include="src\gui\update_checker.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="src\gui\browser_model.hpp" />
@@ -97,10 +102,20 @@
     <ClInclude Include="src\gui\toolbar_icon_masks.inc" />
     <ClInclude Include="src\gui\app.hpp" />
     <ClInclude Include="src\gui\archive_dialogs.hpp" />
+    <ClInclude Include="src\gui\archive_feature_dialogs.hpp" />
+    <ClInclude Include="src\gui\archive_feature_options.hpp" />
     <ClInclude Include="src\gui\directory_watcher.hpp" />
     <ClInclude Include="src\gui\settings_store.hpp" />
     <ClInclude Include="src\gui\operation_runner.hpp" />
     <ClInclude Include="src\gui\operation_progress_window.hpp" />
+    <ClInclude Include="src\gui\dialog_support.hpp" />
+    <ClInclude Include="src\gui\message_dialog.hpp" />
+    <ClInclude Include="src\gui\about_dialog.hpp" />
+    <ClInclude Include="src\gui\update_checker.hpp" />
+    <ClInclude Include="src\gui\resource.hpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <ResourceCompile Include="src\gui\axiom_gui.rc" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="AxiomLib.vcxproj">
