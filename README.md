@@ -79,6 +79,10 @@ axiomc x --overwrite skip archive.axar dest-dir
 axiomc a -p "password" archive.axar private-dir
 axiomc a -p "password" --encrypt-names hidden.axar private-dir
 axiomc l -p "password" hidden.axar
+axiomc keygen secret.key public.key
+axiomc sign archive.axar secret.key
+axiomc verify archive.axar public.key
+axiomc sfx archive.axar archive.exe
 ```
 
 Single-stream mode (one input stream to one `.axc` blob):
@@ -112,16 +116,17 @@ resizable columns, and hierarchical archive browsing. Archive presentation is
 isolated behind a provider/catalog layer with explicit capability flags, so
 archive editing, comments, locking, links, and data encryption are wired through
 public archive APIs. Filename encryption and encrypted-archive editing have backend
-support and are the next GUI integration step. Recovery records, volumes,
-authenticity, and SFX remain capability-gated until their archive APIs land.
+support. Native OLE drag/drop handles Explorer-to-archive insertion,
+archive-to-Explorer selective extraction, and moves between archive folders.
+Authenticity signing/verification and native SFX creation are wired. Recovery
+records and volumes remain capability-gated.
 Its owner-drawn dark menu bar exposes File, Commands, Tools, Options, and Help
 menus without falling back to a light system menu, and routes menu and keyboard
 commands through the same command IDs used by the toolbar.
 Filesystem folders refresh automatically through `ReadDirectoryChangesW`; dropped
-archives open in the browser, while dropped files and folders currently enter the
-create-archive workflow. The backend now exposes destination-aware add, selective
-extract, and metadata-only move APIs for the pending Explorer-style archive
-drag/drop layer. Window placement, the last location, sorting, and application
+archives open in the browser, and the archive list is an OLE drop source and target.
+Drag-out extracts lazily and retains managed staging until exit so Explorer cannot
+race cleanup. Window placement, the last location, sorting, and application
 defaults persist per user under `HKCU\Software\AxiomCompress\GUI`.
 
 ### Effort levels (`--level 1..9`, default 5)

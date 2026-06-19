@@ -72,6 +72,7 @@ if(WIN32)
         src/gui/archive_dialogs.cpp
         src/gui/archive_feature_dialogs.cpp
         src/gui/directory_watcher.cpp
+        src/gui/drag_drop.cpp
         src/gui/settings_store.cpp
         src/gui/browser_model.cpp
         src/gui/operation_runner.cpp

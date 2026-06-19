@@ -11,6 +11,11 @@ namespace axiom::core {
 // A derived 256-bit symmetric key.
 using CryptoKey = std::array<std::uint8_t, 32>;
 
+struct SigningKeyPair {
+    std::array<std::uint8_t, 64> secret_key{};
+    std::array<std::uint8_t, 32> public_key{};
+};
+
 // Password key-derivation parameters (Argon2id). The salt and the cost parameters
 // are stored in the archive so the same key can be re-derived on decrypt.
 struct KdfParams {
@@ -42,6 +47,14 @@ bool aead_open(const CryptoKey& key, std::span<const std::uint8_t> sealed,
 
 // Best-effort wipe of a secret buffer (not optimized away).
 void secure_wipe(std::span<std::uint8_t> buffer);
+
+SigningKeyPair generate_signing_key();
+std::array<std::uint8_t, 64> sign_message(
+    const std::array<std::uint8_t, 64>& secret_key,
+    std::span<const std::uint8_t> message);
+bool verify_message(const std::array<std::uint8_t, 32>& public_key,
+                    const std::array<std::uint8_t, 64>& signature,
+                    std::span<const std::uint8_t> message);
 
 // Bytes prepended to a sealed blob: 24-byte nonce + 16-byte Poly1305 tag.
 constexpr std::size_t kAeadOverhead = 24 + 16;

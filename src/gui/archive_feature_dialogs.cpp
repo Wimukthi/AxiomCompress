@@ -360,7 +360,7 @@ private:
         if (context_ == ArchiveFeatureDialogContext::create_or_update) {
             page_heading(kPageAuthenticity, L"Authenticity and self-extraction",
                          L"Sign completed archives or package them with the native SFX stub.");
-            page_checkbox(kPageAuthenticity, kSignArchive, L"Sign archive with Ed25519",
+            page_checkbox(kPageAuthenticity, kSignArchive, L"Sign archive with Monocypher EdDSA",
                           archive_options_.sign_archive, 72, availability_.authenticity);
             page_label(kPageAuthenticity, L"Signing key", 8, 121, 125,
                        availability_.authenticity);

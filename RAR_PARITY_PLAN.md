@@ -34,9 +34,9 @@ own codec. Companion to [FORMAT.md](FORMAT.md) and [ROADMAP.md](ROADMAP.md).
 | Encryption (data + filenames) | Complete; encrypted-directory edits remain | 3 |
 | Recovery record / recovery volumes | RS codec foundation only | 4 |
 | Multi-volume (split) archives | Not started | 4 |
-| Authenticity / digital signature | Not started | 5 |
-| Self-extracting (SFX) | Not started | 5 |
-| Full POSIX mode/ownership restore | pass-through | 5 |
+| Authenticity / digital signature | Complete (Monocypher EdDSA) | 5 |
+| Self-extracting (SFX) | Complete (native Axiom stub) | 5 |
+| Full POSIX mode/ownership restore | Complete, best-effort ownership | 5 |
 | 64-bit everything (>4 GiB blocks) | 32-bit block pos | 0 |
 
 ## Phase 0 — Extensible container (foundation)
@@ -97,7 +97,8 @@ feature is an additive header/record type, never a format break.
 
 Backend: **Monocypher** (vendored single-file, audited) instead of libsodium —
 chosen for clean two-compiler portability; provides XChaCha20-Poly1305 + Argon2id
-(and Ed25519 for Phase 5). Windows CSPRNG via `BCryptGenRandom`.
+(and its Curve25519/BLAKE2b EdDSA primitive for Phase 5). Windows CSPRNG via
+`BCryptGenRandom`.
 
 - ✅ **Data:** per-block **XChaCha20-Poly1305** AEAD; the block index is the AD
   (anti-reordering). Stored as `nonce ‖ tag ‖ ciphertext`.
@@ -131,12 +132,13 @@ archives.
 
 ## Phase 5 — Authenticity, SFX, full POSIX
 
-- **Authenticity:** Ed25519 archive signing/verification (Monocypher), key
-  management out of band.
-- **SFX:** a Win32 self-extractor stub prepended to the archive that extracts
-  itself; the reader already tolerates a prefix via the trailing footer/directory.
-- **Full POSIX metadata restore** (mode/ownership/symlink perms) to round out the
-  Windows-first work from Phase 1.
+- ✅ **Authenticity:** Monocypher Curve25519/BLAKE2b EdDSA archive
+  signing/verification with raw key management out of band. Standard Ed25519 wire
+  compatibility would require adding Monocypher's optional Ed25519 module.
+- ✅ **SFX:** the native GUI executable is the self-extractor stub; an intact archive
+  and fixed length trailer are appended, detected on launch, verified, and extracted.
+- ✅ **Full POSIX metadata restore:** mode/uid/gid capture, chmod, and best-effort
+  lchown (including link ownership). Device/FIFO/socket records remain unsupported.
 
 ## Cross-cutting (every phase)
 

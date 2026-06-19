@@ -34,6 +34,7 @@
     <ClCompile Include="src\gui\directory_watcher.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="src\gui\drag_drop.cpp"><Filter>Source Files</Filter></ClCompile>
     <ClCompile Include="src\gui\settings_store.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -75,6 +76,7 @@
     <ClInclude Include="src\gui\directory_watcher.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="src\gui\drag_drop.hpp"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="src\gui\settings_store.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>

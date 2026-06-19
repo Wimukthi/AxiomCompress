@@ -851,6 +851,56 @@ void test_archive_comment_lock() {
     fs::remove_all(root, ec);
 }
 
+void test_archive_authenticity_and_sfx() {
+    const auto root = make_temp_dir();
+    const auto source = root / "signed.txt";
+    const auto archive = root / "signed.axar";
+    write_all(source, bytes_from_string("signed archive payload"));
+    axiom::create_archive({source}, archive, {});
+
+    AXIOM_CHECK(!axiom::verify_archive_signature(archive).present);
+    const auto key = axiom::generate_archive_signing_key();
+    axiom::sign_archive(archive, key);
+    const auto verified = axiom::verify_archive_signature(archive, {}, key.public_key);
+    AXIOM_CHECK(verified.present);
+    AXIOM_CHECK(verified.valid);
+    AXIOM_CHECK(verified.trusted_key);
+    axiom::test_archive(archive);
+
+    auto tampered = read_all(archive);
+    AXIOM_CHECK(tampered.size() > 20);
+    tampered[16] ^= 0x40u;
+    const auto bad = root / "tampered.axar";
+    write_all(bad, tampered);
+    const auto rejected = axiom::verify_archive_signature(bad);
+    AXIOM_CHECK(rejected.present);
+    AXIOM_CHECK(!rejected.valid);
+    expect_throws([&] { axiom::test_archive(bad); });
+
+    // Any archive edit deliberately removes the stale signature.
+    axiom::set_archive_comment(archive, "changed after signing");
+    AXIOM_CHECK(!axiom::verify_archive_signature(archive).present);
+
+    // SFX packaging preserves both the stub and the exact archive, then appends
+    // the fixed trailer used by the native GUI self-extractor.
+    const auto stub = root / "stub.exe";
+    const auto sfx = root / "package.exe";
+    const auto stub_bytes = bytes_from_string("MZ fake test stub");
+    write_all(stub, stub_bytes);
+    const auto archive_bytes = read_all(archive);
+    axiom::create_sfx_archive(archive, stub, sfx);
+    const auto packaged = read_all(sfx);
+    AXIOM_CHECK(packaged.size() == stub_bytes.size() + archive_bytes.size() + 16);
+    AXIOM_CHECK(std::equal(stub_bytes.begin(), stub_bytes.end(), packaged.begin()));
+    AXIOM_CHECK(std::equal(archive_bytes.begin(), archive_bytes.end(),
+                           packaged.begin() + static_cast<std::ptrdiff_t>(stub_bytes.size())));
+    const std::string marker = "AXIOMSFX";
+    AXIOM_CHECK(std::equal(marker.begin(), marker.end(), packaged.end() - 16));
+
+    std::error_code error;
+    fs::remove_all(root, error);
+}
+
 // Password-encrypted archives: blocks are sealed, plaintext never hits disk, the
 // right password round-trips, and wrong password / tampering are rejected.
 void test_archive_encryption() {
@@ -1540,6 +1590,7 @@ int main() {
     test_archive_delete_repack();
     test_archive_update_sync();
     test_archive_comment_lock();
+    test_archive_authenticity_and_sfx();
     test_archive_encryption();
     test_archive_encrypted_directory();
     test_archive_operation_control();

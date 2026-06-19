@@ -212,11 +212,29 @@ void apply_ads(const std::filesystem::path& path, const std::vector<AdsStream>& 
 
 #else
 
-FileMetadata capture_metadata(const std::filesystem::path&) {
-    return {};
+FileMetadata capture_metadata(const std::filesystem::path& path) {
+    FileMetadata meta;
+    struct ::stat st {};
+    if (::lstat(path.c_str(), &st) == 0) {
+        meta.has_posix = true;
+        meta.posix_mode = static_cast<std::uint32_t>(st.st_mode);
+        meta.posix_uid = static_cast<std::uint32_t>(st.st_uid);
+        meta.posix_gid = static_cast<std::uint32_t>(st.st_gid);
+    }
+    return meta;
 }
 
-void apply_metadata(const std::filesystem::path&, const FileMetadata&, bool) {}
+void apply_metadata(const std::filesystem::path& path, const FileMetadata& meta, bool) {
+    if (!meta.has_posix) return;
+    const bool symlink = S_ISLNK(static_cast<mode_t>(meta.posix_mode));
+    if (!symlink) {
+        ::chmod(path.c_str(), static_cast<mode_t>(meta.posix_mode & 07777u));
+    }
+    // Ownership restore is best-effort and normally requires privilege. lchown
+    // intentionally addresses the link itself rather than following it.
+    ::lchown(path.c_str(), static_cast<uid_t>(meta.posix_uid),
+             static_cast<gid_t>(meta.posix_gid));
+}
 
 std::optional<FileId> hardlink_identity(const std::filesystem::path& path) {
     struct ::stat st {};

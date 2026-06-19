@@ -139,8 +139,9 @@ Large subsystem; design deliberately.
 A separate, phased effort is bringing `.axar` to **feature parity with RAR**.
 Phases 1–3 now cover strong hashes, Windows metadata/ADS, links, safe extraction,
 editing, comments/lock, and Monocypher data/name encryption. A portable tested
-Reed–Solomon core is the Phase-4 foundation, but recovery records, volumes,
-signatures, POSIX ownership, and SFX still remain. Full status is in
+Reed–Solomon core is the Phase-4 foundation, but recovery records and volumes
+remain. Phase 5 now includes Monocypher authenticity signatures, native SFX
+packaging/extraction, and POSIX mode/ownership capture and restore. Full status is in
 [RAR_PARITY_PLAN.md](RAR_PARITY_PLAN.md). The items below are folded into its
 Phase 0–1.
 
@@ -150,7 +151,7 @@ Phase 0–1.
   core to create/test/repair, then add split and recovery volumes.
 - **Encrypted-directory editing:** data-only encrypted archives are editable;
   archives with sealed names remain read-only.
-- **Metadata:** POSIX modes/ownership and special files remain; Windows attributes,
+- **Metadata:** POSIX special files remain; modes/ownership, Windows attributes,
   high-precision times, ADS, symlinks, and hardlinks are implemented.
 - **CLI polish**: real `-h`/`--help`/`--version` (today help prints only on
   misuse, to stderr, exit 2).

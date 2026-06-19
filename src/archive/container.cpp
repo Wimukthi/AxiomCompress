@@ -39,6 +39,7 @@ constexpr std::uint16_t kFlagEncryptedDirectory = 0x0001;
 // AEAD associated data tag for a sealed directory (distinct from any block index).
 constexpr std::array<std::uint8_t, 8> kDirectoryAd = {'A', 'X', 'D', 'I', 'R', 0, 0, 0};
 constexpr std::size_t kFooterSize = 24;
+constexpr std::array<std::uint8_t, 8> kSfxMagic = {'A', 'X', 'I', 'O', 'M', 'S', 'F', 'X'};
 constexpr std::uint8_t kEntryFile = 0;
 constexpr std::uint8_t kEntryDir = 1;
 constexpr std::uint8_t kEntrySymlink = 2;
@@ -56,12 +57,14 @@ constexpr std::uint64_t kExtraBlake3 = 3;    // file BLAKE3-256 digest (32 bytes
 constexpr std::uint64_t kExtraWinAttrs = 4;  // Windows file attributes (u32 LE)
 constexpr std::uint64_t kExtraWinTimes = 5;  // Windows creation/access/write FILETIMEs (3 × u64 LE)
 constexpr std::uint64_t kExtraAdsStream = 6; // one NTFS named stream: vint name_len, name, bytes
+constexpr std::uint64_t kExtraPosix = 7;     // mode, uid, gid (3 x u32 LE)
 
 // Archive-level extra record types (the TLV area after the entry list). Separate
 // numbering from the per-entry extras above; unknown types are skipped by length.
 constexpr std::uint64_t kArchiveComment = 1;  // UTF-8 archive comment (payload = the text)
 constexpr std::uint64_t kArchiveLock = 2;     // presence marks the archive read-only (no payload)
 constexpr std::uint64_t kArchiveEncryption = 3;  // KDF params + salt + password key-check token
+constexpr std::uint64_t kArchiveSignature = 4;   // public key (32) + EdDSA signature (64)
 
 // ---- little-endian serialization -------------------------------------------
 
@@ -321,6 +324,9 @@ struct ArchiveMeta {
     std::string comment;     // free-form UTF-8 comment (empty = none)
     bool locked = false;     // read-only: edit operations refuse to modify the archive
     EncryptionInfo encryption;
+    bool has_signature = false;
+    std::array<std::uint8_t, 32> signature_public_key{};
+    std::array<std::uint8_t, 64> signature{};
 };
 
 // Fixed plaintext sealed under the archive key to verify a password without touching
@@ -782,6 +788,11 @@ ArchiveIndex parse_directory(const ByteVector& directory, std::uint64_t director
                 const auto data = payload.take(payload.remaining());
                 stream.data.assign(data.begin(), data.end());
                 entry.ads.push_back(std::move(stream));
+            } else if (record_type == kExtraPosix) {
+                entry.meta.has_posix = true;
+                entry.meta.posix_mode = payload.u32();
+                entry.meta.posix_uid = payload.u32();
+                entry.meta.posix_gid = payload.u32();
             }
             // Unknown extra records are intentionally skipped (consumed by length).
         }
@@ -810,6 +821,17 @@ ArchiveIndex parse_directory(const ByteVector& directory, std::uint64_t director
             const auto check_len = static_cast<std::size_t>(payload.vint());
             const auto check = payload.take(check_len);
             enc.key_check.assign(check.begin(), check.end());
+        } else if (record_type == kArchiveSignature) {
+            if (payload.remaining() != index.meta.signature_public_key.size() +
+                                           index.meta.signature.size()) {
+                throw FormatError("invalid archive signature record");
+            }
+            const auto public_key = payload.take(index.meta.signature_public_key.size());
+            std::copy(public_key.begin(), public_key.end(),
+                      index.meta.signature_public_key.begin());
+            const auto signature = payload.take(index.meta.signature.size());
+            std::copy(signature.begin(), signature.end(), index.meta.signature.begin());
+            index.meta.has_signature = true;
         }
     }
 
@@ -991,6 +1013,7 @@ void compress_items_into(std::ofstream& out, std::uint64_t& written,
 
         EntryRec entry;
         entry.path = item.archive_path;
+        entry.meta = core::capture_metadata(item.absolute);
 
         if (item.is_symlink) {
             entry.type = kEntrySymlink;
@@ -1011,8 +1034,6 @@ void compress_items_into(std::ofstream& out, std::uint64_t& written,
                 entry.mtime = 0;
             }
         }
-        entry.meta = core::capture_metadata(item.absolute);
-
         if (item.is_directory) {
             entry.type = kEntryDir;
             entries.push_back(std::move(entry));
@@ -1193,6 +1214,87 @@ LoadedArchive load_index(const ByteSource& source, const std::string& password) 
     return loaded;
 }
 
+core::Blake3Digest archive_signature_digest(const ByteSource& source,
+                                            const ArchiveLayout& layout,
+                                            const ArchiveIndex& index) {
+    core::Blake3 hasher;
+    constexpr std::array<std::uint8_t, 18> domain = {
+        'A', 'X', 'I', 'O', 'M', '-', 'S', 'I', 'G', 'N', 'A', 'T', 'U', 'R', 'E', '-', '0', '1'};
+    hasher.update(domain);
+
+    // Cover the exact header, encryption preamble, and compressed/encrypted block
+    // bytes. The directory is covered below as a canonical semantic manifest with
+    // the signature record omitted, avoiding a self-referential byte stream.
+    std::uint64_t offset = 0;
+    while (offset < layout.directory_offset) {
+        const std::size_t count = static_cast<std::size_t>(
+            std::min<std::uint64_t>(kFileChunk, layout.directory_offset - offset));
+        const auto chunk = source.read(offset, count);
+        hasher.update(chunk);
+        offset += count;
+    }
+
+    ByteVector manifest;
+    put_vint(manifest, index.blocks.size());
+    for (const auto& block : index.blocks) {
+        put_u64(manifest, block.compressed_offset);
+        put_u64(manifest, block.compressed_size);
+        put_u64(manifest, block.uncompressed_size);
+    }
+    put_vint(manifest, index.entries.size());
+    for (const auto& entry : index.entries) {
+        put_vint(manifest, entry.type);
+        put_vint(manifest, entry.path.size());
+        manifest.insert(manifest.end(), entry.path.begin(), entry.path.end());
+        put_u64(manifest, entry.size);
+        put_u64(manifest, static_cast<std::uint64_t>(entry.mtime));
+        put_u32(manifest, entry.crc);
+        put_u64(manifest, entry.first_block);
+        put_u64(manifest, entry.offset);
+        manifest.push_back(entry.has_blake3 ? 1 : 0);
+        if (entry.has_blake3) {
+            manifest.insert(manifest.end(), entry.blake3.begin(), entry.blake3.end());
+        }
+        put_vint(manifest, entry.link_target.size());
+        manifest.insert(manifest.end(), entry.link_target.begin(), entry.link_target.end());
+        manifest.push_back(entry.meta.has_windows_attributes ? 1 : 0);
+        put_u32(manifest, entry.meta.windows_attributes);
+        manifest.push_back(entry.meta.has_windows_times ? 1 : 0);
+        put_u64(manifest, entry.meta.windows_creation_time);
+        put_u64(manifest, entry.meta.windows_access_time);
+        put_u64(manifest, entry.meta.windows_write_time);
+        manifest.push_back(entry.meta.has_posix ? 1 : 0);
+        put_u32(manifest, entry.meta.posix_mode);
+        put_u32(manifest, entry.meta.posix_uid);
+        put_u32(manifest, entry.meta.posix_gid);
+        put_vint(manifest, entry.ads.size());
+        for (const auto& stream : entry.ads) {
+            put_vint(manifest, stream.name.size());
+            manifest.insert(manifest.end(), stream.name.begin(), stream.name.end());
+            put_vint(manifest, stream.data.size());
+            manifest.insert(manifest.end(), stream.data.begin(), stream.data.end());
+        }
+    }
+    put_vint(manifest, index.meta.comment.size());
+    manifest.insert(manifest.end(), index.meta.comment.begin(), index.meta.comment.end());
+    manifest.push_back(index.meta.locked ? 1 : 0);
+    manifest.push_back(index.meta.encryption.enabled ? 1 : 0);
+    manifest.push_back(index.meta.encryption.encrypt_directory ? 1 : 0);
+    if (index.meta.encryption.enabled) {
+        const auto& kdf = index.meta.encryption.kdf;
+        put_u32(manifest, kdf.algorithm);
+        put_u32(manifest, kdf.mem_blocks);
+        put_u32(manifest, kdf.passes);
+        put_u32(manifest, kdf.lanes);
+        manifest.insert(manifest.end(), kdf.salt.begin(), kdf.salt.end());
+        put_vint(manifest, index.meta.encryption.key_check.size());
+        manifest.insert(manifest.end(), index.meta.encryption.key_check.begin(),
+                        index.meta.encryption.key_check.end());
+    }
+    hasher.update(manifest);
+    return hasher.finalize();
+}
+
 // Serialize the central directory and footer for the given blocks/entries to `out`
 // (already positioned at `written`) and close the stream. When `dir_key` is given the
 // directory is sealed before writing (its parameters live in the header preamble, not
@@ -1252,6 +1354,13 @@ void write_directory_and_footer(std::ofstream& out, std::uint64_t written,
             put_u64(body, entry.meta.windows_access_time);
             put_u64(body, entry.meta.windows_write_time);
         }
+        if (entry.meta.has_posix) {
+            put_vint(body, kExtraPosix);
+            put_vint(body, 12);
+            put_u32(body, entry.meta.posix_mode);
+            put_u32(body, entry.meta.posix_uid);
+            put_u32(body, entry.meta.posix_gid);
+        }
         for (const auto& stream : entry.ads) {
             ByteVector payload;
             put_vint(payload, stream.name.size());
@@ -1298,6 +1407,15 @@ void write_directory_and_footer(std::ofstream& out, std::uint64_t written,
         archive_extras.insert(archive_extras.end(), payload.begin(), payload.end());
         ++archive_extra_count;
     }
+    if (meta.has_signature) {
+        put_vint(archive_extras, kArchiveSignature);
+        put_vint(archive_extras,
+                 meta.signature_public_key.size() + meta.signature.size());
+        archive_extras.insert(archive_extras.end(), meta.signature_public_key.begin(),
+                              meta.signature_public_key.end());
+        archive_extras.insert(archive_extras.end(), meta.signature.begin(), meta.signature.end());
+        ++archive_extra_count;
+    }
     put_vint(directory, archive_extra_count);
     directory.insert(directory.end(), archive_extras.begin(), archive_extras.end());
 
@@ -1335,10 +1453,11 @@ void rebuild_archive_keeping(const fs::path& archive_path,
     std::uint64_t file_size = 0;
     auto in = open_archive(archive_path, file_size);
     const ByteSource bytes(in, file_size);
-    const auto index = read_index(bytes);
+    auto index = read_index(bytes);
     if (index.meta.locked) {
         throw std::runtime_error("archive is locked (read-only)");
     }
+    index.meta.has_signature = false;
     // For an encrypted archive, derive the key once: it both decrypts the surviving
     // blocks (via BlockSource) and re-seals the freshly written ones.
     std::optional<core::CryptoKey> key;
@@ -1491,7 +1610,8 @@ void append_items_to_archive(const fs::path& archive_path, const std::vector<Sca
         key = derive_archive_key(existing.meta.encryption, options.password);
     }
     const core::CryptoKey* key_ptr = key ? &*key : nullptr;
-    const ArchiveMeta result_meta = meta_override ? *meta_override : existing.meta;
+    ArchiveMeta result_meta = meta_override ? *meta_override : existing.meta;
+    result_meta.has_signature = false;
     std::uint64_t block_region_end = kHeaderSize;
     if (!existing.blocks.empty()) {
         const auto& last = existing.blocks.back();
@@ -2055,6 +2175,7 @@ void move_archive_entries(const std::filesystem::path& archive_path,
         }
     }
 
+    index.meta.has_signature = false;
     rewrite_archive_directory(archive_path, std::move(index), options);
 }
 
@@ -2070,6 +2191,7 @@ void set_archive_comment(const std::filesystem::path& archive_path, const std::s
         meta = read_index(source).meta;
     }
     meta.comment = comment;
+    meta.has_signature = false;
     append_items_to_archive(archive_path, {}, options, &meta);
 }
 
@@ -2082,6 +2204,7 @@ void lock_archive(const std::filesystem::path& archive_path, const CompressionOp
         meta = read_index(source).meta;  // preserve any existing comment
     }
     meta.locked = true;
+    meta.has_signature = false;
     append_items_to_archive(archive_path, {}, options, &meta);
 }
 
@@ -2119,6 +2242,115 @@ bool archive_is_encrypted(const std::filesystem::path& archive_path) {
     return archive_encryption_mode(archive_path) != ArchiveEncryptionMode::none;
 }
 
+ArchiveSigningKey generate_archive_signing_key() {
+    const auto generated = core::generate_signing_key();
+    return {generated.secret_key, generated.public_key};
+}
+
+void sign_archive(const std::filesystem::path& archive_path,
+                  const ArchiveSigningKey& key,
+                  const CompressionOptions& options) {
+    std::uint64_t file_size = 0;
+    auto stream = open_archive(archive_path, file_size);
+    const ByteSource source(stream, file_size);
+    const ArchiveLayout layout = read_layout(source);
+    if ((layout.flags & kFlagEncryptedDirectory) != 0) {
+        throw std::runtime_error(
+            "signing an archive with an encrypted directory is not supported");
+    }
+    auto loaded = load_index(source, options.password);
+    if (loaded.index.meta.locked) {
+        throw std::runtime_error("archive is locked (read-only)");
+    }
+    const auto digest = archive_signature_digest(source, layout, loaded.index);
+    const auto signature = core::sign_message(key.secret_key, digest);
+    if (!core::verify_message(key.public_key, signature, digest)) {
+        throw std::invalid_argument("signing key public and secret components do not match");
+    }
+    loaded.index.meta.has_signature = true;
+    loaded.index.meta.signature_public_key = key.public_key;
+    loaded.index.meta.signature = signature;
+    stream.close();
+    rewrite_archive_directory(archive_path, std::move(loaded.index), options);
+}
+
+ArchiveSignatureInfo verify_archive_signature(
+    const std::filesystem::path& archive_path,
+    const std::string& password,
+    const std::optional<std::array<std::uint8_t, 32>>& trusted_key) {
+    std::uint64_t file_size = 0;
+    auto stream = open_archive(archive_path, file_size);
+    const ByteSource source(stream, file_size);
+    const ArchiveLayout layout = read_layout(source);
+    const auto loaded = load_index(source, password);
+    ArchiveSignatureInfo info;
+    info.present = loaded.index.meta.has_signature;
+    if (!info.present) return info;
+    info.public_key = loaded.index.meta.signature_public_key;
+    const auto digest = archive_signature_digest(source, layout, loaded.index);
+    info.valid = core::verify_message(info.public_key, loaded.index.meta.signature, digest);
+    info.trusted_key = trusted_key.has_value() && *trusted_key == info.public_key;
+    return info;
+}
+
+void create_sfx_archive(const std::filesystem::path& archive_path,
+                        const std::filesystem::path& stub_executable,
+                        const std::filesystem::path& output_executable,
+                        const std::shared_ptr<OperationControl>& operation) {
+    const auto normalized_output = fs::absolute(output_executable).lexically_normal();
+    if (fs::absolute(archive_path).lexically_normal() == normalized_output ||
+        fs::absolute(stub_executable).lexically_normal() == normalized_output) {
+        throw std::invalid_argument("SFX output must differ from its archive and stub");
+    }
+    std::error_code error;
+    const std::uint64_t stub_size = fs::file_size(stub_executable, error);
+    if (error) throw std::runtime_error("cannot read SFX stub: " + error.message());
+    const std::uint64_t archive_size = fs::file_size(archive_path, error);
+    if (error) throw std::runtime_error("cannot read SFX archive: " + error.message());
+
+    fs::path temporary = output_executable;
+    temporary += ".tmp";
+    TempFileGuard guard(temporary);
+    std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
+    if (!output) throw std::runtime_error("cannot create SFX output");
+
+    std::uint64_t completed = 0;
+    const std::uint64_t total = stub_size + archive_size;
+    auto copy = [&](const fs::path& path) {
+        std::ifstream input(path, std::ios::binary);
+        if (!input) throw std::runtime_error("cannot read SFX input: " + path.string());
+        std::array<char, kFileChunk> chunk{};
+        while (input) {
+            operation_checkpoint(operation);
+            input.read(chunk.data(), static_cast<std::streamsize>(chunk.size()));
+            const auto count = input.gcount();
+            if (count <= 0) break;
+            output.write(chunk.data(), count);
+            if (!output) throw std::runtime_error("failed while writing SFX output");
+            completed += static_cast<std::uint64_t>(count);
+            report_operation(operation, OperationStage::writing, completed, total, 0, 2,
+                             path.filename().string());
+        }
+    };
+    copy(stub_executable);
+    copy(archive_path);
+    output.write(reinterpret_cast<const char*>(kSfxMagic.data()),
+                 static_cast<std::streamsize>(kSfxMagic.size()));
+    ByteVector size;
+    put_u64(size, archive_size);
+    output.write(reinterpret_cast<const char*>(size.data()),
+                 static_cast<std::streamsize>(size.size()));
+    output.close();
+    if (!output) throw std::runtime_error("failed to finalize SFX output");
+    fs::rename(temporary, output_executable, error);
+    if (error) {
+        fs::remove(output_executable, error);
+        fs::rename(temporary, output_executable, error);
+        if (error) throw std::runtime_error("cannot install SFX output: " + error.message());
+    }
+    guard.dismiss();
+}
+
 std::vector<ArchiveEntry> list_archive(const std::filesystem::path& archive_path,
                                        const std::string& password) {
     std::uint64_t file_size = 0;
@@ -2154,6 +2386,14 @@ void test_archive(const std::filesystem::path& archive_path,
     const ByteSource bytes(stream, file_size);
     auto loaded = load_index(bytes, options.password);
     const auto& index = loaded.index;
+    if (index.meta.has_signature) {
+        const auto layout = read_layout(bytes);
+        const auto digest = archive_signature_digest(bytes, layout, index);
+        if (!core::verify_message(index.meta.signature_public_key,
+                                  index.meta.signature, digest)) {
+            throw FormatError("archive authenticity signature is invalid");
+        }
+    }
     if (index.meta.encryption.enabled && !loaded.key) {
         throw std::runtime_error("archive is encrypted; a password is required");
     }

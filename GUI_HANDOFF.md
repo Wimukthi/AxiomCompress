@@ -73,7 +73,7 @@ resizable columns, archive hierarchy browsing, incoming shell drops, owner-drawn
 menus/context menus, the icon toolbar, custom dialogs, and create/open/test/extract
 plus add/update/fresh/sync/delete/repack/comment/lock workflows.
 
-The backend now exposes the APIs needed for full file-manager drag/drop:
+The backend and GUI now provide full file-manager drag/drop:
 
 - `ArchiveInput` + path-aware `add_to_archive` maps dropped filesystem objects to
   the current archive directory.
@@ -84,12 +84,14 @@ The backend now exposes the APIs needed for full file-manager drag/drop:
 - `archive_encryption_mode` distinguishes plaintext, editable data-only encryption,
   and currently read-only encrypted-directory archives.
 
-The next GUI slice is an OLE `IDropTarget`/`IDataObject` layer over those APIs.
-Incoming `WM_DROPFILES` still routes non-archive files to create-archive. Outbound
-drag should selectively extract to managed temporary storage before publishing
-`CF_HDROP`; cleanup must not race Explorer's asynchronous consumption. Also wire
-filename encryption and password-authenticated block-only archive editing. Recovery
-UI remains disabled: the Reed–Solomon core exists, but recovery records do not.
+- `src/gui/drag_drop.*` implements `IDataObject`, `IDropSource`, `IDropTarget`,
+  `CF_HDROP`, and a private archive-entry format for same-process moves.
+- Explorer drops add at the hovered/current archive folder; internal drops move
+  subtrees; drag-out lazily extracts selected roots on a pause/cancel-aware worker
+  and retains staging until exit.
+- Phase-5 signature verification/signing, SFX creation/self-extraction, and POSIX
+  metadata APIs are active. Recovery UI remains disabled: the Reed–Solomon core
+  exists, but recovery records do not.
 
 ## Build And Verification
 

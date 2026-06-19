@@ -80,6 +80,7 @@ unknown types are skipped by length, the same way block- and entry-level extras 
 | 1    | comment    | free-form UTF-8 archive comment (the whole payload) |
 | 2    | lock       | none — its presence marks the archive read-only     |
 | 3    | encryption | KDF params + salt + key-check token (see *Encryption*) |
+| 4    | signature  | signer public key (32 bytes) + Monocypher EdDSA signature (64 bytes) |
 
 Recovery-record parameters and volume info will be added here as further types.
 
@@ -166,6 +167,7 @@ u8[]     payload               payload_len bytes
 | 4    | win_attrs | Windows file attributes bitmask (`FILE_ATTRIBUTE_*`, u32 LE) |
 | 5    | win_times | Windows creation/access/write times, 100-ns FILETIME ticks since 1601 UTC (3 × u64 LE); full precision, supersedes `mtime` on restore |
 | 6    | ads_stream | one NTFS named alternate data stream: `vint name_len`, the UTF-8 stream name, then the stream bytes (rest of the record). A file may carry several; each ≤ 1 MiB (larger streams are skipped at capture time) |
+| 7    | posix      | POSIX mode, uid, and gid (3 x u32 LE); ignored on Windows |
 
 Readers consume the extra records they understand and **skip the rest by
 `payload_len`**. A file's bytes are recovered by reading `size` bytes starting at
@@ -269,12 +271,20 @@ What the format and the current implementation do and do not handle:
   leaves names listable and supports edits with the password. `--encrypt-names`
   additionally seals the central directory, requiring the password to list it.
 
+- **Authenticity signatures:** type-4 archive metadata stores a Curve25519 EdDSA
+  public key and signature using Monocypher's BLAKE2b-based primitive. The signed
+  digest covers exact header/preamble/block bytes and canonical directory semantics.
+  `test` rejects an invalid signature and any edit removes the stale signature.
+  This primitive is not wire-compatible with standard SHA-512 Ed25519.
+- **SFX packaging:** an intact `.axar` is appended to `Axiom.exe`, followed by
+  `"AXIOMSFX"` and a u64 archive length. The stub verifies and extracts the payload.
+
 **Additional behavior and current limits**
 
 - **Metadata stored:** mtime (seconds), plus on Windows the file attributes,
   full-precision creation/access/write times, and **NTFS alternate data streams**
-  (named streams ≤ 1 MiB each; larger ones are skipped). POSIX permission bits and
-  ownership are not yet stored (a later phase).
+  (named streams ≤ 1 MiB each; larger ones are skipped). POSIX mode/uid/gid are
+  stored and restored best-effort on POSIX hosts; ownership requires privilege.
 - **No special files** (devices, FIFOs, sockets) — only regular files,
   directories, symlinks, and hard links are stored; everything else is skipped.
 - **Encryption**: block contents are always sealed; with `--encrypt-names` the
@@ -286,7 +296,8 @@ What the format and the current implementation do and do not handle:
   seekable output (the directory and footer are written last).
 - **Integrity:** per-block CRC-32 (inside each `.axc`) plus a per-file CRC-32 and
   a per-file **BLAKE3-256** content hash, all checked by `test`. Encrypted blocks add
-  an authenticated AEAD tag. (Authenticity *signatures* are a later phase.)
+  an authenticated AEAD tag. Optional signatures cover stored block bytes and
+  canonical directory metadata.
 
 **Size and resource ceilings**
 
@@ -318,6 +329,6 @@ What the format and the current implementation do and do not handle:
 
 ## Not yet specified (planned)
 
-- POSIX permission bits and special-file records.
+- POSIX special-file records (devices, FIFOs, and sockets).
 - Append/update in place and a seekable streaming-write mode for non-seekable
   outputs.

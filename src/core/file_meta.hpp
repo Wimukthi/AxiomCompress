@@ -49,7 +49,7 @@ void apply_ads(const std::filesystem::path& path, const std::vector<AdsStream>& 
 
 // OS file metadata captured at archive time and reapplied on extract. Fields are
 // platform-tagged; a reader applies what is present and relevant to the extracting
-// OS and ignores the rest. (POSIX mode/owner fields are added in a later phase.)
+// OS and ignores the rest.
 struct FileMetadata {
     bool has_windows_attributes = false;
     std::uint32_t windows_attributes = 0;  // Windows FILE_ATTRIBUTE_* bitmask
@@ -60,6 +60,11 @@ struct FileMetadata {
     std::uint64_t windows_creation_time = 0;
     std::uint64_t windows_access_time = 0;
     std::uint64_t windows_write_time = 0;
+
+    bool has_posix = false;
+    std::uint32_t posix_mode = 0;
+    std::uint32_t posix_uid = 0;
+    std::uint32_t posix_gid = 0;
 };
 
 // Read metadata from an existing path (file or directory). On non-Windows builds,

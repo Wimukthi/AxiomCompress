@@ -55,6 +55,12 @@ replacement rename, honor `OperationControl`, and reject locked archives. Data-o
 encrypted archives are editable with the password; encrypted-directory archives
 currently remain read-only.
 
+Phase-5 services are archive-level APIs: signatures cover exact stored block bytes
+and canonical directory semantics, SFX appends an intact archive plus a fixed trailer
+to the native GUI stub, and POSIX mode/uid/gid uses a skippable entry TLV. The Win32
+file list implements `IDataObject`, `IDropSource`, and `IDropTarget`; drag-out only
+materializes selected entries when a shell target requests `CF_HDROP`.
+
 Reed–Solomon erasure coding is present as a tested portable core, but no recovery
 record is written to `.axar` yet. Recovery records and multi-volume orchestration
 remain Phase 4 container work.

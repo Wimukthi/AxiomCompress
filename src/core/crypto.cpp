@@ -101,4 +101,29 @@ void secure_wipe(std::span<std::uint8_t> buffer) {
     }
 }
 
+SigningKeyPair generate_signing_key() {
+    std::array<std::uint8_t, 32> seed{};
+    random_bytes(seed);
+    SigningKeyPair pair;
+    crypto_eddsa_key_pair(pair.secret_key.data(), pair.public_key.data(), seed.data());
+    secure_wipe(seed);
+    return pair;
+}
+
+std::array<std::uint8_t, 64> sign_message(
+    const std::array<std::uint8_t, 64>& secret_key,
+    std::span<const std::uint8_t> message) {
+    std::array<std::uint8_t, 64> signature{};
+    crypto_eddsa_sign(signature.data(), secret_key.data(),
+                      message.empty() ? nullptr : message.data(), message.size());
+    return signature;
+}
+
+bool verify_message(const std::array<std::uint8_t, 32>& public_key,
+                    const std::array<std::uint8_t, 64>& signature,
+                    std::span<const std::uint8_t> message) {
+    return crypto_eddsa_check(signature.data(), public_key.data(),
+                              message.empty() ? nullptr : message.data(), message.size()) == 0;
+}
+
 }  // namespace axiom::core

@@ -253,6 +253,7 @@ ArchiveCatalog::ArchiveCatalog(fs::path path, std::vector<ArchiveEntry> entries)
     capabilities_.lock = true;
     capabilities_.metadata = true;
     capabilities_.links = true;
+    capabilities_.authenticity = true;
     capabilities_.locked = archive_is_locked(path_);
     capabilities_.encrypted = archive_is_encrypted(path_);
 }

@@ -2,9 +2,13 @@
 #include "axiom/axiom.hpp"
 
 #include <ctime>
+#include <array>
+#include <algorithm>
+#include <fstream>
 #include <exception>
 #include <filesystem>
 #include <iostream>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -13,6 +17,7 @@
 namespace {
 
 namespace fs = std::filesystem;
+fs::path executable_path;
 
 void print_usage() {
     std::cerr <<
@@ -30,6 +35,10 @@ void print_usage() {
         "  axiomc x [options] <archive.axar> [dest-dir]   extract (default: current dir)\n"
         "  axiomc l <archive.axar>                         list contents\n"
         "  axiomc t [options] <archive.axar>               test integrity\n"
+        "  axiomc keygen <secret.key> <public.key>          generate an archive signing key\n"
+        "  axiomc sign [options] <archive.axar> <secret.key> sign an archive\n"
+        "  axiomc verify [options] <archive.axar> [public.key] verify authenticity\n"
+        "  axiomc sfx <archive.axar> <output.exe> [stub.exe] create a self-extractor\n"
         "\n"
         "Single-stream commands:\n"
         "  axiomc c [options] <input> <output.axc>         compress one stream\n"
@@ -73,6 +82,27 @@ std::size_t parse_size(const std::string& value) {
         }
     }
     return static_cast<std::size_t>(std::stoull(digits) * multiplier);
+}
+
+template <std::size_t Size>
+std::array<std::uint8_t, Size> read_key(const fs::path& path) {
+    std::array<std::uint8_t, Size> key{};
+    std::ifstream input(path, std::ios::binary);
+    if (!input || !input.read(reinterpret_cast<char*>(key.data()),
+                              static_cast<std::streamsize>(key.size())) ||
+        input.peek() != std::char_traits<char>::eof()) {
+        throw std::runtime_error("invalid signing key file: " + path.string());
+    }
+    return key;
+}
+
+template <std::size_t Size>
+void write_key(const fs::path& path, const std::array<std::uint8_t, Size>& key) {
+    std::ofstream output(path, std::ios::binary | std::ios::trunc);
+    if (!output || !output.write(reinterpret_cast<const char*>(key.data()),
+                                 static_cast<std::streamsize>(key.size()))) {
+        throw std::runtime_error("cannot write signing key file: " + path.string());
+    }
 }
 
 // Effort presets, fastest (1) to maximum ratio (9). Each level picks a coherent
@@ -468,6 +498,73 @@ int run_test(std::vector<std::string> args) {
     return 0;
 }
 
+int run_keygen(const std::vector<std::string>& args) {
+    if (args.size() != 2) {
+        print_usage();
+        return 2;
+    }
+    auto key = axiom::generate_archive_signing_key();
+    write_key(args[0], key.secret_key);
+    write_key(args[1], key.public_key);
+    std::fill(key.secret_key.begin(), key.secret_key.end(), std::uint8_t{0});
+    std::cout << "signing key generated\n";
+    return 0;
+}
+
+int run_sign(std::vector<std::string> args) {
+    axiom::CompressionOptions options;
+    if (!take_compression_flags(args, options) || args.size() != 2) {
+        print_usage();
+        return 2;
+    }
+    axiom::ArchiveSigningKey key;
+    key.secret_key = read_key<64>(args[1]);
+    std::copy_n(key.secret_key.begin() + 32, key.public_key.size(), key.public_key.begin());
+    axiom::sign_archive(args[0], key, options);
+    std::fill(key.secret_key.begin(), key.secret_key.end(), std::uint8_t{0});
+    std::cout << "archive signed\n";
+    return 0;
+}
+
+int run_verify(std::vector<std::string> args) {
+    axiom::DecompressionOptions options;
+    if (!take_decompression_flags(args, options) || args.empty() || args.size() > 2) {
+        print_usage();
+        return 2;
+    }
+    std::optional<std::array<std::uint8_t, 32>> trusted;
+    if (args.size() == 2) trusted = read_key<32>(args[1]);
+    const auto info = axiom::verify_archive_signature(args[0], options.password, trusted);
+    if (!info.present) {
+        std::cout << "archive is not signed\n";
+        return 3;
+    }
+    if (!info.valid) {
+        std::cout << "archive signature is invalid\n";
+        return 1;
+    }
+    if (trusted && !info.trusted_key) {
+        std::cout << "archive signature is valid but uses a different key\n";
+        return 4;
+    }
+    std::cout << (trusted ? "archive signature is valid and trusted\n"
+                          : "archive signature is valid\n");
+    return 0;
+}
+
+int run_sfx(const std::vector<std::string>& args) {
+    if (args.size() < 2 || args.size() > 3) {
+        print_usage();
+        return 2;
+    }
+    const fs::path stub = args.size() == 3
+        ? fs::path(args[2])
+        : executable_path.parent_path() / "Axiom.exe";
+    axiom::create_sfx_archive(args[0], stub, args[1]);
+    std::cout << "self-extracting archive created\n";
+    return 0;
+}
+
 int run_compress(std::vector<std::string> args) {
     axiom::CompressionOptions options;
     if (!take_compression_flags(args, options)) {
@@ -502,6 +599,7 @@ int main(int argc, char** argv) {
         return 2;
     }
 
+    executable_path = fs::absolute(argv[0]);
     const std::string_view command = argv[1];
     std::vector<std::string> args(argv + 2, argv + argc);
 
@@ -538,6 +636,18 @@ int main(int argc, char** argv) {
         }
         if (command == "t" || command == "test") {
             return run_test(std::move(args));
+        }
+        if (command == "keygen") {
+            return run_keygen(args);
+        }
+        if (command == "sign") {
+            return run_sign(std::move(args));
+        }
+        if (command == "verify") {
+            return run_verify(std::move(args));
+        }
+        if (command == "sfx") {
+            return run_sfx(args);
         }
         if (command == "c" || command == "compress") {
             return run_compress(std::move(args));

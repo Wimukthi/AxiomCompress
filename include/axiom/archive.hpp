@@ -5,6 +5,7 @@
 #include <array>
 #include <cstdint>
 #include <filesystem>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -57,6 +58,34 @@ enum class ArchiveEncryptionMode {
     data_only,
     data_and_directory,
 };
+
+struct ArchiveSigningKey {
+    std::array<std::uint8_t, 64> secret_key{};
+    std::array<std::uint8_t, 32> public_key{};
+};
+
+struct ArchiveSignatureInfo {
+    bool present = false;
+    bool valid = false;
+    bool trusted_key = false;
+    std::array<std::uint8_t, 32> public_key{};
+};
+
+ArchiveSigningKey generate_archive_signing_key();
+void sign_archive(const std::filesystem::path& archive_path,
+                  const ArchiveSigningKey& key,
+                  const CompressionOptions& options = {});
+ArchiveSignatureInfo verify_archive_signature(
+    const std::filesystem::path& archive_path,
+    const std::string& password = {},
+    const std::optional<std::array<std::uint8_t, 32>>& trusted_key = std::nullopt);
+
+// Create a Windows self-extracting executable by appending an intact archive and
+// an Axiom SFX trailer to a native Axiom GUI stub.
+void create_sfx_archive(const std::filesystem::path& archive_path,
+                        const std::filesystem::path& stub_executable,
+                        const std::filesystem::path& output_executable,
+                        const std::shared_ptr<OperationControl>& operation = nullptr);
 
 // Build a `.axar` archive from the given files/directories (directories are
 // scanned recursively). Archive paths are stored relative to each input's
