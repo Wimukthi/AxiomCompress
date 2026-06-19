@@ -17,6 +17,10 @@ set(BLAKE3_SOURCES
     src/third_party/blake3/blake3_dispatch.c
     src/third_party/blake3/blake3_portable.c)
 
+# Vendored Monocypher (XChaCha20-Poly1305 + Argon2id). Single C file; warnings off.
+set(MONOCYPHER_SOURCES
+    src/third_party/monocypher/monocypher.c)
+
 add_library(axiom STATIC
     src/archive/container.cpp
     src/codec/block.cpp
@@ -26,10 +30,12 @@ add_library(axiom STATIC
     src/core/archive.cpp
     src/core/checksum.cpp
     src/core/cpu.cpp
+    src/core/crypto.cpp
     src/core/file_meta.cpp
     src/entropy/huffman.cpp
     src/entropy/range.cpp
-    ${BLAKE3_SOURCES})
+    ${BLAKE3_SOURCES}
+    ${MONOCYPHER_SOURCES})
 
 target_include_directories(axiom
     PUBLIC include
@@ -42,10 +48,15 @@ target_compile_definitions(axiom PRIVATE
 
 if(MSVC)
     target_compile_options(axiom PRIVATE /W4 /permissive-)
-    set_source_files_properties(${BLAKE3_SOURCES} PROPERTIES COMPILE_OPTIONS /w)
+    set_source_files_properties(${BLAKE3_SOURCES} ${MONOCYPHER_SOURCES} PROPERTIES COMPILE_OPTIONS /w)
 else()
     target_compile_options(axiom PRIVATE -Wall -Wextra -Wpedantic)
-    set_source_files_properties(${BLAKE3_SOURCES} PROPERTIES COMPILE_OPTIONS -w)
+    set_source_files_properties(${BLAKE3_SOURCES} ${MONOCYPHER_SOURCES} PROPERTIES COMPILE_OPTIONS -w)
+endif()
+
+# Windows CSPRNG (BCryptGenRandom) used by core/crypto.
+if(WIN32)
+    target_link_libraries(axiom PUBLIC bcrypt)
 endif()
 
 add_executable(axiomc src/cli/main.cpp)

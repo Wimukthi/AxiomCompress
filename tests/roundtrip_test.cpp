@@ -25,6 +25,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -385,7 +386,7 @@ void test_archive_symlinks() {
             saw_link = true;
             AXIOM_CHECK(entry.is_symlink);
             AXIOM_CHECK(!entry.is_directory);
-            AXIOM_CHECK(entry.symlink_target == "real.txt");
+            AXIOM_CHECK(entry.link_target == "real.txt");
         }
     }
     AXIOM_CHECK(saw_link);
@@ -399,6 +400,331 @@ void test_archive_symlinks() {
     // The link still resolves to the real content beside it.
     AXIOM_CHECK(read_all(extracted) == bytes_from_string("the real file"));
 
+    fs::remove_all(root, ec);
+}
+
+// Two paths to one inode are stored once (canonical file + a hardlink entry) and
+// re-linked on extract. Hard links need no privilege on NTFS/most POSIX FSes, so
+// this exercises the full path; it skips only if the FS refuses the link.
+void test_archive_hardlinks() {
+    const auto root = make_temp_dir();
+    const auto src = root / "src";
+    fs::create_directories(src);
+    const auto payload = bytes_from_string("shared inode payload, stored exactly once");
+    write_all(src / "a.txt", payload);
+
+    std::error_code ec;
+    fs::create_hard_link(src / "a.txt", src / "b.txt", ec);
+    if (ec) {
+        fs::remove_all(root, ec);
+        return;  // filesystem does not support hard links here
+    }
+
+    const auto archive = root / "hard.axar";
+    axiom::create_archive({src}, archive, {});
+
+    const auto entries = axiom::list_archive(archive);
+    int files = 0, hardlinks = 0;
+    std::string link_target;
+    for (const auto& entry : entries) {
+        if (entry.is_hardlink) {
+            ++hardlinks;
+            link_target = entry.link_target;
+            AXIOM_CHECK(!entry.is_directory && !entry.is_symlink);
+        } else if (!entry.is_directory) {
+            ++files;
+        }
+    }
+    // Exactly one of the pair is stored as bytes; the other references it.
+    AXIOM_CHECK(files == 1);
+    AXIOM_CHECK(hardlinks == 1);
+    AXIOM_CHECK(link_target == "src/a.txt" || link_target == "src/b.txt");
+    axiom::test_archive(archive);
+
+    const auto dest = root / "out";
+    axiom::extract_archive(archive, dest, {});
+    AXIOM_CHECK(read_all(dest / "src" / "a.txt") == payload);
+    AXIOM_CHECK(read_all(dest / "src" / "b.txt") == payload);
+    // The extracted pair should once again share one inode.
+    AXIOM_CHECK(fs::hard_link_count(dest / "src" / "a.txt", ec) == 2);
+
+    fs::remove_all(root, ec);
+}
+
+// add_to_archive appends new files (reusing existing compressed blocks) and an
+// added path replaces the existing entry of the same name.
+void test_archive_add() {
+    const auto root = make_temp_dir();
+    const auto src = root / "src";
+    fs::create_directories(src);
+    const auto a = bytes_from_string("first file content " + std::string(2000, 'x'));
+    write_all(src / "a.txt", a);
+
+    const auto archive = root / "a.axar";
+    axiom::create_archive({src}, archive, {});
+
+    // Append a brand-new file in a separate directory.
+    const auto more = root / "more";
+    fs::create_directories(more);
+    const auto b = bytes_from_string("second file " + std::string(3000, 'y'));
+    write_all(more / "b.txt", b);
+    axiom::add_to_archive({more}, archive, {});
+    axiom::test_archive(archive);
+
+    {
+        bool has_a = false, has_b = false;
+        for (const auto& e : axiom::list_archive(archive)) {
+            has_a = has_a || e.path == "src/a.txt";
+            has_b = has_b || e.path == "more/b.txt";
+        }
+        AXIOM_CHECK(has_a && has_b);
+        const auto dest = root / "out";
+        axiom::extract_archive(archive, dest, {});
+        AXIOM_CHECK(read_all(dest / "src" / "a.txt") == a);
+        AXIOM_CHECK(read_all(dest / "more" / "b.txt") == b);
+    }
+
+    // Re-adding src with changed content replaces the existing src/a.txt in place.
+    const auto a2 = bytes_from_string("REPLACED content, different length");
+    write_all(src / "a.txt", a2);
+    axiom::add_to_archive({src}, archive, {});
+    axiom::test_archive(archive);
+
+    int count_a = 0;
+    for (const auto& e : axiom::list_archive(archive)) {
+        count_a += (e.path == "src/a.txt") ? 1 : 0;
+    }
+    AXIOM_CHECK(count_a == 1);  // replaced, not duplicated
+
+    const auto dest2 = root / "out2";
+    axiom::extract_archive(archive, dest2, {});
+    AXIOM_CHECK(read_all(dest2 / "src" / "a.txt") == a2);
+    AXIOM_CHECK(read_all(dest2 / "more" / "b.txt") == b);  // earlier add untouched
+
+    std::error_code ec;
+    fs::remove_all(root, ec);
+}
+
+// delete removes entries (and directory subtrees) and reclaims their space; repack
+// reclaims dead space left behind by a replace.
+void test_archive_delete_repack() {
+    const auto root = make_temp_dir();
+    const auto src = root / "src";
+    fs::create_directories(src / "keep");
+    const auto big = bytes_from_string(std::string(50000, 'Z'));
+    write_all(src / "big.bin", big);
+    write_all(src / "keep" / "small.txt", bytes_from_string("keep me"));
+
+    axiom::CompressionOptions opt;
+    opt.block_size = 8 * 1024;  // several blocks, so removal visibly shrinks the file
+    const auto archive = root / "a.axar";
+    axiom::create_archive({src}, archive, opt);
+    const auto size_full = fs::file_size(archive);
+
+    // Delete the big file: it disappears and the archive shrinks (space reclaimed).
+    axiom::delete_from_archive(archive, {"src/big.bin"}, opt);
+    axiom::test_archive(archive);
+    {
+        bool has_big = false, has_small = false;
+        for (const auto& e : axiom::list_archive(archive)) {
+            has_big = has_big || e.path == "src/big.bin";
+            has_small = has_small || e.path == "src/keep/small.txt";
+        }
+        AXIOM_CHECK(!has_big);
+        AXIOM_CHECK(has_small);
+    }
+    AXIOM_CHECK(fs::file_size(archive) < size_full);
+
+    const auto dest = root / "out";
+    axiom::extract_archive(archive, dest, {});
+    AXIOM_CHECK(read_all(dest / "src" / "keep" / "small.txt") == bytes_from_string("keep me"));
+    AXIOM_CHECK(!fs::exists(dest / "src" / "big.bin"));
+
+    // Deleting a directory removes its whole subtree.
+    axiom::delete_from_archive(archive, {"src/keep"}, opt);
+    for (const auto& e : axiom::list_archive(archive)) {
+        AXIOM_CHECK(e.path != "src/keep" && e.path != "src/keep/small.txt");
+    }
+
+    // Repack reclaims the dead space a same-path replace leaves behind.
+    const auto arch2 = root / "b.axar";
+    write_all(src / "big.bin", big);
+    axiom::create_archive({src}, arch2, opt);
+    write_all(src / "big.bin", bytes_from_string(std::string(50000, 'Q')));
+    axiom::add_to_archive({src}, arch2, opt);  // replaces big.bin; old blocks linger
+    const auto bloated = fs::file_size(arch2);
+    axiom::repack_archive(arch2, opt);
+    axiom::test_archive(arch2);
+    AXIOM_CHECK(fs::file_size(arch2) < bloated);
+
+    const auto dest2 = root / "out2";
+    axiom::extract_archive(arch2, dest2, {});
+    AXIOM_CHECK(read_all(dest2 / "src" / "big.bin") == bytes_from_string(std::string(50000, 'Q')));
+
+    std::error_code ec;
+    fs::remove_all(root, ec);
+}
+
+// update adds new + replaces newer (by mtime); fresh refreshes only existing files;
+// sync mirrors the inputs, deleting archived entries no longer on disk.
+void test_archive_update_sync() {
+    const auto root = make_temp_dir();
+    const auto src = root / "src";
+    fs::create_directories(src);
+    write_all(src / "a.txt", bytes_from_string("A original"));
+
+    const auto archive = root / "a.axar";
+    axiom::create_archive({src}, archive, {});
+
+    auto has = [&](const std::string& path) {
+        for (const auto& e : axiom::list_archive(archive)) {
+            if (e.path == path) return true;
+        }
+        return false;
+    };
+
+    // update: a brand-new file is added; the unchanged a.txt is left alone.
+    write_all(src / "b.txt", bytes_from_string("B new"));
+    axiom::update_archive({src}, archive, {}, /*fresh_only=*/false);
+    AXIOM_CHECK(has("src/a.txt") && has("src/b.txt"));
+
+    // A newer a.txt (bumped mtime) is replaced by update.
+    write_all(src / "a.txt", bytes_from_string("A UPDATED, different length"));
+    std::error_code ec;
+    const auto stamp = fs::last_write_time(src / "a.txt", ec);
+    fs::last_write_time(src / "a.txt", stamp + std::chrono::seconds(120), ec);
+    axiom::update_archive({src}, archive, {}, /*fresh_only=*/false);
+    {
+        const auto dest = root / "out";
+        axiom::extract_archive(archive, dest, {});
+        AXIOM_CHECK(read_all(dest / "src" / "a.txt") == bytes_from_string("A UPDATED, different length"));
+        AXIOM_CHECK(read_all(dest / "src" / "b.txt") == bytes_from_string("B new"));
+    }
+
+    // fresh: a new file is NOT added (fresh only refreshes files already present).
+    write_all(src / "c.txt", bytes_from_string("C not added by fresh"));
+    axiom::update_archive({src}, archive, {}, /*fresh_only=*/true);
+    AXIOM_CHECK(!has("src/c.txt"));
+
+    // sync: c.txt (now on disk) is added; b.txt (removed from disk) is deleted.
+    fs::remove(src / "b.txt", ec);
+    axiom::sync_archive({src}, archive, {});
+    axiom::test_archive(archive);
+    AXIOM_CHECK(has("src/c.txt"));
+    AXIOM_CHECK(!has("src/b.txt"));
+
+    fs::remove_all(root, ec);
+}
+
+// Archive comment survives edits; lock makes every edit operation refuse while
+// reads keep working.
+void test_archive_comment_lock() {
+    const auto root = make_temp_dir();
+    const auto src = root / "src";
+    fs::create_directories(src);
+    write_all(src / "a.txt", bytes_from_string("payload"));
+    const auto archive = root / "a.axar";
+    axiom::create_archive({src}, archive, {});
+
+    AXIOM_CHECK(axiom::archive_comment(archive).empty());
+    AXIOM_CHECK(!axiom::archive_is_locked(archive));
+
+    const std::string note = "release build \xE2\x9C\x93 keep me";  // includes a UTF-8 check mark
+    axiom::set_archive_comment(archive, note);
+    AXIOM_CHECK(axiom::archive_comment(archive) == note);
+
+    // The comment survives a later edit.
+    write_all(src / "b.txt", bytes_from_string("more"));
+    axiom::add_to_archive({src}, archive, {});
+    AXIOM_CHECK(axiom::archive_comment(archive) == note);
+    axiom::test_archive(archive);
+
+    // Locking makes edits refuse; reads still succeed.
+    axiom::lock_archive(archive);
+    AXIOM_CHECK(axiom::archive_is_locked(archive));
+    AXIOM_CHECK(axiom::archive_comment(archive) == note);
+    axiom::test_archive(archive);
+    AXIOM_CHECK(axiom::list_archive(archive).size() >= 2);
+    expect_throws([&] { axiom::add_to_archive({src}, archive, {}); });
+    expect_throws([&] { axiom::delete_from_archive(archive, {"src/a.txt"}, {}); });
+    expect_throws([&] { axiom::repack_archive(archive, {}); });
+    expect_throws([&] { axiom::set_archive_comment(archive, "nope"); });
+    expect_throws([&] { axiom::lock_archive(archive); });
+
+    std::error_code ec;
+    fs::remove_all(root, ec);
+}
+
+// Password-encrypted archives: blocks are sealed, plaintext never hits disk, the
+// right password round-trips, and wrong password / tampering are rejected.
+void test_archive_encryption() {
+    const auto root = make_temp_dir();
+    const auto src = root / "src";
+    fs::create_directories(src / "sub");
+    const auto secret = bytes_from_string("top secret payload " + std::string(3000, 'S'));
+    write_all(src / "secret.txt", secret);
+    const auto blob = bytes_from_string(std::string(1500, '\x7f'));
+    write_all(src / "sub" / "data.bin", blob);
+
+    axiom::CompressionOptions opt;
+    opt.block_size = 1024;  // multiple sealed blocks
+    opt.password = "hunter2 correct horse";
+    const auto archive = root / "enc.axar";
+    axiom::create_archive({src}, archive, opt);
+
+    AXIOM_CHECK(axiom::archive_is_encrypted(archive));
+    AXIOM_CHECK(axiom::list_archive(archive).size() >= 2);  // names readable w/o password
+
+    // Wrong or missing password is rejected before any block is read.
+    {
+        axiom::ExtractOptions x;
+        x.password = "wrong password";
+        expect_throws([&] { axiom::extract_archive(archive, root / "bad", x); });
+        axiom::DecompressionOptions d;  // no password at all
+        expect_throws([&] { axiom::test_archive(archive, d); });
+    }
+
+    // Correct password round-trips through test + extract.
+    {
+        axiom::DecompressionOptions d;
+        d.password = opt.password;
+        axiom::test_archive(archive, d);
+        axiom::ExtractOptions x;
+        x.password = opt.password;
+        const auto dest = root / "out";
+        axiom::extract_archive(archive, dest, x);
+        AXIOM_CHECK(read_all(dest / "src" / "secret.txt") == secret);
+        AXIOM_CHECK(read_all(dest / "src" / "sub" / "data.bin") == blob);
+    }
+
+    // The recognizable plaintext marker must not appear anywhere in the archive.
+    {
+        const auto raw = read_all(archive);
+        const std::string marker = "top secret payload";
+        const auto* needle = reinterpret_cast<const std::uint8_t*>(marker.data());
+        AXIOM_CHECK(std::search(raw.begin(), raw.end(), needle, needle + marker.size()) == raw.end());
+    }
+
+    // Tampering with a ciphertext byte must fail authentication, not corrupt silently.
+    {
+        auto raw = read_all(archive);
+        AXIOM_CHECK(raw.size() > 60);
+        raw[50] ^= 0xFFu;  // inside the first sealed block
+        const auto bad = root / "tampered.axar";
+        write_all(bad, raw);
+        axiom::DecompressionOptions d;
+        d.password = opt.password;
+        expect_throws([&] { axiom::test_archive(bad, d); });
+    }
+
+    // Editing an encrypted archive is refused in this slice.
+    {
+        axiom::CompressionOptions a;
+        a.password = opt.password;
+        expect_throws([&] { axiom::add_to_archive({src}, archive, a); });
+    }
+
+    std::error_code ec;
     fs::remove_all(root, ec);
 }
 
@@ -495,6 +821,52 @@ void test_windows_metadata() {
     std::error_code ec;
     fs::remove_all(root, ec);
 }
+
+// NTFS alternate data streams (e.g. the Zone.Identifier mark-of-the-web) must be
+// captured and recreated on extract.
+void test_archive_ads() {
+    const auto root = make_temp_dir();
+    const auto src = root / "src";
+    fs::create_directories(src);
+    const auto file = src / "host.txt";
+    write_all(file, bytes_from_string("primary content stream"));
+
+    const std::string ads_data = "[ZoneTransfer]\r\nZoneId=3\r\n";
+    auto write_stream = [](const std::wstring& path, const std::string& data) {
+        const HANDLE handle = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr,
+                                          CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        AXIOM_CHECK(handle != INVALID_HANDLE_VALUE);
+        DWORD wrote = 0;
+        WriteFile(handle, data.data(), static_cast<DWORD>(data.size()), &wrote, nullptr);
+        CloseHandle(handle);
+    };
+    auto read_stream = [](const std::wstring& path) {
+        const HANDLE handle = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                                          OPEN_EXISTING, 0, nullptr);
+        if (handle == INVALID_HANDLE_VALUE) {
+            return std::string("<missing>");
+        }
+        char buffer[256];
+        DWORD got = 0;
+        ReadFile(handle, buffer, sizeof(buffer), &got, nullptr);
+        CloseHandle(handle);
+        return std::string(buffer, got);
+    };
+
+    write_stream(file.wstring() + L":Zone.Identifier", ads_data);
+
+    const auto archive = root / "ads.axar";
+    axiom::create_archive({src}, archive, {});
+    const auto dest = root / "out";
+    axiom::extract_archive(archive, dest, {});
+
+    const auto extracted = dest / "src" / "host.txt";
+    AXIOM_CHECK(read_all(extracted) == bytes_from_string("primary content stream"));
+    AXIOM_CHECK(read_stream(extracted.wstring() + L":Zone.Identifier") == ads_data);
+
+    std::error_code ec;
+    fs::remove_all(root, ec);
+}
 #endif
 
 void test_archive_safety() {
@@ -554,6 +926,48 @@ void test_archive_safety() {
     }
 
     std::error_code ec;
+    fs::remove_all(root, ec);
+}
+
+// Safe extraction must refuse to write through a redirecting directory link
+// (symlink, or on Windows a junction) sitting in the destination — otherwise a
+// pre-existing or archive-planted link could divert files outside the target tree.
+// Junctions need no privilege, so this exercises the guard on Windows directly.
+void test_extract_link_safety() {
+    const auto root = make_temp_dir();
+    fs::create_directories(root / "src" / "sub");
+    write_all(root / "src" / "sub" / "f.txt", bytes_from_string("must stay inside the destination"));
+    const auto archive = root / "a.axar";
+    axiom::create_archive({root / "src"}, archive, {});
+
+    const auto dest = root / "out";
+    const auto outside = root / "outside";
+    fs::create_directories(dest / "src");
+    fs::create_directories(outside);
+
+    // Plant a redirecting link where the archive expects a real directory.
+    const auto link = dest / "src" / "sub";
+    bool linked = false;
+#if defined(_WIN32)
+    const std::string cmd =
+        "cmd /c mklink /J \"" + link.string() + "\" \"" + outside.string() + "\" >nul 2>&1";
+    linked = std::system(cmd.c_str()) == 0;
+#else
+    std::error_code lec;
+    fs::create_directory_symlink(outside, link, lec);
+    linked = !lec;
+#endif
+    std::error_code ec;
+    if (!linked) {  // platform/filesystem won't make the link; nothing to test
+        fs::remove_all(root, ec);
+        return;
+    }
+
+    // Extraction must refuse rather than follow the link out of the destination.
+    expect_throws([&] { axiom::extract_archive(archive, dest, {}); });
+    AXIOM_CHECK(!fs::exists(outside / "f.txt"));  // nothing escaped through the link
+
+    fs::remove(link, ec);  // drop the junction before cleaning the tree
     fs::remove_all(root, ec);
 }
 
@@ -786,11 +1200,20 @@ int main() {
     test_blake3();
     test_rans_edges();
     test_archive_roundtrip();
+    test_archive_symlinks();
+    test_archive_hardlinks();
+    test_archive_add();
+    test_archive_delete_repack();
+    test_archive_update_sync();
+    test_archive_comment_lock();
+    test_archive_encryption();
     test_archive_operation_control();
 #if defined(_WIN32)
     test_windows_metadata();
+    test_archive_ads();
 #endif
     test_archive_safety();
+    test_extract_link_safety();
     test_decompress_bomb();
     fuzz_decompress(20000);
     fuzz_archive(1500);

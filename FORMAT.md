@@ -69,12 +69,48 @@ block_count × BlockRec
 vint                     entry_count
 entry_count × EntryRec
 vint                     archive_extra_count
-archive_extra_count × (vint type, vint len, u8[len])   archive-level TLV (reserved)
+archive_extra_count × (vint type, vint len, u8[len])   archive-level TLV
 ```
 
-The trailing **archive-level extra records** are reserved for service data added
-later — comment, recovery-record parameters, encryption parameters, volume info —
-and are skipped by length today, the same way block- and entry-level extras are.
+The trailing **archive-level extra records** carry archive-wide service data;
+unknown types are skipped by length, the same way block- and entry-level extras are.
+
+| type | name       | payload                                            |
+|------|------------|----------------------------------------------------|
+| 1    | comment    | free-form UTF-8 archive comment (the whole payload) |
+| 2    | lock       | none — its presence marks the archive read-only     |
+| 3    | encryption | KDF params + salt + key-check token (see *Encryption*) |
+
+Recovery-record parameters and volume info will be added here as further types.
+
+### Encryption
+
+When an archive is created with a password, every solid block is encrypted and the
+`encryption` archive-extra record records how to derive the key:
+
+```
+vint     kdf_algorithm     2 = Argon2id
+vint     mem_blocks        Argon2 memory cost, in 1 KiB blocks
+vint     passes            Argon2 time cost
+vint     lanes             Argon2 parallelism
+vint     salt_len          (16)
+u8[]     salt              per-archive random salt
+vint     check_len
+u8[]     key_check         a fixed plaintext sealed under the key (salt as AD)
+```
+
+- **Key:** Argon2id(password, salt, params) → 32 bytes. Derived once per archive.
+- **Blocks:** each block's compressed `.axc` bytes are sealed with **XChaCha20-Poly1305**
+  (Monocypher). The stored block is `nonce(24) ‖ tag(16) ‖ ciphertext`; the block's
+  index (8-byte LE) is the AEAD associated data, so a block is valid only at its own
+  position (no reordering or cross-archive transplant). `compressed_size` covers the
+  whole sealed blob; `uncompressed_size` is the plaintext block size as before.
+- **Wrong-password check:** `key_check` is a known constant sealed under the key; a
+  reader re-derives the key and opens it first, rejecting a wrong password before any
+  block is read.
+- **Scope:** block *contents* are encrypted; the central directory (file names, sizes,
+  hashes) is **not** encrypted yet, and encrypted archives cannot yet be *edited*
+  (add/update/delete/repack refuse). Both are planned follow-ups.
 
 `BlockRec`:
 
@@ -92,13 +128,18 @@ types can be skipped whole:
 ```
 vint     record_len            (length of the record body that follows)
 --- record body (record_len bytes) ---
-vint     type                  0 = file, 1 = directory (future: symlink, hardlink, …)
+vint     type                  0 = file, 1 = directory, 2 = symlink, 3 = hardlink
 vint     path_len
 u8[]     path                  relative, UTF-8, '/'-separated, no '..'
   if type == file:
     vint   size                uncompressed size
     vint   first_block         index of the block holding the first byte
     vint   offset              byte offset of the file within first_block
+  if type == symlink or hardlink:
+    vint   target_len          length of the target
+    u8[]   target              symlink: the link target, verbatim (relative or absolute)
+                               hardlink: the archive path of the file whose bytes are
+                               shared (always an earlier entry); carries no content
 --- zero or more TLV extra records, until the body ends ---
 vint     record_type
 vint     payload_len
@@ -114,6 +155,7 @@ u8[]     payload               payload_len bytes
 | 3    | blake3    | BLAKE3-256 digest of the file's bytes (32 bytes) — the strong content hash, verified by `test` |
 | 4    | win_attrs | Windows file attributes bitmask (`FILE_ATTRIBUTE_*`, u32 LE) |
 | 5    | win_times | Windows creation/access/write times, 100-ns FILETIME ticks since 1601 UTC (3 × u64 LE); full precision, supersedes `mtime` on restore |
+| 6    | ads_stream | one NTFS named alternate data stream: `vint name_len`, the UTF-8 stream name, then the stream bytes (rest of the record). A file may carry several; each ≤ 1 MiB (larger streams are skipped at capture time) |
 
 Readers consume the extra records they understand and **skip the rest by
 `payload_len`**. A file's bytes are recovered by reading `size` bytes starting at
@@ -158,7 +200,7 @@ declared size. The decoder defends against this before allocating:
 
 The format is **pre-release and free to change**, so writers and readers are
 deliberately strict: a reader accepts **only the exact current version** it was
-built for (`.axar` container = `3`, embedded `.axc` stream = `4`) and rejects
+built for (`.axar` container = `4`, embedded `.axc` stream = `4`) and rejects
 anything else with a clear error. There is **no backward or forward compatibility
 yet** — an archive must be produced and read by the same build generation.
 
@@ -176,22 +218,58 @@ What the format and the current implementation do and do not handle:
 
 - Many regular files and directories, recursive, with relative `/`-separated
   UTF-8 paths; empty files and empty directories are preserved.
+- **Symbolic links** — stored as links (the target is recorded verbatim, the link
+  is *not* followed) and recreated on extract. Creating a symlink on extract can
+  require privilege (Windows without Developer Mode); when the OS refuses, that
+  link is skipped and the rest of the archive still extracts.
+- **Hard links** — files sharing one identity (Windows volume+file index, or POSIX
+  dev+inode) are stored **once**: the first occurrence holds the bytes, later ones
+  are hardlink entries referencing it, and extract re-links them with
+  `create_hard_link` (falling back to an independent copy across volumes). Detection
+  costs nothing for the common single-link file (only files with link count > 1 are
+  probed).
 - Solid (cross-file) compression with per-block *and* per-file CRC-32, random
   access list/extract, selective single-file extraction, atomic writes,
   `--overwrite fail|skip|all`, mtime restore, and threaded encode/decode.
+- **Add / update** files into an existing archive (`a` on an existing `.axar`):
+  existing files are not recompressed — their solid blocks are copied verbatim and
+  new files are appended as new blocks, then the directory is rebuilt. An added path
+  replaces the existing entry of the same name (the replaced bytes become dead space
+  until a repack).
+- **Update / fresh / sync** (`u`, `f`, `s`): refresh by modification time. `update`
+  adds new files and replaces archived copies older than the disk file; `fresh`
+  replaces only files already in the archive; `sync` mirrors the inputs — update,
+  then delete any archived entry no longer present on disk.
+- **Delete / repack** (`delete <path>…`, `repack`): rebuild the archive keeping only
+  the surviving entries, re-solidifying their files into fresh blocks so removed and
+  replaced data is physically reclaimed. A directory path removes its whole subtree;
+  a hard link whose target is removed is dropped. `repack` keeps everything, purely
+  reclaiming dead space.
+- **Comment** (`comment`) and **lock** (`lock`): a free-form UTF-8 archive comment,
+  and a one-way read-only flag after which every edit operation refuses. Both live in
+  the archive-level TLV and survive edits; reads (list/test/extract) ignore the lock.
+- **Encryption** (`-p`/`--password`): per-block XChaCha20-Poly1305 with an Argon2id
+  password key. Wrong password and tampering are rejected (authenticated); listing
+  names still works without the password. (Names and editing of encrypted archives
+  are not yet covered — see below.)
 
 **Not stored / not supported**
 
-- **Metadata:** mtime (seconds), plus on Windows the file attributes and
-  full-precision creation/access/write times. POSIX permission bits and ownership
-  are not yet stored (a later phase); NTFS alternate data streams are not yet
-  captured.
-- **No symlinks or special files** — symlinks are *skipped* when adding.
-- **No encryption** and **no append/update in place**; writing needs a seekable
-  output (the directory and footer are written last).
+- **Metadata:** mtime (seconds), plus on Windows the file attributes,
+  full-precision creation/access/write times, and **NTFS alternate data streams**
+  (named streams ≤ 1 MiB each; larger ones are skipped). POSIX permission bits and
+  ownership are not yet stored (a later phase).
+- **No special files** (devices, FIFOs, sockets) — only regular files,
+  directories, symlinks, and hard links are stored; everything else is skipped.
+- **Encryption** covers block *contents* only — the central directory (names, sizes,
+  hashes) is still plaintext, and an encrypted archive cannot yet be *edited*
+  (add/update/delete/repack refuse). Encrypted-directory mode and editing are planned.
+- Editing (`add`/replace/`delete`/`repack`) rewrites the whole file via a temp +
+  atomic rename; there is no true zero-copy in-place append yet. Writing needs a
+  seekable output (the directory and footer are written last).
 - **Integrity:** per-block CRC-32 (inside each `.axc`) plus a per-file CRC-32 and
-  a per-file **BLAKE3-256** content hash, all checked by `test`. (Encryption and
-  authenticity signatures are later phases.)
+  a per-file **BLAKE3-256** content hash, all checked by `test`. Encrypted blocks add
+  an authenticated AEAD tag. (Authenticity *signatures* are a later phase.)
 
 **Size and resource ceilings**
 
@@ -206,14 +284,23 @@ What the format and the current implementation do and do not handle:
 - `decompress` rejects any declared output size above a caller limit (**default
   4 GiB**) before allocating (decompression-bomb guard).
 
-**Extraction-safety caveat**
+**Extraction safety**
 
-- Path containment is **lexical** — solid against `..` and absolute paths, but a
-  *pre-existing symlink already in the destination directory* is not yet guarded
-  (`openat`/`O_NOFOLLOW` is planned). Extract only into trusted directories.
+- Path containment is **lexical** — solid against `..` and absolute paths.
+- **Symlink-safe**: lexical containment only proves a path *spells* no escape, so
+  before materializing any entry the extractor requires every existing directory
+  component from the destination root down to that entry's parent to be a **real
+  directory, not a redirecting link**. This covers symlinks on every platform and,
+  on Windows, **NTFS junctions / mount points** (directory reparse points, which
+  need no privilege to create and which `std::filesystem::is_symlink` does not
+  report). It rejects both a *pre-existing* link in the destination and one an
+  archive plants and then tries to write through (in-order extraction means the
+  later entry's parent chain now contains the link and is refused). A restored
+  symlink's **target** is still stored verbatim and may point anywhere — the
+  guarantee is that no archive entry is written *through* it.
 
 ## Not yet specified (planned)
 
-- POSIX permission bits / Windows attributes, symlink and special-file records.
+- POSIX permission bits and special-file records.
 - Append/update in place and a seekable streaming-write mode for non-seekable
   outputs.

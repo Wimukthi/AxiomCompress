@@ -39,12 +39,14 @@ $libSources = @(
     "src\core\archive.cpp",
     "src\core\checksum.cpp",
     "src\core\cpu.cpp",
+    "src\core\crypto.cpp",
     "src\core\file_meta.cpp",
     "src\entropy\huffman.cpp",
     "src\entropy\range.cpp",
     "src\third_party\blake3\blake3.c",
     "src\third_party\blake3\blake3_dispatch.c",
-    "src\third_party\blake3\blake3_portable.c"
+    "src\third_party\blake3\blake3_portable.c",
+    "src\third_party\monocypher\monocypher.c"
 ) | ForEach-Object { "`"$Root\$_`"" }
 
 # Vendored BLAKE3: portable build (SIMD backends disabled).

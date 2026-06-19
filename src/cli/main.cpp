@@ -19,7 +19,14 @@ void print_usage() {
         "axiomc - Axiom archiver\n"
         "\n"
         "Archive commands:\n"
-        "  axiomc a [options] <archive.axar> <input>...   create an archive\n"
+        "  axiomc a [options] <archive.axar> <input>...   create, or add/replace into an existing archive\n"
+        "  axiomc u [options] <archive.axar> <input>...   update: add new + replace newer (by mtime)\n"
+        "  axiomc f [options] <archive.axar> <input>...   fresh: replace newer only, never add new\n"
+        "  axiomc s [options] <archive.axar> <input>...   sync: mirror inputs (add/replace + delete missing)\n"
+        "  axiomc delete [options] <archive.axar> <path>...  remove entries (dir removes its subtree)\n"
+        "  axiomc repack [options] <archive.axar>          rebuild, reclaiming replaced/deleted space\n"
+        "  axiomc comment <archive.axar> [text]            show, or set, the archive comment\n"
+        "  axiomc lock <archive.axar>                      mark the archive read-only (no unlock)\n"
         "  axiomc x [options] <archive.axar> [dest-dir]   extract (default: current dir)\n"
         "  axiomc l <archive.axar>                         list contents\n"
         "  axiomc t [options] <archive.axar>               test integrity\n"
@@ -27,6 +34,10 @@ void print_usage() {
         "Single-stream commands:\n"
         "  axiomc c [options] <input> <output.axc>         compress one stream\n"
         "  axiomc d [options] <input.axc> <output>         decompress one stream\n"
+        "\n"
+        "Encryption:\n"
+        "  -p, --password STR  encrypt blocks on 'a' (create); supply to read 'x'/'t'\n"
+        "                      (XChaCha20-Poly1305 per block, Argon2id key derivation)\n"
         "\n"
         "Compression options (a, c):\n"
         "  --level N           1=fastest .. 9=max ratio (default 5)\n"
@@ -150,6 +161,8 @@ bool take_compression_flags(std::vector<std::string>& args, axiom::CompressionOp
             options.enable_optimal_parser = false;
         } else if (arg == "--threads") {
             options.thread_count = parse_size(next("--threads"));
+        } else if (arg == "-p" || arg == "--password") {
+            options.password = next(arg.c_str());
         } else if (arg == "--block-size") {
             options.block_size = parse_size(next("--block-size"));
             options.auto_block_size_for_threads = false;
@@ -196,6 +209,8 @@ bool take_decompression_flags(std::vector<std::string>& args,
 
         if (arg == "--threads") {
             options.thread_count = parse_size(next("--threads"));
+        } else if (arg == "-p" || arg == "--password") {
+            options.password = next(arg.c_str());
         } else if (arg.rfind("--", 0) == 0) {
             std::cerr << "axiomc: unknown option " << arg << '\n';
             return false;
@@ -234,7 +249,98 @@ int run_add(std::vector<std::string> args) {
 
     const fs::path archive = args.front();
     std::vector<fs::path> inputs(args.begin() + 1, args.end());
-    axiom::create_archive(inputs, archive, options);
+    // `a` creates a new archive, or adds to (and updates entries in) an existing one.
+    if (fs::exists(archive)) {
+        axiom::add_to_archive(inputs, archive, options);
+    } else {
+        axiom::create_archive(inputs, archive, options);
+    }
+    return 0;
+}
+
+int run_update(std::vector<std::string> args, bool fresh_only) {
+    axiom::CompressionOptions options;
+    if (!take_compression_flags(args, options)) {
+        return 2;
+    }
+    if (args.size() < 2) {
+        print_usage();
+        return 2;
+    }
+    const fs::path archive = args.front();
+    std::vector<fs::path> inputs(args.begin() + 1, args.end());
+    axiom::update_archive(inputs, archive, options, fresh_only);
+    return 0;
+}
+
+int run_sync(std::vector<std::string> args) {
+    axiom::CompressionOptions options;
+    if (!take_compression_flags(args, options)) {
+        return 2;
+    }
+    if (args.size() < 2) {
+        print_usage();
+        return 2;
+    }
+    const fs::path archive = args.front();
+    std::vector<fs::path> inputs(args.begin() + 1, args.end());
+    axiom::sync_archive(inputs, archive, options);
+    return 0;
+}
+
+int run_comment(std::vector<std::string> args) {
+    if (args.empty() || args.size() > 2) {
+        print_usage();
+        return 2;
+    }
+    const fs::path archive = args.front();
+    if (args.size() == 1) {
+        const std::string comment = axiom::archive_comment(archive);
+        if (comment.empty()) {
+            std::cout << "(no comment)\n";
+        } else {
+            std::cout << comment << '\n';
+        }
+        return 0;
+    }
+    axiom::set_archive_comment(archive, args[1]);
+    return 0;
+}
+
+int run_lock(std::vector<std::string> args) {
+    if (args.size() != 1) {
+        print_usage();
+        return 2;
+    }
+    axiom::lock_archive(args.front());
+    return 0;
+}
+
+int run_delete(std::vector<std::string> args) {
+    axiom::CompressionOptions options;
+    if (!take_compression_flags(args, options)) {
+        return 2;
+    }
+    if (args.size() < 2) {
+        print_usage();
+        return 2;
+    }
+    const fs::path archive = args.front();
+    const std::vector<std::string> paths(args.begin() + 1, args.end());
+    axiom::delete_from_archive(archive, paths, options);
+    return 0;
+}
+
+int run_repack(std::vector<std::string> args) {
+    axiom::CompressionOptions options;
+    if (!take_compression_flags(args, options)) {
+        return 2;
+    }
+    if (args.size() != 1) {
+        print_usage();
+        return 2;
+    }
+    axiom::repack_archive(args.front(), options);
     return 0;
 }
 
@@ -265,6 +371,12 @@ int run_extract(std::vector<std::string> args) {
                 return 2;
             }
             decompression.thread_count = parse_size(args[++i]);
+        } else if (args[i] == "-p" || args[i] == "--password") {
+            if (i + 1 >= args.size()) {
+                print_usage();
+                return 2;
+            }
+            extract.password = args[++i];
         } else if (args[i].rfind("--", 0) == 0) {
             std::cerr << "axiomc: unknown option " << args[i] << '\n';
             return 2;
@@ -291,9 +403,26 @@ int run_list(const std::vector<std::string>& args) {
     }
     const auto entries = axiom::list_archive(args[0]);
 
+    const std::string comment = axiom::archive_comment(args[0]);
+    if (!comment.empty()) {
+        std::cout << "Comment: " << comment << '\n';
+    }
+    if (axiom::archive_is_locked(args[0])) {
+        std::cout << "[locked: read-only]\n";
+    }
+    if (axiom::archive_is_encrypted(args[0])) {
+        std::cout << "[encrypted: password required to extract]\n";
+    }
+
     std::uint64_t total_bytes = 0;
     for (const auto& entry : entries) {
-        if (entry.is_directory) {
+        if (entry.is_symlink) {
+            std::cout << "       <LINK>  " << format_time(entry.mtime) << "  " << entry.path
+                      << " -> " << entry.link_target << '\n';
+        } else if (entry.is_hardlink) {
+            std::cout << "       <HLNK>  " << format_time(entry.mtime) << "  " << entry.path
+                      << " => " << entry.link_target << '\n';
+        } else if (entry.is_directory) {
             std::cout << "        <DIR>  " << format_time(entry.mtime) << "  " << entry.path << '\n';
         } else {
             std::cout.width(13);
@@ -359,6 +488,27 @@ int main(int argc, char** argv) {
     try {
         if (command == "a" || command == "add") {
             return run_add(std::move(args));
+        }
+        if (command == "u" || command == "update") {
+            return run_update(std::move(args), /*fresh_only=*/false);
+        }
+        if (command == "f" || command == "fresh") {
+            return run_update(std::move(args), /*fresh_only=*/true);
+        }
+        if (command == "s" || command == "sync") {
+            return run_sync(std::move(args));
+        }
+        if (command == "delete" || command == "rm") {
+            return run_delete(std::move(args));
+        }
+        if (command == "repack") {
+            return run_repack(std::move(args));
+        }
+        if (command == "comment") {
+            return run_comment(std::move(args));
+        }
+        if (command == "lock") {
+            return run_lock(std::move(args));
         }
         if (command == "x" || command == "extract") {
             return run_extract(std::move(args));

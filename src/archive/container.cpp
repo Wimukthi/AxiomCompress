@@ -2,6 +2,7 @@
 
 #include "archive/fuzz_support.hpp"
 #include "core/checksum.hpp"
+#include "core/crypto.hpp"
 #include "core/file_meta.hpp"
 #include "core/hash.hpp"
 
@@ -12,9 +13,14 @@
 #include <fstream>
 #include <functional>
 #include <limits>
+#include <map>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <tuple>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -30,6 +36,7 @@ constexpr std::size_t kFooterSize = 24;
 constexpr std::uint8_t kEntryFile = 0;
 constexpr std::uint8_t kEntryDir = 1;
 constexpr std::uint8_t kEntrySymlink = 2;
+constexpr std::uint8_t kEntryHardlink = 3;  // link_target = archive path of the shared file
 constexpr std::size_t kFileChunk = 1u << 16;
 
 // Per-entry "extra area" record types (TLV). The directory stores each entry as a
@@ -42,6 +49,13 @@ constexpr std::uint64_t kExtraCrc32 = 2;     // file CRC-32 (4-byte LE)
 constexpr std::uint64_t kExtraBlake3 = 3;    // file BLAKE3-256 digest (32 bytes)
 constexpr std::uint64_t kExtraWinAttrs = 4;  // Windows file attributes (u32 LE)
 constexpr std::uint64_t kExtraWinTimes = 5;  // Windows creation/access/write FILETIMEs (3 × u64 LE)
+constexpr std::uint64_t kExtraAdsStream = 6; // one NTFS named stream: vint name_len, name, bytes
+
+// Archive-level extra record types (the TLV area after the entry list). Separate
+// numbering from the per-entry extras above; unknown types are skipped by length.
+constexpr std::uint64_t kArchiveComment = 1;  // UTF-8 archive comment (payload = the text)
+constexpr std::uint64_t kArchiveLock = 2;     // presence marks the archive read-only (no payload)
+constexpr std::uint64_t kArchiveEncryption = 3;  // KDF params + salt + password key-check token
 
 // ---- little-endian serialization -------------------------------------------
 
@@ -135,6 +149,8 @@ public:
 
     bool has_more() const { return cursor_ < data_.size(); }
 
+    std::size_t remaining() const { return data_.size() - cursor_; }
+
 private:
     void need(std::size_t count) const {
         if (cursor_ + count > data_.size()) {
@@ -190,6 +206,30 @@ bool is_within(const fs::path& base, const fs::path& target) {
     return true;
 }
 
+// Symlink-safe extraction: lexical containment (is_within) only proves a path *spells*
+// no escape — a symlink among its real directory components could still redirect a
+// write outside the destination. Before materializing any entry we require every
+// existing component from the destination root down to the entry's parent to be a
+// real directory, never a symlink. Combined with in-order extraction this also stops
+// an archive that plants a symlink and then writes through it: the later entry's
+// parent chain now contains that symlink and is rejected. `dest_norm` is trusted.
+void reject_symlinked_ancestor(const fs::path& dest_norm, const fs::path& target) {
+    std::vector<fs::path> chain;  // target's parent up to (excluding) dest_norm
+    for (fs::path p = target.parent_path(); p != dest_norm; p = p.parent_path()) {
+        chain.push_back(p);
+        if (p == p.parent_path()) {
+            break;  // hit a filesystem root without meeting dest (post-containment: unreachable)
+        }
+    }
+    // Check outermost-first so the message names the shallowest offending link.
+    for (auto it = chain.rbegin(); it != chain.rend(); ++it) {
+        if (core::is_reparse_point(*it)) {
+            throw FormatError("refusing to extract through a symlinked directory: " +
+                              it->lexically_relative(dest_norm).generic_string());
+        }
+    }
+}
+
 // ---- archive model ---------------------------------------------------------
 
 struct BlockRec {
@@ -210,11 +250,34 @@ struct EntryRec {
     core::Blake3Digest blake3{};
     core::FileMetadata meta;
     std::string link_target;  // symlink target (verbatim) for kEntrySymlink
+    std::vector<core::AdsStream> ads;  // NTFS alternate data streams (kEntryFile)
 };
+
+// Password-encryption parameters recorded in the directory (present only when the
+// archive is encrypted). The salt + cost parameters let a reader re-derive the key;
+// the key-check token is a sealed constant used to reject a wrong password up front.
+struct EncryptionInfo {
+    bool enabled = false;
+    core::KdfParams kdf;
+    std::vector<std::uint8_t> key_check;
+};
+
+// Archive-wide metadata stored in the directory's trailing TLV area.
+struct ArchiveMeta {
+    std::string comment;     // free-form UTF-8 comment (empty = none)
+    bool locked = false;     // read-only: edit operations refuse to modify the archive
+    EncryptionInfo encryption;
+};
+
+// Fixed plaintext sealed under the archive key to verify a password without touching
+// any block; its AEAD also binds the KDF salt as associated data.
+constexpr std::array<std::uint8_t, 16> kKeyCheckPlaintext = {
+    'a', 'x', 'i', 'o', 'm', '-', 'k', 'e', 'y', 'c', 'h', 'e', 'c', 'k', '0', '1'};
 
 struct ArchiveIndex {
     std::vector<BlockRec> blocks;
     std::vector<EntryRec> entries;
+    ArchiveMeta meta;
 };
 
 struct ScanItem {
@@ -457,7 +520,7 @@ ArchiveIndex read_index(const ByteSource& source) {
         EntryRec entry;
         entry.type = static_cast<std::uint8_t>(body.vint());
         if (entry.type != kEntryFile && entry.type != kEntryDir &&
-            entry.type != kEntrySymlink) {
+            entry.type != kEntrySymlink && entry.type != kEntryHardlink) {
             throw FormatError("unknown archive entry type");
         }
         entry.path = body.str(static_cast<std::size_t>(body.vint()));
@@ -465,7 +528,7 @@ ArchiveIndex read_index(const ByteSource& source) {
             entry.size = body.vint();
             entry.first_block = body.vint();
             entry.offset = body.vint();
-        } else if (entry.type == kEntrySymlink) {
+        } else if (entry.type == kEntrySymlink || entry.type == kEntryHardlink) {
             entry.link_target = body.str(static_cast<std::size_t>(body.vint()));
         }
         while (body.has_more()) {
@@ -487,17 +550,41 @@ ArchiveIndex read_index(const ByteSource& source) {
                 entry.meta.windows_creation_time = payload.u64();
                 entry.meta.windows_access_time = payload.u64();
                 entry.meta.windows_write_time = payload.u64();
+            } else if (record_type == kExtraAdsStream) {
+                core::AdsStream stream;
+                stream.name = payload.str(static_cast<std::size_t>(payload.vint()));
+                const auto data = payload.take(payload.remaining());
+                stream.data.assign(data.begin(), data.end());
+                entry.ads.push_back(std::move(stream));
             }
             // Unknown extra records are intentionally skipped (consumed by length).
         }
         index.entries.push_back(std::move(entry));
     }
 
-    // Archive-level extra records (reserved); consumed by length, ignored today.
+    // Archive-level extra records (comment, lock, …); unknown ones skipped by length.
     const auto archive_extra_count = reader.vint();
     for (std::uint64_t i = 0; i < archive_extra_count; ++i) {
-        (void)reader.vint();  // record type
-        (void)reader.take(static_cast<std::size_t>(reader.vint()));  // payload
+        const auto record_type = reader.vint();
+        Reader payload(reader.take(static_cast<std::size_t>(reader.vint())));
+        if (record_type == kArchiveComment) {
+            index.meta.comment = payload.str(payload.remaining());
+        } else if (record_type == kArchiveLock) {
+            index.meta.locked = true;
+        } else if (record_type == kArchiveEncryption) {
+            auto& enc = index.meta.encryption;
+            enc.enabled = true;
+            enc.kdf.algorithm = static_cast<std::uint32_t>(payload.vint());
+            enc.kdf.mem_blocks = static_cast<std::uint32_t>(payload.vint());
+            enc.kdf.passes = static_cast<std::uint32_t>(payload.vint());
+            enc.kdf.lanes = static_cast<std::uint32_t>(payload.vint());
+            const auto salt_len = static_cast<std::size_t>(payload.vint());
+            const auto salt = payload.take(salt_len);
+            std::copy_n(salt.begin(), std::min(salt_len, enc.kdf.salt.size()), enc.kdf.salt.begin());
+            const auto check_len = static_cast<std::size_t>(payload.vint());
+            const auto check = payload.take(check_len);
+            enc.key_check.assign(check.begin(), check.end());
+        }
     }
 
     return index;
@@ -505,16 +592,30 @@ ArchiveIndex read_index(const ByteSource& source) {
 
 // Decodes solid blocks on demand, caching the most recently used one so the many
 // small files sharing a block are not decoded repeatedly.
+
+// Associated data for a block's AEAD: its index, little-endian. Binding the index
+// makes a sealed block valid only at its own position, defeating block reordering.
+inline std::array<std::uint8_t, 8> block_associated_data(std::uint64_t block_index) {
+    std::array<std::uint8_t, 8> ad{};
+    for (int i = 0; i < 8; ++i) {
+        ad[static_cast<std::size_t>(i)] =
+            static_cast<std::uint8_t>((block_index >> (8 * i)) & 0xFFu);
+    }
+    return ad;
+}
+
 class BlockSource {
 public:
     BlockSource(const ByteSource& source,
                 const ArchiveIndex& index,
                 std::size_t thread_count,
-                std::shared_ptr<OperationControl> operation)
+                std::shared_ptr<OperationControl> operation,
+                std::optional<core::CryptoKey> key = std::nullopt)
         : source_(source),
           index_(index),
           thread_count_(thread_count),
-          operation_(std::move(operation)) {}
+          operation_(std::move(operation)),
+          key_(std::move(key)) {}
 
     const ByteVector& block(std::uint64_t block_index) {
         if (block_index != cached_index_) {
@@ -523,7 +624,17 @@ public:
                 throw FormatError("block index out of range");
             }
             const auto& record = index_.blocks[block_index];
-            const auto compressed = source_.read(record.compressed_offset, record.compressed_size);
+            auto compressed = source_.read(record.compressed_offset, record.compressed_size);
+            if (key_) {
+                // Verify + decrypt before decompressing; the index is the AEAD's AD.
+                std::vector<std::uint8_t> plaintext;
+                if (!core::aead_open(*key_, compressed, block_associated_data(block_index),
+                                     plaintext)) {
+                    throw FormatError(
+                        "block authentication failed (wrong password or corrupt archive)");
+                }
+                compressed = std::move(plaintext);
+            }
             // Bound the decode to this block's declared size; the equality check
             // below then confirms the block produced exactly what the directory
             // promised.
@@ -546,6 +657,7 @@ private:
     const ArchiveIndex& index_;
     std::size_t thread_count_ = 0;
     std::shared_ptr<OperationControl> operation_;
+    std::optional<core::CryptoKey> key_;
     std::uint64_t cached_index_ = std::numeric_limits<std::uint64_t>::max();
     ByteVector cached_;
 };
@@ -587,49 +699,24 @@ std::ifstream open_archive(const fs::path& archive_path, std::uint64_t& file_siz
     return stream;
 }
 
-}  // namespace
-
-void create_archive(const std::vector<std::filesystem::path>& inputs,
-                    const std::filesystem::path& archive_path,
-                    const CompressionOptions& options) {
-    const auto operation = options.operation;
-    report_operation(operation, OperationStage::scanning, 0, 0, 0, inputs.size());
-
-    std::vector<ScanItem> items;
-    for (const auto& input : inputs) {
-        operation_checkpoint(operation);
-        scan_input(input, items);
-    }
-
-    const auto total_bytes = scanned_file_bytes(items);
-    const auto total_items = static_cast<std::uint64_t>(items.size());
-    std::uint64_t completed_bytes = 0;
-    std::uint64_t completed_items = 0;
-    report_operation(operation, OperationStage::reading, completed_bytes, total_bytes,
-                     completed_items, total_items);
-
-    const auto block_size = std::max<std::size_t>(1, options.block_size);
-
-    fs::path temp_path = archive_path;
-    temp_path += ".tmp";
-    TempFileGuard temp_guard(temp_path);
-    std::ofstream out(temp_path, std::ios::binary | std::ios::trunc);
-    if (!out) {
-        throw std::runtime_error("cannot create archive: " + temp_path.string());
-    }
-
-    ByteVector header;
-    header.insert(header.end(), kArchiveMagic.begin(), kArchiveMagic.end());
-    put_u16(header, kArchiveVersion);
-    put_u16(header, 0);  // flags
-    put_u32(header, 0);  // reserved
-    out.write(reinterpret_cast<const char*>(header.data()), static_cast<std::streamsize>(header.size()));
-    std::uint64_t written = header.size();
-
-    std::vector<BlockRec> blocks;
-    std::vector<EntryRec> entries;
+// Compress a list of scanned items into solid blocks, appending to `out` and to the
+// `blocks`/`entries` vectors and advancing `written`. New blocks are numbered from
+// blocks.size(), so seeding `blocks`/`entries`/`written` with an existing archive's
+// contents (and having pre-copied its block bytes into `out`) appends to it.
+void compress_items_into(std::ofstream& out, std::uint64_t& written,
+                         std::vector<BlockRec>& blocks, std::vector<EntryRec>& entries,
+                         const std::vector<ScanItem>& items, const CompressionOptions& options,
+                         std::size_t block_size,
+                         const std::shared_ptr<OperationControl>& operation,
+                         std::uint64_t total_bytes, std::uint64_t total_items,
+                         std::uint64_t& completed_bytes, std::uint64_t& completed_items,
+                         const core::CryptoKey* key = nullptr) {
     ByteVector buffer;
-    std::uint64_t current_block = 0;
+    std::uint64_t current_block = blocks.size();
+
+    // Maps a file's on-disk identity to the archive path under which its bytes were
+    // first stored; later paths sharing that identity become hardlink entries.
+    std::map<std::tuple<std::uint64_t, std::uint64_t, std::uint64_t>, std::string> hardlinks;
 
     auto flush_block = [&](std::string current_path = {}) {
         if (buffer.empty()) {
@@ -637,7 +724,13 @@ void create_archive(const std::vector<std::filesystem::path>& inputs,
         }
         report_operation(operation, OperationStage::compressing, completed_bytes, total_bytes,
                          completed_items, total_items, current_path);
-        const auto compressed = compress(buffer, options);
+        auto compressed = compress(buffer, options);
+        if (key != nullptr) {
+            // Seal the block, binding its index as associated data so blocks cannot
+            // be reordered or transplanted between archives.
+            const auto ad = block_associated_data(blocks.size());
+            compressed = core::aead_seal(*key, compressed, ad);
+        }
         operation_checkpoint(operation);
         blocks.push_back({written, static_cast<std::uint64_t>(compressed.size()),
                           static_cast<std::uint64_t>(buffer.size())});
@@ -692,6 +785,25 @@ void create_archive(const std::vector<std::filesystem::path>& inputs,
             continue;
         }
 
+        // A regular file that shares its identity with one already stored is a hard
+        // link: record a reference to the first path instead of duplicating bytes.
+        if (auto id = core::hardlink_identity(item.absolute)) {
+            const auto identity = std::make_tuple(id->volume, id->index_high, id->index_low);
+            const auto found = hardlinks.find(identity);
+            if (found != hardlinks.end()) {
+                entry.type = kEntryHardlink;
+                entry.link_target = found->second;
+                entry.mtime = 0;          // shared with the canonical file's inode
+                entry.meta = {};
+                entries.push_back(std::move(entry));
+                ++completed_items;
+                report_operation(operation, OperationStage::reading, completed_bytes, total_bytes,
+                                 completed_items, total_items, item.archive_path);
+                continue;
+            }
+            hardlinks.emplace(identity, item.archive_path);  // canonical copy follows below
+        }
+
         entry.type = kEntryFile;
         entry.first_block = current_block;
         entry.offset = buffer.size();
@@ -732,15 +844,64 @@ void create_archive(const std::vector<std::filesystem::path>& inputs,
         entry.crc = core::crc32_final(crc);
         entry.blake3 = hasher.finalize();
         entry.has_blake3 = true;
+        entry.ads = core::capture_ads(item.absolute);  // NTFS named streams (Win32 only)
         entries.push_back(std::move(entry));
         ++completed_items;
         report_operation(operation, OperationStage::reading, completed_bytes, total_bytes,
                          completed_items, total_items, item.archive_path);
     }
     flush_block();
+}
 
-    report_operation(operation, OperationStage::finalizing, completed_bytes, total_bytes,
-                     completed_items, total_items);
+// Build encryption parameters for a new archive: random salt, default Argon2id cost,
+// a freshly derived key, and a key-check token (the fixed plaintext sealed under the
+// key, with the salt as associated data). Returns the metadata and the live key.
+std::pair<EncryptionInfo, core::CryptoKey> make_encryption(const std::string& password) {
+    EncryptionInfo enc;
+    enc.enabled = true;
+    enc.kdf = core::KdfParams{};
+    core::random_bytes(enc.kdf.salt);
+    core::CryptoKey key = core::derive_key(password, enc.kdf);
+    const std::span<const std::uint8_t> ad(enc.kdf.salt.data(), enc.kdf.salt.size());
+    enc.key_check = core::aead_seal(key, kKeyCheckPlaintext, ad);
+    return {std::move(enc), key};
+}
+
+// Re-derive an encrypted archive's key from the password and verify it against the
+// stored key-check token. Throws on a missing or wrong password before any block is
+// touched, so failures are fast and unambiguous.
+core::CryptoKey derive_archive_key(const EncryptionInfo& enc, const std::string& password) {
+    if (password.empty()) {
+        throw std::runtime_error("archive is encrypted; a password is required");
+    }
+    // The KDF parameters come from the untrusted header; a hostile archive could ask
+    // for terabytes of Argon2 memory to OOM whoever supplies a password. Bound them
+    // (and enforce Argon2's own minimums) before allocating.
+    constexpr std::uint32_t kMaxKdfMemBlocks = 1u << 21;  // 2 GiB of 1 KiB blocks
+    constexpr std::uint32_t kMaxKdfPasses = 64;
+    if (enc.kdf.lanes < 1 || enc.kdf.passes < 1 || enc.kdf.passes > kMaxKdfPasses ||
+        enc.kdf.mem_blocks < 8 * enc.kdf.lanes || enc.kdf.mem_blocks > kMaxKdfMemBlocks) {
+        throw std::runtime_error("encrypted archive has implausible KDF parameters");
+    }
+    core::CryptoKey key = core::derive_key(password, enc.kdf);
+    const std::span<const std::uint8_t> ad(enc.kdf.salt.data(), enc.kdf.salt.size());
+    std::vector<std::uint8_t> check;
+    const bool ok = core::aead_open(key, enc.key_check, ad, check) &&
+                    check.size() == kKeyCheckPlaintext.size() &&
+                    std::equal(check.begin(), check.end(), kKeyCheckPlaintext.begin());
+    if (!ok) {
+        core::secure_wipe(key);
+        throw std::runtime_error("wrong password for encrypted archive");
+    }
+    return key;
+}
+
+// Serialize the central directory and footer for the given blocks/entries to `out`
+// (already positioned at `written`) and close the stream.
+void write_directory_and_footer(std::ofstream& out, std::uint64_t written,
+                                const std::vector<BlockRec>& blocks,
+                                const std::vector<EntryRec>& entries,
+                                const ArchiveMeta& meta) {
     ByteVector directory;
     put_vint(directory, blocks.size());
     for (const auto& block : blocks) {
@@ -770,7 +931,7 @@ void create_archive(const std::vector<std::filesystem::path>& inputs,
                 body.insert(body.end(), entry.blake3.begin(), entry.blake3.end());
             }
         }
-        if (entry.type == kEntrySymlink) {
+        if (entry.type == kEntrySymlink || entry.type == kEntryHardlink) {
             put_vint(body, entry.link_target.size());
             body.insert(body.end(), entry.link_target.begin(), entry.link_target.end());
         }
@@ -791,13 +952,52 @@ void create_archive(const std::vector<std::filesystem::path>& inputs,
             put_u64(body, entry.meta.windows_access_time);
             put_u64(body, entry.meta.windows_write_time);
         }
+        for (const auto& stream : entry.ads) {
+            ByteVector payload;
+            put_vint(payload, stream.name.size());
+            payload.insert(payload.end(), stream.name.begin(), stream.name.end());
+            payload.insert(payload.end(), stream.data.begin(), stream.data.end());
+            put_vint(body, kExtraAdsStream);
+            put_vint(body, payload.size());
+            body.insert(body.end(), payload.begin(), payload.end());
+        }
         put_vint(directory, body.size());
         directory.insert(directory.end(), body.begin(), body.end());
     }
 
-    // Archive-level extra records (TLV), reserved for service data added later —
-    // comment, recovery-record parameters, encryption parameters, volume info.
-    put_vint(directory, 0);  // archive extra record count
+    // Archive-level extra records (TLV): comment, lock, and (later) recovery,
+    // encryption, and volume parameters. Each is type + length + payload.
+    ByteVector archive_extras;
+    std::uint64_t archive_extra_count = 0;
+    if (!meta.comment.empty()) {
+        put_vint(archive_extras, kArchiveComment);
+        put_vint(archive_extras, meta.comment.size());
+        archive_extras.insert(archive_extras.end(), meta.comment.begin(), meta.comment.end());
+        ++archive_extra_count;
+    }
+    if (meta.locked) {
+        put_vint(archive_extras, kArchiveLock);
+        put_vint(archive_extras, 0);  // presence is the signal; no payload
+        ++archive_extra_count;
+    }
+    if (meta.encryption.enabled) {
+        const auto& enc = meta.encryption;
+        ByteVector payload;
+        put_vint(payload, enc.kdf.algorithm);
+        put_vint(payload, enc.kdf.mem_blocks);
+        put_vint(payload, enc.kdf.passes);
+        put_vint(payload, enc.kdf.lanes);
+        put_vint(payload, enc.kdf.salt.size());
+        payload.insert(payload.end(), enc.kdf.salt.begin(), enc.kdf.salt.end());
+        put_vint(payload, enc.key_check.size());
+        payload.insert(payload.end(), enc.key_check.begin(), enc.key_check.end());
+        put_vint(archive_extras, kArchiveEncryption);
+        put_vint(archive_extras, payload.size());
+        archive_extras.insert(archive_extras.end(), payload.begin(), payload.end());
+        ++archive_extra_count;
+    }
+    put_vint(directory, archive_extra_count);
+    directory.insert(directory.end(), archive_extras.begin(), archive_extras.end());
 
     const std::uint64_t directory_offset = written;
     out.write(reinterpret_cast<const char*>(directory.data()),
@@ -814,6 +1014,122 @@ void create_archive(const std::vector<std::filesystem::path>& inputs,
         throw std::runtime_error("failed to finalize archive");
     }
     out.close();
+}
+
+// Rewrite an archive keeping only the entries for which `keep` returns true,
+// decoding each kept file's bytes from the old blocks into fresh solid blocks. This
+// reclaims dead space (e.g. data left behind by replaced/removed entries) and is the
+// engine behind both `delete` (keep = not-deleted) and `repack` (keep = all).
+void rebuild_archive_keeping(const fs::path& archive_path,
+                             const std::function<bool(const EntryRec&)>& keep,
+                             const CompressionOptions& options) {
+    const auto operation = options.operation;
+
+    std::uint64_t file_size = 0;
+    auto in = open_archive(archive_path, file_size);
+    const ByteSource bytes(in, file_size);
+    const auto index = read_index(bytes);
+    if (index.meta.locked) {
+        throw std::runtime_error("archive is locked (read-only)");
+    }
+    if (index.meta.encryption.enabled) {
+        throw std::runtime_error("editing an encrypted archive is not yet supported");
+    }
+    BlockSource source(bytes, index, 0, operation);
+
+    // Paths surviving the filter — used to drop hardlinks whose target is removed.
+    std::unordered_set<std::string> kept_paths;
+    std::uint64_t total_bytes = 0;
+    std::uint64_t total_items = 0;
+    for (const auto& entry : index.entries) {
+        if (keep(entry)) {
+            kept_paths.insert(entry.path);
+            ++total_items;
+            if (entry.type == kEntryFile) {
+                total_bytes += entry.size;
+            }
+        }
+    }
+
+    const auto block_size = std::max<std::size_t>(1, options.block_size);
+
+    fs::path temp_path = archive_path;
+    temp_path += ".tmp";
+    TempFileGuard temp_guard(temp_path);
+    std::ofstream out(temp_path, std::ios::binary | std::ios::trunc);
+    if (!out) {
+        throw std::runtime_error("cannot create archive: " + temp_path.string());
+    }
+
+    ByteVector header;
+    header.insert(header.end(), kArchiveMagic.begin(), kArchiveMagic.end());
+    put_u16(header, kArchiveVersion);
+    put_u16(header, 0);  // flags
+    put_u32(header, 0);  // reserved
+    out.write(reinterpret_cast<const char*>(header.data()), static_cast<std::streamsize>(header.size()));
+    std::uint64_t written = header.size();
+
+    std::vector<BlockRec> new_blocks;
+    std::vector<EntryRec> new_entries;
+    ByteVector buffer;
+    std::uint64_t current_block = 0;
+    std::uint64_t completed_bytes = 0;
+    std::uint64_t completed_items = 0;
+
+    auto flush_block = [&]() {
+        if (buffer.empty()) {
+            return;
+        }
+        report_operation(operation, OperationStage::compressing, completed_bytes, total_bytes,
+                         completed_items, total_items);
+        const auto compressed = compress(buffer, options);
+        operation_checkpoint(operation);
+        new_blocks.push_back({written, static_cast<std::uint64_t>(compressed.size()),
+                              static_cast<std::uint64_t>(buffer.size())});
+        out.write(reinterpret_cast<const char*>(compressed.data()),
+                  static_cast<std::streamsize>(compressed.size()));
+        if (!out) {
+            throw std::runtime_error("failed while writing archive blocks");
+        }
+        written += compressed.size();
+        ++current_block;
+        buffer.clear();
+    };
+
+    for (const auto& entry : index.entries) {
+        operation_checkpoint(operation);
+        if (!keep(entry)) {
+            continue;
+        }
+        if (entry.type == kEntryHardlink &&
+            kept_paths.find(entry.link_target) == kept_paths.end()) {
+            continue;  // its target was removed; drop the now-dangling hard link
+        }
+
+        EntryRec out_entry = entry;  // carries metadata, crc/blake3, link target, ads
+        if (entry.type == kEntryFile) {
+            out_entry.first_block = current_block;
+            out_entry.offset = buffer.size();
+            read_file_bytes(source, index.blocks.size(), entry, operation,
+                            [&](std::span<const std::uint8_t> chunk) {
+                                buffer.insert(buffer.end(), chunk.begin(), chunk.end());
+                                completed_bytes += chunk.size();
+                                if (buffer.size() >= block_size) {
+                                    flush_block();
+                                }
+                            });
+        }
+        new_entries.push_back(std::move(out_entry));
+        ++completed_items;
+        report_operation(operation, OperationStage::writing, completed_bytes, total_bytes,
+                         completed_items, total_items, entry.path);
+    }
+    flush_block();
+    in.close();  // release the source handle so the rename can replace it (Windows)
+
+    report_operation(operation, OperationStage::finalizing, completed_bytes, total_bytes,
+                     completed_items, total_items);
+    write_directory_and_footer(out, written, new_blocks, new_entries, index.meta);
 
     std::error_code ec;
     fs::rename(temp_path, archive_path, ec);
@@ -829,6 +1145,382 @@ void create_archive(const std::vector<std::filesystem::path>& inputs,
                      total_items, total_items);
 }
 
+// Append already-scanned items to an existing archive: existing block bytes are
+// copied verbatim and the items become new blocks, with same-path items replacing
+// the existing entry. Shared by add/update/sync. `meta_override`, when non-null,
+// replaces the archive metadata (used to set the comment / lock flag); otherwise the
+// existing metadata is preserved.
+void append_items_to_archive(const fs::path& archive_path, const std::vector<ScanItem>& items,
+                             const CompressionOptions& options,
+                             const ArchiveMeta* meta_override = nullptr) {
+    const auto operation = options.operation;
+
+    // Read the existing archive's directory; new solid blocks are appended after its
+    // block region, so existing block indices (and entry references) stay valid.
+    ArchiveIndex existing;
+    {
+        std::uint64_t file_size = 0;
+        auto in = open_archive(archive_path, file_size);
+        const ByteSource source(in, file_size);
+        existing = read_index(source);
+    }
+    if (existing.meta.locked) {
+        throw std::runtime_error("archive is locked (read-only)");
+    }
+    if (existing.meta.encryption.enabled) {
+        throw std::runtime_error("editing an encrypted archive is not yet supported");
+    }
+    const ArchiveMeta result_meta = meta_override ? *meta_override : existing.meta;
+    std::uint64_t block_region_end = kHeaderSize;
+    if (!existing.blocks.empty()) {
+        const auto& last = existing.blocks.back();
+        block_region_end = last.compressed_offset + last.compressed_size;
+    }
+
+    // Added paths replace any existing entry with the same path; the replaced data
+    // stays in its solid block as dead space until a repack reclaims it.
+    std::unordered_set<std::string> new_paths;
+    for (const auto& item : items) {
+        new_paths.insert(item.archive_path);
+    }
+    std::vector<EntryRec> entries;
+    entries.reserve(existing.entries.size() + items.size());
+    for (auto& existing_entry : existing.entries) {
+        if (new_paths.find(existing_entry.path) == new_paths.end()) {
+            entries.push_back(std::move(existing_entry));
+        }
+    }
+    std::vector<BlockRec> blocks = std::move(existing.blocks);
+
+    const auto total_bytes = scanned_file_bytes(items);
+    const auto total_items = static_cast<std::uint64_t>(items.size());
+    std::uint64_t completed_bytes = 0;
+    std::uint64_t completed_items = 0;
+    report_operation(operation, OperationStage::reading, completed_bytes, total_bytes,
+                     completed_items, total_items);
+
+    const auto block_size = std::max<std::size_t>(1, options.block_size);
+
+    fs::path temp_path = archive_path;
+    temp_path += ".tmp";
+    TempFileGuard temp_guard(temp_path);
+    std::ofstream out(temp_path, std::ios::binary | std::ios::trunc);
+    if (!out) {
+        throw std::runtime_error("cannot create archive: " + temp_path.string());
+    }
+
+    // Copy the existing header + block region verbatim — the existing files are not
+    // recompressed, only the directory is rebuilt with the merged entry list.
+    {
+        std::ifstream src(archive_path, std::ios::binary);
+        if (!src) {
+            throw std::runtime_error("cannot open archive: " + archive_path.string());
+        }
+        std::uint64_t remaining = block_region_end;
+        std::array<char, kFileChunk> chunk{};
+        while (remaining > 0) {
+            operation_checkpoint(operation);
+            const auto want = static_cast<std::streamsize>(
+                std::min<std::uint64_t>(remaining, chunk.size()));
+            src.read(chunk.data(), want);
+            const auto got = src.gcount();
+            if (got <= 0) {
+                throw std::runtime_error("archive truncated while copying blocks");
+            }
+            out.write(chunk.data(), got);
+            remaining -= static_cast<std::uint64_t>(got);
+        }
+    }
+    std::uint64_t written = block_region_end;
+
+    compress_items_into(out, written, blocks, entries, items, options, block_size, operation,
+                        total_bytes, total_items, completed_bytes, completed_items);
+
+    report_operation(operation, OperationStage::finalizing, completed_bytes, total_bytes,
+                     completed_items, total_items);
+    write_directory_and_footer(out, written, blocks, entries, result_meta);
+
+    std::error_code ec;
+    fs::rename(temp_path, archive_path, ec);
+    if (ec) {
+        fs::remove(archive_path, ec);
+        fs::rename(temp_path, archive_path, ec);
+        if (ec) {
+            throw std::runtime_error("failed to move archive into place: " + ec.message());
+        }
+    }
+    temp_guard.dismiss();
+    report_operation(operation, OperationStage::finalizing, total_bytes, total_bytes,
+                     total_items, total_items);
+}
+
+}  // namespace
+
+void create_archive(const std::vector<std::filesystem::path>& inputs,
+                    const std::filesystem::path& archive_path,
+                    const CompressionOptions& options) {
+    const auto operation = options.operation;
+    report_operation(operation, OperationStage::scanning, 0, 0, 0, inputs.size());
+
+    std::vector<ScanItem> items;
+    for (const auto& input : inputs) {
+        operation_checkpoint(operation);
+        scan_input(input, items);
+    }
+
+    const auto total_bytes = scanned_file_bytes(items);
+    const auto total_items = static_cast<std::uint64_t>(items.size());
+    std::uint64_t completed_bytes = 0;
+    std::uint64_t completed_items = 0;
+    report_operation(operation, OperationStage::reading, completed_bytes, total_bytes,
+                     completed_items, total_items);
+
+    const auto block_size = std::max<std::size_t>(1, options.block_size);
+
+    fs::path temp_path = archive_path;
+    temp_path += ".tmp";
+    TempFileGuard temp_guard(temp_path);
+    std::ofstream out(temp_path, std::ios::binary | std::ios::trunc);
+    if (!out) {
+        throw std::runtime_error("cannot create archive: " + temp_path.string());
+    }
+
+    ByteVector header;
+    header.insert(header.end(), kArchiveMagic.begin(), kArchiveMagic.end());
+    put_u16(header, kArchiveVersion);
+    put_u16(header, 0);  // flags
+    put_u32(header, 0);  // reserved
+    out.write(reinterpret_cast<const char*>(header.data()), static_cast<std::streamsize>(header.size()));
+    std::uint64_t written = header.size();
+
+    // Encryption (optional): derive a key from the password and record the salt +
+    // key-check token so the archive can be decrypted later. The key seals each block.
+    ArchiveMeta meta;
+    core::CryptoKey key{};
+    const core::CryptoKey* key_ptr = nullptr;
+    if (!options.password.empty()) {
+        auto [enc, derived] = make_encryption(options.password);
+        meta.encryption = std::move(enc);
+        key = derived;
+        key_ptr = &key;
+    }
+
+    std::vector<BlockRec> blocks;
+    std::vector<EntryRec> entries;
+    compress_items_into(out, written, blocks, entries, items, options, block_size, operation,
+                        total_bytes, total_items, completed_bytes, completed_items, key_ptr);
+
+    report_operation(operation, OperationStage::finalizing, completed_bytes, total_bytes,
+                     completed_items, total_items);
+    write_directory_and_footer(out, written, blocks, entries, meta);
+    core::secure_wipe(key);
+
+    std::error_code ec;
+    fs::rename(temp_path, archive_path, ec);
+    if (ec) {
+        fs::remove(archive_path, ec);
+        fs::rename(temp_path, archive_path, ec);
+        if (ec) {
+            throw std::runtime_error("failed to move archive into place: " + ec.message());
+        }
+    }
+    temp_guard.dismiss();
+    report_operation(operation, OperationStage::finalizing, total_bytes, total_bytes,
+                     total_items, total_items);
+}
+
+void add_to_archive(const std::vector<std::filesystem::path>& inputs,
+                    const std::filesystem::path& archive_path,
+                    const CompressionOptions& options) {
+    const auto operation = options.operation;
+    report_operation(operation, OperationStage::scanning, 0, 0, 0, inputs.size());
+
+    std::vector<ScanItem> items;
+    for (const auto& input : inputs) {
+        operation_checkpoint(operation);
+        scan_input(input, items);
+    }
+    append_items_to_archive(archive_path, items, options);
+}
+
+void delete_from_archive(const std::filesystem::path& archive_path,
+                         const std::vector<std::string>& paths,
+                         const CompressionOptions& options) {
+    // Normalize the targets the way archive paths are stored: '/'-separated, no
+    // trailing slash. A directory target removes its whole subtree.
+    std::vector<std::string> targets;
+    targets.reserve(paths.size());
+    for (auto path : paths) {
+        std::replace(path.begin(), path.end(), '\\', '/');
+        while (path.size() > 1 && path.back() == '/') {
+            path.pop_back();
+        }
+        if (!path.empty()) {
+            targets.push_back(std::move(path));
+        }
+    }
+    auto is_deleted = [&](const std::string& candidate) {
+        for (const auto& target : targets) {
+            if (candidate == target) {
+                return true;
+            }
+            if (candidate.size() > target.size() &&
+                candidate.compare(0, target.size(), target) == 0 &&
+                candidate[target.size()] == '/') {
+                return true;  // entry lives under a deleted directory
+            }
+        }
+        return false;
+    };
+    rebuild_archive_keeping(
+        archive_path, [&](const EntryRec& entry) { return !is_deleted(entry.path); }, options);
+}
+
+void repack_archive(const std::filesystem::path& archive_path,
+                    const CompressionOptions& options) {
+    rebuild_archive_keeping(archive_path, [](const EntryRec&) { return true; }, options);
+}
+
+void update_archive(const std::vector<std::filesystem::path>& inputs,
+                    const std::filesystem::path& archive_path, const CompressionOptions& options,
+                    bool fresh_only) {
+    const auto operation = options.operation;
+    report_operation(operation, OperationStage::scanning, 0, 0, 0, inputs.size());
+
+    std::vector<ScanItem> items;
+    for (const auto& input : inputs) {
+        operation_checkpoint(operation);
+        scan_input(input, items);
+    }
+
+    if (!fs::exists(archive_path)) {
+        // Nothing to refresh against. `update` seeds a new archive; `fresh` is a no-op.
+        if (!fresh_only) {
+            create_archive(inputs, archive_path, options);
+        }
+        return;
+    }
+
+    // Map each existing entry's path to its stored mtime so we can compare ages.
+    std::unordered_map<std::string, std::int64_t> existing_mtime;
+    {
+        std::uint64_t file_size = 0;
+        auto in = open_archive(archive_path, file_size);
+        const ByteSource source(in, file_size);
+        const auto index = read_index(source);
+        for (const auto& entry : index.entries) {
+            existing_mtime.emplace(entry.path, entry.mtime);
+        }
+    }
+
+    // Keep only the items that should be written: a file when it is newer than the
+    // archived copy (or, for `update`, brand new); a directory/symlink only when it
+    // is new (and `update`, not `fresh`).
+    std::vector<ScanItem> selected;
+    std::error_code ec;
+    for (const auto& item : items) {
+        const auto found = existing_mtime.find(item.archive_path);
+        const bool in_archive = found != existing_mtime.end();
+        if (item.is_directory || item.is_symlink) {
+            if (!in_archive && !fresh_only) {
+                selected.push_back(item);
+            }
+            continue;
+        }
+        std::int64_t disk_mtime = 0;
+        const auto stamp = fs::last_write_time(item.absolute, ec);
+        if (!ec) {
+            try {
+                disk_mtime = to_unix_seconds(stamp);
+            } catch (...) {
+                disk_mtime = 0;
+            }
+        }
+        if (in_archive) {
+            if (disk_mtime > found->second) {
+                selected.push_back(item);  // newer on disk → replace
+            }
+        } else if (!fresh_only) {
+            selected.push_back(item);  // new file → add (update only)
+        }
+    }
+
+    append_items_to_archive(archive_path, selected, options);
+}
+
+void sync_archive(const std::vector<std::filesystem::path>& inputs,
+                  const std::filesystem::path& archive_path, const CompressionOptions& options) {
+    // First bring in new and newer files (creating the archive if it is missing).
+    update_archive(inputs, archive_path, options, /*fresh_only=*/false);
+
+    // Then mirror deletions: drop any archived path no longer present in the inputs.
+    std::vector<ScanItem> items;
+    for (const auto& input : inputs) {
+        scan_input(input, items);
+    }
+    std::unordered_set<std::string> wanted;
+    for (const auto& item : items) {
+        wanted.insert(item.archive_path);
+    }
+
+    std::vector<std::string> stale;
+    {
+        std::uint64_t file_size = 0;
+        auto in = open_archive(archive_path, file_size);
+        const ByteSource source(in, file_size);
+        const auto index = read_index(source);
+        for (const auto& entry : index.entries) {
+            if (wanted.find(entry.path) == wanted.end()) {
+                stale.push_back(entry.path);
+            }
+        }
+    }
+    if (!stale.empty()) {
+        delete_from_archive(archive_path, stale, options);
+    }
+}
+
+void set_archive_comment(const std::filesystem::path& archive_path, const std::string& comment,
+                         const CompressionOptions& options) {
+    ArchiveMeta meta;
+    meta.comment = comment;
+    meta.locked = false;  // unlocked archives stay unlocked (locked ones are refused below)
+    append_items_to_archive(archive_path, {}, options, &meta);
+}
+
+void lock_archive(const std::filesystem::path& archive_path, const CompressionOptions& options) {
+    ArchiveMeta meta;
+    {
+        std::uint64_t file_size = 0;
+        auto in = open_archive(archive_path, file_size);
+        const ByteSource source(in, file_size);
+        meta = read_index(source).meta;  // preserve any existing comment
+    }
+    meta.locked = true;
+    append_items_to_archive(archive_path, {}, options, &meta);
+}
+
+std::string archive_comment(const std::filesystem::path& archive_path) {
+    std::uint64_t file_size = 0;
+    auto in = open_archive(archive_path, file_size);
+    const ByteSource source(in, file_size);
+    return read_index(source).meta.comment;
+}
+
+bool archive_is_locked(const std::filesystem::path& archive_path) {
+    std::uint64_t file_size = 0;
+    auto in = open_archive(archive_path, file_size);
+    const ByteSource source(in, file_size);
+    return read_index(source).meta.locked;
+}
+
+bool archive_is_encrypted(const std::filesystem::path& archive_path) {
+    std::uint64_t file_size = 0;
+    auto in = open_archive(archive_path, file_size);
+    const ByteSource source(in, file_size);
+    return read_index(source).meta.encryption.enabled;
+}
+
 std::vector<ArchiveEntry> list_archive(const std::filesystem::path& archive_path) {
     std::uint64_t file_size = 0;
     auto stream = open_archive(archive_path, file_size);
@@ -842,7 +1534,8 @@ std::vector<ArchiveEntry> list_archive(const std::filesystem::path& archive_path
         out.path = entry.path;
         out.is_directory = entry.type == kEntryDir;
         out.is_symlink = entry.type == kEntrySymlink;
-        out.symlink_target = entry.link_target;
+        out.is_hardlink = entry.type == kEntryHardlink;
+        out.link_target = entry.link_target;
         out.size = entry.size;
         out.mtime = entry.mtime;
         out.crc32 = entry.crc;
@@ -860,7 +1553,11 @@ void test_archive(const std::filesystem::path& archive_path,
     auto stream = open_archive(archive_path, file_size);
     const ByteSource bytes(stream, file_size);
     const auto index = read_index(bytes);
-    BlockSource source(bytes, index, options.thread_count, operation);
+    std::optional<core::CryptoKey> key;
+    if (index.meta.encryption.enabled) {
+        key = derive_archive_key(index.meta.encryption, options.password);
+    }
+    BlockSource source(bytes, index, options.thread_count, operation, key);
 
     const auto total_bytes = archive_file_bytes(index);
     const auto total_items = static_cast<std::uint64_t>(index.entries.size());
@@ -871,8 +1568,9 @@ void test_archive(const std::filesystem::path& archive_path,
 
     for (const auto& entry : index.entries) {
         operation_checkpoint(operation);
-        if (entry.type == kEntryDir || entry.type == kEntrySymlink) {
-            // No block content to verify (a symlink's target lives in the directory).
+        if (entry.type == kEntryDir || entry.type == kEntrySymlink ||
+            entry.type == kEntryHardlink) {
+            // No block content to verify (links carry only a target, not bytes).
             ++completed_items;
             report_operation(operation, OperationStage::testing, completed_bytes, total_bytes,
                              completed_items, total_items, entry.path);
@@ -909,7 +1607,11 @@ void extract_archive(const std::filesystem::path& archive_path,
     auto stream = open_archive(archive_path, file_size);
     const ByteSource bytes(stream, file_size);
     const auto index = read_index(bytes);
-    BlockSource source(bytes, index, options.thread_count, operation);
+    std::optional<core::CryptoKey> key;
+    if (index.meta.encryption.enabled) {
+        key = derive_archive_key(index.meta.encryption, options.password);
+    }
+    BlockSource source(bytes, index, options.thread_count, operation, key);
 
     const auto total_bytes = archive_file_bytes(index);
     const auto total_items = static_cast<std::uint64_t>(index.entries.size());
@@ -940,6 +1642,9 @@ void extract_archive(const std::filesystem::path& archive_path,
         if (!is_within(dest_norm, target)) {
             throw FormatError("archive path escapes the destination: " + entry.path);
         }
+        // Real directory components must not be symlinks, or a write could be
+        // redirected outside the destination through one of them.
+        reject_symlinked_ancestor(dest_norm, target);
 
         if (entry.type == kEntrySymlink) {
             fs::create_directories(target.parent_path(), ec);
@@ -973,7 +1678,44 @@ void extract_archive(const std::filesystem::path& archive_path,
             continue;
         }
 
+        if (entry.type == kEntryHardlink) {
+            // The canonical file precedes its hard links in the directory, so its
+            // target already exists on disk by the time we reach this entry.
+            const fs::path link_to = (dest_dir / fs::path(entry.link_target)).lexically_normal();
+            if (!is_within(dest_norm, link_to)) {
+                throw FormatError("hardlink target escapes the destination: " +
+                                  entry.link_target);
+            }
+            fs::create_directories(target.parent_path(), ec);
+            if (fs::exists(fs::symlink_status(target, ec))) {
+                if (options.overwrite == ExtractOptions::Overwrite::skip) {
+                    ++completed_items;
+                    report_operation(operation, OperationStage::extracting, completed_bytes,
+                                     total_bytes, completed_items, total_items, entry.path);
+                    continue;
+                }
+                if (options.overwrite == ExtractOptions::Overwrite::fail) {
+                    throw std::runtime_error("target already exists: " + target.string());
+                }
+                fs::remove(target, ec);
+            }
+            std::error_code link_ec;
+            fs::create_hard_link(link_to, target, link_ec);
+            if (link_ec) {
+                // Cross-device or unsupported FS: fall back to an independent copy
+                // so the file still appears, even if it no longer shares an inode.
+                fs::copy_file(link_to, target, fs::copy_options::overwrite_existing, link_ec);
+            }
+            ++completed_items;
+            report_operation(operation, OperationStage::extracting, completed_bytes, total_bytes,
+                             completed_items, total_items, entry.path);
+            continue;
+        }
+
         if (entry.type == kEntryDir) {
+            if (core::is_reparse_point(target)) {
+                throw FormatError("refusing to restore a directory over a symlink: " + entry.path);
+            }
             fs::create_directories(target, ec);
             // Attributes now (harmless to later child writes); timestamps deferred.
             core::apply_metadata(target, entry.meta, /*restore_times=*/false);
@@ -1031,6 +1773,9 @@ void extract_archive(const std::filesystem::path& archive_path,
         }
         temp_guard.dismiss();
 
+        // NTFS named streams are written before timestamps so restoring the write
+        // time isn't disturbed by the stream writes that follow it.
+        core::apply_ads(target, entry.ads);
         // High-precision Windows times (when present) supersede the seconds mtime.
         core::apply_metadata(target, entry.meta, options.restore_mtime);
         if (options.restore_mtime && !entry.meta.has_windows_times && entry.mtime != 0) {
