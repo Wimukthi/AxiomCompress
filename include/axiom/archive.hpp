@@ -39,6 +39,25 @@ struct ExtractOptions {
     std::string password;
 };
 
+// A filesystem object mapped to an explicit path in an archive. For a directory,
+// descendants are stored beneath destination_path. Archive paths are relative,
+// UTF-8, and '/'-separated.
+struct ArchiveInput {
+    std::filesystem::path source;
+    std::string destination_path;
+};
+
+struct ArchiveMove {
+    std::string source_path;
+    std::string destination_path;
+};
+
+enum class ArchiveEncryptionMode {
+    none,
+    data_only,
+    data_and_directory,
+};
+
 // Build a `.axar` archive from the given files/directories (directories are
 // scanned recursively). Archive paths are stored relative to each input's
 // parent, so adding "dir" yields entries "dir/...". Written atomically.
@@ -52,6 +71,12 @@ void create_archive(const std::vector<std::filesystem::path>& inputs,
 // matches an existing entry replaces it (the old data remains as dead space until a
 // future repack). Written atomically.
 void add_to_archive(const std::vector<std::filesystem::path>& inputs,
+                    const std::filesystem::path& archive_path,
+                    const CompressionOptions& options = {});
+
+// Add files/directories at caller-selected archive paths. This is the path-aware
+// form used by file-manager drag/drop into an archive subdirectory.
+void add_to_archive(const std::vector<ArchiveInput>& inputs,
                     const std::filesystem::path& archive_path,
                     const CompressionOptions& options = {});
 
@@ -83,6 +108,12 @@ void sync_archive(const std::vector<std::filesystem::path>& inputs,
                   const std::filesystem::path& archive_path,
                   const CompressionOptions& options = {});
 
+// Rename or move entries without recompressing file data. Moving a directory moves
+// its complete subtree and updates internal hard-link targets.
+void move_archive_entries(const std::filesystem::path& archive_path,
+                          const std::vector<ArchiveMove>& moves,
+                          const CompressionOptions& options = {});
+
 // Set (or clear, with an empty string) the archive's free-form comment. Refused if
 // the archive is locked. Rewrites the directory only; block data is untouched.
 void set_archive_comment(const std::filesystem::path& archive_path, const std::string& comment,
@@ -107,6 +138,10 @@ bool archive_is_locked(const std::filesystem::path& archive_path,
 // directory). Never needs a password itself.
 bool archive_is_encrypted(const std::filesystem::path& archive_path);
 
+// Distinguish editable block-only encryption from encrypted-directory mode, which
+// currently requires a password even to list and does not support editing.
+ArchiveEncryptionMode archive_encryption_mode(const std::filesystem::path& archive_path);
+
 // Read the central directory without decompressing any block. A password is required
 // only when the directory itself is encrypted (otherwise names are listable freely).
 std::vector<ArchiveEntry> list_archive(const std::filesystem::path& archive_path,
@@ -121,6 +156,13 @@ void test_archive(const std::filesystem::path& archive_path,
 // (archive entries that would escape it are rejected). Files are written
 // atomically.
 void extract_archive(const std::filesystem::path& archive_path,
+                     const std::filesystem::path& dest_dir,
+                     const ExtractOptions& options = {});
+
+// Extract only the named entries. Selecting a directory includes its subtree;
+// overlapping selections are deduplicated.
+void extract_entries(const std::filesystem::path& archive_path,
+                     const std::vector<std::string>& entries,
                      const std::filesystem::path& dest_dir,
                      const ExtractOptions& options = {});
 

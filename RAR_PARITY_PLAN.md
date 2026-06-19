@@ -9,9 +9,10 @@ own codec. Companion to [FORMAT.md](FORMAT.md) and [ROADMAP.md](ROADMAP.md).
 
 - **Scope:** full parity, including the niche items (SFX, NTFS alternate data
   streams, authenticity signatures).
-- **Dependencies:** use vetted libraries — **libsodium** (AES-256 AEAD, Argon2id,
-  Ed25519) for crypto, **ISA-L** (or equivalent) for Reed-Solomon recovery. No
-  homemade cryptography or erasure coding.
+- **Dependencies:** **Monocypher** is the vendored crypto backend
+  (XChaCha20-Poly1305, Argon2id, and Phase-5 signing primitives). Recovery uses a
+  tested portable systematic Reed–Solomon implementation over GF(2^8); its scalar
+  backend can later be replaced or accelerated without changing the recovery format.
 - **Platform priority:** **Windows-first** metadata fidelity (matches the GUI);
   Unix `mode`/owner stored as pass-through and given full POSIX restore later.
 - **Compatibility:** still pre-release, so the container is redesigned **once**
@@ -22,19 +23,19 @@ own codec. Companion to [FORMAT.md](FORMAT.md) and [ROADMAP.md](ROADMAP.md).
 
 | RAR feature | `.axar` today | Phase |
 |---|---|---|
-| Solid archives, random-access list/extract | ✅ | — |
-| Per-file integrity | CRC-32 only → add **BLAKE3** | 1 |
-| Windows attrs, high-precision mtime/ctime/atime | ❌ | 1 |
-| NTFS alternate data streams | ❌ | 1 |
-| Symlinks / junctions / hardlinks / special files | ❌ (skipped) | 1 |
-| Symlink-safe extraction | lexical only | 1 |
-| Add / update / delete / sync in place | ❌ | 2 |
-| Archive comment, lock flag, quick-open | ❌ | 2 |
-| Encryption (data + filenames) | ❌ | 3 |
-| Recovery record / recovery volumes | ❌ | 4 |
-| Multi-volume (split) archives | ❌ | 4 |
-| Authenticity / digital signature | ❌ | 5 |
-| Self-extracting (SFX) | ❌ | 5 |
+| Solid archives, random-access list/selective extract | Complete | — |
+| Per-file integrity | CRC-32 + **BLAKE3** complete | 1 |
+| Windows attrs, high-precision mtime/ctime/atime | Complete | 1 |
+| NTFS alternate data streams | Complete (streams ≤ 1 MiB) | 1 |
+| Symlinks / hardlinks | Complete; special files remain | 1 |
+| Symlink-safe extraction | Complete, including Windows reparse ancestors | 1 |
+| Add / update / delete / sync / mapped move | Complete | 2 |
+| Archive comment, lock flag, quick-open | Complete | 2 |
+| Encryption (data + filenames) | Complete; encrypted-directory edits remain | 3 |
+| Recovery record / recovery volumes | RS codec foundation only | 4 |
+| Multi-volume (split) archives | Not started | 4 |
+| Authenticity / digital signature | Not started | 5 |
+| Self-extracting (SFX) | Not started | 5 |
 | Full POSIX mode/ownership restore | pass-through | 5 |
 | 64-bit everything (>4 GiB blocks) | 32-bit block pos | 0 |
 
@@ -58,15 +59,15 @@ feature is an additive header/record type, never a format break.
 
 ## Phase 1 — Integrity & Windows metadata fidelity
 
-- **BLAKE3** per-file hash (keep CRC-32 for the fast path / per-block check).
-- **Windows metadata:** file attributes (read-only/hidden/system/archive),
+- ✅ **BLAKE3** per-file hash (CRC-32 remains for the fast path / block check).
+- ✅ **Windows metadata:** file attributes (read-only/hidden/system/archive),
   high-precision **mtime/ctime/atime** (100 ns, UTC), and **NTFS alternate data
   streams** captured and restored.
-- **Links & special files:** symlinks and junctions (store reparse target),
-  **hardlinks** (dedupe by file id → link record), device/fifo records.
-- **Symlink-safe extraction:** `O_NOFOLLOW`/`openat`-style containment on POSIX and
-  the Win32 equivalent — closes the last decoder-safety gap.
-- Unix `mode`/uid/gid captured and stored as pass-through (full restore in Phase 5).
+- ✅ **Links:** symlinks and hardlinks (dedupe by file identity → link record).
+  Junction-specific records and device/FIFO records remain Phase 5 work.
+- ✅ **Symlink-safe extraction:** existing ancestor components are rejected when
+  they are symlinks or, on Windows, directory reparse points.
+- Unix `mode`/uid/gid capture and restore remains Phase 5 work.
 - *Verify:* a metadata edge-case corpus (attrs, ADS, symlink loops, hardlink
   fan-out, sub-second times, long/unicode paths) round-trips in CI.
 
@@ -78,6 +79,10 @@ feature is an additive header/record type, never a format break.
   re-solidifying their files so replaced/removed data is physically reclaimed.
 - ✅ `update`/`fresh` (mtime-based) and `sync` (mirror a directory: update + delete
   the missing). CLI `u` / `f` / `s`.
+- ✅ File-manager APIs: explicit source-to-archive destination mapping, selective
+  file/directory extraction, and metadata-only file/directory moves with hard-link
+  target rewriting. These are backend APIs for GUI/OLE drag-and-drop; they do not
+  change the on-disk format.
 - Strategy: append new solid blocks + rewrite the directory; delete/repack rebuild
   affected runs (RAR's model, done eagerly here). True zero-copy in-place append is
   a later optimization — today every edit writes a fresh file via temp + rename.
@@ -99,8 +104,8 @@ chosen for clean two-compiler portability; provides XChaCha20-Poly1305 + Argon2i
 - ✅ **Key derivation:** **Argon2id** with a per-archive random salt; KDF params in
   the `encryption` archive-extra record; a sealed key-check token rejects a wrong
   password up front. Key wiped after use.
-- ✅ CLI `-p`/`--password`; wired through extract/test; edits on encrypted archives
-  refuse (for now). *Verified:* roundtrip, wrong-password, tamper (AEAD failure), and
+- ✅ CLI `-p`/`--password`; wired through list/extract/test and block-only encrypted
+  edits. *Verified:* roundtrip, wrong-password, tamper (AEAD failure), and
   no-plaintext-on-disk tests; archive parser fuzzed with the encryption record.
 - ✅ **Editing encrypted archives** — add/update/sync seal new blocks under the same
   key; delete/repack decrypt + re-seal; wrong password rejected before writing.
@@ -112,8 +117,10 @@ chosen for clean two-compiler portability; provides XChaCha20-Poly1305 + Argon2i
 Phase 3 is functionally complete; the only open item is editing directory-encrypted
 archives.
 
-## Phase 4 — Recovery records & multi-volume (ISA-L)
+## Phase 4 — Recovery records & multi-volume
 
+- ✅ **Foundation:** portable systematic Reed–Solomon encode/reconstruct over
+  GF(2^8), with randomized erasure tests. It is not connected to `.axar` yet.
 - **Recovery record:** Reed-Solomon redundancy sized as a percentage of archive
   data (RAR's `rr`), stored in a `SERVICE` header; repair during `test`/`extract`
   with a damaged-archive test corpus.
@@ -124,7 +131,7 @@ archives.
 
 ## Phase 5 — Authenticity, SFX, full POSIX
 
-- **Authenticity:** Ed25519 archive signing/verification (libsodium), key
+- **Authenticity:** Ed25519 archive signing/verification (Monocypher), key
   management out of band.
 - **SFX:** a Win32 self-extractor stub prepended to the archive that extracts
   itself; the reader already tolerates a prefix via the trailing footer/directory.
@@ -137,8 +144,8 @@ archives.
 - **Surfaces:** CLI flags and GUI controls for each feature.
 - **Tests:** round-trip + targeted unit tests + libFuzzer coverage on every new
   untrusted-input surface (headers, encrypted streams, recovery data).
-- **Build:** integrate libsodium and ISA-L via the build system (CMake
-  FetchContent or vcpkg) and add them to CI on Windows and Linux.
+- **Build:** keep the checked-in MSVC projects and CMake source manifests aligned;
+  test Monocypher and Reed–Solomon on Windows and Linux CI.
 
 ## Sequencing & risk
 

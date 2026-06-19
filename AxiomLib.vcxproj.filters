@@ -57,6 +57,9 @@
     <ClInclude Include="src\core\file_meta.hpp">
       <Filter>Core</Filter>
     </ClInclude>
+    <ClInclude Include="src\core\reed_solomon.hpp">
+      <Filter>Core</Filter>
+    </ClInclude>
     <ClInclude Include="src\entropy\huffman.hpp">
       <Filter>Entropy</Filter>
     </ClInclude>
@@ -102,6 +105,9 @@
       <Filter>Core</Filter>
     </ClCompile>
     <ClCompile Include="src\core\file_meta.cpp">
+      <Filter>Core</Filter>
+    </ClCompile>
+    <ClCompile Include="src\core\reed_solomon.cpp">
       <Filter>Core</Filter>
     </ClCompile>
     <ClCompile Include="src\entropy\huffman.cpp">

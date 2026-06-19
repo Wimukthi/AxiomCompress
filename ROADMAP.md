@@ -23,13 +23,15 @@ A snapshot of where the project stands and what to pick up next. Companion to
   profile — level 1 is the fast path, levels 2–6 tune the hash chain (depth, lazy,
   entropy effort), 7–9 use the binary tree with growing windows, 9 adds the
   optimal parser. Individual flags override the preset.
-- **Front-ends & archiver**: multi-file `.axar` container (solid blocks + central
-  directory) via CLI `a`/`x`/`l`/`t` (plus single-stream `c`/`d`) and a **Windows
-  GUI** (`axiom_gui`). Streaming, bounded-memory create; random-access
-  list/extract; progress reporting and cooperative pause/cancel via
-  `OperationControl`.
-- **Safety**: zip-slip containment, atomic writes, per-block + per-file CRCs,
-  decompression-bomb guard (capped `decompress`), bounded reserves.
+- **Front-ends & archiver**: multi-file `.axar` container via CLI and the native
+  Windows **`Axiom.exe`** archive manager. The archive library supports create,
+  list/test, selective extract, destination-aware add, update/fresh/sync,
+  delete/repack, metadata-only move/rename, comments, locking, Windows metadata,
+  links, and Monocypher data/name encryption. Operations report progress and honor
+  cooperative pause/cancel through `OperationControl`.
+- **Safety**: lexical containment plus symlink/reparse-point ancestor rejection,
+  atomic writes, CRC-32 + BLAKE3 integrity, authenticated encrypted blocks,
+  decompression-bomb guards, and bounded reserves.
 - **Quality**: Release-mode test suite (roundtrip + safety + in-process mutation
   fuzz), coverage-guided libFuzzer+ASan targets, GitHub Actions CI (Windows MSVC
   + Linux clang, build/test/fuzz).
@@ -134,24 +136,27 @@ Large subsystem; design deliberately.
 
 ## Archive feature parity (RAR)
 
-A separate, phased effort to bring the `.axar` format to **feature parity with
-RAR** — strong hashes, rich Windows/POSIX metadata, symlinks/hardlinks,
-encryption (libsodium), recovery records + multi-volume (ISA-L), in-place editing,
-signatures, and SFX. Full plan and sequencing in
+A separate, phased effort is bringing `.axar` to **feature parity with RAR**.
+Phases 1–3 now cover strong hashes, Windows metadata/ADS, links, safe extraction,
+editing, comments/lock, and Monocypher data/name encryption. A portable tested
+Reed–Solomon core is the Phase-4 foundation, but recovery records, volumes,
+signatures, POSIX ownership, and SFX still remain. Full status is in
 [RAR_PARITY_PLAN.md](RAR_PARITY_PLAN.md). The items below are folded into its
 Phase 0–1.
 
 ## Deferred / smaller items
 
-- **Symlink-resistant extraction** (`openat`/`O_NOFOLLOW`): current containment is
-  lexical — solid against `..`, not against a pre-existing symlink in the
-  destination. Last decoder-safety gap. (Parity plan Phase 1.)
-- **Metadata**: POSIX modes / Windows attributes, symlink records (currently
-  skipped on add); mtime is restored best-effort. (Parity plan Phase 1.)
+- **Archive recovery:** define recovery service records, connect the Reed–Solomon
+  core to create/test/repair, then add split and recovery volumes.
+- **Encrypted-directory editing:** data-only encrypted archives are editable;
+  archives with sealed names remain read-only.
+- **Metadata:** POSIX modes/ownership and special files remain; Windows attributes,
+  high-precision times, ADS, symlinks, and hardlinks are implemented.
 - **CLI polish**: real `-h`/`--help`/`--version` (today help prints only on
   misuse, to stderr, exit 2).
-- **Archive features**: append/update in place; a stable `libaxiom` C ABI for
-  bindings. (Parity plan Phase 2.)
+- **Archive optimization:** edits currently use a temporary file + replacement
+  rename; true in-place append remains an optimization. A stable `libaxiom` C ABI
+  for bindings is also pending.
 - **Encoder speed**: the default still re-runs several candidate codecs; a
   cheap-statistics codec chooser would cut compress time further.
 

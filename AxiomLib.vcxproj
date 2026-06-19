@@ -81,6 +81,7 @@
     <ClInclude Include="src\core\cpu.hpp" />
     <ClInclude Include="src\core\crypto.hpp" />
     <ClInclude Include="src\core\file_meta.hpp" />
+    <ClInclude Include="src\core\reed_solomon.hpp" />
     <ClInclude Include="src\entropy\huffman.hpp" />
     <ClInclude Include="src\entropy\range.hpp" />
     <ClInclude Include="src\third_party\blake3\blake3.h" />
@@ -98,6 +99,7 @@
     <ClCompile Include="src\core\cpu.cpp" />
     <ClCompile Include="src\core\crypto.cpp" />
     <ClCompile Include="src\core\file_meta.cpp" />
+    <ClCompile Include="src\core\reed_solomon.cpp" />
     <ClCompile Include="src\entropy\huffman.cpp" />
     <ClCompile Include="src\entropy\range.cpp" />
     <ClCompile Include="src\third_party\blake3\blake3.c">

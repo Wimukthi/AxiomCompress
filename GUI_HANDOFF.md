@@ -7,9 +7,10 @@ a fresh Codex session. Read it together with `README.md`, `ARCHITECTURE.md`, and
 ## Git Checkpoint
 
 - Branch: `gui/file-browser`
-- GUI checkpoint before this handoff: `daca639`
-- Main worktree: `E:\OneDrive\DEV Channel\Software\AxiomCompress`
-- GUI worktree on the original PC: `E:\OneDrive\DEV Channel\Software\AxiomCompress-GUI`
+- Completed native GUI checkpoint: `8749014`
+- Backend merged from `main` through `58a50db`; inspect the current tip with
+  `git log --oneline --decorate -8` because subsequent integration commits may
+  advance both branches.
 
 On another PC, a separate worktree is optional. If only the GUI is being worked
 on there, clone the repository and check out `gui/file-browser` normally.
@@ -51,6 +52,10 @@ PCs. Prefer a Git remote, commit on one PC, push, and pull on the other.
   `toolbar_icon_masks.inc` is generated from the pinned MIT-licensed SVG assets
   under `assets/icons/fluent`.
 - `src/gui/archive_dialogs.*`: native dark create, extract, and settings dialogs.
+- `src/gui/archive_feature_dialogs.*`: capability-gated compression, update,
+  security, comment, lock, recovery, volume, signature, and SFX option surfaces.
+- `src/gui/message_dialog.*`, `about_dialog.*`, `update_checker.*`: DPI-aware
+  native custom messages/about and the NativePad-style update flow.
 - `src/gui/operation_runner.*`: worker lifetime, progress message delivery,
   pause/cancel control, and completion/error results.
 - `src/gui/operation_progress_window.*`: separate modeless progress window for
@@ -64,8 +69,27 @@ PCs. Prefer a Git remote, commit on one PC, push, and pull on the other.
 
 The main window currently provides drive/directory navigation, editable address
 bar, back/forward/up/refresh, shell icons, multi-selection, sortable and
-resizable columns, archive hierarchy browsing, drag/drop, owner-drawn menus and
-context menus, the icon toolbar, and archive create/open/test/extract workflows.
+resizable columns, archive hierarchy browsing, incoming shell drops, owner-drawn
+menus/context menus, the icon toolbar, custom dialogs, and create/open/test/extract
+plus add/update/fresh/sync/delete/repack/comment/lock workflows.
+
+The backend now exposes the APIs needed for full file-manager drag/drop:
+
+- `ArchiveInput` + path-aware `add_to_archive` maps dropped filesystem objects to
+  the current archive directory.
+- `extract_entries` extracts only selected files/directories; a directory includes
+  its subtree and an isolated hardlink is materialized safely.
+- `ArchiveMove` + `move_archive_entries` renames/moves archive subtrees without
+  recompressing block data and rewrites hard-link targets.
+- `archive_encryption_mode` distinguishes plaintext, editable data-only encryption,
+  and currently read-only encrypted-directory archives.
+
+The next GUI slice is an OLE `IDropTarget`/`IDataObject` layer over those APIs.
+Incoming `WM_DROPFILES` still routes non-archive files to create-archive. Outbound
+drag should selectively extract to managed temporary storage before publishing
+`CF_HDROP`; cleanup must not race Explorer's asynchronous consumption. Also wire
+filename encryption and password-authenticated block-only archive editing. Recovery
+UI remains disabled: the Reed–Solomon core exists, but recovery records do not.
 
 ## Build And Verification
 

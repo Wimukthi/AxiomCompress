@@ -46,7 +46,20 @@ single-stream codec and the archive share exactly the same encode/decode path.
 The decoder is deliberately simple and bounded (see "Decoder Rule"); all the
 complexity lives in the encoder.
 
-## Container
+The `.axar` public API deliberately separates archive storage from file-manager
+presentation. Besides create/list/test/extract, it provides destination-aware
+insertion (`ArchiveInput`), selective extraction, metadata-only entry moves
+(`ArchiveMove`), add/update/fresh/sync/delete/repack, comments, locking, and an
+`ArchiveEncryptionMode` query. All mutating operations use a temporary archive and
+replacement rename, honor `OperationControl`, and reject locked archives. Data-only
+encrypted archives are editable with the password; encrypted-directory archives
+currently remain read-only.
+
+Reed–Solomon erasure coding is present as a tested portable core, but no recovery
+record is written to `.axar` yet. Recovery records and multi-volume orchestration
+remain Phase 4 container work.
+
+## Single-stream container
 
 The archive header stores:
 

@@ -201,6 +201,53 @@ bool is_safe_relative(const std::string& path) {
     return true;
 }
 
+std::string normalize_archive_path(std::string path, const char* field_name) {
+    if (path.empty() || path.find('\0') != std::string::npos) {
+        throw std::invalid_argument(std::string(field_name) + " must not be empty");
+    }
+    std::replace(path.begin(), path.end(), '\\', '/');
+    if (path.front() == '/' || path.back() == '/' || path.find("//") != std::string::npos ||
+        (path.size() >= 2 && path[1] == ':')) {
+        throw std::invalid_argument(std::string(field_name) +
+                                    " must be a normalized relative archive path");
+    }
+    std::size_t begin = 0;
+    while (begin < path.size()) {
+        const std::size_t end = path.find('/', begin);
+        const std::string_view part(path.data() + begin,
+                                    (end == std::string::npos ? path.size() : end) - begin);
+        if (part.empty() || part == "." || part == "..") {
+            throw std::invalid_argument(std::string(field_name) +
+                                        " contains an invalid path component");
+        }
+        if (end == std::string::npos) {
+            break;
+        }
+        begin = end + 1;
+    }
+    if (!is_safe_relative(path)) {
+        throw std::invalid_argument(std::string(field_name) + " is not a safe relative path");
+    }
+    return path;
+}
+
+bool is_same_or_child(std::string_view candidate, std::string_view parent) {
+    return candidate == parent ||
+           (candidate.size() > parent.size() &&
+            candidate.compare(0, parent.size(), parent) == 0 &&
+            candidate[parent.size()] == '/');
+}
+
+std::string join_archive_path(std::string_view parent, std::string_view child) {
+    if (child.empty()) {
+        return std::string(parent);
+    }
+    std::string result(parent);
+    result.push_back('/');
+    result.append(child);
+    return result;
+}
+
 bool is_within(const fs::path& base, const fs::path& target) {
     auto b = base.begin();
     auto t = target.begin();
@@ -295,6 +342,8 @@ struct ScanItem {
     std::string symlink_target{};  // verbatim target when is_symlink
 };
 
+void operation_checkpoint(const std::shared_ptr<OperationControl>& operation);
+
 void scan_input(const fs::path& input, std::vector<ScanItem>& items) {
     std::error_code ec;
 
@@ -347,6 +396,132 @@ void scan_input(const fs::path& input, std::vector<ScanItem>& items) {
     }
 
     throw std::runtime_error("unsupported input type: " + input.string());
+}
+
+void scan_input_at(const ArchiveInput& input, std::vector<ScanItem>& items,
+                   const std::shared_ptr<OperationControl>& operation) {
+    const std::string destination =
+        normalize_archive_path(input.destination_path, "archive destination");
+    std::error_code ec;
+    auto archive_path_for = [&](const fs::path& path) {
+        if (path == input.source) {
+            return destination;
+        }
+        const fs::path relative = path.lexically_relative(input.source);
+        if (relative.empty() || relative.native().empty()) {
+            throw std::runtime_error("cannot map input beneath archive destination: " +
+                                     path.string());
+        }
+        return join_archive_path(destination, relative.generic_string());
+    };
+    auto add_symlink = [&](const fs::path& path) {
+        const fs::path target = fs::read_symlink(path, ec);
+        if (ec) {
+            throw std::runtime_error("cannot read symbolic link: " + path.string());
+        }
+        items.push_back({path, archive_path_for(path), false, true, target.generic_string()});
+    };
+
+    const fs::file_status status = fs::symlink_status(input.source, ec);
+    if (ec) {
+        throw std::runtime_error("cannot inspect input: " + input.source.string());
+    }
+    if (fs::is_symlink(status)) {
+        add_symlink(input.source);
+        return;
+    }
+    if (!fs::exists(status)) {
+        throw std::runtime_error("input does not exist: " + input.source.string());
+    }
+    if (fs::is_regular_file(status)) {
+        items.push_back({input.source, destination, false});
+        return;
+    }
+    if (!fs::is_directory(status)) {
+        throw std::runtime_error("unsupported input type: " + input.source.string());
+    }
+
+    items.push_back({input.source, destination, true});
+    for (fs::recursive_directory_iterator it(
+             input.source, fs::directory_options::skip_permission_denied, ec),
+         end;
+         it != end && !ec; it.increment(ec)) {
+        operation_checkpoint(operation);
+        const auto& entry = *it;
+        if (entry.is_symlink(ec)) {
+            add_symlink(entry.path());
+        } else if (entry.is_directory(ec)) {
+            items.push_back({entry.path(), archive_path_for(entry.path()), true});
+        } else if (entry.is_regular_file(ec)) {
+            items.push_back({entry.path(), archive_path_for(entry.path()), false});
+        }
+    }
+    if (ec) {
+        throw std::runtime_error("failed while scanning input: " + input.source.string());
+    }
+}
+
+std::uint8_t scan_item_type(const ScanItem& item) {
+    if (item.is_directory) {
+        return kEntryDir;
+    }
+    return item.is_symlink ? kEntrySymlink : kEntryFile;
+}
+
+void validate_mapped_items(const std::vector<ScanItem>& items,
+                           const ArchiveIndex& existing,
+                           const std::shared_ptr<OperationControl>& operation) {
+    std::unordered_map<std::string, std::uint8_t> incoming;
+    incoming.reserve(items.size());
+    for (const auto& item : items) {
+        operation_checkpoint(operation);
+        const auto [it, inserted] = incoming.emplace(item.archive_path, scan_item_type(item));
+        if (!inserted) {
+            throw std::invalid_argument("duplicate archive destination: " + item.archive_path);
+        }
+    }
+
+    auto validate_tree = [](const auto& paths, const char* message) {
+        for (const auto& [path, type] : paths) {
+            if (type == kEntryDir) {
+                continue;
+            }
+            const std::string prefix = path + "/";
+            for (const auto& [other, ignored] : paths) {
+                (void)ignored;
+                if (other.size() > path.size() && other.compare(0, prefix.size(), prefix) == 0) {
+                    throw std::invalid_argument(std::string(message) + path);
+                }
+            }
+        }
+    };
+    validate_tree(incoming, "non-directory archive destination has children: ");
+
+    std::unordered_map<std::string, std::uint8_t> current;
+    current.reserve(existing.entries.size());
+    for (const auto& entry : existing.entries) {
+        current.emplace(entry.path, entry.type);
+    }
+    for (const auto& [path, type] : incoming) {
+        operation_checkpoint(operation);
+        if (const auto found = current.find(path);
+            found != current.end() && found->second != type) {
+            throw std::invalid_argument("archive destination changes entry type: " + path);
+        }
+        for (const auto& [old_path, old_type] : current) {
+            if (old_path == path) {
+                continue;
+            }
+            if (old_type != kEntryDir && is_same_or_child(path, old_path)) {
+                throw std::invalid_argument("archive destination is beneath a non-directory: " +
+                                            old_path);
+            }
+            if (type != kEntryDir && is_same_or_child(old_path, path)) {
+                throw std::invalid_argument("non-directory archive destination has children: " +
+                                            path);
+            }
+        }
+    }
 }
 
 std::uint64_t scanned_file_bytes(const std::vector<ScanItem>& items) {
@@ -1403,6 +1578,81 @@ void append_items_to_archive(const fs::path& archive_path, const std::vector<Sca
                      total_items, total_items);
 }
 
+void rewrite_archive_directory(const fs::path& archive_path, ArchiveIndex index,
+                               const CompressionOptions& options) {
+    const auto operation = options.operation;
+    std::uint64_t file_size = 0;
+    auto in = open_archive(archive_path, file_size);
+    const ByteSource source(in, file_size);
+    const ArchiveLayout layout = read_layout(source);
+    if ((layout.flags & kFlagEncryptedDirectory) != 0) {
+        throw std::runtime_error("editing an archive with an encrypted directory is not supported");
+    }
+    if (index.meta.locked) {
+        throw std::runtime_error("archive is locked (read-only)");
+    }
+    if (index.meta.encryption.enabled) {
+        auto key = derive_archive_key(index.meta.encryption, options.password);
+        core::secure_wipe(key);
+    }
+
+    std::uint64_t block_region_end = kHeaderSize;
+    if (!index.blocks.empty()) {
+        const auto& last = index.blocks.back();
+        block_region_end = last.compressed_offset + last.compressed_size;
+    }
+
+    fs::path temp_path = archive_path;
+    temp_path += ".tmp";
+    TempFileGuard temp_guard(temp_path);
+    std::ofstream out(temp_path, std::ios::binary | std::ios::trunc);
+    if (!out) {
+        throw std::runtime_error("cannot create archive: " + temp_path.string());
+    }
+
+    std::uint64_t copied = 0;
+    const std::uint64_t total_items = index.entries.size();
+    report_operation(operation, OperationStage::writing, 0, block_region_end, 0, total_items);
+    in.clear();
+    in.seekg(0, std::ios::beg);
+    std::array<char, kFileChunk> chunk{};
+    while (copied < block_region_end) {
+        operation_checkpoint(operation);
+        const auto want = static_cast<std::streamsize>(
+            std::min<std::uint64_t>(block_region_end - copied, chunk.size()));
+        in.read(chunk.data(), want);
+        const auto got = in.gcount();
+        if (got <= 0) {
+            throw std::runtime_error("archive truncated while copying blocks");
+        }
+        out.write(chunk.data(), got);
+        if (!out) {
+            throw std::runtime_error("failed while copying archive blocks");
+        }
+        copied += static_cast<std::uint64_t>(got);
+        report_operation(operation, OperationStage::writing, copied, block_region_end,
+                         0, total_items);
+    }
+    in.close();
+
+    report_operation(operation, OperationStage::finalizing, copied, block_region_end,
+                     total_items, total_items);
+    write_directory_and_footer(out, block_region_end, index.blocks, index.entries, index.meta);
+
+    std::error_code ec;
+    fs::rename(temp_path, archive_path, ec);
+    if (ec) {
+        fs::remove(archive_path, ec);
+        fs::rename(temp_path, archive_path, ec);
+        if (ec) {
+            throw std::runtime_error("failed to move archive into place: " + ec.message());
+        }
+    }
+    temp_guard.dismiss();
+    report_operation(operation, OperationStage::finalizing, block_region_end, block_region_end,
+                     total_items, total_items);
+}
+
 }  // namespace
 
 void create_archive(const std::vector<std::filesystem::path>& inputs,
@@ -1499,6 +1749,29 @@ void add_to_archive(const std::vector<std::filesystem::path>& inputs,
         operation_checkpoint(operation);
         scan_input(input, items);
     }
+    append_items_to_archive(archive_path, items, options);
+}
+
+void add_to_archive(const std::vector<ArchiveInput>& inputs,
+                    const std::filesystem::path& archive_path,
+                    const CompressionOptions& options) {
+    const auto operation = options.operation;
+    report_operation(operation, OperationStage::scanning, 0, 0, 0, inputs.size());
+
+    std::vector<ScanItem> items;
+    for (const auto& input : inputs) {
+        operation_checkpoint(operation);
+        scan_input_at(input, items, operation);
+    }
+
+    ArchiveIndex existing;
+    {
+        std::uint64_t file_size = 0;
+        auto in = open_archive(archive_path, file_size);
+        const ByteSource source(in, file_size);
+        existing = read_index(source);
+    }
+    validate_mapped_items(items, existing, operation);
     append_items_to_archive(archive_path, items, options);
 }
 
@@ -1639,6 +1912,152 @@ void sync_archive(const std::vector<std::filesystem::path>& inputs,
     }
 }
 
+void move_archive_entries(const std::filesystem::path& archive_path,
+                          const std::vector<ArchiveMove>& moves,
+                          const CompressionOptions& options) {
+    if (moves.empty()) {
+        return;
+    }
+
+    const auto operation = options.operation;
+    std::vector<ArchiveMove> normalized;
+    normalized.reserve(moves.size());
+    std::unordered_set<std::string> sources;
+    std::unordered_set<std::string> destinations;
+    for (const auto& move : moves) {
+        operation_checkpoint(operation);
+        ArchiveMove item{
+            normalize_archive_path(move.source_path, "archive move source"),
+            normalize_archive_path(move.destination_path, "archive move destination")};
+        if (item.source_path == item.destination_path) {
+            throw std::invalid_argument("archive move source and destination are identical: " +
+                                        item.source_path);
+        }
+        if (!sources.insert(item.source_path).second) {
+            throw std::invalid_argument("duplicate archive move source: " + item.source_path);
+        }
+        if (!destinations.insert(item.destination_path).second) {
+            throw std::invalid_argument("duplicate archive move destination: " +
+                                        item.destination_path);
+        }
+        normalized.push_back(std::move(item));
+    }
+
+    for (std::size_t i = 0; i < normalized.size(); ++i) {
+        operation_checkpoint(operation);
+        const auto& move = normalized[i];
+        if (is_same_or_child(move.destination_path, move.source_path)) {
+            throw std::invalid_argument("cannot move an archive entry into its own subtree: " +
+                                        move.source_path);
+        }
+        for (std::size_t j = 0; j < normalized.size(); ++j) {
+            if (i == j) {
+                continue;
+            }
+            if (is_same_or_child(move.source_path, normalized[j].source_path)) {
+                throw std::invalid_argument("archive move sources overlap: " + move.source_path);
+            }
+            if (is_same_or_child(move.destination_path, normalized[j].source_path)) {
+                throw std::invalid_argument(
+                    "archive move destination lies in another moved subtree: " +
+                    move.destination_path);
+            }
+        }
+    }
+
+    ArchiveIndex index;
+    {
+        std::uint64_t file_size = 0;
+        auto in = open_archive(archive_path, file_size);
+        const ByteSource source(in, file_size);
+        index = read_index(source);
+    }
+
+    std::unordered_map<std::string, std::uint8_t> original_types;
+    original_types.reserve(index.entries.size());
+    for (const auto& entry : index.entries) {
+        operation_checkpoint(operation);
+        original_types.emplace(entry.path, entry.type);
+    }
+    for (const auto& move : normalized) {
+        bool found_source = original_types.find(move.source_path) != original_types.end();
+        if (!found_source) {
+            for (const auto& [path, ignored] : original_types) {
+                (void)ignored;
+                if (is_same_or_child(path, move.source_path)) {
+                    found_source = true;  // implicit directory represented by descendants
+                    break;
+                }
+            }
+        }
+        if (!found_source) {
+            throw std::invalid_argument("archive move source does not exist: " +
+                                        move.source_path);
+        }
+    }
+
+    auto moved_path = [&](const std::string& path) {
+        for (const auto& move : normalized) {
+            if (path == move.source_path) {
+                return move.destination_path;
+            }
+            if (is_same_or_child(path, move.source_path)) {
+                return move.destination_path + path.substr(move.source_path.size());
+            }
+        }
+        return path;
+    };
+
+    std::unordered_map<std::string, std::uint8_t> final_types;
+    final_types.reserve(index.entries.size());
+    for (auto& entry : index.entries) {
+        operation_checkpoint(operation);
+        entry.path = moved_path(entry.path);
+        if (entry.type == kEntryHardlink) {
+            entry.link_target = moved_path(entry.link_target);
+        }
+        if (!final_types.emplace(entry.path, entry.type).second) {
+            throw std::invalid_argument("archive move destination already exists: " + entry.path);
+        }
+    }
+
+    for (const auto& [path, type] : final_types) {
+        operation_checkpoint(operation);
+        std::size_t slash = path.rfind('/');
+        if (slash != std::string::npos) {
+            const std::string parent = path.substr(0, slash);
+            const auto found = final_types.find(parent);
+            if (found != final_types.end() && found->second != kEntryDir) {
+                throw std::invalid_argument("archive move destination parent is not a directory: " +
+                                            parent);
+            }
+        }
+        if (type != kEntryDir) {
+            const std::string prefix = path + "/";
+            for (const auto& [other, ignored] : final_types) {
+                (void)ignored;
+                if (other.size() > path.size() &&
+                    other.compare(0, prefix.size(), prefix) == 0) {
+                    throw std::invalid_argument("non-directory archive entry has children: " +
+                                                path);
+                }
+            }
+        }
+    }
+    for (const auto& entry : index.entries) {
+        operation_checkpoint(operation);
+        if (entry.type == kEntryHardlink) {
+            const auto target = final_types.find(entry.link_target);
+            if (target == final_types.end() || target->second != kEntryFile) {
+                throw std::invalid_argument("archive move leaves a dangling hard link: " +
+                                            entry.path);
+            }
+        }
+    }
+
+    rewrite_archive_directory(archive_path, std::move(index), options);
+}
+
 void set_archive_comment(const std::filesystem::path& archive_path, const std::string& comment,
                          const CompressionOptions& options) {
     // Start from the existing metadata so the encryption record (and anything else)
@@ -1681,7 +2100,7 @@ bool archive_is_locked(const std::filesystem::path& archive_path, const std::str
     return load_index(source, password).index.meta.locked;
 }
 
-bool archive_is_encrypted(const std::filesystem::path& archive_path) {
+ArchiveEncryptionMode archive_encryption_mode(const std::filesystem::path& archive_path) {
     std::uint64_t file_size = 0;
     auto in = open_archive(archive_path, file_size);
     const ByteSource source(in, file_size);
@@ -1689,9 +2108,15 @@ bool archive_is_encrypted(const std::filesystem::path& archive_path) {
     // block-only encrypted archive is identified from its (plaintext) directory.
     const auto layout = read_layout(source);
     if ((layout.flags & kFlagEncryptedDirectory) != 0) {
-        return true;
+        return ArchiveEncryptionMode::data_and_directory;
     }
-    return read_index(source).meta.encryption.enabled;
+    return read_index(source).meta.encryption.enabled
+        ? ArchiveEncryptionMode::data_only
+        : ArchiveEncryptionMode::none;
+}
+
+bool archive_is_encrypted(const std::filesystem::path& archive_path) {
+    return archive_encryption_mode(archive_path) != ArchiveEncryptionMode::none;
 }
 
 std::vector<ArchiveEntry> list_archive(const std::filesystem::path& archive_path,
@@ -1774,9 +2199,12 @@ void test_archive(const std::filesystem::path& archive_path,
     }
 }
 
-void extract_archive(const std::filesystem::path& archive_path,
-                     const std::filesystem::path& dest_dir,
-                     const ExtractOptions& options) {
+namespace {
+
+void extract_entries_impl(const std::filesystem::path& archive_path,
+                          const std::vector<std::string>* requested_entries,
+                          const std::filesystem::path& dest_dir,
+                          const ExtractOptions& options) {
     const auto operation = options.operation;
     std::uint64_t file_size = 0;
     auto stream = open_archive(archive_path, file_size);
@@ -1788,8 +2216,63 @@ void extract_archive(const std::filesystem::path& archive_path,
     }
     BlockSource source(bytes, index, options.thread_count, operation, loaded.key);
 
-    const auto total_bytes = archive_file_bytes(index);
-    const auto total_items = static_cast<std::uint64_t>(index.entries.size());
+    std::unordered_map<std::string, std::size_t> entry_by_path;
+    entry_by_path.reserve(index.entries.size());
+    for (std::size_t i = 0; i < index.entries.size(); ++i) {
+        operation_checkpoint(operation);
+        entry_by_path.emplace(index.entries[i].path, i);
+    }
+    std::vector<bool> selected(index.entries.size(), requested_entries == nullptr);
+    if (requested_entries != nullptr) {
+        std::unordered_set<std::string> unique_requests;
+        for (const auto& requested : *requested_entries) {
+            operation_checkpoint(operation);
+            const std::string path = normalize_archive_path(requested, "archive entry");
+            if (!unique_requests.insert(path).second) {
+                continue;
+            }
+            const auto found = entry_by_path.find(path);
+            bool matched = false;
+            if (found != entry_by_path.end()) {
+                selected[found->second] = true;
+                matched = true;
+            }
+            if (found == entry_by_path.end() || index.entries[found->second].type == kEntryDir) {
+                for (std::size_t i = 0; i < index.entries.size(); ++i) {
+                    if (is_same_or_child(index.entries[i].path, path) &&
+                        index.entries[i].path != path) {
+                        selected[i] = true;
+                        matched = true;
+                    }
+                }
+            }
+            if (!matched) {
+                throw std::invalid_argument("archive entry does not exist: " + path);
+            }
+        }
+    }
+
+    std::uint64_t total_bytes = 0;
+    std::uint64_t total_items = 0;
+    for (std::size_t i = 0; i < index.entries.size(); ++i) {
+        operation_checkpoint(operation);
+        if (!selected[i]) {
+            continue;
+        }
+        ++total_items;
+        const auto& entry = index.entries[i];
+        if (entry.type == kEntryFile) {
+            total_bytes += entry.size;
+        } else if (entry.type == kEntryHardlink) {
+            const auto target = entry_by_path.find(entry.link_target);
+            if (target == entry_by_path.end() || index.entries[target->second].type != kEntryFile) {
+                throw FormatError("archive contains a dangling hard link: " + entry.path);
+            }
+            if (!selected[target->second]) {
+                total_bytes += index.entries[target->second].size;
+            }
+        }
+    }
     std::uint64_t completed_bytes = 0;
     std::uint64_t completed_items = 0;
     report_operation(operation, OperationStage::extracting, completed_bytes, total_bytes,
@@ -1808,7 +2291,11 @@ void extract_archive(const std::filesystem::path& archive_path,
     };
     std::vector<DeferredDir> deferred_dirs;
 
-    for (const auto& entry : index.entries) {
+    for (std::size_t entry_index = 0; entry_index < index.entries.size(); ++entry_index) {
+        if (!selected[entry_index]) {
+            continue;
+        }
+        const auto& entry = index.entries[entry_index];
         operation_checkpoint(operation);
         if (!is_safe_relative(entry.path)) {
             throw FormatError("archive contains an unsafe path: " + entry.path);
@@ -1853,7 +2340,19 @@ void extract_archive(const std::filesystem::path& archive_path,
             continue;
         }
 
+        const EntryRec* file_entry = &entry;
         if (entry.type == kEntryHardlink) {
+            const auto canonical = entry_by_path.find(entry.link_target);
+            if (canonical == entry_by_path.end() ||
+                index.entries[canonical->second].type != kEntryFile) {
+                throw FormatError("archive contains a dangling hard link: " + entry.path);
+            }
+            if (!selected[canonical->second]) {
+                // A selected hardlink whose canonical file is outside the selection
+                // is materialized directly from the canonical entry. This keeps the
+                // requested output self-contained without exposing unrelated paths.
+                file_entry = &index.entries[canonical->second];
+            } else {
             // The canonical file precedes its hard links in the directory, so its
             // target already exists on disk by the time we reach this entry.
             const fs::path link_to = (dest_dir / fs::path(entry.link_target)).lexically_normal();
@@ -1885,6 +2384,7 @@ void extract_archive(const std::filesystem::path& archive_path,
             report_operation(operation, OperationStage::extracting, completed_bytes, total_bytes,
                              completed_items, total_items, entry.path);
             continue;
+            }
         }
 
         if (entry.type == kEntryDir) {
@@ -1904,7 +2404,7 @@ void extract_archive(const std::filesystem::path& archive_path,
         fs::create_directories(target.parent_path(), ec);
         if (fs::exists(target, ec)) {
             if (options.overwrite == ExtractOptions::Overwrite::skip) {
-                completed_bytes += entry.size;
+                completed_bytes += file_entry->size;
                 ++completed_items;
                 report_operation(operation, OperationStage::extracting, completed_bytes, total_bytes,
                                  completed_items, total_items, entry.path);
@@ -1923,7 +2423,7 @@ void extract_archive(const std::filesystem::path& archive_path,
             if (!file_out) {
                 throw std::runtime_error("cannot write file: " + temp_target.string());
             }
-            read_file_bytes(source, index.blocks.size(), entry, operation,
+            read_file_bytes(source, index.blocks.size(), *file_entry, operation,
                             [&](std::span<const std::uint8_t> bytes) {
                                 operation_checkpoint(operation);
                                 file_out.write(reinterpret_cast<const char*>(bytes.data()),
@@ -1950,12 +2450,13 @@ void extract_archive(const std::filesystem::path& archive_path,
 
         // NTFS named streams are written before timestamps so restoring the write
         // time isn't disturbed by the stream writes that follow it.
-        core::apply_ads(target, entry.ads);
+        core::apply_ads(target, file_entry->ads);
         // High-precision Windows times (when present) supersede the seconds mtime.
-        core::apply_metadata(target, entry.meta, options.restore_mtime);
-        if (options.restore_mtime && !entry.meta.has_windows_times && entry.mtime != 0) {
+        core::apply_metadata(target, file_entry->meta, options.restore_mtime);
+        if (options.restore_mtime && !file_entry->meta.has_windows_times &&
+            file_entry->mtime != 0) {
             try {
-                fs::last_write_time(target, from_unix_seconds(entry.mtime), ec);
+                fs::last_write_time(target, from_unix_seconds(file_entry->mtime), ec);
             } catch (...) {
                 // best effort
             }
@@ -1977,6 +2478,21 @@ void extract_archive(const std::filesystem::path& archive_path,
             }
         }
     }
+}
+
+}  // namespace
+
+void extract_archive(const std::filesystem::path& archive_path,
+                     const std::filesystem::path& dest_dir,
+                     const ExtractOptions& options) {
+    extract_entries_impl(archive_path, nullptr, dest_dir, options);
+}
+
+void extract_entries(const std::filesystem::path& archive_path,
+                     const std::vector<std::string>& entries,
+                     const std::filesystem::path& dest_dir,
+                     const ExtractOptions& options) {
+    extract_entries_impl(archive_path, &entries, dest_dir, options);
 }
 
 namespace detail {

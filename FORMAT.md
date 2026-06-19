@@ -239,13 +239,19 @@ What the format and the current implementation do and do not handle:
   costs nothing for the common single-link file (only files with link count > 1 are
   probed).
 - Solid (cross-file) compression with per-block *and* per-file CRC-32, random
-  access list/extract, selective single-file extraction, atomic writes,
+  access listing, selective file/directory extraction, atomic writes,
   `--overwrite fail|skip|all`, mtime restore, and threaded encode/decode.
 - **Add / update** files into an existing archive (`a` on an existing `.axar`):
   existing files are not recompressed — their solid blocks are copied verbatim and
   new files are appended as new blocks, then the directory is rebuilt. An added path
   replaces the existing entry of the same name (the replaced bytes become dead space
   until a repack).
+- **File-manager operations:** callers can map a filesystem file/directory to an
+  explicit archive destination, extract selected entries (a selected directory
+  includes its subtree), and rename/move files or whole directory subtrees without
+  recompressing their block data. Hard-link targets are rewritten when their
+  canonical path moves; a selectively extracted hardlink is materialized as a
+  regular file when its canonical entry was not selected.
 - **Update / fresh / sync** (`u`, `f`, `s`): refresh by modification time. `update`
   adds new files and replaces archived copies older than the disk file; `fresh`
   replaces only files already in the archive; `sync` mirrors the inputs — update,
@@ -259,13 +265,13 @@ What the format and the current implementation do and do not handle:
   and a one-way read-only flag after which every edit operation refuses. Both live in
   the archive-level TLV and survive edits; reads (list/test/extract) ignore the lock.
 - **Encryption** (`-p`/`--password`): per-block XChaCha20-Poly1305 with an Argon2id
-  password key. Wrong password and tampering are rejected (authenticated); listing
-  names still works without the password. (Names and editing of encrypted archives
-  are not yet covered — see below.)
+  password key. Wrong password and tampering are rejected. Block-only encryption
+  leaves names listable and supports edits with the password. `--encrypt-names`
+  additionally seals the central directory, requiring the password to list it.
 
-**Not stored / not supported**
+**Additional behavior and current limits**
 
-- **Metadata:** mtime (seconds), plus on Windows the file attributes,
+- **Metadata stored:** mtime (seconds), plus on Windows the file attributes,
   full-precision creation/access/write times, and **NTFS alternate data streams**
   (named streams ≤ 1 MiB each; larger ones are skipped). POSIX permission bits and
   ownership are not yet stored (a later phase).

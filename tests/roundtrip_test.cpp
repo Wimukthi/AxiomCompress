@@ -453,6 +453,12 @@ void test_archive_symlinks() {
     // The link still resolves to the real content beside it.
     AXIOM_CHECK(read_all(extracted) == bytes_from_string("the real file"));
 
+    const auto selected = root / "selected";
+    axiom::extract_entries(archive, {"src/link.txt"}, selected, {});
+    AXIOM_CHECK(fs::is_symlink(fs::symlink_status(selected / "src" / "link.txt", ec)));
+    AXIOM_CHECK(fs::read_symlink(selected / "src" / "link.txt", ec) == fs::path("real.txt"));
+    AXIOM_CHECK(!fs::exists(selected / "src" / "real.txt"));
+
     fs::remove_all(root, ec);
 }
 
@@ -479,10 +485,12 @@ void test_archive_hardlinks() {
     const auto entries = axiom::list_archive(archive);
     int files = 0, hardlinks = 0;
     std::string link_target;
+    std::string hardlink_path;
     for (const auto& entry : entries) {
         if (entry.is_hardlink) {
             ++hardlinks;
             link_target = entry.link_target;
+            hardlink_path = entry.path;
             AXIOM_CHECK(!entry.is_directory && !entry.is_symlink);
         } else if (!entry.is_directory) {
             ++files;
@@ -500,6 +508,27 @@ void test_archive_hardlinks() {
     AXIOM_CHECK(read_all(dest / "src" / "b.txt") == payload);
     // The extracted pair should once again share one inode.
     AXIOM_CHECK(fs::hard_link_count(dest / "src" / "a.txt", ec) == 2);
+
+    // Selecting only the hardlink must still produce its bytes without exposing the
+    // unselected canonical path in the destination.
+    const auto selected = root / "selected";
+    axiom::extract_entries(archive, {hardlink_path}, selected, {});
+    AXIOM_CHECK(read_all(selected / fs::path(hardlink_path)) == payload);
+    AXIOM_CHECK(!fs::exists(selected / fs::path(link_target)));
+
+    const std::string moved_target = "src/canonical-moved.txt";
+    axiom::move_archive_entries(archive, {{link_target, moved_target}}, {});
+    bool updated_link = false;
+    for (const auto& entry : axiom::list_archive(archive)) {
+        if (entry.path == hardlink_path) {
+            updated_link = entry.is_hardlink && entry.link_target == moved_target;
+        }
+    }
+    AXIOM_CHECK(updated_link);
+    const auto moved = root / "moved";
+    axiom::extract_archive(archive, moved, {});
+    AXIOM_CHECK(read_all(moved / fs::path(moved_target)) == payload);
+    AXIOM_CHECK(read_all(moved / fs::path(hardlink_path)) == payload);
 
     fs::remove_all(root, ec);
 }
@@ -553,6 +582,117 @@ void test_archive_add() {
     axiom::extract_archive(archive, dest2, {});
     AXIOM_CHECK(read_all(dest2 / "src" / "a.txt") == a2);
     AXIOM_CHECK(read_all(dest2 / "more" / "b.txt") == b);  // earlier add untouched
+
+    std::error_code ec;
+    fs::remove_all(root, ec);
+}
+
+void test_archive_file_manager_apis() {
+    const auto root = make_temp_dir();
+    const auto src = root / "src";
+    fs::create_directories(src / "folder");
+    write_all(src / "keep.txt", bytes_from_string("keep"));
+    write_all(src / "folder" / "existing.txt", bytes_from_string("existing"));
+
+    const auto archive = root / "drag.axar";
+    axiom::create_archive({src}, archive, {});
+    AXIOM_CHECK(axiom::archive_encryption_mode(archive) ==
+                axiom::ArchiveEncryptionMode::none);
+
+    const auto dropped = root / "dropped.txt";
+    const auto dropped_bytes = bytes_from_string("dropped into an archive folder");
+    write_all(dropped, dropped_bytes);
+    const auto tree = root / "tree";
+    fs::create_directories(tree / "deep");
+    write_all(tree / "deep" / "leaf.txt", bytes_from_string("leaf"));
+
+    const std::vector<axiom::ArchiveInput> mapped = {
+        {dropped, "src/folder/dropped.txt"},
+        {tree, "src/folder/tree"},
+        {dropped, "virtual/deep/lone.txt"},
+    };
+    axiom::add_to_archive(mapped, archive, {});
+    axiom::test_archive(archive);
+
+    // Invalid, duplicate, and type-changing destinations fail without modifying
+    // the existing archive.
+    const auto before_invalid = read_all(archive);
+    expect_throws([&] {
+        axiom::add_to_archive(
+            std::vector<axiom::ArchiveInput>{{dropped, "../escape.txt"}}, archive, {});
+    });
+    expect_throws([&] {
+        axiom::add_to_archive(
+            std::vector<axiom::ArchiveInput>{{dropped, "src/folder/x.txt"},
+                                             {dropped, "src/folder/x.txt"}},
+            archive, {});
+    });
+    expect_throws([&] {
+        axiom::add_to_archive(
+            std::vector<axiom::ArchiveInput>{{dropped, "src/folder"}}, archive, {});
+    });
+    AXIOM_CHECK(read_all(archive) == before_invalid);
+
+    // Single-file extraction does not spill unrelated archive entries.
+    const auto one = root / "one";
+    axiom::extract_entries(archive, {"src/folder/dropped.txt"}, one, {});
+    AXIOM_CHECK(read_all(one / "src" / "folder" / "dropped.txt") == dropped_bytes);
+    AXIOM_CHECK(!fs::exists(one / "src" / "keep.txt"));
+    AXIOM_CHECK(!fs::exists(one / "src" / "folder" / "existing.txt"));
+
+    // Directory selection includes its subtree and overlapping selections are
+    // naturally deduplicated.
+    const auto subtree = root / "subtree";
+    axiom::extract_entries(
+        archive, {"src/folder/tree", "src/folder/tree/deep/leaf.txt"}, subtree, {});
+    AXIOM_CHECK(read_all(subtree / "src" / "folder" / "tree" / "deep" / "leaf.txt") ==
+                bytes_from_string("leaf"));
+    AXIOM_CHECK(!fs::exists(subtree / "src" / "keep.txt"));
+    const auto implicit = root / "implicit";
+    axiom::extract_entries(archive, {"virtual"}, implicit, {});
+    AXIOM_CHECK(read_all(implicit / "virtual" / "deep" / "lone.txt") == dropped_bytes);
+    expect_throws([&] {
+        axiom::extract_entries(archive, {"src/missing.txt"}, root / "missing", {});
+    });
+
+    // Moves rewrite only paths/directory metadata; content remains intact.
+    axiom::move_archive_entries(
+        archive,
+        {{"src/folder/dropped.txt", "src/folder/renamed.txt"},
+         {"src/folder/tree", "src/moved"}},
+        {});
+    axiom::move_archive_entries(archive, {{"virtual", "src/implicit"}}, {});
+    axiom::test_archive(archive);
+    const auto moved = root / "moved-out";
+    axiom::extract_entries(archive, {"src/folder/renamed.txt", "src/moved"}, moved, {});
+    AXIOM_CHECK(read_all(moved / "src" / "folder" / "renamed.txt") == dropped_bytes);
+    AXIOM_CHECK(read_all(moved / "src" / "moved" / "deep" / "leaf.txt") ==
+                bytes_from_string("leaf"));
+    const auto implicit_moved = root / "implicit-moved";
+    axiom::extract_entries(archive, {"src/implicit"}, implicit_moved, {});
+    AXIOM_CHECK(read_all(implicit_moved / "src" / "implicit" / "deep" / "lone.txt") ==
+                dropped_bytes);
+
+    const auto before_collision = read_all(archive);
+    expect_throws([&] {
+        axiom::move_archive_entries(archive, {{"src", "src/folder/inside"}}, {});
+    });
+    expect_throws([&] {
+        axiom::move_archive_entries(
+            archive, {{"src/folder/renamed.txt", "src/folder/existing.txt"}}, {});
+    });
+    AXIOM_CHECK(read_all(archive) == before_collision);
+
+    auto cancelled = std::make_shared<axiom::OperationControl>();
+    cancelled->request_cancel();
+    axiom::CompressionOptions cancelled_options;
+    cancelled_options.operation = cancelled;
+    expect_throws([&] {
+        axiom::add_to_archive(
+            std::vector<axiom::ArchiveInput>{{dropped, "src/cancelled.txt"}},
+            archive, cancelled_options);
+    });
+    AXIOM_CHECK(read_all(archive) == before_collision);
 
     std::error_code ec;
     fs::remove_all(root, ec);
@@ -701,6 +841,9 @@ void test_archive_comment_lock() {
     expect_throws([&] { axiom::add_to_archive({src}, archive, {}); });
     expect_throws([&] { axiom::delete_from_archive(archive, {"src/a.txt"}, {}); });
     expect_throws([&] { axiom::repack_archive(archive, {}); });
+    expect_throws([&] {
+        axiom::move_archive_entries(archive, {{"src/a.txt", "src/moved.txt"}}, {});
+    });
     expect_throws([&] { axiom::set_archive_comment(archive, "nope"); });
     expect_throws([&] { axiom::lock_archive(archive); });
 
@@ -726,6 +869,8 @@ void test_archive_encryption() {
     axiom::create_archive({src}, archive, opt);
 
     AXIOM_CHECK(axiom::archive_is_encrypted(archive));
+    AXIOM_CHECK(axiom::archive_encryption_mode(archive) ==
+                axiom::ArchiveEncryptionMode::data_only);
     AXIOM_CHECK(axiom::list_archive(archive).size() >= 2);  // names readable w/o password
 
     // Wrong or missing password is rejected before any block is read.
@@ -776,11 +921,24 @@ void test_archive_encryption() {
         write_all(src / "added.txt", bytes_from_string("added under encryption"));
         axiom::CompressionOptions a;
         a.password = "totally wrong";
-        expect_throws([&] { axiom::add_to_archive({src / "added.txt"}, archive, a); });
+        const std::vector<axiom::ArchiveInput> encrypted_add = {
+            {src / "added.txt", "src/sub/added.txt"}};
+        expect_throws([&] { axiom::add_to_archive(encrypted_add, archive, a); });
 
         a.password = opt.password;
-        axiom::add_to_archive({src / "added.txt"}, archive, a);
+        axiom::add_to_archive(encrypted_add, archive, a);
         AXIOM_CHECK(axiom::archive_is_encrypted(archive));
+
+        axiom::CompressionOptions wrong_move;
+        wrong_move.password = "wrong";
+        const auto before_wrong_move = read_all(archive);
+        expect_throws([&] {
+            axiom::move_archive_entries(
+                archive, {{"src/sub/added.txt", "src/sub/moved.txt"}}, wrong_move);
+        });
+        AXIOM_CHECK(read_all(archive) == before_wrong_move);
+        axiom::move_archive_entries(
+            archive, {{"src/sub/added.txt", "src/sub/moved.txt"}}, a);
 
         axiom::DecompressionOptions d;
         d.password = opt.password;
@@ -789,8 +947,20 @@ void test_archive_encryption() {
         x.password = opt.password;
         const auto dest = root / "out2";
         axiom::extract_archive(archive, dest, x);
-        AXIOM_CHECK(read_all(dest / "added.txt") == bytes_from_string("added under encryption"));
+        AXIOM_CHECK(read_all(dest / "src" / "sub" / "moved.txt") ==
+                    bytes_from_string("added under encryption"));
         AXIOM_CHECK(read_all(dest / "src" / "secret.txt") == secret);  // original intact
+
+        const auto selected = root / "selected-encrypted";
+        axiom::ExtractOptions wrong_extract;
+        wrong_extract.password = "wrong";
+        expect_throws([&] {
+            axiom::extract_entries(
+                archive, {"src/sub/moved.txt"}, root / "selected-wrong", wrong_extract);
+        });
+        axiom::extract_entries(archive, {"src/sub/moved.txt"}, selected, x);
+        AXIOM_CHECK(read_all(selected / "src" / "sub" / "moved.txt") ==
+                    bytes_from_string("added under encryption"));
     }
 
     // A comment change preserves the encryption metadata (would otherwise orphan the
@@ -817,7 +987,8 @@ void test_archive_encryption() {
         const auto dest = root / "out3";
         axiom::extract_archive(archive, dest, x);
         AXIOM_CHECK(read_all(dest / "src" / "secret.txt") == secret);
-        AXIOM_CHECK(read_all(dest / "added.txt") == bytes_from_string("added under encryption"));
+        AXIOM_CHECK(read_all(dest / "src" / "sub" / "moved.txt") ==
+                    bytes_from_string("added under encryption"));
     }
 
     std::error_code ec;
@@ -841,6 +1012,12 @@ void test_archive_encrypted_directory() {
     axiom::create_archive({src}, archive, opt);
 
     AXIOM_CHECK(axiom::archive_is_encrypted(archive));  // detectable without a password
+    AXIOM_CHECK(axiom::archive_encryption_mode(archive) ==
+                axiom::ArchiveEncryptionMode::data_and_directory);
+
+    expect_throws([&] {
+        axiom::move_archive_entries(archive, {{"src", "renamed"}}, opt);
+    });
 
     // Listing is refused without (or with a wrong) password — the directory is sealed.
     expect_throws([&] { (void)axiom::list_archive(archive); });
@@ -1359,6 +1536,7 @@ int main() {
     test_archive_symlinks();
     test_archive_hardlinks();
     test_archive_add();
+    test_archive_file_manager_apis();
     test_archive_delete_repack();
     test_archive_update_sync();
     test_archive_comment_lock();

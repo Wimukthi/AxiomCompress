@@ -5,9 +5,10 @@ AxiomCompress is an experimental archival compressor. The benchmark target is
 
 What it does today:
 
-- **Multi-file `.axar` archives** — solid blocks for cross-file redundancy, kept
-  independently decodable for random-access list/extract; per-block + per-file
-  CRC-32; atomic, bounded-memory writes. See [FORMAT.md](FORMAT.md).
+- **Multi-file `.axar` archives** — solid blocks for cross-file redundancy,
+  independently decodable for selective extraction; BLAKE3 + CRC integrity,
+  Windows metadata/ADS, links, archive editing, comments/locking, and optional
+  Monocypher encryption of data and names. See [FORMAT.md](FORMAT.md).
 - **One speed/ratio knob:** `--level 1..9`. Level 1 is a fast LZ4-style path
   (`fast_lz`); levels 2–6 a lazy hash-chain matcher; 7–9 a cyclic-window
   binary-tree matcher, with the optimal parser available via `--optimal`.
@@ -75,6 +76,9 @@ axiomc l archive.axar                        # list contents
 axiomc t archive.axar                        # verify integrity
 axiomc x archive.axar dest-dir               # extract (paths contained to dest-dir)
 axiomc x --overwrite skip archive.axar dest-dir
+axiomc a -p "password" archive.axar private-dir
+axiomc a -p "password" --encrypt-names hidden.axar private-dir
+axiomc l -p "password" hidden.axar
 ```
 
 Single-stream mode (one input stream to one `.axc` blob):
@@ -99,21 +103,25 @@ layout/fonts). Operations run on a worker thread so the window stays responsive;
 create/test/extract report byte progress to the status strip and progress bar,
 including throughput, ETA, output size, and live compression ratio when available.
 Operations can be paused or cancelled cooperatively. Archive creation, extraction,
-and application settings use native dark, DPI-scaled dialogs rather than the old
-form-style controls.
+feature options, custom messages/about, and application settings use native dark,
+DPI-scaled dialogs.
 
 The main window is a file-manager browser with drive and directory navigation,
 an editable address bar, history, shell icons, multi-selection, sortable and
 resizable columns, and hierarchical archive browsing. Archive presentation is
 isolated behind a provider/catalog layer with explicit capability flags, so
-packed-size, encryption, recovery, volume, comment, authenticity, and archive
-mutation features can be enabled as their public archive APIs become available.
+archive editing, comments, locking, links, and data encryption are wired through
+public archive APIs. Filename encryption and encrypted-archive editing have backend
+support and are the next GUI integration step. Recovery records, volumes,
+authenticity, and SFX remain capability-gated until their archive APIs land.
 Its owner-drawn dark menu bar exposes File, Commands, Tools, Options, and Help
 menus without falling back to a light system menu, and routes menu and keyboard
 commands through the same command IDs used by the toolbar.
 Filesystem folders refresh automatically through `ReadDirectoryChangesW`; dropped
-archives open in the browser, while dropped files and folders enter the create
-archive workflow. Window placement, the last location, sorting, and application
+archives open in the browser, while dropped files and folders currently enter the
+create-archive workflow. The backend now exposes destination-aware add, selective
+extract, and metadata-only move APIs for the pending Explorer-style archive
+drag/drop layer. Window placement, the last location, sorting, and application
 defaults persist per user under `HKCU\Software\AxiomCompress\GUI`.
 
 ### Effort levels (`--level 1..9`, default 5)
