@@ -145,6 +145,11 @@ struct CompressionOptions {
     bool force_parallel_blocks = false;
     bool enable_optimal_parser = false;
     std::shared_ptr<OperationControl> operation;
+    // When non-empty, archive blocks are encrypted: a per-archive key is derived
+    // from this password (Argon2id) and each solid block is sealed with
+    // XChaCha20-Poly1305. Applies to the archive container, not single-stream
+    // compress(). Empty = no encryption.
+    std::string password;
 };
 
 class FormatError final : public std::runtime_error {
@@ -165,6 +170,9 @@ struct DecompressionOptions {
     std::size_t max_output_size = kDefaultMaxDecompressedSize;
     std::size_t thread_count = 0;
     std::shared_ptr<OperationControl> operation;
+    // Password for an encrypted archive (container blocks). Empty for plaintext
+    // archives; required to read an encrypted one.
+    std::string password{};
 };
 
 ByteVector compress(std::span<const std::uint8_t> input,

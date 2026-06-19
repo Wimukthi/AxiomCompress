@@ -72,24 +72,39 @@ feature is an additive header/record type, never a format break.
 
 ## Phase 2 — In-place archive editing
 
-- `add` / `update` (replace if newer) / `delete` / `sync` (mirror a directory).
-- Strategy: append new solid blocks + rewrite the directory; `delete` tombstones
-  entries, with `--repack` to recompact solid runs (RAR rebuilds affected runs —
-  same model, done lazily).
-- **Archive comment** and **lock/read-only** flag (service headers / `MAIN` flags).
-- **Quick-open**: redundant file-header copies near the end for instant listing of
-  huge archives without scanning.
+- ✅ `add` (and same-path *replace*) — existing blocks copied verbatim, new files
+  appended as new blocks, directory rebuilt; `axiomc a` on an existing archive.
+- ✅ `delete` (dir = subtree) and `repack` — rebuild keeping live entries,
+  re-solidifying their files so replaced/removed data is physically reclaimed.
+- ✅ `update`/`fresh` (mtime-based) and `sync` (mirror a directory: update + delete
+  the missing). CLI `u` / `f` / `s`.
+- Strategy: append new solid blocks + rewrite the directory; delete/repack rebuild
+  affected runs (RAR's model, done eagerly here). True zero-copy in-place append is
+  a later optimization — today every edit writes a fresh file via temp + rename.
+- ✅ **Archive comment** and **lock/read-only** flag — archive-level TLV records
+  (`comment`, `lock`); CLI `comment` / `lock`. Lock is one-way; edits refuse.
+- ✅ **Quick-open** — *N/A by design*: the format already keeps a self-locating
+  central directory at the end (footer → directory_offset), so `list`/`test` read it
+  directly without scanning blocks. RAR needs quick-open only because it lacks a
+  central directory.
 
-## Phase 3 — Encryption (libsodium)
+## Phase 3 — Encryption (Monocypher)
 
-- **Data:** AES-256 AEAD (GCM, or CTR + HMAC-SHA-256) per block.
-- **Header/filename encryption:** optionally encrypt the central directory behind
-  an `ENCRYPTION` header so names are not visible.
-- **Key derivation:** Argon2id with a per-archive random salt; constant-time
-  password checks; clear, versioned KDF parameters in the header.
-- Wire through the existing `OperationControl` and atomic-write paths.
-- *Verify:* known-answer tests against libsodium primitives; wrong-password and
-  tamper (AEAD failure) tests; ensure no plaintext leaks into temp files.
+Backend: **Monocypher** (vendored single-file, audited) instead of libsodium —
+chosen for clean two-compiler portability; provides XChaCha20-Poly1305 + Argon2id
+(and Ed25519 for Phase 5). Windows CSPRNG via `BCryptGenRandom`.
+
+- ✅ **Data:** per-block **XChaCha20-Poly1305** AEAD; the block index is the AD
+  (anti-reordering). Stored as `nonce ‖ tag ‖ ciphertext`.
+- ✅ **Key derivation:** **Argon2id** with a per-archive random salt; KDF params in
+  the `encryption` archive-extra record; a sealed key-check token rejects a wrong
+  password up front. Key wiped after use.
+- ✅ CLI `-p`/`--password`; wired through extract/test; edits on encrypted archives
+  refuse (for now). *Verified:* roundtrip, wrong-password, tamper (AEAD failure), and
+  no-plaintext-on-disk tests; archive parser fuzzed with the encryption record.
+- ⬜ **Header/filename encryption:** optionally encrypt the central directory so
+  names/sizes are hidden.
+- ⬜ **Editing encrypted archives** (add/update/delete/repack with the password).
 
 ## Phase 4 — Recovery records & multi-volume (ISA-L)
 
