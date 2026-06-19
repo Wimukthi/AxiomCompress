@@ -32,6 +32,12 @@ namespace fs = std::filesystem;
 constexpr std::array<std::uint8_t, 8> kArchiveMagic = {'A', 'X', 'I', 'O', 'M', 'A', 'R', '\0'};
 constexpr std::uint16_t kArchiveVersion = 4;
 constexpr std::size_t kHeaderSize = 16;
+// Header flag: the central directory is sealed and the encryption parameters live in
+// a plaintext preamble after the header (rather than in the directory's TLV). Old
+// readers reject this flag, so it doubles as the compatibility gate.
+constexpr std::uint16_t kFlagEncryptedDirectory = 0x0001;
+// AEAD associated data tag for a sealed directory (distinct from any block index).
+constexpr std::array<std::uint8_t, 8> kDirectoryAd = {'A', 'X', 'D', 'I', 'R', 0, 0, 0};
 constexpr std::size_t kFooterSize = 24;
 constexpr std::uint8_t kEntryFile = 0;
 constexpr std::uint8_t kEntryDir = 1;
@@ -258,6 +264,7 @@ struct EntryRec {
 // the key-check token is a sealed constant used to reject a wrong password up front.
 struct EncryptionInfo {
     bool enabled = false;
+    bool encrypt_directory = false;  // directory sealed + params in the header preamble
     core::KdfParams kdf;
     std::vector<std::uint8_t> key_check;
 };
@@ -453,12 +460,21 @@ private:
     std::uint64_t size_ = 0;
 };
 
-ArchiveIndex read_index(const ByteSource& source) {
+// Where an archive's fixed structure points: directory location, plus the header
+// flags and (if the directory is encrypted) the plaintext preamble's extent.
+struct ArchiveLayout {
+    std::uint16_t flags = 0;
+    std::uint64_t directory_offset = 0;
+    std::uint64_t directory_size = 0;
+    std::uint64_t preamble_offset = 0;  // start of the encryption preamble (if any)
+    std::uint64_t preamble_size = 0;    // length of the preamble's parameter bytes
+};
+
+ArchiveLayout read_layout(const ByteSource& source) {
     const auto file_size = source.size();
     if (file_size < kHeaderSize + kFooterSize) {
         throw FormatError("archive is smaller than its fixed structure");
     }
-
     const auto header = source.read(0, kHeaderSize);
     if (!std::equal(kArchiveMagic.begin(), kArchiveMagic.end(), header.begin())) {
         throw FormatError("not an Axiom archive");
@@ -467,7 +483,9 @@ ArchiveIndex read_index(const ByteSource& source) {
     if (header_reader.u16() != kArchiveVersion) {
         throw FormatError("unsupported archive version");
     }
-    if (header_reader.u16() != 0) {
+    ArchiveLayout layout;
+    layout.flags = header_reader.u16();
+    if ((layout.flags & ~kFlagEncryptedDirectory) != 0) {
         throw FormatError("archive uses features this build does not support");
     }
 
@@ -476,14 +494,47 @@ ArchiveIndex read_index(const ByteSource& source) {
         throw FormatError("invalid archive footer");
     }
     Reader footer_reader(footer);
-    const auto directory_offset = footer_reader.u64();
-    const auto directory_size = footer_reader.u64();
-    if (directory_offset < kHeaderSize ||
-        directory_offset + directory_size > file_size - kFooterSize) {
+    layout.directory_offset = footer_reader.u64();
+    layout.directory_size = footer_reader.u64();
+    if (layout.directory_offset < kHeaderSize ||
+        layout.directory_offset + layout.directory_size > file_size - kFooterSize) {
         throw FormatError("invalid directory location");
     }
+    if ((layout.flags & kFlagEncryptedDirectory) != 0) {
+        // The preamble is a fixed u32 length right after the header, then that many
+        // plaintext parameter bytes, before the (encrypted) block region.
+        const auto len_bytes = source.read(kHeaderSize, 4);
+        Reader len_reader(len_bytes);
+        layout.preamble_size = len_reader.u32();
+        layout.preamble_offset = kHeaderSize + 4;
+        if (layout.preamble_offset + layout.preamble_size > layout.directory_offset) {
+            throw FormatError("invalid encryption preamble");
+        }
+    }
+    return layout;
+}
 
-    const auto directory = source.read(directory_offset, directory_size);
+// Parse the plaintext encryption parameters carried in the header preamble.
+EncryptionInfo parse_encryption_preamble(const ByteVector& bytes) {
+    EncryptionInfo enc;
+    enc.enabled = true;
+    enc.encrypt_directory = true;
+    Reader r(bytes);
+    enc.kdf.algorithm = static_cast<std::uint32_t>(r.vint());
+    enc.kdf.mem_blocks = static_cast<std::uint32_t>(r.vint());
+    enc.kdf.passes = static_cast<std::uint32_t>(r.vint());
+    enc.kdf.lanes = static_cast<std::uint32_t>(r.vint());
+    const auto salt_len = static_cast<std::size_t>(r.vint());
+    const auto salt = r.take(salt_len);
+    std::copy_n(salt.begin(), std::min(salt_len, enc.kdf.salt.size()), enc.kdf.salt.begin());
+    const auto check_len = static_cast<std::size_t>(r.vint());
+    const auto check = r.take(check_len);
+    enc.key_check.assign(check.begin(), check.end());
+    return enc;
+}
+
+// Parse a (decrypted) directory image into the block table, entries, and metadata.
+ArchiveIndex parse_directory(const ByteVector& directory, std::uint64_t directory_offset) {
     Reader reader(directory);
 
     ArchiveIndex index;
@@ -588,6 +639,17 @@ ArchiveIndex read_index(const ByteSource& source) {
     }
 
     return index;
+}
+
+// Read the directory of a non-directory-encrypted archive (plaintext directory).
+// A directory-encrypted archive needs the password — callers use load_index instead.
+ArchiveIndex read_index(const ByteSource& source) {
+    const auto layout = read_layout(source);
+    if ((layout.flags & kFlagEncryptedDirectory) != 0) {
+        throw std::runtime_error("archive directory is encrypted; a password is required");
+    }
+    const auto directory = source.read(layout.directory_offset, layout.directory_size);
+    return parse_directory(directory, layout.directory_offset);
 }
 
 // Decodes solid blocks on demand, caching the most recently used one so the many
@@ -867,6 +929,25 @@ std::pair<EncryptionInfo, core::CryptoKey> make_encryption(const std::string& pa
     return {std::move(enc), key};
 }
 
+// Serialize the plaintext encryption preamble (a fixed u32 length then the Argon2
+// parameters, salt, and key-check) that precedes the blocks of a sealed-directory
+// archive.
+ByteVector serialize_encryption_preamble(const EncryptionInfo& enc) {
+    ByteVector params;
+    put_vint(params, enc.kdf.algorithm);
+    put_vint(params, enc.kdf.mem_blocks);
+    put_vint(params, enc.kdf.passes);
+    put_vint(params, enc.kdf.lanes);
+    put_vint(params, enc.kdf.salt.size());
+    params.insert(params.end(), enc.kdf.salt.begin(), enc.kdf.salt.end());
+    put_vint(params, enc.key_check.size());
+    params.insert(params.end(), enc.key_check.begin(), enc.key_check.end());
+    ByteVector out;
+    put_u32(out, static_cast<std::uint32_t>(params.size()));
+    out.insert(out.end(), params.begin(), params.end());
+    return out;
+}
+
 // Re-derive an encrypted archive's key from the password and verify it against the
 // stored key-check token. Throws on a missing or wrong password before any block is
 // touched, so failures are fast and unambiguous.
@@ -896,12 +977,56 @@ core::CryptoKey derive_archive_key(const EncryptionInfo& enc, const std::string&
     return key;
 }
 
+// An archive's directory plus, when encrypted, the derived key (for reading blocks).
+struct LoadedArchive {
+    ArchiveIndex index;
+    std::optional<core::CryptoKey> key;
+};
+
+// Read an archive's directory, transparently handling encryption. For a
+// directory-encrypted archive the preamble carries the parameters, the directory is
+// decrypted before parsing, and a password is mandatory; for a block-only encrypted
+// archive the directory is plaintext and the password is used only for the blocks.
+LoadedArchive load_index(const ByteSource& source, const std::string& password) {
+    const auto layout = read_layout(source);
+    LoadedArchive loaded;
+    if ((layout.flags & kFlagEncryptedDirectory) != 0) {
+        const auto preamble = source.read(layout.preamble_offset, layout.preamble_size);
+        const EncryptionInfo enc = parse_encryption_preamble(preamble);
+        core::CryptoKey key = derive_archive_key(enc, password);
+        const auto sealed = source.read(layout.directory_offset, layout.directory_size);
+        ByteVector plain;
+        const std::span<const std::uint8_t> ad(kDirectoryAd.data(), kDirectoryAd.size());
+        if (!core::aead_open(key, sealed, ad, plain)) {
+            core::secure_wipe(key);
+            throw std::runtime_error(
+                "archive directory failed to decrypt (wrong password or corrupt)");
+        }
+        loaded.index = parse_directory(plain, layout.directory_offset);
+        loaded.index.meta.encryption = enc;
+        loaded.key = key;
+    } else {
+        const auto directory = source.read(layout.directory_offset, layout.directory_size);
+        loaded.index = parse_directory(directory, layout.directory_offset);
+        // Block-only encryption keeps the directory plaintext, so list/comment work
+        // without a password; the key is derived only when one is supplied (to read
+        // blocks). Callers that need block data check for the key and demand it.
+        if (loaded.index.meta.encryption.enabled && !password.empty()) {
+            loaded.key = derive_archive_key(loaded.index.meta.encryption, password);
+        }
+    }
+    return loaded;
+}
+
 // Serialize the central directory and footer for the given blocks/entries to `out`
-// (already positioned at `written`) and close the stream.
+// (already positioned at `written`) and close the stream. When `dir_key` is given the
+// directory is sealed before writing (its parameters live in the header preamble, not
+// in the directory's own TLV).
 void write_directory_and_footer(std::ofstream& out, std::uint64_t written,
                                 const std::vector<BlockRec>& blocks,
                                 const std::vector<EntryRec>& entries,
-                                const ArchiveMeta& meta) {
+                                const ArchiveMeta& meta,
+                                const core::CryptoKey* dir_key = nullptr) {
     ByteVector directory;
     put_vint(directory, blocks.size());
     for (const auto& block : blocks) {
@@ -980,7 +1105,9 @@ void write_directory_and_footer(std::ofstream& out, std::uint64_t written,
         put_vint(archive_extras, 0);  // presence is the signal; no payload
         ++archive_extra_count;
     }
-    if (meta.encryption.enabled) {
+    // Block-only encryption records its parameters here; for a sealed directory the
+    // parameters are in the plaintext preamble instead (dir_key != nullptr).
+    if (meta.encryption.enabled && dir_key == nullptr) {
         const auto& enc = meta.encryption;
         ByteVector payload;
         put_vint(payload, enc.kdf.algorithm);
@@ -998,6 +1125,11 @@ void write_directory_and_footer(std::ofstream& out, std::uint64_t written,
     }
     put_vint(directory, archive_extra_count);
     directory.insert(directory.end(), archive_extras.begin(), archive_extras.end());
+
+    if (dir_key != nullptr) {
+        const std::span<const std::uint8_t> ad(kDirectoryAd.data(), kDirectoryAd.size());
+        directory = core::aead_seal(*dir_key, directory, ad);
+    }
 
     const std::uint64_t directory_offset = written;
     out.write(reinterpret_cast<const char*>(directory.data()),
@@ -1302,24 +1434,33 @@ void create_archive(const std::vector<std::filesystem::path>& inputs,
         throw std::runtime_error("cannot create archive: " + temp_path.string());
     }
 
+    // Encryption (optional). Derive the key + key-check first so we can flag the
+    // header and, for a sealed directory, emit the plaintext parameter preamble.
+    ArchiveMeta meta;
+    core::CryptoKey key{};
+    const core::CryptoKey* key_ptr = nullptr;
+    const bool encrypt_dir = !options.password.empty() && options.encrypt_header;
+    if (!options.password.empty()) {
+        auto [enc, derived] = make_encryption(options.password);
+        enc.encrypt_directory = encrypt_dir;
+        meta.encryption = std::move(enc);
+        key = derived;
+        key_ptr = &key;
+    }
+
     ByteVector header;
     header.insert(header.end(), kArchiveMagic.begin(), kArchiveMagic.end());
     put_u16(header, kArchiveVersion);
-    put_u16(header, 0);  // flags
+    put_u16(header, encrypt_dir ? kFlagEncryptedDirectory : static_cast<std::uint16_t>(0));
     put_u32(header, 0);  // reserved
     out.write(reinterpret_cast<const char*>(header.data()), static_cast<std::streamsize>(header.size()));
     std::uint64_t written = header.size();
 
-    // Encryption (optional): derive a key from the password and record the salt +
-    // key-check token so the archive can be decrypted later. The key seals each block.
-    ArchiveMeta meta;
-    core::CryptoKey key{};
-    const core::CryptoKey* key_ptr = nullptr;
-    if (!options.password.empty()) {
-        auto [enc, derived] = make_encryption(options.password);
-        meta.encryption = std::move(enc);
-        key = derived;
-        key_ptr = &key;
+    if (encrypt_dir) {
+        const auto preamble = serialize_encryption_preamble(meta.encryption);
+        out.write(reinterpret_cast<const char*>(preamble.data()),
+                  static_cast<std::streamsize>(preamble.size()));
+        written += preamble.size();
     }
 
     std::vector<BlockRec> blocks;
@@ -1329,7 +1470,8 @@ void create_archive(const std::vector<std::filesystem::path>& inputs,
 
     report_operation(operation, OperationStage::finalizing, completed_bytes, total_bytes,
                      completed_items, total_items);
-    write_directory_and_footer(out, written, blocks, entries, meta);
+    write_directory_and_footer(out, written, blocks, entries, meta,
+                               encrypt_dir ? key_ptr : nullptr);
     core::secure_wipe(key);
 
     std::error_code ec;
@@ -1524,32 +1666,41 @@ void lock_archive(const std::filesystem::path& archive_path, const CompressionOp
     append_items_to_archive(archive_path, {}, options, &meta);
 }
 
-std::string archive_comment(const std::filesystem::path& archive_path) {
+std::string archive_comment(const std::filesystem::path& archive_path,
+                            const std::string& password) {
     std::uint64_t file_size = 0;
     auto in = open_archive(archive_path, file_size);
     const ByteSource source(in, file_size);
-    return read_index(source).meta.comment;
+    return load_index(source, password).index.meta.comment;
 }
 
-bool archive_is_locked(const std::filesystem::path& archive_path) {
+bool archive_is_locked(const std::filesystem::path& archive_path, const std::string& password) {
     std::uint64_t file_size = 0;
     auto in = open_archive(archive_path, file_size);
     const ByteSource source(in, file_size);
-    return read_index(source).meta.locked;
+    return load_index(source, password).index.meta.locked;
 }
 
 bool archive_is_encrypted(const std::filesystem::path& archive_path) {
     std::uint64_t file_size = 0;
     auto in = open_archive(archive_path, file_size);
     const ByteSource source(in, file_size);
+    // The header flag identifies a sealed-directory archive without a password; a
+    // block-only encrypted archive is identified from its (plaintext) directory.
+    const auto layout = read_layout(source);
+    if ((layout.flags & kFlagEncryptedDirectory) != 0) {
+        return true;
+    }
     return read_index(source).meta.encryption.enabled;
 }
 
-std::vector<ArchiveEntry> list_archive(const std::filesystem::path& archive_path) {
+std::vector<ArchiveEntry> list_archive(const std::filesystem::path& archive_path,
+                                       const std::string& password) {
     std::uint64_t file_size = 0;
     auto stream = open_archive(archive_path, file_size);
     const ByteSource source(stream, file_size);
-    const auto index = read_index(source);
+    const auto loaded = load_index(source, password);
+    const auto& index = loaded.index;
 
     std::vector<ArchiveEntry> result;
     result.reserve(index.entries.size());
@@ -1576,12 +1727,12 @@ void test_archive(const std::filesystem::path& archive_path,
     std::uint64_t file_size = 0;
     auto stream = open_archive(archive_path, file_size);
     const ByteSource bytes(stream, file_size);
-    const auto index = read_index(bytes);
-    std::optional<core::CryptoKey> key;
-    if (index.meta.encryption.enabled) {
-        key = derive_archive_key(index.meta.encryption, options.password);
+    auto loaded = load_index(bytes, options.password);
+    const auto& index = loaded.index;
+    if (index.meta.encryption.enabled && !loaded.key) {
+        throw std::runtime_error("archive is encrypted; a password is required");
     }
-    BlockSource source(bytes, index, options.thread_count, operation, key);
+    BlockSource source(bytes, index, options.thread_count, operation, loaded.key);
 
     const auto total_bytes = archive_file_bytes(index);
     const auto total_items = static_cast<std::uint64_t>(index.entries.size());
@@ -1630,12 +1781,12 @@ void extract_archive(const std::filesystem::path& archive_path,
     std::uint64_t file_size = 0;
     auto stream = open_archive(archive_path, file_size);
     const ByteSource bytes(stream, file_size);
-    const auto index = read_index(bytes);
-    std::optional<core::CryptoKey> key;
-    if (index.meta.encryption.enabled) {
-        key = derive_archive_key(index.meta.encryption, options.password);
+    auto loaded = load_index(bytes, options.password);
+    const auto& index = loaded.index;
+    if (index.meta.encryption.enabled && !loaded.key) {
+        throw std::runtime_error("archive is encrypted; a password is required");
     }
-    BlockSource source(bytes, index, options.thread_count, operation, key);
+    BlockSource source(bytes, index, options.thread_count, operation, loaded.key);
 
     const auto total_bytes = archive_file_bytes(index);
     const auto total_items = static_cast<std::uint64_t>(index.entries.size());

@@ -771,6 +771,65 @@ void test_archive_encryption() {
     fs::remove_all(root, ec);
 }
 
+// Directory encryption (--encrypt-names): the whole central directory is sealed, so
+// names/sizes are hidden and even listing needs the password.
+void test_archive_encrypted_directory() {
+    const auto root = make_temp_dir();
+    const auto src = root / "src";
+    fs::create_directories(src);
+    const auto secret = bytes_from_string("hidden payload " + std::string(2000, 'H'));
+    write_all(src / "secret_name.txt", secret);
+
+    axiom::CompressionOptions opt;
+    opt.block_size = 1024;
+    opt.password = "directory pass word";
+    opt.encrypt_header = true;
+    const auto archive = root / "hp.axar";
+    axiom::create_archive({src}, archive, opt);
+
+    AXIOM_CHECK(axiom::archive_is_encrypted(archive));  // detectable without a password
+
+    // Listing is refused without (or with a wrong) password — the directory is sealed.
+    expect_throws([&] { (void)axiom::list_archive(archive); });
+    expect_throws([&] { (void)axiom::list_archive(archive, "wrong"); });
+
+    {
+        const auto entries = axiom::list_archive(archive, opt.password);
+        bool found = false;
+        for (const auto& e : entries) {
+            found = found || e.path == "src/secret_name.txt";
+        }
+        AXIOM_CHECK(found);
+    }
+
+    // The file name must not appear in plaintext anywhere in the archive.
+    {
+        const auto raw = read_all(archive);
+        const std::string marker = "secret_name.txt";
+        const auto* needle = reinterpret_cast<const std::uint8_t*>(marker.data());
+        AXIOM_CHECK(std::search(raw.begin(), raw.end(), needle, needle + marker.size()) == raw.end());
+    }
+
+    // Test + extract need the password and reproduce the bytes; wrong password fails.
+    {
+        axiom::DecompressionOptions d;
+        d.password = opt.password;
+        axiom::test_archive(archive, d);
+        axiom::ExtractOptions x;
+        x.password = opt.password;
+        const auto dest = root / "out";
+        axiom::extract_archive(archive, dest, x);
+        AXIOM_CHECK(read_all(dest / "src" / "secret_name.txt") == secret);
+
+        axiom::DecompressionOptions bad;
+        bad.password = "nope";
+        expect_throws([&] { axiom::test_archive(archive, bad); });
+    }
+
+    std::error_code ec;
+    fs::remove_all(root, ec);
+}
+
 void test_archive_operation_control() {
     const auto root = make_temp_dir();
     const auto src = root / "src";
@@ -1250,6 +1309,7 @@ int main() {
     test_archive_update_sync();
     test_archive_comment_lock();
     test_archive_encryption();
+    test_archive_encrypted_directory();
     test_archive_operation_control();
 #if defined(_WIN32)
     test_windows_metadata();

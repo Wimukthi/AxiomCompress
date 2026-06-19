@@ -150,6 +150,10 @@ struct CompressionOptions {
     // XChaCha20-Poly1305. Applies to the archive container, not single-stream
     // compress(). Empty = no encryption.
     std::string password;
+    // With a password, also encrypt the central directory so file names, sizes, and
+    // hashes are hidden (reading then requires the password even to list). Ignored
+    // when password is empty.
+    bool encrypt_header = false;
 };
 
 class FormatError final : public std::runtime_error {

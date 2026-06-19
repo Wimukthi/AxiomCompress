@@ -88,22 +88,29 @@ void sync_archive(const std::vector<std::filesystem::path>& inputs,
 void set_archive_comment(const std::filesystem::path& archive_path, const std::string& comment,
                          const CompressionOptions& options = {});
 
-// Read the archive's comment ("" if none).
-std::string archive_comment(const std::filesystem::path& archive_path);
+// Read the archive's comment ("" if none). A password is required only for an archive
+// with an encrypted directory.
+std::string archive_comment(const std::filesystem::path& archive_path,
+                            const std::string& password = {});
 
 // Mark the archive read-only. Once locked, every edit operation (add/update/sync/
 // delete/repack/comment/lock) refuses with an error. There is no unlock.
 void lock_archive(const std::filesystem::path& archive_path,
                   const CompressionOptions& options = {});
 
-// Whether the archive is locked (read-only).
-bool archive_is_locked(const std::filesystem::path& archive_path);
+// Whether the archive is locked (read-only). A password is required only for an
+// archive with an encrypted directory.
+bool archive_is_locked(const std::filesystem::path& archive_path,
+                       const std::string& password = {});
 
-// Whether the archive's blocks are password-encrypted (reading needs a password).
+// Whether the archive is password-encrypted (block contents, and possibly the
+// directory). Never needs a password itself.
 bool archive_is_encrypted(const std::filesystem::path& archive_path);
 
-// Read the central directory without decompressing any block.
-std::vector<ArchiveEntry> list_archive(const std::filesystem::path& archive_path);
+// Read the central directory without decompressing any block. A password is required
+// only when the directory itself is encrypted (otherwise names are listable freely).
+std::vector<ArchiveEntry> list_archive(const std::filesystem::path& archive_path,
+                                       const std::string& password = {});
 
 // Verify structure, per-block checksums, and per-file CRCs. Throws FormatError
 // describing the first problem found; returns normally if the archive is intact.

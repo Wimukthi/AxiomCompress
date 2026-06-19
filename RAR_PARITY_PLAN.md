@@ -104,8 +104,13 @@ chosen for clean two-compiler portability; provides XChaCha20-Poly1305 + Argon2i
   no-plaintext-on-disk tests; archive parser fuzzed with the encryption record.
 - ✅ **Editing encrypted archives** — add/update/sync seal new blocks under the same
   key; delete/repack decrypt + re-seal; wrong password rejected before writing.
-- ⬜ **Header/filename encryption:** optionally encrypt the central directory so
-  names/sizes are hidden (RAR `-hp`).
+- ✅ **Header/filename encryption** (`--encrypt-names`, RAR `-hp`) — the central
+  directory is sealed (names/sizes/hashes hidden); KDF params move to a plaintext
+  header preamble; listing requires the password. (Editing a directory-encrypted
+  archive is still refused — a small follow-up.)
+
+Phase 3 is functionally complete; the only open item is editing directory-encrypted
+archives.
 
 ## Phase 4 — Recovery records & multi-volume (ISA-L)
 
