@@ -32,6 +32,8 @@ constexpr wchar_t kAutoUpdateSetting[] = L"CheckForUpdates";
 constexpr wchar_t kLastUpdateCheckSetting[] = L"LastUpdateCheckUtc";
 constexpr DWORD kUpdateCheckIntervalSeconds = 24u * 60u * 60u;
 constexpr wchar_t kVersionFallback[] = L"0.1.0.0";
+constexpr wchar_t kDefaultUpdateUrl[] =
+    L"https://api.github.com/repos/Wimukthi/AxiomCompress/releases/latest";
 constexpr std::size_t kMaximumDownloadBytes = 512u * 1024u * 1024u;
 
 class WinHttpHandle {
@@ -152,16 +154,18 @@ std::wstring trim(std::wstring value) {
 std::wstring update_feed_url() {
     if (auto configured = read_setting_string(kUpdateUrlSetting)) {
         std::wstring url = trim(*configured);
-        const DWORD channel = read_setting_dword(kUpdateChannelSetting).value_or(0);
-        const std::wstring channel_name = channel == 1 ? L"preview" : L"stable";
-        constexpr std::wstring_view token = L"{channel}";
-        for (std::size_t pos = url.find(token); pos != std::wstring::npos;
-             pos = url.find(token, pos + channel_name.size())) {
-            url.replace(pos, token.size(), channel_name);
+        if (!url.empty()) {
+            const DWORD channel = read_setting_dword(kUpdateChannelSetting).value_or(0);
+            const std::wstring channel_name = channel == 1 ? L"preview" : L"stable";
+            constexpr std::wstring_view token = L"{channel}";
+            for (std::size_t pos = url.find(token); pos != std::wstring::npos;
+                 pos = url.find(token, pos + channel_name.size())) {
+                url.replace(pos, token.size(), channel_name);
+            }
+            return url;
         }
-        return url;
     }
-    return {};
+    return kDefaultUpdateUrl;
 }
 
 std::wstring module_path(HINSTANCE instance) {
@@ -349,8 +353,7 @@ std::optional<URL_COMPONENTS> crack_https_url(std::wstring_view url,
                                                std::wstring& path,
                                                std::wstring& error) {
     if (url.empty()) {
-        error = L"The update feed URL is not configured yet. Set the UpdateUrl value under "
-                L"HKCU\\Software\\AxiomCompress\\GUI when the release feed is available.";
+        error = L"The update feed URL is empty.";
         return std::nullopt;
     }
     if (url.size() > std::numeric_limits<DWORD>::max()) {

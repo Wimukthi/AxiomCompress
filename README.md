@@ -41,6 +41,11 @@ Or use the helper script:
 .\tools\test_msvc.ps1 -Configuration Release
 ```
 
+`AxiomGui.vcxproj` uses the same source-backed versioning model as NativePad:
+every normal Visual Studio GUI build increments the fourth component in
+`src\gui\axiom_gui.rc`. For diagnostic builds that must not change source, pass
+`/p:AutoIncrementVersion=false`. See [docs\VERSIONING.md](docs/VERSIONING.md).
+
 The solution contains:
 
 - `AxiomLib`: static library for the compression engine.
@@ -62,6 +67,20 @@ If Ninja is not installed but Visual Studio 2022 is available:
 cmake --preset vs2022
 cmake --build --preset vs2022 --config Release
 ```
+
+## Packaging
+
+Axiom uses Inno Setup 6 for release installers, matching NativePad's packaging
+flow:
+
+```powershell
+.\installer\build-installer.ps1
+```
+
+The script builds Release x64, runs the Release round-trip test, reads the app
+version from `src\gui\axiom_gui.rc`, and writes
+`installer\output\AxiomSetup-<version>-win-x64.exe`. See
+[docs\INSTALLER.md](docs/INSTALLER.md).
 
 ## CLI
 

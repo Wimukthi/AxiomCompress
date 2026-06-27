@@ -45,6 +45,9 @@
     <OutDir>$(SolutionDir)out\$(Configuration)\</OutDir>
     <IntDir>$(SolutionDir)build\msvc\$(ProjectName)\$(Configuration)\</IntDir>
     <TargetName>Axiom</TargetName>
+    <AutoIncrementVersion Condition="'$(AutoIncrementVersion)' == ''">true</AutoIncrementVersion>
+    <!-- Version increments are source-backed, so Visual Studio must invoke MSBuild even when outputs look current. -->
+    <DisableFastUpToDateCheck>true</DisableFastUpToDateCheck>
   </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <ClCompile>
@@ -122,10 +125,20 @@
     <ResourceCompile Include="src\gui\axiom_gui.rc" />
   </ItemGroup>
   <ItemGroup>
+    <Image Include="Icons\axiom.ico" />
+    <Image Include="Icons\axiom.png" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="tools\Update-AxiomVersion.ps1" />
+  </ItemGroup>
+  <ItemGroup>
     <ProjectReference Include="AxiomLib.vcxproj">
       <Project>{A16F0B4E-82B2-43BB-A779-0E9563F8EC11}</Project>
     </ProjectReference>
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <Target Name="IncrementAxiomVersion" BeforeTargets="PrepareForBuild" Condition="'$(AutoIncrementVersion)' == 'true' and '$(DesignTimeBuild)' != 'true'">
+    <Exec Command="powershell.exe -NoProfile -ExecutionPolicy Bypass -File &quot;$(MSBuildProjectDirectory)\tools\Update-AxiomVersion.ps1&quot; -ResourceFile &quot;$(MSBuildProjectDirectory)\src\gui\axiom_gui.rc&quot; -IncrementBuild" />
+  </Target>
   <ImportGroup Label="ExtensionTargets" />
 </Project>

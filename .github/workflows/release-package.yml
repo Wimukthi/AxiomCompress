@@ -1,0 +1,80 @@
+name: Release Package
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Expected app version after the build auto-increments src/gui/axiom_gui.rc
+        required: true
+
+jobs:
+  package:
+    name: Package win-x64
+    runs-on: windows-2025-vs2026
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Add MSBuild to PATH
+        uses: microsoft/setup-msbuild@v3
+
+      - name: Build Release
+        run: msbuild AxiomCompress.sln /p:Configuration=Release /p:Platform=x64 /m
+
+      - name: Test Release
+        run: .\out\Release\axiom_roundtrip.exe
+
+      - name: Resolve Package Version
+        id: package-version
+        shell: pwsh
+        run: |
+          $version = .\tools\Update-AxiomVersion.ps1 -PrintVersion
+          $expected = "${{ inputs.version }}"
+          if ($version -ne $expected) {
+            throw "Build produced version $version, but workflow input expected $expected."
+          }
+          "PACKAGE_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Create ZIP
+        shell: pwsh
+        run: |
+          $version = $env:PACKAGE_VERSION
+          $stage = Join-Path $env:RUNNER_TEMP "Axiom-$version-win-x64"
+          $zip = "Axiom-$version-win-x64.zip"
+
+          New-Item -ItemType Directory -Path $stage -Force | Out-Null
+
+          Copy-Item -LiteralPath ".\out\Release\Axiom.exe" -Destination $stage
+          Copy-Item -LiteralPath ".\out\Release\axiomc.exe" -Destination $stage
+          Copy-Item -LiteralPath ".\README.md" -Destination $stage
+          Copy-Item -LiteralPath ".\CLI_GUIDE.md" -Destination $stage
+          Copy-Item -LiteralPath ".\ARCHITECTURE.md" -Destination $stage
+          Copy-Item -LiteralPath ".\FORMAT.md" -Destination $stage
+          Copy-Item -LiteralPath ".\LICENSE" -Destination $stage
+          Copy-Item -LiteralPath ".\docs" -Destination (Join-Path $stage "docs") -Recurse
+
+          Compress-Archive -Path (Join-Path $stage "*") -DestinationPath $zip -Force
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup --yes --no-progress
+
+      - name: Create Installer
+        shell: pwsh
+        run: .\installer\build-installer.ps1 -Version "$env:PACKAGE_VERSION" -SkipBuild -SkipTests
+
+      - name: Upload ZIP
+        uses: actions/upload-artifact@v7
+        with:
+          name: Axiom-${{ steps.package-version.outputs.version }}-win-x64
+          path: Axiom-${{ steps.package-version.outputs.version }}-win-x64.zip
+          if-no-files-found: error
+
+      - name: Upload Installer
+        uses: actions/upload-artifact@v7
+        with:
+          name: Axiom-${{ steps.package-version.outputs.version }}-installer-win-x64
+          path: installer\output\AxiomSetup-${{ steps.package-version.outputs.version }}-win-x64.exe
+          if-no-files-found: error

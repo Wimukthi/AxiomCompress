@@ -23,3 +23,7 @@ __pycache__/
 bench/corpus/
 bench/work/
 bench/*.log
+
+# Release packaging output
+installer/output/
+*.zip
