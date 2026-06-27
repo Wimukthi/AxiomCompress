@@ -69,18 +69,21 @@ struct ArchiveCapabilities {
     bool authenticity = false;
     bool locked = false;
     bool encrypted = false;
+    bool directory_encrypted = false;
 };
 
 class ArchiveCatalog {
 public:
-    static std::shared_ptr<const ArchiveCatalog> load(const std::filesystem::path& path);
+    static std::shared_ptr<const ArchiveCatalog> load(const std::filesystem::path& path,
+                                                      const std::string& password = {});
 
     const std::filesystem::path& path() const;
     const ArchiveCapabilities& capabilities() const;
     BrowserSnapshot list(const BrowserLocation& location, std::stop_token stop) const;
 
 private:
-    ArchiveCatalog(std::filesystem::path path, std::vector<ArchiveEntry> entries);
+    ArchiveCatalog(std::filesystem::path path, std::vector<ArchiveEntry> entries,
+                   const std::string& password);
 
     std::filesystem::path path_;
     std::vector<ArchiveEntry> entries_;
@@ -96,7 +99,8 @@ BrowserLoadResult load_browser_location(
     const BrowserLocation& location,
     std::uint64_t generation,
     std::shared_ptr<const ArchiveCatalog> archive_catalog,
-    std::stop_token stop);
+    std::stop_token stop,
+    const std::string& archive_password = {});
 
 class NavigationHistory {
 public:

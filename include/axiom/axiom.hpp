@@ -154,6 +154,10 @@ struct CompressionOptions {
     // hashes are hidden (reading then requires the password even to list). Ignored
     // when password is empty.
     bool encrypt_header = false;
+    // Optional archive recovery redundancy, as a percentage of protected archive
+    // bytes. Zero disables the recovery service record; valid enabled values are
+    // 1..100. Applies only to the multi-file archive container.
+    unsigned recovery_percent = 0;
 };
 
 class FormatError final : public std::runtime_error {

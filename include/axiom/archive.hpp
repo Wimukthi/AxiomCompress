@@ -71,6 +71,14 @@ struct ArchiveSignatureInfo {
     std::array<std::uint8_t, 32> public_key{};
 };
 
+struct ArchiveRecoveryInfo {
+    bool present = false;
+    unsigned percent = 0;
+    std::uint32_t data_shards = 0;
+    std::uint32_t parity_shards = 0;
+    std::uint64_t protected_size = 0;
+};
+
 ArchiveSigningKey generate_archive_signing_key();
 void sign_archive(const std::filesystem::path& archive_path,
                   const ArchiveSigningKey& key,
@@ -79,6 +87,35 @@ ArchiveSignatureInfo verify_archive_signature(
     const std::filesystem::path& archive_path,
     const std::string& password = {},
     const std::optional<std::array<std::uint8_t, 32>>& trusted_key = std::nullopt);
+
+// Inspect, add/replace, or remove (percent=0) the archive's Reed-Solomon recovery
+// service. Repair writes atomically in place and returns false when no recovery
+// service exists; malformed data beyond the available redundancy throws.
+ArchiveRecoveryInfo archive_recovery_info(const std::filesystem::path& archive_path);
+void set_archive_recovery(const std::filesystem::path& archive_path, unsigned percent,
+                          const std::shared_ptr<OperationControl>& operation = nullptr);
+bool repair_archive(const std::filesystem::path& archive_path,
+                    const std::shared_ptr<OperationControl>& operation = nullptr);
+
+struct ArchiveVolumeSetInfo {
+    std::uint32_t data_volumes = 0;
+    std::uint32_t recovery_volumes = 0;
+    std::uint64_t volume_size = 0;
+    std::uint64_t archive_size = 0;
+};
+
+// Split a completed archive into numbered `name.part001.axar` volumes and optional
+// `name.rev001` Reed-Solomon recovery volumes. The source archive is preserved.
+// Joining accepts any surviving data/recovery volume and reconstructs missing or
+// corrupt data volumes when enough recovery volumes remain.
+ArchiveVolumeSetInfo create_archive_volumes(
+    const std::filesystem::path& archive_path, std::uint64_t volume_size,
+    unsigned recovery_volume_count = 0,
+    const std::shared_ptr<OperationControl>& operation = nullptr);
+ArchiveVolumeSetInfo archive_volume_set_info(const std::filesystem::path& any_volume);
+void join_archive_volumes(const std::filesystem::path& any_volume,
+                          const std::filesystem::path& output_archive,
+                          const std::shared_ptr<OperationControl>& operation = nullptr);
 
 // Create a Windows self-extracting executable by appending an intact archive and
 // an Axiom SFX trailer to a native Axiom GUI stub.

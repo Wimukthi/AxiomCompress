@@ -91,6 +91,7 @@
     <ClCompile Include="src\gui\browser_model.cpp" />
     <ClCompile Include="src\gui\operation_runner.cpp" />
     <ClCompile Include="src\gui\operation_progress_window.cpp" />
+    <ClCompile Include="src\gui\sfx_dialog.cpp" />
     <ClCompile Include="src\gui\dialog_support.cpp" />
     <ClCompile Include="src\gui\message_dialog.cpp" />
     <ClCompile Include="src\gui\about_dialog.cpp" />
@@ -110,6 +111,7 @@
     <ClInclude Include="src\gui\settings_store.hpp" />
     <ClInclude Include="src\gui\operation_runner.hpp" />
     <ClInclude Include="src\gui\operation_progress_window.hpp" />
+    <ClInclude Include="src\gui\sfx_dialog.hpp" />
     <ClInclude Include="src\gui\dialog_support.hpp" />
     <ClInclude Include="src\gui\message_dialog.hpp" />
     <ClInclude Include="src\gui\about_dialog.hpp" />

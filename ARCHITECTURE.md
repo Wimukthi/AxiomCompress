@@ -61,9 +61,12 @@ to the native GUI stub, and POSIX mode/uid/gid uses a skippable entry TLV. The W
 file list implements `IDataObject`, `IDropSource`, and `IDropTarget`; drag-out only
 materializes selected entries when a shell target requests `CF_HDROP`.
 
-Reed–Solomon erasure coding is present as a tested portable core, but no recovery
-record is written to `.axar` yet. Recovery records and multi-volume orchestration
-remain Phase 4 container work.
+Phase-4 services use the tested portable Reed–Solomon core. An optional
+self-locating recovery service protects the archive through the end of its central
+directory and can atomically repair damaged shards. Multi-volume orchestration
+wraps the exact completed archive bytes in checked `partNNN.axar` data shards and
+optional `.revNNN` parity shards; joining validates the complete archive with
+BLAKE3 before installing it. Both long operations honor `OperationControl`.
 
 ## Single-stream container
 
@@ -152,8 +155,7 @@ benchmark runs.
 The standing corpus is **enwik8** (100 MB of English Wikipedia text), the de-facto
 LZMA-class ratio benchmark. `tools\bench_enwik8.ps1` downloads it on first run,
 sweeps the match finders and window sizes, prints a 7-Zip reference, and verifies
-every row by round-trip before reporting a ratio. Current numbers and analysis
-live in [ROADMAP.md](ROADMAP.md#benchmark-snapshot-enwik8-100-mb-vs-7-zip-lzma2).
+every row by round-trip before reporting a ratio.
 
 For ad-hoc inputs, the Python harness (`bench/bench_7zip.py`) can compare files
 directly; for folders it builds a deterministic byte stream of relative paths and

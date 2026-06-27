@@ -244,22 +244,29 @@ bool BrowserItem::is_container() const {
 
 bool BrowserItem::is_parent() const { return kind == BrowserItemKind::parent; }
 
-ArchiveCatalog::ArchiveCatalog(fs::path path, std::vector<ArchiveEntry> entries)
+ArchiveCatalog::ArchiveCatalog(fs::path path, std::vector<ArchiveEntry> entries,
+                               const std::string& password)
     : path_(std::move(path)), entries_(std::move(entries)) {
     capabilities_.selective_extract = true;
     capabilities_.update = true;
     capabilities_.encryption = true;
+    capabilities_.recovery_records = true;
+    capabilities_.multi_volume = true;
     capabilities_.comments = true;
     capabilities_.lock = true;
     capabilities_.metadata = true;
     capabilities_.links = true;
     capabilities_.authenticity = true;
-    capabilities_.locked = archive_is_locked(path_);
+    capabilities_.locked = archive_is_locked(path_, password);
     capabilities_.encrypted = archive_is_encrypted(path_);
+    capabilities_.directory_encrypted =
+        archive_encryption_mode(path_) == ArchiveEncryptionMode::data_and_directory;
 }
 
-std::shared_ptr<const ArchiveCatalog> ArchiveCatalog::load(const fs::path& path) {
-    return std::shared_ptr<const ArchiveCatalog>(new ArchiveCatalog(path, list_archive(path)));
+std::shared_ptr<const ArchiveCatalog> ArchiveCatalog::load(const fs::path& path,
+                                                           const std::string& password) {
+    return std::shared_ptr<const ArchiveCatalog>(
+        new ArchiveCatalog(path, list_archive(path, password), password));
 }
 
 const fs::path& ArchiveCatalog::path() const { return path_; }
@@ -314,7 +321,8 @@ BrowserLoadResult load_browser_location(
     const BrowserLocation& location,
     std::uint64_t generation,
     std::shared_ptr<const ArchiveCatalog> archive_catalog,
-    std::stop_token stop) {
+    std::stop_token stop,
+    const std::string& archive_password) {
     BrowserLoadResult result;
     try {
         if (location.kind == BrowserLocationKind::computer) {
@@ -323,7 +331,7 @@ BrowserLoadResult load_browser_location(
             result.snapshot = load_filesystem(location, stop);
         } else {
             if (!archive_catalog || archive_catalog->path() != location.archive_path) {
-                archive_catalog = ArchiveCatalog::load(location.archive_path);
+                archive_catalog = ArchiveCatalog::load(location.archive_path, archive_password);
             }
             result.snapshot = archive_catalog->list(location, stop);
             result.archive_catalog = std::move(archive_catalog);

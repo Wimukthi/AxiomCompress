@@ -24,7 +24,6 @@ struct ButtonSpec {
 struct MessageDialogState {
     HWND hwnd{};
     HWND owner{};
-    HWND icon_control{};
     HWND message_control{};
     std::array<HWND, 3> buttons{};
     HINSTANCE instance{};
@@ -82,7 +81,7 @@ LPCWSTR system_icon_for(MessageDialogIcon icon) {
 }
 
 void refresh_content_icon(MessageDialogState* state) {
-    if (state == nullptr || state->icon_control == nullptr) {
+    if (state == nullptr) {
         return;
     }
     LPCWSTR icon_name = system_icon_for(state->icon);
@@ -93,10 +92,10 @@ void refresh_content_icon(MessageDialogState* state) {
     HICON replacement = static_cast<HICON>(LoadImageW(
         nullptr, icon_name, IMAGE_ICON, icon_size, icon_size, LR_DEFAULTCOLOR));
     if (replacement == nullptr) {
-        return;
+        HICON shared = LoadIconW(nullptr, icon_name);
+        replacement = shared != nullptr ? CopyIcon(shared) : nullptr;
     }
-    SendMessageW(state->icon_control, STM_SETICON,
-                 reinterpret_cast<WPARAM>(replacement), 0);
+    if (replacement == nullptr) return;
     if (state->content_icon != nullptr) {
         DestroyIcon(state->content_icon);
     }
@@ -175,14 +174,11 @@ void layout_dialog(MessageDialogState* state) {
     const int button_width = scale_for_dialog_dpi(88, state->dpi);
     const int button_height = scale_for_dialog_dpi(30, state->dpi);
     const int button_gap = scale_for_dialog_dpi(10, state->dpi);
-    const int text_left = margin + (state->icon_control != nullptr ? icon_size + icon_gap : 0);
+    const int text_left = margin +
+        (state->icon != MessageDialogIcon::none ? icon_size + icon_gap : 0);
     const int text_width = std::max<int>(
         1, static_cast<int>(client.right) - margin - text_left);
 
-    if (state->icon_control != nullptr) {
-        MoveWindow(state->icon_control, margin, margin + scale_for_dialog_dpi(1, state->dpi),
-                   icon_size, icon_size, TRUE);
-    }
     MoveWindow(state->message_control, text_left, margin, text_width,
                state->message_height, TRUE);
 
@@ -231,12 +227,7 @@ LRESULT CALLBACK message_dialog_proc(HWND hwnd, UINT message, WPARAM wparam, LPA
                 WS_CHILD | WS_VISIBLE | SS_LEFT | SS_NOPREFIX,
                 0, 0, 0, 0, hwnd, nullptr, state->instance, nullptr);
 
-            if (system_icon_for(state->icon) != nullptr) {
-                state->icon_control = CreateWindowExW(
-                    0, L"STATIC", nullptr, WS_CHILD | WS_VISIBLE | SS_ICON | SS_CENTERIMAGE,
-                    0, 0, 0, 0, hwnd, nullptr, state->instance, nullptr);
-                refresh_content_icon(state);
-            }
+            refresh_content_icon(state);
 
             for (std::size_t index = 0; index < state->button_specs.size(); ++index) {
                 const ButtonSpec& spec = state->button_specs[index];
@@ -275,10 +266,25 @@ LRESULT CALLBACK message_dialog_proc(HWND hwnd, UINT message, WPARAM wparam, LPA
                          SWP_NOZORDER | SWP_NOACTIVATE);
             apply_axiom_window_icons(hwnd, state->instance);
             refresh_font_and_measurement(state);
-            if (state->icon_control != nullptr) {
-                refresh_content_icon(state);
-            }
+            refresh_content_icon(state);
             layout_dialog(state);
+            return 0;
+        }
+        case WM_PAINT: {
+            PAINTSTRUCT paint{};
+            HDC dc = BeginPaint(hwnd, &paint);
+            if (state->content_icon != nullptr) {
+                const int margin = scale_for_dialog_dpi(18, state->dpi);
+                const int slot_size = scale_for_dialog_dpi(kContentIconSlotPixels,
+                                                           state->dpi);
+                const int icon_size = scale_for_dialog_dpi(kContentIconPixels,
+                                                           state->dpi);
+                const int inset = std::max(0, (slot_size - icon_size) / 2);
+                DrawIconEx(dc, margin + inset, margin + inset,
+                           state->content_icon, icon_size, icon_size,
+                           0, nullptr, DI_NORMAL);
+            }
+            EndPaint(hwnd, &paint);
             return 0;
         }
         case WM_CTLCOLORSTATIC:

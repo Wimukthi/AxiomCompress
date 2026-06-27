@@ -13,6 +13,8 @@ struct PersistedGuiSettings {
     WINDOWPLACEMENT placement{sizeof(WINDOWPLACEMENT)};
     bool has_placement = false;
     std::wstring last_location;
+    std::wstring last_archive_output_folder;
+    std::wstring last_extract_destination_folder;
     int sort_column = 0;
     bool sort_ascending = true;
 };

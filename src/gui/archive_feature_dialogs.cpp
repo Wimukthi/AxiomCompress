@@ -26,19 +26,7 @@ constexpr int kNavBase = 4100;
 constexpr int kAccept = IDOK;
 constexpr int kCancel = IDCANCEL;
 
-constexpr int kStoreAttributes = 4200;
-constexpr int kStoreTimes = 4201;
-constexpr int kStoreStreams = 4202;
-constexpr int kStoreLinks = 4203;
-constexpr int kStorePosix = 4204;
-constexpr int kRestoreAttributes = 4205;
-constexpr int kRestoreCreation = 4206;
-constexpr int kRestoreAccess = 4207;
-constexpr int kRestoreStreams = 4208;
-constexpr int kRestoreLinks = 4209;
-constexpr int kRestorePosix = 4210;
 constexpr int kUpdateMode = 4220;
-constexpr int kQuickOpen = 4221;
 constexpr int kLockArchive = 4222;
 constexpr int kComment = 4223;
 constexpr int kRepackAfterUpdate = 4224;
@@ -47,27 +35,21 @@ constexpr int kEncryptNames = 4231;
 constexpr int kPassword = 4232;
 constexpr int kConfirmPassword = 4233;
 constexpr int kShowPassword = 4234;
-constexpr int kKdfPreset = 4235;
 constexpr int kVolumeSize = 4240;
 constexpr int kVolumeUnit = 4241;
 constexpr int kRecoveryPercent = 4242;
 constexpr int kRecoveryVolumes = 4243;
-constexpr int kAutoDiscoverVolumes = 4244;
 constexpr int kAttemptRecovery = 4245;
 constexpr int kSignArchive = 4250;
 constexpr int kSigningKey = 4251;
 constexpr int kCreateSfx = 4252;
 constexpr int kSfxDestination = 4253;
-constexpr int kSfxRunAfter = 4254;
 constexpr int kVerifySignature = 4255;
-constexpr int kRequireTrusted = 4256;
 
 constexpr std::array<const wchar_t*, 5> kUpdateModeNames{
     L"Create a new archive", L"Add or replace entries",
     L"Update entries that are newer", L"Freshen existing entries",
     L"Synchronize with source"};
-constexpr std::array<const wchar_t*, 3> kKdfPresetNames{
-    L"Interactive", L"Moderate", L"Sensitive"};
 constexpr std::array<const wchar_t*, 4> kVolumeUnitNames{
     L"KiB", L"MiB", L"GiB", L"TiB"};
 
@@ -78,6 +60,7 @@ struct PlacedControl {
     int y{};
     int width{};
     int height{};
+    bool wrapped{};
 };
 
 std::wstring control_text(HWND window) {
@@ -93,11 +76,13 @@ public:
     ArchiveFeatureDialog(ArchiveFeatureDialogContext context,
                          ArchiveFeatureOptions archive_options,
                          ExtractFeatureOptions extract_options,
-                         ArchiveFeatureAvailability availability)
+                         ArchiveFeatureAvailability availability,
+                         std::wstring suggested_sfx_output = {})
         : context_(context),
           archive_options_(std::move(archive_options)),
           extract_options_(std::move(extract_options)),
-          availability_(availability) {}
+          availability_(availability),
+          suggested_sfx_output_(std::move(suggested_sfx_output)) {}
 
     ~ArchiveFeatureDialog() {
         delete_dialog_font(font_);
@@ -187,16 +172,18 @@ private:
     }
 
     HWND place(int page, const wchar_t* type, const wchar_t* text, DWORD style, int id,
-               int x, int y, int width, int height, bool enabled = true) {
+               int x, int y, int width, int height, bool enabled = true,
+               bool wrapped = false) {
         HWND control = make_control(type, text, style, id, enabled);
-        placed_.push_back({control, page, x, y, width, height});
+        placed_.push_back({control, page, x, y, width, height, wrapped});
         return control;
     }
 
     HWND page_label(int page, const wchar_t* text, int x, int y, int width,
-                    bool enabled = true) {
-        return place(page, L"STATIC", text, SS_LEFT | SS_NOPREFIX, 0,
-                     x, y, width, 24, enabled);
+                    bool enabled = true, bool wrapped = false) {
+        return place(page, L"STATIC", text,
+                     SS_LEFT | SS_NOPREFIX | (wrapped ? SS_EDITCONTROL : 0), 0,
+                     x, y, width, wrapped ? 48 : 24, enabled, wrapped);
     }
 
     HWND page_edit(int page, const wchar_t* text, int id, int x, int y, int width,
@@ -206,6 +193,25 @@ private:
         SendMessageW(edit, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN,
                      MAKELPARAM(scale(6), scale(6)));
         return edit;
+    }
+
+    HWND page_combo(int page, int id, int x, int y, int width, int drop_height,
+                    const wchar_t* const* items, std::size_t item_count,
+                    int selection, bool enabled) {
+        HWND combo = place(page, L"COMBOBOX", L"",
+                           WS_TABSTOP | WS_VSCROLL | CBS_DROPDOWNLIST |
+                               CBS_OWNERDRAWFIXED | CBS_HASSTRINGS,
+                           id, x, y, width, drop_height, enabled);
+        SendMessageW(combo, CB_SETITEMHEIGHT, 0, scale(24));
+        SendMessageW(combo, CB_SETITEMHEIGHT, static_cast<WPARAM>(-1), scale(24));
+        for (std::size_t i = 0; i < item_count; ++i) {
+            SendMessageW(combo, CB_ADDSTRING, 0,
+                         reinterpret_cast<LPARAM>(items[i]));
+        }
+        SendMessageW(combo, CB_SETCURSEL,
+                     static_cast<WPARAM>(std::clamp(selection, 0,
+                         static_cast<int>(item_count) - 1)), 0);
+        return combo;
     }
 
     void page_checkbox(int page, int id, const wchar_t* text, bool& value,
@@ -219,60 +225,57 @@ private:
 
     void page_heading(int page, const wchar_t* title, const wchar_t* description) {
         page_label(page, title, 8, 0, 500);
-        page_label(page, description, 8, 28, 510, true);
+        page_label(page, description, 8, 28, 510, true, true);
     }
 
     void create_metadata_page() {
         if (context_ == ArchiveFeatureDialogContext::create_or_update) {
             page_heading(kPageMetadata, L"Metadata and links",
-                         L"Choose which filesystem metadata is captured in new or updated entries.");
-            page_checkbox(kPageMetadata, kStoreAttributes, L"Store Windows file attributes",
-                          archive_options_.store_windows_attributes, 72, availability_.metadata);
-            page_checkbox(kPageMetadata, kStoreTimes,
-                          L"Store creation, access, and modification times",
-                          archive_options_.store_file_times, 106, availability_.metadata);
-            page_checkbox(kPageMetadata, kStoreStreams,
-                          L"Include NTFS alternate data streams",
-                          archive_options_.store_alternate_streams, 140, availability_.metadata);
-            page_checkbox(kPageMetadata, kStoreLinks,
-                          L"Preserve symbolic links, junctions, and hardlinks",
-                          archive_options_.store_links, 174, availability_.metadata);
-            page_checkbox(kPageMetadata, kStorePosix,
-                          L"Store POSIX mode and ownership",
-                          archive_options_.store_posix_metadata, 208,
-                          availability_.posix_metadata);
+                         L"Supported filesystem metadata is captured automatically.");
+            page_label(kPageMetadata,
+                       L"Axiom stores Windows attributes and full-precision timestamps, NTFS "
+                       L"alternate data streams, symbolic and hard links, and POSIX mode and "
+                       L"ownership where the host exposes them.",
+                       8, 76, 500, true, true);
+            page_label(kPageMetadata,
+                       L"Unsupported special files are skipped; metadata that the destination "
+                       L"filesystem cannot represent is restored on a best-effort basis.",
+                       8, 150, 500, true, true);
         } else {
             page_heading(kPageMetadata, L"Restore metadata and links",
-                         L"Control which stored metadata is restored during extraction.");
-            page_checkbox(kPageMetadata, kRestoreAttributes, L"Restore Windows file attributes",
-                          extract_options_.restore_windows_attributes, 72, availability_.metadata);
-            page_checkbox(kPageMetadata, kRestoreCreation, L"Restore creation times",
-                          extract_options_.restore_creation_time, 106, availability_.metadata);
-            page_checkbox(kPageMetadata, kRestoreAccess, L"Restore last-access times",
-                          extract_options_.restore_access_time, 140, availability_.metadata);
-            page_checkbox(kPageMetadata, kRestoreStreams,
-                          L"Restore NTFS alternate data streams",
-                          extract_options_.restore_alternate_streams, 174, availability_.metadata);
-            page_checkbox(kPageMetadata, kRestoreLinks,
-                          L"Restore symbolic links, junctions, and hardlinks",
-                          extract_options_.restore_links, 208, availability_.metadata);
-            page_checkbox(kPageMetadata, kRestorePosix,
-                          L"Restore POSIX mode and ownership",
-                          extract_options_.restore_posix_metadata, 242,
-                          availability_.posix_metadata);
+                         L"Stored filesystem metadata is restored automatically.");
+            page_label(kPageMetadata,
+                       L"Attributes, creation/access times, alternate data streams, links, and "
+                       L"POSIX metadata are restored when supported by the destination.",
+                       8, 76, 500, true, true);
+            page_label(kPageMetadata,
+                       L"Modification-time restoration remains available in the main extraction "
+                       L"dialog because it is the one metadata policy exposed by the engine.",
+                       8, 150, 500, true, true);
         }
     }
 
     void create_update_page() {
+        if (context_ == ArchiveFeatureDialogContext::comment) {
+            page_heading(kPageUpdate, L"Archive comment",
+                         L"Add, replace, or remove the comment stored in this archive.");
+            page_label(kPageUpdate, L"Comment", 8, 75, 160, true);
+            comment_ = page_edit(kPageUpdate, archive_options_.comment.c_str(), kComment,
+                                 8, 104, 500, 240, true,
+                                 ES_MULTILINE | ES_AUTOVSCROLL | WS_VSCROLL | ES_WANTRETURN);
+            return;
+        }
+
         page_heading(kPageUpdate, L"Archive update behavior",
                      L"Configure in-place editing, synchronization, and archive service data.");
         page_label(kPageUpdate, L"Update mode", 8, 75, 120, availability_.update);
-        update_mode_ = place(kPageUpdate, L"BUTTON",
-                             kUpdateModeNames[static_cast<std::size_t>(archive_options_.update_mode)],
-                             WS_TABSTOP | BS_OWNERDRAW,
-                             kUpdateMode, 145, 70, 290, 30, availability_.update);
-        page_checkbox(kPageUpdate, kQuickOpen, L"Write quick-open records",
-                      archive_options_.quick_open, 116, availability_.quick_open);
+        update_mode_ = page_combo(
+            kPageUpdate, kUpdateMode, 145, 70, 290, 190,
+            kUpdateModeNames.data(), kUpdateModeNames.size(),
+            static_cast<int>(archive_options_.update_mode), availability_.update);
+        page_label(kPageUpdate,
+                   L"Axiom always writes a self-locating central directory for immediate listing.",
+                   8, 116, 500, true, true);
         page_checkbox(kPageUpdate, kLockArchive, L"Lock archive against further changes",
                       archive_options_.lock_archive, 150, availability_.lock);
         page_checkbox(kPageUpdate, kRepackAfterUpdate,
@@ -305,13 +308,10 @@ private:
                 ES_PASSWORD | ES_AUTOHSCROLL);
             page_checkbox(kPageSecurity, kShowPassword, L"Show password",
                           show_password_, 231, availability_.encryption);
-            page_label(kPageSecurity, L"Argon2id preset", 8, 283, 130,
-                       availability_.kdf_presets);
-            kdf_preset_ = place(
-                kPageSecurity, L"BUTTON",
-                kKdfPresetNames[static_cast<std::size_t>(archive_options_.kdf_preset)],
-                WS_TABSTOP | BS_OWNERDRAW, kKdfPreset, 145, 276, 220, 30,
-                availability_.kdf_presets);
+            page_label(kPageSecurity,
+                       L"Argon2id uses the current format defaults; parameters are stored in the "
+                       L"archive for deterministic decoding.",
+                       8, 283, 500, true, true);
         } else {
             page_label(kPageSecurity, L"Password", 8, 79, 130, availability_.encryption);
             password_ = page_edit(kPageSecurity, extract_options_.password.c_str(), kPassword,
@@ -329,10 +329,10 @@ private:
             page_label(kPageRecovery, L"Split volume size", 8, 77, 135, availability_.volumes);
             volume_size_ = page_edit(kPageRecovery, archive_options_.volume_size.c_str(),
                                      kVolumeSize, 155, 70, 160, 30, availability_.volumes);
-            volume_unit_ = place(kPageRecovery, L"BUTTON",
-                                 kVolumeUnitNames[static_cast<std::size_t>(archive_options_.volume_unit)],
-                                 WS_TABSTOP | BS_OWNERDRAW,
-                                 kVolumeUnit, 325, 70, 110, 30, availability_.volumes);
+            volume_unit_ = page_combo(
+                kPageRecovery, kVolumeUnit, 325, 70, 110, 150,
+                kVolumeUnitNames.data(), kVolumeUnitNames.size(),
+                archive_options_.volume_unit, availability_.volumes);
             page_label(kPageRecovery, L"Recovery record", 8, 125, 135, availability_.recovery);
             recovery_percent_ = page_edit(
                 kPageRecovery, std::to_wstring(archive_options_.recovery_percent).c_str(),
@@ -344,15 +344,14 @@ private:
                           archive_options_.create_recovery_volumes, 168,
                           availability_.recovery && availability_.volumes);
         } else {
-            page_checkbox(kPageRecovery, kAutoDiscoverVolumes,
-                          L"Automatically discover adjacent archive volumes",
-                          extract_options_.auto_discover_volumes, 72, availability_.volumes);
             page_checkbox(kPageRecovery, kAttemptRecovery,
                           L"Attempt recovery before reporting damaged data",
-                          extract_options_.attempt_recovery, 106, availability_.recovery);
+                          extract_options_.attempt_recovery, 72, availability_.recovery);
             page_label(kPageRecovery,
-                       L"If a required volume is missing, Axiom will pause the worker and ask for it.",
-                       8, 160, 500, availability_.volumes);
+                       L"Split sets are joined before browsing or extraction. Opening any surviving "
+                       L"data or recovery volume discovers adjacent members and reconstructs the "
+                       L"complete archive when enough shards remain.",
+                       8, 126, 500, availability_.volumes, true);
         }
     }
 
@@ -371,28 +370,34 @@ private:
             page_checkbox(kPageAuthenticity, kCreateSfx,
                           L"Create a self-extracting Windows executable",
                           archive_options_.create_sfx, 166, availability_.sfx);
-            page_label(kPageAuthenticity, L"Default destination", 8, 215, 125,
+            page_label(kPageAuthenticity, L"SFX output path", 8, 215, 125,
                        availability_.sfx);
+            const std::wstring displayed_sfx_output =
+                archive_options_.sfx_destination.empty()
+                    ? suggested_sfx_output_
+                    : archive_options_.sfx_destination;
+            sfx_destination_uses_default_ = archive_options_.sfx_destination.empty();
             sfx_destination_ = page_edit(kPageAuthenticity,
-                                         archive_options_.sfx_destination.c_str(),
+                                         displayed_sfx_output.c_str(),
                                          kSfxDestination, 145, 208, 350, 30,
                                          availability_.sfx);
-            page_checkbox(kPageAuthenticity, kSfxRunAfter,
-                          L"Allow an optional command after extraction",
-                          archive_options_.sfx_run_after_extract, 258, availability_.sfx);
+            page_label(kPageAuthenticity,
+                       L"The .exe embeds the completed .axar and is created beside it by default.",
+                       8, 244, 500, availability_.sfx, true);
+            page_label(kPageAuthenticity,
+                       L"Runtime destination, overwrite policy, thread count, timestamp restore, "
+                       L"and destination-folder opening are selected by the self-extractor.",
+                       8, 280, 500, availability_.sfx, true);
         } else {
             page_heading(kPageAuthenticity, L"Signature verification",
                          L"Control how authenticity signatures are handled during extraction.");
             page_checkbox(kPageAuthenticity, kVerifySignature,
-                          L"Verify the archive signature before extraction",
+                          L"Verify signed archives before extraction",
                           extract_options_.verify_signature, 72, availability_.authenticity);
-            page_checkbox(kPageAuthenticity, kRequireTrusted,
-                          L"Require a signature from a trusted key",
-                          extract_options_.require_trusted_signature, 106,
-                          availability_.authenticity);
             page_label(kPageAuthenticity,
-                       L"Signer identity, fingerprint, and verification results appear in Archive Properties.",
-                       8, 160, 500, availability_.authenticity);
+                       L"Invalid signatures block extraction. Unsigned archives remain allowed; "
+                       L"trusted-key pinning is available through the CLI verify command.",
+                       8, 126, 500, availability_.authenticity, true);
         }
     }
 
@@ -414,7 +419,13 @@ private:
             SS_LEFT | SS_NOPREFIX, 0);
         banner_ = make_control(
             L"STATIC",
-            L"Controls become available when the linked archive engine reports support.",
+            context_ == ArchiveFeatureDialogContext::comment
+                ? L"Archive comments are optional; an empty comment removes the current one."
+                : context_ == ArchiveFeatureDialogContext::password_prompt
+                    ? L"The password is retained only in memory while this archive is open."
+                    : context_ == ArchiveFeatureDialogContext::create_or_update
+                        ? L"Configure archive metadata, security, recovery, volumes, and packaging."
+                        : L"Configure restoration, security verification, and recovery behavior.",
             SS_LEFT | SS_NOPREFIX, 0);
         ShowWindow(heading_, SW_SHOW);
         ShowWindow(banner_, SW_SHOW);
@@ -449,7 +460,10 @@ private:
         }
 
         create_metadata_page();
-        if (context_ == ArchiveFeatureDialogContext::create_or_update) create_update_page();
+        if (context_ == ArchiveFeatureDialogContext::create_or_update ||
+            context_ == ArchiveFeatureDialogContext::comment) {
+            create_update_page();
+        }
         create_security_page();
         create_recovery_page();
         create_authenticity_page();
@@ -490,9 +504,25 @@ private:
             nav_y += scale(42);
         }
         for (const PlacedControl& control : placed_) {
+            const int available_width = std::max(
+                scale(120), static_cast<int>(client.right) - margin -
+                                content_left - scale(control.x));
+            const int width = std::min(scale(control.width), available_width);
+            int height = scale(control.height);
+            if (control.wrapped) {
+                HDC dc = GetDC(control.window);
+                HGDIOBJ old_font = SelectObject(dc, font_);
+                RECT measured{0, 0, width, 0};
+                const std::wstring text = control_text(control.window);
+                DrawTextW(dc, text.c_str(), -1, &measured,
+                          DT_CALCRECT | DT_WORDBREAK | DT_NOPREFIX | DT_EDITCONTROL);
+                SelectObject(dc, old_font);
+                ReleaseDC(control.window, dc);
+                height = std::max(height, static_cast<int>(measured.bottom) + scale(3));
+            }
             MoveWindow(control.window,
                        content_left + scale(control.x), top + scale(control.y),
-                       scale(control.width), scale(control.height), TRUE);
+                       width, height, TRUE);
         }
         const int button_width = scale(88);
         const int button_height = scale(30);
@@ -542,6 +572,10 @@ private:
     }
 
     void draw_item(const DRAWITEMSTRUCT& draw) const {
+        if (draw.CtlType == ODT_COMBOBOX) {
+            draw_dialog_combo_item(draw, dark_);
+            return;
+        }
         const int id = GetDlgCtrlID(draw.hwndItem);
         if (id >= kNavBase && id < kNavBase + 5) {
             draw_nav_button(draw, id - kNavBase);
@@ -560,6 +594,19 @@ private:
         HWND checkbox = checkbox_windows_[id];
         if (!IsWindowEnabled(checkbox)) return;
         *found->second = !*found->second;
+        if (id == kEncryptNames && archive_options_.encrypt_names) {
+            archive_options_.encrypt_data = true;
+            if (const auto data = checkbox_windows_.find(kEncryptData);
+                data != checkbox_windows_.end()) {
+                InvalidateRect(data->second, nullptr, TRUE);
+            }
+        } else if (id == kEncryptData && !archive_options_.encrypt_data) {
+            archive_options_.encrypt_names = false;
+            if (const auto names = checkbox_windows_.find(kEncryptNames);
+                names != checkbox_windows_.end()) {
+                InvalidateRect(names->second, nullptr, TRUE);
+            }
+        }
         if (id == kShowPassword) {
             const WPARAM password_character = show_password_ ? 0 : static_cast<WPARAM>(L'\x25cf');
             SendMessageW(password_, EM_SETPASSWORDCHAR, password_character, 0);
@@ -573,23 +620,29 @@ private:
     }
 
     void accept() {
+        if (update_mode_ != nullptr && IsWindowEnabled(update_mode_)) {
+            const LRESULT selection = SendMessageW(update_mode_, CB_GETCURSEL, 0, 0);
+            if (selection != CB_ERR) {
+                archive_options_.update_mode = static_cast<ArchiveUpdateMode>(selection);
+            }
+        }
+        if (volume_unit_ != nullptr && IsWindowEnabled(volume_unit_)) {
+            const LRESULT selection = SendMessageW(volume_unit_, CB_GETCURSEL, 0, 0);
+            if (selection != CB_ERR) archive_options_.volume_unit = static_cast<int>(selection);
+        }
+
         if (password_ != nullptr && IsWindowEnabled(password_)) {
             const std::wstring password = control_text(password_);
             if (context_ == ArchiveFeatureDialogContext::create_or_update) {
                 if (archive_options_.encrypt_data) {
-                    if (archive_options_.update_mode != ArchiveUpdateMode::create_new) {
-                        show_message_dialog(
-                            window_, instance_, dpi_, dark_, L"Axiom",
-                            L"Encryption can currently be enabled only when creating a new archive.",
-                            MessageDialogIcon::warning);
-                        return;
-                    }
                     const bool has_comment = comment_ != nullptr &&
                                              !control_text(comment_).empty();
-                    if (has_comment || archive_options_.lock_archive) {
+                    if (archive_options_.encrypt_names &&
+                        (has_comment || archive_options_.lock_archive)) {
                         show_message_dialog(
                             window_, instance_, dpi_, dark_, L"Axiom",
-                            L"Comments and locking cannot currently be combined with encryption.",
+                            L"Comments and locking cannot currently be changed after file-name "
+                            L"encryption is applied. Clear those options or encrypt file data only.",
                             MessageDialogIcon::warning);
                         return;
                     }
@@ -638,7 +691,18 @@ private:
             archive_options_.signing_key = control_text(signing_key_);
         }
         if (sfx_destination_ != nullptr && IsWindowEnabled(sfx_destination_)) {
-            archive_options_.sfx_destination = control_text(sfx_destination_);
+            std::wstring output = control_text(sfx_destination_);
+            if (!output.empty()) {
+                std::filesystem::path output_path(output);
+                if (lstrcmpiW(output_path.extension().c_str(), L".exe") != 0) {
+                    output_path.replace_extension(L".exe");
+                }
+                output = output_path.wstring();
+            }
+            archive_options_.sfx_destination =
+                sfx_destination_uses_default_ && output == suggested_sfx_output_
+                    ? std::wstring{}
+                    : std::move(output);
         }
         if (password_ != nullptr) {
             SetWindowTextW(password_, L"");
@@ -723,30 +787,6 @@ private:
                     toggle_checkbox(id);
                     return 0;
                 }
-                if (id == kUpdateMode && IsWindowEnabled(update_mode_)) {
-                    const int next = (static_cast<int>(archive_options_.update_mode) + 1) %
-                                     static_cast<int>(kUpdateModeNames.size());
-                    archive_options_.update_mode = static_cast<ArchiveUpdateMode>(next);
-                    SetWindowTextW(update_mode_, kUpdateModeNames[static_cast<std::size_t>(next)]);
-                    InvalidateRect(update_mode_, nullptr, TRUE);
-                    return 0;
-                }
-                if (id == kKdfPreset && IsWindowEnabled(kdf_preset_)) {
-                    archive_options_.kdf_preset =
-                        (archive_options_.kdf_preset + 1) % static_cast<int>(kKdfPresetNames.size());
-                    SetWindowTextW(kdf_preset_,
-                                   kKdfPresetNames[static_cast<std::size_t>(archive_options_.kdf_preset)]);
-                    InvalidateRect(kdf_preset_, nullptr, TRUE);
-                    return 0;
-                }
-                if (id == kVolumeUnit && IsWindowEnabled(volume_unit_)) {
-                    archive_options_.volume_unit =
-                        (archive_options_.volume_unit + 1) % static_cast<int>(kVolumeUnitNames.size());
-                    SetWindowTextW(volume_unit_,
-                                   kVolumeUnitNames[static_cast<std::size_t>(archive_options_.volume_unit)]);
-                    InvalidateRect(volume_unit_, nullptr, TRUE);
-                    return 0;
-                }
                 if (id == kAccept) {
                     accept();
                     return 0;
@@ -792,6 +832,7 @@ private:
     ArchiveFeatureOptions archive_options_;
     ExtractFeatureOptions extract_options_;
     ArchiveFeatureAvailability availability_;
+    std::wstring suggested_sfx_output_;
     HWND owner_{};
     HWND window_{};
     HINSTANCE instance_{};
@@ -799,6 +840,7 @@ private:
     bool dark_{};
     bool accepted_{};
     bool show_password_{};
+    bool sfx_destination_uses_default_{};
     HFONT font_{};
     HBRUSH background_brush_{};
     HBRUSH edit_brush_{};
@@ -810,7 +852,6 @@ private:
     HWND comment_{};
     HWND password_{};
     HWND confirm_password_{};
-    HWND kdf_preset_{};
     HWND volume_size_{};
     HWND volume_unit_{};
     HWND recovery_percent_{};
@@ -835,8 +876,10 @@ bool show_archive_feature_options_dialog(
     ArchiveFeatureDialogContext context,
     ArchiveFeatureOptions& archive_options,
     ExtractFeatureOptions& extract_options,
-    const ArchiveFeatureAvailability& availability) {
-    ArchiveFeatureDialog dialog(context, archive_options, extract_options, availability);
+    const ArchiveFeatureAvailability& availability,
+    std::wstring suggested_sfx_output) {
+    ArchiveFeatureDialog dialog(context, archive_options, extract_options, availability,
+                                std::move(suggested_sfx_output));
     if (!dialog.show(owner)) return false;
     archive_options = dialog.archive_options();
     extract_options = dialog.extract_options();

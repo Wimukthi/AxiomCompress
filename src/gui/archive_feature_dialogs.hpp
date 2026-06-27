@@ -21,7 +21,8 @@ bool show_archive_feature_options_dialog(
     ArchiveFeatureDialogContext context,
     ArchiveFeatureOptions& archive_options,
     ExtractFeatureOptions& extract_options,
-    const ArchiveFeatureAvailability& availability = {});
+    const ArchiveFeatureAvailability& availability = {},
+    std::wstring suggested_sfx_output = {});
 
 bool show_archive_password_dialog(HWND owner, std::wstring& password);
 bool show_archive_comment_dialog(HWND owner, std::wstring& comment);

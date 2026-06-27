@@ -851,6 +851,80 @@ void test_archive_comment_lock() {
     fs::remove_all(root, ec);
 }
 
+void test_archive_recovery_and_volumes() {
+    const auto root = make_temp_dir();
+    const auto source = root / "payload.bin";
+    std::vector<std::uint8_t> payload(48 * 1024);
+    std::mt19937 random(0xA4104u);
+    std::generate(payload.begin(), payload.end(), [&] {
+        return static_cast<std::uint8_t>(random() & 0xFFu);
+    });
+    write_all(source, payload);
+
+    axiom::CompressionOptions options;
+    options.recovery_percent = 25;
+    const auto archive = root / "resilient.axar";
+    axiom::create_archive({source}, archive, options);
+    auto recovery = axiom::archive_recovery_info(archive);
+    AXIOM_CHECK(recovery.present);
+    AXIOM_CHECK(recovery.percent == 25);
+    AXIOM_CHECK(recovery.parity_shards >= 1);
+
+    // Corrupt protected archive data while leaving the recovery locator intact.
+    auto damaged = read_all(archive);
+    AXIOM_CHECK(damaged.size() > 64);
+    damaged[32] ^= 0xA5u;
+    write_all(archive, damaged);
+    expect_throws([&] { axiom::test_archive(archive); });
+    AXIOM_CHECK(axiom::repair_archive(archive));
+    axiom::test_archive(archive);
+    {
+        const auto extracted = root / "repaired";
+        axiom::extract_archive(archive, extracted);
+        AXIOM_CHECK(read_all(extracted / "payload.bin") == payload);
+    }
+
+    // Ordinary edits preserve an existing recovery percentage unless explicitly
+    // replaced or removed.
+    const auto added = root / "added.txt";
+    write_all(added, bytes_from_string("added after recovery repair"));
+    axiom::add_to_archive({added}, archive);
+    recovery = axiom::archive_recovery_info(archive);
+    AXIOM_CHECK(recovery.present && recovery.percent == 25);
+    axiom::set_archive_comment(archive, "recovery survives directory rewrites");
+    recovery = axiom::archive_recovery_info(archive);
+    AXIOM_CHECK(recovery.present && recovery.percent == 25);
+    axiom::test_archive(archive);
+
+    // Two recovery volumes can replace one missing data volume and one data
+    // volume whose payload checksum no longer matches its header.
+    const auto volume_info = axiom::create_archive_volumes(archive, 4096, 2);
+    AXIOM_CHECK(volume_info.data_volumes >= 3);
+    AXIOM_CHECK(volume_info.recovery_volumes == 2);
+    const auto part1 = root / "resilient.part001.axar";
+    const auto part2 = root / "resilient.part002.axar";
+    const auto part3 = root / "resilient.part003.axar";
+    AXIOM_CHECK(axiom::archive_volume_set_info(part1).data_volumes ==
+                volume_info.data_volumes);
+    std::error_code error;
+    AXIOM_CHECK(fs::remove(part2, error));
+    auto corrupt_volume = read_all(part1);
+    AXIOM_CHECK(corrupt_volume.size() > 80);
+    corrupt_volume[80] ^= 0x3Cu;
+    write_all(part1, corrupt_volume);
+
+    const auto joined = root / "joined.axar";
+    axiom::join_archive_volumes(part3, joined);
+    AXIOM_CHECK(read_all(joined) == read_all(archive));
+    axiom::test_archive(joined);
+
+    axiom::set_archive_recovery(joined, 0);
+    AXIOM_CHECK(!axiom::archive_recovery_info(joined).present);
+    axiom::test_archive(joined);
+
+    fs::remove_all(root, error);
+}
+
 void test_archive_authenticity_and_sfx() {
     const auto root = make_temp_dir();
     const auto source = root / "signed.txt";
@@ -1590,6 +1664,7 @@ int main() {
     test_archive_delete_repack();
     test_archive_update_sync();
     test_archive_comment_lock();
+    test_archive_recovery_and_volumes();
     test_archive_authenticity_and_sfx();
     test_archive_encryption();
     test_archive_encrypted_directory();

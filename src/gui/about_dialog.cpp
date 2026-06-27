@@ -12,7 +12,7 @@ namespace {
 
 constexpr wchar_t kAboutDialogClass[] = L"AxiomAboutDialog";
 constexpr wchar_t kAuthor[] = L"Wimukthi Bandara";
-constexpr wchar_t kLicense[] = L"Not specified";
+constexpr wchar_t kLicense[] = L"GNU GPLv3";
 constexpr int kAutoUpdateControl = 201;
 constexpr int kCheckUpdatesControl = 202;
 

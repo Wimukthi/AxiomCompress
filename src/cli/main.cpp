@@ -32,6 +32,10 @@ void print_usage() {
         "  axiomc repack [options] <archive.axar>          rebuild, reclaiming replaced/deleted space\n"
         "  axiomc comment <archive.axar> [text]            show, or set, the archive comment\n"
         "  axiomc lock <archive.axar>                      mark the archive read-only (no unlock)\n"
+        "  axiomc recovery <archive.axar> [percent]        show/set recovery redundancy (0 removes)\n"
+        "  axiomc repair <archive.axar>                    repair damage using its recovery record\n"
+        "  axiomc split <archive.axar> <size> [rev-count]  create numbered/recovery volumes\n"
+        "  axiomc join <any-volume> <archive.axar>         join or reconstruct a volume set\n"
         "  axiomc x [options] <archive.axar> [dest-dir]   extract (default: current dir)\n"
         "  axiomc l <archive.axar>                         list contents\n"
         "  axiomc t [options] <archive.axar>               test integrity\n"
@@ -57,6 +61,7 @@ void print_usage() {
         "  --lazy / --no-lazy  --fast-entropy     (override level knobs)\n"
         "  --fast-lz                              (byte-token fast profile)\n"
         "  --window SIZE                          (match window; bounds --bt memory)\n"
+        "  --recovery N                           add 1..100% Reed-Solomon recovery data\n"
         "  --bt                                   (binary-tree match finder)\n"
         "  --optimal          --optimal-depth N   --optimal-candidates N\n"
         "\n"
@@ -199,6 +204,11 @@ bool take_compression_flags(std::vector<std::string>& args, axiom::CompressionOp
         } else if (arg == "--block-size") {
             options.block_size = parse_size(next("--block-size"));
             options.auto_block_size_for_threads = false;
+        } else if (arg == "--recovery") {
+            options.recovery_percent = static_cast<unsigned>(parse_size(next("--recovery")));
+            if (options.recovery_percent > 100) {
+                throw std::runtime_error("--recovery must be between 0 and 100");
+            }
         } else if (arg == "--chain-depth") {
             options.max_chain_depth = parse_size(next("--chain-depth"));
         } else if (arg == "--nice") {
@@ -498,6 +508,63 @@ int run_test(std::vector<std::string> args) {
     return 0;
 }
 
+int run_recovery(const std::vector<std::string>& args) {
+    if (args.empty() || args.size() > 2) {
+        print_usage();
+        return 2;
+    }
+    if (args.size() == 2) {
+        const auto percent = static_cast<unsigned>(parse_size(args[1]));
+        axiom::set_archive_recovery(args[0], percent);
+    }
+    const auto info = axiom::archive_recovery_info(args[0]);
+    if (!info.present) {
+        std::cout << "archive has no recovery record\n";
+    } else {
+        std::cout << "recovery record: " << info.percent << "% ("
+                  << info.data_shards << " data + " << info.parity_shards
+                  << " parity shards)\n";
+    }
+    return 0;
+}
+
+int run_repair(const std::vector<std::string>& args) {
+    if (args.size() != 1) {
+        print_usage();
+        return 2;
+    }
+    if (!axiom::repair_archive(args[0])) {
+        std::cout << "archive has no recovery record\n";
+        return 3;
+    }
+    std::cout << "archive repaired and verified recovery data was rebuilt\n";
+    return 0;
+}
+
+int run_split(const std::vector<std::string>& args) {
+    if (args.size() < 2 || args.size() > 3) {
+        print_usage();
+        return 2;
+    }
+    const auto recovery_count = args.size() == 3
+        ? static_cast<unsigned>(parse_size(args[2])) : 0;
+    const auto info = axiom::create_archive_volumes(args[0], parse_size(args[1]),
+                                                     recovery_count);
+    std::cout << info.data_volumes << " data volume(s), " << info.recovery_volumes
+              << " recovery volume(s) created\n";
+    return 0;
+}
+
+int run_join(const std::vector<std::string>& args) {
+    if (args.size() != 2) {
+        print_usage();
+        return 2;
+    }
+    axiom::join_archive_volumes(args[0], args[1]);
+    std::cout << "archive volumes joined\n";
+    return 0;
+}
+
 int run_keygen(const std::vector<std::string>& args) {
     if (args.size() != 2) {
         print_usage();
@@ -627,6 +694,18 @@ int main(int argc, char** argv) {
         }
         if (command == "lock") {
             return run_lock(std::move(args));
+        }
+        if (command == "recovery" || command == "rr") {
+            return run_recovery(args);
+        }
+        if (command == "repair") {
+            return run_repair(args);
+        }
+        if (command == "split") {
+            return run_split(args);
+        }
+        if (command == "join") {
+            return run_join(args);
         }
         if (command == "x" || command == "extract") {
             return run_extract(std::move(args));

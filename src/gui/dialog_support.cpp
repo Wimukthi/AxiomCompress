@@ -2,6 +2,8 @@
 
 #include "gui/resource.hpp"
 
+#include <algorithm>
+#include <commctrl.h>
 #include <dwmapi.h>
 #include <uxtheme.h>
 
@@ -9,6 +11,220 @@ namespace axiom::gui {
 namespace {
 
 constexpr DWORD kOlderImmersiveDarkMode = 19;
+constexpr UINT_PTR kDarkComboSubclass = 1;
+constexpr const wchar_t* kSavedComboStyleProperty = L"AxiomSavedComboStyle";
+constexpr const wchar_t* kSavedComboExStyleProperty = L"AxiomSavedComboExStyle";
+
+void save_window_style(HWND window) {
+    if (window == nullptr || GetPropW(window, kSavedComboStyleProperty) != nullptr) {
+        return;
+    }
+    const auto style = static_cast<UINT_PTR>(GetWindowLongPtrW(window, GWL_STYLE));
+    const auto ex_style = static_cast<UINT_PTR>(GetWindowLongPtrW(window, GWL_EXSTYLE));
+    SetPropW(window, kSavedComboStyleProperty,
+             reinterpret_cast<HANDLE>(style + 1));
+    SetPropW(window, kSavedComboExStyleProperty,
+             reinterpret_cast<HANDLE>(ex_style + 1));
+}
+
+void strip_light_control_edges(HWND window) {
+    if (window == nullptr) return;
+    save_window_style(window);
+    LONG_PTR style = GetWindowLongPtrW(window, GWL_STYLE);
+    LONG_PTR ex_style = GetWindowLongPtrW(window, GWL_EXSTYLE);
+    style &= ~static_cast<LONG_PTR>(WS_BORDER);
+    ex_style &= ~static_cast<LONG_PTR>(WS_EX_CLIENTEDGE | WS_EX_STATICEDGE |
+                                       WS_EX_WINDOWEDGE);
+    SetWindowLongPtrW(window, GWL_STYLE, style);
+    SetWindowLongPtrW(window, GWL_EXSTYLE, ex_style);
+    SetWindowPos(window, nullptr, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER |
+                     SWP_NOACTIVATE | SWP_FRAMECHANGED);
+}
+
+void restore_control_edges(HWND window) {
+    if (window == nullptr) return;
+    const HANDLE saved_style = GetPropW(window, kSavedComboStyleProperty);
+    const HANDLE saved_ex_style = GetPropW(window, kSavedComboExStyleProperty);
+    if (saved_style == nullptr || saved_ex_style == nullptr) return;
+
+    SetWindowLongPtrW(window, GWL_STYLE,
+                      static_cast<LONG_PTR>(
+                          reinterpret_cast<UINT_PTR>(saved_style) - 1));
+    SetWindowLongPtrW(window, GWL_EXSTYLE,
+                      static_cast<LONG_PTR>(
+                          reinterpret_cast<UINT_PTR>(saved_ex_style) - 1));
+    RemovePropW(window, kSavedComboStyleProperty);
+    RemovePropW(window, kSavedComboExStyleProperty);
+    SetWindowPos(window, nullptr, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER |
+                     SWP_NOACTIVATE | SWP_FRAMECHANGED);
+}
+
+void apply_combo_child_theme(HWND combo, bool dark) {
+    COMBOBOXINFO info{sizeof(info)};
+    if (!GetComboBoxInfo(combo, &info)) return;
+    const wchar_t* theme = dark ? L"DarkMode_Explorer" : nullptr;
+    if (dark) {
+        strip_light_control_edges(combo);
+    } else {
+        restore_control_edges(combo);
+    }
+    if (info.hwndList != nullptr) {
+        SetWindowTheme(info.hwndList, theme, nullptr);
+        if (dark) {
+            strip_light_control_edges(info.hwndList);
+        } else {
+            restore_control_edges(info.hwndList);
+        }
+        RedrawWindow(info.hwndList, nullptr, nullptr,
+                     RDW_INVALIDATE | RDW_FRAME | RDW_ALLCHILDREN);
+    }
+    if (info.hwndItem != nullptr && info.hwndItem != combo) {
+        SetWindowTheme(info.hwndItem, theme, nullptr);
+        if (dark) {
+            strip_light_control_edges(info.hwndItem);
+        } else {
+            restore_control_edges(info.hwndItem);
+        }
+        RedrawWindow(info.hwndItem, nullptr, nullptr,
+                     RDW_INVALIDATE | RDW_FRAME | RDW_ALLCHILDREN);
+    }
+}
+
+void draw_dark_combo_frame(HWND window) {
+    RECT client{};
+    if (!GetClientRect(window, &client)) return;
+
+    const DialogColors colors = dialog_colors(true);
+    const UINT dpi = GetDpiForWindow(window);
+    const int arrow_width = (std::max)(
+        scale_for_dialog_dpi(18, dpi), GetSystemMetricsForDpi(SM_CXVSCROLL, dpi));
+    RECT arrow{
+        (std::max)(client.left + 1, client.right - arrow_width),
+        client.top + 1,
+        client.right - 1,
+        client.bottom - 1,
+    };
+
+    POINT cursor{};
+    GetCursorPos(&cursor);
+    ScreenToClient(window, &cursor);
+    const bool hot = PtInRect(&arrow, cursor) != FALSE;
+    const bool pressed = hot && (GetKeyState(VK_LBUTTON) & 0x8000) != 0;
+    const COLORREF arrow_background = pressed
+        ? RGB(58, 58, 59)
+        : hot ? RGB(48, 48, 49) : colors.control_background;
+
+    HDC dc = GetDC(window);
+    if (dc == nullptr) return;
+    HBRUSH fill = CreateSolidBrush(arrow_background);
+    FillRect(dc, &arrow, fill);
+    DeleteObject(fill);
+
+    HBRUSH control_fill = CreateSolidBrush(colors.control_background);
+    RECT top_edge{client.left + 1, client.top + 1, arrow.left, client.top + 2};
+    RECT left_edge{client.left + 1, client.top + 1, client.left + 2, client.bottom - 1};
+    RECT bottom_edge{client.left + 1, client.bottom - 2, arrow.left, client.bottom - 1};
+    RECT separator_erase{
+        arrow.left - scale_for_dialog_dpi(2, dpi),
+        client.top + 1,
+        arrow.left + scale_for_dialog_dpi(2, dpi),
+        client.bottom - 1,
+    };
+    FillRect(dc, &top_edge, control_fill);
+    FillRect(dc, &left_edge, control_fill);
+    FillRect(dc, &bottom_edge, control_fill);
+    FillRect(dc, &separator_erase, control_fill);
+    DeleteObject(control_fill);
+    fill = CreateSolidBrush(arrow_background);
+    RECT arrow_after_separator{
+        arrow.left + 1,
+        arrow.top,
+        arrow.right,
+        arrow.bottom,
+    };
+    FillRect(dc, &arrow_after_separator, fill);
+    DeleteObject(fill);
+
+    HPEN border_pen = CreatePen(PS_SOLID, 1, colors.border);
+    HGDIOBJ old_pen = SelectObject(dc, border_pen);
+    HGDIOBJ old_brush = SelectObject(dc, GetStockObject(NULL_BRUSH));
+    Rectangle(dc, client.left, client.top, client.right, client.bottom);
+    SelectObject(dc, old_brush);
+    SelectObject(dc, old_pen);
+    DeleteObject(border_pen);
+
+    HBRUSH separator_brush = CreateSolidBrush(colors.border);
+    RECT separator{
+        arrow.left,
+        arrow.top,
+        arrow.left + 1,
+        arrow.bottom,
+    };
+    FillRect(dc, &separator, separator_brush);
+    DeleteObject(separator_brush);
+
+    const int half_width = scale_for_dialog_dpi(4, dpi);
+    const int half_height = scale_for_dialog_dpi(2, dpi);
+    const int center_x = arrow.left + (arrow.right - arrow.left) / 2;
+    const int center_y = arrow.top + (arrow.bottom - arrow.top) / 2;
+    POINT triangle[3]{
+        {center_x - half_width, center_y - half_height},
+        {center_x + half_width, center_y - half_height},
+        {center_x, center_y + half_height},
+    };
+    HBRUSH arrow_brush = CreateSolidBrush(
+        IsWindowEnabled(window) ? colors.text : colors.disabled_text);
+    old_pen = SelectObject(dc, GetStockObject(NULL_PEN));
+    old_brush = SelectObject(dc, arrow_brush);
+    Polygon(dc, triangle, 3);
+    SelectObject(dc, old_brush);
+    SelectObject(dc, old_pen);
+    DeleteObject(arrow_brush);
+    ReleaseDC(window, dc);
+}
+
+LRESULT CALLBACK dark_combo_subclass_proc(HWND window, UINT message,
+                                          WPARAM wparam, LPARAM lparam,
+                                          UINT_PTR subclass_id,
+                                          DWORD_PTR reference_data) {
+    switch (message) {
+        case CB_SHOWDROPDOWN: {
+            const LRESULT result = DefSubclassProc(window, message, wparam, lparam);
+            apply_combo_child_theme(window, reference_data != 0);
+            return result;
+        }
+        case WM_PAINT: {
+            const LRESULT result = DefSubclassProc(window, message, wparam, lparam);
+            if (reference_data != 0) draw_dark_combo_frame(window);
+            return result;
+        }
+        case WM_NCPAINT: {
+            const LRESULT result = DefSubclassProc(window, message, wparam, lparam);
+            if (reference_data != 0) draw_dark_combo_frame(window);
+            return result;
+        }
+        case WM_MOUSEMOVE: {
+            TRACKMOUSEEVENT tracking{sizeof(tracking), TME_LEAVE, window, 0};
+            TrackMouseEvent(&tracking);
+            InvalidateRect(window, nullptr, FALSE);
+            break;
+        }
+        case WM_MOUSELEAVE:
+        case WM_LBUTTONDOWN:
+        case WM_LBUTTONUP:
+        case WM_ENABLE:
+        case WM_SETFOCUS:
+        case WM_KILLFOCUS:
+            InvalidateRect(window, nullptr, FALSE);
+            break;
+        case WM_NCDESTROY:
+            RemoveWindowSubclass(window, dark_combo_subclass_proc, subclass_id);
+            break;
+    }
+    return DefSubclassProc(window, message, wparam, lparam);
+}
 
 }  // namespace
 
@@ -102,7 +318,24 @@ void apply_dialog_dark_frame(HWND window, bool dark) {
 
 void apply_dialog_control_theme(HWND control, bool dark) {
     if (control != nullptr) {
-        SetWindowTheme(control, dark ? L"DarkMode_Explorer" : nullptr, nullptr);
+        wchar_t class_name[32]{};
+        GetClassNameW(control, class_name,
+                      static_cast<int>(sizeof(class_name) / sizeof(class_name[0])));
+        const bool combo_box = lstrcmpiW(class_name, L"ComboBox") == 0;
+        SetWindowTheme(control,
+                       dark ? (combo_box ? L"DarkMode_CFD" : L"DarkMode_Explorer")
+                            : nullptr,
+                       nullptr);
+        if (combo_box) {
+            if (dark) {
+                SetWindowSubclass(control, dark_combo_subclass_proc,
+                                  kDarkComboSubclass, 1);
+            } else {
+                RemoveWindowSubclass(control, dark_combo_subclass_proc,
+                                     kDarkComboSubclass);
+            }
+            apply_combo_child_theme(control, dark);
+        }
         RedrawWindow(control, nullptr, nullptr, RDW_INVALIDATE | RDW_FRAME | RDW_ALLCHILDREN);
     }
 }
@@ -216,6 +449,57 @@ void draw_dialog_checkbox(const DRAWITEMSTRUCT& draw, bool dark, bool checked) {
     DrawTextW(draw.hDC, text, -1, &text_rect,
               DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
     if (old_font != nullptr) SelectObject(draw.hDC, old_font);
+}
+
+void draw_dialog_combo_item(const DRAWITEMSTRUCT& draw, bool dark) {
+    if (draw.CtlType != ODT_COMBOBOX || draw.hDC == nullptr || draw.hwndItem == nullptr) {
+        return;
+    }
+
+    const DialogColors colors = dialog_colors(dark);
+    const bool enabled = (draw.itemState & ODS_DISABLED) == 0;
+    const bool selected = (draw.itemState & ODS_SELECTED) != 0;
+    const COLORREF background = selected
+        ? colors.selection_background
+        : colors.control_background;
+    const COLORREF text_color = !enabled
+        ? colors.disabled_text
+        : selected ? colors.selection_text : colors.text;
+
+    HBRUSH brush = CreateSolidBrush(background);
+    FillRect(draw.hDC, &draw.rcItem, brush);
+    DeleteObject(brush);
+
+    if (draw.itemID != static_cast<UINT>(-1)) {
+        const LRESULT length = SendMessageW(draw.hwndItem, CB_GETLBTEXTLEN,
+                                            draw.itemID, 0);
+        if (length >= 0) {
+            std::wstring text(static_cast<std::size_t>(length) + 1, L'\0');
+            SendMessageW(draw.hwndItem, CB_GETLBTEXT, draw.itemID,
+                         reinterpret_cast<LPARAM>(text.data()));
+            text.resize(static_cast<std::size_t>(length));
+            HFONT font = reinterpret_cast<HFONT>(
+                SendMessageW(draw.hwndItem, WM_GETFONT, 0, 0));
+            HGDIOBJ old_font = font != nullptr ? SelectObject(draw.hDC, font) : nullptr;
+            SetBkMode(draw.hDC, TRANSPARENT);
+            SetTextColor(draw.hDC, text_color);
+            RECT text_rect = draw.rcItem;
+            text_rect.left += scale_for_dialog_dpi(7, GetDpiForWindow(draw.hwndItem));
+            text_rect.right -= scale_for_dialog_dpi(4, GetDpiForWindow(draw.hwndItem));
+            DrawTextW(draw.hDC, text.c_str(), -1, &text_rect,
+                      DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+            if (old_font != nullptr) SelectObject(draw.hDC, old_font);
+        }
+    }
+
+    if ((draw.itemState & ODS_FOCUS) != 0) {
+        if ((draw.itemState & ODS_COMBOBOXEDIT) != 0) return;
+        RECT focus = draw.rcItem;
+        InflateRect(&focus, -2, -2);
+        HBRUSH focus_brush = CreateSolidBrush(colors.focus_border);
+        FrameRect(draw.hDC, &focus, focus_brush);
+        DeleteObject(focus_brush);
+    }
 }
 
 bool message_targets_window(HWND window, const MSG& message) {

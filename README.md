@@ -20,9 +20,8 @@ What it does today:
 - **CLI** (`axiomc`) and a **Windows GUI** (`Axiom.exe`).
 - Coverage-guided libFuzzer+ASan targets and a Release-mode test suite.
 
-It does not yet match 7-Zip's ratio — the open gap is the entropy stage (a
-context-modeled coder; see [ROADMAP.md](ROADMAP.md)) — but it decodes fast and the
-decoder stays simple and bounded by design.
+It does not yet match 7-Zip's ratio — the open gap is the entropy stage — but it
+decodes fast and the decoder stays simple and bounded by design.
 
 ## Build With Visual C++
 
@@ -67,7 +66,8 @@ cmake --build --preset vs2022 --config Release
 ## CLI
 
 Multi-file archives (`.axar`) — files and directories with paths, metadata, and
-per-file integrity. See [FORMAT.md](FORMAT.md) for the on-disk layout.
+per-file integrity. See the [complete CLI guide](CLI_GUIDE.md) for command-by-command
+instructions and [FORMAT.md](FORMAT.md) for the on-disk layout.
 
 ```powershell
 axiomc a archive.axar mydir file.txt        # create (recurses directories)
@@ -79,6 +79,11 @@ axiomc x --overwrite skip archive.axar dest-dir
 axiomc a -p "password" archive.axar private-dir
 axiomc a -p "password" --encrypt-names hidden.axar private-dir
 axiomc l -p "password" hidden.axar
+axiomc a --recovery 10 resilient.axar important-data
+axiomc recovery resilient.axar
+axiomc repair resilient.axar
+axiomc split resilient.axar 100M 3
+axiomc join resilient.part001.axar restored.axar
 axiomc keygen secret.key public.key
 axiomc sign archive.axar secret.key
 axiomc verify archive.axar public.key
@@ -108,18 +113,39 @@ create/test/extract report byte progress to the status strip and progress bar,
 including throughput, ETA, output size, and live compression ratio when available.
 Operations can be paused or cancelled cooperatively. Archive creation, extraction,
 feature options, custom messages/about, and application settings use native dark,
-DPI-scaled dialogs.
+DPI-scaled dialogs. Finite-choice fields use keyboard-accessible native combo boxes;
+archive creation exposes level-aware dictionary size, word size, solid block size,
+and thread-count controls. Add to Archive is one resizable dialog with Compression,
+General, Security, Recovery & volumes, and SFX & signing tabs. The common
+output path and a live effective-output preview remain visible on every tab;
+wrapped help text is measured using the current per-monitor DPI. Capability flags
+disable unsupported settings in place instead of sending creation through a
+separate advanced-options dialog.
 
 The main window is a file-manager browser with drive and directory navigation,
-an editable address bar, history, shell icons, multi-selection, sortable and
+an editable address dropdown with shell locations, drives, recent/current folders,
+history, shell icons, multi-selection, sortable and
 resizable columns, and hierarchical archive browsing. Archive presentation is
 isolated behind a provider/catalog layer with explicit capability flags, so
 archive editing, comments, locking, links, and data encryption are wired through
 public archive APIs. Filename encryption and encrypted-archive editing have backend
 support. Native OLE drag/drop handles Explorer-to-archive insertion,
 archive-to-Explorer selective extraction, and moves between archive folders.
-Authenticity signing/verification and native SFX creation are wired. Recovery
-records and volumes remain capability-gated.
+Encrypted archives prompt when opened and keep the password only in memory for
+that open archive, so Explorer's synchronous drag data request never displays a
+modal password dialog.
+Authenticity signing/verification and native SFX creation are wired. A generated
+SFX is one standalone `.exe` containing the intact archive and presents a native,
+dark/DPI-aware extraction dialog with destination browsing, archive/security
+summary, overwrite policy, CPU-thread selection, timestamp restoration, and an
+open-destination option. Extraction uses the shared progress window with
+Pause/Resume and Cancel. When SFX is selected during archive creation, the GUI
+uses `.axar` only as an intermediate and leaves the merged `.exe` as the sole
+output. Recovery records, repair, fixed-size split volumes, and optional `.rev`
+recovery volumes are wired through the same worker/progress path. Opening or
+dropping any numbered volume reconstructs and verifies the complete archive before
+the browser enters it. Test and extract can repair recoverable archive damage and
+retry the requested operation.
 Its owner-drawn dark menu bar exposes File, Commands, Tools, Options, and Help
 menus without falling back to a light system menu, and routes menu and keyboard
 commands through the same command IDs used by the toolbar.
@@ -127,7 +153,12 @@ Filesystem folders refresh automatically through `ReadDirectoryChangesW`; droppe
 archives open in the browser, and the archive list is an OLE drop source and target.
 Drag-out extracts lazily and retains managed staging until exit so Explorer cannot
 race cleanup. Window placement, the last location, sorting, and application
-defaults persist per user under `HKCU\Software\AxiomCompress\GUI`.
+defaults persist per user under `HKCU\Software\AxiomCompress\GUI`. The Settings
+dialog is a resizable native dark tabbed dialog with General, Compression, Paths,
+File list, Viewer, Security, Integration, Updates, and Advanced pages. GUI-side
+settings are wired to runtime behavior where the archive engine exposes matching
+capabilities; unsupported engine knobs are disabled instead of being stored as
+silent no-ops.
 
 ### Effort levels (`--level 1..9`, default 5)
 
@@ -202,9 +233,7 @@ laptop (MSVC Release), **level 1** runs ~140 MB/s compress and ~476 MB/s decode
 deficit. Higher levels trade compress speed for ratio down to ~1 MB/s at level 9;
 decode stays fast on levels 1–3 (rANS literals) and is slower on 4–9 (order-1
 literals). 7-Zip `-mx9` still leads on ratio (4.03×) — the remaining gap is the
-entropy stage, not the matcher. See
-[ROADMAP.md](ROADMAP.md#benchmark-snapshot-enwik8-100-mb-vs-7-zip-lzma2) for the
-full analysis, and `tools\bench_enwik8.ps1` to reproduce.
+entropy stage, not the matcher. Use `tools\bench_enwik8.ps1` to reproduce.
 
 ## Testing and fuzzing
 
@@ -230,13 +259,7 @@ parser. MSVC ships the libFuzzer runtime, so no external toolchain is needed:
 CI (`.github/workflows/ci.yml`) builds and tests on Windows and Linux and runs
 both fuzz targets on every push, with a longer nightly run.
 
-## Roadmap
+## License
 
-1. ~~Add binary-tree match finding~~ — done: cyclic-window bt4 with node
-   deletion (`--bt`), memory bounded by `--window`. Next: make it the default
-   where it wins (see [ROADMAP.md](ROADMAP.md)).
-2. Add file classification and solid block grouping.
-3. Add executable, delta, text, JSON/XML, and binary record transforms.
-4. Add long-distance matching across entire solid groups.
-5. Add context models for literals, lengths, and distances (the largest
-   remaining gap to LZMA: adaptive, context-mixed entropy coding).
+AxiomCompress is licensed under the GNU General Public License version 3. See
+[LICENSE](LICENSE).

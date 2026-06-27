@@ -5,6 +5,7 @@
 #include "core/crypto.hpp"
 #include "core/file_meta.hpp"
 #include "core/hash.hpp"
+#include "core/reed_solomon.hpp"
 
 #include <algorithm>
 #include <array>
@@ -12,9 +13,11 @@
 #include <cstdint>
 #include <fstream>
 #include <functional>
+#include <iomanip>
 #include <limits>
 #include <map>
 #include <optional>
+#include <sstream>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -40,6 +43,12 @@ constexpr std::uint16_t kFlagEncryptedDirectory = 0x0001;
 constexpr std::array<std::uint8_t, 8> kDirectoryAd = {'A', 'X', 'D', 'I', 'R', 0, 0, 0};
 constexpr std::size_t kFooterSize = 24;
 constexpr std::array<std::uint8_t, 8> kSfxMagic = {'A', 'X', 'I', 'O', 'M', 'S', 'F', 'X'};
+constexpr std::array<std::uint8_t, 8> kRecoveryMagic = {'A', 'X', 'I', 'O', 'M', 'R', 'R', 0};
+constexpr std::array<std::uint8_t, 8> kVolumeMagic = {'A', 'X', 'I', 'O', 'M', 'V', 'L', 0};
+constexpr std::uint16_t kRecoveryVersion = 1;
+constexpr std::uint16_t kVolumeVersion = 1;
+constexpr std::size_t kVolumeHeaderSize = 80;
+constexpr std::size_t kRecoveryTailSize = 24;
 constexpr std::uint8_t kEntryFile = 0;
 constexpr std::uint8_t kEntryDir = 1;
 constexpr std::uint8_t kEntrySymlink = 2;
@@ -641,6 +650,8 @@ private:
     std::uint64_t size_ = 0;
 };
 
+std::ifstream open_archive(const fs::path& archive_path, std::uint64_t& file_size);
+
 // Where an archive's fixed structure points: directory location, plus the header
 // flags and (if the directory is encrypted) the plaintext preamble's extent.
 struct ArchiveLayout {
@@ -650,6 +661,75 @@ struct ArchiveLayout {
     std::uint64_t preamble_offset = 0;  // start of the encryption preamble (if any)
     std::uint64_t preamble_size = 0;    // length of the preamble's parameter bytes
 };
+
+struct RecoveryService {
+    unsigned percent = 0;
+    std::uint16_t data_shards = 0;
+    std::uint16_t parity_shards = 0;
+    std::uint64_t shard_size = 0;
+    std::uint64_t protected_size = 0;
+    std::uint64_t directory_offset = 0;
+    std::uint64_t directory_size = 0;
+    std::uint64_t service_offset = 0;
+    std::uint64_t service_size = 0;
+    std::vector<std::uint32_t> checksums;
+    ByteVector parity;
+};
+
+std::uint32_t recovery_crc(std::span<const std::uint8_t> bytes) {
+    auto crc = core::crc32_init();
+    crc = core::crc32_update(crc, bytes);
+    return core::crc32_final(crc);
+}
+
+std::optional<RecoveryService> read_recovery_service(const ByteSource& source) {
+    if (source.size() < kFooterSize + kRecoveryTailSize) return std::nullopt;
+    const std::uint64_t tail_offset = source.size() - kFooterSize - kRecoveryTailSize;
+    const auto tail = source.read(tail_offset, kRecoveryTailSize);
+    if (!std::equal(kRecoveryMagic.begin(), kRecoveryMagic.end(), tail.begin() + 16)) {
+        return std::nullopt;
+    }
+    Reader tail_reader(tail);
+    RecoveryService service;
+    service.service_offset = tail_reader.u64();
+    service.service_size = tail_reader.u64();
+    if (service.service_size > tail_offset ||
+        service.service_offset != tail_offset - service.service_size) {
+        throw FormatError("invalid recovery service location");
+    }
+    const auto body = source.read(service.service_offset, service.service_size);
+    if (body.size() < 48 ||
+        !std::equal(kRecoveryMagic.begin(), kRecoveryMagic.end(), body.begin())) {
+        throw FormatError("invalid recovery service header");
+    }
+    Reader reader(body, kRecoveryMagic.size());
+    if (reader.u16() != kRecoveryVersion) throw FormatError("unsupported recovery service version");
+    service.percent = reader.u16();
+    service.data_shards = reader.u16();
+    service.parity_shards = reader.u16();
+    service.shard_size = reader.u64();
+    service.protected_size = reader.u64();
+    service.directory_offset = reader.u64();
+    service.directory_size = reader.u64();
+    if (service.percent == 0 || service.percent > 100 || service.data_shards == 0 ||
+        service.parity_shards == 0 ||
+        service.data_shards + service.parity_shards > 255 || service.shard_size == 0 ||
+        service.protected_size > service.service_offset ||
+        service.directory_offset + service.directory_size > service.protected_size) {
+        throw FormatError("invalid recovery service parameters");
+    }
+    const std::size_t checksum_count =
+        static_cast<std::size_t>(service.data_shards + service.parity_shards);
+    service.checksums.reserve(checksum_count);
+    for (std::size_t i = 0; i < checksum_count; ++i) service.checksums.push_back(reader.u32());
+    const std::uint64_t parity_bytes =
+        static_cast<std::uint64_t>(service.parity_shards) * service.shard_size;
+    if (parity_bytes > reader.remaining()) throw FormatError("recovery service is truncated");
+    const auto parity = reader.take(static_cast<std::size_t>(parity_bytes));
+    service.parity.assign(parity.begin(), parity.end());
+    if (reader.has_more()) throw FormatError("recovery service has trailing data");
+    return service;
+}
 
 ArchiveLayout read_layout(const ByteSource& source) {
     const auto file_size = source.size();
@@ -693,6 +773,146 @@ ArchiveLayout read_layout(const ByteSource& source) {
         }
     }
     return layout;
+}
+
+ByteVector archive_footer_bytes(std::uint64_t directory_offset,
+                                std::uint64_t directory_size) {
+    ByteVector footer;
+    put_u64(footer, directory_offset);
+    put_u64(footer, directory_size);
+    footer.insert(footer.end(), kArchiveMagic.begin(), kArchiveMagic.end());
+    return footer;
+}
+
+struct EncodedRecoveryService {
+    ByteVector body;
+    ByteVector tail;
+};
+
+EncodedRecoveryService encode_recovery_service(
+    const ByteSource& source, std::uint64_t protected_size,
+    std::uint64_t directory_offset, std::uint64_t directory_size,
+    unsigned percent, const std::shared_ptr<OperationControl>& operation) {
+    if (percent < 1 || percent > 100) {
+        throw std::invalid_argument("recovery percentage must be between 1 and 100");
+    }
+    constexpr std::uint64_t target_shard_size = 1u << 20;
+    const std::uint64_t desired_data = std::max<std::uint64_t>(
+        1, (protected_size + target_shard_size - 1) / target_shard_size);
+    const std::uint64_t max_data = std::max<std::uint64_t>(
+        1, (255u * 100u) / (100u + percent));
+    const auto data_count = static_cast<int>(std::min(desired_data, max_data));
+    const auto parity_count = static_cast<int>(std::max<std::uint64_t>(
+        1, std::min<std::uint64_t>(255 - data_count,
+            (static_cast<std::uint64_t>(data_count) * percent + 99) / 100)));
+    const std::uint64_t shard_size =
+        std::max<std::uint64_t>(1, (protected_size + data_count - 1) / data_count);
+    if (shard_size > std::numeric_limits<std::size_t>::max()) {
+        throw std::runtime_error("archive is too large for recovery processing");
+    }
+
+    std::vector<std::vector<std::uint8_t>> data(
+        static_cast<std::size_t>(data_count),
+        std::vector<std::uint8_t>(static_cast<std::size_t>(shard_size), 0));
+    std::uint64_t completed = 0;
+    for (int i = 0; i < data_count; ++i) {
+        operation_checkpoint(operation);
+        const std::uint64_t offset = static_cast<std::uint64_t>(i) * shard_size;
+        const std::uint64_t count = offset < protected_size
+            ? std::min(shard_size, protected_size - offset) : 0;
+        if (count != 0) {
+            auto bytes = source.read(offset, count);
+            std::copy(bytes.begin(), bytes.end(), data[static_cast<std::size_t>(i)].begin());
+            completed += count;
+        }
+        report_operation(operation, OperationStage::finalizing, completed, protected_size,
+                         static_cast<std::uint64_t>(i + 1),
+                         static_cast<std::uint64_t>(data_count + parity_count),
+                         "Building recovery record");
+    }
+
+    std::vector<std::vector<std::uint8_t>> parity(
+        static_cast<std::size_t>(parity_count),
+        std::vector<std::uint8_t>(static_cast<std::size_t>(shard_size), 0));
+    std::vector<std::span<const std::uint8_t>> data_spans;
+    std::vector<std::span<std::uint8_t>> parity_spans;
+    data_spans.reserve(data.size());
+    parity_spans.reserve(parity.size());
+    for (const auto& shard : data) data_spans.emplace_back(shard);
+    for (auto& shard : parity) parity_spans.emplace_back(shard);
+    core::ReedSolomon(data_count, parity_count).encode(data_spans, parity_spans);
+
+    ByteVector body;
+    body.insert(body.end(), kRecoveryMagic.begin(), kRecoveryMagic.end());
+    put_u16(body, kRecoveryVersion);
+    put_u16(body, static_cast<std::uint16_t>(percent));
+    put_u16(body, static_cast<std::uint16_t>(data_count));
+    put_u16(body, static_cast<std::uint16_t>(parity_count));
+    put_u64(body, shard_size);
+    put_u64(body, protected_size);
+    put_u64(body, directory_offset);
+    put_u64(body, directory_size);
+    for (const auto& shard : data) put_u32(body, recovery_crc(shard));
+    for (const auto& shard : parity) put_u32(body, recovery_crc(shard));
+    for (const auto& shard : parity) body.insert(body.end(), shard.begin(), shard.end());
+
+    ByteVector tail;
+    put_u64(tail, protected_size);
+    put_u64(tail, body.size());
+    tail.insert(tail.end(), kRecoveryMagic.begin(), kRecoveryMagic.end());
+    return {std::move(body), std::move(tail)};
+}
+
+void replace_archive_file(const fs::path& temporary, const fs::path& destination) {
+    std::error_code error;
+    fs::rename(temporary, destination, error);
+    if (!error) return;
+    fs::remove(destination, error);
+    fs::rename(temporary, destination, error);
+    if (error) throw std::runtime_error("failed to install archive: " + error.message());
+}
+
+void rewrite_recovery_service(const fs::path& archive_path, unsigned percent,
+                              const std::shared_ptr<OperationControl>& operation) {
+    std::uint64_t file_size = 0;
+    auto input = open_archive(archive_path, file_size);
+    const ByteSource source(input, file_size);
+    const ArchiveLayout layout = read_layout(source);
+    const std::uint64_t protected_size = layout.directory_offset + layout.directory_size;
+    EncodedRecoveryService recovery;
+    if (percent != 0) {
+        recovery = encode_recovery_service(source, protected_size, layout.directory_offset,
+                                           layout.directory_size, percent, operation);
+    }
+    const auto footer = archive_footer_bytes(layout.directory_offset, layout.directory_size);
+
+    fs::path temporary = archive_path;
+    temporary += L".recovery.tmp";
+    TempFileGuard guard(temporary);
+    std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
+    if (!output) throw std::runtime_error("cannot create recovery output");
+    std::uint64_t copied = 0;
+    while (copied < protected_size) {
+        operation_checkpoint(operation);
+        const auto count = std::min<std::uint64_t>(kFileChunk, protected_size - copied);
+        const auto bytes = source.read(copied, count);
+        output.write(reinterpret_cast<const char*>(bytes.data()),
+                     static_cast<std::streamsize>(bytes.size()));
+        copied += count;
+    }
+    if (percent != 0) {
+        output.write(reinterpret_cast<const char*>(recovery.body.data()),
+                     static_cast<std::streamsize>(recovery.body.size()));
+        output.write(reinterpret_cast<const char*>(recovery.tail.data()),
+                     static_cast<std::streamsize>(recovery.tail.size()));
+    }
+    output.write(reinterpret_cast<const char*>(footer.data()),
+                 static_cast<std::streamsize>(footer.size()));
+    output.close();
+    if (!output) throw std::runtime_error("failed to finalize recovery output");
+    input.close();
+    replace_archive_file(temporary, archive_path);
+    guard.dismiss();
 }
 
 // Parse the plaintext encryption parameters carried in the header preamble.
@@ -1453,6 +1673,7 @@ void rebuild_archive_keeping(const fs::path& archive_path,
     std::uint64_t file_size = 0;
     auto in = open_archive(archive_path, file_size);
     const ByteSource bytes(in, file_size);
+    const auto existing_recovery = read_recovery_service(bytes);
     auto index = read_index(bytes);
     if (index.meta.locked) {
         throw std::runtime_error("archive is locked (read-only)");
@@ -1576,6 +1797,12 @@ void rebuild_archive_keeping(const fs::path& archive_path,
     if (key) {
         core::secure_wipe(*key);
     }
+    const unsigned recovery_percent = options.recovery_percent != 0
+        ? options.recovery_percent
+        : (existing_recovery ? existing_recovery->percent : 0);
+    if (recovery_percent != 0) {
+        rewrite_recovery_service(archive_path, recovery_percent, operation);
+    }
     report_operation(operation, OperationStage::finalizing, total_bytes, total_bytes,
                      total_items, total_items);
 }
@@ -1593,10 +1820,14 @@ void append_items_to_archive(const fs::path& archive_path, const std::vector<Sca
     // Read the existing archive's directory; new solid blocks are appended after its
     // block region, so existing block indices (and entry references) stay valid.
     ArchiveIndex existing;
+    unsigned existing_recovery_percent = 0;
     {
         std::uint64_t file_size = 0;
         auto in = open_archive(archive_path, file_size);
         const ByteSource source(in, file_size);
+        if (const auto recovery = read_recovery_service(source)) {
+            existing_recovery_percent = recovery->percent;
+        }
         existing = read_index(source);
     }
     if (existing.meta.locked) {
@@ -1694,6 +1925,11 @@ void append_items_to_archive(const fs::path& archive_path, const std::vector<Sca
         }
     }
     temp_guard.dismiss();
+    const unsigned recovery_percent = options.recovery_percent != 0
+        ? options.recovery_percent : existing_recovery_percent;
+    if (recovery_percent != 0) {
+        rewrite_recovery_service(archive_path, recovery_percent, operation);
+    }
     report_operation(operation, OperationStage::finalizing, total_bytes, total_bytes,
                      total_items, total_items);
 }
@@ -1704,6 +1940,7 @@ void rewrite_archive_directory(const fs::path& archive_path, ArchiveIndex index,
     std::uint64_t file_size = 0;
     auto in = open_archive(archive_path, file_size);
     const ByteSource source(in, file_size);
+    const auto existing_recovery = read_recovery_service(source);
     const ArchiveLayout layout = read_layout(source);
     if ((layout.flags & kFlagEncryptedDirectory) != 0) {
         throw std::runtime_error("editing an archive with an encrypted directory is not supported");
@@ -1769,6 +2006,12 @@ void rewrite_archive_directory(const fs::path& archive_path, ArchiveIndex index,
         }
     }
     temp_guard.dismiss();
+    const unsigned recovery_percent = options.recovery_percent != 0
+        ? options.recovery_percent
+        : (existing_recovery ? existing_recovery->percent : 0);
+    if (recovery_percent != 0) {
+        rewrite_recovery_service(archive_path, recovery_percent, operation);
+    }
     report_operation(operation, OperationStage::finalizing, block_region_end, block_region_end,
                      total_items, total_items);
 }
@@ -1854,6 +2097,9 @@ void create_archive(const std::vector<std::filesystem::path>& inputs,
         }
     }
     temp_guard.dismiss();
+    if (options.recovery_percent != 0) {
+        rewrite_recovery_service(archive_path, options.recovery_percent, operation);
+    }
     report_operation(operation, OperationStage::finalizing, total_bytes, total_bytes,
                      total_items, total_items);
 }
@@ -2240,6 +2486,412 @@ ArchiveEncryptionMode archive_encryption_mode(const std::filesystem::path& archi
 
 bool archive_is_encrypted(const std::filesystem::path& archive_path) {
     return archive_encryption_mode(archive_path) != ArchiveEncryptionMode::none;
+}
+
+namespace {
+
+struct VolumeHeader {
+    bool recovery = false;
+    std::uint32_t index = 0;
+    std::uint32_t data_count = 0;
+    std::uint32_t parity_count = 0;
+    std::uint64_t shard_size = 0;
+    std::uint64_t archive_size = 0;
+    core::Blake3Digest digest{};
+    std::uint32_t payload_crc = 0;
+};
+
+ByteVector serialize_volume_header(const VolumeHeader& header) {
+    ByteVector bytes;
+    bytes.insert(bytes.end(), kVolumeMagic.begin(), kVolumeMagic.end());
+    put_u16(bytes, kVolumeVersion);
+    put_u16(bytes, header.recovery ? 1 : 0);
+    put_u32(bytes, header.index);
+    put_u32(bytes, header.data_count);
+    put_u32(bytes, header.parity_count);
+    put_u64(bytes, header.shard_size);
+    put_u64(bytes, header.archive_size);
+    bytes.insert(bytes.end(), header.digest.begin(), header.digest.end());
+    put_u32(bytes, header.payload_crc);
+    put_u32(bytes, 0);
+    return bytes;
+}
+
+VolumeHeader read_volume_header(const fs::path& path) {
+    std::ifstream input(path, std::ios::binary);
+    if (!input) throw std::runtime_error("cannot open archive volume: " + path.string());
+    ByteVector bytes(kVolumeHeaderSize);
+    input.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    if (input.gcount() != static_cast<std::streamsize>(bytes.size()) ||
+        !std::equal(kVolumeMagic.begin(), kVolumeMagic.end(), bytes.begin())) {
+        throw FormatError("invalid archive volume header");
+    }
+    Reader reader(bytes, kVolumeMagic.size());
+    if (reader.u16() != kVolumeVersion) throw FormatError("unsupported archive volume version");
+    VolumeHeader header;
+    const auto kind = reader.u16();
+    if (kind > 1) throw FormatError("invalid archive volume kind");
+    header.recovery = kind == 1;
+    header.index = reader.u32();
+    header.data_count = reader.u32();
+    header.parity_count = reader.u32();
+    header.shard_size = reader.u64();
+    header.archive_size = reader.u64();
+    const auto digest = reader.take(header.digest.size());
+    std::copy(digest.begin(), digest.end(), header.digest.begin());
+    header.payload_crc = reader.u32();
+    (void)reader.u32();
+    if (header.data_count == 0 || header.data_count + header.parity_count > 255 ||
+        header.shard_size == 0 || header.index >=
+            (header.recovery ? header.parity_count : header.data_count)) {
+        throw FormatError("invalid archive volume parameters");
+    }
+    return header;
+}
+
+std::wstring three_digit(unsigned value) {
+    std::wostringstream text;
+    text << std::setw(3) << std::setfill(L'0') << value;
+    return text.str();
+}
+
+fs::path volume_root(const fs::path& any_volume) {
+    std::wstring name = any_volume.filename().wstring();
+    const auto part = name.rfind(L".part");
+    const auto rev = name.rfind(L".rev");
+    std::size_t cut = std::wstring::npos;
+    if (part != std::wstring::npos) cut = part;
+    if (rev != std::wstring::npos && (cut == std::wstring::npos || rev > cut)) cut = rev;
+    if (cut == std::wstring::npos) throw std::invalid_argument("not a numbered Axiom volume");
+    return any_volume.parent_path() / name.substr(0, cut);
+}
+
+fs::path data_volume_path(const fs::path& root, unsigned index) {
+    return fs::path(root.wstring() + L".part" + three_digit(index + 1) + L".axar");
+}
+
+fs::path recovery_volume_path(const fs::path& root, unsigned index) {
+    return fs::path(root.wstring() + L".rev" + three_digit(index + 1));
+}
+
+core::Blake3Digest hash_file(const fs::path& path,
+                             const std::shared_ptr<OperationControl>& operation = nullptr) {
+    std::ifstream input(path, std::ios::binary);
+    if (!input) throw std::runtime_error("cannot open archive: " + path.string());
+    core::Blake3 hash;
+    std::array<std::uint8_t, kFileChunk> buffer{};
+    while (input) {
+        operation_checkpoint(operation);
+        input.read(reinterpret_cast<char*>(buffer.data()),
+                   static_cast<std::streamsize>(buffer.size()));
+        const auto count = input.gcount();
+        if (count > 0) hash.update(std::span<const std::uint8_t>(
+            buffer.data(), static_cast<std::size_t>(count)));
+    }
+    return hash.finalize();
+}
+
+void write_volume(const fs::path& path, const VolumeHeader& header,
+                  std::span<const std::uint8_t> payload) {
+    const auto bytes = serialize_volume_header(header);
+    fs::path temporary = path;
+    temporary += L".tmp";
+    TempFileGuard guard(temporary);
+    std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
+    output.write(reinterpret_cast<const char*>(bytes.data()),
+                 static_cast<std::streamsize>(bytes.size()));
+    output.write(reinterpret_cast<const char*>(payload.data()),
+                 static_cast<std::streamsize>(payload.size()));
+    output.close();
+    if (!output) throw std::runtime_error("failed to write archive volume");
+    replace_archive_file(temporary, path);
+    guard.dismiss();
+}
+
+}  // namespace
+
+ArchiveRecoveryInfo archive_recovery_info(const std::filesystem::path& archive_path) {
+    std::uint64_t file_size = 0;
+    auto stream = open_archive(archive_path, file_size);
+    const ByteSource source(stream, file_size);
+    const auto service = read_recovery_service(source);
+    if (!service) return {};
+    return {true, service->percent, service->data_shards, service->parity_shards,
+            service->protected_size};
+}
+
+void set_archive_recovery(const std::filesystem::path& archive_path, unsigned percent,
+                          const std::shared_ptr<OperationControl>& operation) {
+    if (percent > 100) throw std::invalid_argument("recovery percentage must be 0..100");
+    rewrite_recovery_service(archive_path, percent, operation);
+}
+
+bool repair_archive(const std::filesystem::path& archive_path,
+                    const std::shared_ptr<OperationControl>& operation) {
+    std::uint64_t file_size = 0;
+    auto input = open_archive(archive_path, file_size);
+    const ByteSource source(input, file_size);
+    const auto service_optional = read_recovery_service(source);
+    if (!service_optional) return false;
+    const auto& service = *service_optional;
+    const int data_count = service.data_shards;
+    const int parity_count = service.parity_shards;
+    const int total_count = data_count + parity_count;
+    if (service.shard_size > std::numeric_limits<std::size_t>::max()) {
+        throw FormatError("recovery shard is too large");
+    }
+    const auto shard_size = static_cast<std::size_t>(service.shard_size);
+    std::vector<std::vector<std::uint8_t>> shards(
+        static_cast<std::size_t>(total_count), std::vector<std::uint8_t>(shard_size, 0));
+    std::vector<bool> present(static_cast<std::size_t>(total_count), true);
+    int damaged = 0;
+    for (int index = 0; index < data_count; ++index) {
+        operation_checkpoint(operation);
+        const std::uint64_t offset = static_cast<std::uint64_t>(index) * service.shard_size;
+        const std::uint64_t count = offset < service.protected_size
+            ? std::min(service.shard_size, service.protected_size - offset) : 0;
+        if (count != 0) {
+            const auto bytes = source.read(offset, count);
+            std::copy(bytes.begin(), bytes.end(), shards[static_cast<std::size_t>(index)].begin());
+        }
+        if (recovery_crc(shards[static_cast<std::size_t>(index)]) !=
+            service.checksums[static_cast<std::size_t>(index)]) {
+            present[static_cast<std::size_t>(index)] = false;
+            ++damaged;
+        }
+        report_operation(operation, OperationStage::testing,
+                         std::min(service.protected_size, offset + count),
+                         service.protected_size, index + 1, total_count,
+                         "Checking recovery shards");
+    }
+    for (int index = 0; index < parity_count; ++index) {
+        const auto begin = service.parity.begin() +
+            static_cast<std::ptrdiff_t>(static_cast<std::uint64_t>(index) * service.shard_size);
+        std::copy_n(begin, shard_size,
+                    shards[static_cast<std::size_t>(data_count + index)].begin());
+        const auto shard_index = static_cast<std::size_t>(data_count + index);
+        if (recovery_crc(shards[shard_index]) != service.checksums[shard_index]) {
+            present[shard_index] = false;
+            ++damaged;
+        }
+    }
+    if (damaged > parity_count ||
+        !core::ReedSolomon(data_count, parity_count).reconstruct(shards, present)) {
+        throw FormatError("archive damage exceeds the recovery record capacity");
+    }
+
+    ByteVector protected_bytes;
+    protected_bytes.reserve(static_cast<std::size_t>(service.protected_size));
+    for (int index = 0; index < data_count &&
+                        protected_bytes.size() < service.protected_size; ++index) {
+        const auto remaining = static_cast<std::size_t>(
+            service.protected_size - protected_bytes.size());
+        const auto count = std::min(shard_size, remaining);
+        protected_bytes.insert(protected_bytes.end(), shards[static_cast<std::size_t>(index)].begin(),
+                               shards[static_cast<std::size_t>(index)].begin() +
+                                   static_cast<std::ptrdiff_t>(count));
+    }
+    const ByteSource repaired_source{std::span<const std::uint8_t>(protected_bytes)};
+    auto rebuilt = encode_recovery_service(
+        repaired_source, service.protected_size, service.directory_offset,
+        service.directory_size, service.percent, operation);
+    const auto footer = archive_footer_bytes(service.directory_offset, service.directory_size);
+
+    fs::path temporary = archive_path;
+    temporary += L".repair.tmp";
+    TempFileGuard guard(temporary);
+    std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
+    output.write(reinterpret_cast<const char*>(protected_bytes.data()),
+                 static_cast<std::streamsize>(protected_bytes.size()));
+    output.write(reinterpret_cast<const char*>(rebuilt.body.data()),
+                 static_cast<std::streamsize>(rebuilt.body.size()));
+    output.write(reinterpret_cast<const char*>(rebuilt.tail.data()),
+                 static_cast<std::streamsize>(rebuilt.tail.size()));
+    output.write(reinterpret_cast<const char*>(footer.data()),
+                 static_cast<std::streamsize>(footer.size()));
+    output.close();
+    if (!output) throw std::runtime_error("failed to write repaired archive");
+    input.close();
+    replace_archive_file(temporary, archive_path);
+    guard.dismiss();
+    return true;
+}
+
+ArchiveVolumeSetInfo create_archive_volumes(
+    const std::filesystem::path& archive_path, std::uint64_t volume_size,
+    unsigned recovery_volume_count,
+    const std::shared_ptr<OperationControl>& operation) {
+    if (volume_size == 0 || volume_size > std::numeric_limits<std::size_t>::max()) {
+        throw std::invalid_argument("volume size is out of range");
+    }
+    std::error_code error;
+    const std::uint64_t archive_size = fs::file_size(archive_path, error);
+    if (error) throw std::runtime_error("cannot size archive: " + error.message());
+    const std::uint64_t count64 = std::max<std::uint64_t>(
+        1, (archive_size + volume_size - 1) / volume_size);
+    if (count64 > 254 || recovery_volume_count > 255 - count64) {
+        throw std::invalid_argument("volume set exceeds the 255-shard Reed-Solomon limit");
+    }
+    const auto data_count = static_cast<int>(count64);
+    const auto parity_count = static_cast<int>(recovery_volume_count);
+    const auto shard_size = static_cast<std::size_t>(volume_size);
+    const auto digest = hash_file(archive_path, operation);
+
+    std::vector<std::vector<std::uint8_t>> data(
+        static_cast<std::size_t>(data_count), std::vector<std::uint8_t>(shard_size, 0));
+    std::ifstream input(archive_path, std::ios::binary);
+    if (!input) throw std::runtime_error("cannot open archive for splitting");
+    for (int index = 0; index < data_count; ++index) {
+        operation_checkpoint(operation);
+        const auto offset = static_cast<std::uint64_t>(index) * volume_size;
+        const auto actual = static_cast<std::size_t>(
+            std::min<std::uint64_t>(volume_size, archive_size - offset));
+        input.read(reinterpret_cast<char*>(data[static_cast<std::size_t>(index)].data()),
+                   static_cast<std::streamsize>(actual));
+        if (input.gcount() != static_cast<std::streamsize>(actual)) {
+            throw std::runtime_error("archive changed while creating volumes");
+        }
+    }
+
+    std::vector<std::vector<std::uint8_t>> parity(
+        static_cast<std::size_t>(parity_count), std::vector<std::uint8_t>(shard_size, 0));
+    if (parity_count != 0) {
+        std::vector<std::span<const std::uint8_t>> data_spans;
+        std::vector<std::span<std::uint8_t>> parity_spans;
+        for (const auto& shard : data) data_spans.emplace_back(shard);
+        for (auto& shard : parity) parity_spans.emplace_back(shard);
+        core::ReedSolomon(data_count, parity_count).encode(data_spans, parity_spans);
+    }
+
+    fs::path root = archive_path;
+    if (root.extension() == fs::path(".axar")) root.replace_extension();
+    std::vector<fs::path> created;
+    try {
+        for (int index = 0; index < data_count; ++index) {
+            operation_checkpoint(operation);
+            const auto offset = static_cast<std::uint64_t>(index) * volume_size;
+            const auto actual = static_cast<std::size_t>(
+                std::min<std::uint64_t>(volume_size, archive_size - offset));
+            VolumeHeader header{false, static_cast<std::uint32_t>(index),
+                static_cast<std::uint32_t>(data_count), static_cast<std::uint32_t>(parity_count),
+                volume_size, archive_size, digest,
+                recovery_crc(data[static_cast<std::size_t>(index)])};
+            const auto path = data_volume_path(root, static_cast<unsigned>(index));
+            write_volume(path, header, std::span<const std::uint8_t>(
+                data[static_cast<std::size_t>(index)].data(), actual));
+            created.push_back(path);
+            report_operation(operation, OperationStage::writing,
+                             std::min(archive_size, offset + actual), archive_size,
+                             index + 1, data_count + parity_count, path.filename().string());
+        }
+        for (int index = 0; index < parity_count; ++index) {
+            VolumeHeader header{true, static_cast<std::uint32_t>(index),
+                static_cast<std::uint32_t>(data_count), static_cast<std::uint32_t>(parity_count),
+                volume_size, archive_size, digest,
+                recovery_crc(parity[static_cast<std::size_t>(index)])};
+            const auto path = recovery_volume_path(root, static_cast<unsigned>(index));
+            write_volume(path, header, parity[static_cast<std::size_t>(index)]);
+            created.push_back(path);
+        }
+    } catch (...) {
+        for (const auto& path : created) fs::remove(path, error);
+        throw;
+    }
+    return {static_cast<std::uint32_t>(data_count), static_cast<std::uint32_t>(parity_count),
+            volume_size, archive_size};
+}
+
+ArchiveVolumeSetInfo archive_volume_set_info(const std::filesystem::path& any_volume) {
+    const auto header = read_volume_header(any_volume);
+    return {header.data_count, header.parity_count, header.shard_size, header.archive_size};
+}
+
+void join_archive_volumes(const std::filesystem::path& any_volume,
+                          const std::filesystem::path& output_archive,
+                          const std::shared_ptr<OperationControl>& operation) {
+    const auto seed = read_volume_header(any_volume);
+    const fs::path root = volume_root(any_volume);
+    const int data_count = static_cast<int>(seed.data_count);
+    const int parity_count = static_cast<int>(seed.parity_count);
+    const int total_count = data_count + parity_count;
+    if (seed.shard_size > std::numeric_limits<std::size_t>::max()) {
+        throw FormatError("archive volume shard is too large");
+    }
+    const auto shard_size = static_cast<std::size_t>(seed.shard_size);
+    std::vector<std::vector<std::uint8_t>> shards(
+        static_cast<std::size_t>(total_count), std::vector<std::uint8_t>(shard_size, 0));
+    std::vector<bool> present(static_cast<std::size_t>(total_count), false);
+
+    auto compatible = [&](const VolumeHeader& header, bool recovery, int index) {
+        return header.recovery == recovery && header.index == static_cast<std::uint32_t>(index) &&
+               header.data_count == seed.data_count && header.parity_count == seed.parity_count &&
+               header.shard_size == seed.shard_size && header.archive_size == seed.archive_size &&
+               header.digest == seed.digest;
+    };
+    auto read_one = [&](const fs::path& path, bool recovery, int index,
+                        std::vector<std::uint8_t>& shard) {
+        std::error_code exists_error;
+        if (!fs::exists(path, exists_error)) return false;
+        try {
+            const auto header = read_volume_header(path);
+            if (!compatible(header, recovery, index)) {
+                throw FormatError("archive volume belongs to a different set");
+            }
+            const auto expected = recovery ? shard_size : static_cast<std::size_t>(
+                std::min<std::uint64_t>(seed.shard_size,
+                    seed.archive_size - static_cast<std::uint64_t>(index) * seed.shard_size));
+            std::ifstream input(path, std::ios::binary);
+            input.seekg(static_cast<std::streamoff>(kVolumeHeaderSize));
+            input.read(reinterpret_cast<char*>(shard.data()), static_cast<std::streamsize>(expected));
+            if (input.gcount() != static_cast<std::streamsize>(expected)) return false;
+            return recovery_crc(shard) == header.payload_crc;
+        } catch (const FormatError&) {
+            throw;
+        } catch (...) {
+            return false;
+        }
+    };
+
+    for (int index = 0; index < data_count; ++index) {
+        present[static_cast<std::size_t>(index)] = read_one(
+            data_volume_path(root, static_cast<unsigned>(index)), false, index,
+            shards[static_cast<std::size_t>(index)]);
+    }
+    for (int index = 0; index < parity_count; ++index) {
+        const auto shard_index = static_cast<std::size_t>(data_count + index);
+        present[shard_index] = read_one(
+            recovery_volume_path(root, static_cast<unsigned>(index)), true, index,
+            shards[shard_index]);
+    }
+    const auto available = std::count(present.begin(), present.end(), true);
+    if (available < data_count || (available != total_count &&
+        !core::ReedSolomon(data_count, parity_count).reconstruct(shards, present))) {
+        throw FormatError("not enough archive/recovery volumes to reconstruct the archive");
+    }
+
+    fs::path temporary = output_archive;
+    temporary += L".join.tmp";
+    TempFileGuard guard(temporary);
+    std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
+    core::Blake3 hash;
+    std::uint64_t written = 0;
+    for (int index = 0; index < data_count && written < seed.archive_size; ++index) {
+        operation_checkpoint(operation);
+        const auto count = static_cast<std::size_t>(
+            std::min<std::uint64_t>(seed.shard_size, seed.archive_size - written));
+        output.write(reinterpret_cast<const char*>(shards[static_cast<std::size_t>(index)].data()),
+                     static_cast<std::streamsize>(count));
+        hash.update(std::span<const std::uint8_t>(
+            shards[static_cast<std::size_t>(index)].data(), count));
+        written += count;
+        report_operation(operation, OperationStage::writing, written, seed.archive_size,
+                         index + 1, data_count, output_archive.filename().string());
+    }
+    output.close();
+    if (!output) throw std::runtime_error("failed to join archive volumes");
+    if (hash.finalize() != seed.digest) throw FormatError("joined archive hash mismatch");
+    replace_archive_file(temporary, output_archive);
+    guard.dismiss();
 }
 
 ArchiveSigningKey generate_archive_signing_key() {

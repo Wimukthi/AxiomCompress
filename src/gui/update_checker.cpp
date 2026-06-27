@@ -27,6 +27,7 @@ namespace {
 
 constexpr wchar_t kRegistryPath[] = L"Software\\AxiomCompress\\GUI";
 constexpr wchar_t kUpdateUrlSetting[] = L"UpdateUrl";
+constexpr wchar_t kUpdateChannelSetting[] = L"UpdateChannel";
 constexpr wchar_t kAutoUpdateSetting[] = L"CheckForUpdates";
 constexpr wchar_t kLastUpdateCheckSetting[] = L"LastUpdateCheckUtc";
 constexpr DWORD kUpdateCheckIntervalSeconds = 24u * 60u * 60u;
@@ -150,7 +151,15 @@ std::wstring trim(std::wstring value) {
 
 std::wstring update_feed_url() {
     if (auto configured = read_setting_string(kUpdateUrlSetting)) {
-        return trim(*configured);
+        std::wstring url = trim(*configured);
+        const DWORD channel = read_setting_dword(kUpdateChannelSetting).value_or(0);
+        const std::wstring channel_name = channel == 1 ? L"preview" : L"stable";
+        constexpr std::wstring_view token = L"{channel}";
+        for (std::size_t pos = url.find(token); pos != std::wstring::npos;
+             pos = url.find(token, pos + channel_name.size())) {
+            url.replace(pos, token.size(), channel_name);
+        }
+        return url;
     }
     return {};
 }

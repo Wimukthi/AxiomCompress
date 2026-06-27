@@ -30,6 +30,8 @@ the archive file unless stated otherwise.
 +--------------------+
 | Central directory  |  block table + file/dir entries
 +--------------------+
+| Recovery service   |  optional Reed-Solomon parity + locator
++--------------------+
 | Footer (24 bytes)  |
 +--------------------+
 ```
@@ -82,7 +84,8 @@ unknown types are skipped by length, the same way block- and entry-level extras 
 | 3    | encryption | KDF params + salt + key-check token (see *Encryption*) |
 | 4    | signature  | signer public key (32 bytes) + Monocypher EdDSA signature (64 bytes) |
 
-Recovery-record parameters and volume info will be added here as further types.
+Recovery data is deliberately outside the central-directory TLV. This lets repair
+locate it even when the protected directory itself is damaged.
 
 ### Encryption
 
@@ -173,6 +176,61 @@ Readers consume the extra records they understand and **skip the rest by
 `payload_len`**. A file's bytes are recovered by reading `size` bytes starting at
 (`first_block`, `offset`), continuing into consecutive blocks (using each block's
 `uncompressed_size`) when the file straddles a boundary.
+
+### Optional recovery service
+
+An archive created with `--recovery N`, or updated with `axiomc recovery`, places
+a systematic Reed-Solomon service after the central directory. The protected byte
+range is `[0, directory_offset + directory_size)`: header, optional encryption
+preamble, all stored solid blocks, and the complete central directory.
+
+| field | type | notes |
+|---|---|---|
+| magic | u8[8] | `"AXIOMRR\0"` |
+| version | u16 | recovery-service version, currently `1` |
+| percent | u16 | requested redundancy percentage, `1..100` |
+| data_shards | u16 | systematic data-shard count |
+| parity_shards | u16 | Reed-Solomon parity-shard count |
+| shard_size | u64 | bytes per shard; final data shard is zero-padded |
+| protected_size | u64 | end of the protected archive range |
+| directory_offset | u64 | copied directory location for repair |
+| directory_size | u64 | copied directory length for repair |
+| checksums | u32[] | CRC-32 for every data shard, then every parity shard |
+| parity | u8[] | `parity_shards * shard_size` bytes |
+
+The body is followed by a fixed 24-byte locator immediately before the normal
+archive footer: `u64 service_offset`, `u64 service_size`, `u8[8] "AXIOMRR\0"`.
+The normal footer remains last, so listing and extraction need no special path
+when the archive is intact. Repair validates each shard CRC, treats failures as
+erasures, reconstructs up to `parity_shards` unavailable shards, and atomically
+rewrites the protected data and fresh recovery parity.
+
+### Split and recovery volumes
+
+Volume sets wrap the exact bytes of a completed `.axar`; they are not individually
+parseable archives. For `name.axar`, data volumes are `name.part001.axar`,
+`name.part002.axar`, … and optional recovery volumes are `name.rev001`,
+`name.rev002`, … . Every member begins with this 80-byte header:
+
+| field | type | notes |
+|---|---|---|
+| magic | u8[8] | `"AXIOMVL\0"` |
+| version | u16 | volume format version, currently `1` |
+| kind | u16 | `0` data, `1` recovery |
+| index | u32 | zero-based index within its kind |
+| data_count | u32 | number of data volumes |
+| recovery_count | u32 | number of parity volumes |
+| shard_size | u64 | target data-volume payload size |
+| archive_size | u64 | exact original `.axar` size |
+| archive_digest | u8[32] | BLAKE3-256 of the original archive |
+| payload_crc | u32 | CRC-32 of the zero-padded shard |
+| reserved | u32 | `0` |
+
+Data payloads are consecutive archive byte ranges; only the last may be shorter
+than `shard_size`. Recovery payloads are full Reed-Solomon parity shards. Joining
+validates set identity and payload CRCs, reconstructs unavailable shards when
+enough members survive, truncates to `archive_size`, verifies `archive_digest`,
+and installs the output atomically. A set is limited to 255 total volumes.
 
 ### Footer (24 bytes, at end of file)
 
@@ -278,6 +336,10 @@ What the format and the current implementation do and do not handle:
   This primitive is not wire-compatible with standard SHA-512 Ed25519.
 - **SFX packaging:** an intact `.axar` is appended to `Axiom.exe`, followed by
   `"AXIOMSFX"` and a u64 archive length. The stub verifies and extracts the payload.
+- **Recovery records:** optional Reed-Solomon parity protects the archive through
+  the end of its central directory and supports atomic repair.
+- **Split/recovery volumes:** exact archive bytes can be divided into checked data
+  volumes and reconstructed from optional `.rev` parity volumes.
 
 **Additional behavior and current limits**
 

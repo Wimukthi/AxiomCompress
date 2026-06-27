@@ -77,6 +77,7 @@ if(WIN32)
         src/gui/browser_model.cpp
         src/gui/operation_runner.cpp
         src/gui/operation_progress_window.cpp
+        src/gui/sfx_dialog.cpp
         src/gui/dialog_support.cpp
         src/gui/message_dialog.cpp
         src/gui/about_dialog.cpp

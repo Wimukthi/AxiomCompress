@@ -129,10 +129,12 @@ bool OperationProgressWindow::create(HWND owner,
     AdjustWindowRectExForDpi(&window_rect, kWindowStyle, FALSE, 0, dpi_);
     const int width = window_rect.right - window_rect.left;
     const int height = window_rect.bottom - window_rect.top;
-    RECT owner_rect{};
-    GetWindowRect(owner, &owner_rect);
-    const int x = owner_rect.left + (owner_rect.right - owner_rect.left - width) / 2;
-    const int y = owner_rect.top + (owner_rect.bottom - owner_rect.top - height) / 2;
+    RECT anchor_rect{};
+    if (owner == nullptr || !GetWindowRect(owner, &anchor_rect)) {
+        SystemParametersInfoW(SPI_GETWORKAREA, 0, &anchor_rect, 0);
+    }
+    const int x = anchor_rect.left + (anchor_rect.right - anchor_rect.left - width) / 2;
+    const int y = anchor_rect.top + (anchor_rect.bottom - anchor_rect.top - height) / 2;
     const std::wstring caption = title_ + L" - Axiom";
     hwnd_ = CreateWindowExW(WS_EX_TOOLWINDOW, kWindowClass, caption.c_str(),
                             kWindowStyle,
