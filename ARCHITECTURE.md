@@ -111,7 +111,9 @@ higher-effort ratio tools for levels that explicitly trade speed away.
 A single `--level 1..9` knob selects the speed/ratio operating point (default 5).
 Levels 1–6 drive the hash-chain matcher, raising chain depth and turning on lazy
 matching and the full entropy bake-off as the level rises; levels 7–9 switch to
-the binary-tree matcher with growing windows, and level 9 adds the optimal parser.
+the binary-tree matcher with growing windows. Level 9 keeps the deepest default
+tree search but uses bounded solid blocks so mixed random/text archives do not
+spend maximum effort on data that will be stored anyway.
 Individual flags (`--chain-depth`, `--nice`, `--lazy`/`--no-lazy`,
 `--fast-entropy`, `--bt`, `--window`, `--optimal…`) override the preset, so a level
 is just a starting point. The decoder is identical at every level.

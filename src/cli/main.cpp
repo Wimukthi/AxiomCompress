@@ -4,6 +4,7 @@
 #include <ctime>
 #include <array>
 #include <algorithm>
+#include <cctype>
 #include <fstream>
 #include <exception>
 #include <filesystem>
@@ -13,6 +14,12 @@
 #include <string_view>
 #include <utility>
 #include <vector>
+
+#ifdef _WIN32
+#include <io.h>
+#else
+#include <unistd.h>
+#endif
 
 namespace {
 
@@ -70,6 +77,91 @@ void print_usage() {
         "  --overwrite MODE   extract only: fail (default), skip, all\n";
 }
 
+bool stream_is_terminal(FILE* stream) {
+#ifdef _WIN32
+    return _isatty(_fileno(stream)) != 0;
+#else
+    return isatty(fileno(stream)) != 0;
+#endif
+}
+
+void print_splash() {
+    std::cout <<
+        "     ___        _                \n"
+        "    / _ \\__  __(_) ___  _ __ ___ \n"
+        "   / /_)/\\ \\/ /| |/ _ \\| '_ ` _ \\\n"
+        "  / ___/  >  < | | (_) | | | | | |\n"
+        "  \\/     /_/\\_\\|_|\\___/|_| |_| |_|\n"
+        "\n"
+        "        Axiom Archive Manager\n"
+        "  type \"help\" for commands, \"exit\" to quit\n\n";
+}
+
+void print_interactive_help() {
+    std::cout <<
+        "Interactive commands:\n"
+        "  help                         show full command help\n"
+        "  clear                        clear the console\n"
+        "  pwd                          print the current working directory\n"
+        "  cd <dir>                     change the current working directory\n"
+        "  exit | quit                  leave the prompt\n"
+        "\n"
+        "Examples:\n"
+        "  a archive.axar folder file.txt\n"
+        "  l archive.axar\n"
+        "  t archive.axar\n"
+        "  x --overwrite skip archive.axar out\n"
+        "  a --level 9 --threads 0 backup.axar D:\\data\n"
+        "\n";
+}
+
+std::string trim_ascii(std::string value) {
+    const auto first = std::find_if_not(value.begin(), value.end(), [](unsigned char ch) {
+        return std::isspace(ch) != 0;
+    });
+    const auto last = std::find_if_not(value.rbegin(), value.rend(), [](unsigned char ch) {
+        return std::isspace(ch) != 0;
+    }).base();
+    if (first >= last) return {};
+    return std::string(first, last);
+}
+
+std::vector<std::string> split_interactive_command(std::string_view line) {
+    std::vector<std::string> result;
+    std::string current;
+    bool in_quotes = false;
+
+    for (std::size_t index = 0; index < line.size(); ++index) {
+        const char ch = line[index];
+        if (ch == '\\') {
+            if (index + 1 < line.size() &&
+                (line[index + 1] == '"' || line[index + 1] == '\\')) {
+                current.push_back(line[++index]);
+            } else {
+                current.push_back(ch);
+            }
+            continue;
+        }
+        if (ch == '"') {
+            in_quotes = !in_quotes;
+            continue;
+        }
+        if (!in_quotes && std::isspace(static_cast<unsigned char>(ch)) != 0) {
+            if (!current.empty()) {
+                result.push_back(std::move(current));
+                current.clear();
+            }
+            continue;
+        }
+        current.push_back(ch);
+    }
+    if (in_quotes) {
+        throw std::runtime_error("unterminated quote");
+    }
+    if (!current.empty()) result.push_back(std::move(current));
+    return result;
+}
+
 std::size_t parse_size(const std::string& value) {
     std::string digits = value;
     std::size_t multiplier = 1;
@@ -113,7 +205,8 @@ void write_key(const fs::path& path, const std::array<std::uint8_t, Size>& key) 
 // Effort presets, fastest (1) to maximum ratio (9). Each level picks a coherent
 // set of match-finder and entropy knobs; individual --flags still override. Levels
 // 1-6 drive the hash-chain matcher (depth + lazy + entropy effort); 7-9 switch to
-// the binary-tree matcher with growing windows, and 9 adds the optimal parser.
+// the binary-tree matcher with growing windows. The optimal parser remains an
+// explicit --optimal override because its per-byte DP cost is significant.
 void apply_level(axiom::CompressionOptions& o, int level) {
     if (level < 1) level = 1;
     if (level > 9) level = 9;
@@ -144,12 +237,11 @@ void apply_level(axiom::CompressionOptions& o, int level) {
             o.auto_block_size_for_threads = false;
             break;
         case 9:
-            // Maximum ratio that still finishes in bounded time/memory: one big
-            // block so the binary tree sees a full window. The optimal parser is
-            // left opt-in (`--optimal`, ideally with a smaller `--block-size`) — its
-            // per-byte DP makes it impractical on a 100 MB single block.
+            // Maximum preset keeps the deepest tree search, but avoids a single
+            // huge mixed-content block where random regions dominate runtime and
+            // still end up stored.
             o.use_tree_matcher = true; o.max_chain_depth = 512;
-            o.block_size = 512u << 20; o.window_size = 512u << 20; o.fast_entropy = false;
+            o.block_size = 16u << 20; o.window_size = 64u << 20; o.fast_entropy = false;
             o.auto_block_size_for_threads = false;
             break;
     }
@@ -658,85 +750,151 @@ int run_decompress(std::vector<std::string> args) {
     return 0;
 }
 
+int run_command(std::string_view command, std::vector<std::string> args) {
+    if (command == "help" || command == "-h" || command == "--help" || command == "/?") {
+        print_usage();
+        return 0;
+    }
+    if (command == "a" || command == "add") {
+        return run_add(std::move(args));
+    }
+    if (command == "u" || command == "update") {
+        return run_update(std::move(args), /*fresh_only=*/false);
+    }
+    if (command == "f" || command == "fresh") {
+        return run_update(std::move(args), /*fresh_only=*/true);
+    }
+    if (command == "s" || command == "sync") {
+        return run_sync(std::move(args));
+    }
+    if (command == "delete" || command == "rm") {
+        return run_delete(std::move(args));
+    }
+    if (command == "repack") {
+        return run_repack(std::move(args));
+    }
+    if (command == "comment") {
+        return run_comment(std::move(args));
+    }
+    if (command == "lock") {
+        return run_lock(std::move(args));
+    }
+    if (command == "recovery" || command == "rr") {
+        return run_recovery(args);
+    }
+    if (command == "repair") {
+        return run_repair(args);
+    }
+    if (command == "split") {
+        return run_split(args);
+    }
+    if (command == "join") {
+        return run_join(args);
+    }
+    if (command == "x" || command == "extract") {
+        return run_extract(std::move(args));
+    }
+    if (command == "l" || command == "list") {
+        return run_list(args);
+    }
+    if (command == "t" || command == "test") {
+        return run_test(std::move(args));
+    }
+    if (command == "keygen") {
+        return run_keygen(args);
+    }
+    if (command == "sign") {
+        return run_sign(std::move(args));
+    }
+    if (command == "verify") {
+        return run_verify(std::move(args));
+    }
+    if (command == "sfx") {
+        return run_sfx(args);
+    }
+    if (command == "c" || command == "compress") {
+        return run_compress(std::move(args));
+    }
+    if (command == "d" || command == "decompress") {
+        return run_decompress(std::move(args));
+    }
+
+    std::cerr << "axiomc: unknown command " << command << '\n';
+    print_interactive_help();
+    return 2;
+}
+
+int run_interactive_shell() {
+    if (stream_is_terminal(stdout)) {
+        print_splash();
+    } else {
+        print_interactive_help();
+    }
+
+    std::string line;
+    for (;;) {
+        if (stream_is_terminal(stdout)) {
+            std::cout << "axiom> " << std::flush;
+        }
+        if (!std::getline(std::cin, line)) {
+            std::cout << '\n';
+            return 0;
+        }
+        line = trim_ascii(std::move(line));
+        if (line.empty()) continue;
+
+        try {
+            std::vector<std::string> tokens = split_interactive_command(line);
+            if (tokens.empty()) continue;
+            const std::string command = tokens.front();
+            tokens.erase(tokens.begin());
+
+            if (command == "exit" || command == "quit") {
+                return 0;
+            }
+            if (command == "clear" || command == "cls") {
+                std::cout << "\x1b[2J\x1b[H";
+                continue;
+            }
+            if (command == "pwd") {
+                std::cout << fs::current_path().string() << '\n';
+                continue;
+            }
+            if (command == "cd") {
+                if (tokens.size() != 1) {
+                    std::cerr << "usage: cd <dir>\n";
+                    continue;
+                }
+                fs::current_path(tokens.front());
+                continue;
+            }
+
+            const int exit_code = run_command(command, std::move(tokens));
+            if (exit_code != 0) {
+                std::cout << "command failed with exit code " << exit_code << '\n';
+            }
+        } catch (const std::exception& ex) {
+            std::cerr << "axiomc: " << ex.what() << '\n';
+        }
+    }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
+    executable_path = fs::absolute(argv[0]);
     if (argc < 2) {
-        print_usage();
-        return 2;
+        return run_interactive_shell();
     }
 
-    executable_path = fs::absolute(argv[0]);
     const std::string_view command = argv[1];
+    if (command == "shell" || command == "--interactive") {
+        return run_interactive_shell();
+    }
     std::vector<std::string> args(argv + 2, argv + argc);
 
     try {
-        if (command == "a" || command == "add") {
-            return run_add(std::move(args));
-        }
-        if (command == "u" || command == "update") {
-            return run_update(std::move(args), /*fresh_only=*/false);
-        }
-        if (command == "f" || command == "fresh") {
-            return run_update(std::move(args), /*fresh_only=*/true);
-        }
-        if (command == "s" || command == "sync") {
-            return run_sync(std::move(args));
-        }
-        if (command == "delete" || command == "rm") {
-            return run_delete(std::move(args));
-        }
-        if (command == "repack") {
-            return run_repack(std::move(args));
-        }
-        if (command == "comment") {
-            return run_comment(std::move(args));
-        }
-        if (command == "lock") {
-            return run_lock(std::move(args));
-        }
-        if (command == "recovery" || command == "rr") {
-            return run_recovery(args);
-        }
-        if (command == "repair") {
-            return run_repair(args);
-        }
-        if (command == "split") {
-            return run_split(args);
-        }
-        if (command == "join") {
-            return run_join(args);
-        }
-        if (command == "x" || command == "extract") {
-            return run_extract(std::move(args));
-        }
-        if (command == "l" || command == "list") {
-            return run_list(args);
-        }
-        if (command == "t" || command == "test") {
-            return run_test(std::move(args));
-        }
-        if (command == "keygen") {
-            return run_keygen(args);
-        }
-        if (command == "sign") {
-            return run_sign(std::move(args));
-        }
-        if (command == "verify") {
-            return run_verify(std::move(args));
-        }
-        if (command == "sfx") {
-            return run_sfx(args);
-        }
-        if (command == "c" || command == "compress") {
-            return run_compress(std::move(args));
-        }
-        if (command == "d" || command == "decompress") {
-            return run_decompress(std::move(args));
-        }
-
-        print_usage();
-        return 2;
+        return run_command(command, std::move(args));
     } catch (const std::exception& ex) {
         std::cerr << "axiomc: " << ex.what() << '\n';
         return 1;

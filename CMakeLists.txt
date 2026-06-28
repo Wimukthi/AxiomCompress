@@ -75,6 +75,7 @@ if(WIN32)
         src/gui/drag_drop.cpp
         src/gui/settings_store.cpp
         src/gui/browser_model.cpp
+        src/gui/benchmark_dialog.cpp
         src/gui/operation_runner.cpp
         src/gui/operation_progress_window.cpp
         src/gui/sfx_dialog.cpp

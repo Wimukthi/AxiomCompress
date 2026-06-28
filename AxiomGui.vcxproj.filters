@@ -41,6 +41,9 @@
     <ClCompile Include="src\gui\browser_model.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="src\gui\benchmark_dialog.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="src\gui\operation_runner.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -78,6 +81,9 @@
     </ClInclude>
     <ClInclude Include="src\gui\drag_drop.hpp"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="src\gui\settings_store.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\gui\benchmark_dialog.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="src\gui\operation_runner.hpp">

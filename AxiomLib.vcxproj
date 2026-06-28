@@ -73,6 +73,7 @@
     <ClInclude Include="include\axiom\archive.hpp" />
     <ClInclude Include="src\codec\block.hpp" />
     <ClInclude Include="src\codec\fast_lz.hpp" />
+    <ClInclude Include="src\codec\incompressible.hpp" />
     <ClInclude Include="src\codec\lz77.hpp" />
     <ClInclude Include="src\codec\lz77_split.hpp" />
     <ClInclude Include="src\codec\varint.hpp" />

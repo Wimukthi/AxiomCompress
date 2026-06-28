@@ -17,7 +17,10 @@ What it does today:
   order-0 rANS**, and an adaptive **order-1** coder — chosen per substream.
 - **Threaded** independent-block compression and decompression, with progress
   reporting and cooperative pause/cancel (`OperationControl`).
-- **CLI** (`axiomc`) and a **Windows GUI** (`Axiom.exe`).
+- **CLI** (`axiomc`) with direct command mode plus an interactive prompt when
+  launched without arguments.
+- **Windows GUI** (`Axiom.exe`) with native archive browsing and a
+  `Tools > Benchmark...` throughput test inspired by 7-Zip's benchmark window.
 - Coverage-guided libFuzzer+ASan targets and a Release-mode test suite.
 
 It does not yet match 7-Zip's ratio — the open gap is the entropy stage — but it
@@ -194,7 +197,7 @@ to the cyclic-window binary tree with growing windows.
 | 6 | hash, chain 256 | best hash-chain ratio |
 | 7 | bt, 8M window | long-range matches, still parallel |
 | 8 | bt, 32M window | wider window |
-| 9 (`--max`) | bt, full window | maximum ratio, slowest |
+| 9 (`--max`) | bt, 64M window / 16M block | maximum preset with bounded mixed-data runtime |
 
 Individual flags override the preset (in any order): `--chain-depth N`, `--nice N`,
 `--lazy` / `--no-lazy`, `--fast-entropy`, `--bt`, `--window SIZE`, `--block-size`,

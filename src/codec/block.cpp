@@ -1,6 +1,7 @@
 #include "codec/block.hpp"
 
 #include "codec/fast_lz.hpp"
+#include "codec/incompressible.hpp"
 #include "codec/lz77.hpp"
 #include "codec/lz77_split.hpp"
 #include "codec/varint.hpp"
@@ -81,6 +82,10 @@ BlockResult compress_block(std::span<const std::uint8_t> input,
     best.codec = BlockCodec::store;
     best.original_size = input.size();
     best.payload.assign(input.begin(), input.end());
+
+    if (likely_incompressible(input)) {
+        return best;
+    }
 
     if (options.use_fast_lz) {
         // The fast path's primary codec is LZ77 sequences entropy-coded with the
@@ -328,13 +333,17 @@ ByteVector encode_parallel_blocks(std::span<const std::uint8_t> input,
         }
     };
 
-    std::vector<std::thread> workers;
-    workers.reserve(worker_count);
-    for (std::size_t i = 0; i < worker_count; ++i) {
-        workers.emplace_back(worker);
-    }
-    for (auto& thread : workers) {
-        thread.join();
+    if (worker_count <= 1) {
+        worker();
+    } else {
+        std::vector<std::thread> workers;
+        workers.reserve(worker_count);
+        for (std::size_t i = 0; i < worker_count; ++i) {
+            workers.emplace_back(worker);
+        }
+        for (auto& thread : workers) {
+            thread.join();
+        }
     }
     if (first_exception) {
         std::rethrow_exception(first_exception);
@@ -403,13 +412,17 @@ ByteVector decode_parallel_blocks(std::span<const std::uint8_t> encoded,
         }
     };
 
-    std::vector<std::thread> workers;
-    workers.reserve(worker_count);
-    for (std::size_t i = 0; i < worker_count; ++i) {
-        workers.emplace_back(worker);
-    }
-    for (auto& thread : workers) {
-        thread.join();
+    if (worker_count <= 1) {
+        worker();
+    } else {
+        std::vector<std::thread> workers;
+        workers.reserve(worker_count);
+        for (std::size_t i = 0; i < worker_count; ++i) {
+            workers.emplace_back(worker);
+        }
+        for (auto& thread : workers) {
+            thread.join();
+        }
     }
     if (first_exception) {
         std::rethrow_exception(first_exception);

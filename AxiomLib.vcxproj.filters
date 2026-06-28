@@ -36,6 +36,9 @@
     <ClInclude Include="src\codec\fast_lz.hpp">
       <Filter>Codec</Filter>
     </ClInclude>
+    <ClInclude Include="src\codec\incompressible.hpp">
+      <Filter>Codec</Filter>
+    </ClInclude>
     <ClInclude Include="src\codec\lz77_split.hpp">
       <Filter>Codec</Filter>
     </ClInclude>

@@ -28,6 +28,38 @@ axiomc a "D:\Backups\Work files.axar" "D:\Work files"
 Options may appear before or after positional paths, although putting options
 first is easier to read.
 
+## Interactive shell
+
+Launching `axiomc` without arguments opens an interactive prompt instead of
+printing usage and closing:
+
+```powershell
+axiomc
+```
+
+The prompt shows the Axiom ASCII logo, then accepts the same commands documented
+below without the leading `axiomc`:
+
+```text
+axiom> a backup.axar "D:\Work files"
+axiom> l backup.axar
+axiom> t backup.axar
+axiom> x backup.axar restored
+axiom> exit
+```
+
+You can also enter the prompt explicitly with `axiomc shell` or
+`axiomc --interactive`. Command-line mode remains script-friendly: when arguments
+are supplied, Axiom runs the command and exits normally without the splash.
+
+Prompt helpers:
+
+- `help` prints the full command help.
+- `pwd` prints the current working directory.
+- `cd <dir>` changes the working directory.
+- `clear` clears the console.
+- `exit` or `quit` closes the prompt.
+
 ## Command overview
 
 | Command | Purpose |
@@ -288,7 +320,7 @@ axiomc a --max maximum-ratio.axar Data
 | 6 | Deep hash-chain search | Better ratio without tree memory |
 | 7 | Binary tree, 8 MiB window/block | High ratio |
 | 8 | Binary tree, 32 MiB window/block | Very high ratio |
-| 9 | Binary tree, 512 MiB window/block | Maximum preset; high memory |
+| 9 | Binary tree, 64 MiB window / 16 MiB block | Maximum preset; bounded high-effort search |
 
 Explicit tuning options override the level regardless of argument order.
 

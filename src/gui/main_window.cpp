@@ -5,6 +5,7 @@
 #include "gui/app.hpp"
 #include "gui/archive_dialogs.hpp"
 #include "gui/archive_feature_dialogs.hpp"
+#include "gui/benchmark_dialog.hpp"
 #include "gui/browser_model.hpp"
 #include "gui/custom_menu.hpp"
 #include "gui/dialog_support.hpp"
@@ -114,6 +115,7 @@ enum ControlId : int {
     kVerifyArchiveSignature = 1129,
     kCreateSfx = 1130,
     kFreshenArchive = 1131,
+    kBenchmark = 1132,
 };
 
 template <typename T>
@@ -623,8 +625,8 @@ void apply_level(axiom::CompressionOptions& options, int level) {
         case 9:
             options.use_tree_matcher = true;
             options.max_chain_depth = 512;
-            options.block_size = 512u << 20;
-            options.window_size = 512u << 20;
+            options.block_size = 16u << 20;
+            options.window_size = 64u << 20;
             options.fast_entropy = false;
             options.auto_block_size_for_threads = false;
             break;
@@ -2274,6 +2276,8 @@ private:
                 return {
                     {kInfo, L"Archive &information", L"Ctrl+I"},
                     {kArchiveFeatures, L"Archive &features...", L"", has_archive},
+                    {0, L"", L"", false, true},
+                    {kBenchmark, L"&Benchmark...", L"", !busy_},
                     {0, L"", L"", false, true},
                     {kEditArchiveComment, L"Edit archive &comment...", L"",
                       !busy_ && has_archive && capabilities.comments && archive_editable},
@@ -3988,6 +3992,10 @@ private:
         axiom::gui::show_about_dialog(hwnd_, instance_, dpi_, theme_.dark, kCheckUpdates);
     }
 
+    void on_benchmark() {
+        axiom::gui::show_benchmark_dialog(hwnd_, instance_, dpi_, theme_.dark);
+    }
+
     void maybe_start_automatic_update_check() {
         if (axiom::gui::automatic_update_check_due()) {
             begin_update_check(axiom::gui::UpdateCheckKind::automatic);
@@ -4961,6 +4969,7 @@ private:
                     case kCreateRecoveryVolumes: on_create_recovery_volumes(); return 0;
                     case kVerifyArchiveSignature: on_verify_archive_signature(); return 0;
                     case kCreateSfx: on_create_sfx(); return 0;
+                    case kBenchmark: on_benchmark(); return 0;
                     case kSettings: on_settings(); return 0;
                     case kSelectAll: on_select_all(); return 0;
                     case kAbout: on_about(); return 0;

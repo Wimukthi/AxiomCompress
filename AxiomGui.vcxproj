@@ -92,6 +92,7 @@
     <ClCompile Include="src\gui\drag_drop.cpp" />
     <ClCompile Include="src\gui\settings_store.cpp" />
     <ClCompile Include="src\gui\browser_model.cpp" />
+    <ClCompile Include="src\gui\benchmark_dialog.cpp" />
     <ClCompile Include="src\gui\operation_runner.cpp" />
     <ClCompile Include="src\gui\operation_progress_window.cpp" />
     <ClCompile Include="src\gui\sfx_dialog.cpp" />
@@ -112,6 +113,7 @@
     <ClInclude Include="src\gui\directory_watcher.hpp" />
     <ClInclude Include="src\gui\drag_drop.hpp" />
     <ClInclude Include="src\gui\settings_store.hpp" />
+    <ClInclude Include="src\gui\benchmark_dialog.hpp" />
     <ClInclude Include="src\gui\operation_runner.hpp" />
     <ClInclude Include="src\gui\operation_progress_window.hpp" />
     <ClInclude Include="src\gui\sfx_dialog.hpp" />

@@ -1,6 +1,7 @@
 #include "core/archive.hpp"
 
 #include "codec/block.hpp"
+#include "codec/incompressible.hpp"
 #include "codec/lz77.hpp"
 #include "codec/lz77_split.hpp"
 #include "core/checksum.hpp"
@@ -198,6 +199,8 @@ ByteVector compress(std::span<const std::uint8_t> input,
 
     if (options.force_store) {
         payload.assign(input.begin(), input.end());
+    } else if (!options.force_parallel_blocks && codec::likely_incompressible(input)) {
+        payload.assign(input.begin(), input.end());
     } else {
         auto parallel_options = options;
         parallel_options.block_size = codec::effective_parallel_block_size(input.size(), options);
@@ -238,9 +241,10 @@ ByteVector compress(std::span<const std::uint8_t> input,
             return core::write_archive(payload, header);
         }
 
-        std::future<ByteVector> block_future;
         const auto evaluate_parallel_candidate = block_count > 1 && workers > 1;
-        if (evaluate_parallel_candidate) {
+        const bool thorough = options.enable_optimal_parser;
+        std::future<ByteVector> block_future;
+        if (evaluate_parallel_candidate && thorough) {
             block_future = std::async(std::launch::async, [&input, parallel_options] {
                 return codec::encode_parallel_blocks(input, parallel_options);
             });
@@ -291,10 +295,8 @@ ByteVector compress(std::span<const std::uint8_t> input,
         // uses the parallel result; the slower single-stream (and optimal)
         // analysis runs only for small inputs or when maximum effort is asked
         // for via the optimal parser.
-        const bool thorough = options.enable_optimal_parser;
-
         if (evaluate_parallel_candidate && !thorough) {
-            auto block_payload = block_future.get();
+            auto block_payload = codec::encode_parallel_blocks(input, parallel_options);
             if (block_payload.size() < payload.size()) {
                 codec = core::CodecId::parallel_blocks;
                 payload = std::move(block_payload);
