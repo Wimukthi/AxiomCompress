@@ -85,6 +85,8 @@ if(WIN32)
         src/gui/update_checker.cpp
         src/gui/axiom_gui.rc)
     target_link_libraries(axiom_gui PRIVATE axiom Bcrypt Comctl32 Dwmapi Msimg32 Ole32 Shell32 Uxtheme Version Winhttp)
+    target_include_directories(axiom_gui PRIVATE src)
+    target_compile_definitions(axiom_gui PRIVATE UNICODE _UNICODE)
     set_target_properties(axiom_gui PROPERTIES OUTPUT_NAME "Axiom")
 endif()
 
@@ -92,4 +94,5 @@ enable_testing()
 
 add_executable(axiom_roundtrip tests/roundtrip_test.cpp)
 target_link_libraries(axiom_roundtrip PRIVATE axiom)
+target_include_directories(axiom_roundtrip PRIVATE src)
 add_test(NAME axiom_roundtrip COMMAND axiom_roundtrip)
