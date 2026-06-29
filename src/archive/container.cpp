@@ -364,8 +364,9 @@ void scan_input(const fs::path& input, std::vector<ScanItem>& items) {
 
     const fs::path base = input.has_parent_path() ? input.parent_path() : fs::path(".");
     auto relative_path = [&](const fs::path& path) {
-        auto rel = fs::relative(path, base, ec).generic_string();
-        if (ec || rel.empty()) {
+        const fs::path lexical = path.lexically_relative(base);
+        auto rel = lexical.generic_string();
+        if (rel.empty()) {
             rel = path.filename().generic_string();
         }
         return rel;
