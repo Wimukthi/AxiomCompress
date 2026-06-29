@@ -399,11 +399,15 @@ void scan_input(const fs::path& input, std::vector<ScanItem>& items) {
              it != end && !ec;
              it.increment(ec)) {
             const auto& entry = *it;
-            if (entry.is_symlink(ec)) {
+            const fs::file_status entry_status = fs::symlink_status(entry.path(), ec);
+            if (ec) {
+                continue;
+            }
+            if (fs::is_symlink(entry_status)) {
                 items.push_back(symlink_item(entry.path()));
-            } else if (entry.is_directory(ec)) {
+            } else if (fs::is_directory(entry_status)) {
                 items.push_back({entry.path(), relative_path(entry.path()), true});
-            } else if (entry.is_regular_file(ec)) {
+            } else if (fs::is_regular_file(entry_status)) {
                 items.push_back({entry.path(), relative_path(entry.path()), false});
             }
         }
@@ -463,11 +467,15 @@ void scan_input_at(const ArchiveInput& input, std::vector<ScanItem>& items,
          it != end && !ec; it.increment(ec)) {
         operation_checkpoint(operation);
         const auto& entry = *it;
-        if (entry.is_symlink(ec)) {
+        const fs::file_status entry_status = fs::symlink_status(entry.path(), ec);
+        if (ec) {
+            continue;
+        }
+        if (fs::is_symlink(entry_status)) {
             add_symlink(entry.path());
-        } else if (entry.is_directory(ec)) {
+        } else if (fs::is_directory(entry_status)) {
             items.push_back({entry.path(), archive_path_for(entry.path()), true});
-        } else if (entry.is_regular_file(ec)) {
+        } else if (fs::is_regular_file(entry_status)) {
             items.push_back({entry.path(), archive_path_for(entry.path()), false});
         }
     }

@@ -13,8 +13,18 @@ $outDir = Join-Path $Root "build\fuzz"
 
 # The ASan/libFuzzer runtime DLL ships beside cl.exe; put it on PATH so the
 # instrumented executables can load it outside a developer shell.
-$clangRt = Get-ChildItem "C:\Program Files\Microsoft Visual Studio" -Recurse `
+function Find-VisualStudioRoot {
+    $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+    if (Test-Path $vswhere) {
+        $install = & $vswhere -latest -products * -property installationPath
+        if ($install) { return $install }
+    }
+    return "C:\Program Files\Microsoft Visual Studio"
+}
+
+$clangRt = Get-ChildItem (Find-VisualStudioRoot) -Recurse `
     -Filter "clang_rt.asan_dynamic-x86_64.dll" -ErrorAction SilentlyContinue |
+    Sort-Object FullName -Descending |
     Select-Object -First 1
 if ($clangRt) { $env:PATH = "$($clangRt.Directory.FullName);$env:PATH" }
 $env:ASAN_OPTIONS = "allocator_may_return_null=1"

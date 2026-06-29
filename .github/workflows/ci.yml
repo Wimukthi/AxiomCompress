@@ -21,7 +21,7 @@ jobs:
         os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Configure
         run: cmake -B build -DCMAKE_BUILD_TYPE=Release
       - name: Build
@@ -34,19 +34,33 @@ jobs:
   fuzz-linux:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Pick fuzz duration
         id: dur
         run: echo "seconds=${{ github.event_name == 'schedule' && 600 || 60 }}" >> "$GITHUB_OUTPUT"
       - name: Build fuzz targets (clang + libFuzzer + ASan)
         run: |
           set -euo pipefail
-          srcs="src/archive/container.cpp src/codec/block.cpp src/codec/lz77.cpp \
-                src/codec/fast_lz.cpp src/codec/lz77_split.cpp src/core/archive.cpp src/core/checksum.cpp \
-                src/entropy/huffman.cpp src/entropy/range.cpp"
+          cxx_srcs="src/archive/container.cpp src/codec/block.cpp src/codec/fast_lz.cpp \
+                    src/codec/lz77.cpp src/codec/lz77_split.cpp src/core/archive.cpp \
+                    src/core/checksum.cpp src/core/cpu.cpp src/core/crypto.cpp \
+                    src/core/file_meta.cpp src/core/reed_solomon.cpp \
+                    src/entropy/huffman.cpp src/entropy/range.cpp"
+          c_srcs="src/third_party/blake3/blake3.c src/third_party/blake3/blake3_dispatch.c \
+                  src/third_party/blake3/blake3_portable.c src/third_party/monocypher/monocypher.c"
+          mkdir -p build/fuzz-linux
+          c_objs=()
+          for src in $c_srcs; do
+            obj="build/fuzz-linux/$(basename "$src").o"
+            clang -std=c17 -O1 -g -fsanitize=address \
+              -DBLAKE3_NO_AVX512 -DBLAKE3_NO_AVX2 -DBLAKE3_NO_SSE41 -DBLAKE3_NO_SSE2 \
+              -Iinclude -Isrc -c "$src" -o "$obj"
+            c_objs+=("$obj")
+          done
           for target in fuzz_decompress fuzz_archive; do
             clang++ -std=c++20 -O1 -g -fsanitize=fuzzer,address \
-              -Iinclude -Isrc $srcs fuzz/$target.cpp -o $target
+              -DBLAKE3_NO_AVX512 -DBLAKE3_NO_AVX2 -DBLAKE3_NO_SSE41 -DBLAKE3_NO_SSE2 \
+              -Iinclude -Isrc $cxx_srcs fuzz/$target.cpp "${c_objs[@]}" -o $target
           done
       - name: Fuzz decode surfaces
         run: |
@@ -56,7 +70,7 @@ jobs:
           ASAN_OPTIONS=allocator_may_return_null=1 ./fuzz_archive    -max_total_time=$secs -rss_limit_mb=2048
       - name: Upload crash artifacts
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: fuzz-crashes
           path: |
@@ -70,7 +84,7 @@ jobs:
   fuzz-windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Build axiomc (for seed corpus)
         run: |
           cmake -B build -DCMAKE_BUILD_TYPE=Release
