@@ -10,6 +10,15 @@ The executable resource in `src\gui\axiom_gui.rc` is the source of truth. The
 About dialog reads the file version from that resource at runtime, and the
 installer reads the same value when naming release artifacts.
 
+## Short version
+
+- Change `major`, `minor`, or `patch` manually when preparing a release that
+  deserves it.
+- Let the Visual Studio GUI build increment `build`.
+- Use the exact resulting version for the installer name and GitHub release tag.
+- Use `/p:AutoIncrementVersion=false` for diagnostic builds that must leave the
+  working tree unchanged.
+
 ## Increment Rules
 
 - Increment `major` for compatibility-breaking behavior or major architecture

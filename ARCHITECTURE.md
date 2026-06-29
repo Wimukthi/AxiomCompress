@@ -2,6 +2,23 @@
 
 The project is structured so the encoder can become much more complex without making the decoder expensive or unpredictable.
 
+## Quick map
+
+Use this document when you need to know where a feature belongs:
+
+| Area | Owns |
+|---|---|
+| `src/codec` | Single-block compression and decompression |
+| `src/archive` | `.axar` container, metadata, encryption, recovery, volumes, signing, SFX |
+| `src/core` | Shared utilities: checksums, crypto, filesystem metadata, Reed-Solomon |
+| `src/cli` | `axiomc` command parsing and CLI workflows |
+| `src/gui` | Native Win32 GUI over the public archive APIs |
+| `tests` | Round-trip, safety, and regression tests |
+
+The important design rule is simple: compression may spend more CPU to find a
+better representation, but decompression must stay deterministic, bounded, and
+easy to validate.
+
 ```text
 archive input
   -> classifier
@@ -46,27 +63,45 @@ single-stream codec and the archive share exactly the same encode/decode path.
 The decoder is deliberately simple and bounded (see "Decoder Rule"); all the
 complexity lives in the encoder.
 
+### Archive API shape
+
 The `.axar` public API deliberately separates archive storage from file-manager
-presentation. Besides create/list/test/extract, it provides destination-aware
-insertion (`ArchiveInput`), selective extraction, metadata-only entry moves
-(`ArchiveMove`), add/update/fresh/sync/delete/repack, comments, locking, and an
-`ArchiveEncryptionMode` query. All mutating operations use a temporary archive and
-replacement rename, honor `OperationControl`, and reject locked archives. Data-only
-encrypted archives are editable with the password; encrypted-directory archives
-currently remain read-only.
+presentation. Besides create/list/test/extract, it exposes:
 
-Phase-5 services are archive-level APIs: signatures cover exact stored block bytes
-and canonical directory semantics, SFX appends an intact archive plus a fixed trailer
-to the native GUI stub, and POSIX mode/uid/gid uses a skippable entry TLV. The Win32
-file list implements `IDataObject`, `IDropSource`, and `IDropTarget`; drag-out only
-materializes selected entries when a shell target requests `CF_HDROP`.
+- destination-aware insertion through `ArchiveInput`;
+- selective extraction;
+- metadata-only entry moves through `ArchiveMove`;
+- add, update, freshen, sync, delete, and repack;
+- comments and locking;
+- archive encryption mode queries.
 
-Phase-4 services use the tested portable Reed–Solomon core. An optional
-self-locating recovery service protects the archive through the end of its central
-directory and can atomically repair damaged shards. Multi-volume orchestration
-wraps the exact completed archive bytes in checked `partNNN.axar` data shards and
-optional `.revNNN` parity shards; joining validates the complete archive with
-BLAKE3 before installing it. Both long operations honor `OperationControl`.
+All mutating operations use a temporary archive and replacement rename. They
+honor `OperationControl` and reject locked archives. Data-only encrypted archives
+are editable with the password; encrypted-directory archives currently remain
+read-only.
+
+### Archive services
+
+Archive-level services include:
+
+- signatures over exact stored block bytes and canonical directory semantics;
+- SFX output by appending an intact archive plus a fixed trailer to the native GUI
+  stub;
+- POSIX mode/uid/gid metadata through a skippable entry TLV;
+- recovery records backed by the portable Reed-Solomon core;
+- numbered data volumes and optional `.revNNN` recovery volumes.
+
+Recovery protects the archive through the end of the central directory and can
+repair damaged shards atomically. Volume joining validates the reconstructed
+archive with BLAKE3 before installing it. Long recovery and volume operations
+honor `OperationControl`.
+
+### GUI drag/drop boundary
+
+The Win32 file list implements `IDataObject`, `IDropSource`, and `IDropTarget`.
+Drag-out materializes selected archive entries only when a shell target requests
+`CF_HDROP`, which avoids doing extraction work before Explorer actually needs the
+files.
 
 ## Single-stream container
 
@@ -106,7 +141,7 @@ Axiom split streams. It must not depend on the LZMA-style binary-tree matcher,
 optimal parser, or probability/range model to hit its speed target. Those remain
 higher-effort ratio tools for levels that explicitly trade speed away.
 
-## Parser Modes
+## Parser modes
 
 A single `--level 1..9` knob selects the speed/ratio operating point (default 5).
 Levels 1–6 drive the hash-chain matcher, raising chain depth and turning on lazy
@@ -118,39 +153,57 @@ Individual flags (`--chain-depth`, `--nice`, `--lazy`/`--no-lazy`,
 `--fast-entropy`, `--bt`, `--window`, `--optimal…`) override the preset, so a level
 is just a starting point. The decoder is identical at every level.
 
-Normal mode uses greedy hash-chain parsing with optional **lazy matching** (before
-committing a match at `p`, peek at `p+1`; if a strictly longer match starts there,
-emit a literal so the better match is taken next — this lets a shallow chain reach
-close to a deep chain's ratio), then lets split streams and entropy coding recover
-as much ratio as possible cheaply. Match-length comparison reads eight bytes at a
-time. The split-stream entropy stage either trial-encodes every coder and keeps the
-smallest (high levels) or, in fast mode (levels 1–3), picks a coder from a one-pass
-order-0 entropy estimate and codes literals with **rANS rather than the bit-serial
-order-1 coder** — order-1 wins a little ratio on text but decodes ~15× slower and
-dominates decode time, so the speed levels take the far faster rANS literal stream.
-`--bt` swaps the hash chain for
-an LZMA-style binary-tree (suffix-BST) match finder over a *cyclic window*: the
-tree is indexed by `position % min(window, n)`, and a descent stops as soon as a
-candidate falls outside the window. That window bound is the node-deletion
-mechanism — it keeps the tree's footprint proportional to `--window` rather than
-the input, and keeps the descent from chasing evicted positions. Set `--window`
-as large as the block to recover full-window matches. `--optimal` enables bounded
-dynamic-programming parsing over the same match finder. That parser scores
-literals, a limited set of useful match lengths, and repeat-offset matches, then
-reconstructs the lowest-cost path into the LZ77 token format. The recent-distance
-list is path dependent, so each position carries the rep state of the lowest-cost
-path that reaches it; because a forward position's cost is final once the loop
-reaches it, that rep state is settled deterministically from the recorded
-decision and the emitted token sequence decodes to exactly the same state.
+### Normal hash-chain parsing
 
-The parser runs twice. The first pass uses fixed weights; its output is measured
-(order-0 entropy of the literal, command, length, and distance-slot streams, plus
-the exact slot footer bits for each distance) to build a cost model that reflects
-the real entropy-coded size, and the second pass re-parses with those costs. The
-encoder keeps whichever pass is smaller after entropy coding. The default optimal effort
-uses a shallower chain than greedy parsing so ultra mode stays practical; use
-`--optimal-depth` and `--optimal-candidates` to trade runtime for ratio during
-benchmark runs.
+Normal mode is greedy with optional **lazy matching**:
+
+1. Find a match at position `p`.
+2. Peek at `p + 1`.
+3. If `p + 1` has a strictly longer match, emit one literal and take that better
+   match next.
+
+This gives shallow chains much of the ratio of deeper chains without making the
+fast levels too slow. Match-length comparison reads eight bytes at a time.
+
+### Entropy selection
+
+After parsing, Axiom splits the LZ77 data into separate streams. The entropy stage
+then either:
+
+- trial-encodes every available coder and keeps the smallest result on higher
+  levels, or
+- uses a one-pass order-0 estimate on levels 1-3.
+
+Fast levels code literals with rANS instead of the bit-serial order-1 coder.
+Order-1 can improve text ratio, but it decodes much more slowly and would dominate
+decode time.
+
+### Binary-tree mode
+
+`--bt` swaps the hash chain for an LZMA-style binary-tree match finder over a
+cyclic window.
+
+- Tree slots are indexed by `position % min(window, input_size)`.
+- A descent stops when a candidate falls outside the configured window.
+- Memory stays proportional to `--window`, not to the whole input.
+- Set `--window` as large as the block to search the full block.
+
+### Optimal parser
+
+`--optimal` enables bounded dynamic-programming parsing over the same match
+finder. It scores literals, useful match lengths, and repeat-offset matches, then
+reconstructs the lowest-cost token sequence.
+
+The parser runs twice:
+
+1. First pass: use fixed weights.
+2. Measure the output streams.
+3. Second pass: use measured entropy costs.
+4. Keep whichever fully encoded result is smaller.
+
+The default optimal effort uses a shallower chain than greedy parsing so high
+levels stay practical. Use `--optimal-depth` and `--optimal-candidates` only when
+benchmarking or deliberately trading runtime for ratio.
 
 ## Benchmarking
 

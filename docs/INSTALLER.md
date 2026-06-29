@@ -6,6 +6,18 @@ packaging model.
 The installer uses Inno Setup's dynamic modern wizard style, so Setup and
 Uninstall follow the user's Windows light/dark app mode.
 
+## Quick path
+
+For a normal local package build:
+
+```powershell
+winget install --id JRSoftware.InnoSetup --exact
+.\installer\build-installer.ps1
+```
+
+The script builds Axiom, runs the Release test executable, reads the version from
+`src\gui\axiom_gui.rc`, and writes the installer to `installer\output`.
+
 ## Local Requirements
 
 - Release x64 build tools from Visual Studio.
@@ -25,8 +37,7 @@ From the repository root:
 .\installer\build-installer.ps1
 ```
 
-The script builds Release x64, runs `out\Release\axiom_roundtrip.exe`, reads the
-post-build version from `src\gui\axiom_gui.rc`, and writes:
+Output:
 
 ```text
 installer\output\AxiomSetup-<version>-win-x64.exe

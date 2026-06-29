@@ -7,6 +7,25 @@ This document specifies the on-disk layout of a multi-file Axiom archive
 All integers are little-endian. Offsets and sizes are absolute byte positions in
 the archive file unless stated otherwise.
 
+## How to read this document
+
+The first half explains the normal archive path: header, solid blocks, central
+directory, entries, and footer. The later sections cover optional services:
+encryption, recovery records, split volumes, signatures, SFX packaging, and
+compatibility rules.
+
+Plain-language layout:
+
+1. The header identifies the file as an Axiom archive.
+2. Solid blocks store the compressed file bytes.
+3. The central directory says which files exist and where their bytes live.
+4. Optional recovery data can protect the archive from damage.
+5. The footer points back to the central directory.
+
+Readers should treat all documented limits and validation rules as part of the
+format. Rejecting malformed data is intentional behavior, not just an
+implementation detail.
+
 ## Goals
 
 - Hold many files and directories with their relative paths and metadata.
@@ -14,9 +33,8 @@ the archive file unless stated otherwise.
   while keeping each block **independently decompressible** for selective
   extraction and bounded-memory decode.
 - Single-pass, bounded-memory writing (one solid block in memory at a time).
-- Localizable integrity: a per-block checksum (from the embedded `.axc`) plus a
-  per-file CRC-32, so damage can be attributed to a file rather than the whole
-  archive.
+- Localizable integrity: per-block checks from the embedded `.axc`, plus
+  per-file CRC-32 and BLAKE3-256 content hashes.
 
 ## Layout
 
@@ -91,6 +109,15 @@ locate it even when the protected directory itself is damaged.
 
 When an archive is created with a password, every solid block is encrypted and the
 `encryption` archive-extra record records how to derive the key:
+
+At a glance:
+
+- The password is never stored.
+- Argon2id derives one archive key from the password and per-archive salt.
+- Each compressed solid block is sealed independently.
+- Block-only encryption leaves the central directory readable.
+- `--encrypt-names` also seals the central directory, so listing requires the
+  password.
 
 ```
 vint     kdf_algorithm     2 = Argon2id

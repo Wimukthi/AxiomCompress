@@ -1,62 +1,85 @@
 # AxiomCompress
 
-AxiomCompress is an experimental archival compressor. The benchmark target is
-7-Zip (`7z` + LZMA2) in high-ratio solid mode.
+AxiomCompress is an experimental archive compressor for Windows and the command
+line. Its main archive format is `.axar`; the lower-level single-stream format is
+`.axc`.
 
-What it does today:
+The current goal is 7-Zip-class solid compression with a simple, bounded decoder.
+The project is not yet at 7-Zip's maximum ratio, but it already has a complete
+archive container, a native Win32 GUI, a scriptable CLI, integrity checks,
+encryption, recovery data, split volumes, signing, and SFX packaging.
 
-- **Multi-file `.axar` archives** — solid blocks for cross-file redundancy,
-  independently decodable for selective extraction; BLAKE3 + CRC integrity,
-  Windows metadata/ADS, links, archive editing, comments/locking, and optional
-  Monocypher encryption of data and names. See [FORMAT.md](FORMAT.md).
-- **One speed/ratio knob:** `--level 1..9`. Level 1 is a fast LZ4-style path
-  (`fast_lz`); levels 2–6 a lazy hash-chain matcher; 7–9 a cyclic-window
-  binary-tree matcher, with the optimal parser available via `--optimal`.
-- **Repeat-offset (rep0–rep3) matches**, split LZ77 streams (with a position-slot
-  distance variant), and entropy via canonical Huffman, **4-lane interleaved
-  order-0 rANS**, and an adaptive **order-1** coder — chosen per substream.
-- **Threaded** independent-block compression and decompression, with progress
-  reporting and cooperative pause/cancel (`OperationControl`).
-- **CLI** (`axiomc`) with direct command mode plus an interactive prompt when
-  launched without arguments.
-- **Windows GUI** (`Axiom.exe`) with native archive browsing and a
-  `Tools > Benchmark...` throughput test inspired by 7-Zip's benchmark window.
-- Coverage-guided libFuzzer+ASan targets and a Release-mode test suite.
+## Start here
 
-It does not yet match 7-Zip's ratio — the open gap is the entropy stage — but it
-decodes fast and the decoder stays simple and bounded by design.
+Most users need one of these paths:
 
-## Build With Visual C++
+| Goal | Use |
+|---|---|
+| Create/open archives visually | `out\Release\Axiom.exe` |
+| Script backups or tests | `out\Release\axiomc.exe` |
+| Learn every CLI command | [CLI_GUIDE.md](CLI_GUIDE.md) |
+| Understand the archive layout | [FORMAT.md](FORMAT.md) |
+| Understand the codec design | [ARCHITECTURE.md](ARCHITECTURE.md) |
+| Build an installer | [docs/INSTALLER.md](docs/INSTALLER.md) |
+
+## What Axiom supports today
+
+- Multi-file `.axar` archives with files, folders, metadata, NTFS alternate data
+  streams, symlinks, hardlinks, comments, locking, and archive editing.
+- Solid blocks for cross-file compression while keeping each block independently
+  decodable for selective extraction.
+- Per-block CRC checks, per-file CRC-32, and per-file BLAKE3-256 hashes.
+- Optional password encryption using Monocypher Argon2id and
+  XChaCha20-Poly1305.
+- Optional encrypted filenames/directories.
+- Recovery records, repair, split volumes, and `.rev` recovery volumes.
+- Monocypher EdDSA archive signatures.
+- Native Windows SFX output as a single merged `.exe`.
+- Cooperative progress, pause, resume, and cancel through shared worker-thread
+  operation control.
+- Coverage-guided fuzz targets and Release-mode round-trip tests.
+
+## Build
+
+### Visual Studio / MSBuild
 
 Open `AxiomCompress.sln` in Visual Studio and build `Release|x64`.
-The checked-in projects target the installed Visual C++ toolset `v145`.
+The checked-in Visual Studio projects target the installed Visual C++ toolset
+`v145`.
 
-From PowerShell on this machine, MSBuild is available through the Visual Studio install path:
+From PowerShell:
 
 ```powershell
 & "C:\Program Files\Microsoft Visual Studio\18\Community\MSBuild\Current\Bin\MSBuild.exe" AxiomCompress.sln /p:Configuration=Release /p:Platform=x64
 ```
 
-Or use the helper script:
+Or use the helper scripts:
 
 ```powershell
 .\tools\build_msvc.ps1 -Configuration Release
 .\tools\test_msvc.ps1 -Configuration Release
 ```
 
-`AxiomGui.vcxproj` uses the same source-backed versioning model as NativePad:
-every normal Visual Studio GUI build increments the fourth component in
-`src\gui\axiom_gui.rc`. For diagnostic builds that must not change source, pass
-`/p:AutoIncrementVersion=false`. See [docs\VERSIONING.md](docs/VERSIONING.md).
-
 The solution contains:
 
-- `AxiomLib`: static library for the compression engine.
-- `AxiomC`: command-line compressor/decompressor.
-- `AxiomGui`: Windows-only native Win32 GUI frontend for `.axar` archives.
-- `AxiomRoundtrip`: executable round-trip tests.
+| Project | Purpose |
+|---|---|
+| `AxiomLib` | Static library for the archive and codec engine |
+| `AxiomC` | CLI executable, `axiomc.exe` |
+| `AxiomGui` | Native Win32 GUI executable, `Axiom.exe` |
+| `AxiomRoundtrip` | Test executable |
 
-## Build With CMake
+`AxiomGui.vcxproj` uses source-backed versioning like NativePad. Normal GUI
+builds increment the fourth version component in `src\gui\axiom_gui.rc`. For a
+diagnostic build that must not modify source, pass:
+
+```powershell
+/p:AutoIncrementVersion=false
+```
+
+Details: [docs/VERSIONING.md](docs/VERSIONING.md).
+
+### CMake
 
 ```powershell
 cmake --preset default
@@ -71,215 +94,254 @@ cmake --preset vs2022
 cmake --build --preset vs2022 --config Release
 ```
 
-## Packaging
+## GUI
 
-Axiom uses Inno Setup 6 for release installers, matching NativePad's packaging
-flow:
+The GUI executable is:
 
-```powershell
-.\installer\build-installer.ps1
+```text
+out\Release\Axiom.exe
 ```
 
-The script builds Release x64, runs the Release round-trip test, reads the app
-version from `src\gui\axiom_gui.rc`, and writes
-`installer\output\AxiomSetup-<version>-win-x64.exe`. See
-[docs\INSTALLER.md](docs/INSTALLER.md).
+It is a native Visual C++ / Win32 application. It does not use Qt, .NET, WinUI, or
+web UI layers.
 
-## CLI
+### Main window
 
-Multi-file archives (`.axar`) — files and directories with paths, metadata, and
-per-file integrity. See the [complete CLI guide](CLI_GUIDE.md) for command-by-command
-instructions and [FORMAT.md](FORMAT.md) for the on-disk layout.
+The main window behaves like a file manager:
+
+- Browse filesystem folders and `.axar` archives.
+- Use the editable address dropdown for paths, drives, shell locations, recent
+  folders, and history.
+- Sort and resize columns.
+- Select multiple files.
+- Drag files from Explorer into an archive.
+- Drag files out of an archive to Explorer.
+- Move entries between folders inside an archive.
+- Open dropped archives directly in the browser.
+
+Archives are presented through a provider/catalog layer. The UI asks the archive
+engine what each archive can do, then enables or disables commands from those
+capability flags.
+
+### Archive operations
+
+The GUI supports:
+
+- Add files/folders.
+- Extract.
+- Test integrity.
+- Delete entries.
+- Edit archive comments.
+- Lock archives.
+- Repair damaged archives when recovery data is available.
+- Open numbered split volumes and reconstruct the complete archive.
+- Sign and verify archives.
+- Create native SFX executables.
+
+Long-running operations run on worker threads. The main window remains
+responsive, and progress includes byte counts, throughput, ETA, output size, and
+compression ratio when available. Pause/resume and cancel use the same
+`OperationControl` path as the CLI/library.
+
+### Add to Archive dialog
+
+Archive creation uses one resizable tabbed dialog:
+
+| Tab | Contains |
+|---|---|
+| Compression | Level, dictionary size, word size, solid block size, threads |
+| General | Update mode, archive comment, metadata notes |
+| Security | Password, filename encryption, show-password toggle |
+| Recovery & volumes | Recovery record, split volume size, recovery volumes |
+| SFX & signing | Self-extracting output and archive signing |
+
+The output path and effective-output preview stay visible across tabs. If SFX is
+enabled, the final output is the merged `.exe`; Axiom does not leave a separate
+archive next to it.
+
+### Dark mode and DPI
+
+The GUI is designed to stay native while still looking correct in dark mode:
+
+- Dark title bars, menus, dialogs, list views, progress controls, combo boxes, and
+  custom message boxes.
+- Per-monitor DPI-scaled fonts, icons, spacing, and dialog layouts.
+- Owner-drawn controls where common controls do not dark-theme correctly.
+- Shared command IDs for menus, toolbar buttons, keyboard shortcuts, and context
+  actions.
+
+### Settings
+
+Settings are stored per user under:
+
+```text
+HKCU\Software\AxiomCompress\GUI
+```
+
+The Settings dialog has these pages:
+
+- General
+- Compression
+- Paths
+- File list
+- Viewer
+- Security
+- Integration
+- Updates
+- Advanced
+
+Settings are wired only where the engine or GUI has real behavior. Unsupported
+future options are disabled instead of being stored as silent no-ops.
+
+### Benchmark window
+
+`Tools > Benchmark...` opens a 7-Zip-style benchmark window for measuring Axiom
+compression and extraction throughput. It can use generated corpora or a custom
+input folder/file.
+
+## CLI quick start
+
+Use `axiomc.exe` for scripts and automation:
 
 ```powershell
-axiomc a archive.axar mydir file.txt        # create (recurses directories)
-axiomc a --optimal --block-size 16M archive.axar mydir
-axiomc l archive.axar                        # list contents
-axiomc t archive.axar                        # verify integrity
-axiomc x archive.axar dest-dir               # extract (paths contained to dest-dir)
-axiomc x --overwrite skip archive.axar dest-dir
+axiomc a archive.axar mydir file.txt
+axiomc l archive.axar
+axiomc t archive.axar
+axiomc x archive.axar restored
+```
+
+Common archive commands:
+
+```powershell
+axiomc a --level 9 archive.axar mydir
 axiomc a -p "password" archive.axar private-dir
 axiomc a -p "password" --encrypt-names hidden.axar private-dir
-axiomc l -p "password" hidden.axar
-axiomc a --recovery 10 resilient.axar important-data
-axiomc recovery resilient.axar
-axiomc repair resilient.axar
-axiomc split resilient.axar 100M 3
-axiomc join resilient.part001.axar restored.axar
+axiomc recovery archive.axar 10
+axiomc repair archive.axar
+axiomc split archive.axar 100M 3
+axiomc join archive.part001.axar restored.axar
 axiomc keygen secret.key public.key
 axiomc sign archive.axar secret.key
 axiomc verify archive.axar public.key
 axiomc sfx archive.axar archive.exe
 ```
 
-Single-stream mode (one input stream to one `.axc` blob):
+Single-stream `.axc` mode:
 
 ```powershell
-axiomc c input.bin output.axc                # default: level 5 (balanced)
-axiomc c --fast input.bin output.axc         # level 1 (fastest)
-axiomc c --max input.bin output.axc          # level 9 (maximum ratio)
-axiomc c --level 7 input.bin output.axc      # pick a point on the curve
-axiomc c --level 3 --threads 8 input.bin output.axc
+axiomc c input.bin output.axc
+axiomc c --fast input.bin output.axc
+axiomc c --max input.bin output.axc
 axiomc d output.axc restored.bin
 ```
 
-## GUI
+Launching `axiomc` without arguments opens an interactive prompt. Full command
+reference: [CLI_GUIDE.md](CLI_GUIDE.md).
 
-`out\Release\Axiom.exe` is a native Win32 frontend for `.axar` archives. It
-supports adding files/folders, creating archives, opening/listing archives,
-testing integrity, and extracting to a chosen folder. The GUI is Windows-only,
-per-monitor DPI aware, and has a dark-mode foundation (system theme detection,
-dark title bar, custom dark-painted table/progress controls, and scaled
-layout/fonts). Operations run on a worker thread so the window stays responsive;
-create/test/extract report byte progress to the status strip and progress bar,
-including throughput, ETA, output size, and live compression ratio when available.
-Operations can be paused or cancelled cooperatively. Archive creation, extraction,
-feature options, custom messages/about, and application settings use native dark,
-DPI-scaled dialogs. Finite-choice fields use keyboard-accessible native combo boxes;
-archive creation exposes level-aware dictionary size, word size, solid block size,
-and thread-count controls. Add to Archive is one resizable dialog with Compression,
-General, Security, Recovery & volumes, and SFX & signing tabs. The common
-output path and a live effective-output preview remain visible on every tab;
-wrapped help text is measured using the current per-monitor DPI. Capability flags
-disable unsupported settings in place instead of sending creation through a
-separate advanced-options dialog.
+## Compression levels
 
-The main window is a file-manager browser with drive and directory navigation,
-an editable address dropdown with shell locations, drives, recent/current folders,
-history, shell icons, multi-selection, sortable and
-resizable columns, and hierarchical archive browsing. Archive presentation is
-isolated behind a provider/catalog layer with explicit capability flags, so
-archive editing, comments, locking, links, and data encryption are wired through
-public archive APIs. Filename encryption and encrypted-archive editing have backend
-support. Native OLE drag/drop handles Explorer-to-archive insertion,
-archive-to-Explorer selective extraction, and moves between archive folders.
-Encrypted archives prompt when opened and keep the password only in memory for
-that open archive, so Explorer's synchronous drag data request never displays a
-modal password dialog.
-Authenticity signing/verification and native SFX creation are wired. A generated
-SFX is one standalone `.exe` containing the intact archive and presents a native,
-dark/DPI-aware extraction dialog with destination browsing, archive/security
-summary, overwrite policy, CPU-thread selection, timestamp restoration, and an
-open-destination option. Extraction uses the shared progress window with
-Pause/Resume and Cancel. When SFX is selected during archive creation, the GUI
-uses `.axar` only as an intermediate and leaves the merged `.exe` as the sole
-output. Recovery records, repair, fixed-size split volumes, and optional `.rev`
-recovery volumes are wired through the same worker/progress path. Opening or
-dropping any numbered volume reconstructs and verifies the complete archive before
-the browser enters it. Test and extract can repair recoverable archive damage and
-retry the requested operation.
-Its owner-drawn dark menu bar exposes File, Commands, Tools, Options, and Help
-menus without falling back to a light system menu, and routes menu and keyboard
-commands through the same command IDs used by the toolbar.
-Filesystem folders refresh automatically through `ReadDirectoryChangesW`; dropped
-archives open in the browser, and the archive list is an OLE drop source and target.
-Drag-out extracts lazily and retains managed staging until exit so Explorer cannot
-race cleanup. Window placement, the last location, sorting, and application
-defaults persist per user under `HKCU\Software\AxiomCompress\GUI`. The Settings
-dialog is a resizable native dark tabbed dialog with General, Compression, Paths,
-File list, Viewer, Security, Integration, Updates, and Advanced pages. GUI-side
-settings are wired to runtime behavior where the archive engine exposes matching
-capabilities; unsupported engine knobs are disabled instead of being stored as
-silent no-ops.
+One level chooses the speed/ratio tradeoff:
 
-### Effort levels (`--level 1..9`, default 5)
-
-One knob trades speed for ratio. `--fast` = 1, `--max` = 9. **Level 1** is the
-dedicated fast path (`fast_lz` 2-way row hash, rANS literals); **levels 2–6** use
-the lazy hash-chain matcher (rising chain depth + entropy effort); **7–9** switch
-to the cyclic-window binary tree with growing windows.
-
-| level | matcher | profile |
+| Level | Matcher | Intended use |
 |---|---|---|
-| 1 (`--fast`) | `fast_lz` 2-way row hash | fastest; rANS literals, no lazy |
-| 3 | hash, chain 32 | fast; lazy + rANS-literal entropy |
-| 5 (default) | hash, chain 128 | balanced; lazy + full entropy bake-off |
-| 6 | hash, chain 256 | best hash-chain ratio |
-| 7 | bt, 8M window | long-range matches, still parallel |
-| 8 | bt, 32M window | wider window |
-| 9 (`--max`) | bt, 64M window / 16M block | maximum preset with bounded mixed-data runtime |
+| 1 / `--fast` | Fast row hash | Fastest compression |
+| 2-3 | Shallow hash chain | Fast backups |
+| 4-5 | Lazy hash chain | Balanced default use |
+| 6 | Deeper hash chain | Better ratio without tree memory |
+| 7 | Binary tree, 8 MiB window | Long-range matches |
+| 8 | Binary tree, 32 MiB window | Wider long-range search |
+| 9 / `--max` | Binary tree, 64 MiB window | Maximum preset |
 
-Individual flags override the preset (in any order): `--chain-depth N`, `--nice N`,
-`--lazy` / `--no-lazy`, `--fast-entropy`, `--bt`, `--window SIZE`, `--block-size`,
-`--threads`, `--parallel`, `--optimal[-depth N][-candidates N]`. `--window` sets
-the bt match window and bounds its memory (≈ `2 × min(window, block) × 4` bytes).
-The optimal parser (`--optimal`) is not folded into a level — its per-byte DP is
-impractical on a large single block, so combine it with a smaller `--block-size`.
+The default is level 5.
 
-## Benchmark
+Advanced flags can override the preset:
 
-The standing benchmark is **enwik8** (100 MB of English Wikipedia text).
-`tools\bench_enwik8.ps1` downloads it on first run, sweeps the match finders and
-window sizes, prints a 7-Zip reference, and verifies every row by round-trip
-before reporting a ratio:
+```text
+--chain-depth N
+--nice N
+--lazy / --no-lazy
+--fast-entropy
+--bt
+--window SIZE
+--block-size SIZE
+--threads N
+--parallel
+--optimal
+--optimal-depth N
+--optimal-candidates N
+```
+
+## Benchmarking
+
+The standard text benchmark is `enwik8`:
 
 ```powershell
-.\tools\bench_enwik8.ps1                         # full sweep
-.\tools\bench_enwik8.ps1 -Quick                  # skip the slow full-window rows
+.\tools\bench_enwik8.ps1
+.\tools\bench_enwik8.ps1 -Quick
 .\tools\bench_enwik8.ps1 -Axiomc out\Release\axiomc.exe
 ```
 
-For ad-hoc inputs, the Python harness auto-detects `7z` on `PATH`, `SEVENZIP`, and
-the standard `C:\Program Files\7-Zip\7z.exe` install path. It accepts either a
-file or folder; folders are packed into a deterministic benchmark byte stream so
-Axiom and 7-Zip compress the same input until Axiom has a native multi-file
-archive.
+For custom files or folders:
 
 ```powershell
 python bench/bench_7zip.py --axiom out/Release/axiomc.exe --input path/to/corpus
 python bench/bench_7zip.py --axiom out/Release/axiomc.exe --input path/to/corpus --axiom-threads 8 --axiom-block-size 4M
-python bench/bench_7zip.py --axiom out/Release/axiomc.exe --input path/to/corpus --axiom-parallel --axiom-threads 8
 python bench/bench_7zip.py --axiom out/Release/axiomc.exe --input path/to/corpus --axiom-optimal --axiom-threads 8
-python bench/bench_7zip.py --axiom out/Release/axiomc.exe --input path/to/corpus --axiom-optimal-depth 64 --axiom-optimal-candidates 8 --axiom-threads 8
 ```
 
-## Performance
+## Performance snapshot
 
-Speed and ratio are selected with `--level` (above). Levels share most building
-blocks — repeat-offset matches, split streams, 4-lane rANS, parallel independent
-blocks, eight-byte-at-a-time match comparison — but differ in matcher and entropy
-effort. Higher levels search harder (deeper chains → cyclic-window binary tree →
-optimal parser) and run the full entropy bake-off; the fast levels (1–3) use a
-shallow/row-hash matcher and code literals with rANS instead of the slow
-bit-serial order-1 coder, which is what keeps their **decode** fast.
+Ratios below are for `enwik8` (100 MB English Wikipedia text). They are exact for
+the current codec; throughput depends on hardware and build settings.
 
-Compressed ratio by level on **enwik8** (100 MB text; exact, reproducible):
-
-| level | 1 | 3 | 5 (default) | 6 | 7 | 8 | 9 |
+| Level | 1 | 3 | 5 default | 6 | 7 | 8 | 9 |
 |---|---|---|---|---|---|---|---|
-| ratio | 2.68× | 3.01× | 3.09× | 3.10× | 3.17× | 3.33× | 3.47× |
+| Ratio | 2.68x | 3.01x | 3.09x | 3.10x | 3.17x | 3.33x | 3.47x |
 
-Throughput is machine-dependent; ratios above are exact. On an Intel i7-13620H
-laptop (MSVC Release), **level 1** runs ~140 MB/s compress and ~476 MB/s decode
-(to NUL) — within ~1.2×/1.8× of 7-Zip `-mx1` (162 / 860 MB/s) at a ~10% ratio
-deficit. Higher levels trade compress speed for ratio down to ~1 MB/s at level 9;
-decode stays fast on levels 1–3 (rANS literals) and is slower on 4–9 (order-1
-literals). 7-Zip `-mx9` still leads on ratio (4.03×) — the remaining gap is the
-entropy stage, not the matcher. Use `tools\bench_enwik8.ps1` to reproduce.
+On an Intel i7-13620H laptop with MSVC Release, level 1 is roughly 140 MB/s
+compress and 476 MB/s decode-to-NUL. Higher levels trade compression speed for
+ratio; the remaining gap to 7-Zip maximum ratio is mainly in the entropy stage.
 
 ## Testing and fuzzing
 
-`AxiomRoundtrip` is the test suite: codec roundtrips, a multi-file archive
-roundtrip, and deterministic safety tests (truncation, bad magic, zip-slip
-rejection, decompression-bomb rejection, integrity checks), plus an in-process
-mutation-fuzz pass. It runs in every configuration (checks abort on failure
-rather than being compiled out).
+Run the Release tests:
 
 ```powershell
-.\tools\test_msvc.ps1 -Configuration Release    # or: ctest --preset default
+.\tools\test_msvc.ps1 -Configuration Release
 ```
 
-Coverage-guided fuzzing runs libFuzzer under AddressSanitizer over the two
-untrusted-input surfaces — the single-stream decoder and the archive container
-parser. MSVC ships the libFuzzer runtime, so no external toolchain is needed:
+Or with CMake:
+
+```powershell
+ctest --preset default
+```
+
+Build and run fuzz targets:
 
 ```powershell
 .\tools\build_fuzz.ps1 -Target all
 .\tools\run_fuzz.ps1 -Seconds 60 -Target all
 ```
 
-CI (`.github/workflows/ci.yml`) builds and tests on Windows and Linux and runs
-both fuzz targets on every push, with a longer nightly run.
+CI builds and tests on Windows and Linux, then runs both fuzz targets on every
+push.
+
+## Packaging
+
+Axiom uses Inno Setup 6 for release installers:
+
+```powershell
+.\installer\build-installer.ps1
+```
+
+The script builds Release x64, runs the Release round-trip test, reads the app
+version from `src\gui\axiom_gui.rc`, and writes:
+
+```text
+installer\output\AxiomSetup-<version>-win-x64.exe
+```
+
+Details: [docs/INSTALLER.md](docs/INSTALLER.md).
 
 ## License
 

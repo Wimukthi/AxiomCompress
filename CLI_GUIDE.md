@@ -5,6 +5,23 @@ archives and `.axc` single-stream compressed files. This guide documents the
 commands implemented by the current CLI. See [FORMAT.md](FORMAT.md) for the binary
 format.
 
+## How to use this guide
+
+If you only need the normal archive workflow, read these sections first:
+
+1. [Getting started](#getting-started)
+2. [Create or add files](#create-or-add-files-a-add)
+3. [List, test, and extract](#list-test-and-extract)
+4. [Compression options](#compression-options)
+
+The later sections cover maintenance features such as comments, locking,
+recovery records, split volumes, signing, SFX creation, and the lower-level
+single-stream `.axc` commands.
+
+Important rule: paths after an archive name are usually paths **inside the
+archive**, not Windows filesystem paths. Use `axiomc l archive.axar` to see the
+exact archive paths before deleting, moving, or selectively extracting entries.
+
 ## Getting started
 
 After a Visual C++ Release build, the executable is
@@ -85,6 +102,44 @@ Prompt helpers:
 | `sfx` | Build a self-extracting Windows executable |
 | `c`, `compress` | Compress one stream to `.axc` |
 | `d`, `decompress` | Decompress one `.axc` stream |
+
+## Common workflows
+
+### Create, verify, and extract a backup
+
+```powershell
+axiomc a backup.axar "D:\Work"
+axiomc t backup.axar
+axiomc x backup.axar "D:\Restore-test"
+```
+
+### Create an encrypted archive
+
+```powershell
+axiomc a -p "correct horse battery staple" private.axar "D:\Private"
+```
+
+Add `--encrypt-names` when filenames, sizes, and directory metadata should also
+be hidden:
+
+```powershell
+axiomc a -p "correct horse battery staple" --encrypt-names private-hidden.axar "D:\Private"
+```
+
+### Add recovery data before storing an important archive
+
+```powershell
+axiomc a important.axar "D:\Important"
+axiomc recovery important.axar 10
+axiomc t important.axar
+```
+
+### Split an archive for transfer
+
+```powershell
+axiomc split important.axar 100M 3
+axiomc join important.part001.axar restored.axar
+```
 
 ## Create or add files: `a`, `add`
 
