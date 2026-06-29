@@ -171,7 +171,7 @@ public:
 
 private:
     void need(std::size_t count) const {
-        if (cursor_ + count > data_.size()) {
+        if (count > data_.size() - cursor_) {
             throw FormatError("archive directory is truncated");
         }
     }
