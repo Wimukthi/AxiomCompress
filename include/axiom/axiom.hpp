@@ -160,6 +160,90 @@ struct CompressionOptions {
     unsigned recovery_percent = 0;
 };
 
+// Effort presets, fastest (1) to maximum ratio (9). Each level picks a coherent
+// set of match-finder and entropy knobs; individual CLI/GUI flags may still
+// override fields after applying the preset. Levels 1-6 use the hash-chain
+// matcher; levels 7-9 switch to the binary-tree matcher with larger windows.
+inline void apply_compression_level(CompressionOptions& options, int level) {
+    if (level < 1) {
+        level = 1;
+    } else if (level > 9) {
+        level = 9;
+    }
+
+    options.use_tree_matcher = false;
+    options.use_fast_lz = false;
+    options.enable_optimal_parser = false;
+    options.auto_block_size_for_threads = true;
+
+    switch (level) {
+        case 1:
+            options.max_chain_depth = 8;
+            options.nice_length = 64;
+            options.lazy_matching = false;
+            options.fast_entropy = true;
+            options.use_fast_lz = true;
+            break;
+        case 2:
+            options.max_chain_depth = 16;
+            options.nice_length = 64;
+            options.lazy_matching = true;
+            options.fast_entropy = true;
+            break;
+        case 3:
+            options.max_chain_depth = 32;
+            options.nice_length = 128;
+            options.lazy_matching = true;
+            options.fast_entropy = true;
+            break;
+        case 4:
+            options.max_chain_depth = 64;
+            options.nice_length = 128;
+            options.lazy_matching = true;
+            options.fast_entropy = false;
+            break;
+        case 5:
+            options.max_chain_depth = 128;
+            options.nice_length = 128;
+            options.lazy_matching = true;
+            options.fast_entropy = false;
+            break;
+        case 6:
+            options.max_chain_depth = 256;
+            options.nice_length = 192;
+            options.lazy_matching = true;
+            options.fast_entropy = false;
+            break;
+        case 7:
+            options.use_tree_matcher = true;
+            options.max_chain_depth = 128;
+            options.block_size = 8u << 20;
+            options.window_size = 8u << 20;
+            options.fast_entropy = false;
+            options.auto_block_size_for_threads = false;
+            break;
+        case 8:
+            options.use_tree_matcher = true;
+            options.max_chain_depth = 256;
+            options.block_size = 32u << 20;
+            options.window_size = 32u << 20;
+            options.fast_entropy = false;
+            options.auto_block_size_for_threads = false;
+            break;
+        case 9:
+            // Maximum preset keeps the deepest tree search with the same
+            // 32 MiB block granularity as level 8; smaller blocks hurt ratio
+            // on large text/mixed corpora without enough speed benefit.
+            options.use_tree_matcher = true;
+            options.max_chain_depth = 512;
+            options.block_size = 32u << 20;
+            options.window_size = 64u << 20;
+            options.fast_entropy = false;
+            options.auto_block_size_for_threads = false;
+            break;
+    }
+}
+
 class FormatError final : public std::runtime_error {
 public:
     explicit FormatError(const char* message);

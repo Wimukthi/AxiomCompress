@@ -136,6 +136,31 @@ void expect_fast_archive_roundtrip(const std::vector<std::uint8_t>& input) {
     AXIOM_CHECK(axiom::decompress(archive) == input);
 }
 
+void test_compression_level_presets() {
+    axiom::CompressionOptions fast;
+    axiom::apply_compression_level(fast, 0);
+    AXIOM_CHECK(fast.use_fast_lz);
+    AXIOM_CHECK(fast.fast_entropy);
+    AXIOM_CHECK(!fast.lazy_matching);
+    AXIOM_CHECK(fast.max_chain_depth == 8);
+
+    axiom::CompressionOptions balanced;
+    axiom::apply_compression_level(balanced, 5);
+    AXIOM_CHECK(!balanced.use_fast_lz);
+    AXIOM_CHECK(!balanced.use_tree_matcher);
+    AXIOM_CHECK(!balanced.fast_entropy);
+    AXIOM_CHECK(balanced.lazy_matching);
+    AXIOM_CHECK(balanced.max_chain_depth == 128);
+
+    axiom::CompressionOptions maximum;
+    axiom::apply_compression_level(maximum, 99);
+    AXIOM_CHECK(maximum.use_tree_matcher);
+    AXIOM_CHECK(!maximum.use_fast_lz);
+    AXIOM_CHECK(maximum.max_chain_depth == 512);
+    AXIOM_CHECK(maximum.block_size == (32u << 20));
+    AXIOM_CHECK(maximum.window_size == (64u << 20));
+    AXIOM_CHECK(!maximum.auto_block_size_for_threads);
+}
 void expect_tree_lz77_roundtrip(const std::vector<std::uint8_t>& input) {
     axiom::CompressionOptions options;
     options.use_tree_matcher = true;
@@ -1652,6 +1677,7 @@ int main() {
     }
     AXIOM_CHECK(failed);
 
+    test_compression_level_presets();
     test_crc32();
     test_blake3();
     test_reed_solomon();

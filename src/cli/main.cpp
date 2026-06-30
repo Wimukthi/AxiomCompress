@@ -202,51 +202,6 @@ void write_key(const fs::path& path, const std::array<std::uint8_t, Size>& key) 
     }
 }
 
-// Effort presets, fastest (1) to maximum ratio (9). Each level picks a coherent
-// set of match-finder and entropy knobs; individual --flags still override. Levels
-// 1-6 drive the hash-chain matcher (depth + lazy + entropy effort); 7-9 switch to
-// the binary-tree matcher with growing windows. The optimal parser remains an
-// explicit --optimal override because its per-byte DP cost is significant.
-void apply_level(axiom::CompressionOptions& o, int level) {
-    if (level < 1) level = 1;
-    if (level > 9) level = 9;
-
-    o.use_tree_matcher = false;
-    o.use_fast_lz = false;
-    o.enable_optimal_parser = false;
-    o.auto_block_size_for_threads = true;
-
-    switch (level) {
-        case 1:
-            o.max_chain_depth = 8; o.nice_length = 64; o.lazy_matching = false;
-            o.fast_entropy = true; o.use_fast_lz = true;
-            break;
-        case 2: o.max_chain_depth = 16;  o.nice_length = 64;  o.lazy_matching = true;  o.fast_entropy = true;  break;
-        case 3: o.max_chain_depth = 32;  o.nice_length = 128; o.lazy_matching = true;  o.fast_entropy = true;  break;
-        case 4: o.max_chain_depth = 64;  o.nice_length = 128; o.lazy_matching = true;  o.fast_entropy = false; break;
-        case 5: o.max_chain_depth = 128; o.nice_length = 128; o.lazy_matching = true;  o.fast_entropy = false; break;
-        case 6: o.max_chain_depth = 256; o.nice_length = 192; o.lazy_matching = true;  o.fast_entropy = false; break;
-        case 7:
-            o.use_tree_matcher = true; o.max_chain_depth = 128;
-            o.block_size = 8u << 20;  o.window_size = 8u << 20;  o.fast_entropy = false;
-            o.auto_block_size_for_threads = false;
-            break;
-        case 8:
-            o.use_tree_matcher = true; o.max_chain_depth = 256;
-            o.block_size = 32u << 20; o.window_size = 32u << 20; o.fast_entropy = false;
-            o.auto_block_size_for_threads = false;
-            break;
-        case 9:
-            // Maximum preset keeps the deepest tree search, but avoids a single
-            // huge mixed-content block where random regions dominate runtime and
-            // still end up stored.
-            o.use_tree_matcher = true; o.max_chain_depth = 512;
-            o.block_size = 16u << 20; o.window_size = 64u << 20; o.fast_entropy = false;
-            o.auto_block_size_for_threads = false;
-            break;
-    }
-}
-
 // Pulls recognized compression flags out of args, leaving positional arguments.
 bool take_compression_flags(std::vector<std::string>& args, axiom::CompressionOptions& options) {
     // First pass: pick the effort level (default 5) and apply its preset, so the
@@ -261,7 +216,7 @@ bool take_compression_flags(std::vector<std::string>& args, axiom::CompressionOp
             level = static_cast<int>(parse_size(args[i + 1]));
         }
     }
-    apply_level(options, level);
+    axiom::apply_compression_level(options, level);
 
     std::vector<std::string> positionals;
     for (std::size_t i = 0; i < args.size(); ++i) {

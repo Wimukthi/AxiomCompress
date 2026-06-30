@@ -240,53 +240,6 @@ std::wstring stage_text(axiom::OperationStage stage) {
     return L"Working";
 }
 
-void apply_level(axiom::CompressionOptions& options, int level) {
-    if (level < 1) level = 1;
-    if (level > 9) level = 9;
-    options.use_tree_matcher = false;
-    options.use_fast_lz = false;
-    options.enable_optimal_parser = false;
-    options.auto_block_size_for_threads = true;
-    switch (level) {
-        case 1:
-            options.max_chain_depth = 8;
-            options.nice_length = 64;
-            options.lazy_matching = false;
-            options.fast_entropy = true;
-            options.use_fast_lz = true;
-            break;
-        case 2: options.max_chain_depth = 16; options.nice_length = 64; options.lazy_matching = true; options.fast_entropy = true; break;
-        case 3: options.max_chain_depth = 32; options.nice_length = 128; options.lazy_matching = true; options.fast_entropy = true; break;
-        case 4: options.max_chain_depth = 64; options.nice_length = 128; options.lazy_matching = true; options.fast_entropy = false; break;
-        case 5: options.max_chain_depth = 128; options.nice_length = 128; options.lazy_matching = true; options.fast_entropy = false; break;
-        case 6: options.max_chain_depth = 256; options.nice_length = 192; options.lazy_matching = true; options.fast_entropy = false; break;
-        case 7:
-            options.use_tree_matcher = true;
-            options.max_chain_depth = 128;
-            options.block_size = 8u << 20;
-            options.window_size = 8u << 20;
-            options.fast_entropy = false;
-            options.auto_block_size_for_threads = false;
-            break;
-        case 8:
-            options.use_tree_matcher = true;
-            options.max_chain_depth = 256;
-            options.block_size = 32u << 20;
-            options.window_size = 32u << 20;
-            options.fast_entropy = false;
-            options.auto_block_size_for_threads = false;
-            break;
-        default:
-            options.use_tree_matcher = true;
-            options.max_chain_depth = 512;
-            options.block_size = 16u << 20;
-            options.window_size = 64u << 20;
-            options.fast_entropy = false;
-            options.auto_block_size_for_threads = false;
-            break;
-    }
-}
-
 fs::path local_benchmark_root() {
     PWSTR local_app_data = nullptr;
     if (FAILED(SHGetKnownFolderPath(FOLDERID_LocalAppData, KF_FLAG_CREATE, nullptr,
@@ -491,7 +444,7 @@ void benchmark_worker(HWND hwnd, BenchmarkParams params,
             fs::remove(archive);
             fs::remove_all(extract);
             axiom::CompressionOptions compression;
-            apply_level(compression, params.level);
+            axiom::apply_compression_level(compression, params.level);
             compression.thread_count = params.threads;
             compression.operation = operation;
             const auto compress_start = std::chrono::steady_clock::now();
