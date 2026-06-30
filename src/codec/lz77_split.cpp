@@ -105,6 +105,23 @@ double order1_bits_per_byte(std::span<const std::uint8_t> raw) {
     return bits;
 }
 
+std::size_t varuint_size(std::uint64_t value) {
+    std::size_t bytes = 1;
+    while (value >= 0x80) {
+        value >>= 7;
+        ++bytes;
+    }
+    return bytes;
+}
+
+double stream_entropy_lower_bound(double bits_per_byte, std::size_t raw_size) {
+    const double payload_bytes =
+        (bits_per_byte * static_cast<double>(raw_size)) / 8.0;
+    const auto payload_floor = static_cast<std::uint64_t>(payload_bytes);
+    return static_cast<double>(varuint_size(raw_size) + 1 + varuint_size(payload_floor)) +
+           payload_bytes;
+}
+
 void write_stream(ByteVector& output,
                   std::span<const std::uint8_t> raw,
                   bool try_order1 = false,
@@ -682,11 +699,31 @@ std::pair<ByteVector, std::optional<ByteVector>> encode_lz77_split_payloads(
 
     std::optional<ByteVector> slots;
     if (slots_ok) {
+        auto distance_extra = extra.finish();
+        if (!fast) {
+            const auto slot_bits =
+                has_distance_slots_hist
+                    ? order0_bits_per_byte(distance_slots_hist, distance_slots.size())
+                    : order0_bits_per_byte(distance_slots);
+            const auto extra_bits = order0_bits_per_byte(distance_extra);
+            const double slot_distance_lower_bound =
+                stream_entropy_lower_bound(slot_bits, distance_slots.size()) +
+                stream_entropy_lower_bound(extra_bits, distance_extra.size());
+
+            // The slot layout only differs from the plain layout in the distance
+            // streams. If even the entropy lower bound for slot distances cannot
+            // beat the already encoded plain distance stream, the real encoded
+            // slot candidate cannot win. Skip its Huffman/rANS trial work.
+            if (slot_distance_lower_bound >= static_cast<double>(plain_distances.size())) {
+                return {std::move(plain), std::nullopt};
+            }
+        }
+
         ByteVector slot_distances;
         write_stream(slot_distances, distance_slots, /*try_order1=*/false, fast,
                      /*prefer_rans=*/fast,
                      has_distance_slots_hist ? &distance_slots_hist : nullptr);
-        write_stream(slot_distances, extra.finish(), /*try_order1=*/false, fast);
+        write_stream(slot_distances, distance_extra, /*try_order1=*/false, fast);
         slots = concat(shared, slot_distances, literals_encoded);
     }
 
