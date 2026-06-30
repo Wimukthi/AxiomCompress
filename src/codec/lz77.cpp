@@ -1,6 +1,7 @@
 #include "codec/lz77.hpp"
 
 #include "codec/lz77_split.hpp"
+#include "codec/match_copy.hpp"
 #include "codec/varint.hpp"
 
 #include <algorithm>
@@ -51,6 +52,12 @@ std::size_t hash4(std::span<const std::uint8_t> input, std::size_t position) {
     return (value * 2654435761u) >> (32 - kHashBits);
 }
 
+std::uint32_t load_u32_le(const std::uint8_t* data) {
+    std::uint32_t value = 0;
+    std::memcpy(&value, data, sizeof(value));
+    return value;
+}
+
 // Length of the common prefix of two byte runs, capped at `limit`. Compares eight
 // bytes per step (the first mismatching byte is located with a single
 // count-trailing-zeros) instead of one byte at a time. Both pointers read the
@@ -91,6 +98,10 @@ std::size_t match_length_at(std::span<const std::uint8_t> input,
     }
 
     const auto source = position - distance;
+    if (limit >= kMinMatch &&
+        load_u32_le(input.data() + source) != load_u32_le(input.data() + position)) {
+        return 0;
+    }
     return common_prefix(input.data() + source, input.data() + position, limit);
 }
 
@@ -269,6 +280,12 @@ std::vector<Match> find_matches_at(std::span<const std::uint8_t> input,
             }
         }
 
+        if (load_u32_le(input.data() + candidate) != load_u32_le(input.data() + position)) {
+            candidate = previous[candidate];
+            ++depth;
+            continue;
+        }
+
         const std::size_t length =
             common_prefix(input.data() + candidate, input.data() + position, limit);
 
@@ -383,7 +400,8 @@ ByteVector encode_lz77_impl(std::span<const std::uint8_t> input,
             }
 
             if (best_length < limit &&
-                input[candidate + best_length] == input[pos + best_length]) {
+                input[candidate + best_length] == input[pos + best_length] &&
+                load_u32_le(input.data() + candidate) == load_u32_le(input.data() + pos)) {
                 const std::size_t length =
                     common_prefix(input.data() + candidate, input.data() + pos, limit);
 
@@ -994,37 +1012,8 @@ void decode_lz77_into(std::span<const std::uint8_t> encoded,
 
     std::array<std::size_t, kRepCount> reps{1, 2, 3, 4};
     auto copy_match = [&](std::size_t length, std::size_t distance) {
-        if (length == 0 || distance == 0 || distance > out) {
-            throw FormatError("invalid match reference");
-        }
-        if (length > output_size - out) {
-            throw FormatError("match exceeds declared output size");
-        }
-
-        if (distance == 1) {
-            std::fill_n(output.begin() + static_cast<std::ptrdiff_t>(out), length, output[out - 1]);
-            out += length;
-            return;
-        }
-
-        if (distance >= length) {
-            std::memcpy(output.data() + out, output.data() + out - distance, length);
-            out += length;
-            return;
-        }
-
-        // Matches can overlap the destination. Copy forward, with a word-sized
-        // fast path for the common distance >= 8 case.
-        while (length >= 8 && distance >= 8) {
-            std::memcpy(output.data() + out, output.data() + out - distance, 8);
-            out += 8;
-            length -= 8;
-        }
-        while (length > 0) {
-            output[out] = output[out - distance];
-            ++out;
-            --length;
-        }
+        copy_lz_match(output, out, distance, length, "invalid match reference",
+                      "match exceeds declared output size");
     };
 
     std::size_t cursor = 0;

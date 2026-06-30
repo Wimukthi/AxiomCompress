@@ -2,10 +2,27 @@
 
 #include "axiom/axiom.hpp"
 
+#include <array>
 #include <optional>
 #include <utility>
 
 namespace axiom::codec {
+
+struct Lz77SplitStreams {
+    using Histogram = std::array<std::uint64_t, 256>;
+
+    ByteVector commands;
+    ByteVector literal_lengths;
+    ByteVector match_lengths;
+    ByteVector distances;
+    ByteVector literals;
+    bool has_histograms = false;
+    Histogram commands_hist{};
+    Histogram literal_lengths_hist{};
+    Histogram match_lengths_hist{};
+    Histogram distances_hist{};
+    Histogram literals_hist{};
+};
 
 // When `fast` is set, each substream's entropy coder is chosen from a cheap
 // order-0 (and, for literals, sampled order-1) entropy estimate instead of
@@ -39,5 +56,8 @@ void decode_lz77_split_streams_slots_into(std::span<const std::uint8_t> encoded,
 // identical to calling the two encoders separately, but roughly half the work.
 std::pair<ByteVector, std::optional<ByteVector>> encode_lz77_split_payloads(
     std::span<const std::uint8_t> lz77_payload, bool fast = false);
+
+std::pair<ByteVector, std::optional<ByteVector>> encode_lz77_split_payloads(
+    const Lz77SplitStreams& streams, bool fast = false);
 
 }  // namespace axiom::codec

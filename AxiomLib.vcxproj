@@ -76,6 +76,7 @@
     <ClInclude Include="src\codec\incompressible.hpp" />
     <ClInclude Include="src\codec\lz77.hpp" />
     <ClInclude Include="src\codec\lz77_split.hpp" />
+    <ClInclude Include="src\codec\match_copy.hpp" />
     <ClInclude Include="src\codec\varint.hpp" />
     <ClInclude Include="src\core\archive.hpp" />
     <ClInclude Include="src\core\checksum.hpp" />

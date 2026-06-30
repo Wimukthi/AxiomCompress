@@ -1,5 +1,6 @@
 #include "codec/lz77_split.hpp"
 
+#include "codec/match_copy.hpp"
 #include "codec/varint.hpp"
 #include "entropy/huffman.hpp"
 #include "entropy/range.hpp"
@@ -29,14 +30,6 @@ enum class StreamCodec : std::uint8_t {
     rans = 3,
 };
 
-struct SplitStreams {
-    ByteVector commands;
-    ByteVector literal_lengths;
-    ByteVector match_lengths;
-    ByteVector distances;
-    ByteVector literals;
-};
-
 // Order-0 entropy of a byte stream, in bits per byte (0..8). The lower bound on
 // what any order-0 coder (Huffman, rANS) can achieve, used to decide cheaply
 // whether coding is worth attempting at all.
@@ -53,6 +46,21 @@ double order0_bits_per_byte(std::span<const std::uint8_t> raw) {
     for (const auto count : hist) {
         if (count != 0) {
             const auto p = count / total;
+            bits -= p * std::log2(p);
+        }
+    }
+    return bits;
+}
+
+double order0_bits_per_byte(const Lz77SplitStreams::Histogram& hist, std::size_t size) {
+    if (size == 0) {
+        return 0.0;
+    }
+    const auto total = static_cast<double>(size);
+    double bits = 0.0;
+    for (const auto count : hist) {
+        if (count != 0) {
+            const auto p = static_cast<double>(count) / total;
             bits -= p * std::log2(p);
         }
     }
@@ -100,11 +108,23 @@ void write_stream(ByteVector& output,
                   std::span<const std::uint8_t> raw,
                   bool try_order1 = false,
                   bool fast = false,
-                  bool prefer_rans = false) {
+                  bool prefer_rans = false,
+                  const Lz77SplitStreams::Histogram* histogram = nullptr) {
     write_varuint(output, raw.size());
 
-    auto payload = ByteVector(raw.begin(), raw.end());
     auto codec = StreamCodec::store;
+    ByteVector payload;
+    std::size_t best_size = raw.size();
+
+    auto consider = [&](StreamCodec candidate_codec, std::optional<ByteVector> candidate) {
+        if (candidate && candidate->size() < best_size) {
+            codec = candidate_codec;
+            payload = std::move(*candidate);
+            best_size = payload.size();
+            return true;
+        }
+        return false;
+    };
 
     if (fast) {
         // Fast mode either tries rANS directly for streams that are known to be
@@ -112,67 +132,57 @@ void write_stream(ByteVector& output,
         // footers that are often near-uniform and not worth coding.
         constexpr std::size_t kMinWorthCoding = 64;
         if (prefer_rans && raw.size() >= kMinWorthCoding) {
-            if (auto rans = entropy::encode_rans(raw);
-                rans && rans->size() < payload.size()) {
-                codec = StreamCodec::rans;
-                payload = std::move(*rans);
-            }
+            (void)consider(StreamCodec::rans,
+                           histogram ? entropy::encode_rans(raw, *histogram)
+                                     : entropy::encode_rans(raw));
         } else {
-            const auto o0 = order0_bits_per_byte(raw);
+            const auto o0 = histogram ? order0_bits_per_byte(*histogram, raw.size())
+                                      : order0_bits_per_byte(raw);
             if (raw.size() >= kMinWorthCoding && o0 < 7.5) {
                 bool coded = false;
                 if (try_order1 && order1_bits_per_byte(raw) + 0.10 < o0) {
-                    if (auto order1 = entropy::encode_order1(raw);
-                        order1 && order1->size() < payload.size()) {
-                        codec = StreamCodec::order1;
-                        payload = std::move(*order1);
-                        coded = true;
-                    }
+                    coded = consider(StreamCodec::order1, entropy::encode_order1(raw));
                 }
                 if (!coded) {
-                    if (auto rans = entropy::encode_rans(raw);
-                        rans && rans->size() < payload.size()) {
-                        codec = StreamCodec::rans;
-                        payload = std::move(*rans);
-                    }
+                    (void)consider(StreamCodec::rans,
+                                   histogram ? entropy::encode_rans(raw, *histogram)
+                                             : entropy::encode_rans(raw));
                 }
             }
         }
 
         output.push_back(static_cast<std::uint8_t>(codec));
-        write_varuint(output, payload.size());
-        output.insert(output.end(), payload.begin(), payload.end());
+        write_varuint(output, best_size);
+        if (codec == StreamCodec::store) {
+            output.insert(output.end(), raw.begin(), raw.end());
+        } else {
+            output.insert(output.end(), payload.begin(), payload.end());
+        }
         return;
     }
 
-    if (auto huffman = entropy::encode_huffman(raw);
-        huffman && huffman->size() < payload.size()) {
-        codec = StreamCodec::huffman;
-        payload = std::move(*huffman);
-    }
+    (void)consider(StreamCodec::huffman, entropy::encode_huffman(raw));
 
     // Order-1 modelling only pays off on the literal stream; the command,
     // length, and distance streams have little previous-symbol structure, so we
     // skip the expensive coder there. (It is also the slowest one to encode.)
     if (try_order1) {
-        if (auto order1 = entropy::encode_order1(raw);
-            order1 && order1->size() < payload.size()) {
-            codec = StreamCodec::order1;
-            payload = std::move(*order1);
-        }
+        (void)consider(StreamCodec::order1, entropy::encode_order1(raw));
     }
 
     // rANS is the order-0 choice; the older bit-serial order-0 range stream is
     // intentionally unsupported while the format is still free to change.
-    if (auto rans = entropy::encode_rans(raw);
-        rans && rans->size() < payload.size()) {
-        codec = StreamCodec::rans;
-        payload = std::move(*rans);
-    }
+    (void)consider(StreamCodec::rans,
+                   histogram ? entropy::encode_rans(raw, *histogram)
+                             : entropy::encode_rans(raw));
 
     output.push_back(static_cast<std::uint8_t>(codec));
-    write_varuint(output, payload.size());
-    output.insert(output.end(), payload.begin(), payload.end());
+    write_varuint(output, best_size);
+    if (codec == StreamCodec::store) {
+        output.insert(output.end(), raw.begin(), raw.end());
+    } else {
+        output.insert(output.end(), payload.begin(), payload.end());
+    }
 }
 
 ByteVector read_stream(std::span<const std::uint8_t> encoded, std::size_t& cursor) {
@@ -215,8 +225,8 @@ ByteVector read_stream(std::span<const std::uint8_t> encoded, std::size_t& curso
     throw FormatError("unknown split-stream codec");
 }
 
-SplitStreams split_lz77_payload(std::span<const std::uint8_t> lz77_payload) {
-    SplitStreams streams;
+Lz77SplitStreams split_lz77_payload(std::span<const std::uint8_t> lz77_payload) {
+    Lz77SplitStreams streams;
     std::size_t cursor = 0;
 
     while (cursor < lz77_payload.size()) {
@@ -399,37 +409,8 @@ public:
     }
 
     void copy_match(std::size_t length, std::size_t distance) {
-        if (length == 0 || distance == 0 || distance > out_) {
-            throw FormatError("invalid split match reference");
-        }
-        if (length > output_.size() - out_) {
-            throw FormatError("split match exceeds declared output size");
-        }
-
-        if (distance == 1) {
-            std::fill_n(output_.begin() + static_cast<std::ptrdiff_t>(out_), length, output_[out_ - 1]);
-            out_ += length;
-            return;
-        }
-
-        if (distance >= length) {
-            std::memcpy(output_.data() + out_, output_.data() + out_ - distance, length);
-            out_ += length;
-            return;
-        }
-
-        // Match ranges may overlap. Copying forward preserves LZ semantics; the
-        // word-sized case keeps common repeated text runs off the byte loop.
-        while (length >= 8 && distance >= 8) {
-            std::memcpy(output_.data() + out_, output_.data() + out_ - distance, 8);
-            out_ += 8;
-            length -= 8;
-        }
-        while (length > 0) {
-            output_[out_] = output_[out_ - distance];
-            ++out_;
-            --length;
-        }
+        copy_lz_match(output_, out_, distance, length, "invalid split match reference",
+                      "split match exceeds declared output size");
     }
 
 private:
@@ -624,23 +605,36 @@ std::optional<ByteVector> encode_lz77_split_streams_slots(
 }
 
 std::pair<ByteVector, std::optional<ByteVector>> encode_lz77_split_payloads(
-    std::span<const std::uint8_t> lz77_payload, bool fast) {
-    const auto streams = split_lz77_payload(lz77_payload);
+    const Lz77SplitStreams& streams, bool fast) {
+    const auto* commands_hist = streams.has_histograms ? &streams.commands_hist : nullptr;
+    const auto* literal_lengths_hist =
+        streams.has_histograms ? &streams.literal_lengths_hist : nullptr;
+    const auto* match_lengths_hist =
+        streams.has_histograms ? &streams.match_lengths_hist : nullptr;
+    const auto* distances_hist = streams.has_histograms ? &streams.distances_hist : nullptr;
+    const auto* literals_hist = streams.has_histograms ? &streams.literals_hist : nullptr;
 
     // Encode the streams the two layouts share exactly once.
     ByteVector shared;
-    write_stream(shared, streams.commands, /*try_order1=*/false, fast, /*prefer_rans=*/fast);
-    write_stream(shared, streams.literal_lengths, /*try_order1=*/false, fast, /*prefer_rans=*/fast);
-    write_stream(shared, streams.match_lengths, /*try_order1=*/false, fast, /*prefer_rans=*/fast);
+    write_stream(shared, streams.commands, /*try_order1=*/false, fast, /*prefer_rans=*/fast,
+                 commands_hist);
+    write_stream(shared, streams.literal_lengths, /*try_order1=*/false, fast, /*prefer_rans=*/fast,
+                 literal_lengths_hist);
+    write_stream(shared, streams.match_lengths, /*try_order1=*/false, fast, /*prefer_rans=*/fast,
+                 match_lengths_hist);
 
     ByteVector literals_encoded;
-    write_stream(literals_encoded, streams.literals, /*try_order1=*/true, fast, /*prefer_rans=*/fast);
+    write_stream(literals_encoded, streams.literals, /*try_order1=*/true, fast,
+                 /*prefer_rans=*/fast, literals_hist);
 
     ByteVector plain_distances;
-    write_stream(plain_distances, streams.distances, /*try_order1=*/false, fast);
+    write_stream(plain_distances, streams.distances, /*try_order1=*/false, fast,
+                 /*prefer_rans=*/false, distances_hist);
 
     // Transcode distances into slots + packed footers for the slot layout.
     ByteVector distance_slots;
+    Lz77SplitStreams::Histogram distance_slots_hist{};
+    const bool has_distance_slots_hist = streams.has_histograms;
     BitPacker extra;
     bool slots_ok = true;
     std::size_t cursor = 0;
@@ -655,6 +649,9 @@ std::pair<ByteVector, std::optional<ByteVector>> encode_lz77_split_payloads(
         const auto slot = distance_to_slot(static_cast<std::uint32_t>(distance),
                                            footer_bits, footer_value);
         distance_slots.push_back(static_cast<std::uint8_t>(slot));
+        if (has_distance_slots_hist) {
+            ++distance_slots_hist[slot];
+        }
         extra.put(footer_value, footer_bits);
     }
 
@@ -672,12 +669,19 @@ std::pair<ByteVector, std::optional<ByteVector>> encode_lz77_split_payloads(
     std::optional<ByteVector> slots;
     if (slots_ok) {
         ByteVector slot_distances;
-        write_stream(slot_distances, distance_slots, /*try_order1=*/false, fast, /*prefer_rans=*/fast);
+        write_stream(slot_distances, distance_slots, /*try_order1=*/false, fast,
+                     /*prefer_rans=*/fast,
+                     has_distance_slots_hist ? &distance_slots_hist : nullptr);
         write_stream(slot_distances, extra.finish(), /*try_order1=*/false, fast);
         slots = concat(shared, slot_distances, literals_encoded);
     }
 
     return {std::move(plain), std::move(slots)};
+}
+
+std::pair<ByteVector, std::optional<ByteVector>> encode_lz77_split_payloads(
+    std::span<const std::uint8_t> lz77_payload, bool fast) {
+    return encode_lz77_split_payloads(split_lz77_payload(lz77_payload), fast);
 }
 
 void decode_lz77_split_streams_slots_into(std::span<const std::uint8_t> encoded,

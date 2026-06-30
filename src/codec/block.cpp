@@ -89,15 +89,12 @@ BlockResult compress_block(std::span<const std::uint8_t> input,
 
     if (options.use_fast_lz) {
         // The fast path's primary codec is LZ77 sequences entropy-coded with the
-        // split-stream rANS backend. It runs the row-hash matcher once.
-        auto lz_payload = encode_fast_lz77(input, options);
-        if (lz_payload.size() < best.payload.size()) {
-            best.codec = BlockCodec::greedy_lz77;
-            best.payload = lz_payload;
-        }
-
+        // split-stream rANS backend. The parser fills split streams directly and
+        // only estimates the raw LZ77 candidate size; raw bytes are materialized
+        // only if that candidate can actually win.
+        auto fast_payloads = encode_fast_lz77_split_payloads(input, options);
         auto [split_payload, slot_payload] =
-            encode_lz77_split_payloads(lz_payload, /*fast=*/true);
+            encode_lz77_split_payloads(fast_payloads.streams, /*fast=*/true);
         if (split_payload.size() < best.payload.size()) {
             best.codec = BlockCodec::greedy_lz77_split;
             best.payload = std::move(split_payload);
@@ -105,6 +102,14 @@ BlockResult compress_block(std::span<const std::uint8_t> input,
         if (slot_payload && slot_payload->size() < best.payload.size()) {
             best.codec = BlockCodec::greedy_lz77_split_slots;
             best.payload = std::move(*slot_payload);
+        }
+        if (fast_payloads.lz77_size < input.size() &&
+            fast_payloads.lz77_size <= best.payload.size()) {
+            auto lz_payload = encode_fast_lz77(input, options);
+            if (lz_payload.size() <= best.payload.size()) {
+                best.codec = BlockCodec::greedy_lz77;
+                best.payload = std::move(lz_payload);
+            }
         }
 
         // The standalone nibble format only wins where the entropy stage cannot

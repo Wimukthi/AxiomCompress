@@ -2,6 +2,7 @@
 
 #include "axiom/axiom.hpp"
 
+#include <array>
 #include <optional>
 
 namespace axiom::entropy {
@@ -19,6 +20,10 @@ ByteVector decode_order1(std::span<const std::uint8_t> encoded,
 // states so decode has independent dependency chains while retaining O(1) slot
 // table lookup per byte.
 std::optional<ByteVector> encode_rans(std::span<const std::uint8_t> input);
+
+std::optional<ByteVector> encode_rans(
+    std::span<const std::uint8_t> input,
+    const std::array<std::uint64_t, 256>& counts);
 
 ByteVector decode_rans(std::span<const std::uint8_t> encoded,
                        std::size_t max_output_size);

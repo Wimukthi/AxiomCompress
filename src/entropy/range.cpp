@@ -476,6 +476,16 @@ std::optional<ByteVector> encode_rans(std::span<const std::uint8_t> input) {
     }
 
     const auto counts = count_frequencies(input);
+    return encode_rans(input, counts);
+}
+
+std::optional<ByteVector> encode_rans(
+    std::span<const std::uint8_t> input,
+    const std::array<std::uint64_t, 256>& counts) {
+    if (input.empty()) {
+        return std::nullopt;
+    }
+
     const auto frequencies = rans_normalize(counts, input.size());
 
     std::array<std::uint32_t, kSymbolCount + 1> cumulative{};
