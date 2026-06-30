@@ -231,12 +231,11 @@ inline void apply_compression_level(CompressionOptions& options, int level) {
             options.auto_block_size_for_threads = false;
             break;
         case 9:
-            // Maximum preset keeps the deepest tree search with the same
-            // 32 MiB block granularity as level 8; smaller blocks hurt ratio
-            // on large text/mixed corpora without enough speed benefit.
+            // Maximum preset keeps the deepest tree search and uses larger
+            // blocks than level 8 so cross-block repetition can improve ratio.
             options.use_tree_matcher = true;
             options.max_chain_depth = 512;
-            options.block_size = 32u << 20;
+            options.block_size = 64u << 20;
             options.window_size = 64u << 20;
             options.fast_entropy = false;
             options.auto_block_size_for_threads = false;

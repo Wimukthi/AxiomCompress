@@ -157,7 +157,7 @@ void test_compression_level_presets() {
     AXIOM_CHECK(maximum.use_tree_matcher);
     AXIOM_CHECK(!maximum.use_fast_lz);
     AXIOM_CHECK(maximum.max_chain_depth == 512);
-    AXIOM_CHECK(maximum.block_size == (32u << 20));
+    AXIOM_CHECK(maximum.block_size == (64u << 20));
     AXIOM_CHECK(maximum.window_size == (64u << 20));
     AXIOM_CHECK(!maximum.auto_block_size_for_threads);
 }
