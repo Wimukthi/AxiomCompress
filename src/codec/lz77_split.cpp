@@ -74,7 +74,8 @@ double order1_bits_per_byte(std::span<const std::uint8_t> raw) {
     if (raw.size() < 2) {
         return order0_bits_per_byte(raw);
     }
-    std::vector<std::uint32_t> joint(256 * 256, 0);
+    thread_local std::array<std::uint32_t, 256 * 256> joint;
+    joint.fill(0);
     std::array<std::uint32_t, 256> context_total{};
     std::uint8_t prev = 0;
     for (const auto byte : raw) {
@@ -227,6 +228,11 @@ ByteVector read_stream(std::span<const std::uint8_t> encoded, std::size_t& curso
 
 Lz77SplitStreams split_lz77_payload(std::span<const std::uint8_t> lz77_payload) {
     Lz77SplitStreams streams;
+    streams.commands.reserve(std::max<std::size_t>(1, lz77_payload.size() / 8));
+    streams.literal_lengths.reserve(std::max<std::size_t>(1, lz77_payload.size() / 64));
+    streams.match_lengths.reserve(std::max<std::size_t>(1, lz77_payload.size() / 64));
+    streams.distances.reserve(std::max<std::size_t>(1, lz77_payload.size() / 64));
+    streams.literals.reserve(lz77_payload.size() / 2);
     std::size_t cursor = 0;
 
     while (cursor < lz77_payload.size()) {
@@ -316,6 +322,10 @@ std::uint32_t slot_to_distance(std::uint32_t slot, std::uint32_t footer_value) {
 // LSB-first bit packing for the near-uniform footer bits.
 class BitPacker {
 public:
+    void reserve(std::size_t byte_count) {
+        bytes_.reserve(byte_count);
+    }
+
     void put(std::uint32_t value, std::uint32_t bits) {
         accumulator_ |= static_cast<std::uint64_t>(value) << filled_;
         filled_ += bits;
@@ -574,7 +584,9 @@ std::optional<ByteVector> encode_lz77_split_streams_slots(
 
     // Transcode the varint distance stream into slot bytes plus packed footers.
     ByteVector distance_slots;
+    distance_slots.reserve(streams.distances.size());
     BitPacker extra;
+    extra.reserve(streams.distances.size());
     std::size_t cursor = 0;
     while (cursor < streams.distances.size()) {
         const auto distance = read_varuint(streams.distances, cursor);
@@ -633,9 +645,11 @@ std::pair<ByteVector, std::optional<ByteVector>> encode_lz77_split_payloads(
 
     // Transcode distances into slots + packed footers for the slot layout.
     ByteVector distance_slots;
+    distance_slots.reserve(streams.distances.size());
     Lz77SplitStreams::Histogram distance_slots_hist{};
     const bool has_distance_slots_hist = streams.has_histograms;
     BitPacker extra;
+    extra.reserve(streams.distances.size());
     bool slots_ok = true;
     std::size_t cursor = 0;
     while (cursor < streams.distances.size()) {

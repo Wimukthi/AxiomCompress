@@ -289,6 +289,31 @@ python bench/bench_7zip.py --axiom out/Release/axiomc.exe --input path/to/corpus
 python bench/bench_7zip.py --axiom out/Release/axiomc.exe --input path/to/corpus --axiom-optimal --axiom-threads 8
 ```
 
+To compare two Axiom builds across compression levels, use the level comparator:
+
+```powershell
+.\tools\bench_axiom_levels.ps1 `
+  -BaselineAxiomc D:\baselines\axiomc.exe `
+  -CurrentAxiomc .\out\Release\axiomc.exe `
+  -CorpusDir D:\tests\axiom-perf\corpora `
+  -OutputDir D:\tests\axiom-perf\results `
+  -Levels 1,2,3,4,5,6,7,8,9 `
+  -Repeats 3
+```
+
+For a quick smoke test, let the script generate deterministic sample corpora:
+
+```powershell
+.\tools\bench_axiom_levels.ps1 `
+  -BaselineAxiomc D:\baselines\axiomc.exe `
+  -GenerateSampleCorpora `
+  -SampleSizeMiB 8
+```
+
+The script verifies round-trips and writes raw, summary, and delta CSV files.
+Positive compression/decompression deltas mean the current build is faster;
+positive ratio deltas mean the current build compressed smaller.
+
 ## Performance snapshot
 
 Ratios below are for `enwik8` (100 MB English Wikipedia text). They are exact for

@@ -81,10 +81,17 @@ BlockResult compress_block(std::span<const std::uint8_t> input,
     BlockResult best;
     best.codec = BlockCodec::store;
     best.original_size = input.size();
-    best.payload.assign(input.begin(), input.end());
+    std::size_t best_size = input.size();
+
+    auto finish_best = [&]() {
+        if (best.codec == BlockCodec::store && best.payload.empty()) {
+            best.payload.assign(input.begin(), input.end());
+        }
+        return std::move(best);
+    };
 
     if (likely_incompressible(input)) {
-        return best;
+        return finish_best();
     }
 
     if (options.use_fast_lz) {
@@ -95,18 +102,21 @@ BlockResult compress_block(std::span<const std::uint8_t> input,
         auto fast_payloads = encode_fast_lz77_split_payloads(input, options);
         auto [split_payload, slot_payload] =
             encode_lz77_split_payloads(fast_payloads.streams, /*fast=*/true);
-        if (split_payload.size() < best.payload.size()) {
+        if (split_payload.size() < best_size) {
+            best_size = split_payload.size();
             best.codec = BlockCodec::greedy_lz77_split;
             best.payload = std::move(split_payload);
         }
-        if (slot_payload && slot_payload->size() < best.payload.size()) {
+        if (slot_payload && slot_payload->size() < best_size) {
+            best_size = slot_payload->size();
             best.codec = BlockCodec::greedy_lz77_split_slots;
             best.payload = std::move(*slot_payload);
         }
         if (fast_payloads.lz77_size < input.size() &&
-            fast_payloads.lz77_size <= best.payload.size()) {
+            fast_payloads.lz77_size <= best_size) {
             auto lz_payload = encode_fast_lz77(input, options);
-            if (lz_payload.size() <= best.payload.size()) {
+            if (lz_payload.size() <= best_size) {
+                best_size = lz_payload.size();
                 best.codec = BlockCodec::greedy_lz77;
                 best.payload = std::move(lz_payload);
             }
@@ -116,18 +126,20 @@ BlockResult compress_block(std::span<const std::uint8_t> input,
         // help (high-entropy but LZ-repetitive data). On normal compressible
         // input the split path wins outright, so skip its second matcher pass
         // unless the block barely compressed (saved < 10%).
-        if (best.payload.size() * 10 > input.size() * 9) {
+        if (best_size * 10 > input.size() * 9) {
             auto fast_payload = encode_fast_lz(input, options);
-            if (fast_payload.size() < best.payload.size()) {
+            if (fast_payload.size() < best_size) {
+                best_size = fast_payload.size();
                 best.codec = BlockCodec::fast_lz;
                 best.payload = std::move(fast_payload);
             }
         }
-        return best;
+        return finish_best();
     }
 
     auto consider_lz_payload = [&](ByteVector lz_payload) {
-        if (lz_payload.size() < best.payload.size()) {
+        if (lz_payload.size() < best_size) {
+            best_size = lz_payload.size();
             best.codec = BlockCodec::greedy_lz77;
             best.payload = lz_payload;
         }
@@ -136,7 +148,8 @@ BlockResult compress_block(std::span<const std::uint8_t> input,
         // real data; in fast mode skip it rather than pay a full Huffman pass.
         if (!options.fast_entropy) {
             if (auto entropy_payload = entropy::encode_huffman(lz_payload);
-                entropy_payload && entropy_payload->size() < best.payload.size()) {
+                entropy_payload && entropy_payload->size() < best_size) {
+                best_size = entropy_payload->size();
                 best.codec = BlockCodec::greedy_lz77_huffman;
                 best.payload = std::move(*entropy_payload);
             }
@@ -144,11 +157,13 @@ BlockResult compress_block(std::span<const std::uint8_t> input,
 
         auto [split_payload, slot_payload] =
             encode_lz77_split_payloads(lz_payload, options.fast_entropy);
-        if (split_payload.size() < best.payload.size()) {
+        if (split_payload.size() < best_size) {
+            best_size = split_payload.size();
             best.codec = BlockCodec::greedy_lz77_split;
             best.payload = std::move(split_payload);
         }
-        if (slot_payload && slot_payload->size() < best.payload.size()) {
+        if (slot_payload && slot_payload->size() < best_size) {
+            best_size = slot_payload->size();
             best.codec = BlockCodec::greedy_lz77_split_slots;
             best.payload = std::move(*slot_payload);
         }
@@ -159,7 +174,7 @@ BlockResult compress_block(std::span<const std::uint8_t> input,
         consider_lz_payload(encode_lz77_optimal(input, options));
     }
 
-    return best;
+    return finish_best();
 }
 
 void decompress_block_into(std::span<const std::uint8_t> payload,
