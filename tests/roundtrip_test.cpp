@@ -152,6 +152,19 @@ void test_compression_level_presets() {
     AXIOM_CHECK(balanced.lazy_matching);
     AXIOM_CHECK(balanced.max_chain_depth == 128);
 
+    axiom::CompressionOptions stronger_chain;
+    axiom::apply_compression_level(stronger_chain, 6);
+    AXIOM_CHECK(!stronger_chain.use_tree_matcher);
+    AXIOM_CHECK(stronger_chain.max_chain_depth == 256);
+    AXIOM_CHECK(stronger_chain.nice_length == 192);
+
+    axiom::CompressionOptions wide_tree;
+    axiom::apply_compression_level(wide_tree, 8);
+    AXIOM_CHECK(wide_tree.use_tree_matcher);
+    AXIOM_CHECK(wide_tree.max_chain_depth == 128);
+    AXIOM_CHECK(wide_tree.block_size == (32u << 20));
+    AXIOM_CHECK(wide_tree.window_size == (32u << 20));
+
     axiom::CompressionOptions maximum;
     axiom::apply_compression_level(maximum, 99);
     AXIOM_CHECK(maximum.use_tree_matcher);

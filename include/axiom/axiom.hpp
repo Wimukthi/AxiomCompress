@@ -224,7 +224,7 @@ inline void apply_compression_level(CompressionOptions& options, int level) {
             break;
         case 8:
             options.use_tree_matcher = true;
-            options.max_chain_depth = 256;
+            options.max_chain_depth = 128;
             options.block_size = 32u << 20;
             options.window_size = 32u << 20;
             options.fast_entropy = false;
