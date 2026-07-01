@@ -5,6 +5,7 @@
 #include "entropy/huffman.hpp"
 #include "entropy/range.hpp"
 
+#include <algorithm>
 #include <array>
 #include <bit>
 #include <cmath>
@@ -122,6 +123,19 @@ double stream_entropy_lower_bound(double bits_per_byte, std::size_t raw_size) {
            payload_bytes;
 }
 
+std::size_t decoded_stream_limit(std::size_t output_size) {
+    constexpr std::size_t kMinimumStreamLimit = 1024;
+    constexpr std::size_t kStreamLimitScale = 4;
+
+    if (output_size > (std::numeric_limits<std::size_t>::max() - kMinimumStreamLimit) /
+                          kStreamLimitScale) {
+        return std::numeric_limits<std::size_t>::max();
+    }
+
+    return std::max(kMinimumStreamLimit, (output_size * kStreamLimitScale) +
+                                             kMinimumStreamLimit);
+}
+
 void write_stream(ByteVector& output,
                   std::span<const std::uint8_t> raw,
                   bool try_order1 = false,
@@ -203,8 +217,13 @@ void write_stream(ByteVector& output,
     }
 }
 
-ByteVector read_stream(std::span<const std::uint8_t> encoded, std::size_t& cursor) {
+ByteVector read_stream(std::span<const std::uint8_t> encoded,
+                       std::size_t& cursor,
+                       std::size_t max_raw_size) {
     const auto raw_size = static_cast<std::size_t>(read_varuint(encoded, cursor));
+    if (raw_size > max_raw_size) {
+        throw FormatError("split stream output exceeds block limit");
+    }
 
     if (cursor >= encoded.size()) {
         throw FormatError("truncated split-stream codec id");
@@ -574,11 +593,12 @@ void reconstruct_from_slot_streams_into(const ByteVector& commands,
 void decode_lz77_split_streams_into(std::span<const std::uint8_t> encoded,
                                     std::span<std::uint8_t> output) {
     std::size_t cursor = 0;
-    const auto commands = read_stream(encoded, cursor);
-    const auto literal_lengths = read_stream(encoded, cursor);
-    const auto match_lengths = read_stream(encoded, cursor);
-    const auto distances = read_stream(encoded, cursor);
-    const auto literals = read_stream(encoded, cursor);
+    const auto stream_limit = decoded_stream_limit(output.size());
+    const auto commands = read_stream(encoded, cursor, stream_limit);
+    const auto literal_lengths = read_stream(encoded, cursor, stream_limit);
+    const auto match_lengths = read_stream(encoded, cursor, stream_limit);
+    const auto distances = read_stream(encoded, cursor, stream_limit);
+    const auto literals = read_stream(encoded, cursor, stream_limit);
 
     if (cursor != encoded.size()) {
         throw FormatError("trailing bytes after split streams");
@@ -738,12 +758,13 @@ std::pair<ByteVector, std::optional<ByteVector>> encode_lz77_split_payloads(
 void decode_lz77_split_streams_slots_into(std::span<const std::uint8_t> encoded,
                                           std::span<std::uint8_t> output) {
     std::size_t cursor = 0;
-    const auto commands = read_stream(encoded, cursor);
-    const auto literal_lengths = read_stream(encoded, cursor);
-    const auto match_lengths = read_stream(encoded, cursor);
-    const auto distance_slots = read_stream(encoded, cursor);
-    const auto distance_extra = read_stream(encoded, cursor);
-    const auto literals = read_stream(encoded, cursor);
+    const auto stream_limit = decoded_stream_limit(output.size());
+    const auto commands = read_stream(encoded, cursor, stream_limit);
+    const auto literal_lengths = read_stream(encoded, cursor, stream_limit);
+    const auto match_lengths = read_stream(encoded, cursor, stream_limit);
+    const auto distance_slots = read_stream(encoded, cursor, stream_limit);
+    const auto distance_extra = read_stream(encoded, cursor, stream_limit);
+    const auto literals = read_stream(encoded, cursor, stream_limit);
 
     if (cursor != encoded.size()) {
         throw FormatError("trailing bytes after slot split streams");
