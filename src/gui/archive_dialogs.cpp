@@ -62,6 +62,7 @@ constexpr int kStartupCustomPath = 2232;
 constexpr int kRestoreWindowPlacement = 2233;
 constexpr int kConfirmOverwrite = 2234;
 constexpr int kRecentLocationCount = 2235;
+constexpr int kBrowseStartupCustomPath = 2236;
 constexpr int kDefaultUpdateMode = 2250;
 constexpr int kDefaultVolumeSize = 2251;
 constexpr int kDefaultVolumeUnit = 2252;
@@ -70,6 +71,7 @@ constexpr int kDefaultRecoveryVolumes = 2254;
 constexpr int kDefaultCreateSfx = 2255;
 constexpr int kDefaultSignArchive = 2256;
 constexpr int kDefaultSigningKey = 2257;
+constexpr int kBrowseDefaultSigningKey = 2258;
 constexpr int kArchiveOutputMode = 2300;
 constexpr int kArchiveOutputFolder = 2301;
 constexpr int kExtractDestinationMode = 2302;
@@ -77,6 +79,9 @@ constexpr int kExtractDestinationFolder = 2303;
 constexpr int kTempFolderMode = 2304;
 constexpr int kTempFolder = 2305;
 constexpr int kTempCleanupDays = 2306;
+constexpr int kBrowseArchiveOutputFolder = 2307;
+constexpr int kBrowseExtractDestinationFolder = 2308;
+constexpr int kBrowseTempFolder = 2309;
 constexpr int kShowParentEntry = 2350;
 constexpr int kShowGridLines = 2351;
 constexpr int kShowHorizontalScrollbar = 2352;
@@ -89,11 +94,14 @@ constexpr int kExternalViewer = 2401;
 constexpr int kExternalEditor = 2402;
 constexpr int kWarnExecutableOpen = 2403;
 constexpr int kKeepViewedFilesUntilExit = 2404;
+constexpr int kBrowseExternalViewer = 2405;
+constexpr int kBrowseExternalEditor = 2406;
 constexpr int kPasswordPromptMode = 2450;
 constexpr int kCachePasswords = 2451;
 constexpr int kVerifySignatures = 2452;
 constexpr int kWipeEncryptedTempFiles = 2453;
 constexpr int kTrustedKeysFolder = 2454;
+constexpr int kBrowseTrustedKeysFolder = 2455;
 constexpr int kAssociateAxar = 2500;
 constexpr int kContextOpen = 2501;
 constexpr int kContextAdd = 2502;
@@ -109,6 +117,7 @@ constexpr int kIoBufferMode = 2603;
 constexpr int kIoBufferSize = 2604;
 constexpr int kMemoryLimitMode = 2605;
 constexpr int kMemoryLimit = 2606;
+constexpr int kBrowseLogFolder = 2607;
 constexpr int kAccept = IDOK;
 constexpr int kCancel = IDCANCEL;
 
@@ -308,6 +317,52 @@ std::optional<fs::path> browse_signing_key(HWND owner) {
     return result;
 }
 
+void set_initial_folder(IFileDialog* dialog, const fs::path& path) {
+    if (dialog == nullptr || path.empty()) return;
+    std::error_code error;
+    fs::path folder = fs::is_directory(path, error) ? path : path.parent_path();
+    if (folder.empty() || !fs::is_directory(folder, error)) return;
+    ComPtr<IShellItem> item;
+    if (SUCCEEDED(SHCreateItemFromParsingName(folder.c_str(), nullptr,
+                                              IID_PPV_ARGS(item.put())))) {
+        dialog->SetFolder(item.get());
+    }
+}
+
+std::optional<fs::path> browse_file(HWND owner,
+                                    const wchar_t* title,
+                                    const COMDLG_FILTERSPEC* filters,
+                                    UINT filter_count,
+                                    const fs::path& initial = {}) {
+    ComPtr<IFileOpenDialog> dialog;
+    if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER,
+                                IID_PPV_ARGS(dialog.put())))) return std::nullopt;
+    FILEOPENDIALOGOPTIONS flags{};
+    dialog->GetOptions(&flags);
+    dialog->SetOptions(flags | FOS_FORCEFILESYSTEM | FOS_FILEMUSTEXIST);
+    if (title != nullptr) dialog->SetTitle(title);
+    if (filters != nullptr && filter_count != 0) {
+        dialog->SetFileTypes(filter_count, filters);
+    }
+    set_initial_folder(dialog.get(), initial);
+    if (dialog->Show(owner) != S_OK) return std::nullopt;
+    ComPtr<IShellItem> item;
+    if (FAILED(dialog->GetResult(item.put()))) return std::nullopt;
+    PWSTR path = nullptr;
+    if (FAILED(item->GetDisplayName(SIGDN_FILESYSPATH, &path))) return std::nullopt;
+    fs::path result(path);
+    CoTaskMemFree(path);
+    return result;
+}
+
+std::optional<fs::path> browse_executable(HWND owner, const fs::path& initial = {}) {
+    const COMDLG_FILTERSPEC filters[] = {
+        {L"Applications and scripts", L"*.exe;*.com;*.bat;*.cmd"},
+        {L"All files", L"*.*"}};
+    return browse_file(owner, L"Choose application", filters,
+                       static_cast<UINT>(sizeof(filters) / sizeof(filters[0])), initial);
+}
+
 constexpr wchar_t kDarkTabClass[] = L"AxiomDarkTabControl";
 constexpr UINT kDarkTabSetSelection = WM_APP + 41;
 
@@ -491,13 +546,17 @@ bool register_dark_tab_class(HINSTANCE instance) {
            GetLastError() == ERROR_CLASS_ALREADY_EXISTS;
 }
 
-std::optional<fs::path> browse_folder(HWND owner) {
+std::optional<fs::path> browse_folder(HWND owner,
+                                      const wchar_t* title = L"Choose folder",
+                                      const fs::path& initial = {}) {
     ComPtr<IFileOpenDialog> dialog;
     if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER,
                                 IID_PPV_ARGS(dialog.put())))) return std::nullopt;
     FILEOPENDIALOGOPTIONS flags{};
     dialog->GetOptions(&flags);
     dialog->SetOptions(flags | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM);
+    if (title != nullptr) dialog->SetTitle(title);
+    set_initial_folder(dialog.get(), initial);
     if (dialog->Show(owner) != S_OK) return std::nullopt;
     ComPtr<IShellItem> item;
     if (FAILED(dialog->GetResult(item.put()))) return std::nullopt;
@@ -724,6 +783,11 @@ private:
         return edit;
     }
 
+    HWND setting_browse(int page, int id, int x, int y) {
+        return setting_control(page, L"BUTTON", L"Browse...",
+                               WS_TABSTOP | BS_OWNERDRAW, id, x, y, 96, 30);
+    }
+
     HWND setting_checkbox(int page, int id, const wchar_t* text,
                           int x, int y, int width = 520) {
         return setting_control(page, L"BUTTON", text,
@@ -774,6 +838,7 @@ private:
         setting_combo(0, kStartupMode, kStartupLocationNames, 180, 78, 260);
         setting_label(0, L"Custom startup path", 0, 126, 170);
         setting_edit(0, kStartupCustomPath, 180, 120, 470);
+        setting_browse(0, kBrowseStartupCustomPath, 660, 120);
         setting_checkbox(0, kRestoreWindowPlacement,
                          L"Restore previous window size and position", 180, 164);
         setting_checkbox(0, kConfirmDelete, L"Confirm before deleting files", 180, 198);
@@ -811,20 +876,24 @@ private:
                          L"Sign archives by default", 180, 440);
         setting_label(1, L"Signing key", 0, 482, 170);
         setting_edit(1, kDefaultSigningKey, 180, 476, 470);
+        setting_browse(1, kBrowseDefaultSigningKey, 660, 476);
 
         setting_label(2, L"Default folders", 0, 0, 660);
         setting_label(2, L"Archive output", 0, 42, 170);
         setting_combo(2, kArchiveOutputMode, kFolderPolicyNames, 180, 36, 260);
         setting_label(2, L"Archive folder", 0, 84, 170);
         setting_edit(2, kArchiveOutputFolder, 180, 78, 470);
+        setting_browse(2, kBrowseArchiveOutputFolder, 660, 78);
         setting_label(2, L"Extraction output", 0, 126, 170);
         setting_combo(2, kExtractDestinationMode, kFolderPolicyNames, 180, 120, 260);
         setting_label(2, L"Extraction folder", 0, 168, 170);
         setting_edit(2, kExtractDestinationFolder, 180, 162, 470);
+        setting_browse(2, kBrowseExtractDestinationFolder, 660, 162);
         setting_label(2, L"Temporary files", 0, 210, 170);
         setting_combo(2, kTempFolderMode, kTempFolderModeNames, 180, 204, 300);
         setting_label(2, L"Temporary folder", 0, 252, 170);
         setting_edit(2, kTempFolder, 180, 246, 470);
+        setting_browse(2, kBrowseTempFolder, 660, 246);
         setting_label(2, L"Cleanup after days", 0, 294, 170);
         setting_edit(2, kTempCleanupDays, 180, 288, 80, ES_NUMBER | ES_AUTOHSCROLL);
         setting_label(2,
@@ -850,8 +919,10 @@ private:
         setting_combo(4, kFileOpenMode, kFileOpenModeNames, 180, 36, 280);
         setting_label(4, L"External viewer", 0, 84, 170);
         setting_edit(4, kExternalViewer, 180, 78, 470);
+        setting_browse(4, kBrowseExternalViewer, 660, 78);
         setting_label(4, L"External editor", 0, 126, 170);
         setting_edit(4, kExternalEditor, 180, 120, 470);
+        setting_browse(4, kBrowseExternalEditor, 660, 120);
         setting_checkbox(4, kWarnExecutableOpen,
                          L"Warn before opening executable/script files from archives", 180, 164);
         setting_checkbox(4, kKeepViewedFilesUntilExit,
@@ -872,6 +943,7 @@ private:
                          L"Wipe temporary files extracted from encrypted archives", 180, 148);
         setting_label(5, L"Trusted keys folder", 0, 198, 170);
         setting_edit(5, kTrustedKeysFolder, 180, 192, 470);
+        setting_browse(5, kBrowseTrustedKeysFolder, 660, 192);
         setting_label(5,
                       L"Passwords are never written to settings. These options only control "
                       L"prompting, in-memory reuse, verification, and temporary-file handling.",
@@ -906,6 +978,7 @@ private:
         setting_checkbox(8, kVerboseLogging, L"Enable verbose operation logging", 180, 80);
         setting_label(8, L"Log folder", 0, 126, 170);
         setting_edit(8, kLogFolder, 180, 120, 470);
+        setting_browse(8, kBrowseLogFolder, 660, 120);
         setting_label(8, L"I/O buffer", 0, 168, 170);
         setting_combo(8, kIoBufferMode, kAutomaticCustomNames, 180, 162, 180);
         setting_edit(8, kIoBufferSize, 370, 162, 160);
@@ -1545,6 +1618,65 @@ private:
             set_window_text(path_edit_, path->wstring());
             update_output_preview();
         }
+    }
+
+    bool browse_settings_path(int id) {
+        int target = 0;
+        std::optional<fs::path> selected;
+        switch (id) {
+            case kBrowseStartupCustomPath:
+                target = kStartupCustomPath;
+                selected = browse_folder(window_, L"Choose startup folder",
+                                         window_text(item(kStartupCustomPath)));
+                if (selected) set_selected_index(kStartupMode, 3);
+                break;
+            case kBrowseDefaultSigningKey:
+                target = kDefaultSigningKey;
+                selected = browse_signing_key(window_);
+                break;
+            case kBrowseArchiveOutputFolder:
+                target = kArchiveOutputFolder;
+                selected = browse_folder(window_, L"Choose archive output folder",
+                                         window_text(item(kArchiveOutputFolder)));
+                if (selected) set_selected_index(kArchiveOutputMode, 2);
+                break;
+            case kBrowseExtractDestinationFolder:
+                target = kExtractDestinationFolder;
+                selected = browse_folder(window_, L"Choose extraction folder",
+                                         window_text(item(kExtractDestinationFolder)));
+                if (selected) set_selected_index(kExtractDestinationMode, 2);
+                break;
+            case kBrowseTempFolder:
+                target = kTempFolder;
+                selected = browse_folder(window_, L"Choose temporary folder",
+                                         window_text(item(kTempFolder)));
+                if (selected) set_selected_index(kTempFolderMode, 2);
+                break;
+            case kBrowseExternalViewer:
+                target = kExternalViewer;
+                selected = browse_executable(window_, window_text(item(kExternalViewer)));
+                break;
+            case kBrowseExternalEditor:
+                target = kExternalEditor;
+                selected = browse_executable(window_, window_text(item(kExternalEditor)));
+                break;
+            case kBrowseTrustedKeysFolder:
+                target = kTrustedKeysFolder;
+                selected = browse_folder(window_, L"Choose trusted keys folder",
+                                         window_text(item(kTrustedKeysFolder)));
+                break;
+            case kBrowseLogFolder:
+                target = kLogFolder;
+                selected = browse_folder(window_, L"Choose log folder",
+                                         window_text(item(kLogFolder)));
+                break;
+            default:
+                return false;
+        }
+        if (selected) {
+            set_window_text(item(target), selected->wstring());
+        }
+        return true;
     }
 
     std::size_t thread_count() const {
@@ -2273,6 +2405,17 @@ private:
                 }
                 switch (id) {
                     case kBrowse: browse(); return 0;
+                    case kBrowseStartupCustomPath:
+                    case kBrowseDefaultSigningKey:
+                    case kBrowseArchiveOutputFolder:
+                    case kBrowseExtractDestinationFolder:
+                    case kBrowseTempFolder:
+                    case kBrowseExternalViewer:
+                    case kBrowseExternalEditor:
+                    case kBrowseTrustedKeysFolder:
+                    case kBrowseLogFolder:
+                        if (browse_settings_path(id)) return 0;
+                        break;
                     case kAdvancedFeatures: show_advanced_features(); return 0;
                     case kBrowseSigningKey:
                         if (const auto key = browse_signing_key(window_)) {

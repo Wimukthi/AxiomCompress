@@ -4,14 +4,18 @@
 #include "gui/dialog_support.hpp"
 #include "gui/message_dialog.hpp"
 
+#include <shobjidl.h>
+
 #include <algorithm>
 #include <array>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <utility>
 #include <vector>
 
 namespace axiom::gui {
+namespace fs = std::filesystem;
 namespace {
 
 constexpr wchar_t kFeatureDialogClass[] = L"AxiomArchiveFeatureOptionsDialog";
@@ -44,7 +48,9 @@ constexpr int kSignArchive = 4250;
 constexpr int kSigningKey = 4251;
 constexpr int kCreateSfx = 4252;
 constexpr int kSfxDestination = 4253;
+constexpr int kBrowseSigningKey = 4254;
 constexpr int kVerifySignature = 4255;
+constexpr int kBrowseSfxDestination = 4256;
 
 constexpr std::array<const wchar_t*, 5> kUpdateModeNames{
     L"Create a new archive", L"Add or replace entries",
@@ -63,12 +69,89 @@ struct PlacedControl {
     bool wrapped{};
 };
 
+template <typename T>
+class ComPtr {
+public:
+    ~ComPtr() { reset(); }
+    T** put() {
+        reset();
+        return &value_;
+    }
+    T* get() const { return value_; }
+    T* operator->() const { return value_; }
+
+private:
+    void reset() {
+        if (value_ != nullptr) value_->Release();
+        value_ = nullptr;
+    }
+    T* value_ = nullptr;
+};
+
 std::wstring control_text(HWND window) {
     const int length = GetWindowTextLengthW(window);
     std::wstring text(static_cast<std::size_t>(length) + 1, L'\0');
     GetWindowTextW(window, text.data(), length + 1);
     text.resize(static_cast<std::size_t>(length));
     return text;
+}
+
+std::optional<fs::path> shell_item_path(IShellItem* item) {
+    if (item == nullptr) return std::nullopt;
+    PWSTR path = nullptr;
+    if (FAILED(item->GetDisplayName(SIGDN_FILESYSPATH, &path))) return std::nullopt;
+    fs::path result(path);
+    CoTaskMemFree(path);
+    return result;
+}
+
+void set_initial_folder(IFileDialog* dialog, const fs::path& path) {
+    if (dialog == nullptr || path.empty()) return;
+    std::error_code error;
+    fs::path folder = fs::is_directory(path, error) ? path : path.parent_path();
+    if (folder.empty() || !fs::is_directory(folder, error)) return;
+    ComPtr<IShellItem> item;
+    if (SUCCEEDED(SHCreateItemFromParsingName(folder.c_str(), nullptr,
+                                              IID_PPV_ARGS(item.put())))) {
+        dialog->SetFolder(item.get());
+    }
+}
+
+std::optional<fs::path> browse_signing_key(HWND owner, const fs::path& initial = {}) {
+    ComPtr<IFileOpenDialog> dialog;
+    if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER,
+                                IID_PPV_ARGS(dialog.put())))) return std::nullopt;
+    const COMDLG_FILTERSPEC filters[] = {
+        {L"Axiom signing keys", L"*.key"}, {L"All files", L"*.*"}};
+    dialog->SetFileTypes(static_cast<UINT>(sizeof(filters) / sizeof(filters[0])), filters);
+    dialog->SetTitle(L"Choose signing key");
+    FILEOPENDIALOGOPTIONS flags{};
+    dialog->GetOptions(&flags);
+    dialog->SetOptions(flags | FOS_FORCEFILESYSTEM | FOS_FILEMUSTEXIST);
+    set_initial_folder(dialog.get(), initial);
+    if (dialog->Show(owner) != S_OK) return std::nullopt;
+    ComPtr<IShellItem> item;
+    if (FAILED(dialog->GetResult(item.put()))) return std::nullopt;
+    return shell_item_path(item.get());
+}
+
+std::optional<fs::path> browse_save_sfx(HWND owner, const fs::path& initial = {}) {
+    ComPtr<IFileSaveDialog> dialog;
+    if (FAILED(CoCreateInstance(CLSID_FileSaveDialog, nullptr, CLSCTX_INPROC_SERVER,
+                                IID_PPV_ARGS(dialog.put())))) return std::nullopt;
+    const COMDLG_FILTERSPEC filters[] = {
+        {L"Axiom self-extractors", L"*.exe"}, {L"All files", L"*.*"}};
+    dialog->SetFileTypes(static_cast<UINT>(sizeof(filters) / sizeof(filters[0])), filters);
+    dialog->SetDefaultExtension(L"exe");
+    dialog->SetTitle(L"Choose SFX output path");
+    set_initial_folder(dialog.get(), initial);
+    if (!initial.filename().empty()) {
+        dialog->SetFileName(initial.filename().c_str());
+    }
+    if (dialog->Show(owner) != S_OK) return std::nullopt;
+    ComPtr<IShellItem> item;
+    if (FAILED(dialog->GetResult(item.put()))) return std::nullopt;
+    return shell_item_path(item.get());
 }
 
 class ArchiveFeatureDialog {
@@ -365,11 +448,14 @@ private:
                        availability_.authenticity);
             signing_key_ = page_edit(kPageAuthenticity,
                                      archive_options_.signing_key.wstring().c_str(),
-                                     kSigningKey, 145, 114, 350, 30,
-                                     availability_.authenticity);
+                                      kSigningKey, 145, 114, 260, 30,
+                                      availability_.authenticity);
+            browse_signing_key_ = place(kPageAuthenticity, L"BUTTON", L"Browse...",
+                                         WS_TABSTOP | BS_OWNERDRAW, kBrowseSigningKey,
+                                         415, 114, 88, 30, availability_.authenticity);
             page_checkbox(kPageAuthenticity, kCreateSfx,
-                          L"Create a self-extracting Windows executable",
-                          archive_options_.create_sfx, 166, availability_.sfx);
+                           L"Create a self-extracting Windows executable",
+                           archive_options_.create_sfx, 166, availability_.sfx);
             page_label(kPageAuthenticity, L"SFX output path", 8, 215, 125,
                        availability_.sfx);
             const std::wstring displayed_sfx_output =
@@ -378,9 +464,13 @@ private:
                     : archive_options_.sfx_destination;
             sfx_destination_uses_default_ = archive_options_.sfx_destination.empty();
             sfx_destination_ = page_edit(kPageAuthenticity,
-                                         displayed_sfx_output.c_str(),
-                                         kSfxDestination, 145, 208, 350, 30,
-                                         availability_.sfx);
+                                          displayed_sfx_output.c_str(),
+                                          kSfxDestination, 145, 208, 260, 30,
+                                          availability_.sfx);
+            browse_sfx_destination_ = place(kPageAuthenticity, L"BUTTON", L"Browse...",
+                                            WS_TABSTOP | BS_OWNERDRAW,
+                                            kBrowseSfxDestination,
+                                            415, 208, 88, 30, availability_.sfx);
             page_label(kPageAuthenticity,
                        L"The .exe embeds the completed .axar and is created beside it by default.",
                        8, 244, 500, availability_.sfx, true);
@@ -619,6 +709,21 @@ private:
         InvalidateRect(checkbox, nullptr, TRUE);
     }
 
+    void browse_signing_key_path() {
+        if (signing_key_ == nullptr || !IsWindowEnabled(signing_key_)) return;
+        if (const auto selected = browse_signing_key(window_, control_text(signing_key_))) {
+            SetWindowTextW(signing_key_, selected->c_str());
+        }
+    }
+
+    void browse_sfx_output_path() {
+        if (sfx_destination_ == nullptr || !IsWindowEnabled(sfx_destination_)) return;
+        if (const auto selected = browse_save_sfx(window_, control_text(sfx_destination_))) {
+            SetWindowTextW(sfx_destination_, selected->c_str());
+            sfx_destination_uses_default_ = false;
+        }
+    }
+
     void accept() {
         if (update_mode_ != nullptr && IsWindowEnabled(update_mode_)) {
             const LRESULT selection = SendMessageW(update_mode_, CB_GETCURSEL, 0, 0);
@@ -787,6 +892,14 @@ private:
                     toggle_checkbox(id);
                     return 0;
                 }
+                if (id == kBrowseSigningKey) {
+                    browse_signing_key_path();
+                    return 0;
+                }
+                if (id == kBrowseSfxDestination) {
+                    browse_sfx_output_path();
+                    return 0;
+                }
                 if (id == kAccept) {
                     accept();
                     return 0;
@@ -856,7 +969,9 @@ private:
     HWND volume_unit_{};
     HWND recovery_percent_{};
     HWND signing_key_{};
+    HWND browse_signing_key_{};
     HWND sfx_destination_{};
+    HWND browse_sfx_destination_{};
     int current_page_{kPageMetadata};
     std::vector<int> logical_pages_;
     std::unordered_map<int, HWND> nav_buttons_;
