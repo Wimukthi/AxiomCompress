@@ -20,6 +20,7 @@ Most users need one of these paths:
 | Learn every CLI command | [CLI_GUIDE.md](CLI_GUIDE.md) |
 | Understand the archive layout | [FORMAT.md](FORMAT.md) |
 | Understand the codec design | [ARCHITECTURE.md](ARCHITECTURE.md) |
+| Benchmark speed and ratio changes | [docs/BENCHMARKING.md](docs/BENCHMARKING.md) |
 | Build an installer | [docs/INSTALLER.md](docs/INSTALLER.md) |
 
 ## What Axiom supports today
@@ -74,7 +75,7 @@ builds increment the fourth version component in `src\gui\axiom_gui.rc`. For a
 diagnostic build that must not modify source, pass:
 
 ```powershell
-/p:AutoIncrementVersion=false
+.\tools\build_msvc.ps1 -Configuration Release -AutoIncrementVersion:$false
 ```
 
 Details: [docs/VERSIONING.md](docs/VERSIONING.md).
@@ -312,7 +313,9 @@ For a quick smoke test, let the script generate deterministic sample corpora:
 
 The script verifies round-trips and writes raw, summary, and delta CSV files.
 Positive compression/decompression deltas mean the current build is faster;
-positive ratio deltas mean the current build compressed smaller.
+positive ratio deltas mean the current build compressed smaller. For custom
+profile sweeps and repeatable tuning workflow details, see
+[docs/BENCHMARKING.md](docs/BENCHMARKING.md).
 
 ## Performance snapshot
 

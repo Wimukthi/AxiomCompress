@@ -1,5 +1,4 @@
 param(
-    [Parameter(Mandatory = $true)]
     [string]$BaselineAxiomc,
 
     [string]$CurrentAxiomc = (Join-Path (Split-Path -Parent $PSScriptRoot) "out\Release\axiomc.exe"),
@@ -9,6 +8,8 @@ param(
     [string]$OutputDir = (Join-Path (Split-Path -Parent $PSScriptRoot) "out\benchmarks\axiom-levels"),
 
     [int[]]$Levels = @(1, 2, 3, 4, 5, 6, 7, 8, 9),
+
+    [string[]]$Profiles = @(),
 
     [ValidateRange(1, 50)]
     [int]$Repeats = 3,
@@ -59,7 +60,12 @@ function Get-SafeName {
             [void]$builder.Append($ch)
         }
     }
-    return $builder.ToString()
+
+    $safe = $builder.ToString()
+    if ([string]::IsNullOrWhiteSpace($safe)) {
+        return "item"
+    }
+    return $safe
 }
 
 function Get-Median {
@@ -73,6 +79,91 @@ function Get-Median {
         return $sorted[[int]($sorted.Count / 2)]
     }
     return ($sorted[$sorted.Count / 2 - 1] + $sorted[$sorted.Count / 2]) / 2.0
+}
+
+function Split-ProfileArguments {
+    param([Parameter(Mandatory = $true)][string]$Text)
+
+    $result = @()
+    $builder = [Text.StringBuilder]::new()
+    $quote = $null
+    $doubleQuote = [char]34
+    $singleQuote = [char]39
+
+    foreach ($ch in $Text.ToCharArray()) {
+        if ($null -ne $quote) {
+            if ($ch -eq $quote) {
+                $quote = $null
+            } else {
+                [void]$builder.Append($ch)
+            }
+        } elseif ($ch -eq $doubleQuote -or $ch -eq $singleQuote) {
+            $quote = $ch
+        } elseif ([char]::IsWhiteSpace($ch)) {
+            if ($builder.Length -gt 0) {
+                $result += $builder.ToString()
+                [void]$builder.Clear()
+            }
+        } else {
+            [void]$builder.Append($ch)
+        }
+    }
+
+    if ($null -ne $quote) {
+        throw "Unterminated quote in profile arguments: $Text"
+    }
+    if ($builder.Length -gt 0) {
+        $result += $builder.ToString()
+    }
+
+    return $result
+}
+
+function Get-ProfileLevel {
+    param([Parameter(Mandatory = $true)][string[]]$Arguments)
+
+    for ($i = 0; $i -lt $Arguments.Count; ++$i) {
+        if ($Arguments[$i] -eq "--fast") {
+            return 1
+        }
+        if ($Arguments[$i] -eq "--max") {
+            return 9
+        }
+        if ($Arguments[$i] -eq "--level" -and $i + 1 -lt $Arguments.Count) {
+            return [int]$Arguments[$i + 1]
+        }
+    }
+
+    return $null
+}
+
+function ConvertTo-Profile {
+    param([Parameter(Mandatory = $true)][string]$Spec)
+
+    $separator = $Spec.IndexOf("=")
+    if ($separator -le 0) {
+        throw "Invalid profile '$Spec'. Expected name=arguments."
+    }
+
+    $name = $Spec.Substring(0, $separator).Trim()
+    $argumentText = $Spec.Substring($separator + 1).Trim()
+    if ([string]::IsNullOrWhiteSpace($name)) {
+        throw "Profile name is empty in '$Spec'."
+    }
+    if ([string]::IsNullOrWhiteSpace($argumentText)) {
+        throw "Profile '$name' has no arguments."
+    }
+
+    $arguments = @(Split-ProfileArguments $argumentText)
+    if ($arguments.Count -eq 0) {
+        throw "Profile '$name' has no arguments."
+    }
+
+    return [pscustomobject]@{
+        Name = $name
+        Level = Get-ProfileLevel $arguments
+        Args = $arguments
+    }
 }
 
 function Write-RepeatedCorpus {
@@ -164,7 +255,6 @@ function Invoke-Axiom {
     return $elapsed
 }
 
-$BaselineAxiomc = Resolve-ExistingFile $BaselineAxiomc "Baseline axiomc.exe"
 $CurrentAxiomc = Resolve-ExistingFile $CurrentAxiomc "Current axiomc.exe"
 $CorpusDir = New-Directory $CorpusDir
 $OutputDir = New-Directory $OutputDir
@@ -185,10 +275,36 @@ if ($corpora.Count -eq 0) {
     throw "No corpus files found in $CorpusDir. Pass -GenerateSampleCorpora or provide input files."
 }
 
-$tools = @(
-    [pscustomobject]@{ Name = "baseline"; Exe = $BaselineAxiomc },
-    [pscustomobject]@{ Name = "current"; Exe = $CurrentAxiomc }
-)
+$profileRows = @()
+if ($Profiles.Count -gt 0) {
+    foreach ($profileSpec in $Profiles) {
+        $profileRows += ConvertTo-Profile $profileSpec
+    }
+} else {
+    foreach ($level in $Levels) {
+        if ($level -lt 1 -or $level -gt 9) {
+            throw "Invalid level: $level. Expected 1..9."
+        }
+        $profileRows += [pscustomobject]@{
+            Name = "level$level"
+            Level = $level
+            Args = @("--level", [string]$level)
+        }
+    }
+}
+
+$duplicateProfile = $profileRows | Group-Object Name | Where-Object { $_.Count -gt 1 } | Select-Object -First 1
+if ($duplicateProfile) {
+    throw "Duplicate profile name: $($duplicateProfile.Name)"
+}
+
+$tools = @()
+if (-not [string]::IsNullOrWhiteSpace($BaselineAxiomc)) {
+    $BaselineAxiomc = Resolve-ExistingFile $BaselineAxiomc "Baseline axiomc.exe"
+    $tools += [pscustomobject]@{ Name = "baseline"; Exe = $BaselineAxiomc }
+}
+$tools += [pscustomobject]@{ Name = "current"; Exe = $CurrentAxiomc }
+$hasBaseline = $tools.Name -contains "baseline"
 
 $rawRows = @()
 
@@ -197,23 +313,21 @@ foreach ($corpus in $corpora) {
     $inputMiB = $corpus.Length / 1MB
     $safeCorpus = Get-SafeName $corpus.BaseName
 
-    foreach ($level in $Levels) {
-        if ($level -lt 1 -or $level -gt 9) {
-            throw "Invalid level: $level. Expected 1..9."
-        }
+    foreach ($profile in $profileRows) {
+        $safeProfile = Get-SafeName $profile.Name
 
         foreach ($tool in $tools) {
             for ($repeat = 1; $repeat -le $Repeats; ++$repeat) {
-                $prefix = "$($tool.Name)-$safeCorpus-l$level-r$repeat"
+                $prefix = "$($tool.Name)-$safeCorpus-$safeProfile-r$repeat"
                 $archive = Join-Path $OutputDir "$prefix.axc"
                 $restore = Join-Path $OutputDir "$prefix.restore"
                 Remove-Item -LiteralPath $archive, $restore -Force -ErrorAction SilentlyContinue
 
-                $compressArgs = @("c", "--level", [string]$level, $corpus.FullName, $archive)
+                $compressArgs = @("c") + $profile.Args + @($corpus.FullName, $archive)
                 $compress = Invoke-Axiom `
                     -Exe $tool.Exe `
                     -Arguments $compressArgs `
-                    -FailureMessage "$($tool.Name) compress failed for $($corpus.Name) level $level repeat $repeat"
+                    -FailureMessage "$($tool.Name) compress failed for $($corpus.Name) profile $($profile.Name) repeat $repeat"
 
                 $archiveBytes = (Get-Item -LiteralPath $archive).Length
 
@@ -221,17 +335,18 @@ foreach ($corpus in $corpora) {
                 $decompress = Invoke-Axiom `
                     -Exe $tool.Exe `
                     -Arguments $decompressArgs `
-                    -FailureMessage "$($tool.Name) decompress failed for $($corpus.Name) level $level repeat $repeat"
+                    -FailureMessage "$($tool.Name) decompress failed for $($corpus.Name) profile $($profile.Name) repeat $repeat"
 
                 $restoreHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $restore).Hash
                 if ($restoreHash -ne $inputHash) {
-                    throw "$($tool.Name) hash mismatch for $($corpus.Name) level $level repeat $repeat"
+                    throw "$($tool.Name) hash mismatch for $($corpus.Name) profile $($profile.Name) repeat $repeat"
                 }
 
                 $rawRows += [pscustomobject]@{
                     Tool = $tool.Name
                     Corpus = $corpus.Name
-                    Level = $level
+                    Profile = $profile.Name
+                    Level = $profile.Level
                     Repeat = $repeat
                     InputBytes = $corpus.Length
                     ArchiveBytes = $archiveBytes
@@ -253,15 +368,20 @@ foreach ($corpus in $corpora) {
 $summaryRows = @()
 $deltaRows = @()
 foreach ($corpus in ($rawRows.Corpus | Sort-Object -Unique)) {
-    foreach ($level in ($rawRows | Where-Object { $_.Corpus -eq $corpus } | Select-Object -ExpandProperty Level -Unique | Sort-Object)) {
+    foreach ($profile in $profileRows) {
         foreach ($tool in $tools.Name) {
             $rows = @($rawRows | Where-Object {
-                $_.Tool -eq $tool -and $_.Corpus -eq $corpus -and $_.Level -eq $level
+                $_.Tool -eq $tool -and $_.Corpus -eq $corpus -and $_.Profile -eq $profile.Name
             })
+            if ($rows.Count -eq 0) {
+                continue
+            }
+
             $summaryRows += [pscustomobject]@{
                 Tool = $tool
                 Corpus = $corpus
-                Level = $level
+                Profile = $profile.Name
+                Level = $profile.Level
                 Repeats = $rows.Count
                 ArchiveBytes = [int64](Get-Median @($rows.ArchiveBytes))
                 Ratio = [math]::Round((Get-Median @($rows.Ratio)), 6)
@@ -270,25 +390,30 @@ foreach ($corpus in ($rawRows.Corpus | Sort-Object -Unique)) {
             }
         }
 
-        $baseline = $summaryRows | Where-Object {
-            $_.Tool -eq "baseline" -and $_.Corpus -eq $corpus -and $_.Level -eq $level
-        }
-        $current = $summaryRows | Where-Object {
-            $_.Tool -eq "current" -and $_.Corpus -eq $corpus -and $_.Level -eq $level
-        }
+        if ($hasBaseline) {
+            $baseline = $summaryRows | Where-Object {
+                $_.Tool -eq "baseline" -and $_.Corpus -eq $corpus -and $_.Profile -eq $profile.Name
+            } | Select-Object -First 1
+            $current = $summaryRows | Where-Object {
+                $_.Tool -eq "current" -and $_.Corpus -eq $corpus -and $_.Profile -eq $profile.Name
+            } | Select-Object -First 1
 
-        $deltaRows += [pscustomobject]@{
-            Corpus = $corpus
-            Level = $level
-            RatioDeltaPct = [math]::Round((($current.Ratio / $baseline.Ratio) - 1.0) * 100.0, 4)
-            CompressDeltaPct = [math]::Round((($current.MedianCompressMBs / $baseline.MedianCompressMBs) - 1.0) * 100.0, 4)
-            DecompressDeltaPct = [math]::Round((($current.MedianDecompressMBs / $baseline.MedianDecompressMBs) - 1.0) * 100.0, 4)
-            BaselineRatio = $baseline.Ratio
-            CurrentRatio = $current.Ratio
-            BaselineCompressMBs = $baseline.MedianCompressMBs
-            CurrentCompressMBs = $current.MedianCompressMBs
-            BaselineDecompressMBs = $baseline.MedianDecompressMBs
-            CurrentDecompressMBs = $current.MedianDecompressMBs
+            if ($baseline -and $current) {
+                $deltaRows += [pscustomobject]@{
+                    Corpus = $corpus
+                    Profile = $profile.Name
+                    Level = $profile.Level
+                    RatioDeltaPct = [math]::Round((($current.Ratio / $baseline.Ratio) - 1.0) * 100.0, 4)
+                    CompressDeltaPct = [math]::Round((($current.MedianCompressMBs / $baseline.MedianCompressMBs) - 1.0) * 100.0, 4)
+                    DecompressDeltaPct = [math]::Round((($current.MedianDecompressMBs / $baseline.MedianDecompressMBs) - 1.0) * 100.0, 4)
+                    BaselineRatio = $baseline.Ratio
+                    CurrentRatio = $current.Ratio
+                    BaselineCompressMBs = $baseline.MedianCompressMBs
+                    CurrentCompressMBs = $current.MedianCompressMBs
+                    BaselineDecompressMBs = $baseline.MedianDecompressMBs
+                    CurrentDecompressMBs = $current.MedianDecompressMBs
+                }
+            }
         }
     }
 }
@@ -301,9 +426,15 @@ $rawRows | Export-Csv -NoTypeInformation -Path $rawPath
 $summaryRows | Export-Csv -NoTypeInformation -Path $summaryPath
 $deltaRows | Export-Csv -NoTypeInformation -Path $deltaPath
 
-$deltaRows |
-    Select-Object Corpus, Level, RatioDeltaPct, CompressDeltaPct, DecompressDeltaPct |
-    Format-Table -AutoSize
+if ($deltaRows.Count -gt 0) {
+    $deltaRows |
+        Select-Object Corpus, Profile, Level, RatioDeltaPct, CompressDeltaPct, DecompressDeltaPct |
+        Format-Table -AutoSize
+} else {
+    $summaryRows |
+        Select-Object Tool, Corpus, Profile, Level, Ratio, MedianCompressMBs, MedianDecompressMBs |
+        Format-Table -AutoSize
+}
 Write-Host ""
 Write-Host "Raw results:     $rawPath"
 Write-Host "Summary results: $summaryPath"
