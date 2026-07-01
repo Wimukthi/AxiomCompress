@@ -16,6 +16,8 @@ installer reads the same value when naming release artifacts.
   deserves it.
 - Let the Visual Studio GUI build increment `build`.
 - Use the exact resulting version for the installer name and GitHub release tag.
+- For a tagged packaged release, pin the desired exact version and build with
+  `/p:AutoIncrementVersion=false`.
 - Use `/p:AutoIncrementVersion=false` for diagnostic builds that must leave the
   working tree unchanged.
 
@@ -59,7 +61,22 @@ Before producing a packaged release build:
 
 1. Manually update `major`, `minor`, or `patch` in `src\gui\axiom_gui.rc` if the
    release requires it.
-2. Build Release x64 and let MSBuild increment the `build` component.
-3. Run the Release test binary.
-4. Build the Inno Setup installer.
-5. Tag the release with the exact resource version.
+2. Set the full four-part resource version to the exact tag you intend to ship.
+3. Build Release x64 with auto-increment disabled:
+
+   ```powershell
+   .\tools\test_msvc.ps1 -Configuration Release -AutoIncrementVersion:$false
+   ```
+
+4. Build the Inno Setup installer from that already-built binary:
+
+   ```powershell
+   .\installer\build-installer.ps1 -SkipBuild -SkipTests -Version <version>
+   ```
+
+5. Build the matching portable zip asset if the release needs one.
+6. Tag the release with the exact resource version.
+
+For day-to-day Release builds, keeping the default auto-increment behavior is
+fine. For published releases, disabling it avoids accidentally turning a planned
+version such as `0.1.1.0` into `0.1.1.1` during packaging.

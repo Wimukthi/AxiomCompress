@@ -80,6 +80,10 @@ diagnostic build that must not modify source, pass:
 
 Details: [docs/VERSIONING.md](docs/VERSIONING.md).
 
+Packaged releases pin the exact resource version before tagging, then build with
+`-AutoIncrementVersion:$false` so the installer, zip asset, About dialog, and
+GitHub release tag all use the same four-part version.
+
 ### CMake
 
 ```powershell
@@ -286,9 +290,14 @@ For custom files or folders:
 
 ```powershell
 python bench/bench_7zip.py --axiom out/Release/axiomc.exe --input path/to/corpus
-python bench/bench_7zip.py --axiom out/Release/axiomc.exe --input path/to/corpus --axiom-threads 8 --axiom-block-size 4M
-python bench/bench_7zip.py --axiom out/Release/axiomc.exe --input path/to/corpus --axiom-optimal --axiom-threads 8
+python bench/bench_7zip.py --axiom out/Release/axiomc.exe --input path/to/corpus --axiom-threads 0
+python bench/bench_7zip.py --axiom out/Release/axiomc.exe --input path/to/corpus --axiom-optimal --axiom-threads 0
 ```
+
+`--threads 0` is the default and means all detected hardware threads. Supplying
+`--block-size` is useful for controlled experiments, but it disables the default
+auto block sizing that keeps enough independent work available for the selected
+thread count.
 
 To compare two Axiom builds across compression levels, use the level comparator:
 
@@ -326,9 +335,21 @@ the current codec; throughput depends on hardware and build settings.
 |---|---|---|---|---|---|---|---|
 | Ratio | 2.68x | 3.01x | 3.09x | 3.10x | 3.17x | 3.33x | 3.47x |
 
-On an Intel i7-13620H laptop with MSVC Release, level 1 is roughly 140 MB/s
-compress and 476 MB/s decode-to-NUL. Higher levels trade compression speed for
-ratio; the remaining gap to 7-Zip maximum ratio is mainly in the entropy stage.
+The 0.1.1.0 CPU-scaling pass keeps the archive format unchanged and improves
+throughput by feeding all available workers by default. Local D:\tests corpus
+measurements from the release candidate:
+
+| Corpus / level | Compress before | Compress 0.1.1.0 | Decode-to-NUL 0.1.1.0 | Ratio |
+|---|---:|---:|---:|---:|
+| mixed-64m, level 1 | 211.9 MiB/s | 907.2 MiB/s | 2204.0 MiB/s | 386.14x |
+| mixed-64m, level 8 | 126.2 MiB/s | 255.0 MiB/s | 2059.3 MiB/s | 440.51x |
+| long-distance-112m, level 1 | 127.4 MiB/s | 217.3 MiB/s | 1048.8 MiB/s | 1.17x |
+| mixed-512m, level 1 | 229.8 MiB/s | 1098.1 MiB/s | 3853.7 MiB/s | 409.09x |
+| mixed-512m, level 8 | 127.3 MiB/s | 246.3 MiB/s | 2729.8 MiB/s | 515.30x |
+
+Throughput depends on CPU, memory bandwidth, storage, corpus shape, and Release
+build settings. Higher levels still trade compression speed for ratio; the
+remaining gap to 7-Zip maximum ratio is mainly in the entropy stage.
 
 ## Testing and fuzzing
 
@@ -368,6 +389,10 @@ version from `src\gui\axiom_gui.rc`, and writes:
 ```text
 installer\output\AxiomSetup-<version>-win-x64.exe
 ```
+
+GitHub releases also carry a portable zip asset named
+`Axiom-<version>-win-x64.zip` containing `Axiom.exe`, `axiomc.exe`, the license,
+and the user/developer docs.
 
 Details: [docs/INSTALLER.md](docs/INSTALLER.md).
 

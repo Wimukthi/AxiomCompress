@@ -128,6 +128,51 @@ Delta interpretation:
 
 The script verifies decompressed output with SHA-256 before recording a result.
 
+## Check CPU scaling explicitly
+
+Throughput changes must be tested with the default automatic thread count and
+with at least one fixed high thread count. This catches two common regressions:
+too few blocks to feed the CPU, and serial work such as whole-buffer CRC or input
+I/O dominating the threaded codec.
+
+Recommended checks:
+
+```powershell
+.\tools\bench_axiom_levels.ps1 `
+  -BaselineAxiomc D:\baselines\axiomc.exe `
+  -CurrentAxiomc .\out\Release\axiomc.exe `
+  -CorpusDir D:\tests\axiom-perf\corpora `
+  -OutputDir D:\tests\axiom-perf\results\cpu-scaling `
+  -Profiles @(
+    "l1_auto=--level 1 --threads 0",
+    "l1_fixed=--level 1 --threads 32",
+    "l8_auto=--level 8 --threads 0",
+    "l8_fixed=--level 8 --threads 32"
+  ) `
+  -Repeats 3
+```
+
+Do not pass `--block-size` for the default scaling check. An explicit block size
+turns off automatic block sizing and can hide whether the normal CLI/GUI path is
+feeding enough work to all available cores.
+
+The 0.1.1.0 release candidate used the D:\tests tuning corpus and showed these
+median improvements with archive size unchanged:
+
+| Corpus / profile | Compress before | Compress after | Decode-to-NUL after | Compression CPU cores after |
+|---|---:|---:|---:|---:|
+| mixed-64m, level 1 auto | 211.9 MiB/s | 907.2 MiB/s | 2204.0 MiB/s | 1.1 |
+| mixed-64m, level 8 auto | 126.2 MiB/s | 255.0 MiB/s | 2059.3 MiB/s | 21.7 |
+| long-distance-112m, level 1 auto | 127.4 MiB/s | 217.3 MiB/s | 1048.8 MiB/s | 1.6 |
+| long-distance-112m, level 8 auto | 84.3 MiB/s | 127.9 MiB/s | 894.4 MiB/s | 1.8 |
+| mixed-512m, level 1 auto | 229.8 MiB/s | 1098.1 MiB/s | 3853.7 MiB/s | 3.2 |
+| mixed-512m, level 8 auto | 127.3 MiB/s | 246.3 MiB/s | 2729.8 MiB/s | 21.6 |
+
+Level 1 still reports fewer compression CPU cores on easy corpora because it can
+become limited by memory bandwidth and archive I/O after the block-splitting
+fix. Treat low CPU utilization as a regression only when throughput also fails
+to scale on larger or harder corpora.
+
 ## Current preset notes
 
 Level 9 currently uses a 64 MiB block/window maximum. Larger 96 MiB and 128 MiB
@@ -143,6 +188,10 @@ when testing new candidates:
 
 Only promote a profile to a default preset when it improves the overall corpus
 set, not just one synthetic case.
+
+When comparing explicit block-size profiles, keep a matching no-`--block-size`
+profile in the same run. The no-override row is the user-facing default and is
+the only one that exercises automatic CPU-aware block sizing.
 
 ## GUI benchmark
 

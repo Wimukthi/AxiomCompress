@@ -66,8 +66,11 @@ implementation detail.
 ### Solid blocks
 
 The concatenated bytes of the archived files are split into solid blocks whose
-uncompressed size is approximately `block_size` (default 4 MiB). A file may
-straddle a block boundary; a file larger than `block_size` spans several blocks.
+uncompressed size is approximately the writer's effective `block_size`. Current
+writers choose that size from the compression preset, any explicit
+`--block-size`, and the selected thread count; this is a writer policy, not a
+different on-disk layout. A file may straddle a block boundary; a file larger
+than `block_size` spans several blocks.
 Each block's bytes are compressed with `axiom::compress`, producing a
 self-contained `.axc` payload (with its own header and CRC-32 — this is the
 per-block integrity check). Blocks are written back-to-back after the header. The

@@ -379,6 +379,10 @@ axiomc a --max maximum-ratio.axar Data
 
 Explicit tuning options override the level regardless of argument order.
 
+Preset block sizes are starting points. Unless `--block-size` is supplied,
+Axiom may adjust the effective archive and codec block sizes at runtime to keep
+the selected worker count busy.
+
 ## Advanced compression options
 
 These options apply to commands that create or recompress data: `add`, `update`,
@@ -386,17 +390,27 @@ These options apply to commands that create or recompress data: `add`, `update`,
 
 ### Threads: `--threads N`
 
-`0` means all available hardware threads.
+`0` means all available hardware threads. This is also the default for
+compression, testing, extraction, decompression, and the GUI's automatic thread
+setting. Axiom caps the actual worker count to useful work items, so a small
+archive will not create one busy thread per CPU just to sit idle.
 
 ```powershell
 axiomc a --threads 8 archive.axar Data
+axiomc a --threads 0 archive.axar Data
 ```
 
 ### Solid block size: `--block-size SIZE`
 
 For `.axar`, this is the target solid-block size. Larger blocks can find
 redundancy across more files, but increase memory use and selective-extraction
-work while reducing independent blocks available for parallel compression.
+work.
+
+When this option is omitted, Axiom uses automatic block sizing. With multiple
+threads, the archive layer keeps the solid block large enough for ratio, then the
+codec layer splits it into enough independent internal blocks to feed the
+workers. Supplying `--block-size` disables that auto sizing and is best reserved
+for repeatable benchmarks or deliberate memory/ratio tuning.
 
 ```powershell
 axiomc a --block-size 32M archive.axar Data

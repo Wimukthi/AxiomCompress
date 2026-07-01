@@ -51,7 +51,9 @@ The codec currently implements:
   order-0 *arithmetic* coder was removed once rANS superseded it at the same size
   and far higher decode speed.)
 - A threaded independent-block codec, and a multi-file `.axar` container of solid
-  blocks with a central directory (see [FORMAT.md](FORMAT.md)).
+  blocks with a central directory (see [FORMAT.md](FORMAT.md)). The default
+  writer now sizes both archive solid blocks and internal codec blocks from the
+  selected hardware-thread count so `--threads 0` feeds all detected workers.
 - Two front-ends — a CLI (`axiomc`) and a Windows GUI (`Axiom.exe`) — over the
   same library. Long operations report progress and honor cooperative
   pause/cancel through an `OperationControl` passed in the option structs;
@@ -230,14 +232,41 @@ Any new feature must keep decompression deterministic and bounded:
 
 ## Threading
 
+`thread_count == 0` means all hardware threads. The codec caps the actual worker
+count to the number of useful work items so small inputs do not create idle
+threads, while large inputs split enough independent blocks to keep the requested
+workers busy.
+
+There are two block-sizing layers:
+
+- Archive solid blocks group file bytes for cross-file compression and selective
+  extraction.
+- The single-stream codec can split a solid block into independently compressed
+  sub-blocks.
+
+By default, the archive layer raises the target solid-block size to at least
+`hardware_threads * 1 MiB` when multiple workers are available. The codec layer
+then shrinks the internal block size as needed, down to 1 MiB minimum useful
+work, so one large solid block can still feed many compression workers. Supplying
+an explicit `--block-size` disables this automatic sizing for repeatable tuning
+runs.
+
 Parallel blocks are independent by design: each block picks store, raw LZ77,
 Huffman-coded LZ77, the level-1 `fast_lz` format, or split-stream LZ77 whose
 substreams can use store, Huffman, **order-0 rANS**, or the adaptive **order-1**
 range coder. The order-1 coder transmits no table; both endpoints evolve identical
 per-context (previous-byte) models. On the speed levels it is skipped in favor of
 rANS even on literals (it decodes bit-serially and would dominate decode time); on
-the ratio levels it is selected per substream only when it is the smallest. The
-container-level block payload records enough sizes for deterministic
-reconstruction. This sacrifices cross-block matches when the parallel codec is
-selected, so the archive selector still keeps the smallest single-stream result
-for cases where ratio wins over block-level parallelism.
+the ratio levels it is selected per substream only when it is the smallest.
+
+The container-level block payload records enough sizes for deterministic
+reconstruction. Parallel-block encode and decode also compute per-block CRCs on
+the worker threads and combine them, avoiding a serial full-buffer CRC pass after
+the selected payload is already available. This keeps the format identical while
+removing a CPU-scaling bottleneck.
+
+This sacrifices cross-block matches when the parallel codec is selected, so the
+archive selector still keeps the smallest single-stream result for cases where
+ratio wins over block-level parallelism. Fast non-thorough levels prefer the
+parallel result for large multi-block inputs because the serial whole-input parse
+is otherwise the dominant bottleneck.

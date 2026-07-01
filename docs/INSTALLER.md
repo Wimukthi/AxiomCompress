@@ -18,6 +18,14 @@ winget install --id JRSoftware.InnoSetup --exact
 The script builds Axiom, runs the Release test executable, reads the version from
 `src\gui\axiom_gui.rc`, and writes the installer to `installer\output`.
 
+For a tagged release where the resource version has already been pinned, build
+and test first with auto-increment disabled, then package without rebuilding:
+
+```powershell
+.\tools\test_msvc.ps1 -Configuration Release -AutoIncrementVersion:$false
+.\installer\build-installer.ps1 -SkipBuild -SkipTests -Version <version>
+```
+
 ## Local Requirements
 
 - Release x64 build tools from Visual Studio.
@@ -52,6 +60,29 @@ To package an already-built Release binary:
 If `-Version` is supplied, it must match the current `src\gui\axiom_gui.rc`
 version. This keeps the installer name, release tag, Windows file properties,
 About dialog, and uninstall metadata aligned.
+
+## Portable Zip Asset
+
+GitHub releases should also include a portable zip for users who do not want an
+installer or do not have administrator rights. The zip should be named:
+
+```text
+Axiom-<version>-win-x64.zip
+```
+
+Recommended contents:
+
+- `Axiom.exe`.
+- `axiomc.exe`.
+- `README.md`.
+- `CLI_GUIDE.md`.
+- `ARCHITECTURE.md`.
+- `FORMAT.md`.
+- `LICENSE`.
+- `docs\`.
+
+Build the zip from the same Release output and docs used by the installer so
+both release assets describe the same version.
 
 ## Installed Files
 
