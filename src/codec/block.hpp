@@ -5,7 +5,8 @@
 namespace axiom::codec {
 
 ByteVector encode_parallel_blocks(std::span<const std::uint8_t> input,
-                                  const CompressionOptions& options);
+                                  const CompressionOptions& options,
+                                  std::uint32_t* crc32 = nullptr);
 
 ByteVector decode_parallel_blocks(std::span<const std::uint8_t> encoded,
                                   std::size_t output_size,

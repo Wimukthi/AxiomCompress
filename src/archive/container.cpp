@@ -21,6 +21,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <tuple>
 #include <unordered_map>
 #include <unordered_set>
@@ -54,6 +55,35 @@ constexpr std::uint8_t kEntryDir = 1;
 constexpr std::uint8_t kEntrySymlink = 2;
 constexpr std::uint8_t kEntryHardlink = 3;  // link_target = archive path of the shared file
 constexpr std::size_t kFileChunk = 1u << 16;
+constexpr std::size_t kMinAutoCodecBlockSize = std::size_t{1} << 20;
+
+std::size_t selected_thread_count(std::size_t requested_threads) {
+    auto threads = requested_threads;
+    if (threads == 0) {
+        threads = std::thread::hardware_concurrency();
+    }
+    return threads == 0 ? 1 : threads;
+}
+
+std::size_t effective_solid_block_size(const CompressionOptions& options) {
+    const auto block_size = std::max<std::size_t>(1, options.block_size);
+    if (!options.auto_block_size_for_threads) {
+        return block_size;
+    }
+
+    const auto threads = selected_thread_count(options.thread_count);
+    if (threads <= 1) {
+        return block_size;
+    }
+
+    // The archive container batches files into solid blocks, then the codec splits
+    // each solid block internally. Keep the outer block large enough to feed one
+    // independent codec block per detected/requested worker by default.
+    if (threads > std::numeric_limits<std::size_t>::max() / kMinAutoCodecBlockSize) {
+        return block_size;
+    }
+    return std::max(block_size, threads * kMinAutoCodecBlockSize);
+}
 
 // Per-entry "extra area" record types (TLV). The directory stores each entry as a
 // length-prefixed record: a small typed core followed by zero or more of these
@@ -1710,7 +1740,7 @@ void rebuild_archive_keeping(const fs::path& archive_path,
         }
     }
 
-    const auto block_size = std::max<std::size_t>(1, options.block_size);
+    const auto block_size = effective_solid_block_size(options);
 
     fs::path temp_path = archive_path;
     temp_path += ".tmp";
@@ -1880,7 +1910,7 @@ void append_items_to_archive(const fs::path& archive_path, const std::vector<Sca
     report_operation(operation, OperationStage::reading, completed_bytes, total_bytes,
                      completed_items, total_items);
 
-    const auto block_size = std::max<std::size_t>(1, options.block_size);
+    const auto block_size = effective_solid_block_size(options);
 
     fs::path temp_path = archive_path;
     temp_path += ".tmp";
@@ -2046,7 +2076,7 @@ void create_archive(const std::vector<std::filesystem::path>& inputs,
     report_operation(operation, OperationStage::reading, completed_bytes, total_bytes,
                      completed_items, total_items);
 
-    const auto block_size = std::max<std::size_t>(1, options.block_size);
+    const auto block_size = effective_solid_block_size(options);
 
     fs::path temp_path = archive_path;
     temp_path += ".tmp";

@@ -164,6 +164,9 @@ void test_compression_level_presets() {
     AXIOM_CHECK(wide_tree.max_chain_depth == 128);
     AXIOM_CHECK(wide_tree.block_size == (32u << 20));
     AXIOM_CHECK(wide_tree.window_size == (32u << 20));
+    wide_tree.thread_count = 16;
+    AXIOM_CHECK(axiom::codec::effective_parallel_block_size(64u << 20, wide_tree) ==
+                (4u << 20));
 
     axiom::CompressionOptions maximum;
     axiom::apply_compression_level(maximum, 99);
@@ -172,7 +175,7 @@ void test_compression_level_presets() {
     AXIOM_CHECK(maximum.max_chain_depth == 512);
     AXIOM_CHECK(maximum.block_size == (64u << 20));
     AXIOM_CHECK(maximum.window_size == (64u << 20));
-    AXIOM_CHECK(!maximum.auto_block_size_for_threads);
+    AXIOM_CHECK(maximum.auto_block_size_for_threads);
 }
 void expect_tree_lz77_roundtrip(const std::vector<std::uint8_t>& input) {
     axiom::CompressionOptions options;

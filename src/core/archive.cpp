@@ -72,12 +72,39 @@ std::uint64_t read_u64(std::span<const std::uint8_t> input, std::size_t& cursor)
 }
 
 ByteVector read_file(const std::filesystem::path& path) {
-    std::ifstream stream(path, std::ios::binary);
+    std::ifstream stream(path, std::ios::binary | std::ios::ate);
     if (!stream) {
         throw std::runtime_error("failed to open input file: " + path.string());
     }
 
-    return ByteVector(std::istreambuf_iterator<char>(stream), std::istreambuf_iterator<char>());
+    const auto end = stream.tellg();
+    if (end < std::streampos{0}) {
+        throw std::runtime_error("failed to determine input size: " + path.string());
+    }
+    const auto size = static_cast<std::uintmax_t>(end);
+    if (size > static_cast<std::uintmax_t>(std::numeric_limits<std::size_t>::max())) {
+        throw std::runtime_error("input file exceeds platform size limit: " + path.string());
+    }
+
+    ByteVector bytes(static_cast<std::size_t>(size));
+    stream.seekg(0, std::ios::beg);
+    if (!bytes.empty()) {
+        // Bulk reads avoid the byte-at-a-time iterator path, which dominated the
+        // fastest compression profiles before worker threads even started.
+        std::size_t offset = 0;
+        constexpr std::size_t kReadChunk = std::size_t{8} << 20;
+        while (offset < bytes.size()) {
+            const auto want = std::min(kReadChunk, bytes.size() - offset);
+            stream.read(reinterpret_cast<char*>(bytes.data() + offset),
+                        static_cast<std::streamsize>(want));
+            if (stream.gcount() != static_cast<std::streamsize>(want)) {
+                throw std::runtime_error("failed to read input file: " + path.string());
+            }
+            offset += want;
+        }
+    }
+
+    return bytes;
 }
 
 void write_file(const std::filesystem::path& path, std::span<const std::uint8_t> bytes) {
@@ -196,6 +223,7 @@ ByteVector compress(std::span<const std::uint8_t> input,
 
     ByteVector payload;
     auto codec = core::CodecId::store;
+    std::optional<std::uint32_t> payload_crc;
 
     if (options.force_store) {
         payload.assign(input.begin(), input.end());
@@ -209,24 +237,28 @@ ByteVector compress(std::span<const std::uint8_t> input,
         const auto workers = codec::effective_thread_count(options.thread_count, block_count);
 
         if (options.force_parallel_blocks) {
-            const auto block_payload = codec::encode_parallel_blocks(input, parallel_options);
+            std::uint32_t block_crc = 0;
+            const auto block_payload =
+                codec::encode_parallel_blocks(input, parallel_options, &block_crc);
             const core::ArchiveHeader header{
                 core::CodecId::parallel_blocks,
                 static_cast<std::uint64_t>(input.size()),
                 static_cast<std::uint64_t>(block_payload.size()),
-                core::crc32(input),
+                block_crc,
             };
             return core::write_archive(block_payload, header);
         }
 
         if (options.use_fast_lz) {
-            auto block_payload = codec::encode_parallel_blocks(input, parallel_options);
+            std::uint32_t block_crc = 0;
+            auto block_payload =
+                codec::encode_parallel_blocks(input, parallel_options, &block_crc);
             if (block_payload.size() < input.size()) {
                 const core::ArchiveHeader header{
                     core::CodecId::parallel_blocks,
                     static_cast<std::uint64_t>(input.size()),
                     static_cast<std::uint64_t>(block_payload.size()),
-                    core::crc32(input),
+                    block_crc,
                 };
                 return core::write_archive(block_payload, header);
             }
@@ -296,10 +328,13 @@ ByteVector compress(std::span<const std::uint8_t> input,
         // analysis runs only for small inputs or when maximum effort is asked
         // for via the optimal parser.
         if (evaluate_parallel_candidate && !thorough) {
-            auto block_payload = codec::encode_parallel_blocks(input, parallel_options);
+            std::uint32_t block_crc = 0;
+            auto block_payload =
+                codec::encode_parallel_blocks(input, parallel_options, &block_crc);
             if (block_payload.size() < payload.size()) {
                 codec = core::CodecId::parallel_blocks;
                 payload = std::move(block_payload);
+                payload_crc = block_crc;
             }
         } else {
             if (options.operation) {
@@ -336,7 +371,7 @@ ByteVector compress(std::span<const std::uint8_t> input,
         codec,
         static_cast<std::uint64_t>(input.size()),
         static_cast<std::uint64_t>(payload.size()),
-        core::crc32(input),
+        payload_crc ? *payload_crc : core::crc32(input),
     };
 
     if (options.operation) {

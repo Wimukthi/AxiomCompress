@@ -298,9 +298,9 @@ std::size_t effective_parallel_block_size(std::size_t input_size,
         return block_size;
     }
 
-    // Keep at least roughly one block per selected worker unless the input is
-    // too small to amortize block framing. This is what makes the default CLI
-    // scale on high-core machines even for high-ratio presets with large windows.
+    // Keep enough independent blocks for the selected workers unless the input
+    // is too small to amortize block framing. This makes the default CLI scale
+    // with the detected machine without over-splitting and throwing away ratio.
     constexpr std::size_t kMinAutoBlockSize = std::size_t{1} << 20;
     const auto max_useful_blocks = std::max<std::size_t>(1, input_size / kMinAutoBlockSize);
     const auto target_blocks = std::min<std::size_t>(target_threads, max_useful_blocks);
@@ -314,7 +314,8 @@ std::size_t effective_parallel_block_size(std::size_t input_size,
 }
 
 ByteVector encode_parallel_blocks(std::span<const std::uint8_t> input,
-                                  const CompressionOptions& options) {
+                                  const CompressionOptions& options,
+                                  std::uint32_t* crc32) {
     if (options.operation) {
         options.operation->checkpoint();
     }
@@ -322,6 +323,7 @@ ByteVector encode_parallel_blocks(std::span<const std::uint8_t> input,
     const auto block_count = (input.size() + block_size - 1) / block_size;
 
     std::vector<BlockResult> results(block_count);
+    std::vector<std::uint32_t> block_crcs(crc32 != nullptr ? block_count : 0);
     std::atomic_size_t next_block = 0;
     const auto worker_count = effective_thread_count(options.thread_count, block_count);
     std::mutex exception_mutex;
@@ -340,7 +342,14 @@ ByteVector encode_parallel_blocks(std::span<const std::uint8_t> input,
                 }
                 const auto start = block_index * block_size;
                 const auto length = std::min(block_size, input.size() - start);
-                results[block_index] = compress_block(input.subspan(start, length), options);
+                const auto block_input = input.subspan(start, length);
+                results[block_index] = compress_block(block_input, options);
+                if (crc32 != nullptr) {
+                    // The archive header still stores the normal whole-input
+                    // CRC. Computing block CRCs here lets large parallel
+                    // compressions avoid a later serial pass over the input.
+                    block_crcs[block_index] = core::crc32(block_input);
+                }
                 if (options.operation) {
                     options.operation->checkpoint();
                 }
@@ -373,6 +382,13 @@ ByteVector encode_parallel_blocks(std::span<const std::uint8_t> input,
     write_varuint(output, block_count);
     for (const auto& block : results) {
         write_block(output, block);
+    }
+    if (crc32 != nullptr) {
+        auto combined = core::crc32(std::span<const std::uint8_t>{});
+        for (std::size_t i = 0; i < results.size(); ++i) {
+            combined = core::crc32_combine(combined, block_crcs[i], results[i].original_size);
+        }
+        *crc32 = combined;
     }
 
     return output;

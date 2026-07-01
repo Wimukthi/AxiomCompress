@@ -220,7 +220,6 @@ inline void apply_compression_level(CompressionOptions& options, int level) {
             options.block_size = 8u << 20;
             options.window_size = 8u << 20;
             options.fast_entropy = false;
-            options.auto_block_size_for_threads = false;
             break;
         case 8:
             options.use_tree_matcher = true;
@@ -228,7 +227,6 @@ inline void apply_compression_level(CompressionOptions& options, int level) {
             options.block_size = 32u << 20;
             options.window_size = 32u << 20;
             options.fast_entropy = false;
-            options.auto_block_size_for_threads = false;
             break;
         case 9:
             // Maximum preset keeps the deepest tree search and uses larger
@@ -238,7 +236,6 @@ inline void apply_compression_level(CompressionOptions& options, int level) {
             options.block_size = 64u << 20;
             options.window_size = 64u << 20;
             options.fast_entropy = false;
-            options.auto_block_size_for_threads = false;
             break;
     }
 }
