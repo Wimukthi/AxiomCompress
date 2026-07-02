@@ -78,6 +78,24 @@
     <ClInclude Include="src\third_party\blake3\blake3_impl.h">
       <Filter>Third Party</Filter>
     </ClInclude>
+    <ClInclude Include="src\third_party\miniz\miniz.h">
+      <Filter>Third Party</Filter>
+    </ClInclude>
+    <ClInclude Include="src\third_party\miniz\miniz_common.h">
+      <Filter>Third Party</Filter>
+    </ClInclude>
+    <ClInclude Include="src\third_party\miniz\miniz_export.h">
+      <Filter>Third Party</Filter>
+    </ClInclude>
+    <ClInclude Include="src\third_party\miniz\miniz_tdef.h">
+      <Filter>Third Party</Filter>
+    </ClInclude>
+    <ClInclude Include="src\third_party\miniz\miniz_tinfl.h">
+      <Filter>Third Party</Filter>
+    </ClInclude>
+    <ClInclude Include="src\third_party\miniz\miniz_zip.h">
+      <Filter>Third Party</Filter>
+    </ClInclude>
     <ClInclude Include="src\third_party\monocypher\monocypher.h">
       <Filter>Third Party</Filter>
     </ClInclude>
@@ -129,6 +147,18 @@
       <Filter>Third Party</Filter>
     </ClCompile>
     <ClCompile Include="src\third_party\blake3\blake3_portable.c">
+      <Filter>Third Party</Filter>
+    </ClCompile>
+    <ClCompile Include="src\third_party\miniz\miniz.c">
+      <Filter>Third Party</Filter>
+    </ClCompile>
+    <ClCompile Include="src\third_party\miniz\miniz_tdef.c">
+      <Filter>Third Party</Filter>
+    </ClCompile>
+    <ClCompile Include="src\third_party\miniz\miniz_tinfl.c">
+      <Filter>Third Party</Filter>
+    </ClCompile>
+    <ClCompile Include="src\third_party\miniz\miniz_zip.c">
       <Filter>Third Party</Filter>
     </ClCompile>
     <ClCompile Include="src\third_party\monocypher\monocypher.c">

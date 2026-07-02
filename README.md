@@ -115,6 +115,7 @@ web UI layers.
 The main window behaves like a file manager:
 
 - Browse filesystem folders and `.axar` archives.
+- Open `.zip` archives for browsing, testing, and extraction.
 - Use the editable address dropdown for paths, drives, shell locations, recent
   folders, and history.
 - Sort and resize columns.
@@ -127,6 +128,22 @@ The main window behaves like a file manager:
 Archives are presented through a provider/catalog layer. The UI asks the archive
 engine what each archive can do, then enables or disables commands from those
 capability flags.
+
+That provider layer is internal for now. It is designed so future built-in
+providers such as ZIP or TAR can expose view/extract/test/update capabilities
+without turning Axiom into an external plug-in host before the API is stable.
+
+Current provider support:
+
+| Format | Browse | Extract | Test | Create/update |
+|---|---:|---:|---:|---:|
+| AXAR | Yes | Yes | Yes | Yes |
+| ZIP | Yes | Yes, stored/deflated entries | Yes | Yes, for normal unencrypted ZIPs |
+
+ZIP create/update/delete support rewrites the ZIP atomically through the archive
+provider layer. AXAR-only features such as archive comments, locking, recovery
+records, split volumes, signatures, SFX packaging, encrypted names, and Axiom
+metadata remain disabled when ZIP is selected.
 
 ### Archive operations
 
@@ -400,3 +417,6 @@ Details: [docs/INSTALLER.md](docs/INSTALLER.md).
 
 AxiomCompress is licensed under the GNU General Public License version 3. See
 [LICENSE](LICENSE).
+
+Vendored third-party components keep their license notices under
+`src/third_party`. ZIP container support uses miniz 3.1.1 under the MIT license.

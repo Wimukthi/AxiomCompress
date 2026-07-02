@@ -82,6 +82,50 @@ honor `OperationControl` and reject locked archives. Data-only encrypted archive
 are editable with the password; encrypted-directory archives currently remain
 read-only.
 
+### Archive providers
+
+Archive browsing now goes through a built-in provider layer. The registered
+providers are:
+
+- `axar`: the native full read/write provider, adapting the existing archive API
+  without changing the format or behavior;
+- `zip`: a miniz-backed provider for browsing, testing, extracting, creating,
+  adding, updating, synchronizing, and deleting entries in normal unencrypted ZIP
+  archives. Existing entries are preserved by cloning them into an atomically
+  rewritten ZIP.
+
+The GUI asks the provider for:
+
+- format identity and file type text;
+- capability flags such as list, extract, test, update, comments, encryption,
+  recovery, signatures, and SFX;
+- directory entries for the browser;
+- test, extraction, and write operations.
+
+This is intentionally **plug-in-shaped but not externally pluggable** yet. New
+formats should land as compiled-in providers first so the capability model,
+password prompts, drag/drop behavior, and command enabling can stabilize without
+committing to a public C ABI, DLL loading policy, sandboxing story, or third-party
+parser trust model.
+
+The intended support split is:
+
+- full native support remains `.axar`;
+- ZIP has practical read/write support for normal unencrypted archives; comments,
+  encryption, rich attributes, and AXAR-specific services remain unsupported;
+- TAR-family providers can later support create/extract/update by rewriting as
+  needed;
+- 7z/RAR/ISO/CAB-style providers should start as view/extract/test providers
+  unless their container semantics and licensing justify more.
+
+For ZIP specifically, Axiom currently vendors miniz 3.1.1 because it provides a
+small, build-system-friendly ZIP container reader/writer and Deflate/Inflate
+implementation. zlib-ng remains a reasonable future Deflate/Inflate backend
+candidate if profiling shows that miniz's codec path is the bottleneck, but it
+is not a ZIP container layer. ZIP support owns central-directory rewrites in the
+provider layer; future work is mainly richer metadata, comments, encryption, and
+possibly swapping the Deflate backend if profiling justifies it.
+
 ### Archive services
 
 Archive-level services include:

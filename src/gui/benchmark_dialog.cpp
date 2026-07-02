@@ -56,6 +56,10 @@ constexpr int kCustomPath = 3112;
 constexpr int kBrowseCustom = 3113;
 constexpr int kBrowseCustomFolder = 3114;
 constexpr int kCloseButton = IDCANCEL;
+constexpr int kBenchmarkInitialWidth = 960;
+constexpr int kBenchmarkMinimumWidth = 940;
+constexpr int kBenchmarkInitialHeight = 640;
+constexpr int kBenchmarkMinimumHeight = 600;
 
 constexpr std::array<const wchar_t*, 3> kCorpusNames{
     L"Text/log corpus", L"Mixed files", L"Binary/random"};
@@ -156,6 +160,7 @@ struct BenchmarkDialogState {
     HINSTANCE instance{};
     UINT dpi{USER_DEFAULT_SCREEN_DPI};
     bool dark = false;
+    bool owner_was_enabled = false;
     HFONT font{};
     HFONT fixed_font{};
     HBRUSH background_brush{};
@@ -229,7 +234,7 @@ void configure_combo(HWND combo, UINT dpi) {
 
 HFONT create_benchmark_results_font(UINT dpi) {
     LOGFONTW font{};
-    font.lfHeight = -MulDiv(11, static_cast<int>(dpi == 0 ? USER_DEFAULT_SCREEN_DPI : dpi), 72);
+    font.lfHeight = -MulDiv(10, static_cast<int>(dpi == 0 ? USER_DEFAULT_SCREEN_DPI : dpi), 72);
     font.lfWeight = FW_NORMAL;
     font.lfCharSet = DEFAULT_CHARSET;
     font.lfQuality = CLEARTYPE_QUALITY;
@@ -266,7 +271,7 @@ int report_line_height(BenchmarkDialogState* state, HDC dc) {
     TEXTMETRICW metrics{};
     GetTextMetricsW(dc, &metrics);
     if (old_font) SelectObject(dc, old_font);
-    return metrics.tmHeight + metrics.tmExternalLeading + scale_for_dialog_dpi(3, state->dpi);
+    return metrics.tmHeight + metrics.tmExternalLeading + scale_for_dialog_dpi(1, state->dpi);
 }
 
 int report_line_count(std::wstring_view text) {
@@ -287,7 +292,7 @@ void update_report_scrollbar(BenchmarkDialogState* state) {
 
     RECT client{};
     GetClientRect(state->results, &client);
-    const int padding = scale_for_dialog_dpi(10, state->dpi);
+    const int padding = scale_for_dialog_dpi(8, state->dpi);
     state->report_content_height =
         padding * 2 + report_line_count(state->latest_results) * line_height;
     const int visible_height = client.bottom - client.top;
@@ -637,60 +642,59 @@ std::wstring render_benchmark_report(const BenchmarkLiveState& state) {
             : std::chrono::duration<double>(now - state.started).count();
 
     std::wostringstream out;
-    out << L"Axiom Benchmark\r\n\r\n";
+    out << L"Axiom Benchmark\r\n";
     out << L"Settings\r\n";
-    out << L"  Corpus/input: " << corpus_text(state.params) << L"\r\n";
-    out << L"  Input size: "
+    out << L"  Input: " << corpus_text(state.params) << L" | Size: "
         << (state.input_ready ? format_bytes(state.original_bytes)
                               : format_bytes(state.params.bytes))
-        << L"\r\n";
-    out << L"  Level: " << state.params.level << L"\r\n";
-    out << L"  Dictionary size: " << format_bytes(state.compression.window_size) << L"\r\n";
-    out << L"  Solid block size: " << format_bytes(effective_block)
-        << (state.compression.auto_block_size_for_threads ? L" effective (auto)" : L"")
-        << L"\r\n";
-    out << L"  Number of CPU threads: " << selected_threads << L" / "
+        << L" | Level: " << state.params.level
+        << L" | Threads: " << selected_threads << L" / "
         << state.system.hardware_threads << L"\r\n";
-    out << L"  Estimated memory usage: " << format_bytes(state.estimated_memory);
+    out << L"  Dict: " << format_bytes(state.compression.window_size)
+        << L" | Solid: " << format_bytes(effective_block)
+        << (state.compression.auto_block_size_for_threads ? L" effective (auto)" : L"")
+        << L" | Memory: " << format_bytes(state.estimated_memory);
     if (state.system.total_memory != 0) {
         out << L" / " << format_bytes(state.system.total_memory);
     }
-    out << L"\r\n\r\n";
+    out << L"\r\n";
 
     out << L"System\r\n";
-    out << L"  " << state.system.cpu_name << L"\r\n";
-    out << L"  " << state.system.windows_version << L"  " << state.system.architecture
+    out << L"  CPU: " << state.system.cpu_name << L"\r\n";
+    out << L"  OS: " << state.system.windows_version << L"  " << state.system.architecture
         << L"  Axiom " << (state.params.app_version.empty() ? L"unknown" : state.params.app_version)
         << L"\r\n";
-    out << L"  CPU features: " << state.system.cpu_features << L"\r\n\r\n";
+    out << L"  Features: " << state.system.cpu_features << L"\r\n";
 
     out << L"Compressing\r\n";
     append_metric_header(out);
     append_current_phase_row(out, state, BenchmarkPhase::compressing);
     append_aggregate_row(out, L"Resulting", state, true);
-    out << L"\r\n";
 
     out << L"Decompressing\r\n";
     append_metric_header(out);
     append_current_phase_row(out, state, BenchmarkPhase::decompressing);
     append_aggregate_row(out, L"Resulting", state, false);
-    out << L"\r\n";
 
     out << L"Run\r\n";
-    out << L"  Status: " << benchmark_status_line(state) << L"\r\n";
-    out << L"  Elapsed time: " << format_duration(elapsed) << L"\r\n";
-    out << L"  Passes: " << state.passes.size();
+    out << L"  Status: " << benchmark_status_line(state)
+        << L" | Elapsed: " << format_duration(elapsed)
+        << L" | Passes: " << state.passes.size();
     if (state.phase != BenchmarkPhase::finished && state.current_pass > 0) {
         out << L" completed, pass " << state.current_pass << L" active";
     }
     out << L" / " << state.params.passes << L"\r\n";
     if (state.archive_bytes != 0) {
-        out << L"  Archive size: " << format_bytes(state.archive_bytes) << L"\r\n";
-        out << L"  Compression ratio: "
-            << ratio_text(state.original_bytes, state.archive_bytes) << L"\r\n";
+        out << L"  Archive: " << format_bytes(state.archive_bytes)
+            << L" | Ratio: " << ratio_text(state.original_bytes, state.archive_bytes)
+            << L" | Verify: " << (state.verified ? L"Passed" : L"...")
+            << L" | Workspace: " << (state.workspace_cleaned ? L"cleaned" : L"temporary")
+            << L"\r\n";
+    } else {
+        out << L"  Archive: ... | Verify: " << (state.verified ? L"Passed" : L"...")
+            << L" | Workspace: " << (state.workspace_cleaned ? L"cleaned" : L"temporary")
+            << L"\r\n";
     }
-    out << L"  Round-trip verify: " << (state.verified ? L"Passed" : L"...") << L"\r\n";
-    out << L"  Workspace: " << (state.workspace_cleaned ? L"cleaned" : L"temporary") << L"\r\n\r\n";
 
     if (!state.passes.empty()) {
         out << L"Completed passes\r\n";
@@ -1244,12 +1248,9 @@ void paint_report_view(BenchmarkDialogState* state, HWND window) {
     FillRect(dc, &client, background);
     DeleteObject(background);
 
-    const int padding = scale_for_dialog_dpi(10, state->dpi);
+    const int padding = scale_for_dialog_dpi(8, state->dpi);
     HFONT old_font = static_cast<HFONT>(SelectObject(dc, state->fixed_font));
-    TEXTMETRICW metrics{};
-    GetTextMetricsW(dc, &metrics);
-    const int line_height = metrics.tmHeight + metrics.tmExternalLeading +
-        scale_for_dialog_dpi(3, state->dpi);
+    const int line_height = report_line_height(state, dc);
 
     int y = padding - state->report_scroll;
     std::wstring_view text = state->latest_results.empty()
@@ -1517,6 +1518,20 @@ void browse_custom_folder(BenchmarkDialogState* state) {
     }
 }
 
+void close_benchmark_dialog(BenchmarkDialogState* state) {
+    if (state == nullptr) return;
+    restore_dialog_owner(state->owner, state->owner_was_enabled);
+    state->owner_was_enabled = false;
+    if (state->owner != nullptr && IsWindow(state->owner)) {
+        RedrawWindow(state->owner, nullptr, nullptr,
+                     RDW_INVALIDATE | RDW_ALLCHILDREN |
+                         RDW_UPDATENOW | RDW_NOERASE);
+    }
+    if (state->hwnd != nullptr && IsWindow(state->hwnd)) {
+        DestroyWindow(state->hwnd);
+    }
+}
+
 LRESULT CALLBACK benchmark_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam) {
     auto* state = reinterpret_cast<BenchmarkDialogState*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
     if (message == WM_NCCREATE) {
@@ -1613,8 +1628,8 @@ LRESULT CALLBACK benchmark_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM l
         }
         case WM_GETMINMAXINFO: {
             auto* info = reinterpret_cast<MINMAXINFO*>(lparam);
-            info->ptMinTrackSize.x = scale_for_dialog_dpi(760, state->dpi);
-            info->ptMinTrackSize.y = scale_for_dialog_dpi(520, state->dpi);
+            info->ptMinTrackSize.x = scale_for_dialog_dpi(kBenchmarkMinimumWidth, state->dpi);
+            info->ptMinTrackSize.y = scale_for_dialog_dpi(kBenchmarkMinimumHeight, state->dpi);
             return 0;
         }
         case WM_PAINT: {
@@ -1695,7 +1710,7 @@ LRESULT CALLBACK benchmark_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM l
                         state->operation->request_cancel();
                         return 0;
                     }
-                    DestroyWindow(hwnd);
+                    close_benchmark_dialog(state);
                     return 0;
             }
             break;
@@ -1721,7 +1736,7 @@ LRESULT CALLBACK benchmark_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM l
                 state->operation->request_cancel();
                 return 0;
             }
-            DestroyWindow(hwnd);
+            close_benchmark_dialog(state);
             return 0;
         case WM_NCDESTROY:
             if (state != nullptr) {
@@ -1766,8 +1781,8 @@ void show_benchmark_dialog(HWND owner, HINSTANCE instance, UINT dpi, bool dark) 
     const UINT effective_dpi = dpi == 0 ? GetDpiForWindow(owner) : dpi;
     RECT owner_rect{};
     GetWindowRect(owner, &owner_rect);
-    const int width = scale_for_dialog_dpi(860, effective_dpi);
-    const int height = scale_for_dialog_dpi(600, effective_dpi);
+    const int width = scale_for_dialog_dpi(kBenchmarkInitialWidth, effective_dpi);
+    const int height = scale_for_dialog_dpi(kBenchmarkInitialHeight, effective_dpi);
     BenchmarkDialogState state{};
     state.owner = owner;
     state.instance = instance;
@@ -1785,7 +1800,7 @@ void show_benchmark_dialog(HWND owner, HINSTANCE instance, UINT dpi, bool dark) 
         return;
     }
     apply_axiom_window_icons(dialog, instance);
-    EnableWindow(owner, FALSE);
+    state.owner_was_enabled = disable_dialog_owner(owner);
     ShowWindow(dialog, SW_SHOW);
     UpdateWindow(dialog);
     MSG message{};
@@ -1805,11 +1820,8 @@ void show_benchmark_dialog(HWND owner, HINSTANCE instance, UINT dpi, bool dark) 
             DispatchMessageW(&message);
         }
     }
-    if (IsWindow(owner)) {
-        EnableWindow(owner, TRUE);
-        SetActiveWindow(owner);
-        SetFocus(owner);
-    }
+    restore_dialog_owner(owner, state.owner_was_enabled);
+    state.owner_was_enabled = false;
 }
 
 }  // namespace axiom::gui

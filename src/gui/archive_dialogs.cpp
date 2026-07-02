@@ -33,6 +33,7 @@ constexpr int kAdvancedFeatures = 2011;
 constexpr int kDictionarySize = 2012;
 constexpr int kWordSize = 2013;
 constexpr int kSolidBlockSize = 2014;
+constexpr int kArchiveFormat = 2015;
 constexpr int kCreateTabs = 2099;
 constexpr int kCreateTabBase = 2100;
 constexpr int kUpdateMode = 2110;
@@ -176,6 +177,48 @@ int value_index(const std::array<std::size_t, Size>& values, std::size_t value) 
     return found == values.end() ? 0 : static_cast<int>(found - values.begin());
 }
 
+std::wstring widen_ascii(std::string_view value) {
+    return std::wstring(value.begin(), value.end());
+}
+
+int archive_format_index(axiom::ArchiveFormat format) {
+    const auto formats = axiom::supported_archive_formats();
+    for (std::size_t index = 0; index < formats.size(); ++index) {
+        if (formats[index].format == format) {
+            return static_cast<int>(index);
+        }
+    }
+    return 0;
+}
+
+const axiom::ArchiveFormatInfo& archive_format_info(axiom::ArchiveFormat format) {
+    const auto formats = axiom::supported_archive_formats();
+    const int index = archive_format_index(format);
+    return formats[static_cast<std::size_t>(index)];
+}
+
+axiom::ArchiveFormat archive_format_from_path(const fs::path& path,
+                                              axiom::ArchiveFormat fallback) {
+    if (const auto* provider = axiom::archive_provider_for_path(path)) {
+        return provider->info().format;
+    }
+    return fallback;
+}
+
+bool is_known_archive_extension(const fs::path& path) {
+    const auto extension = path.extension().wstring();
+    if (extension.empty()) {
+        return false;
+    }
+    for (const auto& format : axiom::supported_archive_formats()) {
+        if (_wcsicmp(extension.c_str(),
+                    widen_ascii(format.default_extension).c_str()) == 0) {
+            return true;
+        }
+    }
+    return _wcsicmp(extension.c_str(), L".exe") == 0;
+}
+
 template <typename T>
 class ComPtr {
 public:
@@ -276,17 +319,28 @@ void set_window_text(HWND window, const std::wstring& text) {
     SetWindowTextW(window, text.c_str());
 }
 
-std::optional<fs::path> browse_save_archive(HWND owner, bool executable = false) {
+std::optional<fs::path> browse_save_archive(HWND owner,
+                                            axiom::ArchiveFormat format,
+                                            bool executable = false) {
     ComPtr<IFileSaveDialog> dialog;
     if (FAILED(CoCreateInstance(CLSID_FileSaveDialog, nullptr, CLSCTX_INPROC_SERVER,
                                 IID_PPV_ARGS(dialog.put())))) return std::nullopt;
     const COMDLG_FILTERSPEC archive_filters[] = {
-        {L"Axiom archives", L"*.axar"}, {L"All files", L"*.*"}};
+        {L"Axiom archives", L"*.axar"},
+        {L"ZIP archives", L"*.zip"},
+        {L"All files", L"*.*"}};
     const COMDLG_FILTERSPEC executable_filters[] = {
         {L"Axiom self-extractors", L"*.exe"}, {L"All files", L"*.*"}};
     const auto* filters = executable ? executable_filters : archive_filters;
-    dialog->SetFileTypes(2, filters);
-    dialog->SetDefaultExtension(executable ? L"exe" : L"axar");
+    dialog->SetFileTypes(executable ? 2 : 3, filters);
+    if (!executable) {
+        dialog->SetFileTypeIndex(static_cast<UINT>(archive_format_index(format) + 1));
+    }
+    const auto& info = archive_format_info(format);
+    const std::wstring default_extension = executable
+        ? L"exe"
+        : widen_ascii(info.default_extension).substr(1);
+    dialog->SetDefaultExtension(default_extension.c_str());
     if (dialog->Show(owner) != S_OK) return std::nullopt;
     ComPtr<IShellItem> item;
     if (FAILED(dialog->GetResult(item.put()))) return std::nullopt;
@@ -606,14 +660,12 @@ public:
             WS_CLIPCHILDREN |
             (mode_ == DialogMode::create_archive || mode_ == DialogMode::settings
                  ? WS_THICKFRAME | WS_MAXIMIZEBOX : 0);
-        const DWORD extended_style = WS_EX_DLGMODALFRAME |
-            (mode_ == DialogMode::create_archive || mode_ == DialogMode::settings
-                 ? WS_EX_COMPOSITED : 0);
+        const DWORD extended_style = WS_EX_DLGMODALFRAME;
         window_ = CreateWindowExW(extended_style, class_name(), title,
                                   window_style,
                                   x, y, width, height, owner, nullptr, instance_, this);
         if (!window_) return false;
-        EnableWindow(owner, FALSE);
+        owner_was_enabled_ = disable_dialog_owner(owner);
         ShowWindow(window_, SW_SHOW);
         UpdateWindow(window_);
         MSG message{};
@@ -623,8 +675,8 @@ public:
                 DispatchMessageW(&message);
             }
         }
-        EnableWindow(owner, TRUE);
-        SetForegroundWindow(owner);
+        restore_dialog_owner(owner_, owner_was_enabled_);
+        owner_was_enabled_ = false;
         return accepted_;
     }
 
@@ -698,6 +750,19 @@ private:
             const std::wstring value = std::to_wstring(i);
             SendMessageW(combo, CB_ADDSTRING, 0,
                          reinterpret_cast<LPARAM>(value.c_str()));
+        }
+        return combo;
+    }
+
+    HWND archive_format_combo() {
+        HWND combo = control(
+            L"COMBOBOX", L"", WS_TABSTOP | WS_VSCROLL | CBS_DROPDOWNLIST |
+                CBS_OWNERDRAWFIXED | CBS_HASSTRINGS, kArchiveFormat);
+        SendMessageW(combo, CB_SETITEMHEIGHT, 0, scale(24));
+        SendMessageW(combo, CB_SETITEMHEIGHT, static_cast<WPARAM>(-1), scale(24));
+        for (const auto& format : axiom::supported_archive_formats()) {
+            const std::wstring label = widen_ascii(format.display_name);
+            SendMessageW(combo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(label.c_str()));
         }
         return combo;
     }
@@ -1006,6 +1071,8 @@ private:
         browse_ = control(L"BUTTON", L"Browse...", WS_TABSTOP | BS_OWNERDRAW, kBrowse);
         SendMessageW(path_edit_, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN,
                      MAKELPARAM(scale(6), scale(6)));
+        format_label_ = label(L"Format");
+        format_combo_ = archive_format_combo();
 
         create_tabs_ = control(kDarkTabClass, L"", WS_TABSTOP | WS_GROUP,
                                kCreateTabs);
@@ -1504,6 +1571,9 @@ private:
                    row, TRUE);
         MoveWindow(browse_, client.right - margin - browse_width, y,
                    browse_width, row, TRUE);
+        y += row + scale(10);
+        MoveWindow(format_label_, margin, y + scale(6), scale(72), row, TRUE);
+        MoveWindow(format_combo_, edit_x, y, scale(260), scale(240), TRUE);
         y += row + scale(15);
 
         MoveWindow(create_tabs_, margin, y,
@@ -1612,10 +1682,21 @@ private:
 
     void browse() {
         const auto path = mode_ == DialogMode::create_archive
-            ? browse_save_archive(window_, create_options.features.create_sfx)
+            ? browse_save_archive(window_, selected_archive_format(),
+                                  create_options.features.create_sfx)
             : browse_folder(window_);
         if (path) {
             set_window_text(path_edit_, path->wstring());
+            if (mode_ == DialogMode::create_archive &&
+                !create_options.features.create_sfx) {
+                create_options.archive_format =
+                    archive_format_from_path(*path, selected_archive_format());
+                SendMessageW(format_combo_, CB_SETCURSEL,
+                             static_cast<WPARAM>(archive_format_index(
+                                 create_options.archive_format)), 0);
+                clear_options_unsupported_by_selected_format();
+                update_create_dependencies();
+            }
             update_output_preview();
         }
     }
@@ -1688,6 +1769,10 @@ private:
     }
 
     void load_create_values() {
+        create_options.archive_format =
+            archive_format_from_path(create_options.archive_path, create_options.archive_format);
+        SendMessageW(format_combo_, CB_SETCURSEL,
+                     static_cast<WPARAM>(archive_format_index(create_options.archive_format)), 0);
         level_ = std::clamp(create_options.level, 1, 9);
         SendMessageW(level_combo_, CB_SETCURSEL, static_cast<WPARAM>(level_ - 1), 0);
         SendMessageW(dictionary_combo_, CB_SETCURSEL,
@@ -1720,6 +1805,7 @@ private:
         set_window_text(recovery_percent_edit_,
                         std::to_wstring(create_options.features.recovery_percent));
         set_window_text(signing_key_edit_, create_options.features.signing_key.wstring());
+        clear_options_unsupported_by_selected_format();
     }
 
     void select_create_page(int page) {
@@ -1759,9 +1845,124 @@ private:
         InvalidateRect(confirm_password_edit_, nullptr, TRUE);
     }
 
+    axiom::ArchiveFormat selected_archive_format() const {
+        if (format_combo_ == nullptr) {
+            return create_options.archive_format;
+        }
+        const LRESULT selection = SendMessageW(format_combo_, CB_GETCURSEL, 0, 0);
+        const auto formats = axiom::supported_archive_formats();
+        if (selection == CB_ERR || selection < 0 ||
+            selection >= static_cast<LRESULT>(formats.size())) {
+            return create_options.archive_format;
+        }
+        return formats[static_cast<std::size_t>(selection)].format;
+    }
+
+    bool selected_format_is_native() const {
+        return archive_format_info(selected_archive_format()).native;
+    }
+
+    ArchiveFeatureAvailability selected_format_availability() const {
+        ArchiveFeatureAvailability available = create_options.feature_availability;
+        if (!selected_format_is_native()) {
+            available.metadata = false;
+            available.comments = false;
+            available.lock = false;
+            available.encryption = false;
+            available.header_encryption = false;
+            available.kdf_presets = false;
+            available.volumes = false;
+            available.recovery = false;
+            available.authenticity = false;
+            available.sfx = false;
+            available.posix_metadata = false;
+            available.update = true;
+        }
+        return available;
+    }
+
+    void clear_options_unsupported_by_selected_format() {
+        if (selected_format_is_native()) {
+            return;
+        }
+        create_options.features.comment.clear();
+        create_options.features.lock_archive = false;
+        create_options.features.repack_after_update = false;
+        create_options.features.encrypt_data = false;
+        create_options.features.encrypt_names = false;
+        create_options.features.password.clear();
+        create_options.features.volume_size.clear();
+        create_options.features.recovery_percent = 0;
+        create_options.features.create_recovery_volumes = false;
+        create_options.features.sign_archive = false;
+        create_options.features.signing_key.clear();
+        create_options.features.create_sfx = false;
+        create_options.features.sfx_destination.clear();
+        set_window_text(comment_edit_, L"");
+        set_window_text(password_edit_, L"");
+        set_window_text(confirm_password_edit_, L"");
+        set_window_text(volume_size_edit_, L"");
+        set_window_text(recovery_percent_edit_, L"0");
+        set_window_text(signing_key_edit_, L"");
+    }
+
+    void apply_selected_format_extension(bool force = false) {
+        if (path_edit_ == nullptr || create_options.features.create_sfx) {
+            return;
+        }
+        fs::path output = window_text(path_edit_);
+        if (output.empty()) {
+            return;
+        }
+        const auto& format = archive_format_info(selected_archive_format());
+        if (force || output.extension().empty() || is_known_archive_extension(output)) {
+            output.replace_extension(widen_ascii(format.default_extension));
+            set_window_text(path_edit_, output.wstring());
+        }
+    }
+
+    void on_archive_format_changed() {
+        create_options.archive_format = selected_archive_format();
+        clear_options_unsupported_by_selected_format();
+        apply_selected_format_extension(true);
+        update_create_dependencies();
+        update_output_preview();
+    }
+
+    void sync_archive_format_from_path() {
+        if (create_options.fixed_archive_format || create_options.features.create_sfx) {
+            return;
+        }
+        const fs::path output = window_text(path_edit_);
+        if (const auto* provider = axiom::archive_provider_for_path(output)) {
+            if (provider->info().format != selected_archive_format()) {
+                create_options.archive_format = provider->info().format;
+                SendMessageW(format_combo_, CB_SETCURSEL,
+                             static_cast<WPARAM>(archive_format_index(
+                                 create_options.archive_format)), 0);
+                clear_options_unsupported_by_selected_format();
+                update_create_dependencies();
+            }
+        }
+    }
+
     void update_create_dependencies() {
-        const auto& available = create_options.feature_availability;
+        const auto available = selected_format_availability();
         const bool updating = create_options.features.update_mode != ArchiveUpdateMode::create_new;
+        const bool native = selected_format_is_native();
+        EnableWindow(format_combo_, !create_options.fixed_archive_format &&
+                                    !create_options.features.create_sfx);
+        EnableWindow(level_combo_, TRUE);
+        EnableWindow(dictionary_combo_, native);
+        EnableWindow(word_size_combo_, native);
+        EnableWindow(solid_block_combo_, native);
+        set_window_text(
+            compression_info_,
+            native
+                ? L"Default values follow the selected compression level. Larger dictionaries "
+                  L"and solid blocks can improve ratio but increase memory use."
+                : L"ZIP uses Deflate compression. The compression level and thread count apply; "
+                  L"Axiom dictionary, word, and solid-block controls are disabled for this format.");
         EnableWindow(update_mode_combo_, available.update);
         EnableWindow(comment_edit_, available.comments);
         EnableWindow(lock_archive_, available.lock);
@@ -1804,6 +2005,10 @@ private:
             if (lstrcmpiW(root.extension().c_str(), L".axar") == 0) root.replace_extension();
             output = fs::path(root.wstring() + L".part001.axar");
             prefix = L"First volume: ";
+        } else if (!output.empty() &&
+                   (output.extension().empty() || is_known_archive_extension(output))) {
+            output.replace_extension(
+                widen_ascii(archive_format_info(selected_archive_format()).default_extension));
         }
         set_window_text(output_preview_, prefix + output.wstring());
     }
@@ -1838,7 +2043,7 @@ private:
         if (mode_ == DialogMode::settings) {
             if (!apply_settings_values()) return;
             accepted_ = true;
-            DestroyWindow(window_);
+            close_dialog();
             return;
         }
         if (mode_ != DialogMode::settings && window_text(path_edit_).empty()) {
@@ -1871,7 +2076,7 @@ private:
             application_options.show_hidden = show_hidden_checked_;
         }
         accepted_ = true;
-        DestroyWindow(window_);
+        close_dialog();
     }
 
     void accept_create() {
@@ -1893,6 +2098,8 @@ private:
             word_size_combo_, kWordSizeValues);
         create_options.solid_block_size = selected_combo_value(
             solid_block_combo_, kSolidBlockValues);
+        create_options.archive_format = selected_archive_format();
+        clear_options_unsupported_by_selected_format();
 
         if (const LRESULT selection = SendMessageW(update_mode_combo_, CB_GETCURSEL, 0, 0);
             selection != CB_ERR) {
@@ -1967,10 +2174,16 @@ private:
             create_options.features.sfx_destination = displayed_output.wstring();
             create_options.archive_path = displayed_output;
             create_options.archive_path.replace_extension(L".axar");
+            create_options.archive_format = axiom::ArchiveFormat::axar;
             create_options.features.volume_size.clear();
             create_options.features.create_recovery_volumes = false;
         } else {
-            if (displayed_output.extension().empty()) displayed_output.replace_extension(L".axar");
+            if (displayed_output.extension().empty() ||
+                is_known_archive_extension(displayed_output)) {
+                displayed_output.replace_extension(
+                    widen_ascii(archive_format_info(create_options.archive_format)
+                                    .default_extension));
+            }
             create_options.archive_path = displayed_output;
             create_options.features.sfx_destination.clear();
         }
@@ -1978,7 +2191,20 @@ private:
         SetWindowTextW(password_edit_, L"");
         SetWindowTextW(confirm_password_edit_, L"");
         accepted_ = true;
-        DestroyWindow(window_);
+        close_dialog();
+    }
+
+    void close_dialog() {
+        restore_dialog_owner(owner_, owner_was_enabled_);
+        owner_was_enabled_ = false;
+        if (owner_ != nullptr && IsWindow(owner_)) {
+            RedrawWindow(owner_, nullptr, nullptr,
+                         RDW_INVALIDATE | RDW_ALLCHILDREN |
+                             RDW_UPDATENOW | RDW_NOERASE);
+        }
+        if (window_ != nullptr && IsWindow(window_)) {
+            DestroyWindow(window_);
+        }
     }
 
     void show_advanced_features() {
@@ -2178,6 +2404,10 @@ private:
             case kCreateSfx:
                 create_options.features.create_sfx = !create_options.features.create_sfx;
                 if (create_options.features.create_sfx) {
+                    create_options.archive_format = axiom::ArchiveFormat::axar;
+                    SendMessageW(format_combo_, CB_SETCURSEL,
+                                 static_cast<WPARAM>(archive_format_index(
+                                     create_options.archive_format)), 0);
                     create_options.features.create_recovery_volumes = false;
                     create_options.features.volume_size.clear();
                     SetWindowTextW(volume_size_edit_, L"");
@@ -2398,8 +2628,16 @@ private:
                     return 0;
                 }
                 if (mode_ == DialogMode::create_archive &&
+                    id == kArchiveFormat && HIWORD(wparam) == CBN_SELCHANGE) {
+                    on_archive_format_changed();
+                    return 0;
+                }
+                if (mode_ == DialogMode::create_archive &&
                     (id == kPathEdit || id == kVolumeSize) &&
                     HIWORD(wparam) == EN_CHANGE) {
+                    if (id == kPathEdit) {
+                        sync_archive_format_from_path();
+                    }
                     update_output_preview();
                     return 0;
                 }
@@ -2438,7 +2676,7 @@ private:
                     case kCancel:
                         if (password_edit_) SetWindowTextW(password_edit_, L"");
                         if (confirm_password_edit_) SetWindowTextW(confirm_password_edit_, L"");
-                        DestroyWindow(window_);
+                        close_dialog();
                         return 0;
                     case kOverwrite: toggle(kOverwrite, overwrite_); return 0;
                     case kRestoreTime: toggle(kRestoreTime, restore_time_); return 0;
@@ -2460,7 +2698,7 @@ private:
             case WM_CLOSE:
                 if (password_edit_) SetWindowTextW(password_edit_, L"");
                 if (confirm_password_edit_) SetWindowTextW(confirm_password_edit_, L"");
-                DestroyWindow(window_);
+                close_dialog();
                 return 0;
         }
         return DefWindowProcW(window_, message, wparam, lparam);
@@ -2485,6 +2723,7 @@ private:
     HWND window_ = nullptr;
     HINSTANCE instance_ = nullptr;
     UINT dpi_ = USER_DEFAULT_SCREEN_DPI;
+    bool owner_was_enabled_ = false;
     Palette palette_;
     HBRUSH window_brush_ = nullptr;
     HBRUSH edit_brush_ = nullptr;
@@ -2506,6 +2745,8 @@ private:
     HWND path_label_ = nullptr;
     HWND path_edit_ = nullptr;
     HWND browse_ = nullptr;
+    HWND format_label_ = nullptr;
+    HWND format_combo_ = nullptr;
     HWND advanced_features_ = nullptr;
     HWND update_mode_label_ = nullptr;
     HWND update_mode_combo_ = nullptr;

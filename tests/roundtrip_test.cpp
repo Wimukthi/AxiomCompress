@@ -10,6 +10,7 @@
 #include "core/reed_solomon.hpp"
 #include "entropy/huffman.hpp"
 #include "entropy/range.hpp"
+#include "third_party/miniz/miniz.h"
 
 #include "check.hpp"
 
@@ -448,6 +449,164 @@ void test_archive_roundtrip() {
     AXIOM_CHECK(fs::exists(dest / "src" / "empty.dat"));
     AXIOM_CHECK(fs::file_size(dest / "src" / "empty.dat") == 0);
     AXIOM_CHECK(fs::is_directory(dest / "src" / "emptydir"));
+
+    std::error_code ec;
+    fs::remove_all(root, ec);
+}
+
+void test_archive_provider_layer() {
+    const auto root = make_temp_dir();
+    const auto src = root / "src";
+    fs::create_directories(src);
+    write_all(src / "file.txt", bytes_from_string("provider extraction"));
+
+    const auto archive = root / "provider.AXAR";
+    axiom::create_archive({src}, archive, {});
+
+    const auto formats = axiom::supported_archive_formats();
+    AXIOM_CHECK(!formats.empty());
+    AXIOM_CHECK(formats.front().id == "axar");
+
+    const auto* provider = axiom::archive_provider_for_path(archive);
+    AXIOM_CHECK(provider != nullptr);
+    AXIOM_CHECK(provider->info().native);
+    AXIOM_CHECK(axiom::is_supported_archive(archive));
+    AXIOM_CHECK(axiom::is_native_archive(archive));
+    AXIOM_CHECK(!axiom::is_supported_archive(root / "not.7z"));
+
+    const auto capabilities = provider->capabilities(archive);
+    AXIOM_CHECK(capabilities.list);
+    AXIOM_CHECK(capabilities.extract);
+    AXIOM_CHECK(capabilities.test);
+    AXIOM_CHECK(capabilities.create);
+    AXIOM_CHECK(capabilities.selective_extract);
+    AXIOM_CHECK(capabilities.update);
+    AXIOM_CHECK(capabilities.comments);
+    AXIOM_CHECK(capabilities.sfx);
+    AXIOM_CHECK(!capabilities.encrypted);
+    AXIOM_CHECK(!capabilities.directory_encrypted);
+
+    const auto entries = provider->list(archive);
+    AXIOM_CHECK(std::any_of(entries.begin(), entries.end(), [](const axiom::ArchiveEntry& entry) {
+        return entry.path == "src/file.txt";
+    }));
+    provider->test(archive);
+
+    const auto selected = root / "selected";
+    provider->extract_selected(archive, {"src/file.txt"}, selected, {});
+    AXIOM_CHECK(read_all(selected / "src" / "file.txt") == bytes_from_string("provider extraction"));
+
+    const auto full = root / "full";
+    provider->extract_all(archive, full, {});
+    AXIOM_CHECK(read_all(full / "src" / "file.txt") == bytes_from_string("provider extraction"));
+
+    std::error_code ec;
+    fs::remove_all(root, ec);
+}
+
+void create_test_zip_archive(const fs::path& archive) {
+    mz_zip_archive zip{};
+    mz_zip_zero_struct(&zip);
+    AXIOM_CHECK(mz_zip_writer_init_file(&zip, archive.string().c_str(), 0));
+
+    const char* first = "zip provider extraction";
+    const char* second = "nested zip payload";
+    AXIOM_CHECK(mz_zip_writer_add_mem(&zip, "folder/file.txt", first,
+                                      std::strlen(first), MZ_BEST_COMPRESSION));
+    AXIOM_CHECK(mz_zip_writer_add_mem(&zip, "folder/sub/data.bin", second,
+                                      std::strlen(second), MZ_BEST_SPEED));
+    AXIOM_CHECK(mz_zip_writer_finalize_archive(&zip));
+    AXIOM_CHECK(mz_zip_writer_end(&zip));
+}
+
+void test_zip_provider_layer() {
+    const auto root = make_temp_dir();
+    const auto archive = root / "sample.ZIP";
+    create_test_zip_archive(archive);
+
+    const auto* provider = axiom::archive_provider_for_path(archive);
+    AXIOM_CHECK(provider != nullptr);
+    AXIOM_CHECK(provider->info().format == axiom::ArchiveFormat::zip);
+    AXIOM_CHECK(provider->info().id == "zip");
+    AXIOM_CHECK(!provider->info().native);
+    AXIOM_CHECK(axiom::is_supported_archive(archive));
+    AXIOM_CHECK(!axiom::is_native_archive(archive));
+
+    const auto capabilities = provider->capabilities(archive);
+    AXIOM_CHECK(capabilities.list);
+    AXIOM_CHECK(capabilities.extract);
+    AXIOM_CHECK(capabilities.test);
+    AXIOM_CHECK(capabilities.selective_extract);
+    AXIOM_CHECK(capabilities.packed_sizes);
+    AXIOM_CHECK(capabilities.create);
+    AXIOM_CHECK(capabilities.update);
+    AXIOM_CHECK(capabilities.delete_entries);
+    AXIOM_CHECK(!capabilities.sfx);
+
+    const auto entries = provider->list(archive);
+    AXIOM_CHECK(entries.size() == 2);
+    AXIOM_CHECK(std::any_of(entries.begin(), entries.end(), [](const axiom::ArchiveEntry& entry) {
+        return entry.path == "folder/file.txt" && !entry.is_directory &&
+               entry.size == std::strlen("zip provider extraction");
+    }));
+    AXIOM_CHECK(std::any_of(entries.begin(), entries.end(), [](const axiom::ArchiveEntry& entry) {
+        return entry.path == "folder/sub/data.bin" && !entry.is_directory &&
+               entry.size == std::strlen("nested zip payload");
+    }));
+
+    provider->test(archive);
+
+    const auto selected = root / "selected";
+    provider->extract_selected(archive, {"folder/file.txt"}, selected, {});
+    AXIOM_CHECK(read_all(selected / "folder" / "file.txt") ==
+                bytes_from_string("zip provider extraction"));
+    AXIOM_CHECK(!fs::exists(selected / "folder" / "sub" / "data.bin"));
+
+    const auto full = root / "full";
+    provider->extract_all(archive, full, {});
+    AXIOM_CHECK(read_all(full / "folder" / "file.txt") ==
+                bytes_from_string("zip provider extraction"));
+    AXIOM_CHECK(read_all(full / "folder" / "sub" / "data.bin") ==
+                bytes_from_string("nested zip payload"));
+
+    const auto source = root / "source";
+    fs::create_directories(source / "nested");
+    write_all(source / "alpha.txt", bytes_from_string("alpha v1"));
+    write_all(source / "nested" / "beta.txt", bytes_from_string("beta"));
+    const auto writable = root / "writable.zip";
+    provider->create({source}, writable, {});
+    const auto created_out = root / "created";
+    provider->extract_all(writable, created_out, {});
+    AXIOM_CHECK(read_all(created_out / "source" / "alpha.txt") ==
+                bytes_from_string("alpha v1"));
+    AXIOM_CHECK(read_all(created_out / "source" / "nested" / "beta.txt") ==
+                bytes_from_string("beta"));
+
+    const auto extra = root / "extra.txt";
+    write_all(extra, bytes_from_string("extra payload"));
+    provider->add_mapped({axiom::ArchiveInput{extra, "source/extra.txt"}}, writable, {});
+    const auto added_out = root / "added";
+    provider->extract_all(writable, added_out, {});
+    AXIOM_CHECK(read_all(added_out / "source" / "extra.txt") ==
+                bytes_from_string("extra payload"));
+
+    write_all(source / "alpha.txt", bytes_from_string("alpha v2"));
+    std::error_code time_error;
+    fs::last_write_time(source / "alpha.txt",
+                        fs::file_time_type::clock::now() + std::chrono::seconds(5),
+                        time_error);
+    provider->update({source}, writable, {}, false);
+    const auto updated_out = root / "updated";
+    provider->extract_all(writable, updated_out, {});
+    AXIOM_CHECK(read_all(updated_out / "source" / "alpha.txt") ==
+                bytes_from_string("alpha v2"));
+
+    provider->delete_entries(writable, {"source/nested"}, {});
+    const auto deleted_out = root / "deleted";
+    provider->extract_all(writable, deleted_out, {});
+    AXIOM_CHECK(read_all(deleted_out / "source" / "alpha.txt") ==
+                bytes_from_string("alpha v2"));
+    AXIOM_CHECK(!fs::exists(deleted_out / "source" / "nested" / "beta.txt"));
 
     std::error_code ec;
     fs::remove_all(root, ec);
@@ -1714,6 +1873,8 @@ int main() {
     test_reed_solomon();
     test_rans_edges();
     test_archive_roundtrip();
+    test_archive_provider_layer();
+    test_zip_provider_layer();
     test_archive_symlinks();
     test_archive_hardlinks();
     test_archive_add();

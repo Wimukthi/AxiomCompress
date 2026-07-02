@@ -75,7 +75,9 @@ std::wstring attributes_text(DWORD attributes) {
 
 std::wstring extension_type(const fs::path& path, bool directory) {
     if (directory) return L"File folder";
-    if (is_axiom_archive(path)) return L"Axiom archive";
+    if (const auto* provider = axiom::archive_provider_for_path(path)) {
+        return widen(provider->info().file_type_name);
+    }
     std::wstring extension = path.extension().wstring();
     if (extension.empty()) return L"File";
     std::transform(extension.begin(), extension.end(), extension.begin(),
@@ -186,8 +188,8 @@ BrowserSnapshot load_filesystem(const BrowserLocation& location, std::stop_token
         item.name = data.cFileName;
         item.kind = directory
             ? BrowserItemKind::directory
-            : (is_axiom_archive(item.filesystem_path) ? BrowserItemKind::archive
-                                                       : BrowserItemKind::file);
+            : (is_supported_archive(item.filesystem_path) ? BrowserItemKind::archive
+                                                          : BrowserItemKind::file);
         item.type = extension_type(item.filesystem_path, directory);
         item.size = directory ? 0
             : (static_cast<std::uint64_t>(data.nFileSizeHigh) << 32) | data.nFileSizeLow;
@@ -244,32 +246,33 @@ bool BrowserItem::is_container() const {
 
 bool BrowserItem::is_parent() const { return kind == BrowserItemKind::parent; }
 
-ArchiveCatalog::ArchiveCatalog(fs::path path, std::vector<ArchiveEntry> entries,
-                               const std::string& password)
-    : path_(std::move(path)), entries_(std::move(entries)) {
-    capabilities_.selective_extract = true;
-    capabilities_.update = true;
-    capabilities_.encryption = true;
-    capabilities_.recovery_records = true;
-    capabilities_.multi_volume = true;
-    capabilities_.comments = true;
-    capabilities_.lock = true;
-    capabilities_.metadata = true;
-    capabilities_.links = true;
-    capabilities_.authenticity = true;
-    capabilities_.locked = archive_is_locked(path_, password);
-    capabilities_.encrypted = archive_is_encrypted(path_);
-    capabilities_.directory_encrypted =
-        archive_encryption_mode(path_) == ArchiveEncryptionMode::data_and_directory;
+ArchiveCatalog::ArchiveCatalog(fs::path path, const axiom::ArchiveProvider& provider,
+                               std::vector<ArchiveEntry> entries,
+                               ArchiveCapabilities capabilities)
+    : path_(std::move(path)),
+      provider_(&provider),
+      entries_(std::move(entries)),
+      capabilities_(capabilities) {
 }
 
 std::shared_ptr<const ArchiveCatalog> ArchiveCatalog::load(const fs::path& path,
                                                            const std::string& password) {
-    return std::shared_ptr<const ArchiveCatalog>(
-        new ArchiveCatalog(path, list_archive(path, password), password));
+    const auto* provider = axiom::archive_provider_for_path(path);
+    if (provider == nullptr) {
+        throw std::runtime_error("unsupported archive format: " + path.string());
+    }
+    auto capabilities = provider->capabilities(path, password);
+    return std::shared_ptr<const ArchiveCatalog>(new ArchiveCatalog(
+        path, *provider, provider->list(path, password), capabilities));
 }
 
 const fs::path& ArchiveCatalog::path() const { return path_; }
+
+const axiom::ArchiveProvider& ArchiveCatalog::provider() const { return *provider_; }
+
+const axiom::ArchiveFormatInfo& ArchiveCatalog::format_info() const {
+    return provider_->info();
+}
 
 const ArchiveCapabilities& ArchiveCatalog::capabilities() const { return capabilities_; }
 
@@ -377,7 +380,11 @@ const BrowserLocation& NavigationHistory::current() const {
 }
 
 bool is_axiom_archive(const fs::path& path) {
-    return _wcsicmp(path.extension().c_str(), L".axar") == 0;
+    return axiom::is_native_archive(path);
+}
+
+bool is_supported_archive(const fs::path& path) {
+    return axiom::is_supported_archive(path);
 }
 
 std::optional<BrowserLocation> parent_location(const BrowserLocation& location) {

@@ -33,6 +33,8 @@ void set_dialog_control_font(HWND control, HFONT font);
 void draw_dialog_button(const DRAWITEMSTRUCT& draw, bool dark);
 void draw_dialog_checkbox(const DRAWITEMSTRUCT& draw, bool dark, bool checked);
 void draw_dialog_combo_item(const DRAWITEMSTRUCT& draw, bool dark);
+bool disable_dialog_owner(HWND owner);
+void restore_dialog_owner(HWND owner, bool was_enabled);
 bool message_targets_window(HWND window, const MSG& message);
 std::wstring last_error_text(DWORD error = GetLastError());
 

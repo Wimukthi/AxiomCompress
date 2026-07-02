@@ -1,5 +1,6 @@
 #pragma once
 
+#include "axiom/archive.hpp"
 #include "gui/archive_feature_options.hpp"
 
 #include <windows.h>
@@ -12,6 +13,8 @@ namespace axiom::gui {
 
 struct CreateArchiveDialogOptions {
     std::filesystem::path archive_path;
+    axiom::ArchiveFormat archive_format = axiom::ArchiveFormat::axar;
+    bool fixed_archive_format = false;
     int level = 5;
     std::size_t thread_count = 0;
     // Zero keeps the selected compression level's preset.
@@ -92,6 +95,8 @@ struct ApplicationDialogOptions {
     std::wstring io_buffer_size;
     int memory_limit_mode = 0;  // 0 = automatic, 1 = custom.
     std::wstring memory_limit;
+
+    bool operator==(const ApplicationDialogOptions&) const = default;
 };
 
 bool show_create_archive_dialog(HWND owner,

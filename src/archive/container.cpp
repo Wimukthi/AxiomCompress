@@ -6,6 +6,7 @@
 #include "core/file_meta.hpp"
 #include "core/hash.hpp"
 #include "core/reed_solomon.hpp"
+#include "third_party/miniz/miniz.h"
 
 #include <algorithm>
 #include <array>
@@ -3424,6 +3425,1172 @@ void extract_entries(const std::filesystem::path& archive_path,
                      const std::filesystem::path& dest_dir,
                      const ExtractOptions& options) {
     extract_entries_impl(archive_path, &entries, dest_dir, options);
+}
+
+namespace {
+
+constexpr std::size_t kAxarFormatIndex = 0;
+constexpr std::size_t kZipFormatIndex = 1;
+
+constexpr std::array<ArchiveFormatInfo, 2> kArchiveFormats{{
+    {
+        ArchiveFormat::axar,
+        "axar",
+        "Axiom archive",
+        "Axiom archive",
+        ".axar",
+        L"Axiom archives (*.axar)",
+        L"*.axar",
+        true,
+    },
+    {
+        ArchiveFormat::zip,
+        "zip",
+        "ZIP archive",
+        "ZIP archive",
+        ".zip",
+        L"ZIP archives (*.zip)",
+        L"*.zip",
+        false,
+    },
+}};
+
+std::string lower_ascii(std::string text) {
+    for (auto& ch : text) {
+        if (ch >= 'A' && ch <= 'Z') {
+            ch = static_cast<char>(ch - 'A' + 'a');
+        }
+    }
+    return text;
+}
+
+class AxarArchiveProvider final : public ArchiveProvider {
+public:
+    const ArchiveFormatInfo& info() const override {
+        return kArchiveFormats[kAxarFormatIndex];
+    }
+
+    bool matches_path(const std::filesystem::path& path) const override {
+        return lower_ascii(path.extension().string()) == ".axar";
+    }
+
+    ArchiveCapabilities capabilities(const std::filesystem::path& archive_path,
+                                     const std::string& password) const override {
+        ArchiveCapabilities result;
+        result.list = true;
+        result.extract = true;
+        result.test = true;
+        result.create = true;
+        result.selective_extract = true;
+        result.update = true;
+        result.delete_entries = true;
+        result.move_entries = true;
+        result.encryption = true;
+        result.recovery_records = true;
+        result.multi_volume = true;
+        result.comments = true;
+        result.lock = true;
+        result.metadata = true;
+        result.links = true;
+        result.authenticity = true;
+        result.sfx = true;
+        result.encrypted = archive_is_encrypted(archive_path);
+        const auto encryption_mode = archive_encryption_mode(archive_path);
+        result.directory_encrypted = encryption_mode == ArchiveEncryptionMode::data_and_directory;
+        if (!result.directory_encrypted || !password.empty()) {
+            result.locked = archive_is_locked(archive_path, password);
+        }
+        return result;
+    }
+
+    std::vector<ArchiveEntry> list(const std::filesystem::path& archive_path,
+                                   const std::string& password) const override {
+        return list_archive(archive_path, password);
+    }
+
+    void test(const std::filesystem::path& archive_path,
+              const DecompressionOptions& options) const override {
+        test_archive(archive_path, options);
+    }
+
+    void extract_all(const std::filesystem::path& archive_path,
+                     const std::filesystem::path& dest_dir,
+                     const ExtractOptions& options) const override {
+        extract_archive(archive_path, dest_dir, options);
+    }
+
+    void extract_selected(const std::filesystem::path& archive_path,
+                          const std::vector<std::string>& entries,
+                          const std::filesystem::path& dest_dir,
+                          const ExtractOptions& options) const override {
+        extract_entries(archive_path, entries, dest_dir, options);
+    }
+
+    void create(const std::vector<std::filesystem::path>& inputs,
+                const std::filesystem::path& archive_path,
+                const CompressionOptions& options) const override {
+        create_archive(inputs, archive_path, options);
+    }
+
+    void add(const std::vector<std::filesystem::path>& inputs,
+             const std::filesystem::path& archive_path,
+             const CompressionOptions& options) const override {
+        add_to_archive(inputs, archive_path, options);
+    }
+
+    void add_mapped(const std::vector<ArchiveInput>& inputs,
+                    const std::filesystem::path& archive_path,
+                    const CompressionOptions& options) const override {
+        add_to_archive(inputs, archive_path, options);
+    }
+
+    void update(const std::vector<std::filesystem::path>& inputs,
+                const std::filesystem::path& archive_path,
+                const CompressionOptions& options,
+                bool fresh_only) const override {
+        update_archive(inputs, archive_path, options, fresh_only);
+    }
+
+    void sync(const std::vector<std::filesystem::path>& inputs,
+              const std::filesystem::path& archive_path,
+              const CompressionOptions& options) const override {
+        sync_archive(inputs, archive_path, options);
+    }
+
+    void delete_entries(const std::filesystem::path& archive_path,
+                        const std::vector<std::string>& paths,
+                        const CompressionOptions& options) const override {
+        delete_from_archive(archive_path, paths, options);
+    }
+};
+
+std::string miniz_error(const mz_zip_archive& zip, std::string_view action) {
+    std::string message(action);
+    message += ": ";
+    message += mz_zip_get_error_string(zip.m_last_error);
+    return message;
+}
+
+std::string normalize_zip_entry_path(std::string path) {
+    std::replace(path.begin(), path.end(), '\\', '/');
+    while (!path.empty() && path.back() == '/') {
+        path.pop_back();
+    }
+    return normalize_archive_path(std::move(path), "ZIP entry path");
+}
+
+std::uint64_t checked_file_size(const fs::path& path) {
+    const auto size = fs::file_size(path);
+    if (size > std::numeric_limits<std::uint64_t>::max()) {
+        throw std::runtime_error("ZIP file is too large: " + path.string());
+    }
+    return static_cast<std::uint64_t>(size);
+}
+
+class ZipReader final {
+public:
+    explicit ZipReader(const fs::path& path)
+        : stream_(path, std::ios::binary), size_(checked_file_size(path)) {
+        if (!stream_) {
+            throw std::runtime_error("cannot open ZIP archive: " + path.string());
+        }
+        mz_zip_zero_struct(&zip_);
+        zip_.m_pRead = &ZipReader::read_callback;
+        zip_.m_pIO_opaque = this;
+        if (!mz_zip_reader_init(&zip_, size_, 0)) {
+            const auto message = miniz_error(zip_, "cannot open ZIP archive");
+            mz_zip_reader_end(&zip_);
+            throw FormatError(message);
+        }
+        open_ = true;
+    }
+
+    ZipReader(const ZipReader&) = delete;
+    ZipReader& operator=(const ZipReader&) = delete;
+
+    ~ZipReader() {
+        if (open_) {
+            mz_zip_reader_end(&zip_);
+        }
+    }
+
+    mz_zip_archive& zip() { return zip_; }
+    const mz_zip_archive& zip() const { return zip_; }
+
+private:
+    static size_t read_callback(void* opaque, mz_uint64 file_ofs, void* buffer, size_t count) {
+        auto* self = static_cast<ZipReader*>(opaque);
+        if (file_ofs >= self->size_) {
+            return 0;
+        }
+        const auto remaining = self->size_ - file_ofs;
+        const auto to_read = static_cast<std::streamsize>(
+            std::min<std::uint64_t>(remaining, count));
+        self->stream_.clear();
+        self->stream_.seekg(static_cast<std::streamoff>(file_ofs), std::ios::beg);
+        if (!self->stream_) {
+            return 0;
+        }
+        self->stream_.read(static_cast<char*>(buffer), to_read);
+        return static_cast<size_t>(self->stream_.gcount());
+    }
+
+    std::ifstream stream_;
+    std::uint64_t size_ = 0;
+    mz_zip_archive zip_{};
+    bool open_ = false;
+};
+
+class ZipWriter final {
+public:
+    explicit ZipWriter(const fs::path& path)
+        : stream_(path, std::ios::binary | std::ios::trunc) {
+        if (!stream_) {
+            throw std::runtime_error("cannot create ZIP archive: " + path.string());
+        }
+        mz_zip_zero_struct(&zip_);
+        zip_.m_pWrite = &ZipWriter::write_callback;
+        zip_.m_pIO_opaque = this;
+        if (!mz_zip_writer_init_v2(&zip_, 0, MZ_ZIP_FLAG_WRITE_ZIP64)) {
+            const auto message = miniz_error(zip_, "cannot initialize ZIP writer");
+            mz_zip_writer_end(&zip_);
+            throw std::runtime_error(message);
+        }
+        open_ = true;
+    }
+
+    ZipWriter(const ZipWriter&) = delete;
+    ZipWriter& operator=(const ZipWriter&) = delete;
+
+    ~ZipWriter() {
+        if (open_) {
+            mz_zip_writer_end(&zip_);
+        }
+    }
+
+    mz_zip_archive& zip() { return zip_; }
+    const mz_zip_archive& zip() const { return zip_; }
+
+    void finalize() {
+        if (!mz_zip_writer_finalize_archive(&zip_)) {
+            throw std::runtime_error(miniz_error(zip_, "cannot finalize ZIP archive"));
+        }
+        if (!stream_) {
+            throw std::runtime_error("failed writing ZIP archive");
+        }
+    }
+
+private:
+    static size_t write_callback(void* opaque, mz_uint64 file_ofs,
+                                 const void* buffer, size_t count) {
+        auto* self = static_cast<ZipWriter*>(opaque);
+        self->stream_.clear();
+        self->stream_.seekp(static_cast<std::streamoff>(file_ofs), std::ios::beg);
+        if (!self->stream_) {
+            return 0;
+        }
+        self->stream_.write(static_cast<const char*>(buffer),
+                            static_cast<std::streamsize>(count));
+        return self->stream_ ? count : 0;
+    }
+
+    std::ofstream stream_;
+    mz_zip_archive zip_{};
+    bool open_ = false;
+};
+
+struct ZipEntryPlan {
+    mz_uint index = 0;
+    ArchiveEntry entry;
+    bool supported = false;
+    bool encrypted = false;
+};
+
+ArchiveEntry archive_entry_from_zip_stat(const mz_zip_archive_file_stat& stat) {
+    ArchiveEntry entry;
+    entry.path = normalize_zip_entry_path(stat.m_filename);
+    entry.is_directory = stat.m_is_directory != 0;
+    entry.size = entry.is_directory ? 0 : static_cast<std::uint64_t>(stat.m_uncomp_size);
+    entry.crc32 = entry.is_directory ? 0 : static_cast<std::uint32_t>(stat.m_crc32);
+#ifndef MINIZ_NO_TIME
+    entry.mtime = static_cast<std::int64_t>(stat.m_time);
+#endif
+    return entry;
+}
+
+std::vector<ZipEntryPlan> read_zip_entry_plans(ZipReader& reader) {
+    mz_zip_archive& zip = reader.zip();
+    const mz_uint count = mz_zip_reader_get_num_files(&zip);
+    std::vector<ZipEntryPlan> result;
+    result.reserve(count);
+    for (mz_uint index = 0; index < count; ++index) {
+        mz_zip_archive_file_stat stat{};
+        if (!mz_zip_reader_file_stat(&zip, index, &stat)) {
+            throw FormatError(miniz_error(zip, "cannot read ZIP directory"));
+        }
+        ZipEntryPlan plan;
+        plan.index = index;
+        plan.entry = archive_entry_from_zip_stat(stat);
+        plan.supported = stat.m_is_supported != 0;
+        plan.encrypted = stat.m_is_encrypted != 0;
+        result.push_back(std::move(plan));
+    }
+    return result;
+}
+
+ArchiveCapabilities zip_capabilities_for_plans(const std::vector<ZipEntryPlan>& entries) {
+    ArchiveCapabilities result;
+    result.list = true;
+    result.create = true;
+    result.metadata = true;
+    result.packed_sizes = true;
+
+    bool all_extractable = true;
+    bool any_extractable = false;
+    bool any_encrypted = false;
+    for (const auto& item : entries) {
+        any_encrypted = any_encrypted || item.encrypted;
+        const bool extractable = !item.encrypted && (item.entry.is_directory || item.supported);
+        any_extractable = any_extractable || extractable;
+        if (!extractable) {
+            all_extractable = false;
+        }
+    }
+    result.extract = all_extractable;
+    result.test = all_extractable;
+    result.selective_extract = any_extractable;
+    result.encrypted = any_encrypted;
+    result.update = !any_encrypted;
+    result.delete_entries = !any_encrypted;
+    return result;
+}
+
+bool zip_plan_selected(const ZipEntryPlan& plan, const std::vector<std::string>& wanted) {
+    if (wanted.empty()) {
+        return true;
+    }
+    for (const auto& item : wanted) {
+        if (plan.entry.path == item || is_same_or_child(plan.entry.path, item)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+int zip_compression_level(const CompressionOptions& options) {
+    if (options.force_store) {
+        return MZ_NO_COMPRESSION;
+    }
+    if (options.use_fast_lz || options.max_chain_depth <= 16 || options.fast_entropy) {
+        return MZ_BEST_SPEED;
+    }
+    if (options.use_tree_matcher || options.max_chain_depth >= 256 ||
+        options.enable_optimal_parser) {
+        return MZ_BEST_COMPRESSION;
+    }
+    return MZ_DEFAULT_COMPRESSION;
+}
+
+void reject_zip_write_options(const CompressionOptions& options) {
+    if (!options.password.empty() || options.encrypt_header) {
+        throw std::runtime_error("ZIP writing does not support encryption yet");
+    }
+    if (options.recovery_percent != 0) {
+        throw std::runtime_error("ZIP writing does not support Axiom recovery records");
+    }
+}
+
+void reject_unwritable_zip_entries(const std::vector<ZipEntryPlan>& plans) {
+    for (const auto& plan : plans) {
+        if (plan.encrypted) {
+            throw FormatError("cannot update encrypted ZIP archives yet");
+        }
+    }
+}
+
+std::vector<ScanItem> scan_zip_inputs(const std::vector<fs::path>& inputs,
+                                      const std::shared_ptr<OperationControl>& operation) {
+    report_operation(operation, OperationStage::scanning, 0, 0, 0, inputs.size());
+    std::vector<ScanItem> items;
+    for (const auto& input : inputs) {
+        operation_checkpoint(operation);
+        scan_input(input, items);
+    }
+    return items;
+}
+
+std::vector<ScanItem> scan_zip_inputs(const std::vector<ArchiveInput>& inputs,
+                                      const std::shared_ptr<OperationControl>& operation) {
+    report_operation(operation, OperationStage::scanning, 0, 0, 0, inputs.size());
+    std::vector<ScanItem> items;
+    for (const auto& input : inputs) {
+        operation_checkpoint(operation);
+        scan_input_at(input, items, operation);
+    }
+    return items;
+}
+
+std::string zip_writer_path(const ScanItem& item) {
+    std::string path = normalize_archive_path(item.archive_path, "ZIP entry path");
+    if (item.is_directory && !path.empty() && path.back() != '/') {
+        path.push_back('/');
+    }
+    return path;
+}
+
+std::unordered_set<std::string> zip_replacement_paths(const std::vector<ScanItem>& items) {
+    std::unordered_set<std::string> result;
+    result.reserve(items.size());
+    for (const auto& item : items) {
+        result.insert(normalize_archive_path(item.archive_path, "ZIP entry path"));
+    }
+    return result;
+}
+
+void validate_zip_items(const std::vector<ScanItem>& items,
+                        const std::vector<ZipEntryPlan>& existing,
+                        const std::shared_ptr<OperationControl>& operation) {
+    std::unordered_map<std::string, bool> incoming;
+    incoming.reserve(items.size());
+    for (const auto& item : items) {
+        operation_checkpoint(operation);
+        if (item.is_symlink) {
+            throw std::runtime_error("ZIP writing does not support symbolic links yet: " +
+                                     item.archive_path);
+        }
+        const std::string path = normalize_archive_path(item.archive_path, "ZIP entry path");
+        const auto [it, inserted] = incoming.emplace(path, item.is_directory);
+        if (!inserted) {
+            throw std::invalid_argument("duplicate ZIP destination: " + path);
+        }
+    }
+
+    for (const auto& [path, is_directory] : incoming) {
+        if (is_directory) {
+            continue;
+        }
+        for (const auto& [other, ignored] : incoming) {
+            (void)ignored;
+            if (other.size() > path.size() && is_same_or_child(other, path)) {
+                throw std::invalid_argument("non-directory ZIP destination has children: " +
+                                            path);
+            }
+        }
+    }
+
+    for (const auto& plan : existing) {
+        const auto& old_path = plan.entry.path;
+        for (const auto& [path, is_directory] : incoming) {
+            if (!is_directory && old_path.size() > path.size() &&
+                is_same_or_child(old_path, path)) {
+                throw std::invalid_argument(
+                    "non-directory ZIP destination has existing children: " + path);
+            }
+            if (!plan.entry.is_directory && path.size() > old_path.size() &&
+                is_same_or_child(path, old_path) && incoming.find(old_path) == incoming.end()) {
+                throw std::invalid_argument("cannot add a ZIP entry below an existing file: " +
+                                            path);
+            }
+        }
+    }
+}
+
+struct ZipFileReadContext {
+    std::ifstream input;
+    std::shared_ptr<OperationControl> operation;
+    std::uint64_t* completed_bytes = nullptr;
+    std::uint64_t total_bytes = 0;
+    std::uint64_t completed_items = 0;
+    std::uint64_t total_items = 0;
+    std::uint64_t reported_until = 0;
+    std::string current_path;
+    bool cancelled = false;
+    bool failed = false;
+    std::string error;
+};
+
+size_t zip_file_read_callback(void* opaque, mz_uint64 file_ofs, void* buffer, size_t count) {
+    auto* context = static_cast<ZipFileReadContext*>(opaque);
+    try {
+        operation_checkpoint(context->operation);
+        context->input.clear();
+        context->input.seekg(static_cast<std::streamoff>(file_ofs), std::ios::beg);
+        if (!context->input) {
+            throw std::runtime_error("failed seeking ZIP input: " + context->current_path);
+        }
+        context->input.read(static_cast<char*>(buffer), static_cast<std::streamsize>(count));
+        const auto read = static_cast<size_t>(context->input.gcount());
+        const std::uint64_t end_offset = file_ofs + read;
+        if (context->completed_bytes != nullptr && end_offset > context->reported_until) {
+            *context->completed_bytes += end_offset - context->reported_until;
+            context->reported_until = end_offset;
+            report_operation(context->operation, OperationStage::compressing,
+                             *context->completed_bytes, context->total_bytes,
+                             context->completed_items, context->total_items,
+                             context->current_path);
+        }
+        return read;
+    } catch (const OperationCancelled&) {
+        context->cancelled = true;
+    } catch (const std::exception& error) {
+        context->failed = true;
+        context->error = error.what();
+    } catch (...) {
+        context->failed = true;
+        context->error = "unknown ZIP input read error";
+    }
+    return 0;
+}
+
+void throw_zip_file_read_failure(const ZipFileReadContext& context,
+                                 const mz_zip_archive& zip,
+                                 std::string_view action) {
+    if (context.cancelled) {
+        throw OperationCancelled();
+    }
+    if (context.failed) {
+        throw std::runtime_error(context.error);
+    }
+    throw std::runtime_error(miniz_error(zip, action));
+}
+
+std::int64_t scan_item_mtime(const ScanItem& item) {
+    std::error_code ec;
+    const auto stamp = fs::last_write_time(item.absolute, ec);
+    if (ec) {
+        return 0;
+    }
+    try {
+        return to_unix_seconds(stamp);
+    } catch (...) {
+        return 0;
+    }
+}
+
+void add_zip_scan_item(ZipWriter& writer, const ScanItem& item,
+                       const CompressionOptions& options,
+                       std::uint64_t& completed_bytes,
+                       std::uint64_t total_bytes,
+                       std::uint64_t& completed_items,
+                       std::uint64_t total_items) {
+    operation_checkpoint(options.operation);
+    const std::string archive_path = zip_writer_path(item);
+    MZ_TIME_T modified = static_cast<MZ_TIME_T>(scan_item_mtime(item));
+    if (item.is_directory) {
+        const char empty = 0;
+        if (!mz_zip_writer_add_mem_ex_v2(&writer.zip(), archive_path.c_str(), &empty, 0,
+                                         nullptr, 0, MZ_NO_COMPRESSION, 0, 0,
+                                         &modified, nullptr, 0, nullptr, 0)) {
+            throw std::runtime_error(miniz_error(writer.zip(), "cannot add ZIP directory"));
+        }
+        ++completed_items;
+        report_operation(options.operation, OperationStage::compressing,
+                         completed_bytes, total_bytes, completed_items, total_items,
+                         item.archive_path);
+        return;
+    }
+    if (item.is_symlink) {
+        throw std::runtime_error("ZIP writing does not support symbolic links yet: " +
+                                 item.archive_path);
+    }
+
+    ZipFileReadContext context;
+    context.input.open(item.absolute, std::ios::binary);
+    if (!context.input) {
+        throw std::runtime_error("cannot read ZIP input: " + item.absolute.string());
+    }
+    context.operation = options.operation;
+    context.completed_bytes = &completed_bytes;
+    context.total_bytes = total_bytes;
+    context.completed_items = completed_items;
+    context.total_items = total_items;
+    context.current_path = item.archive_path;
+    const auto size = static_cast<mz_uint64>(fs::file_size(item.absolute));
+    if (!mz_zip_writer_add_read_buf_callback(
+            &writer.zip(), archive_path.c_str(), &zip_file_read_callback,
+            &context, size, &modified, nullptr, 0,
+            static_cast<mz_uint>(zip_compression_level(options)),
+            nullptr, 0, nullptr, 0)) {
+        throw_zip_file_read_failure(context, writer.zip(), "cannot add ZIP file");
+    }
+    if (context.reported_until < size) {
+        completed_bytes += size - context.reported_until;
+    }
+    ++completed_items;
+    report_operation(options.operation, OperationStage::compressing,
+                     completed_bytes, total_bytes, completed_items, total_items,
+                     item.archive_path);
+}
+
+template <typename KeepExisting>
+void rebuild_zip_archive(const fs::path& archive_path,
+                         const std::vector<ScanItem>& additions,
+                         const CompressionOptions& options,
+                         KeepExisting keep_existing,
+                         bool preserve_existing = true) {
+    reject_zip_write_options(options);
+    const auto replacements = zip_replacement_paths(additions);
+    const bool existing_archive = preserve_existing && fs::exists(archive_path);
+    std::uint64_t total_bytes = scanned_file_bytes(additions);
+    std::uint64_t total_items = additions.size();
+
+    fs::path temp_path = archive_path;
+    temp_path += ".tmp";
+    TempFileGuard temp_guard(temp_path);
+
+    if (existing_archive) {
+        ZipReader reader(archive_path);
+        auto plans = read_zip_entry_plans(reader);
+        reject_unwritable_zip_entries(plans);
+        validate_zip_items(additions, plans, options.operation);
+        for (const auto& plan : plans) {
+            if (keep_existing(plan) &&
+                replacements.find(plan.entry.path) == replacements.end()) {
+                ++total_items;
+                if (!plan.entry.is_directory) {
+                    total_bytes += plan.entry.size;
+                }
+            }
+        }
+
+        std::uint64_t completed_bytes = 0;
+        std::uint64_t completed_items = 0;
+        report_operation(options.operation, OperationStage::compressing,
+                         completed_bytes, total_bytes, completed_items, total_items);
+        {
+            ZipWriter writer(temp_path);
+            for (const auto& plan : plans) {
+                operation_checkpoint(options.operation);
+                if (!keep_existing(plan) ||
+                    replacements.find(plan.entry.path) != replacements.end()) {
+                    continue;
+                }
+                if (!mz_zip_writer_add_from_zip_reader(&writer.zip(), &reader.zip(),
+                                                       plan.index)) {
+                    throw std::runtime_error(miniz_error(
+                        writer.zip(), "cannot preserve existing ZIP entry"));
+                }
+                if (!plan.entry.is_directory) {
+                    completed_bytes += plan.entry.size;
+                }
+                ++completed_items;
+                report_operation(options.operation, OperationStage::compressing,
+                                 completed_bytes, total_bytes, completed_items,
+                                 total_items, plan.entry.path);
+            }
+            for (const auto& item : additions) {
+                add_zip_scan_item(writer, item, options, completed_bytes, total_bytes,
+                                  completed_items, total_items);
+            }
+            report_operation(options.operation, OperationStage::finalizing,
+                             completed_bytes, total_bytes, completed_items, total_items);
+            writer.finalize();
+        }
+    } else {
+        validate_zip_items(additions, {}, options.operation);
+        std::uint64_t completed_bytes = 0;
+        std::uint64_t completed_items = 0;
+        report_operation(options.operation, OperationStage::compressing,
+                         completed_bytes, total_bytes, completed_items, total_items);
+        {
+            ZipWriter writer(temp_path);
+            for (const auto& item : additions) {
+                add_zip_scan_item(writer, item, options, completed_bytes, total_bytes,
+                                  completed_items, total_items);
+            }
+            report_operation(options.operation, OperationStage::finalizing,
+                             completed_bytes, total_bytes, completed_items, total_items);
+            writer.finalize();
+        }
+    }
+
+    replace_archive_file(temp_path, archive_path);
+    temp_guard.dismiss();
+    report_operation(options.operation, OperationStage::finalizing,
+                     total_bytes, total_bytes, total_items, total_items);
+}
+
+struct ZipExtractCallbackContext {
+    std::ofstream* output = nullptr;
+    std::shared_ptr<OperationControl> operation;
+    std::uint64_t* completed_bytes = nullptr;
+    std::uint64_t total_bytes = 0;
+    std::uint64_t completed_items = 0;
+    std::uint64_t total_items = 0;
+    std::string current_path;
+    bool cancelled = false;
+    bool failed = false;
+    std::string error;
+};
+
+size_t zip_extract_write_callback(void* opaque, mz_uint64 file_ofs, const void* buffer,
+                                  size_t count) {
+    auto* context = static_cast<ZipExtractCallbackContext*>(opaque);
+    try {
+        operation_checkpoint(context->operation);
+        if (context->output != nullptr) {
+            context->output->seekp(static_cast<std::streamoff>(file_ofs), std::ios::beg);
+            context->output->write(static_cast<const char*>(buffer),
+                                   static_cast<std::streamsize>(count));
+            if (!*context->output) {
+                throw std::runtime_error("failed writing file: " + context->current_path);
+            }
+        }
+        if (context->completed_bytes != nullptr) {
+            *context->completed_bytes += count;
+            report_operation(context->operation, OperationStage::extracting,
+                             *context->completed_bytes, context->total_bytes,
+                             context->completed_items, context->total_items,
+                             context->current_path);
+        }
+        return count;
+    } catch (const OperationCancelled&) {
+        context->cancelled = true;
+    } catch (const std::exception& error) {
+        context->failed = true;
+        context->error = error.what();
+    } catch (...) {
+        context->failed = true;
+        context->error = "unknown ZIP extraction error";
+    }
+    return 0;
+}
+
+void throw_zip_callback_failure(const ZipExtractCallbackContext& context,
+                                const mz_zip_archive& zip, std::string_view action) {
+    if (context.cancelled) {
+        throw OperationCancelled();
+    }
+    if (context.failed) {
+        throw std::runtime_error(context.error);
+    }
+    throw FormatError(miniz_error(zip, action));
+}
+
+class ZipArchiveProvider final : public ArchiveProvider {
+public:
+    const ArchiveFormatInfo& info() const override {
+        return kArchiveFormats[kZipFormatIndex];
+    }
+
+    bool matches_path(const std::filesystem::path& path) const override {
+        return lower_ascii(path.extension().string()) == ".zip";
+    }
+
+    ArchiveCapabilities capabilities(const std::filesystem::path& archive_path,
+                                     const std::string&) const override {
+        ZipReader reader(archive_path);
+        return zip_capabilities_for_plans(read_zip_entry_plans(reader));
+    }
+
+    std::vector<ArchiveEntry> list(const std::filesystem::path& archive_path,
+                                   const std::string&) const override {
+        ZipReader reader(archive_path);
+        auto plans = read_zip_entry_plans(reader);
+        std::vector<ArchiveEntry> result;
+        result.reserve(plans.size());
+        for (auto& plan : plans) {
+            result.push_back(std::move(plan.entry));
+        }
+        return result;
+    }
+
+    void test(const std::filesystem::path& archive_path,
+              const DecompressionOptions& options) const override {
+        ZipReader reader(archive_path);
+        auto plans = read_zip_entry_plans(reader);
+        const auto capabilities = zip_capabilities_for_plans(plans);
+        if (!capabilities.test) {
+            throw FormatError("ZIP archive uses encryption or compression methods not supported yet");
+        }
+
+        std::uint64_t total_bytes = 0;
+        std::uint64_t total_items = 0;
+        for (const auto& plan : plans) {
+            if (!plan.entry.is_directory) {
+                total_bytes += plan.entry.size;
+            }
+            ++total_items;
+        }
+        std::uint64_t completed_bytes = 0;
+        std::uint64_t completed_items = 0;
+        report_operation(options.operation, OperationStage::testing, completed_bytes,
+                         total_bytes, completed_items, total_items);
+
+        for (const auto& plan : plans) {
+            operation_checkpoint(options.operation);
+            if (plan.entry.is_directory) {
+                ++completed_items;
+                report_operation(options.operation, OperationStage::testing, completed_bytes,
+                                 total_bytes, completed_items, total_items, plan.entry.path);
+                continue;
+            }
+
+            ZipExtractCallbackContext context;
+            context.operation = options.operation;
+            context.completed_bytes = &completed_bytes;
+            context.total_bytes = total_bytes;
+            context.completed_items = completed_items;
+            context.total_items = total_items;
+            context.current_path = plan.entry.path;
+            if (!mz_zip_reader_extract_to_callback(&reader.zip(), plan.index,
+                                                   &zip_extract_write_callback,
+                                                   &context, 0)) {
+                throw_zip_callback_failure(context, reader.zip(), "ZIP integrity test failed");
+            }
+            ++completed_items;
+            report_operation(options.operation, OperationStage::testing, completed_bytes,
+                             total_bytes, completed_items, total_items, plan.entry.path);
+        }
+    }
+
+    void extract_all(const std::filesystem::path& archive_path,
+                     const std::filesystem::path& dest_dir,
+                     const ExtractOptions& options) const override {
+        extract_matching(archive_path, {}, dest_dir, options);
+    }
+
+    void extract_selected(const std::filesystem::path& archive_path,
+                          const std::vector<std::string>& entries,
+                          const std::filesystem::path& dest_dir,
+                          const ExtractOptions& options) const override {
+        std::vector<std::string> normalized;
+        normalized.reserve(entries.size());
+        for (auto entry : entries) {
+            normalized.push_back(normalize_archive_path(std::move(entry), "ZIP selected entry"));
+        }
+        extract_matching(archive_path, normalized, dest_dir, options);
+    }
+
+    void create(const std::vector<std::filesystem::path>& inputs,
+                const std::filesystem::path& archive_path,
+                const CompressionOptions& options) const override {
+        auto items = scan_zip_inputs(inputs, options.operation);
+        rebuild_zip_archive(archive_path, items, options,
+                            [](const ZipEntryPlan&) { return false; },
+                            false);
+    }
+
+    void add(const std::vector<std::filesystem::path>& inputs,
+             const std::filesystem::path& archive_path,
+             const CompressionOptions& options) const override {
+        auto items = scan_zip_inputs(inputs, options.operation);
+        rebuild_zip_archive(archive_path, items, options,
+                            [](const ZipEntryPlan&) { return true; });
+    }
+
+    void add_mapped(const std::vector<ArchiveInput>& inputs,
+                    const std::filesystem::path& archive_path,
+                    const CompressionOptions& options) const override {
+        auto items = scan_zip_inputs(inputs, options.operation);
+        rebuild_zip_archive(archive_path, items, options,
+                            [](const ZipEntryPlan&) { return true; });
+    }
+
+    void update(const std::vector<std::filesystem::path>& inputs,
+                const std::filesystem::path& archive_path,
+                const CompressionOptions& options,
+                bool fresh_only) const override {
+        auto items = scan_zip_inputs(inputs, options.operation);
+        if (!fs::exists(archive_path)) {
+            if (!fresh_only) {
+                rebuild_zip_archive(archive_path, items, options,
+                                    [](const ZipEntryPlan&) { return false; },
+                                    false);
+            }
+            return;
+        }
+
+        std::unordered_map<std::string, std::int64_t> existing_mtime;
+        {
+            ZipReader reader(archive_path);
+            auto plans = read_zip_entry_plans(reader);
+            reject_unwritable_zip_entries(plans);
+            for (const auto& plan : plans) {
+                existing_mtime.emplace(plan.entry.path, plan.entry.mtime);
+            }
+        }
+
+        std::vector<ScanItem> selected;
+        for (const auto& item : items) {
+            operation_checkpoint(options.operation);
+            const auto found = existing_mtime.find(item.archive_path);
+            const bool in_archive = found != existing_mtime.end();
+            if (item.is_directory || item.is_symlink) {
+                if (!in_archive && !fresh_only) {
+                    selected.push_back(item);
+                }
+                continue;
+            }
+            const std::int64_t disk_mtime = scan_item_mtime(item);
+            if (in_archive) {
+                if (disk_mtime > found->second) {
+                    selected.push_back(item);
+                }
+            } else if (!fresh_only) {
+                selected.push_back(item);
+            }
+        }
+        if (selected.empty()) {
+            return;
+        }
+        rebuild_zip_archive(archive_path, selected, options,
+                            [](const ZipEntryPlan&) { return true; });
+    }
+
+    void sync(const std::vector<std::filesystem::path>& inputs,
+              const std::filesystem::path& archive_path,
+              const CompressionOptions& options) const override {
+        auto items = scan_zip_inputs(inputs, options.operation);
+        if (!fs::exists(archive_path)) {
+            rebuild_zip_archive(archive_path, items, options,
+                                [](const ZipEntryPlan&) { return false; },
+                                false);
+            return;
+        }
+
+        std::unordered_map<std::string, std::int64_t> existing_mtime;
+        {
+            ZipReader reader(archive_path);
+            auto plans = read_zip_entry_plans(reader);
+            reject_unwritable_zip_entries(plans);
+            for (const auto& plan : plans) {
+                existing_mtime.emplace(plan.entry.path, plan.entry.mtime);
+            }
+        }
+
+        std::unordered_set<std::string> wanted;
+        wanted.reserve(items.size());
+        std::vector<ScanItem> selected;
+        for (const auto& item : items) {
+            operation_checkpoint(options.operation);
+            wanted.insert(item.archive_path);
+            const auto found = existing_mtime.find(item.archive_path);
+            if (found == existing_mtime.end()) {
+                selected.push_back(item);
+                continue;
+            }
+            if (!item.is_directory && !item.is_symlink &&
+                scan_item_mtime(item) > found->second) {
+                selected.push_back(item);
+            }
+        }
+        rebuild_zip_archive(archive_path, selected, options,
+                            [&wanted](const ZipEntryPlan& plan) {
+                                return wanted.find(plan.entry.path) != wanted.end();
+                            });
+    }
+
+    void delete_entries(const std::filesystem::path& archive_path,
+                        const std::vector<std::string>& paths,
+                        const CompressionOptions& options) const override {
+        std::vector<std::string> targets;
+        targets.reserve(paths.size());
+        for (auto path : paths) {
+            std::replace(path.begin(), path.end(), '\\', '/');
+            while (path.size() > 1 && path.back() == '/') {
+                path.pop_back();
+            }
+            if (!path.empty()) {
+                targets.push_back(normalize_archive_path(std::move(path), "ZIP delete path"));
+            }
+        }
+        if (targets.empty()) {
+            return;
+        }
+        rebuild_zip_archive(archive_path, {}, options,
+                            [&targets](const ZipEntryPlan& plan) {
+                                for (const auto& target : targets) {
+                                    if (plan.entry.path == target ||
+                                        is_same_or_child(plan.entry.path, target)) {
+                                        return false;
+                                    }
+                                }
+                                return true;
+                            });
+    }
+
+private:
+    void extract_matching(const std::filesystem::path& archive_path,
+                          const std::vector<std::string>& wanted,
+                          const std::filesystem::path& dest_dir,
+                          const ExtractOptions& options) const {
+        ZipReader reader(archive_path);
+        auto plans = read_zip_entry_plans(reader);
+
+        std::vector<const ZipEntryPlan*> selected;
+        selected.reserve(plans.size());
+        std::uint64_t total_bytes = 0;
+        for (const auto& plan : plans) {
+            if (!zip_plan_selected(plan, wanted)) {
+                continue;
+            }
+            selected.push_back(&plan);
+            if (!plan.entry.is_directory) {
+                total_bytes += plan.entry.size;
+            }
+        }
+        if (selected.empty() && !wanted.empty()) {
+            throw std::runtime_error("selected ZIP entries were not found");
+        }
+        for (const ZipEntryPlan* plan : selected) {
+            if (plan->encrypted || (!plan->entry.is_directory && !plan->supported)) {
+                throw FormatError(
+                    wanted.empty()
+                        ? "ZIP archive uses encryption or compression methods not supported yet"
+                        : "selected ZIP entries use encryption or compression methods not supported yet");
+            }
+        }
+
+        std::uint64_t completed_bytes = 0;
+        std::uint64_t completed_items = 0;
+        const std::uint64_t total_items = selected.size();
+        report_operation(options.operation, OperationStage::extracting, completed_bytes,
+                         total_bytes, completed_items, total_items);
+
+        std::error_code ec;
+        fs::create_directories(dest_dir, ec);
+        const fs::path dest_norm = dest_dir.lexically_normal();
+
+        struct DeferredDir {
+            fs::path target;
+            std::int64_t mtime = 0;
+        };
+        std::vector<DeferredDir> deferred_dirs;
+
+        for (const auto* selected_plan : selected) {
+            const auto& plan = *selected_plan;
+            const auto& entry = plan.entry;
+            operation_checkpoint(options.operation);
+            if (!is_safe_relative(entry.path)) {
+                throw FormatError("ZIP archive contains an unsafe path: " + entry.path);
+            }
+            const fs::path target = (dest_dir / fs::path(entry.path)).lexically_normal();
+            if (!is_within(dest_norm, target)) {
+                throw FormatError("ZIP archive path escapes the destination: " + entry.path);
+            }
+            reject_symlinked_ancestor(dest_norm, target);
+
+            if (entry.is_directory) {
+                if (core::is_reparse_point(target)) {
+                    throw FormatError("refusing to restore a directory over a symlink: " +
+                                      entry.path);
+                }
+                fs::create_directories(target, ec);
+                deferred_dirs.push_back({target, entry.mtime});
+                ++completed_items;
+                report_operation(options.operation, OperationStage::extracting,
+                                 completed_bytes, total_bytes, completed_items, total_items,
+                                 entry.path);
+                continue;
+            }
+
+            fs::create_directories(target.parent_path(), ec);
+            if (fs::exists(target, ec)) {
+                if (options.overwrite == ExtractOptions::Overwrite::skip) {
+                    completed_bytes += entry.size;
+                    ++completed_items;
+                    report_operation(options.operation, OperationStage::extracting,
+                                     completed_bytes, total_bytes, completed_items, total_items,
+                                     entry.path);
+                    continue;
+                }
+                if (options.overwrite == ExtractOptions::Overwrite::fail) {
+                    throw std::runtime_error("target already exists: " + target.string());
+                }
+                if (fs::is_directory(target, ec)) {
+                    throw std::runtime_error("target is a directory: " + target.string());
+                }
+                fs::remove(target, ec);
+            }
+
+            fs::path temp_target = target;
+            temp_target += ".axtmp";
+            TempFileGuard temp_guard(temp_target);
+            {
+                std::ofstream output(temp_target, std::ios::binary | std::ios::trunc);
+                if (!output) {
+                    throw std::runtime_error("cannot write file: " + temp_target.string());
+                }
+                ZipExtractCallbackContext context;
+                context.output = &output;
+                context.operation = options.operation;
+                context.completed_bytes = &completed_bytes;
+                context.total_bytes = total_bytes;
+                context.completed_items = completed_items;
+                context.total_items = total_items;
+                context.current_path = entry.path;
+                if (!mz_zip_reader_extract_to_callback(&reader.zip(), plan.index,
+                                                       &zip_extract_write_callback,
+                                                       &context, 0)) {
+                    throw_zip_callback_failure(context, reader.zip(), "ZIP extraction failed");
+                }
+            }
+
+            fs::rename(temp_target, target, ec);
+            if (ec) {
+                fs::remove(target, ec);
+                fs::rename(temp_target, target, ec);
+                if (ec) {
+                    throw std::runtime_error("failed to move extracted ZIP file into place: " +
+                                             ec.message());
+                }
+            }
+            temp_guard.dismiss();
+            if (options.restore_mtime && entry.mtime != 0) {
+                try {
+                    fs::last_write_time(target, from_unix_seconds(entry.mtime), ec);
+                } catch (...) {
+                    // best effort
+                }
+            }
+            ++completed_items;
+            report_operation(options.operation, OperationStage::extracting, completed_bytes,
+                             total_bytes, completed_items, total_items, entry.path);
+        }
+
+        std::sort(deferred_dirs.begin(), deferred_dirs.end(),
+                  [](const DeferredDir& left, const DeferredDir& right) {
+                      return left.target.native().size() > right.target.native().size();
+                  });
+        for (const auto& dir : deferred_dirs) {
+            if (options.restore_mtime && dir.mtime != 0) {
+                try {
+                    fs::last_write_time(dir.target, from_unix_seconds(dir.mtime), ec);
+                } catch (...) {
+                    // best effort
+                }
+            }
+        }
+    }
+};
+
+const AxarArchiveProvider kAxarProvider;
+const ZipArchiveProvider kZipProvider;
+const std::array<const ArchiveProvider*, 2> kArchiveProviders{&kAxarProvider, &kZipProvider};
+
+}  // namespace
+
+std::span<const ArchiveFormatInfo> supported_archive_formats() {
+    return kArchiveFormats;
+}
+
+const ArchiveProvider* archive_provider_for_path(const std::filesystem::path& path) {
+    for (const auto* provider : kArchiveProviders) {
+        if (provider->matches_path(path)) {
+            return provider;
+        }
+    }
+    return nullptr;
+}
+
+bool is_supported_archive(const std::filesystem::path& path) {
+    return archive_provider_for_path(path) != nullptr;
+}
+
+bool is_native_archive(const std::filesystem::path& path) {
+    const auto* provider = archive_provider_for_path(path);
+    return provider != nullptr && provider->info().native;
 }
 
 namespace detail {

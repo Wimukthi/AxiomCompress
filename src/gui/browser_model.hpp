@@ -55,22 +55,7 @@ struct BrowserSnapshot {
     std::wstring error;
 };
 
-struct ArchiveCapabilities {
-    bool packed_sizes = false;
-    bool selective_extract = false;
-    bool update = false;
-    bool encryption = false;
-    bool recovery_records = false;
-    bool multi_volume = false;
-    bool comments = false;
-    bool lock = false;
-    bool metadata = false;
-    bool links = false;
-    bool authenticity = false;
-    bool locked = false;
-    bool encrypted = false;
-    bool directory_encrypted = false;
-};
+using ArchiveCapabilities = axiom::ArchiveCapabilities;
 
 class ArchiveCatalog {
 public:
@@ -78,14 +63,17 @@ public:
                                                       const std::string& password = {});
 
     const std::filesystem::path& path() const;
+    const axiom::ArchiveProvider& provider() const;
+    const axiom::ArchiveFormatInfo& format_info() const;
     const ArchiveCapabilities& capabilities() const;
     BrowserSnapshot list(const BrowserLocation& location, std::stop_token stop) const;
 
 private:
-    ArchiveCatalog(std::filesystem::path path, std::vector<ArchiveEntry> entries,
-                   const std::string& password);
+    ArchiveCatalog(std::filesystem::path path, const axiom::ArchiveProvider& provider,
+                   std::vector<ArchiveEntry> entries, ArchiveCapabilities capabilities);
 
     std::filesystem::path path_;
+    const axiom::ArchiveProvider* provider_ = nullptr;
     std::vector<ArchiveEntry> entries_;
     ArchiveCapabilities capabilities_;
 };
@@ -119,6 +107,7 @@ private:
 };
 
 bool is_axiom_archive(const std::filesystem::path& path);
+bool is_supported_archive(const std::filesystem::path& path);
 std::optional<BrowserLocation> parent_location(const BrowserLocation& location);
 
 }  // namespace axiom::gui

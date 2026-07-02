@@ -6,7 +6,9 @@
 #include <cstdint>
 #include <filesystem>
 #include <optional>
+#include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace axiom {
@@ -23,6 +25,46 @@ struct ArchiveEntry {
     std::uint32_t crc32 = 0;     // CRC-32 of file bytes (0 for directories/links)
     bool has_blake3 = false;     // whether blake3 below is populated
     std::array<std::uint8_t, 32> blake3{};  // BLAKE3-256 of file bytes
+};
+
+enum class ArchiveFormat {
+    axar,
+    zip,
+};
+
+struct ArchiveFormatInfo {
+    ArchiveFormat format = ArchiveFormat::axar;
+    std::string_view id;
+    std::string_view display_name;
+    std::string_view file_type_name;
+    std::string_view default_extension;
+    std::wstring_view open_filter_name;
+    std::wstring_view open_filter_pattern;
+    bool native = false;
+};
+
+struct ArchiveCapabilities {
+    bool list = false;
+    bool extract = false;
+    bool test = false;
+    bool create = false;
+    bool packed_sizes = false;
+    bool selective_extract = false;
+    bool update = false;
+    bool delete_entries = false;
+    bool move_entries = false;
+    bool encryption = false;
+    bool recovery_records = false;
+    bool multi_volume = false;
+    bool comments = false;
+    bool lock = false;
+    bool metadata = false;
+    bool links = false;
+    bool authenticity = false;
+    bool sfx = false;
+    bool locked = false;
+    bool encrypted = false;
+    bool directory_encrypted = false;
 };
 
 struct ExtractOptions {
@@ -47,6 +89,51 @@ struct ArchiveInput {
     std::filesystem::path source;
     std::string destination_path;
 };
+
+class ArchiveProvider {
+public:
+    virtual ~ArchiveProvider() = default;
+
+    virtual const ArchiveFormatInfo& info() const = 0;
+    virtual bool matches_path(const std::filesystem::path& path) const = 0;
+    virtual ArchiveCapabilities capabilities(const std::filesystem::path& archive_path,
+                                             const std::string& password = {}) const = 0;
+    virtual std::vector<ArchiveEntry> list(const std::filesystem::path& archive_path,
+                                           const std::string& password = {}) const = 0;
+    virtual void test(const std::filesystem::path& archive_path,
+                      const DecompressionOptions& options = {}) const = 0;
+    virtual void extract_all(const std::filesystem::path& archive_path,
+                             const std::filesystem::path& dest_dir,
+                             const ExtractOptions& options = {}) const = 0;
+    virtual void extract_selected(const std::filesystem::path& archive_path,
+                                  const std::vector<std::string>& entries,
+                                  const std::filesystem::path& dest_dir,
+                                  const ExtractOptions& options = {}) const = 0;
+    virtual void create(const std::vector<std::filesystem::path>& inputs,
+                        const std::filesystem::path& archive_path,
+                        const CompressionOptions& options = {}) const = 0;
+    virtual void add(const std::vector<std::filesystem::path>& inputs,
+                     const std::filesystem::path& archive_path,
+                     const CompressionOptions& options = {}) const = 0;
+    virtual void add_mapped(const std::vector<ArchiveInput>& inputs,
+                            const std::filesystem::path& archive_path,
+                            const CompressionOptions& options = {}) const = 0;
+    virtual void update(const std::vector<std::filesystem::path>& inputs,
+                        const std::filesystem::path& archive_path,
+                        const CompressionOptions& options = {},
+                        bool fresh_only = false) const = 0;
+    virtual void sync(const std::vector<std::filesystem::path>& inputs,
+                      const std::filesystem::path& archive_path,
+                      const CompressionOptions& options = {}) const = 0;
+    virtual void delete_entries(const std::filesystem::path& archive_path,
+                                const std::vector<std::string>& paths,
+                                const CompressionOptions& options = {}) const = 0;
+};
+
+std::span<const ArchiveFormatInfo> supported_archive_formats();
+const ArchiveProvider* archive_provider_for_path(const std::filesystem::path& path);
+bool is_supported_archive(const std::filesystem::path& path);
+bool is_native_archive(const std::filesystem::path& path);
 
 struct ArchiveMove {
     std::string source_path;

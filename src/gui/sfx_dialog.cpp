@@ -127,7 +127,7 @@ public:
                                   L"Axiom Self-Extractor", style,
                                   x, y, width, height, owner, nullptr, instance, this);
         if (window_ == nullptr) return false;
-        if (owner != nullptr) EnableWindow(owner, FALSE);
+        const bool owner_was_enabled = disable_dialog_owner(owner);
         ShowWindow(window_, SW_SHOW);
         UpdateWindow(window_);
 
@@ -138,10 +138,7 @@ public:
                 DispatchMessageW(&message);
             }
         }
-        if (owner != nullptr) {
-            EnableWindow(owner, TRUE);
-            SetForegroundWindow(owner);
-        }
+        restore_dialog_owner(owner, owner_was_enabled);
         return accepted_;
     }
 

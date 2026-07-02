@@ -433,9 +433,7 @@ int show_message_dialog(HWND owner, HINSTANCE instance, UINT dpi, bool dark,
         return safe_result;
     }
 
-    if (owner != nullptr) {
-        EnableWindow(owner, FALSE);
-    }
+    const bool owner_was_enabled = disable_dialog_owner(owner);
     ShowWindow(dialog, SW_SHOW);
     UpdateWindow(dialog);
 
@@ -454,10 +452,7 @@ int show_message_dialog(HWND owner, HINSTANCE instance, UINT dpi, bool dark,
         }
     }
 
-    if (owner != nullptr && IsWindow(owner)) {
-        EnableWindow(owner, TRUE);
-        SetActiveWindow(owner);
-    }
+    restore_dialog_owner(owner, owner_was_enabled);
     return state.result;
 }
 

@@ -82,6 +82,7 @@ enum ControlId : int {
     kOpenArchive = 1008,
     kExtract = 1010,
     kTest = 1011,
+    kTree = 1014,
     kList = 1015,
     kStatus = 1017,
     kNavigateBack = 1022,
@@ -103,7 +104,6 @@ enum ControlId : int {
     kSelectAll = 1111,
     kAbout = 1112,
     kCheckUpdates = 1113,
-    kArchiveFeatures = 1120,
     kUpdateArchive = 1121,
     kSynchronizeArchive = 1122,
     kDeleteArchiveEntries = 1123,
@@ -477,8 +477,23 @@ std::optional<fs::path> shell_item_path(IShellItem* item) {
 }
 
 void set_axar_filter(IFileDialog* dialog) {
+    std::wstring combined_pattern;
+    std::wstring combined_name = L"Supported archives";
+    bool first = true;
+    for (const auto& format : axiom::supported_archive_formats()) {
+        if (!first) {
+            combined_pattern += L";";
+        }
+        combined_pattern += format.open_filter_pattern;
+        first = false;
+    }
+    // Split/recovery volumes are validated before normal provider probing.
+    if (!combined_pattern.empty()) combined_pattern += L";";
+    combined_pattern += L"*.rev*;*.part*.axar";
+    combined_name += L" (" + combined_pattern + L")";
+
     COMDLG_FILTERSPEC filters[] = {
-        {L"Axiom archives and volumes (*.axar;*.rev*)", L"*.axar;*.rev*"},
+        {combined_name.c_str(), combined_pattern.c_str()},
         {L"All files (*.*)", L"*.*"},
     };
     dialog->SetFileTypes(static_cast<UINT>(sizeof(filters) / sizeof(filters[0])), filters);
@@ -728,6 +743,68 @@ void draw_solid_line(HDC dc, int x1, int y1, int x2, int y2, COLORREF color) {
     DeleteObject(pen);
 }
 
+class PaintBuffer {
+public:
+    ~PaintBuffer() {
+        release();
+    }
+
+    PaintBuffer(const PaintBuffer&) = delete;
+    PaintBuffer& operator=(const PaintBuffer&) = delete;
+
+    PaintBuffer() = default;
+
+    bool ensure(HDC reference_dc, int width, int height) {
+        if (reference_dc == nullptr || width <= 0 || height <= 0) return false;
+        if (dc_ == nullptr) {
+            dc_ = CreateCompatibleDC(reference_dc);
+            if (dc_ == nullptr) return false;
+        }
+        if (bitmap_ == nullptr || width > width_ || height > height_) {
+            const int next_width = std::max(width, width_);
+            const int next_height = std::max(height, height_);
+            HBITMAP next_bitmap =
+                CreateCompatibleBitmap(reference_dc, next_width, next_height);
+            if (next_bitmap == nullptr) return false;
+            if (bitmap_ != nullptr) {
+                SelectObject(dc_, old_bitmap_);
+                DeleteObject(bitmap_);
+            }
+            bitmap_ = next_bitmap;
+            old_bitmap_ = SelectObject(dc_, bitmap_);
+            width_ = next_width;
+            height_ = next_height;
+        }
+        return dc_ != nullptr && bitmap_ != nullptr;
+    }
+
+    HDC dc() const {
+        return dc_;
+    }
+
+    void release() {
+        if (dc_ != nullptr) {
+            if (bitmap_ != nullptr) {
+                SelectObject(dc_, old_bitmap_);
+                DeleteObject(bitmap_);
+            }
+            DeleteDC(dc_);
+        }
+        dc_ = nullptr;
+        bitmap_ = nullptr;
+        old_bitmap_ = nullptr;
+        width_ = 0;
+        height_ = 0;
+    }
+
+private:
+    HDC dc_ = nullptr;
+    HBITMAP bitmap_ = nullptr;
+    HGDIOBJ old_bitmap_ = nullptr;
+    int width_ = 0;
+    int height_ = 0;
+};
+
 struct TableColumn {
     std::wstring title;
     int logical_width = 0;
@@ -975,7 +1052,7 @@ private:
 
     void invalidate() const {
         if (hwnd_ != nullptr) {
-            InvalidateRect(hwnd_, nullptr, TRUE);
+            InvalidateRect(hwnd_, nullptr, FALSE);
         }
     }
 
@@ -1419,15 +1496,13 @@ private:
         const int width = client.right - client.left;
         const int height = client.bottom - client.top;
         if (width > 0 && height > 0) {
-            HDC memory_dc = CreateCompatibleDC(dc);
-            HBITMAP bitmap = CreateCompatibleBitmap(dc, width, height);
-            HGDIOBJ old_bitmap = SelectObject(memory_dc, bitmap);
             RECT buffer{0, 0, width, height};
-            paint_content(memory_dc, buffer);
-            BitBlt(dc, 0, 0, width, height, memory_dc, 0, 0, SRCCOPY);
-            SelectObject(memory_dc, old_bitmap);
-            DeleteObject(bitmap);
-            DeleteDC(memory_dc);
+            if (paint_buffer_.ensure(dc, width, height)) {
+                paint_content(paint_buffer_.dc(), buffer);
+                BitBlt(dc, 0, 0, width, height, paint_buffer_.dc(), 0, 0, SRCCOPY);
+            } else {
+                paint_content(dc, buffer);
+            }
         }
         EndPaint(hwnd_, &paint);
     }
@@ -1811,6 +1886,665 @@ private:
     POINT marquee_start_{};
     POINT marquee_current_{};
     std::vector<bool> marquee_base_selection_;
+    PaintBuffer paint_buffer_;
+};
+
+enum class DirectoryTreeNodeKind {
+    dummy,
+    computer,
+    filesystem,
+    archive,
+    archive_directory,
+};
+
+struct DirectoryTreeNode {
+    DirectoryTreeNodeKind kind = DirectoryTreeNodeKind::dummy;
+    fs::path filesystem_path;
+    fs::path archive_path;
+    std::string archive_directory;
+    bool populated = false;
+};
+
+struct DirectoryTreeItem {
+    DirectoryTreeNode node;
+    std::wstring text;
+    ShellIconRef icon;
+    DirectoryTreeItem* parent = nullptr;
+    std::vector<std::unique_ptr<DirectoryTreeItem>> children;
+    bool may_have_children = false;
+    bool expanded = false;
+    bool populated = false;
+};
+
+class DarkDirectoryTreeView {
+public:
+    using PopulateCallback = std::function<void(DirectoryTreeItem&)>;
+    using SelectCallback = std::function<void(const DirectoryTreeItem&)>;
+
+    bool create(HWND parent, HINSTANCE instance, int id) {
+        if (!register_class(instance)) return false;
+        hwnd_ = CreateWindowExW(0, class_name(), L"",
+                                WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+                                0, 0, 0, 0,
+                                parent,
+                                reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),
+                                instance, this);
+        return hwnd_ != nullptr;
+    }
+
+    HWND hwnd() const {
+        return hwnd_;
+    }
+
+    void set_theme(const ThemePalette& theme) {
+        theme_ = theme;
+        invalidate();
+    }
+
+    void set_font(HFONT font) {
+        font_ = font;
+        invalidate();
+    }
+
+    void set_dpi(UINT dpi) {
+        dpi_ = dpi == 0 ? USER_DEFAULT_SCREEN_DPI : dpi;
+        invalidate();
+    }
+
+    void set_populate_callback(PopulateCallback callback) {
+        populate_callback_ = std::move(callback);
+    }
+
+    void set_select_callback(SelectCallback callback) {
+        select_callback_ = std::move(callback);
+    }
+
+    void move(int x, int y, int width, int height, bool repaint = true) {
+        if (hwnd_ != nullptr) {
+            MoveWindow(hwnd_, x, y, width, height, repaint ? TRUE : FALSE);
+        }
+    }
+
+    void clear() {
+        roots_.clear();
+        visible_.clear();
+        selected_ = nullptr;
+        scroll_y_ = 0;
+        invalidate();
+    }
+
+    void begin_update() {
+        ++update_depth_;
+    }
+
+    void end_update() {
+        if (update_depth_ == 0) return;
+        --update_depth_;
+        if (update_depth_ == 0 && refresh_pending_) {
+            refresh_pending_ = false;
+            refresh();
+        }
+    }
+
+    DirectoryTreeItem* insert_item(DirectoryTreeItem* parent,
+                                   std::wstring text,
+                                   DirectoryTreeNode node,
+                                   ShellIconRef icon,
+                                   bool may_have_children) {
+        auto item = std::make_unique<DirectoryTreeItem>();
+        item->node = std::move(node);
+        item->text = std::move(text);
+        item->icon = icon;
+        item->parent = parent;
+        item->may_have_children = may_have_children;
+        DirectoryTreeItem* raw = item.get();
+        if (parent != nullptr) {
+            parent->children.push_back(std::move(item));
+        } else {
+            roots_.push_back(std::move(item));
+        }
+        refresh();
+        return raw;
+    }
+
+    void clear_children(DirectoryTreeItem& item) {
+        if (is_ancestor_of(item, selected_)) selected_ = &item;
+        item.children.clear();
+        item.populated = false;
+        refresh();
+    }
+
+    void refresh() {
+        if (update_depth_ > 0) {
+            refresh_pending_ = true;
+            return;
+        }
+        rebuild_visible_items();
+        clamp_scroll();
+        invalidate();
+    }
+
+    void select_item(DirectoryTreeItem* item, bool notify) {
+        if (item == nullptr) return;
+        selected_ = item;
+        ensure_visible(item);
+        invalidate();
+        if (notify && select_callback_) {
+            select_callback_(*item);
+        }
+    }
+
+    void ensure_visible(DirectoryTreeItem* item) {
+        if (item == nullptr || hwnd_ == nullptr) return;
+        expand_ancestors(item);
+        rebuild_visible_items();
+        RECT client{};
+        GetClientRect(hwnd_, &client);
+        const int viewport = viewport_height(client);
+        const int row = visible_index(item);
+        if (row < 0 || viewport <= 0) return;
+        const int top = row * row_height();
+        const int bottom = top + row_height();
+        if (top < scroll_y_) {
+            scroll_y_ = top;
+        } else if (bottom > scroll_y_ + viewport) {
+            scroll_y_ = bottom - viewport;
+        }
+        clamp_scroll();
+    }
+
+private:
+    struct VisibleItem {
+        DirectoryTreeItem* item = nullptr;
+        int depth = 0;
+    };
+
+    static const wchar_t* class_name() {
+        return L"AxiomDarkDirectoryTreeView";
+    }
+
+    static bool register_class(HINSTANCE instance) {
+        WNDCLASSEXW wc{};
+        if (GetClassInfoExW(instance, class_name(), &wc)) return true;
+        wc.cbSize = sizeof(wc);
+        wc.hInstance = instance;
+        wc.lpfnWndProc = &DarkDirectoryTreeView::window_proc;
+        wc.lpszClassName = class_name();
+        wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        wc.style = CS_DBLCLKS;
+        return RegisterClassExW(&wc) != 0;
+    }
+
+    int scale(int value) const {
+        return scale_for_dpi(dpi_, value);
+    }
+
+    int row_height() const {
+        return scale(24);
+    }
+
+    int indent_width() const {
+        return scale(18);
+    }
+
+    int scrollbar_width() const {
+        return scale(8);
+    }
+
+    int content_height() const {
+        return static_cast<int>(visible_.size()) * row_height();
+    }
+
+    int viewport_height(const RECT& client) const {
+        return std::max(0, static_cast<int>(client.bottom - client.top) - scale(2));
+    }
+
+    int max_scroll(const RECT& client) const {
+        return std::max(0, content_height() - viewport_height(client));
+    }
+
+    bool needs_scrollbar(const RECT& client) const {
+        return content_height() > viewport_height(client);
+    }
+
+    RECT content_rect(const RECT& client) const {
+        RECT rect = client;
+        InflateRect(&rect, -scale(1), -scale(1));
+        if (needs_scrollbar(client)) rect.right -= scrollbar_width();
+        return rect;
+    }
+
+    RECT scrollbar_track_rect(const RECT& client) const {
+        return RECT{
+            client.right - scrollbar_width() - scale(1),
+            client.top + scale(1),
+            client.right - scale(1),
+            client.bottom - scale(1),
+        };
+    }
+
+    RECT scrollbar_thumb_rect(const RECT& client) const {
+        const RECT track = scrollbar_track_rect(client);
+        const int track_height = std::max(0, static_cast<int>(track.bottom - track.top));
+        const int maximum = max_scroll(client);
+        if (maximum <= 0 || track_height <= 0) {
+            return RECT{track.left, track.top, track.right, track.top};
+        }
+        const int thumb_height = std::clamp(
+            MulDiv(viewport_height(client), track_height, content_height()),
+            scale(24), track_height);
+        const int travel = std::max(0, track_height - thumb_height);
+        const int top = track.top + MulDiv(scroll_y_, travel, maximum);
+        return RECT{track.left, top, track.right, top + thumb_height};
+    }
+
+    void clamp_scroll() {
+        if (hwnd_ == nullptr) {
+            scroll_y_ = 0;
+            return;
+        }
+        RECT client{};
+        GetClientRect(hwnd_, &client);
+        scroll_y_ = std::clamp(scroll_y_, 0, max_scroll(client));
+    }
+
+    void scroll_by(int delta) {
+        scroll_y_ += delta;
+        clamp_scroll();
+        invalidate();
+    }
+
+    void set_scroll_from_thumb(POINT point, const RECT& client) {
+        const RECT track = scrollbar_track_rect(client);
+        const RECT thumb = scrollbar_thumb_rect(client);
+        const int thumb_height = thumb.bottom - thumb.top;
+        const int travel = std::max(1, static_cast<int>(track.bottom - track.top) - thumb_height);
+        const int thumb_top = std::clamp(static_cast<int>(point.y) - drag_offset_y_,
+                                         static_cast<int>(track.top),
+                                         static_cast<int>(track.bottom) - thumb_height);
+        scroll_y_ = MulDiv(thumb_top - track.top, max_scroll(client), travel);
+        clamp_scroll();
+        invalidate();
+    }
+
+    static bool is_ancestor_of(const DirectoryTreeItem& ancestor,
+                               const DirectoryTreeItem* item) {
+        for (const DirectoryTreeItem* current = item; current != nullptr;
+             current = current->parent) {
+            if (current == &ancestor) return true;
+        }
+        return false;
+    }
+
+    void flatten(DirectoryTreeItem& item, int depth) {
+        visible_.push_back({&item, depth});
+        if (!item.expanded) return;
+        for (auto& child : item.children) {
+            flatten(*child, depth + 1);
+        }
+    }
+
+    void rebuild_visible_items() {
+        visible_.clear();
+        for (auto& root : roots_) {
+            flatten(*root, 0);
+        }
+    }
+
+    int visible_index(const DirectoryTreeItem* item) const {
+        for (int index = 0; index < static_cast<int>(visible_.size()); ++index) {
+            if (visible_[static_cast<std::size_t>(index)].item == item) return index;
+        }
+        return -1;
+    }
+
+    void expand_ancestors(DirectoryTreeItem* item) {
+        for (DirectoryTreeItem* parent = item->parent; parent != nullptr; parent = parent->parent) {
+            if (!parent->expanded) {
+                ensure_populated(*parent);
+                parent->expanded = true;
+            }
+        }
+    }
+
+    void ensure_populated(DirectoryTreeItem& item) {
+        if (!item.may_have_children || item.populated || !populate_callback_) return;
+        populate_callback_(item);
+    }
+
+    void toggle_item(DirectoryTreeItem& item) {
+        if (!item.may_have_children) return;
+        if (!item.expanded) ensure_populated(item);
+        if (!item.children.empty() || item.populated) {
+            item.expanded = !item.expanded;
+        }
+        refresh();
+    }
+
+    DirectoryTreeItem* item_at_point(POINT point, int* depth = nullptr, RECT* row_rect = nullptr) {
+        rebuild_visible_items();
+        RECT client{};
+        GetClientRect(hwnd_, &client);
+        const RECT content = content_rect(client);
+        if (point.x < content.left || point.x >= content.right ||
+            point.y < content.top || point.y >= content.bottom) {
+            return nullptr;
+        }
+        const int row = (point.y - content.top + scroll_y_) / row_height();
+        if (row < 0 || row >= static_cast<int>(visible_.size())) return nullptr;
+        if (depth != nullptr) *depth = visible_[static_cast<std::size_t>(row)].depth;
+        if (row_rect != nullptr) {
+            const int top = content.top + row * row_height() - scroll_y_;
+            *row_rect = RECT{content.left, top, content.right, top + row_height()};
+        }
+        return visible_[static_cast<std::size_t>(row)].item;
+    }
+
+    RECT glyph_rect_for_row(const RECT& row, int depth) const {
+        const int size = scale(14);
+        const int left = row.left + scale(5) + depth * indent_width();
+        return RECT{left, row.top + (row_height() - size) / 2,
+                    left + size, row.top + (row_height() + size) / 2};
+    }
+
+    void draw_chevron(HDC dc, const RECT& rect, bool expanded, COLORREF color) const {
+        POINT points[3]{};
+        if (expanded) {
+            points[0] = {rect.left + scale(3), rect.top + scale(5)};
+            points[1] = {rect.right - scale(3), rect.top + scale(5)};
+            points[2] = {(rect.left + rect.right) / 2, rect.bottom - scale(4)};
+        } else {
+            points[0] = {rect.left + scale(5), rect.top + scale(3)};
+            points[1] = {rect.left + scale(5), rect.bottom - scale(3)};
+            points[2] = {rect.right - scale(4), (rect.top + rect.bottom) / 2};
+        }
+        HBRUSH brush = CreateSolidBrush(color);
+        HPEN pen = CreatePen(PS_SOLID, 1, color);
+        HGDIOBJ old_brush = SelectObject(dc, brush);
+        HGDIOBJ old_pen = SelectObject(dc, pen);
+        Polygon(dc, points, 3);
+        SelectObject(dc, old_pen);
+        SelectObject(dc, old_brush);
+        DeleteObject(pen);
+        DeleteObject(brush);
+    }
+
+    void paint_content(HDC dc, const RECT& client) {
+        fill_solid_rect(dc, client, theme_.edit);
+        frame_solid_rect(dc, client, theme_.border);
+        const RECT content = content_rect(client);
+
+        HFONT font = font_ != nullptr
+            ? font_
+            : static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
+        HGDIOBJ old_font = SelectObject(dc, font);
+        SetBkMode(dc, TRANSPARENT);
+
+        rebuild_visible_items();
+        const int first_row = row_height() > 0 ? std::max(0, scroll_y_ / row_height()) : 0;
+        const int visible_rows = row_height() > 0
+            ? (content.bottom - content.top + row_height() - 1) / row_height() + 1
+            : 0;
+        const int last_row = std::min(static_cast<int>(visible_.size()),
+                                      first_row + visible_rows);
+
+        for (int row = first_row; row < last_row; ++row) {
+            const auto& visible = visible_[static_cast<std::size_t>(row)];
+            DirectoryTreeItem& item = *visible.item;
+            RECT row_rect{content.left,
+                          content.top + row * row_height() - scroll_y_,
+                          content.right,
+                          content.top + (row + 1) * row_height() - scroll_y_};
+            const bool selected = selected_ == &item;
+            fill_solid_rect(dc, row_rect, selected ? theme_.selection : theme_.edit);
+
+            const RECT glyph = glyph_rect_for_row(row_rect, visible.depth);
+            if (item.may_have_children) {
+                draw_chevron(dc, glyph, item.expanded,
+                             selected ? theme_.selection_text : theme_.muted_text);
+            }
+
+            int text_left = glyph.right + scale(3);
+            if (item.icon.image_list != nullptr && item.icon.index >= 0) {
+                int icon_width = 0;
+                int icon_height = 0;
+                ImageList_GetIconSize(item.icon.image_list, &icon_width, &icon_height);
+                const int icon_y = row_rect.top + std::max(
+                    0, (row_height() - icon_height) / 2);
+                ImageList_Draw(item.icon.image_list, item.icon.index, dc,
+                               text_left, icon_y, ILD_TRANSPARENT);
+                text_left += icon_width + scale(6);
+            }
+
+            RECT text_rect{text_left, row_rect.top, row_rect.right - scale(5), row_rect.bottom};
+            SetTextColor(dc, selected ? theme_.selection_text : theme_.text);
+            DrawTextW(dc, item.text.c_str(), -1, &text_rect,
+                      DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+
+            if (selected && GetFocus() == hwnd_) {
+                RECT focus = row_rect;
+                InflateRect(&focus, -scale(2), -scale(2));
+                frame_solid_rect(dc, focus, theme_.focus);
+            }
+        }
+
+        if (needs_scrollbar(client)) {
+            const RECT track = scrollbar_track_rect(client);
+            const RECT thumb = scrollbar_thumb_rect(client);
+            fill_solid_rect(dc, track, theme_.scrollbar_track);
+            fill_solid_rect(dc, thumb, dragging_scrollbar_
+                                       ? theme_.scrollbar_thumb_pressed
+                                       : theme_.scrollbar_thumb);
+        }
+
+        SelectObject(dc, old_font);
+    }
+
+    void on_paint() {
+        PAINTSTRUCT paint{};
+        HDC dc = BeginPaint(hwnd_, &paint);
+        RECT client{};
+        GetClientRect(hwnd_, &client);
+        const int width = client.right - client.left;
+        const int height = client.bottom - client.top;
+        if (width > 0 && height > 0) {
+            RECT buffer{0, 0, width, height};
+            if (paint_buffer_.ensure(dc, width, height)) {
+                paint_content(paint_buffer_.dc(), buffer);
+                BitBlt(dc, 0, 0, width, height, paint_buffer_.dc(), 0, 0, SRCCOPY);
+            } else {
+                paint_content(dc, buffer);
+            }
+        }
+        EndPaint(hwnd_, &paint);
+    }
+
+    void invalidate() const {
+        if (hwnd_ != nullptr) InvalidateRect(hwnd_, nullptr, FALSE);
+    }
+
+    void select_visible_index(int index) {
+        rebuild_visible_items();
+        if (visible_.empty()) return;
+        index = std::clamp(index, 0, static_cast<int>(visible_.size()) - 1);
+        select_item(visible_[static_cast<std::size_t>(index)].item, true);
+    }
+
+    LRESULT handle_message(UINT message, WPARAM wparam, LPARAM lparam) {
+        switch (message) {
+            case WM_ERASEBKGND:
+                return 1;
+            case WM_PAINT:
+                on_paint();
+                return 0;
+            case WM_SETFONT:
+                font_ = reinterpret_cast<HFONT>(wparam);
+                invalidate();
+                return 0;
+            case WM_SIZE:
+                clamp_scroll();
+                invalidate();
+                return 0;
+            case WM_SETFOCUS:
+            case WM_KILLFOCUS:
+                invalidate();
+                return 0;
+            case WM_MOUSEWHEEL:
+                scroll_by(-GET_WHEEL_DELTA_WPARAM(wparam) / WHEEL_DELTA * row_height() * 3);
+                return 0;
+            case WM_LBUTTONDOWN: {
+                SetFocus(hwnd_);
+                RECT client{};
+                GetClientRect(hwnd_, &client);
+                POINT point{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
+                if (needs_scrollbar(client)) {
+                    const RECT thumb = scrollbar_thumb_rect(client);
+                    const RECT track = scrollbar_track_rect(client);
+                    if (PtInRect(&thumb, point)) {
+                        dragging_scrollbar_ = true;
+                        drag_offset_y_ = point.y - thumb.top;
+                        SetCapture(hwnd_);
+                        return 0;
+                    }
+                    if (PtInRect(&track, point)) {
+                        scroll_by(point.y < thumb.top ? -viewport_height(client)
+                                                      : viewport_height(client));
+                        return 0;
+                    }
+                }
+                int depth = 0;
+                RECT row{};
+                DirectoryTreeItem* item = item_at_point(point, &depth, &row);
+                if (item == nullptr) return 0;
+                const RECT glyph = glyph_rect_for_row(row, depth);
+                if (PtInRect(&glyph, point) && item->may_have_children) {
+                    toggle_item(*item);
+                }
+                select_item(item, true);
+                return 0;
+            }
+            case WM_LBUTTONDBLCLK: {
+                POINT point{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
+                DirectoryTreeItem* item = item_at_point(point);
+                if (item != nullptr && item->may_have_children) {
+                    toggle_item(*item);
+                    return 0;
+                }
+                break;
+            }
+            case WM_MOUSEMOVE:
+                if (dragging_scrollbar_) {
+                    RECT client{};
+                    GetClientRect(hwnd_, &client);
+                    POINT point{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
+                    set_scroll_from_thumb(point, client);
+                    return 0;
+                }
+                break;
+            case WM_LBUTTONUP:
+                if (dragging_scrollbar_) {
+                    dragging_scrollbar_ = false;
+                    if (GetCapture() == hwnd_) ReleaseCapture();
+                    invalidate();
+                    return 0;
+                }
+                break;
+            case WM_CAPTURECHANGED:
+                dragging_scrollbar_ = false;
+                invalidate();
+                return 0;
+            case WM_KEYDOWN: {
+                rebuild_visible_items();
+                if (visible_.empty()) return 0;
+                int index = visible_index(selected_);
+                if (index < 0) index = 0;
+                switch (wparam) {
+                    case VK_DOWN:
+                        select_visible_index(index + 1);
+                        return 0;
+                    case VK_UP:
+                        select_visible_index(index - 1);
+                        return 0;
+                    case VK_NEXT:
+                        select_visible_index(index + std::max(1, viewport_height_for_current() / row_height()));
+                        return 0;
+                    case VK_PRIOR:
+                        select_visible_index(index - std::max(1, viewport_height_for_current() / row_height()));
+                        return 0;
+                    case VK_HOME:
+                        select_visible_index(0);
+                        return 0;
+                    case VK_END:
+                        select_visible_index(static_cast<int>(visible_.size()) - 1);
+                        return 0;
+                    case VK_RIGHT:
+                        if (selected_ != nullptr && selected_->may_have_children) {
+                            if (!selected_->expanded) {
+                                toggle_item(*selected_);
+                            } else if (!selected_->children.empty()) {
+                                select_item(selected_->children.front().get(), true);
+                            }
+                        }
+                        return 0;
+                    case VK_LEFT:
+                        if (selected_ != nullptr) {
+                            if (selected_->expanded) {
+                                selected_->expanded = false;
+                                refresh();
+                            } else if (selected_->parent != nullptr) {
+                                select_item(selected_->parent, true);
+                            }
+                        }
+                        return 0;
+                    case VK_RETURN:
+                    case VK_SPACE:
+                        if (selected_ != nullptr && select_callback_) select_callback_(*selected_);
+                        return 0;
+                    default:
+                        break;
+                }
+                break;
+            }
+        }
+        return DefWindowProcW(hwnd_, message, wparam, lparam);
+    }
+
+    int viewport_height_for_current() const {
+        RECT client{};
+        if (hwnd_ == nullptr) return 0;
+        GetClientRect(hwnd_, &client);
+        return viewport_height(client);
+    }
+
+    static LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam) {
+        DarkDirectoryTreeView* view = nullptr;
+        if (message == WM_NCCREATE) {
+            const auto* create = reinterpret_cast<CREATESTRUCTW*>(lparam);
+            view = static_cast<DarkDirectoryTreeView*>(create->lpCreateParams);
+            view->hwnd_ = hwnd;
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(view));
+        } else {
+            view = reinterpret_cast<DarkDirectoryTreeView*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+        }
+        if (view != nullptr) return view->handle_message(message, wparam, lparam);
+        return DefWindowProcW(hwnd, message, wparam, lparam);
+    }
+
+    HWND hwnd_ = nullptr;
+    ThemePalette theme_ = make_theme();
+    HFONT font_ = nullptr;
+    UINT dpi_ = USER_DEFAULT_SCREEN_DPI;
+    std::vector<std::unique_ptr<DirectoryTreeItem>> roots_;
+    std::vector<VisibleItem> visible_;
+    DirectoryTreeItem* selected_ = nullptr;
+    int scroll_y_ = 0;
+    bool dragging_scrollbar_ = false;
+    int drag_offset_y_ = 0;
+    int update_depth_ = 0;
+    bool refresh_pending_ = false;
+    PopulateCallback populate_callback_;
+    SelectCallback select_callback_;
+    PaintBuffer paint_buffer_;
 };
 
 class MainWindow {
@@ -1871,13 +2605,14 @@ public:
         wc.lpszClassName = L"AxiomGuiWindow";
         wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
         axiom::gui::assign_axiom_window_class_icons(wc, instance);
-        wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
+        wc.hbrBackground = nullptr;
 
         if (RegisterClassExW(&wc) == 0) {
             return false;
         }
 
-        hwnd_ = CreateWindowExW(0, wc.lpszClassName, L"Axiom", WS_OVERLAPPEDWINDOW,
+        hwnd_ = CreateWindowExW(0, wc.lpszClassName, L"Axiom",
+                                WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
                                 CW_USEDEFAULT, CW_USEDEFAULT, initial_width, initial_height,
                                 nullptr, nullptr, instance, this);
         if (hwnd_ == nullptr) {
@@ -1949,6 +2684,7 @@ private:
         }
         menu_bar_.set_font(ui_font_);
         table_.set_font(ui_font_);
+        tree_view_.set_font(ui_font_);
         for (HWND label : transient_labels_) {
             set_control_font(label);
         }
@@ -1962,6 +2698,8 @@ private:
         rebuild_font();
         menu_bar_.set_dpi(dpi_);
         table_.set_dpi(dpi_);
+        tree_view_.set_dpi(dpi_);
+        tree_width_ = std::clamp(tree_width_, scale(180), scale(420));
         apply_fonts();
         apply_edit_margins();
     }
@@ -1993,7 +2731,7 @@ private:
             return;
         }
         SetWindowTheme(control, theme_.dark ? L"DarkMode_Explorer" : nullptr, nullptr);
-        InvalidateRect(control, nullptr, TRUE);
+        InvalidateRect(control, nullptr, FALSE);
     }
 
     void apply_theme() {
@@ -2022,9 +2760,396 @@ private:
             theme_.dark ? RGB(54, 54, 54) : RGB(210, 210, 210),
         });
         table_.set_theme(theme_);
+        tree_view_.set_theme(theme_);
         operation_window_.set_theme(make_operation_window_theme(theme_));
 
-        InvalidateRect(hwnd_, nullptr, TRUE);
+        InvalidateRect(hwnd_, nullptr, FALSE);
+    }
+
+    ShellIconRef tree_icon_for_filesystem(const fs::path& path, bool drive = false) const {
+        return shell_icon_for_path(path, drive);
+    }
+
+    ShellIconRef tree_icon_for_archive(const fs::path& path) const {
+        axiom::gui::BrowserItem item;
+        item.kind = axiom::gui::BrowserItemKind::archive;
+        item.filesystem_path = path;
+        item.name = path.filename().wstring();
+        return shell_icon_for_item(item);
+    }
+
+    DirectoryTreeItem* insert_tree_item(DirectoryTreeItem* parent,
+                                        std::wstring text,
+                                        DirectoryTreeNode node,
+                                        ShellIconRef icon,
+                                        bool may_have_children) {
+        return tree_view_.insert_item(parent, std::move(text), std::move(node),
+                                      icon, may_have_children);
+    }
+
+    bool tree_should_show_filesystem_item(const WIN32_FIND_DATAW& data) const {
+        if (wcscmp(data.cFileName, L".") == 0 || wcscmp(data.cFileName, L"..") == 0) {
+            return false;
+        }
+        if (!application_options_.show_hidden &&
+            ((data.dwFileAttributes & FILE_ATTRIBUTE_HIDDEN) != 0 ||
+             (data.dwFileAttributes & FILE_ATTRIBUTE_SYSTEM) != 0)) {
+            return false;
+        }
+        return true;
+    }
+
+    bool filesystem_has_tree_children(const fs::path& path) const {
+        WIN32_FIND_DATAW data{};
+        HANDLE find = FindFirstFileExW((path / L"*").c_str(), FindExInfoBasic, &data,
+                                       FindExSearchNameMatch, nullptr,
+                                       FIND_FIRST_EX_LARGE_FETCH);
+        if (find == INVALID_HANDLE_VALUE) return false;
+        bool found = false;
+        do {
+            if (!tree_should_show_filesystem_item(data)) continue;
+            const bool directory = (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+            if (directory || axiom::is_supported_archive(path / data.cFileName)) {
+                found = true;
+                break;
+            }
+        } while (FindNextFileW(find, &data));
+        FindClose(find);
+        return found;
+    }
+
+    struct TreeChildCandidate {
+        std::wstring name;
+        fs::path path;
+        bool directory = false;
+        bool archive = false;
+        bool drive = false;
+    };
+
+    void populate_tree_filesystem_children(DirectoryTreeItem& item, const fs::path& path) {
+        std::vector<TreeChildCandidate> candidates;
+        WIN32_FIND_DATAW data{};
+        HANDLE find = FindFirstFileExW((path / L"*").c_str(), FindExInfoBasic, &data,
+                                       FindExSearchNameMatch, nullptr,
+                                       FIND_FIRST_EX_LARGE_FETCH);
+        if (find == INVALID_HANDLE_VALUE) return;
+        do {
+            if (!tree_should_show_filesystem_item(data)) continue;
+            const bool directory = (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+            const fs::path child_path = path / data.cFileName;
+            const bool archive = !directory && axiom::is_supported_archive(child_path);
+            if (!directory && !archive) continue;
+            candidates.push_back({data.cFileName, child_path, directory, archive, false});
+        } while (FindNextFileW(find, &data));
+        FindClose(find);
+
+        std::sort(candidates.begin(), candidates.end(), [](const auto& left, const auto& right) {
+            if (left.directory != right.directory) return left.directory > right.directory;
+            return _wcsicmp(left.name.c_str(), right.name.c_str()) < 0;
+        });
+
+        for (const auto& child : candidates) {
+            DirectoryTreeNode node;
+            node.kind = child.archive ? DirectoryTreeNodeKind::archive
+                                      : DirectoryTreeNodeKind::filesystem;
+            node.filesystem_path = child.path;
+            node.archive_path = child.archive ? child.path : fs::path{};
+            const bool has_children = child.archive || filesystem_has_tree_children(child.path);
+            insert_tree_item(&item, child.name, std::move(node),
+                             child.archive ? tree_icon_for_archive(child.path)
+                                           : tree_icon_for_filesystem(child.path),
+                             has_children);
+        }
+    }
+
+    void add_known_tree_folder(DirectoryTreeItem& parent, const wchar_t* label,
+                               REFKNOWNFOLDERID folder_id) {
+        if (const auto path = known_folder_path(folder_id)) {
+            DirectoryTreeNode node;
+            node.kind = DirectoryTreeNodeKind::filesystem;
+            node.filesystem_path = *path;
+            insert_tree_item(&parent, label, std::move(node),
+                             tree_icon_for_filesystem(*path),
+                             filesystem_has_tree_children(*path));
+        }
+    }
+
+    void populate_tree_computer_children(DirectoryTreeItem& item) {
+        add_known_tree_folder(item, L"Home", FOLDERID_Profile);
+        add_known_tree_folder(item, L"Desktop", FOLDERID_Desktop);
+        add_known_tree_folder(item, L"Documents", FOLDERID_Documents);
+        add_known_tree_folder(item, L"Downloads", FOLDERID_Downloads);
+        add_known_tree_folder(item, L"Pictures", FOLDERID_Pictures);
+        add_known_tree_folder(item, L"OneDrive", FOLDERID_SkyDrive);
+
+        const DWORD required = GetLogicalDriveStringsW(0, nullptr);
+        if (required == 0) return;
+        std::wstring drives(static_cast<std::size_t>(required), L'\0');
+        if (GetLogicalDriveStringsW(required, drives.data()) == 0) return;
+        for (const wchar_t* drive = drives.c_str(); *drive != L'\0';
+             drive += wcslen(drive) + 1) {
+            const fs::path path(drive);
+            wchar_t volume[MAX_PATH]{};
+            std::wstring label;
+            if (GetVolumeInformationW(drive, volume, MAX_PATH, nullptr, nullptr,
+                                      nullptr, nullptr, 0) && volume[0] != L'\0') {
+                label = std::wstring(volume) + L" (" + path.root_name().wstring() + L")";
+            } else {
+                label = path.root_name().wstring();
+            }
+            DirectoryTreeNode node;
+            node.kind = DirectoryTreeNodeKind::filesystem;
+            node.filesystem_path = path;
+            insert_tree_item(&item, std::move(label), std::move(node),
+                             tree_icon_for_filesystem(path, true), true);
+        }
+    }
+
+    std::shared_ptr<const axiom::gui::ArchiveCatalog> tree_archive_catalog(
+        const fs::path& archive) {
+        if (archive_catalog_ && same_filesystem_path(archive_catalog_->path(), archive)) {
+            return archive_catalog_;
+        }
+        try {
+            std::string password;
+            if (!archive_password_path_.empty() &&
+                same_filesystem_path(archive_password_path_, archive)) {
+                password = archive_password_;
+            }
+            return axiom::gui::ArchiveCatalog::load(archive, password);
+        } catch (...) {
+            return {};
+        }
+    }
+
+    bool archive_directory_has_tree_children(const fs::path& archive,
+                                             const std::string& directory) {
+        auto catalog = tree_archive_catalog(archive);
+        if (!catalog) return true;
+        const auto snapshot = catalog->list(axiom::gui::BrowserLocation::archive(archive, directory),
+                                            std::stop_token{});
+        return std::any_of(snapshot.items.begin(), snapshot.items.end(), [](const auto& item) {
+            return item.kind == axiom::gui::BrowserItemKind::directory;
+        });
+    }
+
+    void populate_tree_archive_children(DirectoryTreeItem& item, const fs::path& archive,
+                                        const std::string& directory) {
+        auto catalog = tree_archive_catalog(archive);
+        if (!catalog) return;
+        const auto snapshot = catalog->list(axiom::gui::BrowserLocation::archive(archive, directory),
+                                            std::stop_token{});
+        std::vector<axiom::gui::BrowserItem> directories;
+        for (const auto& child : snapshot.items) {
+            if (child.kind == axiom::gui::BrowserItemKind::directory) {
+                directories.push_back(child);
+            }
+        }
+        std::sort(directories.begin(), directories.end(), [](const auto& left, const auto& right) {
+            return _wcsicmp(left.name.c_str(), right.name.c_str()) < 0;
+        });
+        for (const auto& child : directories) {
+            DirectoryTreeNode node;
+            node.kind = DirectoryTreeNodeKind::archive_directory;
+            node.archive_path = archive;
+            node.archive_directory = child.archive_path;
+            insert_tree_item(&item, child.name, std::move(node),
+                             tree_icon_for_filesystem(L"folder"),
+                             archive_directory_has_tree_children(archive, child.archive_path));
+        }
+    }
+
+    void populate_tree_item(DirectoryTreeItem& item) {
+        auto& node = item.node;
+        if (node.kind == DirectoryTreeNodeKind::dummy || item.populated) {
+            return;
+        }
+        tree_view_.begin_update();
+        tree_view_.clear_children(item);
+        switch (node.kind) {
+            case DirectoryTreeNodeKind::computer:
+                populate_tree_computer_children(item);
+                break;
+            case DirectoryTreeNodeKind::filesystem:
+                populate_tree_filesystem_children(item, node.filesystem_path);
+                break;
+            case DirectoryTreeNodeKind::archive:
+                populate_tree_archive_children(item, node.archive_path, {});
+                break;
+            case DirectoryTreeNodeKind::archive_directory:
+                populate_tree_archive_children(item, node.archive_path, node.archive_directory);
+                break;
+            case DirectoryTreeNodeKind::dummy:
+                break;
+        }
+        item.populated = true;
+        node.populated = true;
+        item.may_have_children = !item.children.empty();
+        tree_view_.end_update();
+    }
+
+    DirectoryTreeItem* find_tree_child_by_filesystem_path(DirectoryTreeItem& parent,
+                                                          const fs::path& path) const {
+        for (const auto& child : parent.children) {
+            const auto& node = child->node;
+            if ((node.kind == DirectoryTreeNodeKind::filesystem ||
+                 node.kind == DirectoryTreeNodeKind::archive) &&
+                same_filesystem_path(node.filesystem_path, path)) {
+                return child.get();
+            }
+        }
+        return nullptr;
+    }
+
+    DirectoryTreeItem* find_tree_child_by_archive_directory(DirectoryTreeItem& parent,
+                                                            const fs::path& archive,
+                                                            const std::string& directory) const {
+        for (const auto& child : parent.children) {
+            const auto& node = child->node;
+            if (node.kind == DirectoryTreeNodeKind::archive_directory &&
+                same_filesystem_path(node.archive_path, archive) &&
+                node.archive_directory == directory) {
+                return child.get();
+            }
+        }
+        return nullptr;
+    }
+
+    DirectoryTreeItem* ensure_filesystem_tree_path(const fs::path& path) {
+        if (tree_computer_item_ == nullptr || path.empty()) return nullptr;
+        populate_tree_item(*tree_computer_item_);
+        tree_computer_item_->expanded = true;
+        fs::path current_path = path.root_path();
+        if (current_path.empty()) current_path = path.root_name();
+        if (current_path.empty()) return tree_computer_item_;
+
+        DirectoryTreeItem* current =
+            find_tree_child_by_filesystem_path(*tree_computer_item_, current_path);
+        if (current == nullptr) {
+            DirectoryTreeNode node;
+            node.kind = DirectoryTreeNodeKind::filesystem;
+            node.filesystem_path = current_path;
+            current = insert_tree_item(tree_computer_item_, current_path.wstring(), std::move(node),
+                                       tree_icon_for_filesystem(current_path, true), true);
+        }
+
+        fs::path relative = path.lexically_relative(current_path);
+        if (relative.empty() || relative.native() == L".") return current;
+        for (const auto& part : relative) {
+            if (part.empty() || part.native() == L".") continue;
+            populate_tree_item(*current);
+            current->expanded = true;
+            current_path /= part;
+            DirectoryTreeItem* child = find_tree_child_by_filesystem_path(*current, current_path);
+            if (child == nullptr) {
+                DirectoryTreeNode node;
+                node.kind = axiom::is_supported_archive(current_path)
+                    ? DirectoryTreeNodeKind::archive
+                    : DirectoryTreeNodeKind::filesystem;
+                node.filesystem_path = current_path;
+                node.archive_path = node.kind == DirectoryTreeNodeKind::archive
+                    ? current_path
+                    : fs::path{};
+                child = insert_tree_item(current, part.wstring(), std::move(node),
+                                         node.kind == DirectoryTreeNodeKind::archive
+                                             ? tree_icon_for_archive(current_path)
+                                             : tree_icon_for_filesystem(current_path),
+                                         node.kind == DirectoryTreeNodeKind::archive ||
+                                             filesystem_has_tree_children(current_path));
+            }
+            current = child;
+        }
+        return current;
+    }
+
+    DirectoryTreeItem* ensure_archive_tree_path(const fs::path& archive,
+                                                const std::string& directory) {
+        DirectoryTreeItem* archive_item = ensure_filesystem_tree_path(archive);
+        if (archive_item == nullptr) return nullptr;
+        populate_tree_item(*archive_item);
+        if (directory.empty()) return archive_item;
+
+        DirectoryTreeItem* current = archive_item;
+        std::string current_directory;
+        std::size_t begin = 0;
+        while (begin < directory.size()) {
+            const std::size_t end = directory.find('/', begin);
+            const std::string part = directory.substr(
+                begin, end == std::string::npos ? std::string::npos : end - begin);
+            current_directory = current_directory.empty()
+                ? part
+                : current_directory + "/" + part;
+            populate_tree_item(*current);
+            current->expanded = true;
+            DirectoryTreeItem* child =
+                find_tree_child_by_archive_directory(*current, archive, current_directory);
+            if (child == nullptr) {
+                DirectoryTreeNode node;
+                node.kind = DirectoryTreeNodeKind::archive_directory;
+                node.archive_path = archive;
+                node.archive_directory = current_directory;
+                child = insert_tree_item(current, widen(part), std::move(node),
+                                         tree_icon_for_filesystem(L"folder"),
+                                         archive_directory_has_tree_children(archive,
+                                                                             current_directory));
+            }
+            current = child;
+            if (end == std::string::npos) break;
+            begin = end + 1;
+        }
+        return current;
+    }
+
+    void sync_tree_to_location(const axiom::gui::BrowserLocation& location) {
+        DirectoryTreeItem* target = nullptr;
+        if (location.kind == axiom::gui::BrowserLocationKind::computer) {
+            target = tree_computer_item_;
+        } else if (location.kind == axiom::gui::BrowserLocationKind::filesystem) {
+            target = ensure_filesystem_tree_path(location.filesystem_path);
+        } else {
+            target = ensure_archive_tree_path(location.archive_path, location.archive_directory);
+        }
+        if (target != nullptr) {
+            syncing_tree_ = true;
+            tree_view_.select_item(target, false);
+            syncing_tree_ = false;
+        }
+    }
+
+    void rebuild_directory_tree() {
+        tree_view_.clear();
+        DirectoryTreeNode root;
+        root.kind = DirectoryTreeNodeKind::computer;
+        tree_computer_item_ = insert_tree_item(nullptr, L"This PC", std::move(root),
+                                               tree_icon_for_filesystem(L"folder"), true);
+        if (tree_computer_item_ != nullptr) {
+            populate_tree_item(*tree_computer_item_);
+            tree_computer_item_->expanded = true;
+            tree_view_.refresh();
+        }
+    }
+
+    void on_tree_selection_changed(const DirectoryTreeItem& item) {
+        if (syncing_tree_ || busy_) return;
+        const auto& node = item.node;
+        if (node.kind == DirectoryTreeNodeKind::dummy) return;
+        switch (node.kind) {
+            case DirectoryTreeNodeKind::computer:
+                navigate_to(axiom::gui::BrowserLocation::computer());
+                break;
+            case DirectoryTreeNodeKind::filesystem:
+                navigate_to(axiom::gui::BrowserLocation::filesystem(node.filesystem_path));
+                break;
+            case DirectoryTreeNodeKind::archive:
+                navigate_to(axiom::gui::BrowserLocation::archive(node.archive_path));
+                break;
+            case DirectoryTreeNodeKind::archive_directory:
+                navigate_to(axiom::gui::BrowserLocation::archive(node.archive_path,
+                                                                 node.archive_directory));
+                break;
+            case DirectoryTreeNodeKind::dummy:
+                break;
+        }
     }
 
     LRESULT paint_control_background(HWND control, HDC dc, UINT message) {
@@ -2180,8 +3305,10 @@ private:
                 return {
                     {kAddFiles, L"&Add to archive...", L"Ctrl+N",
                      !busy_ && (!browsing_archive || archive_editable)},
-                    {kExtract, L"&Extract...", L"Ctrl+E", !busy_ && has_archive},
-                    {kTest, L"&Test archive", L"Ctrl+T", !busy_ && has_archive},
+                    {kExtract, L"&Extract...", L"Ctrl+E",
+                     !busy_ && has_archive && capabilities.extract},
+                    {kTest, L"&Test archive", L"Ctrl+T",
+                     !busy_ && has_archive && capabilities.test},
                     {0, L"", L"", false, true},
                     {kUpdateArchive, L"&Update archive...", L"",
                       !busy_ && has_archive && archive_editable},
@@ -2202,8 +3329,7 @@ private:
                 };
             case kMenuTools:
                 return {
-                    {kInfo, L"Archive &information", L"Ctrl+I"},
-                    {kArchiveFeatures, L"Archive &features...", L"", has_archive},
+                    {kInfo, L"Archive &information", L"Ctrl+I", has_archive || has_selection},
                     {0, L"", L"", false, true},
                     {kBenchmark, L"&Benchmark...", L"", !busy_},
                     {0, L"", L"", false, true},
@@ -2212,13 +3338,14 @@ private:
                     {kLockArchive, L"&Lock archive...", L"",
                       !busy_ && has_archive && capabilities.lock && archive_editable},
                     {kRepairArchive, L"&Repair archive...", L"",
-                     !busy_ && has_archive},
+                     !busy_ && has_archive && capabilities.recovery_records},
                     {kCreateRecoveryVolumes, L"Create recovery &volumes...", L"",
-                     !busy_ && has_archive},
+                     !busy_ && has_archive && capabilities.recovery_records &&
+                         capabilities.multi_volume && archive_editable},
                     {kVerifyArchiveSignature, L"Verify &signature...", L"",
-                     !busy_ && has_archive},
+                     !busy_ && has_archive && capabilities.authenticity},
                     {kCreateSfx, L"Create &self-extracting archive...", L"",
-                     !busy_ && has_archive},
+                     !busy_ && has_archive && capabilities.sfx},
                 };
             case kMenuOptions:
                 return {{kSettings, L"&Settings...", L"", !busy_}};
@@ -2251,8 +3378,10 @@ private:
             {0, L"", L"", false, true},
             {kAddFiles, L"&Add to archive...", L"Ctrl+N",
              !busy_ && has_selection && (!browsing_archive || archive_editable)},
-            {kExtract, L"&Extract...", L"Ctrl+E", !busy_ && has_archive},
-            {kTest, L"&Test archive", L"Ctrl+T", !busy_ && has_archive},
+            {kExtract, L"&Extract...", L"Ctrl+E",
+             !busy_ && has_archive && capabilities.extract},
+            {kTest, L"&Test archive", L"Ctrl+T",
+             !busy_ && has_archive && capabilities.test},
             {0, L"", L"", false, true},
             {kDelete, browsing_archive ? L"&Delete from archive" : L"&Delete", L"Delete",
              !busy_ && has_selection && (!browsing_archive || archive_editable)},
@@ -2265,7 +3394,15 @@ private:
 
     void paint_shell() {
         PAINTSTRUCT paint{};
-        BeginPaint(hwnd_, &paint);
+        HDC dc = BeginPaint(hwnd_, &paint);
+        if (tree_splitter_rect_.right > tree_splitter_rect_.left &&
+            tree_splitter_rect_.bottom > tree_splitter_rect_.top) {
+            fill_rect(dc, tree_splitter_rect_, theme_.border);
+            RECT grip = tree_splitter_rect_;
+            const int inset_x = std::max(1, scale(2));
+            InflateRect(&grip, -inset_x, 0);
+            fill_rect(dc, grip, theme_.panel);
+        }
         EndPaint(hwnd_, &paint);
     }
 
@@ -2303,6 +3440,15 @@ private:
         info_ = make_control(L"BUTTON", L"Info", WS_TABSTOP | BS_OWNERDRAW, kInfo);
         settings_ = make_control(L"BUTTON", L"Settings", WS_TABSTOP | BS_OWNERDRAW, kSettings);
 
+        tree_view_.create(hwnd_, instance_, kTree);
+        tree_view_.set_populate_callback([this](DirectoryTreeItem& item) {
+            populate_tree_item(item);
+        });
+        tree_view_.set_select_callback([this](const DirectoryTreeItem& item) {
+            on_tree_selection_changed(item);
+        });
+        SetWindowTextW(tree_view_.hwnd(), L"Folders and archive directories");
+
         tooltip_ = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, nullptr,
                                    WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX,
                                    CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
@@ -2324,6 +3470,7 @@ private:
             {L"Attributes", 90},
         });
         apply_table_options();
+        rebuild_directory_tree();
 
         status_ = make_control(L"STATIC", L"Ready", SS_LEFT, kStatus);
         // Custom controls do not expose painted content to accessibility tools, so give
@@ -2368,6 +3515,73 @@ private:
             on_extract();
         } else if (startup_command_.kind == AxiomGuiStartupCommand::Kind::test_archive) {
             on_test();
+        }
+    }
+
+    int browser_pane_top() const {
+        return menu_bar_.preferred_height() + scale(8) + scale(30) + scale(6) +
+               scale(30) + scale(6);
+    }
+
+    void layout_browser_panes(const RECT& client, int y, bool invalidate_splitter_only) {
+        const int margin = scale(8);
+        const int bottom_height = scale(28);
+        const int splitter_width = scale(5);
+        const int minimum_tree_width = scale(180);
+        const int minimum_list_width = scale(220);
+        const int width = client.right - client.left;
+        const int right = width - margin;
+        const int content_height = std::max(
+            scale(80), static_cast<int>(client.bottom) - y - bottom_height - margin);
+        const int content_width = std::max(0, width - 2 * margin);
+        if (tree_width_ <= 0) tree_width_ = scale(250);
+        const int maximum_tree_width = std::max(
+            minimum_tree_width,
+            content_width - splitter_width - minimum_list_width);
+        tree_width_ = std::clamp(tree_width_, minimum_tree_width, maximum_tree_width);
+        if (content_width < minimum_tree_width + splitter_width + minimum_list_width) {
+            tree_width_ = std::max(0, content_width / 3);
+        }
+
+        const RECT previous_splitter = tree_splitter_rect_;
+        const int tree_x = margin;
+        const int tree_w = std::clamp(tree_width_, 0, content_width);
+        tree_splitter_rect_ = {
+            tree_x + tree_w,
+            y,
+            tree_x + tree_w + (tree_w > 0 ? splitter_width : 0),
+            y + content_height,
+        };
+        const int list_x = tree_splitter_rect_.right;
+        const int list_w = std::max(0, right - list_x);
+        tree_view_.move(tree_x, y, tree_w, content_height, false);
+        MoveWindow(list_, list_x, y, list_w, content_height, FALSE);
+
+        if (invalidate_splitter_only) {
+            RECT dirty{};
+            UnionRect(&dirty, &previous_splitter, &tree_splitter_rect_);
+            InflateRect(&dirty, scale(2), 0);
+            InvalidateRect(hwnd_, &dirty, FALSE);
+        }
+    }
+
+    void layout_browser_panes_for_current_size() {
+        RECT client{};
+        GetClientRect(hwnd_, &client);
+        layout_browser_panes(client, browser_pane_top(), true);
+    }
+
+    void repaint_browser_panes_now() const {
+        if (tree_view_.hwnd() != nullptr) {
+            RedrawWindow(tree_view_.hwnd(), nullptr, nullptr,
+                         RDW_INVALIDATE | RDW_NOERASE | RDW_UPDATENOW);
+        }
+        if (list_ != nullptr) {
+            RedrawWindow(list_, nullptr, nullptr,
+                         RDW_INVALIDATE | RDW_NOERASE | RDW_UPDATENOW);
+        }
+        if (hwnd_ != nullptr) {
+            UpdateWindow(hwnd_);
         }
     }
 
@@ -2425,12 +3639,10 @@ private:
         y += edit_height + gap;
 
         const int bottom_height = scale(28);
-        const int list_height = std::max(scale(80), static_cast<int>(client.bottom) - y - bottom_height - margin);
-        MoveWindow(list_, margin, y, width - 2 * margin,
-                   list_height, TRUE);
+        layout_browser_panes(client, y, false);
         const int bottom_y = client.bottom - bottom_height;
         MoveWindow(status_, margin, bottom_y + scale(2), width - margin * 2, scale(20), TRUE);
-        InvalidateRect(hwnd_, nullptr, TRUE);
+        InvalidateRect(hwnd_, nullptr, FALSE);
     }
 
     void set_status(const std::wstring& text) {
@@ -2443,6 +3655,7 @@ private:
         EnableWindow(open_archive_, !busy);
         EnableWindow(extract_, !busy);
         EnableWindow(test_, !busy);
+        EnableWindow(tree_view_.hwnd(), !busy);
         EnableWindow(delete_, !busy);
         EnableWindow(settings_, !busy);
         operation_paused_ = false;
@@ -2722,7 +3935,10 @@ private:
 
     std::optional<std::string> password_for_archive_edit(const fs::path& archive) {
         try {
-            if (!axiom::archive_is_encrypted(archive)) return std::string{};
+            const auto* provider = axiom::archive_provider_for_path(archive);
+            if (provider == nullptr || !provider->capabilities(archive).encrypted) {
+                return std::string{};
+            }
         } catch (const std::exception& error) {
             show_app_message(widen(error.what()), axiom::gui::MessageDialogIcon::error,
                              L"Open archive");
@@ -2770,7 +3986,13 @@ private:
 
         bool encrypted = false;
         try {
-            encrypted = axiom::archive_is_encrypted(location.archive_path);
+            const auto* provider = axiom::archive_provider_for_path(location.archive_path);
+            if (provider == nullptr) {
+                show_app_message(L"This archive format is not supported.",
+                                 axiom::gui::MessageDialogIcon::warning, L"Open archive");
+                return false;
+            }
+            encrypted = provider->capabilities(location.archive_path).encrypted;
         } catch (const std::exception& error) {
             show_app_message(widen(error.what()), axiom::gui::MessageDialogIcon::error,
                              L"Open archive");
@@ -2872,12 +4094,14 @@ private:
             if (!axiom::gui::read_archive_entries(object, payload)) return DROPEFFECT_NONE;
             if (same_filesystem_path(payload.archive_path,
                                      history_.current().archive_path)) {
+                if (!capabilities.move_entries) return DROPEFFECT_NONE;
                 return (allowed & DROPEFFECT_MOVE) != 0
                     ? DROPEFFECT_MOVE : DROPEFFECT_COPY;
             }
         }
-        return axiom::gui::data_object_has_file_drop(object) ? DROPEFFECT_COPY
-                                                              : DROPEFFECT_NONE;
+        return capabilities.update && axiom::gui::data_object_has_file_drop(object)
+            ? DROPEFFECT_COPY
+            : DROPEFFECT_NONE;
     }
 
     DWORD perform_file_drop(IDataObject* object, POINT point, DWORD, DWORD allowed) {
@@ -2903,6 +4127,12 @@ private:
             return DROPEFFECT_NONE;
         }
         if (archive_drag && same_filesystem_path(payload.archive_path, archive)) {
+            if (!capabilities.move_entries) {
+                show_app_message(L"This archive format does not support moving entries.",
+                                 axiom::gui::MessageDialogIcon::information,
+                                 L"Move in archive");
+                return DROPEFFECT_NONE;
+            }
             std::vector<axiom::ArchiveMove> moves;
             moves.reserve(payload.entry_paths.size());
             for (const auto& source : payload.entry_paths) {
@@ -2925,6 +4155,12 @@ private:
                     axiom::move_archive_entries(archive, moves, run_options);
                 });
             return (allowed & DROPEFFECT_MOVE) != 0 ? DROPEFFECT_MOVE : DROPEFFECT_COPY;
+        }
+        if (!capabilities.update) {
+            show_app_message(L"This archive format does not support adding entries.",
+                             axiom::gui::MessageDialogIcon::information,
+                             L"Drop into archive");
+            return DROPEFFECT_NONE;
         }
 
         auto paths = axiom::gui::read_file_drop(object);
@@ -2954,7 +4190,11 @@ private:
                 std::shared_ptr<axiom::OperationControl> operation) mutable {
                 auto run_options = options;
                 run_options.operation = std::move(operation);
-                axiom::add_to_archive(inputs, archive, run_options);
+                const auto* provider = axiom::archive_provider_for_path(archive);
+                if (provider == nullptr) {
+                    throw std::runtime_error("unsupported archive format");
+                }
+                provider->add_mapped(inputs, archive, run_options);
             });
         return DROPEFFECT_COPY;
     }
@@ -2962,6 +4202,10 @@ private:
     StagedArchiveEntries extract_archive_entries_to_staging(
         const fs::path& archive, const std::vector<std::string>& entries,
         const std::string& password, bool for_drag, bool sensitive) {
+        const auto* provider = axiom::archive_provider_for_path(archive);
+        if (provider == nullptr || !provider->capabilities(archive, password).selective_extract) {
+            throw std::runtime_error("this archive format does not support selective extraction");
+        }
         const fs::path staging = create_drag_staging_directory(sensitive);
         const HANDLE completed = CreateEventW(nullptr, TRUE, FALSE, nullptr);
         if (completed == nullptr) throw std::runtime_error("could not start temporary extraction");
@@ -2997,7 +4241,7 @@ private:
                 options.overwrite = axiom::ExtractOptions::Overwrite::overwrite;
                 options.password = password;
                 options.operation = control;
-                axiom::extract_entries(archive, entries, staging, options);
+                provider->extract_selected(archive, entries, staging, options);
             } catch (...) {
                 failure = std::current_exception();
             }
@@ -3102,10 +4346,29 @@ private:
 
     axiom::gui::ArchiveCapabilities active_archive_capabilities() const {
         const auto archive = active_archive_path();
-        if (archive && archive_catalog_ && archive_catalog_->path() == *archive) {
+        if (archive && archive_catalog_ &&
+            same_filesystem_path(archive_catalog_->path(), *archive)) {
             return archive_catalog_->capabilities();
         }
+        if (archive) {
+            if (const auto* provider = axiom::archive_provider_for_path(*archive)) {
+                try {
+                    return provider->capabilities(*archive);
+                } catch (...) {
+                    return {};
+                }
+            }
+        }
         return {};
+    }
+
+    const axiom::ArchiveProvider* active_archive_provider() const {
+        const auto archive = active_archive_path();
+        if (!archive) return nullptr;
+        if (archive_catalog_ && same_filesystem_path(archive_catalog_->path(), *archive)) {
+            return &archive_catalog_->provider();
+        }
+        return axiom::archive_provider_for_path(*archive);
     }
 
     static axiom::gui::ArchiveFeatureAvailability implemented_feature_availability() {
@@ -3125,6 +4388,25 @@ private:
         availability.header_encryption = true;
         // Custom KDF presets are not exposed by the current API.
         availability.kdf_presets = false;
+        return availability;
+    }
+
+    static axiom::gui::ArchiveFeatureAvailability feature_availability_from_capabilities(
+        const axiom::gui::ArchiveCapabilities& capabilities) {
+        axiom::gui::ArchiveFeatureAvailability availability;
+        availability.metadata = capabilities.metadata;
+        availability.update = capabilities.update;
+        availability.comments = capabilities.comments;
+        availability.lock = capabilities.lock;
+        availability.quick_open = capabilities.selective_extract;
+        availability.encryption = capabilities.encryption || capabilities.encrypted;
+        availability.header_encryption = capabilities.encryption;
+        availability.kdf_presets = false;
+        availability.volumes = capabilities.multi_volume;
+        availability.recovery = capabilities.recovery_records;
+        availability.authenticity = capabilities.authenticity;
+        availability.sfx = capabilities.sfx;
+        availability.posix_metadata = capabilities.metadata;
         return availability;
     }
 
@@ -3238,6 +4520,7 @@ private:
         std::unique_ptr<axiom::gui::BrowserLoadResult> result(
             reinterpret_cast<axiom::gui::BrowserLoadResult*>(lparam));
         if (!result || result->snapshot.generation != browser_generation_) return;
+        const auto loaded_location = result->snapshot.location;
 
         if (result->archive_catalog) archive_catalog_ = std::move(result->archive_catalog);
         browser_items_ = std::move(result->snapshot.items);
@@ -3261,6 +4544,7 @@ private:
             }
         }
         update_navigation_buttons();
+        sync_tree_to_location(loaded_location);
     }
 
     void on_navigate_back() {
@@ -3511,34 +4795,49 @@ private:
             default_archive = fs::path(application_options_.archive_output_folder) / L"Archive.axar";
         }
         dialog_options.archive_path = target_archive.value_or(default_archive);
+        dialog_options.archive_format =
+            axiom::archive_provider_for_path(dialog_options.archive_path)
+                ? axiom::archive_provider_for_path(dialog_options.archive_path)->info().format
+                : axiom::ArchiveFormat::axar;
+        dialog_options.fixed_archive_format = target_archive.has_value();
         if (target_archive) {
-            try {
-                const auto mode = axiom::archive_encryption_mode(*target_archive);
-                if (mode == axiom::ArchiveEncryptionMode::data_and_directory) {
-                    show_app_message(
-                        L"Editing archives with encrypted file names is not supported yet.",
-                        axiom::gui::MessageDialogIcon::information);
-                    return;
+            const auto* target_provider = axiom::archive_provider_for_path(*target_archive);
+            if (target_provider != nullptr && !target_provider->info().native) {
+                dialog_options.archive_format = target_provider->info().format;
+                dialog_options.features.create_sfx = false;
+                dialog_options.features.sign_archive = false;
+                dialog_options.features.create_recovery_volumes = false;
+                dialog_options.features.recovery_percent = 0;
+                dialog_options.features.volume_size.clear();
+            } else {
+                try {
+                    const auto mode = axiom::archive_encryption_mode(*target_archive);
+                    if (mode == axiom::ArchiveEncryptionMode::data_and_directory) {
+                        show_app_message(
+                            L"Editing archives with encrypted file names is not supported yet.",
+                            axiom::gui::MessageDialogIcon::information);
+                        return;
+                    }
+                    // Existing plaintext archives cannot be converted to encrypted form
+                    // by append/update, and existing data-only archives cannot switch to
+                    // encrypted names without a complete format rewrite.
+                    dialog_options.feature_availability.header_encryption = false;
+                    if (mode == axiom::ArchiveEncryptionMode::none) {
+                        dialog_options.feature_availability.encryption = false;
+                    }
+                    if (mode == axiom::ArchiveEncryptionMode::data_only) {
+                        auto password = password_for_archive_edit(*target_archive);
+                        if (!password) return;
+                        dialog_options.features.encrypt_data = true;
+                        dialog_options.features.password = widen(*password);
+                        secure_clear(*password);
+                    }
+                    dialog_options.features.comment = widen(axiom::archive_comment(
+                        *target_archive, dialog_options.features.encrypt_data
+                            ? utf8(dialog_options.features.password) : std::string{}));
+                } catch (...) {
+                    // The operation itself will report a precise archive error if necessary.
                 }
-                // Existing plaintext archives cannot be converted to encrypted form
-                // by append/update, and existing data-only archives cannot switch to
-                // encrypted names without a complete format rewrite.
-                dialog_options.feature_availability.header_encryption = false;
-                if (mode == axiom::ArchiveEncryptionMode::none) {
-                    dialog_options.feature_availability.encryption = false;
-                }
-                if (mode == axiom::ArchiveEncryptionMode::data_only) {
-                    auto password = password_for_archive_edit(*target_archive);
-                    if (!password) return;
-                    dialog_options.features.encrypt_data = true;
-                    dialog_options.features.password = widen(*password);
-                    secure_clear(*password);
-                }
-                dialog_options.features.comment = widen(axiom::archive_comment(
-                    *target_archive, dialog_options.features.encrypt_data
-                        ? utf8(dialog_options.features.password) : std::string{}));
-            } catch (...) {
-                // The operation itself will report a precise archive error if necessary.
             }
         }
         if (!axiom::gui::show_create_archive_dialog(hwnd_, paths.size(), dialog_options)) return;
@@ -3563,6 +4862,11 @@ private:
         if (history_.current().kind == axiom::gui::BrowserLocationKind::archive) {
             const auto archive = active_archive_path();
             if (!archive || !active_archive_is_editable()) return;
+            if (!active_archive_capabilities().update) {
+                show_app_message(L"This archive format does not support adding entries.",
+                                 axiom::gui::MessageDialogIcon::information);
+                return;
+            }
             auto paths = pick_files(hwnd_);
             if (!paths.empty()) {
                 create_archive_from_paths(std::move(paths), *archive,
@@ -3591,6 +4895,11 @@ private:
                 axiom::gui::MessageDialogIcon::information);
             return;
         }
+        if (!capabilities.update) {
+            show_app_message(L"This archive format does not support updating entries.",
+                             axiom::gui::MessageDialogIcon::information);
+            return;
+        }
         if (mode == axiom::gui::ArchiveUpdateMode::synchronize &&
             show_app_message(
                 L"Synchronize will mirror the selected source into the archive.\n\n"
@@ -3605,11 +4914,16 @@ private:
 
     bool active_archive_is_editable() {
         const auto capabilities = active_archive_capabilities();
-        if (!capabilities.locked && !capabilities.directory_encrypted) return true;
+        if (!capabilities.locked && !capabilities.directory_encrypted &&
+            (capabilities.update || capabilities.delete_entries || capabilities.move_entries)) {
+            return true;
+        }
         show_app_message(
             capabilities.locked
                 ? L"This archive is locked and cannot be changed."
-                : L"Editing archives with encrypted file names is not supported yet.",
+                : capabilities.directory_encrypted
+                    ? L"Editing archives with encrypted file names is not supported yet."
+                    : L"This archive format cannot be changed.",
             axiom::gui::MessageDialogIcon::information);
         return false;
     }
@@ -3626,6 +4940,12 @@ private:
             return;
         }
         if (!active_archive_is_editable()) return;
+        const auto* provider = axiom::archive_provider_for_path(*archive);
+        if (provider == nullptr || !active_archive_capabilities().delete_entries) {
+            show_app_message(L"This archive format does not support deleting entries.",
+                             axiom::gui::MessageDialogIcon::information);
+            return;
+        }
         std::vector<std::string> paths;
         for (const int index : selected_browser_indices()) {
             const auto& item = browser_items_[static_cast<std::size_t>(index)];
@@ -3654,7 +4974,11 @@ private:
                 std::shared_ptr<axiom::OperationControl> operation) mutable {
                 auto run_options = options;
                 run_options.operation = std::move(operation);
-                axiom::delete_from_archive(archive, paths, run_options);
+                const auto* provider = axiom::archive_provider_for_path(archive);
+                if (provider == nullptr) {
+                    throw std::runtime_error("unsupported archive format");
+                }
+                provider->delete_entries(archive, paths, run_options);
             });
     }
 
@@ -3777,48 +5101,70 @@ private:
         const auto indices = selected_browser_indices();
         std::uint64_t bytes = 0;
         for (int index : indices) bytes += browser_items_[index].size;
+        if (const auto archive = active_archive_path()) {
+            axiom::gui::ArchiveSummaryRows details;
+            details.push_back({L"Location", history_.current().display_name()});
+            details.push_back({
+                indices.empty() ? L"Items" : L"Selection",
+                indices.empty()
+                    ? quote_count(browser_items_.size(), L"item", L"items")
+                    : quote_count(indices.size(), L"selected item", L"selected items")
+            });
+            if (bytes != 0) {
+                details.push_back({L"Selected size", format_size(bytes)});
+            }
+            details.push_back({L"Archive path", archive->wstring()});
+            const auto* provider = active_archive_provider();
+            const auto capabilities = active_archive_capabilities();
+            std::wstring archive_comment;
+            if (provider != nullptr) {
+                details.push_back({L"Format", widen(provider->info().display_name)});
+            }
+            if (provider != nullptr && provider->info().native) {
+                std::string metadata_password;
+                try {
+                    const auto encryption = axiom::archive_encryption_mode(*archive);
+                    if (encryption == axiom::ArchiveEncryptionMode::data_and_directory) {
+                        auto password = password_for_archive_edit(*archive);
+                        if (!password) return;
+                        metadata_password = std::move(*password);
+                    }
+                    details.push_back({
+                        L"Encryption",
+                        encryption != axiom::ArchiveEncryptionMode::none
+                            ? L"File data encrypted"
+                            : L"None"
+                    });
+                    details.push_back({
+                        L"State",
+                        axiom::archive_is_locked(*archive, metadata_password)
+                            ? L"Locked (read-only)"
+                            : L"Editable"
+                    });
+                    archive_comment = widen(axiom::archive_comment(
+                        *archive, metadata_password));
+                    secure_clear(metadata_password);
+                } catch (...) {
+                    secure_clear(metadata_password);
+                    details.push_back({L"State", L"Could not read archive metadata"});
+                }
+            } else {
+                details.push_back({L"Provider mode", L"Read-only"});
+                details.push_back({L"Full extraction", capabilities.extract ? L"Supported" : L"Not supported"});
+                details.push_back({L"Selective extraction",
+                                   capabilities.selective_extract ? L"Supported" : L"Not supported"});
+                details.push_back({L"Integrity test", capabilities.test ? L"Supported" : L"Not supported"});
+            }
+            axiom::gui::show_archive_information_dialog(
+                hwnd_, *archive, details, capabilities, std::move(archive_comment));
+            return;
+        }
         std::wstring message = L"Location: " + history_.current().display_name() + L"\n\n";
         message += indices.empty()
             ? quote_count(browser_items_.size(), L"item", L"items")
             : quote_count(indices.size(), L"selected item", L"selected items");
         if (bytes != 0) message += L"\nSize: " + format_size(bytes);
-        if (const auto archive = active_archive_path()) {
-            message += L"\nArchive: " + archive->wstring();
-            std::string metadata_password;
-            try {
-                const auto encryption = axiom::archive_encryption_mode(*archive);
-                if (encryption == axiom::ArchiveEncryptionMode::data_and_directory) {
-                    auto password = password_for_archive_edit(*archive);
-                    if (!password) return;
-                    metadata_password = std::move(*password);
-                }
-                message += encryption != axiom::ArchiveEncryptionMode::none
-                    ? L"\nEncryption: File data encrypted"
-                    : L"\nEncryption: None";
-                message += axiom::archive_is_locked(*archive, metadata_password)
-                    ? L"\nState: Locked (read-only)"
-                    : L"\nState: Editable";
-                const std::wstring comment = widen(
-                    axiom::archive_comment(*archive, metadata_password));
-                secure_clear(metadata_password);
-                if (!comment.empty()) message += L"\nComment: " + comment;
-            } catch (...) {
-                secure_clear(metadata_password);
-                message += L"\nState: Could not read archive metadata";
-            }
-        }
         show_app_message(message, axiom::gui::MessageDialogIcon::information, L"Information");
-    }
-
-    void on_archive_features() {
-        const auto archive = active_archive_path();
-        if (!archive) {
-            show_app_message(L"Open or select an Axiom archive first.",
-                             axiom::gui::MessageDialogIcon::information);
-            return;
-        }
-        const axiom::gui::ArchiveCapabilities capabilities = active_archive_capabilities();
-        axiom::gui::show_archive_feature_summary_dialog(hwnd_, *archive, capabilities);
     }
 
     void on_repair_archive() {
@@ -4038,23 +5384,73 @@ private:
     }
 
     void on_settings() {
-        if (axiom::gui::show_application_settings_dialog(hwnd_, application_options_)) {
-            selected_level_ = application_options_.default_level;
-            selected_thread_count_ = application_options_.default_thread_count;
-            selected_dictionary_size_ = application_options_.default_dictionary_size;
-            selected_word_size_ = application_options_.default_word_size;
-            selected_solid_block_size_ = application_options_.default_solid_block_size;
-            if (!application_options_.cache_passwords ||
-                application_options_.password_prompt_mode != 0) {
-                clear_archive_password();
-            }
-            apply_theme();
-            apply_table_options();
-            cleanup_old_temp_directories();
-            apply_shell_integration();
-            save_current_settings();
-            on_navigate_refresh();
+        const auto previous = application_options_;
+        if (!axiom::gui::show_application_settings_dialog(hwnd_, application_options_)) {
+            return;
         }
+        if (application_options_ == previous) {
+            return;
+        }
+
+        selected_level_ = application_options_.default_level;
+        selected_thread_count_ = application_options_.default_thread_count;
+        selected_dictionary_size_ = application_options_.default_dictionary_size;
+        selected_word_size_ = application_options_.default_word_size;
+        selected_solid_block_size_ = application_options_.default_solid_block_size;
+
+        if (!application_options_.cache_passwords ||
+            application_options_.password_prompt_mode != previous.password_prompt_mode ||
+            application_options_.cache_passwords != previous.cache_passwords) {
+            clear_archive_password();
+        }
+
+        const bool theme_changed =
+            application_options_.theme_mode != previous.theme_mode;
+        const bool table_options_changed =
+            application_options_.show_grid_lines != previous.show_grid_lines ||
+            application_options_.show_horizontal_scrollbar !=
+                previous.show_horizontal_scrollbar ||
+            application_options_.full_row_select != previous.full_row_select;
+        const bool address_options_changed =
+            application_options_.show_address_shell_locations !=
+                previous.show_address_shell_locations ||
+            application_options_.show_address_recent_locations !=
+                previous.show_address_recent_locations ||
+            application_options_.show_address_archive_children !=
+                previous.show_address_archive_children ||
+            application_options_.recent_location_count != previous.recent_location_count;
+        const bool browser_content_changed =
+            application_options_.show_hidden != previous.show_hidden ||
+            application_options_.show_parent_entry != previous.show_parent_entry;
+        const bool temp_options_changed =
+            application_options_.temp_folder_mode != previous.temp_folder_mode ||
+            application_options_.temp_folder != previous.temp_folder ||
+            application_options_.temp_cleanup_days != previous.temp_cleanup_days ||
+            application_options_.wipe_encrypted_temp_files !=
+                previous.wipe_encrypted_temp_files;
+        const bool shell_options_changed =
+            application_options_.associate_axar != previous.associate_axar ||
+            application_options_.context_open != previous.context_open ||
+            application_options_.context_add != previous.context_add ||
+            application_options_.context_extract != previous.context_extract ||
+            application_options_.context_test != previous.context_test;
+
+        if (theme_changed) apply_theme();
+        if (table_options_changed) apply_table_options();
+        if (address_options_changed) {
+            const int limit = std::clamp(application_options_.recent_location_count, 0, 50);
+            if (limit == 0) {
+                recent_addresses_.clear();
+            } else if (recent_addresses_.size() > static_cast<std::size_t>(limit)) {
+                recent_addresses_.resize(static_cast<std::size_t>(limit));
+            }
+            populate_address_dropdown();
+        }
+        if (temp_options_changed) cleanup_old_temp_directories();
+        if (shell_options_changed) apply_shell_integration();
+
+        save_current_settings();
+        if (browser_content_changed) on_navigate_refresh();
     }
 
     void apply_shell_command(bool enabled, const std::wstring& key,
@@ -4152,7 +5548,7 @@ private:
                 return true;
             }
         }
-        if (!axiom::gui::is_axiom_archive(path)) return false;
+        if (!axiom::gui::is_supported_archive(path)) return false;
         navigate_to(axiom::gui::BrowserLocation::archive(path));
         return true;
     }
@@ -4160,7 +5556,7 @@ private:
     void on_open_archive() {
         auto path = pick_open_archive(hwnd_);
         if (path && !open_archive_path(*path)) {
-            show_app_message(L"The selected file is not an Axiom archive or volume.",
+            show_app_message(L"The selected file is not a supported archive or Axiom volume.",
                              axiom::gui::MessageDialogIcon::warning, L"Open archive");
         }
     }
@@ -4331,8 +5727,15 @@ private:
 
         const auto archive = pending_archive_path_;
         if (archive.empty()) {
-            show_app_message(L"Choose an output .axar archive path.",
+            show_app_message(L"Choose an output archive path.",
                              axiom::gui::MessageDialogIcon::information);
+            return;
+        }
+        const auto* archive_provider = axiom::archive_provider_for_path(archive);
+        if (archive_provider == nullptr) {
+            show_app_message(L"Choose a supported archive format (.axar or .zip).",
+                             axiom::gui::MessageDialogIcon::warning,
+                             L"Archive format");
             return;
         }
 
@@ -4369,6 +5772,26 @@ private:
         const bool lock_after = pending_archive_features_.lock_archive;
         const bool sign_after = pending_archive_features_.sign_archive;
         const bool create_sfx_after = pending_archive_features_.create_sfx;
+        const bool native_archive = archive_provider->info().native;
+        if (!native_archive &&
+            (pending_archive_features_.encrypt_data ||
+             pending_archive_features_.encrypt_names ||
+             !pending_archive_features_.comment.empty() ||
+             pending_archive_features_.lock_archive ||
+             pending_archive_features_.repack_after_update ||
+             pending_archive_features_.recovery_percent != 0 ||
+             !pending_archive_features_.volume_size.empty() ||
+             pending_archive_features_.create_recovery_volumes ||
+             pending_archive_features_.sign_archive ||
+             pending_archive_features_.create_sfx)) {
+            show_app_message(
+                L"The selected archive format does not support one or more Axiom-only "
+                L"options. Choose Axiom archive format or clear Security, Recovery, "
+                L"SFX/signing, comment, and lock options.",
+                axiom::gui::MessageDialogIcon::warning,
+                L"Archive format");
+            return;
+        }
         if (create_sfx_after && split_after) {
             show_app_message(L"Self-extracting archives and split volumes are separate output "
                              L"modes. Disable one of them.",
@@ -4454,39 +5877,43 @@ private:
                             std::shared_ptr<axiom::OperationControl> operation) mutable {
                             auto run_options = options;
                             run_options.operation = operation;
+                            const auto* provider = axiom::archive_provider_for_path(archive);
+                            if (provider == nullptr) {
+                                throw std::runtime_error("unsupported archive format");
+                            }
                             try {
                                 switch (mode) {
                                     case axiom::gui::ArchiveUpdateMode::add_or_replace:
-                                        axiom::add_to_archive(inputs, archive, run_options);
+                                        provider->add(inputs, archive, run_options);
                                         break;
                                     case axiom::gui::ArchiveUpdateMode::update_newer:
-                                        axiom::update_archive(inputs, archive, run_options, false);
+                                        provider->update(inputs, archive, run_options, false);
                                         break;
                                     case axiom::gui::ArchiveUpdateMode::fresh_existing:
-                                        axiom::update_archive(inputs, archive, run_options, true);
+                                        provider->update(inputs, archive, run_options, true);
                                         break;
                                     case axiom::gui::ArchiveUpdateMode::synchronize:
-                                        axiom::sync_archive(inputs, archive, run_options);
+                                        provider->sync(inputs, archive, run_options);
                                         break;
                                     default:
-                                        axiom::create_archive(inputs, archive, run_options);
+                                        provider->create(inputs, archive, run_options);
                                         break;
                                 }
-                                if (set_comment) {
+                                if (provider->info().native && set_comment) {
                                     axiom::set_archive_comment(archive, comment, run_options);
                                 }
-                                if (repack_after) {
+                                if (provider->info().native && repack_after) {
                                     axiom::repack_archive(archive, run_options);
                                 }
-                                if (sign_after) {
+                                if (provider->info().native && sign_after) {
                                     axiom::sign_archive(archive, signing_key, run_options);
                                     SecureZeroMemory(signing_key.secret_key.data(),
                                                      signing_key.secret_key.size());
                                 }
-                                if (lock_after) {
+                                if (provider->info().native && lock_after) {
                                     axiom::lock_archive(archive, run_options);
                                 }
-                                if (split_after) {
+                                if (provider->info().native && split_after) {
                                     const std::uint64_t archive_bytes = fs::file_size(archive);
                                     const std::uint64_t data_volumes = std::max<std::uint64_t>(
                                         1, (archive_bytes + volume_size - 1) / volume_size);
@@ -4505,7 +5932,7 @@ private:
                                             remove_error);
                                     }
                                 }
-                                if (create_sfx_after) {
+                                if (provider->info().native && create_sfx_after) {
                                     axiom::create_sfx_archive(archive, sfx_stub, sfx_output,
                                                               operation);
                                     std::error_code remove_error;
@@ -4601,8 +6028,14 @@ private:
     void on_extract() {
         const auto archive = active_archive_path();
         if (!archive) {
-            show_app_message(L"Open or select an Axiom archive first.",
+            show_app_message(L"Open or select a supported archive first.",
                              axiom::gui::MessageDialogIcon::information);
+            return;
+        }
+        const auto* provider = active_archive_provider();
+        if (provider == nullptr) {
+            show_app_message(L"This archive format is not supported.",
+                             axiom::gui::MessageDialogIcon::warning, L"Extract archive");
             return;
         }
         axiom::gui::ExtractArchiveDialogOptions dialog_options;
@@ -4618,16 +6051,26 @@ private:
         } else {
             dialog_options.destination = archive->parent_path() / archive->stem();
         }
-        dialog_options.feature_availability = implemented_feature_availability();
-        dialog_options.features.verify_signature = application_options_.verify_signatures;
-        bool encrypted = false;
-        try {
-            encrypted = axiom::archive_is_encrypted(*archive);
-        } catch (const std::exception& error) {
-            show_app_message(widen(error.what()), axiom::gui::MessageDialogIcon::error,
-                             L"Open archive");
+        auto capabilities = active_archive_capabilities();
+        if (!capabilities.list && !capabilities.extract && !capabilities.test) {
+            try {
+                capabilities = provider->capabilities(*archive);
+            } catch (const std::exception& error) {
+                show_app_message(widen(error.what()), axiom::gui::MessageDialogIcon::error,
+                                 L"Open archive");
+                return;
+            }
+        }
+        if (!capabilities.extract) {
+            show_app_message(L"This archive format does not support extraction.",
+                             axiom::gui::MessageDialogIcon::information,
+                             L"Extract archive");
             return;
         }
+        dialog_options.feature_availability =
+            feature_availability_from_capabilities(capabilities);
+        dialog_options.features.verify_signature = application_options_.verify_signatures;
+        const bool encrypted = capabilities.encrypted;
         dialog_options.feature_availability.encryption = encrypted;
         if (!axiom::gui::show_extract_archive_dialog(hwnd_, *archive, dialog_options)) return;
         if (dialog_options.destination.has_parent_path()) {
@@ -4657,12 +6100,14 @@ private:
         operation_archive_output_ = attempt_recovery ? *archive : fs::path{};
         start_operation(L"Extracting...",
                         L"Extracted to: " + dialog_options.destination.wstring(),
-                        [archive = *archive, output = dialog_options.destination, options,
+                        [archive = *archive, provider, output = dialog_options.destination, options,
                          attempt_recovery, verify_signature, trusted_keys_folder](
                             std::shared_ptr<axiom::OperationControl> operation) mutable {
                             auto run_options = options;
                             run_options.operation = operation;
-                            if (verify_signature) {
+                            const auto capabilities =
+                                provider->capabilities(archive, run_options.password);
+                            if (verify_signature && capabilities.authenticity) {
                                 const auto signature = axiom::verify_archive_signature(
                                     archive, run_options.password);
                                 if (signature.present && !signature.valid) {
@@ -4693,16 +6138,16 @@ private:
                                 }
                             }
                             try {
-                                axiom::extract_archive(archive, output, run_options);
+                                provider->extract_all(archive, output, run_options);
                             } catch (const axiom::FormatError&) {
-                                if (!attempt_recovery ||
+                                if (!attempt_recovery || !capabilities.recovery_records ||
                                     !axiom::repair_archive(archive, operation)) {
                                     throw;
                                 }
                                 auto retry_options = run_options;
                                 retry_options.overwrite =
                                     axiom::ExtractOptions::Overwrite::overwrite;
-                                axiom::extract_archive(archive, output, retry_options);
+                                provider->extract_all(archive, output, retry_options);
                             }
                         });
     }
@@ -4710,15 +6155,28 @@ private:
     void on_test() {
         const auto archive = active_archive_path();
         if (!archive) {
-            show_app_message(L"Open or select an Axiom archive first.",
+            show_app_message(L"Open or select a supported archive first.",
                              axiom::gui::MessageDialogIcon::information);
+            return;
+        }
+        const auto* provider = active_archive_provider();
+        if (provider == nullptr) {
+            show_app_message(L"This archive format is not supported.",
+                             axiom::gui::MessageDialogIcon::warning, L"Test archive");
             return;
         }
 
         axiom::DecompressionOptions options;
         options.thread_count = application_options_.default_thread_count;
         try {
-            if (axiom::archive_is_encrypted(*archive)) {
+            const auto capabilities = provider->capabilities(*archive);
+            if (!capabilities.test) {
+                show_app_message(L"This archive format does not support integrity testing.",
+                                 axiom::gui::MessageDialogIcon::information,
+                                 L"Test archive");
+                return;
+            }
+            if (capabilities.encrypted) {
                 std::wstring password;
                 if (!axiom::gui::show_archive_password_dialog(hwnd_, password)) return;
                 options.password = utf8(password);
@@ -4732,14 +6190,20 @@ private:
         operation_archive_output_ = *archive;
         start_operation(L"Testing archive...",
                         L"Archive integrity test passed.",
-                        [archive = *archive, options](std::shared_ptr<axiom::OperationControl> operation) mutable {
+                        [archive = *archive, provider, options](
+                            std::shared_ptr<axiom::OperationControl> operation) mutable {
                             auto run_options = options;
                             run_options.operation = operation;
+                            const auto capabilities =
+                                provider->capabilities(archive, run_options.password);
                             try {
-                                axiom::test_archive(archive, run_options);
+                                provider->test(archive, run_options);
                             } catch (const axiom::FormatError&) {
-                                if (!axiom::repair_archive(archive, operation)) throw;
-                                axiom::test_archive(archive, run_options);
+                                if (!capabilities.recovery_records ||
+                                    !axiom::repair_archive(archive, operation)) {
+                                    throw;
+                                }
+                                provider->test(archive, run_options);
                             }
                         });
     }
@@ -4855,6 +6319,72 @@ private:
                     return 0;
                 }
                 break;
+            case WM_LBUTTONDOWN: {
+                const POINT point{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
+                if (PtInRect(&tree_splitter_rect_, point)) {
+                    dragging_tree_splitter_ = true;
+                    tree_splitter_start_x_ = point.x;
+                    tree_width_start_ = tree_width_;
+                    SetCapture(hwnd_);
+                    SetCursor(LoadCursorW(nullptr, IDC_SIZEWE));
+                    return 0;
+                }
+                break;
+            }
+            case WM_MOUSEMOVE: {
+                const POINT point{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
+                if (dragging_tree_splitter_) {
+                    RECT client{};
+                    GetClientRect(hwnd_, &client);
+                    const int margin = scale(8);
+                    const int splitter_width = scale(5);
+                    const int minimum_tree_width = scale(180);
+                    const int minimum_list_width = scale(220);
+                    const int content_width = std::max(
+                        0, static_cast<int>(client.right - client.left) - 2 * margin);
+                    const int maximum_tree_width = std::max(
+                        minimum_tree_width,
+                        content_width - splitter_width - minimum_list_width);
+                    const int requested_width = tree_width_start_ +
+                                                static_cast<int>(point.x) -
+                                                tree_splitter_start_x_;
+                    const int next_tree_width =
+                        std::clamp(requested_width, minimum_tree_width, maximum_tree_width);
+                    if (next_tree_width != tree_width_) {
+                        tree_width_ = next_tree_width;
+                        layout_browser_panes_for_current_size();
+                        repaint_browser_panes_now();
+                    }
+                    SetCursor(LoadCursorW(nullptr, IDC_SIZEWE));
+                    return 0;
+                }
+                if (PtInRect(&tree_splitter_rect_, point)) {
+                    SetCursor(LoadCursorW(nullptr, IDC_SIZEWE));
+                    return 0;
+                }
+                break;
+            }
+            case WM_LBUTTONUP:
+                if (dragging_tree_splitter_) {
+                    dragging_tree_splitter_ = false;
+                    if (GetCapture() == hwnd_) ReleaseCapture();
+                    return 0;
+                }
+                break;
+            case WM_CAPTURECHANGED:
+                dragging_tree_splitter_ = false;
+                break;
+            case WM_SETCURSOR:
+                if (LOWORD(lparam) == HTCLIENT) {
+                    POINT point{};
+                    GetCursorPos(&point);
+                    ScreenToClient(hwnd_, &point);
+                    if (PtInRect(&tree_splitter_rect_, point) || dragging_tree_splitter_) {
+                        SetCursor(LoadCursorW(nullptr, IDC_SIZEWE));
+                        return TRUE;
+                    }
+                }
+                break;
             case WM_DROPFILES:
                 on_drop_files(reinterpret_cast<HDROP>(wparam));
                 return 0;
@@ -4879,7 +6409,6 @@ private:
                     case kView: on_view(); return 0;
                     case kDelete: on_delete_selected(); return 0;
                     case kInfo: on_info(); return 0;
-                    case kArchiveFeatures: on_archive_features(); return 0;
                     case kUpdateArchive:
                         on_update_archive(axiom::gui::ArchiveUpdateMode::update_newer);
                         return 0;
@@ -5014,6 +6543,7 @@ private:
     HWND tooltip_ = nullptr;
     HWND list_ = nullptr;
     HWND status_ = nullptr;
+    DarkDirectoryTreeView tree_view_;
     DarkTableView table_;
     axiom::gui::OperationProgressWindow operation_window_;
     ThemePalette theme_;
@@ -5033,6 +6563,13 @@ private:
     fs::path operation_archive_output_;
     fs::path operation_open_after_;
     std::vector<HWND> transient_labels_;
+    int tree_width_ = 0;
+    RECT tree_splitter_rect_{};
+    bool dragging_tree_splitter_ = false;
+    int tree_splitter_start_x_ = 0;
+    int tree_width_start_ = 0;
+    DirectoryTreeItem* tree_computer_item_ = nullptr;
+    bool syncing_tree_ = false;
     std::vector<AddressEntry> address_entries_;
     std::vector<std::wstring> recent_addresses_;
     std::vector<fs::path> inputs_;

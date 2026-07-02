@@ -88,6 +88,12 @@
     <ClInclude Include="src\entropy\range.hpp" />
     <ClInclude Include="src\third_party\blake3\blake3.h" />
     <ClInclude Include="src\third_party\blake3\blake3_impl.h" />
+    <ClInclude Include="src\third_party\miniz\miniz.h" />
+    <ClInclude Include="src\third_party\miniz\miniz_common.h" />
+    <ClInclude Include="src\third_party\miniz\miniz_export.h" />
+    <ClInclude Include="src\third_party\miniz\miniz_tdef.h" />
+    <ClInclude Include="src\third_party\miniz\miniz_tinfl.h" />
+    <ClInclude Include="src\third_party\miniz\miniz_zip.h" />
     <ClInclude Include="src\third_party\monocypher\monocypher.h" />
   </ItemGroup>
   <ItemGroup>
@@ -113,6 +119,22 @@
       <WarningLevel>TurnOffAllWarnings</WarningLevel>
     </ClCompile>
     <ClCompile Include="src\third_party\blake3\blake3_portable.c">
+      <CompileAs>CompileAsC</CompileAs>
+      <WarningLevel>TurnOffAllWarnings</WarningLevel>
+    </ClCompile>
+    <ClCompile Include="src\third_party\miniz\miniz.c">
+      <CompileAs>CompileAsC</CompileAs>
+      <WarningLevel>TurnOffAllWarnings</WarningLevel>
+    </ClCompile>
+    <ClCompile Include="src\third_party\miniz\miniz_tdef.c">
+      <CompileAs>CompileAsC</CompileAs>
+      <WarningLevel>TurnOffAllWarnings</WarningLevel>
+    </ClCompile>
+    <ClCompile Include="src\third_party\miniz\miniz_tinfl.c">
+      <CompileAs>CompileAsC</CompileAs>
+      <WarningLevel>TurnOffAllWarnings</WarningLevel>
+    </ClCompile>
+    <ClCompile Include="src\third_party\miniz\miniz_zip.c">
       <CompileAs>CompileAsC</CompileAs>
       <WarningLevel>TurnOffAllWarnings</WarningLevel>
     </ClCompile>

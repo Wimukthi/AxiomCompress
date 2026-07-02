@@ -328,7 +328,7 @@ void show_about_dialog(HWND owner, HINSTANCE instance, UINT dpi, bool dark,
         return;
     }
     apply_axiom_window_icons(dialog, instance);
-    EnableWindow(owner, FALSE);
+    const bool owner_was_enabled = disable_dialog_owner(owner);
     ShowWindow(dialog, SW_SHOW);
     UpdateWindow(dialog);
     MSG message{};
@@ -348,11 +348,7 @@ void show_about_dialog(HWND owner, HINSTANCE instance, UINT dpi, bool dark,
             DispatchMessageW(&message);
         }
     }
-    if (IsWindow(owner)) {
-        EnableWindow(owner, TRUE);
-        SetActiveWindow(owner);
-        SetFocus(owner);
-    }
+    restore_dialog_owner(owner, owner_was_enabled);
 }
 
 }  // namespace axiom::gui

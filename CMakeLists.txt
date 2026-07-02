@@ -21,6 +21,14 @@ set(BLAKE3_SOURCES
 set(MONOCYPHER_SOURCES
     src/third_party/monocypher/monocypher.c)
 
+# Vendored miniz for ZIP container view/extract/test support. Small C library;
+# warnings off like the other third-party sources.
+set(MINIZ_SOURCES
+    src/third_party/miniz/miniz.c
+    src/third_party/miniz/miniz_tdef.c
+    src/third_party/miniz/miniz_tinfl.c
+    src/third_party/miniz/miniz_zip.c)
+
 add_library(axiom STATIC
     src/archive/container.cpp
     src/codec/block.cpp
@@ -36,7 +44,8 @@ add_library(axiom STATIC
     src/entropy/huffman.cpp
     src/entropy/range.cpp
     ${BLAKE3_SOURCES}
-    ${MONOCYPHER_SOURCES})
+    ${MONOCYPHER_SOURCES}
+    ${MINIZ_SOURCES})
 
 target_include_directories(axiom
     PUBLIC include
@@ -49,10 +58,10 @@ target_compile_definitions(axiom PRIVATE
 
 if(MSVC)
     target_compile_options(axiom PRIVATE /W4 /permissive-)
-    set_source_files_properties(${BLAKE3_SOURCES} ${MONOCYPHER_SOURCES} PROPERTIES COMPILE_OPTIONS /w)
+    set_source_files_properties(${BLAKE3_SOURCES} ${MONOCYPHER_SOURCES} ${MINIZ_SOURCES} PROPERTIES COMPILE_OPTIONS /w)
 else()
     target_compile_options(axiom PRIVATE -Wall -Wextra -Wpedantic)
-    set_source_files_properties(${BLAKE3_SOURCES} ${MONOCYPHER_SOURCES} PROPERTIES COMPILE_OPTIONS -w)
+    set_source_files_properties(${BLAKE3_SOURCES} ${MONOCYPHER_SOURCES} ${MINIZ_SOURCES} PROPERTIES COMPILE_OPTIONS -w)
 endif()
 
 # Windows CSPRNG (BCryptGenRandom) used by core/crypto.
