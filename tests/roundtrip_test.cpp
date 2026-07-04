@@ -26,6 +26,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstring>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
@@ -502,7 +503,7 @@ void test_archive_provider_layer() {
     AXIOM_CHECK(provider->info().native);
     AXIOM_CHECK(axiom::is_supported_archive(archive));
     AXIOM_CHECK(axiom::is_native_archive(archive));
-    AXIOM_CHECK(!axiom::is_supported_archive(root / "not.7z"));
+    AXIOM_CHECK(!axiom::is_supported_archive(root / "not.unsupported"));
 
     const auto capabilities = provider->capabilities(archive);
     AXIOM_CHECK(capabilities.list);
@@ -654,6 +655,87 @@ void test_zip_provider_layer() {
     std::error_code ec;
     fs::remove_all(root, ec);
 }
+
+#if defined(_WIN32)
+bool windows_tar_available() {
+    return std::system("tar --version >nul 2>nul") == 0;
+}
+
+void test_unicode_path_archive_probe() {
+    const auto root = make_temp_dir();
+    const auto unicode_file = root / L"\u0dc3\u0dd2\u0d82\u0dc4\u0dbd-not-archive.txt";
+    write_all(unicode_file, bytes_from_string("not an archive"));
+
+    bool threw = false;
+    try {
+        AXIOM_CHECK(!axiom::is_supported_archive(unicode_file));
+        AXIOM_CHECK(axiom::archive_provider_for_path(unicode_file) == nullptr);
+    } catch (...) {
+        threw = true;
+    }
+    AXIOM_CHECK(!threw);
+
+    std::error_code ec;
+    fs::remove_all(root, ec);
+}
+
+void test_system_archive_provider_layer() {
+    if (!windows_tar_available()) {
+        return;
+    }
+
+    const auto root = make_temp_dir();
+    const auto source = root / "source";
+    fs::create_directories(source / "folder");
+    write_all(source / "folder" / "hello.txt",
+              bytes_from_string("system archive provider payload"));
+    write_all(source / "top.txt", bytes_from_string("top-level payload"));
+
+    const auto archive = root / "sample.not_tar";
+    const std::string command =
+        "tar -cf \"" + archive.string() + "\" -C \"" + source.string() +
+        "\" folder top.txt";
+    AXIOM_CHECK(std::system(command.c_str()) == 0);
+
+    const auto* provider = axiom::archive_provider_for_path(archive);
+    AXIOM_CHECK(provider != nullptr);
+    AXIOM_CHECK(provider->info().format == axiom::ArchiveFormat::tar);
+    AXIOM_CHECK(!provider->info().native);
+
+    const auto capabilities = provider->capabilities(archive);
+    AXIOM_CHECK(capabilities.list);
+    AXIOM_CHECK(capabilities.extract);
+    AXIOM_CHECK(capabilities.test);
+    AXIOM_CHECK(capabilities.selective_extract);
+    AXIOM_CHECK(!capabilities.create);
+    AXIOM_CHECK(!capabilities.update);
+    AXIOM_CHECK(!capabilities.delete_entries);
+    AXIOM_CHECK(!capabilities.move_entries);
+
+    const auto entries = provider->list(archive);
+    AXIOM_CHECK(std::any_of(entries.begin(), entries.end(), [](const axiom::ArchiveEntry& entry) {
+        return entry.path == "folder/hello.txt" && !entry.is_directory &&
+               entry.size == std::strlen("system archive provider payload");
+    }));
+
+    provider->test(archive);
+
+    const auto selected = root / "selected";
+    provider->extract_selected(archive, {"folder/hello.txt"}, selected, {});
+    AXIOM_CHECK(read_all(selected / "folder" / "hello.txt") ==
+                bytes_from_string("system archive provider payload"));
+    AXIOM_CHECK(!fs::exists(selected / "top.txt"));
+
+    const auto full = root / "full";
+    provider->extract_all(archive, full, {});
+    AXIOM_CHECK(read_all(full / "folder" / "hello.txt") ==
+                bytes_from_string("system archive provider payload"));
+    AXIOM_CHECK(read_all(full / "top.txt") == bytes_from_string("top-level payload"));
+
+    std::error_code ec;
+    fs::remove_all(root, ec);
+}
+#endif
 
 void test_zip_aes256_encryption() {
     const auto root = make_temp_dir();
@@ -2152,6 +2234,10 @@ int main() {
     test_archive_roundtrip();
     test_archive_provider_layer();
     test_zip_provider_layer();
+#if defined(_WIN32)
+    test_unicode_path_archive_probe();
+    test_system_archive_provider_layer();
+#endif
     test_zip_aes256_encryption();
     test_zip_aes_data_descriptor_compatibility();
     test_archive_symlinks();

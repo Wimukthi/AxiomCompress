@@ -131,6 +131,12 @@
     <ResourceCompile Include="src\gui\axiom_gui.rc" />
   </ItemGroup>
   <ItemGroup>
+    <Image Include="Icons\archive_7z.ico" />
+    <Image Include="Icons\archive_cab.ico" />
+    <Image Include="Icons\archive_iso.ico" />
+    <Image Include="Icons\archive_rar.ico" />
+    <Image Include="Icons\archive_tar.ico" />
+    <Image Include="Icons\archive_zip.ico" />
     <Image Include="Icons\axiom.ico" />
     <Image Include="Icons\axiom.png" />
   </ItemGroup>

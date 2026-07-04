@@ -140,6 +140,7 @@ Current provider support:
 |---|---:|---:|---:|---:|
 | AXAR | Yes | Yes | Yes | Yes |
 | ZIP | Yes | Yes, stored/deflated entries | Yes | Yes, with limits for encrypted ZIPs |
+| 7z, RAR, TAR family, ISO, CAB | Yes on Windows | Yes on Windows | Yes on Windows | No |
 
 ZIP create/update/delete/move support rewrites the ZIP atomically through the
 archive provider layer and populates the Packed column from the ZIP central
@@ -150,6 +151,12 @@ remain visible, and existing encrypted ZIPs are read/test/extract only for now.
 AXAR-only features such as archive comments, locking, recovery records, split
 volumes, signatures, SFX packaging, encrypted names, and Axiom metadata remain
 disabled when ZIP is selected.
+
+On Windows, Axiom also exposes a read-only system archive provider backed by the
+Windows `tar.exe`/libarchive tool. It is used for browsing, testing, and
+extracting common formats such as `.7z`, `.rar`, `.tar`, `.tar.gz`, `.tgz`,
+`.tar.xz`, `.txz`, `.tar.bz2`, `.tbz2`, `.tar.zst`, `.tzst`, `.iso`, and
+`.cab`. These formats never appear as Add-to-archive creation targets.
 
 See [docs/FORMAT_SUPPORT.md](docs/FORMAT_SUPPORT.md) for the planned split
 between full read/write formats and view/extract-only formats.
@@ -220,6 +227,11 @@ The Settings dialog has these pages:
 - Integration
 - Updates
 - Advanced
+
+The Integration page can register per-user file associations for AXAR,
+ZIP/JAR/WAR/APK, 7z, RAR, TAR-family, ISO, and CAB files. Read-only formats use
+embedded Axiom format icons and open into the browser for viewing, testing, and
+extraction.
 
 Settings are wired only where the engine or GUI has real behavior. Unsupported
 future options are disabled instead of being stored as silent no-ops.

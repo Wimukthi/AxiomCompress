@@ -111,10 +111,16 @@ constexpr int kWipeEncryptedTempFiles = 2453;
 constexpr int kTrustedKeysFolder = 2454;
 constexpr int kBrowseTrustedKeysFolder = 2455;
 constexpr int kAssociateAxar = 2500;
-constexpr int kContextOpen = 2501;
-constexpr int kContextAdd = 2502;
-constexpr int kContextExtract = 2503;
-constexpr int kContextTest = 2504;
+constexpr int kAssociateZip = 2501;
+constexpr int kAssociate7z = 2502;
+constexpr int kAssociateRar = 2503;
+constexpr int kAssociateTar = 2504;
+constexpr int kAssociateIso = 2505;
+constexpr int kAssociateCab = 2506;
+constexpr int kContextOpen = 2510;
+constexpr int kContextAdd = 2511;
+constexpr int kContextExtract = 2512;
+constexpr int kContextTest = 2513;
 constexpr int kAutomaticUpdateChecks = 2550;
 constexpr int kUpdateChannel = 2551;
 constexpr int kUpdateUrl = 2552;
@@ -205,6 +211,27 @@ int archive_format_index(axiom::ArchiveFormat format) {
     return 0;
 }
 
+std::vector<const axiom::ArchiveFormatInfo*> creatable_archive_formats() {
+    std::vector<const axiom::ArchiveFormatInfo*> result;
+    for (const auto& format : axiom::supported_archive_formats()) {
+        if (format.format == axiom::ArchiveFormat::axar ||
+            format.format == axiom::ArchiveFormat::zip) {
+            result.push_back(&format);
+        }
+    }
+    return result;
+}
+
+int creatable_archive_format_index(axiom::ArchiveFormat format) {
+    const auto formats = creatable_archive_formats();
+    for (std::size_t index = 0; index < formats.size(); ++index) {
+        if (formats[index]->format == format) {
+            return static_cast<int>(index);
+        }
+    }
+    return 0;
+}
+
 const axiom::ArchiveFormatInfo& archive_format_info(axiom::ArchiveFormat format) {
     const auto formats = axiom::supported_archive_formats();
     const int index = archive_format_index(format);
@@ -214,23 +241,50 @@ const axiom::ArchiveFormatInfo& archive_format_info(axiom::ArchiveFormat format)
 axiom::ArchiveFormat archive_format_from_path(const fs::path& path,
                                               axiom::ArchiveFormat fallback) {
     if (const auto* provider = axiom::archive_provider_for_path(path)) {
-        return provider->info().format;
+        if (provider->info().format == axiom::ArchiveFormat::axar ||
+            provider->info().format == axiom::ArchiveFormat::zip) {
+            return provider->info().format;
+        }
     }
     return fallback;
 }
 
 bool is_known_archive_extension(const fs::path& path) {
-    const auto extension = path.extension().wstring();
-    if (extension.empty()) {
+    const auto filename = path.filename().wstring();
+    if (filename.empty()) {
         return false;
     }
+    auto folded = filename;
+    std::transform(folded.begin(), folded.end(), folded.begin(), [](wchar_t value) {
+        return static_cast<wchar_t>(std::towlower(value));
+    });
     for (const auto& format : axiom::supported_archive_formats()) {
-        if (_wcsicmp(extension.c_str(),
+        std::wstring pattern(format.open_filter_pattern);
+        std::size_t start = 0;
+        while (start <= pattern.size()) {
+            const std::size_t end = pattern.find(L';', start);
+            std::wstring part = pattern.substr(start, end == std::wstring::npos
+                                                          ? std::wstring::npos
+                                                          : end - start);
+            if (part.size() > 1 && part[0] == L'*') {
+                part.erase(part.begin());
+            }
+            std::transform(part.begin(), part.end(), part.begin(), [](wchar_t value) {
+                return static_cast<wchar_t>(std::towlower(value));
+            });
+            if (!part.empty() && folded.size() >= part.size() &&
+                folded.substr(folded.size() - part.size()) == part) {
+                return true;
+            }
+            if (end == std::wstring::npos) break;
+            start = end + 1;
+        }
+        if (_wcsicmp(path.extension().c_str(),
                     widen_ascii(format.default_extension).c_str()) == 0) {
             return true;
         }
     }
-    return _wcsicmp(extension.c_str(), L".exe") == 0;
+    return _wcsicmp(path.extension().c_str(), L".exe") == 0;
 }
 
 template <typename T>
@@ -835,8 +889,8 @@ private:
                 CBS_OWNERDRAWFIXED | CBS_HASSTRINGS, kArchiveFormat);
         SendMessageW(combo, CB_SETITEMHEIGHT, 0, scale(24));
         SendMessageW(combo, CB_SETITEMHEIGHT, static_cast<WPARAM>(-1), scale(24));
-        for (const auto& format : axiom::supported_archive_formats()) {
-            const std::wstring label = widen_ascii(format.display_name);
+        for (const auto* format : creatable_archive_formats()) {
+            const std::wstring label = widen_ascii(format->display_name);
             SendMessageW(combo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(label.c_str()));
         }
         return combo;
@@ -1099,14 +1153,22 @@ private:
 
         setting_label(6, L"Windows integration", 0, 0, 660);
         setting_checkbox(6, kAssociateAxar, L"Associate .axar files with Axiom", 0, 42);
-        setting_checkbox(6, kContextOpen, L"Explorer context menu: Open with Axiom", 0, 76);
-        setting_checkbox(6, kContextAdd, L"Explorer context menu: Add to archive", 0, 110);
-        setting_checkbox(6, kContextExtract, L"Explorer context menu: Extract here/to folder", 0, 144);
-        setting_checkbox(6, kContextTest, L"Explorer context menu: Test archive", 0, 178);
+        setting_checkbox(6, kAssociateZip, L"Associate .zip, .jar, .war, .apk files with Axiom", 0, 76);
+        setting_checkbox(6, kAssociate7z, L"Associate .7z files with Axiom", 0, 110);
+        setting_checkbox(6, kAssociateRar, L"Associate .rar and RAR volume files with Axiom", 0, 144);
+        setting_checkbox(6, kAssociateTar,
+                         L"Associate TAR family files (.tar, .tgz, .txz, .tbz2, .tzst)", 0, 178);
+        setting_checkbox(6, kAssociateIso, L"Associate .iso images with Axiom", 0, 212);
+        setting_checkbox(6, kAssociateCab, L"Associate .cab archives with Axiom", 0, 246);
+        setting_checkbox(6, kContextOpen, L"Explorer context menu: Open with Axiom", 0, 300);
+        setting_checkbox(6, kContextAdd, L"Explorer context menu: Add to archive", 0, 334);
+        setting_checkbox(6, kContextExtract, L"Explorer context menu: Extract here/to folder", 0, 368);
+        setting_checkbox(6, kContextTest, L"Explorer context menu: Test archive", 0, 402);
         setting_label(6,
                       L"Integration is written per-user under HKCU and applies/removes Axiom's "
-                      L"own file association and Explorer context-menu entries.",
-                      0, 236, 660, 54, true);
+                      L"own file association and Explorer context-menu entries. Read-only "
+                      L"formats can be opened, tested, and extracted but not edited.",
+                      0, 456, 660, 64, true);
 
         setting_label(7, L"Updates", 0, 0, 660);
         setting_checkbox(7, kAutomaticUpdateChecks,
@@ -1852,7 +1914,7 @@ private:
                 create_options.archive_format =
                     archive_format_from_path(*path, selected_archive_format());
                 SendMessageW(format_combo_, CB_SETCURSEL,
-                             static_cast<WPARAM>(archive_format_index(
+                             static_cast<WPARAM>(creatable_archive_format_index(
                                  create_options.archive_format)), 0);
                 clear_options_unsupported_by_selected_format();
                 update_create_dependencies();
@@ -1932,7 +1994,8 @@ private:
         create_options.archive_format =
             archive_format_from_path(create_options.archive_path, create_options.archive_format);
         SendMessageW(format_combo_, CB_SETCURSEL,
-                     static_cast<WPARAM>(archive_format_index(create_options.archive_format)), 0);
+                     static_cast<WPARAM>(creatable_archive_format_index(
+                         create_options.archive_format)), 0);
         level_ = std::clamp(create_options.level, 1, 9);
         SendMessageW(level_combo_, CB_SETCURSEL, static_cast<WPARAM>(level_ - 1), 0);
         SendMessageW(dictionary_combo_, CB_SETCURSEL,
@@ -2010,12 +2073,12 @@ private:
             return create_options.archive_format;
         }
         const LRESULT selection = SendMessageW(format_combo_, CB_GETCURSEL, 0, 0);
-        const auto formats = axiom::supported_archive_formats();
+        const auto formats = creatable_archive_formats();
         if (selection == CB_ERR || selection < 0 ||
             selection >= static_cast<LRESULT>(formats.size())) {
             return create_options.archive_format;
         }
-        return formats[static_cast<std::size_t>(selection)].format;
+        return formats[static_cast<std::size_t>(selection)]->format;
     }
 
     bool selected_format_is_native() const {
@@ -2102,7 +2165,7 @@ private:
             if (provider->info().format != selected_archive_format()) {
                 create_options.archive_format = provider->info().format;
                 SendMessageW(format_combo_, CB_SETCURSEL,
-                             static_cast<WPARAM>(archive_format_index(
+                             static_cast<WPARAM>(creatable_archive_format_index(
                                  create_options.archive_format)), 0);
                 clear_options_unsupported_by_selected_format();
                 update_create_dependencies();
@@ -2422,6 +2485,12 @@ private:
             case kVerifySignatures: return application_options.verify_signatures;
             case kWipeEncryptedTempFiles: return application_options.wipe_encrypted_temp_files;
             case kAssociateAxar: return application_options.associate_axar;
+            case kAssociateZip: return application_options.associate_zip;
+            case kAssociate7z: return application_options.associate_7z;
+            case kAssociateRar: return application_options.associate_rar;
+            case kAssociateTar: return application_options.associate_tar;
+            case kAssociateIso: return application_options.associate_iso;
+            case kAssociateCab: return application_options.associate_cab;
             case kContextOpen: return application_options.context_open;
             case kContextAdd: return application_options.context_add;
             case kContextExtract: return application_options.context_extract;
@@ -2522,6 +2591,24 @@ private:
             case kAssociateAxar:
                 application_options.associate_axar = !application_options.associate_axar;
                 break;
+            case kAssociateZip:
+                application_options.associate_zip = !application_options.associate_zip;
+                break;
+            case kAssociate7z:
+                application_options.associate_7z = !application_options.associate_7z;
+                break;
+            case kAssociateRar:
+                application_options.associate_rar = !application_options.associate_rar;
+                break;
+            case kAssociateTar:
+                application_options.associate_tar = !application_options.associate_tar;
+                break;
+            case kAssociateIso:
+                application_options.associate_iso = !application_options.associate_iso;
+                break;
+            case kAssociateCab:
+                application_options.associate_cab = !application_options.associate_cab;
+                break;
             case kContextOpen:
                 application_options.context_open = !application_options.context_open;
                 break;
@@ -2576,7 +2663,7 @@ private:
                 if (create_options.features.create_sfx) {
                     create_options.archive_format = axiom::ArchiveFormat::axar;
                     SendMessageW(format_combo_, CB_SETCURSEL,
-                                 static_cast<WPARAM>(archive_format_index(
+                                 static_cast<WPARAM>(creatable_archive_format_index(
                                      create_options.archive_format)), 0);
                     create_options.features.create_recovery_volumes = false;
                     create_options.features.volume_size.clear();
@@ -2616,6 +2703,12 @@ private:
             case kVerifySignatures:
             case kWipeEncryptedTempFiles:
             case kAssociateAxar:
+            case kAssociateZip:
+            case kAssociate7z:
+            case kAssociateRar:
+            case kAssociateTar:
+            case kAssociateIso:
+            case kAssociateCab:
             case kContextOpen:
             case kContextAdd:
             case kContextExtract:

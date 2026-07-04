@@ -32,6 +32,7 @@ New-Item -ItemType Directory -Force -Path $outDir | Out-Null
 
 $libSources = @(
     "src\archive\container.cpp",
+    "src\archive\system_provider.cpp",
     "src\codec\block.cpp",
     "src\codec\fast_lz.cpp",
     "src\codec\lz77.cpp",
@@ -47,6 +48,10 @@ $libSources = @(
     "src\third_party\blake3\blake3.c",
     "src\third_party\blake3\blake3_dispatch.c",
     "src\third_party\blake3\blake3_portable.c",
+    "src\third_party\miniz\miniz.c",
+    "src\third_party\miniz\miniz_tdef.c",
+    "src\third_party\miniz\miniz_tinfl.c",
+    "src\third_party\miniz\miniz_zip.c",
     "src\third_party\monocypher\monocypher.c"
 ) | ForEach-Object { "`"$Root\$_`"" }
 

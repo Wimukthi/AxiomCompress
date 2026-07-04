@@ -79,6 +79,7 @@
     <ClInclude Include="src\codec\match_copy.hpp" />
     <ClInclude Include="src\codec\varint.hpp" />
     <ClInclude Include="src\core\archive.hpp" />
+    <ClInclude Include="src\archive\system_provider.hpp" />
     <ClInclude Include="src\core\checksum.hpp" />
     <ClInclude Include="src\core\cpu.hpp" />
     <ClInclude Include="src\core\crypto.hpp" />
@@ -98,6 +99,7 @@
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="src\archive\container.cpp" />
+    <ClCompile Include="src\archive\system_provider.cpp" />
     <ClCompile Include="src\codec\block.cpp" />
     <ClCompile Include="src\codec\fast_lz.cpp" />
     <ClCompile Include="src\codec\lz77.cpp" />

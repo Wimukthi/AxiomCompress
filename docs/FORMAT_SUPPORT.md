@@ -10,6 +10,11 @@ commands that are safe for that format.
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---|
 | AXAR | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Estimated | Native format with encryption, recovery records, split volumes, comments, locking, signatures, metadata, links, and SFX packaging. |
 | ZIP | Yes | Yes | Yes | Yes | Yes, plaintext only | Yes, plaintext only | Yes, plaintext only | Yes | Stored/Deflate ZIP archives. New encrypted ZIPs use WinZip AES-256 file-data encryption. ZIP edits are atomic rewrites. |
+| 7z | Windows | Windows | Windows | No | No | No | No | No | Read-only system provider backed by Windows `tar.exe`/libarchive. Compatibility depends on the OS tool. |
+| RAR/RAR5 | Windows | Windows | Windows | No | No | No | No | No | Read-only system provider. RAR creation is intentionally unsupported. |
+| TAR family | Windows | Windows | Windows | No | No | No | No | No | Covers `.tar`, `.tar.gz`, `.tgz`, `.tar.xz`, `.txz`, `.tar.bz2`, `.tbz2`, `.tar.zst`, and `.tzst` when supported by Windows `tar.exe`. |
+| ISO | Windows | Windows | Windows | No | No | No | No | No | Read-only ISO image browsing/extraction through the system provider. |
+| CAB | Windows | Windows | Windows | No | No | No | No | No | Read-only CAB browsing/extraction through the system provider. |
 
 ZIP stores exact compressed sizes per central-directory entry. AXAR uses solid
 blocks, so per-file Packed values are proportional estimates and the GUI marks
@@ -20,14 +25,22 @@ does not expose AXAR-only services: archive comments, locking, recovery records,
 split volumes, signatures, SFX packaging, encrypted names, and Axiom metadata
 remain disabled when ZIP is selected.
 
+The Windows system provider is intentionally read-only. It uses signature checks
+where possible, falls back to extensions for wrapped/compressed TAR names, and
+routes extraction through a temporary staging directory before copying files into
+the requested destination. It does not currently provide archive passwords,
+comments, packed sizes, write operations, or fine-grained byte progress.
+
 ## Full-support targets
 
-These formats are realistic candidates for browse, extract, test, create,
-add/update/sync, delete, and move/rename.
+AXAR and ZIP are the supported creation targets. Other formats should stay
+read-only unless there is a clear compatibility and maintenance reason to expand
+them.
 
-### 1. TAR
+### 1. Direct TAR backend, optional
 
-TAR should be the next full-support provider.
+If Axiom later needs first-class TAR creation/editing, TAR is the most realistic
+next full-support provider.
 
 - It has a simple sequential container structure and no codec licensing issue.
 - It maps cleanly to Axiom's provider model.
@@ -43,7 +56,7 @@ Initial TAR scope:
 - create, add/update/sync, delete, move/rename by full rewrite
 - no sparse files in the first implementation
 
-### 2. TAR plus external compression
+### 2. TAR plus external compression, optional
 
 After plain TAR is stable, add compressed TAR variants:
 
@@ -63,10 +76,10 @@ taking in the first pass.
 
 | Format | First scope | Reason |
 |---|---|---|
-| 7z | Browse, extract, test | Large feature surface; start read-only before considering creation. |
-| RAR | Browse, extract, test | RAR creation is proprietary; extraction support must respect licensing. |
-| ISO | Browse, extract | Useful and stable as read-only media images. Creation is a separate authoring workflow. |
-| CAB | Browse, extract | Common Windows archive format; read-only support is enough for most use. |
+| 7z | Browse, extract, test | Implemented on Windows through the system provider; direct SDK integration can improve password/progress support later. |
+| RAR | Browse, extract, test | Implemented on Windows through the system provider; creation remains proprietary and unsupported. |
+| ISO | Browse, extract/test | Implemented on Windows through the system provider. Creation is a separate authoring workflow. |
+| CAB | Browse, extract/test | Implemented on Windows through the system provider. |
 | GZip/BZip2/XZ single streams | Extract/test, optional create | These are compressed streams, not multi-file archives. Surface them as single-file operations or as TAR codecs. |
 
 ## GUI behavior

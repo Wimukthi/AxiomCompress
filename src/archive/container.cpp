@@ -6,6 +6,7 @@
 #include "core/file_meta.hpp"
 #include "core/hash.hpp"
 #include "core/reed_solomon.hpp"
+#include "archive/system_provider.hpp"
 #include "third_party/miniz/miniz.h"
 
 #include <algorithm>
@@ -3569,8 +3570,13 @@ namespace {
 
 constexpr std::size_t kAxarFormatIndex = 0;
 constexpr std::size_t kZipFormatIndex = 1;
+constexpr std::size_t kSevenZFormatIndex = 2;
+constexpr std::size_t kRarFormatIndex = 3;
+constexpr std::size_t kTarFormatIndex = 4;
+constexpr std::size_t kIsoFormatIndex = 5;
+constexpr std::size_t kCabFormatIndex = 6;
 
-constexpr std::array<ArchiveFormatInfo, 2> kArchiveFormats{{
+constexpr std::array<ArchiveFormatInfo, 7> kArchiveFormats{{
     {
         ArchiveFormat::axar,
         "axar",
@@ -3591,12 +3597,71 @@ constexpr std::array<ArchiveFormatInfo, 2> kArchiveFormats{{
         L"*.zip",
         false,
     },
+    {
+        ArchiveFormat::seven_z,
+        "7z",
+        "7z archive",
+        "7z archive",
+        ".7z",
+        L"7z archives (*.7z)",
+        L"*.7z",
+        false,
+    },
+    {
+        ArchiveFormat::rar,
+        "rar",
+        "RAR archive",
+        "RAR archive",
+        ".rar",
+        L"RAR archives (*.rar;*.r00;*.part*.rar)",
+        L"*.rar;*.r00;*.part*.rar",
+        false,
+    },
+    {
+        ArchiveFormat::tar,
+        "tar",
+        "TAR archive",
+        "TAR archive",
+        ".tar",
+        L"TAR archives (*.tar;*.tar.gz;*.tgz;*.tar.xz;*.txz;*.tar.bz2;*.tbz2;*.tar.zst;*.tzst)",
+        L"*.tar;*.tar.gz;*.tgz;*.tar.xz;*.txz;*.tar.bz2;*.tbz2;*.tar.zst;*.tzst",
+        false,
+    },
+    {
+        ArchiveFormat::iso,
+        "iso",
+        "ISO image",
+        "ISO image",
+        ".iso",
+        L"ISO images (*.iso)",
+        L"*.iso",
+        false,
+    },
+    {
+        ArchiveFormat::cab,
+        "cab",
+        "CAB archive",
+        "CAB archive",
+        ".cab",
+        L"CAB archives (*.cab)",
+        L"*.cab",
+        false,
+    },
 }};
 
 std::string lower_ascii(std::string text) {
     for (auto& ch : text) {
         if (ch >= 'A' && ch <= 'Z') {
             ch = static_cast<char>(ch - 'A' + 'a');
+        }
+    }
+    return text;
+}
+
+std::wstring lower_ascii(std::wstring text) {
+    for (auto& ch : text) {
+        if (ch >= L'A' && ch <= L'Z') {
+            ch = static_cast<wchar_t>(ch - L'A' + L'a');
         }
     }
     return text;
@@ -3611,6 +3676,39 @@ bool file_starts_with_magic(const fs::path& path,
                 static_cast<std::streamsize>(bytes.size()));
     return static_cast<std::size_t>(stream.gcount()) == bytes.size() &&
            std::equal(expected.begin(), expected.end(), bytes.begin());
+}
+
+bool file_has_magic_at(const fs::path& path,
+                       std::uint64_t offset,
+                       std::span<const std::uint8_t> expected) {
+    std::ifstream stream(path, std::ios::binary);
+    if (!stream) return false;
+    stream.seekg(0, std::ios::end);
+    const auto size = stream.tellg();
+    if (size < 0 ||
+        static_cast<std::uint64_t>(size) < offset + expected.size()) {
+        return false;
+    }
+    stream.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
+    ByteVector bytes(expected.size());
+    stream.read(reinterpret_cast<char*>(bytes.data()),
+                static_cast<std::streamsize>(bytes.size()));
+    return static_cast<std::size_t>(stream.gcount()) == bytes.size() &&
+           std::equal(expected.begin(), expected.end(), bytes.begin());
+}
+
+bool has_ascii_suffix(std::string_view text, std::string_view suffix) {
+    return text.size() >= suffix.size() &&
+           text.substr(text.size() - suffix.size()) == suffix;
+}
+
+bool has_ascii_suffix(std::wstring_view text, std::wstring_view suffix) {
+    return text.size() >= suffix.size() &&
+           text.substr(text.size() - suffix.size()) == suffix;
+}
+
+std::wstring lower_ascii_path_name(const fs::path& path) {
+    return lower_ascii(path.filename().wstring());
 }
 
 bool looks_like_native_archive_file(const fs::path& path) {
@@ -3655,6 +3753,68 @@ bool looks_like_zip_file(const fs::path& path) {
     return std::search(tail.begin(), tail.end(), kEocd.begin(), kEocd.end()) != tail.end();
 }
 
+bool looks_like_7z_file(const fs::path& path) {
+    constexpr std::array<std::uint8_t, 6> kSevenZMagic{{0x37, 0x7a, 0xbc, 0xaf, 0x27, 0x1c}};
+    return file_starts_with_magic(path, kSevenZMagic);
+}
+
+bool looks_like_rar_file(const fs::path& path) {
+    constexpr std::array<std::uint8_t, 7> kRar4Magic{{'R', 'a', 'r', '!', 0x1a, 0x07, 0x00}};
+    constexpr std::array<std::uint8_t, 8> kRar5Magic{{'R', 'a', 'r', '!', 0x1a, 0x07, 0x01, 0x00}};
+    return file_starts_with_magic(path, kRar4Magic) ||
+           file_starts_with_magic(path, kRar5Magic);
+}
+
+bool looks_like_tar_file(const fs::path& path) {
+    constexpr std::array<std::uint8_t, 5> kUstarMagic{{'u', 's', 't', 'a', 'r'}};
+    return file_has_magic_at(path, 257, kUstarMagic);
+}
+
+bool looks_like_iso_file(const fs::path& path) {
+    constexpr std::array<std::uint8_t, 5> kIsoMagic{{'C', 'D', '0', '0', '1'}};
+    return file_has_magic_at(path, 0x8001, kIsoMagic);
+}
+
+bool looks_like_cab_file(const fs::path& path) {
+    constexpr std::array<std::uint8_t, 4> kCabMagic{{'M', 'S', 'C', 'F'}};
+    return file_starts_with_magic(path, kCabMagic);
+}
+
+bool has_7z_extension(const fs::path& path) {
+    return lower_ascii(path.extension().wstring()) == L".7z";
+}
+
+bool has_rar_extension(const fs::path& path) {
+    const std::wstring name = lower_ascii_path_name(path);
+    const std::wstring extension = lower_ascii(path.extension().wstring());
+    if (extension == L".rar") return true;
+    if (extension.size() == 4 && extension[0] == L'.' && extension[1] == L'r' &&
+        extension[2] >= L'0' && extension[2] <= L'9' &&
+        extension[3] >= L'0' && extension[3] <= L'9') {
+        return true;
+    }
+    return name.find(L".part") != std::wstring::npos && has_ascii_suffix(name, L".rar");
+}
+
+bool has_tar_extension(const fs::path& path) {
+    const std::wstring name = lower_ascii_path_name(path);
+    constexpr std::array<std::wstring_view, 9> kTarSuffixes{
+        L".tar", L".tar.gz", L".tgz", L".tar.xz", L".txz",
+        L".tar.bz2", L".tbz2", L".tar.zst", L".tzst"};
+    return std::any_of(kTarSuffixes.begin(), kTarSuffixes.end(),
+                       [&](std::wstring_view suffix) {
+                           return has_ascii_suffix(name, suffix);
+                       });
+}
+
+bool has_iso_extension(const fs::path& path) {
+    return lower_ascii(path.extension().wstring()) == L".iso";
+}
+
+bool has_cab_extension(const fs::path& path) {
+    return lower_ascii(path.extension().wstring()) == L".cab";
+}
+
 class AxarArchiveProvider final : public ArchiveProvider {
 public:
     const ArchiveFormatInfo& info() const override {
@@ -3662,7 +3822,7 @@ public:
     }
 
     bool matches_path(const std::filesystem::path& path) const override {
-        return lower_ascii(path.extension().string()) == ".axar";
+        return lower_ascii(path.extension().wstring()) == L".axar";
     }
 
     ArchiveCapabilities capabilities(const std::filesystem::path& archive_path,
@@ -5792,7 +5952,7 @@ public:
     }
 
     bool matches_path(const std::filesystem::path& path) const override {
-        return lower_ascii(path.extension().string()) == ".zip";
+        return lower_ascii(path.extension().wstring()) == L".zip";
     }
 
     ArchiveCapabilities capabilities(const std::filesystem::path& archive_path,
@@ -6216,6 +6376,592 @@ private:
     }
 };
 
+#ifdef _WIN32
+#if 0  // Moved to src/archive/system_provider.cpp; kept disabled during split.
+
+std::wstring utf8_to_wide_system(std::string_view text) {
+    if (text.empty()) return {};
+    const int needed = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+                                           text.data(), static_cast<int>(text.size()),
+                                           nullptr, 0);
+    if (needed <= 0) {
+        return std::wstring(text.begin(), text.end());
+    }
+    std::wstring result(static_cast<std::size_t>(needed), L'\0');
+    MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+                        text.data(), static_cast<int>(text.size()),
+                        result.data(), needed);
+    return result;
+}
+
+std::string wide_to_utf8_system(std::wstring_view text) {
+    if (text.empty()) return {};
+    const int needed = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS,
+                                           text.data(), static_cast<int>(text.size()),
+                                           nullptr, 0, nullptr, nullptr);
+    if (needed <= 0) {
+        return std::string(text.begin(), text.end());
+    }
+    std::string result(static_cast<std::size_t>(needed), '\0');
+    WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS,
+                        text.data(), static_cast<int>(text.size()),
+                        result.data(), needed, nullptr, nullptr);
+    return result;
+}
+
+std::string process_output_to_utf8(std::string_view bytes) {
+    if (bytes.empty()) return {};
+    auto convert = [&](UINT code_page, DWORD flags) -> std::optional<std::string> {
+        const int needed = MultiByteToWideChar(code_page, flags, bytes.data(),
+                                               static_cast<int>(bytes.size()),
+                                               nullptr, 0);
+        if (needed <= 0) return std::nullopt;
+        std::wstring wide(static_cast<std::size_t>(needed), L'\0');
+        if (MultiByteToWideChar(code_page, flags, bytes.data(),
+                                static_cast<int>(bytes.size()), wide.data(),
+                                needed) <= 0) {
+            return std::nullopt;
+        }
+        return wide_to_utf8_system(wide);
+    };
+    if (auto utf8 = convert(CP_UTF8, MB_ERR_INVALID_CHARS)) return *utf8;
+    if (auto ansi = convert(CP_ACP, 0)) return *ansi;
+    return std::string(bytes);
+}
+
+std::wstring quote_windows_argument(std::wstring_view argument) {
+    if (argument.empty()) return L"\"\"";
+    const bool needs_quotes = argument.find_first_of(L" \t\n\v\"") != std::wstring_view::npos;
+    if (!needs_quotes) return std::wstring(argument);
+    std::wstring result = L"\"";
+    unsigned backslashes = 0;
+    for (wchar_t ch : argument) {
+        if (ch == L'\\') {
+            ++backslashes;
+            continue;
+        }
+        if (ch == L'"') {
+            result.append(backslashes * 2 + 1, L'\\');
+            result.push_back(ch);
+            backslashes = 0;
+            continue;
+        }
+        result.append(backslashes, L'\\');
+        backslashes = 0;
+        result.push_back(ch);
+    }
+    result.append(backslashes * 2, L'\\');
+    result.push_back(L'"');
+    return result;
+}
+
+std::wstring build_windows_command_line(const fs::path& executable,
+                                        const std::vector<std::wstring>& arguments) {
+    std::wstring command = quote_windows_argument(executable.wstring());
+    for (const auto& argument : arguments) {
+        command.push_back(L' ');
+        command += quote_windows_argument(argument);
+    }
+    return command;
+}
+
+std::optional<fs::path> system_tar_executable() {
+    wchar_t system_dir[MAX_PATH]{};
+    const UINT length = GetSystemDirectoryW(system_dir, MAX_PATH);
+    if (length != 0 && length < MAX_PATH) {
+        fs::path candidate = fs::path(system_dir) / L"tar.exe";
+        std::error_code ec;
+        if (fs::exists(candidate, ec)) return candidate;
+    }
+    wchar_t found[MAX_PATH]{};
+    if (SearchPathW(nullptr, L"tar.exe", nullptr, MAX_PATH, found, nullptr) > 0) {
+        return fs::path(found);
+    }
+    return std::nullopt;
+}
+
+struct SystemProcessResult {
+    DWORD exit_code = 0;
+    std::string output;
+};
+
+SystemProcessResult run_system_tar_process(
+    const std::vector<std::wstring>& arguments,
+    bool capture_stdout,
+    const std::shared_ptr<OperationControl>& operation) {
+    const auto executable = system_tar_executable();
+    if (!executable) {
+        throw std::runtime_error("Windows tar.exe was not found; this archive reader is unavailable");
+    }
+
+    SECURITY_ATTRIBUTES security{};
+    security.nLength = sizeof(security);
+    security.bInheritHandle = TRUE;
+
+    HANDLE read_pipe = nullptr;
+    HANDLE write_pipe = nullptr;
+    if (!CreatePipe(&read_pipe, &write_pipe, &security, 0)) {
+        throw std::runtime_error("failed to create process pipe");
+    }
+    SetHandleInformation(read_pipe, HANDLE_FLAG_INHERIT, 0);
+
+    HANDLE null_output = nullptr;
+    if (!capture_stdout) {
+        null_output = CreateFileW(L"NUL", GENERIC_WRITE,
+                                  FILE_SHARE_READ | FILE_SHARE_WRITE, &security,
+                                  OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (null_output == INVALID_HANDLE_VALUE) {
+            CloseHandle(read_pipe);
+            CloseHandle(write_pipe);
+            throw std::runtime_error("failed to open NUL for process output");
+        }
+    }
+
+    STARTUPINFOW startup{};
+    startup.cb = sizeof(startup);
+    startup.dwFlags = STARTF_USESTDHANDLES;
+    startup.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+    startup.hStdOutput = capture_stdout ? write_pipe : null_output;
+    startup.hStdError = write_pipe;
+
+    PROCESS_INFORMATION process{};
+    std::wstring command_line = build_windows_command_line(*executable, arguments);
+    std::vector<wchar_t> mutable_command(command_line.begin(), command_line.end());
+    mutable_command.push_back(L'\0');
+    const BOOL created = CreateProcessW(
+        executable->c_str(), mutable_command.data(), nullptr, nullptr, TRUE,
+        CREATE_NO_WINDOW, nullptr, nullptr, &startup, &process);
+
+    CloseHandle(write_pipe);
+    if (null_output != nullptr && null_output != INVALID_HANDLE_VALUE) {
+        CloseHandle(null_output);
+    }
+    if (!created) {
+        CloseHandle(read_pipe);
+        throw std::runtime_error("failed to start Windows tar.exe");
+    }
+    CloseHandle(process.hThread);
+
+    std::string output;
+    std::array<char, 4096> buffer{};
+    DWORD exit_code = STILL_ACTIVE;
+    bool process_running = true;
+    while (true) {
+        try {
+            operation_checkpoint(operation);
+        } catch (...) {
+            TerminateProcess(process.hProcess, ERROR_CANCELLED);
+            CloseHandle(read_pipe);
+            CloseHandle(process.hProcess);
+            throw;
+        }
+        DWORD available = 0;
+        while (PeekNamedPipe(read_pipe, nullptr, 0, nullptr, &available, nullptr) &&
+               available != 0) {
+            DWORD read = 0;
+            if (!ReadFile(read_pipe, buffer.data(),
+                          static_cast<DWORD>(std::min<std::size_t>(buffer.size(), available)),
+                          &read, nullptr) || read == 0) {
+                break;
+            }
+            output.append(buffer.data(), buffer.data() + read);
+            if (output.size() > (64u << 20)) {
+                TerminateProcess(process.hProcess, ERROR_NOT_ENOUGH_MEMORY);
+                CloseHandle(read_pipe);
+                CloseHandle(process.hProcess);
+                throw std::runtime_error("system archive reader produced too much output");
+            }
+        }
+
+        if (process_running &&
+            WaitForSingleObject(process.hProcess, 25) == WAIT_OBJECT_0) {
+            process_running = false;
+            GetExitCodeProcess(process.hProcess, &exit_code);
+        }
+        if (!process_running) {
+            DWORD read = 0;
+            while (ReadFile(read_pipe, buffer.data(), static_cast<DWORD>(buffer.size()),
+                            &read, nullptr) && read != 0) {
+                output.append(buffer.data(), buffer.data() + read);
+            }
+            break;
+        }
+    }
+
+    CloseHandle(read_pipe);
+    CloseHandle(process.hProcess);
+    return {exit_code, process_output_to_utf8(output)};
+}
+
+std::runtime_error system_archive_error(std::string action, const SystemProcessResult& result) {
+    std::string message = "system archive reader failed while " + std::move(action);
+    if (!result.output.empty()) {
+        message += ": " + result.output;
+    }
+    return std::runtime_error(message);
+}
+
+std::vector<std::string> split_lines(std::string_view text) {
+    std::vector<std::string> result;
+    std::size_t start = 0;
+    while (start < text.size()) {
+        std::size_t end = text.find('\n', start);
+        if (end == std::string_view::npos) end = text.size();
+        std::string line(text.substr(start, end - start));
+        while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) {
+            line.pop_back();
+        }
+        if (!line.empty()) result.push_back(std::move(line));
+        start = end + 1;
+    }
+    return result;
+}
+
+std::string trim_copy(std::string text) {
+    while (!text.empty() &&
+           (text.front() == ' ' || text.front() == '\t' || text.front() == '\r')) {
+        text.erase(text.begin());
+    }
+    while (!text.empty() &&
+           (text.back() == ' ' || text.back() == '\t' || text.back() == '\r')) {
+        text.pop_back();
+    }
+    return text;
+}
+
+std::optional<ArchiveEntry> parse_system_archive_verbose_line(const std::string& line) {
+    std::array<std::string_view, 8> fields{};
+    std::size_t cursor = 0;
+    for (std::size_t index = 0; index < fields.size(); ++index) {
+        while (cursor < line.size() && std::isspace(static_cast<unsigned char>(line[cursor]))) {
+            ++cursor;
+        }
+        const std::size_t start = cursor;
+        while (cursor < line.size() && !std::isspace(static_cast<unsigned char>(line[cursor]))) {
+            ++cursor;
+        }
+        if (start == cursor) return std::nullopt;
+        fields[index] = std::string_view(line).substr(start, cursor - start);
+    }
+    std::string path = trim_copy(std::string(std::string_view(line).substr(cursor)));
+    if (path.empty()) return std::nullopt;
+
+    ArchiveEntry entry;
+    entry.is_directory = !fields[0].empty() && fields[0].front() == 'd';
+    entry.is_symlink = !fields[0].empty() && fields[0].front() == 'l';
+    try {
+        entry.size = static_cast<std::uint64_t>(std::stoull(std::string(fields[4])));
+    } catch (...) {
+        entry.size = 0;
+    }
+    const auto link_separator = path.find(" -> ");
+    if (entry.is_symlink && link_separator != std::string::npos) {
+        entry.link_target = path.substr(link_separator + 4);
+        path.resize(link_separator);
+    }
+    while (path.size() > 1 && path.back() == '/') {
+        entry.is_directory = true;
+        path.pop_back();
+    }
+    entry.path = path;
+    if (!is_safe_relative(entry.path)) {
+        throw FormatError("archive contains an unsafe path: " + entry.path);
+    }
+    return entry;
+}
+
+bool system_entry_selected(const ArchiveEntry& entry,
+                           const std::vector<std::string>& wanted) {
+    if (wanted.empty()) return true;
+    for (const auto& target : wanted) {
+        if (entry.path == target || is_same_or_child(entry.path, target)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+class TemporaryDirectoryGuard {
+public:
+    explicit TemporaryDirectoryGuard(fs::path path) : path_(std::move(path)) {}
+    ~TemporaryDirectoryGuard() {
+        if (!path_.empty()) {
+            std::error_code ignored;
+            fs::remove_all(path_, ignored);
+        }
+    }
+    const fs::path& path() const { return path_; }
+private:
+    fs::path path_;
+};
+
+fs::path unique_temp_path(std::wstring_view prefix) {
+    fs::path root = fs::temp_directory_path();
+    for (int attempt = 0; attempt < 100; ++attempt) {
+        SYSTEMTIME now{};
+        GetSystemTime(&now);
+        const std::wstring name =
+            std::wstring(prefix) + L"-" + std::to_wstring(GetCurrentProcessId()) +
+            L"-" + std::to_wstring(GetTickCount64()) + L"-" + std::to_wstring(attempt);
+        fs::path candidate = root / name;
+        std::error_code ec;
+        if (!fs::exists(candidate, ec)) return candidate;
+    }
+    throw std::runtime_error("could not allocate a temporary path");
+}
+
+void write_system_archive_list_file(const fs::path& path,
+                                    const std::vector<std::string>& entries) {
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    if (!out) {
+        throw std::runtime_error("cannot write archive selection list");
+    }
+    for (const auto& entry : entries) {
+        out.write(entry.data(), static_cast<std::streamsize>(entry.size()));
+        out.put('\n');
+    }
+}
+
+class SystemArchiveProvider final : public ArchiveProvider {
+public:
+    SystemArchiveProvider(std::size_t format_index,
+                          bool (*signature_match)(const fs::path&),
+                          bool (*extension_match)(const fs::path&))
+        : format_index_(format_index),
+          signature_match_(signature_match),
+          extension_match_(extension_match) {}
+
+    const ArchiveFormatInfo& info() const override {
+        return kArchiveFormats[format_index_];
+    }
+
+    bool matches_path(const std::filesystem::path& path) const override {
+        return extension_match_(path);
+    }
+
+    bool matches_signature(const std::filesystem::path& path) const {
+        return signature_match_(path);
+    }
+
+    ArchiveCapabilities capabilities(const std::filesystem::path&,
+                                     const std::string&) const override {
+        ArchiveCapabilities result;
+        result.list = true;
+        result.extract = true;
+        result.test = true;
+        result.selective_extract = true;
+        result.metadata = true;
+        result.links = false;
+        result.packed_sizes = false;
+        return result;
+    }
+
+    std::vector<ArchiveEntry> list(const std::filesystem::path& archive_path,
+                                   const std::string&) const override {
+        const auto result = run_system_tar_process(
+            {L"-tvf", archive_path.wstring()}, true, nullptr);
+        if (result.exit_code != 0) {
+            throw system_archive_error("listing", result);
+        }
+        std::vector<ArchiveEntry> entries;
+        for (const auto& line : split_lines(result.output)) {
+            auto entry = parse_system_archive_verbose_line(line);
+            if (entry) entries.push_back(std::move(*entry));
+        }
+        if (entries.empty() && !result.output.empty()) {
+            throw FormatError("system archive listing could not be parsed");
+        }
+        return entries;
+    }
+
+    void test(const std::filesystem::path& archive_path,
+              const DecompressionOptions& options) const override {
+        report_operation(options.operation, OperationStage::testing, 0, 0, 0, 1,
+                         archive_path.filename().string());
+        const auto result = run_system_tar_process(
+            {L"-tf", archive_path.wstring()}, false, options.operation);
+        if (result.exit_code != 0) {
+            throw system_archive_error("testing", result);
+        }
+        report_operation(options.operation, OperationStage::testing, 1, 1, 1, 1,
+                         archive_path.filename().string());
+    }
+
+    void extract_all(const std::filesystem::path& archive_path,
+                     const std::filesystem::path& dest_dir,
+                     const ExtractOptions& options) const override {
+        extract_matching(archive_path, {}, dest_dir, options);
+    }
+
+    void extract_selected(const std::filesystem::path& archive_path,
+                          const std::vector<std::string>& entries,
+                          const std::filesystem::path& dest_dir,
+                          const ExtractOptions& options) const override {
+        extract_matching(archive_path, entries, dest_dir, options);
+    }
+
+    void create(const std::vector<std::filesystem::path>&,
+                const std::filesystem::path&,
+                const CompressionOptions&) const override {
+        throw std::runtime_error("archive format is read-only");
+    }
+
+    void add(const std::vector<std::filesystem::path>&,
+             const std::filesystem::path&,
+             const CompressionOptions&) const override {
+        throw std::runtime_error("archive format is read-only");
+    }
+
+    void add_mapped(const std::vector<ArchiveInput>&,
+                    const std::filesystem::path&,
+                    const CompressionOptions&) const override {
+        throw std::runtime_error("archive format is read-only");
+    }
+
+    void update(const std::vector<std::filesystem::path>&,
+                const std::filesystem::path&,
+                const CompressionOptions&,
+                bool) const override {
+        throw std::runtime_error("archive format is read-only");
+    }
+
+    void sync(const std::vector<std::filesystem::path>&,
+              const std::filesystem::path&,
+              const CompressionOptions&) const override {
+        throw std::runtime_error("archive format is read-only");
+    }
+
+    void delete_entries(const std::filesystem::path&,
+                        const std::vector<std::string>&,
+                        const CompressionOptions&) const override {
+        throw std::runtime_error("archive format is read-only");
+    }
+
+private:
+    void extract_matching(const std::filesystem::path& archive_path,
+                          const std::vector<std::string>& wanted,
+                          const std::filesystem::path& dest_dir,
+                          const ExtractOptions& options) const {
+        operation_checkpoint(options.operation);
+        auto entries = list(archive_path, options.password);
+        std::vector<ArchiveEntry> selected;
+        std::uint64_t total_bytes = 0;
+        for (const auto& entry : entries) {
+            if (!system_entry_selected(entry, wanted)) continue;
+            if (entry.is_symlink || entry.is_hardlink) {
+                throw FormatError("system archive reader does not restore links yet: " +
+                                  entry.path);
+            }
+            selected.push_back(entry);
+            if (!entry.is_directory) total_bytes += entry.size;
+        }
+        if (selected.empty() && !wanted.empty()) {
+            throw std::runtime_error("selected archive entries were not found");
+        }
+        report_operation(options.operation, OperationStage::extracting, 0, total_bytes,
+                         0, selected.size());
+
+        std::error_code ec;
+        fs::create_directories(dest_dir, ec);
+        if (ec) {
+            throw std::runtime_error("cannot create destination directory: " + ec.message());
+        }
+        const fs::path dest_norm = dest_dir.lexically_normal();
+        for (const auto& entry : selected) {
+            const fs::path target = (dest_dir / fs::path(utf8_to_wide_system(entry.path))).lexically_normal();
+            if (!is_within(dest_norm, target)) {
+                throw FormatError("archive path escapes the destination: " + entry.path);
+            }
+            reject_symlinked_ancestor(dest_norm, target);
+            if (!entry.is_directory && fs::exists(target, ec) &&
+                options.overwrite == ExtractOptions::Overwrite::fail) {
+                throw std::runtime_error("target already exists: " + target.string());
+            }
+        }
+
+        const fs::path staging_path = unique_temp_path(L"AxiomSystemArchive");
+        fs::create_directories(staging_path, ec);
+        if (ec) {
+            throw std::runtime_error("cannot create archive extraction staging directory: " +
+                                     ec.message());
+        }
+        TemporaryDirectoryGuard staging(staging_path);
+
+        std::vector<std::wstring> arguments{L"-xf", archive_path.wstring(),
+                                            L"-C", staging.path().wstring()};
+        fs::path selection_file;
+        std::unique_ptr<TempFileGuard> selection_guard;
+        if (!wanted.empty()) {
+            std::vector<std::string> paths;
+            paths.reserve(selected.size());
+            for (const auto& entry : selected) {
+                paths.push_back(entry.path);
+            }
+            selection_file = unique_temp_path(L"AxiomArchiveSelection");
+            write_system_archive_list_file(selection_file, paths);
+            selection_guard = std::make_unique<TempFileGuard>(selection_file);
+            arguments.push_back(L"-T");
+            arguments.push_back(selection_file.wstring());
+        }
+        const auto result = run_system_tar_process(arguments, true, options.operation);
+        if (result.exit_code != 0) {
+            throw system_archive_error("extracting", result);
+        }
+
+        std::uint64_t completed_bytes = 0;
+        std::uint64_t completed_items = 0;
+        for (const auto& entry : selected) {
+            operation_checkpoint(options.operation);
+            const fs::path relative = fs::path(utf8_to_wide_system(entry.path));
+            const fs::path source = (staging.path() / relative).lexically_normal();
+            const fs::path target = (dest_dir / relative).lexically_normal();
+            if (entry.is_directory) {
+                fs::create_directories(target, ec);
+            } else {
+                if (!fs::exists(source, ec)) {
+                    // Some archive readers omit explicit directory entries or normalize
+                    // names; skip missing directories, but fail missing files.
+                    throw std::runtime_error("system archive reader did not extract: " +
+                                             entry.path);
+                }
+                fs::create_directories(target.parent_path(), ec);
+                if (fs::exists(target, ec)) {
+                    if (options.overwrite == ExtractOptions::Overwrite::skip) {
+                        completed_bytes += entry.size;
+                        ++completed_items;
+                        report_operation(options.operation, OperationStage::extracting,
+                                         completed_bytes, total_bytes,
+                                         completed_items, selected.size(), entry.path);
+                        continue;
+                    }
+                    if (fs::is_directory(target, ec)) {
+                        throw std::runtime_error("target is a directory: " + target.string());
+                    }
+                    fs::remove(target, ec);
+                }
+                fs::copy_file(source, target, fs::copy_options::overwrite_existing, ec);
+                if (ec) {
+                    throw std::runtime_error("failed to copy extracted file: " + ec.message());
+                }
+                completed_bytes += entry.size;
+            }
+            ++completed_items;
+            report_operation(options.operation, OperationStage::extracting,
+                             completed_bytes, total_bytes,
+                             completed_items, selected.size(), entry.path);
+        }
+        report_operation(options.operation, OperationStage::extracting,
+                         total_bytes, total_bytes, selected.size(), selected.size());
+    }
+
+    std::size_t format_index_ = 0;
+    bool (*signature_match_)(const fs::path&) = nullptr;
+    bool (*extension_match_)(const fs::path&) = nullptr;
+};
+
+#endif  // moved system provider block
+#endif  // _WIN32
+
 const AxarArchiveProvider kAxarProvider;
 const ZipArchiveProvider kZipProvider;
 const std::array<const ArchiveProvider*, 2> kArchiveProviders{&kAxarProvider, &kZipProvider};
@@ -6233,6 +6979,11 @@ const ArchiveProvider* archive_provider_for_path(const std::filesystem::path& pa
     if (looks_like_zip_file(path)) {
         return &kZipProvider;
     }
+#ifdef _WIN32
+    if (const auto* provider = system_archive_provider_for_path(path)) {
+        return provider;
+    }
+#endif
     for (const auto* provider : kArchiveProviders) {
         if (provider->matches_path(path)) {
             return provider;

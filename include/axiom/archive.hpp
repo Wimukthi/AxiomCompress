@@ -33,6 +33,11 @@ struct ArchiveEntry {
 enum class ArchiveFormat {
     axar,
     zip,
+    seven_z,
+    rar,
+    tar,
+    iso,
+    cab,
 };
 
 struct ArchiveFormatInfo {

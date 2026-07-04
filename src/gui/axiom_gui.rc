@@ -3,10 +3,16 @@
 #include "resource.hpp"
 
 IDI_AXIOM ICON "..\\..\\Icons\\axiom.ico"
+IDI_ARCHIVE_ZIP ICON "..\\..\\Icons\\archive_zip.ico"
+IDI_ARCHIVE_7Z ICON "..\\..\\Icons\\archive_7z.ico"
+IDI_ARCHIVE_RAR ICON "..\\..\\Icons\\archive_rar.ico"
+IDI_ARCHIVE_TAR ICON "..\\..\\Icons\\archive_tar.ico"
+IDI_ARCHIVE_ISO ICON "..\\..\\Icons\\archive_iso.ico"
+IDI_ARCHIVE_CAB ICON "..\\..\\Icons\\archive_cab.ico"
 
 VS_VERSION_INFO VERSIONINFO
- FILEVERSION 0,2,1,0
- PRODUCTVERSION 0,2,1,0
+ FILEVERSION 0,2,2,0
+ PRODUCTVERSION 0,2,2,0
  FILEFLAGSMASK 0x3fL
 #ifdef _DEBUG
  FILEFLAGS 0x1L
@@ -23,11 +29,11 @@ BEGIN
         BEGIN
             VALUE "CompanyName", "Wimukthi Bandara"
             VALUE "FileDescription", "Axiom native archive manager"
-            VALUE "FileVersion", "0.2.1.0"
+            VALUE "FileVersion", "0.2.2.0"
             VALUE "InternalName", "Axiom"
             VALUE "OriginalFilename", "Axiom.exe"
             VALUE "ProductName", "Axiom"
-            VALUE "ProductVersion", "0.2.1.0"
+            VALUE "ProductVersion", "0.2.2.0"
         END
     END
     BLOCK "VarFileInfo"

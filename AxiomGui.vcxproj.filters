@@ -102,6 +102,12 @@
     <ResourceCompile Include="src\gui\axiom_gui.rc"><Filter>Resource Files</Filter></ResourceCompile>
   </ItemGroup>
   <ItemGroup>
+    <Image Include="Icons\archive_7z.ico"><Filter>Resource Files</Filter></Image>
+    <Image Include="Icons\archive_cab.ico"><Filter>Resource Files</Filter></Image>
+    <Image Include="Icons\archive_iso.ico"><Filter>Resource Files</Filter></Image>
+    <Image Include="Icons\archive_rar.ico"><Filter>Resource Files</Filter></Image>
+    <Image Include="Icons\archive_tar.ico"><Filter>Resource Files</Filter></Image>
+    <Image Include="Icons\archive_zip.ico"><Filter>Resource Files</Filter></Image>
     <Image Include="Icons\axiom.ico"><Filter>Resource Files</Filter></Image>
     <Image Include="Icons\axiom.png"><Filter>Resource Files</Filter></Image>
   </ItemGroup>

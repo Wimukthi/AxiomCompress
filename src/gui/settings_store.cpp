@@ -191,6 +191,12 @@ PersistedGuiSettings load_gui_settings() {
         read_bool(key, L"WipeEncryptedTempFiles", true);
     settings.application.trusted_keys_folder = read_string(key, L"TrustedKeysFolder");
     settings.application.associate_axar = read_bool(key, L"AssociateAxar", false);
+    settings.application.associate_zip = read_bool(key, L"AssociateZip", false);
+    settings.application.associate_7z = read_bool(key, L"Associate7z", false);
+    settings.application.associate_rar = read_bool(key, L"AssociateRar", false);
+    settings.application.associate_tar = read_bool(key, L"AssociateTar", false);
+    settings.application.associate_iso = read_bool(key, L"AssociateIso", false);
+    settings.application.associate_cab = read_bool(key, L"AssociateCab", false);
     settings.application.context_open = read_bool(key, L"ContextOpen", false);
     settings.application.context_add = read_bool(key, L"ContextAdd", false);
     settings.application.context_extract = read_bool(key, L"ContextExtract", false);
@@ -317,6 +323,12 @@ void save_gui_settings(const PersistedGuiSettings& settings) {
                 settings.application.wipe_encrypted_temp_files ? 1 : 0);
     write_string(key, L"TrustedKeysFolder", settings.application.trusted_keys_folder);
     write_dword(key, L"AssociateAxar", settings.application.associate_axar ? 1 : 0);
+    write_dword(key, L"AssociateZip", settings.application.associate_zip ? 1 : 0);
+    write_dword(key, L"Associate7z", settings.application.associate_7z ? 1 : 0);
+    write_dword(key, L"AssociateRar", settings.application.associate_rar ? 1 : 0);
+    write_dword(key, L"AssociateTar", settings.application.associate_tar ? 1 : 0);
+    write_dword(key, L"AssociateIso", settings.application.associate_iso ? 1 : 0);
+    write_dword(key, L"AssociateCab", settings.application.associate_cab ? 1 : 0);
     write_dword(key, L"ContextOpen", settings.application.context_open ? 1 : 0);
     write_dword(key, L"ContextAdd", settings.application.context_add ? 1 : 0);
     write_dword(key, L"ContextExtract", settings.application.context_extract ? 1 : 0);

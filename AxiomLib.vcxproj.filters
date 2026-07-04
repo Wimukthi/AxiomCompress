@@ -27,6 +27,9 @@
     <ClInclude Include="include\axiom\archive.hpp">
       <Filter>Public Headers</Filter>
     </ClInclude>
+    <ClInclude Include="src\archive\system_provider.hpp">
+      <Filter>Archive</Filter>
+    </ClInclude>
     <ClInclude Include="src\codec\lz77.hpp">
       <Filter>Codec</Filter>
     </ClInclude>
@@ -102,6 +105,9 @@
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="src\archive\container.cpp">
+      <Filter>Archive</Filter>
+    </ClCompile>
+    <ClCompile Include="src\archive\system_provider.cpp">
       <Filter>Archive</Filter>
     </ClCompile>
     <ClCompile Include="src\codec\lz77.cpp">

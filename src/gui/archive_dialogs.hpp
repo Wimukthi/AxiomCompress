@@ -85,6 +85,12 @@ struct ApplicationDialogOptions {
     bool wipe_encrypted_temp_files = true;
     std::wstring trusted_keys_folder;
     bool associate_axar = false;
+    bool associate_zip = false;
+    bool associate_7z = false;
+    bool associate_rar = false;
+    bool associate_tar = false;
+    bool associate_iso = false;
+    bool associate_cab = false;
     bool context_open = false;
     bool context_add = false;
     bool context_extract = false;

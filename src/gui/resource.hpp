@@ -1,4 +1,10 @@
 #pragma once
 
 #define IDI_AXIOM 100
+#define IDI_ARCHIVE_ZIP 101
+#define IDI_ARCHIVE_7Z 102
+#define IDI_ARCHIVE_RAR 103
+#define IDI_ARCHIVE_TAR 104
+#define IDI_ARCHIVE_ISO 105
+#define IDI_ARCHIVE_CAB 106
 

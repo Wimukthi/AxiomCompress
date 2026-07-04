@@ -31,6 +31,7 @@ set(MINIZ_SOURCES
 
 add_library(axiom STATIC
     src/archive/container.cpp
+    src/archive/system_provider.cpp
     src/codec/block.cpp
     src/codec/fast_lz.cpp
     src/codec/lz77.cpp

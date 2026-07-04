@@ -14,6 +14,7 @@
 #include "gui/message_dialog.hpp"
 #include "gui/operation_runner.hpp"
 #include "gui/operation_progress_window.hpp"
+#include "gui/resource.hpp"
 #include "gui/settings_store.hpp"
 #include "gui/sfx_dialog.hpp"
 #include "gui/toolbar_icons.hpp"
@@ -7364,6 +7365,12 @@ private:
                 previous.wipe_encrypted_temp_files;
         const bool shell_options_changed =
             application_options_.associate_axar != previous.associate_axar ||
+            application_options_.associate_zip != previous.associate_zip ||
+            application_options_.associate_7z != previous.associate_7z ||
+            application_options_.associate_rar != previous.associate_rar ||
+            application_options_.associate_tar != previous.associate_tar ||
+            application_options_.associate_iso != previous.associate_iso ||
+            application_options_.associate_cab != previous.associate_cab ||
             application_options_.context_open != previous.context_open ||
             application_options_.context_add != previous.context_add ||
             application_options_.context_extract != previous.context_extract ||
@@ -7419,24 +7426,82 @@ private:
     void apply_shell_integration() const {
         const fs::path executable = current_executable_path();
         if (executable.empty()) return;
-        constexpr wchar_t prog_id[] = L"AxiomCompress.Archive";
         const std::wstring classes = L"Software\\Classes\\";
-        const std::wstring axar_key = classes + L".axar";
-        const std::wstring prog_key = classes + prog_id;
         const std::wstring axar_context = classes + L"SystemFileAssociations\\.axar\\shell\\";
 
-        if (application_options_.associate_axar) {
-            set_registry_string(HKEY_CURRENT_USER, axar_key, nullptr, prog_id);
-            set_registry_string(HKEY_CURRENT_USER, prog_key, nullptr, L"Axiom archive");
-            set_registry_string(HKEY_CURRENT_USER, prog_key + L"\\DefaultIcon", nullptr,
-                                quote_argument(executable) + L",0");
-            set_registry_string(HKEY_CURRENT_USER, prog_key + L"\\shell\\open\\command", nullptr,
-                                quoted_executable_command(executable, L"\"%1\""));
-        } else {
-            if (registry_string(HKEY_CURRENT_USER, axar_key, nullptr) == prog_id) {
-                delete_registry_tree(HKEY_CURRENT_USER, axar_key);
+        const auto apply_association =
+            [&](bool enabled, const std::wstring& extension,
+                const std::wstring& prog_id, const std::wstring& file_type,
+                int icon_index = 0) {
+                const std::wstring extension_key = classes + extension;
+                const std::wstring prog_key = classes + prog_id;
+                if (enabled) {
+                    set_registry_string(HKEY_CURRENT_USER, extension_key, nullptr, prog_id);
+                    set_registry_string(HKEY_CURRENT_USER, prog_key, nullptr, file_type);
+                    set_registry_string(HKEY_CURRENT_USER, prog_key + L"\\DefaultIcon", nullptr,
+                                        quote_argument(executable) + L"," +
+                                            std::to_wstring(icon_index));
+                    set_registry_string(HKEY_CURRENT_USER,
+                                        prog_key + L"\\shell\\open\\command", nullptr,
+                                        quoted_executable_command(executable, L"\"%1\""));
+                } else {
+                    if (registry_string(HKEY_CURRENT_USER, extension_key, nullptr) == prog_id) {
+                        delete_registry_tree(HKEY_CURRENT_USER, extension_key);
+                    }
+                    delete_registry_tree(HKEY_CURRENT_USER, prog_key);
+                }
+            };
+        const auto apply_many =
+            [&](bool enabled, std::initializer_list<const wchar_t*> extensions,
+                const std::wstring& prog_prefix, const std::wstring& file_type,
+                int icon_index = 0) {
+                for (const wchar_t* extension : extensions) {
+                    std::wstring suffix = extension;
+                    if (!suffix.empty() && suffix.front() == L'.') suffix.erase(suffix.begin());
+                    apply_association(enabled, extension,
+                                      prog_prefix + L"." + suffix,
+                                      file_type, icon_index);
+                }
+            };
+
+        apply_association(application_options_.associate_axar, L".axar",
+                          L"AxiomCompress.Archive", L"Axiom archive", -IDI_AXIOM);
+        apply_many(application_options_.associate_zip,
+                   {L".zip", L".jar", L".war", L".apk"},
+                   L"AxiomCompress.Zip", L"ZIP archive", -IDI_ARCHIVE_ZIP);
+        apply_association(application_options_.associate_7z, L".7z",
+                          L"AxiomCompress.7z", L"7z archive", -IDI_ARCHIVE_7Z);
+        apply_many(application_options_.associate_rar,
+                   {L".rar", L".r00", L".r01", L".r02", L".r03", L".r04",
+                    L".r05", L".r06", L".r07", L".r08", L".r09"},
+                   L"AxiomCompress.Rar", L"RAR archive", -IDI_ARCHIVE_RAR);
+        apply_many(application_options_.associate_tar,
+                   {L".tar", L".tgz", L".txz", L".tbz2", L".tzst"},
+                   L"AxiomCompress.Tar", L"TAR archive", -IDI_ARCHIVE_TAR);
+        apply_association(application_options_.associate_iso, L".iso",
+                          L"AxiomCompress.Iso", L"ISO image", -IDI_ARCHIVE_ISO);
+        apply_association(application_options_.associate_cab, L".cab",
+                          L"AxiomCompress.Cab", L"CAB archive", -IDI_ARCHIVE_CAB);
+
+        if (!application_options_.associate_tar) {
+            for (const wchar_t* extension :
+                 {L".tar.gz", L".tar.xz", L".tar.bz2", L".tar.zst"}) {
+                const std::wstring extension_key = classes + extension;
+                const std::wstring prog_id =
+                    L"AxiomCompress.Tar." + std::wstring(extension + 1);
+                if (registry_string(HKEY_CURRENT_USER, extension_key, nullptr) == prog_id) {
+                    delete_registry_tree(HKEY_CURRENT_USER, extension_key);
+                }
+                delete_registry_tree(HKEY_CURRENT_USER, classes + prog_id);
             }
-            delete_registry_tree(HKEY_CURRENT_USER, prog_key);
+        } else {
+            for (const wchar_t* extension :
+                 {L".tar.gz", L".tar.xz", L".tar.bz2", L".tar.zst"}) {
+                const std::wstring prog_id =
+                    L"AxiomCompress.Tar." + std::wstring(extension + 1);
+                apply_association(true, extension, prog_id, L"TAR archive",
+                                  -IDI_ARCHIVE_TAR);
+            }
         }
 
         apply_shell_command(application_options_.context_open,
@@ -7723,6 +7788,22 @@ private:
         const auto* archive_provider = axiom::archive_provider_for_path(archive);
         if (archive_provider == nullptr) {
             show_app_message(L"Choose a supported archive format (.axar or .zip).",
+                             axiom::gui::MessageDialogIcon::warning,
+                             L"Archive format");
+            return;
+        }
+        const auto provider_capabilities = archive_provider->capabilities(archive);
+        if (!provider_capabilities.create &&
+            pending_archive_features_.update_mode == axiom::gui::ArchiveUpdateMode::create_new) {
+            show_app_message(
+                L"This format is read-only in Axiom. Create .axar or .zip archives instead.",
+                axiom::gui::MessageDialogIcon::warning,
+                L"Archive format");
+            return;
+        }
+        if (!provider_capabilities.update &&
+            pending_archive_features_.update_mode != axiom::gui::ArchiveUpdateMode::create_new) {
+            show_app_message(L"This archive format is read-only and cannot be updated.",
                              axiom::gui::MessageDialogIcon::warning,
                              L"Archive format");
             return;
@@ -8972,6 +9053,22 @@ private:
         if (archive_provider == nullptr) {
             show_message(L"Choose a supported archive format (.axar or .zip).",
                          axiom::gui::MessageDialogIcon::warning, L"Archive format");
+            return false;
+        }
+        const auto provider_capabilities = archive_provider->capabilities(archive);
+        if (!provider_capabilities.create &&
+            dialog_options.features.update_mode == axiom::gui::ArchiveUpdateMode::create_new) {
+            show_message(
+                L"This format is read-only in Axiom. Create .axar or .zip archives instead.",
+                axiom::gui::MessageDialogIcon::warning,
+                L"Archive format");
+            return false;
+        }
+        if (!provider_capabilities.update &&
+            dialog_options.features.update_mode != axiom::gui::ArchiveUpdateMode::create_new) {
+            show_message(L"This archive format is read-only and cannot be updated.",
+                         axiom::gui::MessageDialogIcon::warning,
+                         L"Archive format");
             return false;
         }
 

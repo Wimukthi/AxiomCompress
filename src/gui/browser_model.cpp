@@ -259,7 +259,7 @@ std::shared_ptr<const ArchiveCatalog> ArchiveCatalog::load(const fs::path& path,
                                                            const std::string& password) {
     const auto* provider = axiom::archive_provider_for_path(path);
     if (provider == nullptr) {
-        throw std::runtime_error("unsupported archive format: " + path.string());
+        throw std::runtime_error("unsupported archive format");
     }
     auto capabilities = provider->capabilities(path, password);
     return std::shared_ptr<const ArchiveCatalog>(new ArchiveCatalog(
