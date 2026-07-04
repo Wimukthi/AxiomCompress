@@ -120,6 +120,7 @@ struct CompressionOptions {
     std::size_t optimal_parse_limit = 64u << 20;
     std::size_t block_size = 4u << 20;
     std::size_t thread_count = 0;
+    std::size_t io_buffer_size = 0;  // 0 = automatic.
     // When thread_count is zero, the CLI/library default is "use the machine".
     // This flag lets the parallel block codec reduce an oversized preset block
     // size so there is enough independent work to keep the selected workers busy.
@@ -257,6 +258,7 @@ inline constexpr std::size_t kDefaultMaxDecompressedSize = std::size_t{4} << 30;
 struct DecompressionOptions {
     std::size_t max_output_size = kDefaultMaxDecompressedSize;
     std::size_t thread_count = 0;
+    std::size_t io_buffer_size = 0;  // 0 = automatic.
     std::shared_ptr<OperationControl> operation;
     // Password for an encrypted archive (container blocks). Empty for plaintext
     // archives; required to read an encrypted one.

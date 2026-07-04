@@ -40,6 +40,7 @@ struct BrowserItem {
     std::wstring attributes;
     std::uint64_t size = 0;
     std::optional<std::uint64_t> packed_size;
+    bool packed_size_estimated = false;
     std::optional<std::uint32_t> crc32;
     std::filesystem::path filesystem_path;
     std::string archive_path;
@@ -65,6 +66,7 @@ public:
     const std::filesystem::path& path() const;
     const axiom::ArchiveProvider& provider() const;
     const axiom::ArchiveFormatInfo& format_info() const;
+    const std::vector<ArchiveEntry>& entries() const;
     const ArchiveCapabilities& capabilities() const;
     BrowserSnapshot list(const BrowserLocation& location, std::stop_token stop) const;
 

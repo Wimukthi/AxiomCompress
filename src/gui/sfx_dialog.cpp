@@ -127,6 +127,7 @@ public:
                                   L"Axiom Self-Extractor", style,
                                   x, y, width, height, owner, nullptr, instance, this);
         if (window_ == nullptr) return false;
+        restore_named_window_placement(window_, owner, L"SfxExtractDialog");
         const bool owner_was_enabled = disable_dialog_owner(owner);
         ShowWindow(window_, SW_SHOW);
         UpdateWindow(window_);
@@ -349,7 +350,12 @@ private:
         options_.thread_count = threads >= 0 && static_cast<std::size_t>(threads) < thread_values_.size()
             ? thread_values_[static_cast<std::size_t>(threads)] : 0;
         accepted_ = true;
-        DestroyWindow(window_);
+        close_dialog();
+    }
+
+    void close_dialog() {
+        save_named_window_placement(L"SfxExtractDialog", window_);
+        if (window_ != nullptr && IsWindow(window_)) DestroyWindow(window_);
     }
 
     LRESULT handle_message(UINT message, WPARAM wparam, LPARAM lparam) {
@@ -385,7 +391,7 @@ private:
                         toggle_checkbox(LOWORD(wparam));
                         return 0;
                     case IDOK: accept(); return 0;
-                    case IDCANCEL: DestroyWindow(window_); return 0;
+                    case IDCANCEL: close_dialog(); return 0;
                 }
                 break;
             case WM_DRAWITEM: {
@@ -424,7 +430,7 @@ private:
             }
             case WM_SETTINGCHANGE:
             case WM_THEMECHANGED: apply_theme(); return 0;
-            case WM_CLOSE: DestroyWindow(window_); return 0;
+            case WM_CLOSE: close_dialog(); return 0;
             case WM_NCDESTROY: window_ = nullptr; return 0;
         }
         return DefWindowProcW(window_, message, wparam, lparam);

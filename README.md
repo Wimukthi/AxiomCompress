@@ -115,7 +115,8 @@ web UI layers.
 The main window behaves like a file manager:
 
 - Browse filesystem folders and `.axar` archives.
-- Open `.zip` archives for browsing, testing, and extraction.
+- Open `.zip` archives for browsing, testing, extraction, and normal edit
+  operations.
 - Use the editable address dropdown for paths, drives, shell locations, recent
   folders, and history.
 - Sort and resize columns.
@@ -135,15 +136,23 @@ without turning Axiom into an external plug-in host before the API is stable.
 
 Current provider support:
 
-| Format | Browse | Extract | Test | Create/update |
+| Format | Browse | Extract | Test | Create/update/delete/move |
 |---|---:|---:|---:|---:|
 | AXAR | Yes | Yes | Yes | Yes |
-| ZIP | Yes | Yes, stored/deflated entries | Yes | Yes, for normal unencrypted ZIPs |
+| ZIP | Yes | Yes, stored/deflated entries | Yes | Yes, with limits for encrypted ZIPs |
 
-ZIP create/update/delete support rewrites the ZIP atomically through the archive
-provider layer. AXAR-only features such as archive comments, locking, recovery
-records, split volumes, signatures, SFX packaging, encrypted names, and Axiom
-metadata remain disabled when ZIP is selected.
+ZIP create/update/delete/move support rewrites the ZIP atomically through the
+archive provider layer and populates the Packed column from the ZIP central
+directory. AXAR populates Packed with a proportional estimate because solid
+blocks can contain data from several files; estimated values are marked with
+`≈`. New encrypted ZIPs use WinZip AES-256 file-data encryption. ZIP file names
+remain visible, and existing encrypted ZIPs are read/test/extract only for now.
+AXAR-only features such as archive comments, locking, recovery records, split
+volumes, signatures, SFX packaging, encrypted names, and Axiom metadata remain
+disabled when ZIP is selected.
+
+See [docs/FORMAT_SUPPORT.md](docs/FORMAT_SUPPORT.md) for the planned split
+between full read/write formats and view/extract-only formats.
 
 ### Archive operations
 
@@ -238,6 +247,8 @@ Common archive commands:
 axiomc a --level 9 archive.axar mydir
 axiomc a -p "password" archive.axar private-dir
 axiomc a -p "password" --encrypt-names hidden.axar private-dir
+axiomc a archive.zip mydir
+axiomc a -p "password" encrypted.zip private-dir
 axiomc recovery archive.axar 10
 axiomc repair archive.axar
 axiomc split archive.axar 100M 3
@@ -247,6 +258,10 @@ axiomc sign archive.axar secret.key
 axiomc verify archive.axar public.key
 axiomc sfx archive.axar archive.exe
 ```
+
+For `.zip` output, `-p/--password` creates WinZip AES-256 file-data encrypted
+entries. ZIP file names remain visible; use `.axar --encrypt-names` when names
+and directory metadata must be hidden.
 
 Single-stream `.axc` mode:
 
@@ -419,4 +434,10 @@ AxiomCompress is licensed under the GNU General Public License version 3. See
 [LICENSE](LICENSE).
 
 Vendored third-party components keep their license notices under
-`src/third_party`. ZIP container support uses miniz 3.1.1 under the MIT license.
+`src/third_party`. Current third-party components include:
+
+- miniz 3.1.1 for ZIP read/write support, under the MIT license.
+- Monocypher for cryptographic primitives, under the BSD 2-Clause license.
+- BLAKE3 for hashing and integrity primitives, under CC0/Apache-2.0 licensing.
+- A generated subset of Microsoft Fluent UI System Icons for the native GUI,
+  under the MIT license.

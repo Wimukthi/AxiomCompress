@@ -90,9 +90,11 @@ providers are:
 - `axar`: the native full read/write provider, adapting the existing archive API
   without changing the format or behavior;
 - `zip`: a miniz-backed provider for browsing, testing, extracting, creating,
-  adding, updating, synchronizing, and deleting entries in normal unencrypted ZIP
-  archives. Existing entries are preserved by cloning them into an atomically
-  rewritten ZIP.
+  adding, updating, synchronizing, deleting, and moving entries in normal ZIP
+  archives. New encrypted ZIPs use WinZip AES-256 file-data encryption.
+  Existing encrypted ZIPs can be listed, tested, and extracted with a password,
+  but are not edited in place yet. Existing unchanged plaintext entries are
+  preserved by cloning them into an atomically rewritten ZIP.
 
 The GUI asks the provider for:
 
@@ -111,10 +113,17 @@ parser trust model.
 The intended support split is:
 
 - full native support remains `.axar`;
-- ZIP has practical read/write support for normal unencrypted archives; comments,
-  encryption, rich attributes, and AXAR-specific services remain unsupported;
-- TAR-family providers can later support create/extract/update by rewriting as
-  needed;
+- ZIP has practical read/write support for plaintext archives, exact
+  central-directory packed sizes, and AES-256 file-data encryption for new ZIPs.
+  Existing encrypted ZIPs are read/test/extract only; comments, encrypted names,
+  rich attributes, and AXAR-specific services remain unsupported;
+- AXAR exposes per-file Packed values as estimates because files share solid
+  blocks; archive-level size and ratio remain exact in the information dialog;
+- plain TAR is the next realistic full-support provider because it can support
+  create/extract/update/delete/move through atomic rewrites without codec or
+  licensing complications;
+- compressed TAR variants should start with browse/extract/test/create, then add
+  update/delete/move only after the full-stream rewrite UX is clear;
 - 7z/RAR/ISO/CAB-style providers should start as view/extract/test providers
   unless their container semantics and licensing justify more.
 
@@ -123,8 +132,13 @@ small, build-system-friendly ZIP container reader/writer and Deflate/Inflate
 implementation. zlib-ng remains a reasonable future Deflate/Inflate backend
 candidate if profiling shows that miniz's codec path is the bottleneck, but it
 is not a ZIP container layer. ZIP support owns central-directory rewrites in the
-provider layer; future work is mainly richer metadata, comments, encryption, and
-possibly swapping the Deflate backend if profiling justifies it.
+provider layer, including the WinZip AES extra-field and payload rewrite used
+for AES-256 encrypted ZIP creation. Future work is mainly richer metadata,
+comments, editable encrypted ZIPs, and possibly swapping the Deflate backend if
+profiling justifies it.
+
+The detailed format support roadmap lives in
+[`docs/FORMAT_SUPPORT.md`](docs/FORMAT_SUPPORT.md).
 
 ### Archive services
 

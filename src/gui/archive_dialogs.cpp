@@ -11,6 +11,10 @@
 
 #include <algorithm>
 #include <array>
+#include <cerrno>
+#include <cwchar>
+#include <cwctype>
+#include <limits>
 #include <optional>
 #include <string>
 #include <thread>
@@ -64,6 +68,9 @@ constexpr int kRestoreWindowPlacement = 2233;
 constexpr int kConfirmOverwrite = 2234;
 constexpr int kRecentLocationCount = 2235;
 constexpr int kBrowseStartupCustomPath = 2236;
+constexpr int kToolbarIconStyle = 2237;
+constexpr int kAccentColorMode = 2238;
+constexpr int kCustomAccentColor = 2239;
 constexpr int kDefaultUpdateMode = 2250;
 constexpr int kDefaultVolumeSize = 2251;
 constexpr int kDefaultVolumeUnit = 2252;
@@ -121,6 +128,8 @@ constexpr int kMemoryLimit = 2606;
 constexpr int kBrowseLogFolder = 2607;
 constexpr int kAccept = IDOK;
 constexpr int kCancel = IDCANCEL;
+constexpr std::uint64_t kMinIoBufferSize = 64ull << 10;
+constexpr std::uint64_t kMaxIoBufferSize = 64ull << 20;
 
 constexpr std::array<const wchar_t*, 9> kLevelNames{
     L"1 - Fastest", L"2 - Very fast", L"3 - Fast", L"4 - Normal",
@@ -154,6 +163,11 @@ constexpr std::array<const wchar_t*, 4> kVolumeUnitNames{
     L"KiB", L"MiB", L"GiB", L"TiB"};
 constexpr std::array<const wchar_t*, 3> kThemeModeNames{
     L"Use Windows app theme", L"Dark", L"Light"};
+constexpr std::array<const wchar_t*, 7> kAccentColorNames{
+    L"Use Windows accent", L"Axiom amber", L"Blue", L"Green", L"Purple", L"Red",
+    L"Custom #RRGGBB"};
+constexpr std::array<const wchar_t*, 3> kToolbarIconStyleNames{
+    L"Theme-tinted monochrome", L"Colorful by command", L"Accent-colored"};
 constexpr std::array<const wchar_t*, 4> kStartupLocationNames{
     L"Last location", L"This PC", L"Desktop", L"Custom path"};
 constexpr std::array<const wchar_t*, 3> kFolderPolicyNames{
@@ -238,19 +252,7 @@ private:
 };
 
 bool use_dark_theme() {
-    HIGHCONTRASTW contrast{sizeof(contrast)};
-    if (SystemParametersInfoW(SPI_GETHIGHCONTRAST, sizeof(contrast), &contrast, 0) &&
-        (contrast.dwFlags & HCF_HIGHCONTRASTON) != 0) {
-        return false;
-    }
-    DWORD value = 1;
-    DWORD size = sizeof(value);
-    if (RegGetValueW(HKEY_CURRENT_USER,
-                     L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
-                     L"AppsUseLightTheme", RRF_RT_REG_DWORD, nullptr, &value, &size) == ERROR_SUCCESS) {
-        return value == 0;
-    }
-    return false;
+    return dialog_should_use_dark();
 }
 
 struct Palette {
@@ -264,6 +266,7 @@ struct Palette {
     COLORREF text = GetSysColor(COLOR_WINDOWTEXT);
     COLORREF muted = GetSysColor(COLOR_GRAYTEXT);
     COLORREF focus = GetSysColor(COLOR_HIGHLIGHT);
+    COLORREF accent = GetSysColor(COLOR_HIGHLIGHT);
 };
 
 struct PageControl {
@@ -284,6 +287,7 @@ struct SettingControl {
 Palette make_palette() {
     Palette result;
     result.dark = use_dark_theme();
+    result.accent = dialog_accent_color();
     if (result.dark) {
         result.window = RGB(30, 30, 30);
         result.edit = RGB(36, 36, 36);
@@ -293,7 +297,9 @@ Palette make_palette() {
         result.border = RGB(63, 63, 67);
         result.text = RGB(242, 242, 242);
         result.muted = RGB(176, 176, 176);
-        result.focus = RGB(78, 115, 158);
+        result.focus = result.accent;
+    } else {
+        result.focus = result.accent;
     }
     return result;
 }
@@ -317,6 +323,64 @@ std::wstring window_text(HWND window) {
 
 void set_window_text(HWND window, const std::wstring& text) {
     SetWindowTextW(window, text.c_str());
+}
+
+std::wstring color_to_hex(COLORREF color) {
+    wchar_t buffer[8]{};
+    swprintf_s(buffer, L"#%02X%02X%02X",
+               GetRValue(color), GetGValue(color), GetBValue(color));
+    return buffer;
+}
+
+std::wstring trim_color_text(std::wstring text) {
+    while (!text.empty() && std::iswspace(text.front())) text.erase(text.begin());
+    while (!text.empty() && std::iswspace(text.back())) text.pop_back();
+    return text;
+}
+
+std::optional<COLORREF> color_from_hex(std::wstring text) {
+    text = trim_color_text(std::move(text));
+    if (!text.empty() && text.front() == L'#') {
+        text.erase(text.begin());
+    }
+    if (text.size() != 6) return std::nullopt;
+    for (wchar_t ch : text) {
+        if (!std::iswxdigit(ch)) return std::nullopt;
+    }
+    wchar_t* end = nullptr;
+    const unsigned long value = std::wcstoul(text.c_str(), &end, 16);
+    if (end == text.c_str() || *end != L'\0') return std::nullopt;
+    return RGB((value >> 16) & 0xff, (value >> 8) & 0xff, value & 0xff);
+}
+
+std::optional<std::uint64_t> parse_size_text(std::wstring text) {
+    text = trim_color_text(std::move(text));
+    if (text.empty()) return std::nullopt;
+    wchar_t* end = nullptr;
+    errno = 0;
+    const unsigned long long value = _wcstoui64(text.c_str(), &end, 10);
+    if (errno == ERANGE || end == text.c_str() || value == 0) return std::nullopt;
+    while (*end != L'\0' && std::iswspace(*end)) ++end;
+    std::wstring unit = end;
+    std::transform(unit.begin(), unit.end(), unit.begin(), [](wchar_t ch) {
+        return static_cast<wchar_t>(std::towlower(ch));
+    });
+    std::uint64_t multiplier = 1;
+    if (unit.empty() || unit == L"b" || unit == L"bytes") {
+        multiplier = 1;
+    } else if (unit == L"k" || unit == L"kb" || unit == L"kib") {
+        multiplier = 1024ull;
+    } else if (unit == L"m" || unit == L"mb" || unit == L"mib") {
+        multiplier = 1024ull * 1024ull;
+    } else if (unit == L"g" || unit == L"gb" || unit == L"gib") {
+        multiplier = 1024ull * 1024ull * 1024ull;
+    } else {
+        return std::nullopt;
+    }
+    if (value > std::numeric_limits<std::uint64_t>::max() / multiplier) {
+        return std::nullopt;
+    }
+    return value * multiplier;
 }
 
 std::optional<fs::path> browse_save_archive(HWND owner,
@@ -665,6 +729,7 @@ public:
                                   window_style,
                                   x, y, width, height, owner, nullptr, instance_, this);
         if (!window_) return false;
+        restore_named_window_placement(window_, owner, layout_name());
         owner_was_enabled_ = disable_dialog_owner(owner);
         ShowWindow(window_, SW_SHOW);
         UpdateWindow(window_);
@@ -683,11 +748,21 @@ public:
     CreateArchiveDialogOptions create_options;
     ExtractArchiveDialogOptions extract_options;
     ApplicationDialogOptions application_options;
+    std::function<void(const ApplicationDialogOptions&)> settings_apply_callback;
     std::size_t input_count = 0;
     fs::path archive_path;
 
 private:
     static const wchar_t* class_name() { return L"AxiomDarkOptionsDialog"; }
+
+    const wchar_t* layout_name() const {
+        switch (mode_) {
+            case DialogMode::create_archive: return L"AddToArchiveDialog";
+            case DialogMode::extract_archive: return L"ExtractArchiveDialog";
+            case DialogMode::settings: return L"SettingsDialog";
+        }
+        return L"OptionsDialog";
+    }
 
     bool register_class() {
         static ATOM atom = 0;
@@ -899,20 +974,28 @@ private:
         setting_label(0, L"Application behavior", 0, 0, 660);
         setting_label(0, L"Theme", 0, 42, 170);
         setting_combo(0, kThemeMode, kThemeModeNames, 180, 36, 260);
-        setting_label(0, L"Startup location", 0, 84, 170);
-        setting_combo(0, kStartupMode, kStartupLocationNames, 180, 78, 260);
-        setting_label(0, L"Custom startup path", 0, 126, 170);
-        setting_edit(0, kStartupCustomPath, 180, 120, 470);
-        setting_browse(0, kBrowseStartupCustomPath, 660, 120);
+        setting_label(0, L"Accent color", 0, 84, 170);
+        setting_combo(0, kAccentColorMode, kAccentColorNames, 180, 78, 260);
+        setting_label(0, L"Custom accent", 0, 126, 170);
+        setting_edit(0, kCustomAccentColor, 180, 120, 150);
+        setting_label(0, L"Use #RRGGBB when Accent color is set to Custom.",
+                      344, 126, 380, 32, true);
+        setting_label(0, L"Button icons", 0, 168, 170);
+        setting_combo(0, kToolbarIconStyle, kToolbarIconStyleNames, 180, 162, 260);
+        setting_label(0, L"Startup location", 0, 210, 170);
+        setting_combo(0, kStartupMode, kStartupLocationNames, 180, 204, 260);
+        setting_label(0, L"Custom startup path", 0, 252, 170);
+        setting_edit(0, kStartupCustomPath, 180, 246, 470);
+        setting_browse(0, kBrowseStartupCustomPath, 660, 246);
         setting_checkbox(0, kRestoreWindowPlacement,
-                         L"Restore previous window size and position", 180, 164);
-        setting_checkbox(0, kConfirmDelete, L"Confirm before deleting files", 180, 198);
+                         L"Restore previous window size and position", 180, 290);
+        setting_checkbox(0, kConfirmDelete, L"Confirm before deleting files", 180, 324);
         setting_checkbox(0, kConfirmOverwrite,
-                         L"Confirm before overwriting existing files", 180, 232);
-        setting_label(0, L"Recent locations", 0, 276, 170);
-        setting_edit(0, kRecentLocationCount, 180, 270, 95, ES_NUMBER | ES_AUTOHSCROLL);
+                         L"Confirm before overwriting existing files", 180, 358);
+        setting_label(0, L"Recent locations", 0, 402, 170);
+        setting_edit(0, kRecentLocationCount, 180, 396, 95, ES_NUMBER | ES_AUTOHSCROLL);
         setting_label(0, L"0 disables recent path entries; 12 matches the current default.",
-                      288, 276, 430, 38, true);
+                      288, 402, 430, 38, true);
 
         setting_label(1, L"Default Add-to-archive options", 0, 0, 660);
         setting_label(1, L"Compression level", 0, 42, 170);
@@ -1051,9 +1134,9 @@ private:
         setting_combo(8, kMemoryLimitMode, kAutomaticCustomNames, 180, 204, 180);
         setting_edit(8, kMemoryLimit, 370, 204, 160);
         setting_label(8,
-                      L"Worker priority and memory limit are applied to GUI operations. Custom "
-                      L"I/O buffer sizing is disabled until the archive engine exposes a matching "
-                      L"runtime option.",
+                      L"Worker priority, I/O buffer size, and memory limit are applied to GUI "
+                      L"operations. Automatic I/O uses 1 MiB; custom values must be 64 KiB "
+                      L"through 64 MiB.",
                       0, 264, 660, 72, true);
 
         accept_ = control(L"BUTTON", L"OK", WS_TABSTOP | BS_DEFPUSHBUTTON | BS_OWNERDRAW, kAccept);
@@ -1287,6 +1370,12 @@ private:
 
     void load_settings_values() {
         set_selected_index(kThemeMode, std::clamp(application_options.theme_mode, 0, 2));
+        set_selected_index(kAccentColorMode,
+                           std::clamp(application_options.accent_color_mode, 0, 6));
+        set_window_text(item(kCustomAccentColor),
+                        color_to_hex(application_options.custom_accent_color));
+        set_selected_index(kToolbarIconStyle,
+                           std::clamp(application_options.toolbar_icon_style, 0, 2));
         set_selected_index(kStartupMode,
                            std::clamp(application_options.startup_location_mode, 0, 3));
         set_window_text(item(kStartupCustomPath), application_options.startup_custom_path);
@@ -1349,18 +1438,35 @@ private:
         set_selected_index(kIoBufferMode,
                            std::clamp(application_options.io_buffer_mode, 0, 1));
         set_window_text(item(kIoBufferSize), application_options.io_buffer_size);
-        EnableWindow(item(kIoBufferMode), FALSE);
-        EnableWindow(item(kIoBufferSize), FALSE);
         set_selected_index(kMemoryLimitMode,
                            std::clamp(application_options.memory_limit_mode, 0, 1));
         set_window_text(item(kMemoryLimit), application_options.memory_limit);
+        update_settings_dependencies();
         for (const SettingControl& control : settings_controls_) {
             InvalidateRect(control.window, nullptr, TRUE);
         }
     }
 
+    void update_settings_dependencies() {
+        if (mode_ != DialogMode::settings) return;
+        EnableWindow(item(kIoBufferSize), selected_index(kIoBufferMode, 0) == 1);
+        EnableWindow(item(kMemoryLimit), selected_index(kMemoryLimitMode, 0) == 1);
+    }
+
     bool apply_settings_values() {
         application_options.theme_mode = selected_index(kThemeMode, 0);
+        application_options.accent_color_mode = selected_index(kAccentColorMode, 0);
+        if (const auto color = color_from_hex(window_text(item(kCustomAccentColor)))) {
+            application_options.custom_accent_color = *color;
+            set_window_text(item(kCustomAccentColor), color_to_hex(*color));
+        } else {
+            show_message_dialog(window_, instance_, dpi_, palette_.dark,
+                                L"Axiom settings",
+                                L"Custom accent color must use #RRGGBB, for example #FFB93C.",
+                                MessageDialogIcon::warning);
+            return false;
+        }
+        application_options.toolbar_icon_style = selected_index(kToolbarIconStyle, 0);
         application_options.startup_location_mode = selected_index(kStartupMode, 0);
         application_options.startup_custom_path = window_text(item(kStartupCustomPath));
         application_options.recent_location_count =
@@ -1405,8 +1511,62 @@ private:
         application_options.log_folder = window_text(item(kLogFolder));
         application_options.io_buffer_mode = selected_index(kIoBufferMode, 0);
         application_options.io_buffer_size = window_text(item(kIoBufferSize));
+        if (application_options.io_buffer_mode == 1) {
+            const auto size = parse_size_text(application_options.io_buffer_size);
+            if (!size || *size < kMinIoBufferSize || *size > kMaxIoBufferSize) {
+                show_message_dialog(
+                    window_, instance_, dpi_, palette_.dark,
+                    L"Axiom settings",
+                    L"Custom I/O buffer size must be between 64 KiB and 64 MiB. "
+                    L"Examples: 1 MiB, 4 MiB, 8388608.",
+                    MessageDialogIcon::warning);
+                return false;
+            }
+        }
         application_options.memory_limit_mode = selected_index(kMemoryLimitMode, 0);
         application_options.memory_limit = window_text(item(kMemoryLimit));
+        return true;
+    }
+
+    void refresh_settings_appearance() {
+        if (mode_ != DialogMode::settings || window_ == nullptr) return;
+        set_dialog_appearance({
+            application_options.theme_mode,
+            application_options.accent_color_mode,
+            application_options.custom_accent_color,
+            application_options.toolbar_icon_style,
+        });
+        palette_ = make_palette();
+        if (window_brush_ != nullptr) {
+            DeleteObject(window_brush_);
+            window_brush_ = nullptr;
+        }
+        if (edit_brush_ != nullptr) {
+            DeleteObject(edit_brush_);
+            edit_brush_ = nullptr;
+        }
+        window_brush_ = CreateSolidBrush(palette_.window);
+        edit_brush_ = CreateSolidBrush(palette_.edit);
+        set_dark_title(window_, palette_.dark);
+        EnumChildWindows(window_, [](HWND child, LPARAM self_param) -> BOOL {
+            auto* self = reinterpret_cast<OptionsDialog*>(self_param);
+            apply_dialog_control_theme(child, self->palette_.dark);
+            InvalidateRect(child, nullptr, FALSE);
+            return TRUE;
+        }, reinterpret_cast<LPARAM>(this));
+        InvalidateRect(window_, nullptr, TRUE);
+    }
+
+    bool apply_settings_live(bool close_after) {
+        if (!apply_settings_values()) return false;
+        if (settings_apply_callback) {
+            settings_apply_callback(application_options);
+        }
+        refresh_settings_appearance();
+        accepted_ = true;
+        if (close_after) {
+            close_dialog();
+        }
         return true;
     }
 
@@ -1865,10 +2025,11 @@ private:
     ArchiveFeatureAvailability selected_format_availability() const {
         ArchiveFeatureAvailability available = create_options.feature_availability;
         if (!selected_format_is_native()) {
+            const bool zip = selected_archive_format() == ArchiveFormat::zip;
             available.metadata = false;
             available.comments = false;
             available.lock = false;
-            available.encryption = false;
+            available.encryption = zip;
             available.header_encryption = false;
             available.kdf_presets = false;
             available.volumes = false;
@@ -1885,12 +2046,17 @@ private:
         if (selected_format_is_native()) {
             return;
         }
+        const bool zip = selected_archive_format() == ArchiveFormat::zip;
         create_options.features.comment.clear();
         create_options.features.lock_archive = false;
         create_options.features.repack_after_update = false;
-        create_options.features.encrypt_data = false;
+        if (!zip) {
+            create_options.features.encrypt_data = false;
+            create_options.features.password.clear();
+            set_window_text(password_edit_, L"");
+            set_window_text(confirm_password_edit_, L"");
+        }
         create_options.features.encrypt_names = false;
-        create_options.features.password.clear();
         create_options.features.volume_size.clear();
         create_options.features.recovery_percent = 0;
         create_options.features.create_recovery_volumes = false;
@@ -1899,8 +2065,6 @@ private:
         create_options.features.create_sfx = false;
         create_options.features.sfx_destination.clear();
         set_window_text(comment_edit_, L"");
-        set_window_text(password_edit_, L"");
-        set_window_text(confirm_password_edit_, L"");
         set_window_text(volume_size_edit_, L"");
         set_window_text(recovery_percent_edit_, L"0");
         set_window_text(signing_key_edit_, L"");
@@ -1976,6 +2140,13 @@ private:
         EnableWindow(password_edit_, password_enabled);
         EnableWindow(confirm_password_edit_, password_enabled);
         EnableWindow(show_password_, password_enabled);
+        set_window_text(
+            security_info_,
+            native
+                ? L"Axiom uses Argon2id key derivation and XChaCha20-Poly1305. Passwords "
+                  L"are never saved in GUI settings and are cleared when this dialog closes."
+                : L"ZIP encryption uses WinZip AES-256 for file data. File names remain "
+                  L"visible; use AXAR if archive directory encryption is required.");
 
         const bool split_enabled = available.volumes && !create_options.features.create_sfx;
         EnableWindow(volume_size_edit_, split_enabled);
@@ -2041,9 +2212,7 @@ private:
             return;
         }
         if (mode_ == DialogMode::settings) {
-            if (!apply_settings_values()) return;
-            accepted_ = true;
-            close_dialog();
+            apply_settings_live(true);
             return;
         }
         if (mode_ != DialogMode::settings && window_text(path_edit_).empty()) {
@@ -2195,6 +2364,7 @@ private:
     }
 
     void close_dialog() {
+        save_named_window_placement(layout_name(), window_);
         restore_dialog_owner(owner_, owner_was_enabled_);
         owner_was_enabled_ = false;
         if (owner_ != nullptr && IsWindow(owner_)) {
@@ -2470,6 +2640,10 @@ private:
         RECT rect = draw.rcItem;
         const int id = GetDlgCtrlID(draw.hwndItem);
         const bool checkbox = is_checkbox_id(id);
+        if (!checkbox) {
+            draw_dialog_button(draw, palette_.dark);
+            return;
+        }
         const bool disabled = (draw.itemState & ODS_DISABLED) != 0;
         const bool pressed = (draw.itemState & ODS_SELECTED) != 0;
         const bool focused = (draw.itemState & ODS_FOCUS) != 0;
@@ -2492,7 +2666,8 @@ private:
             FrameRect(draw.hDC, &box, border_brush);
             DeleteObject(border_brush);
             if (checkbox_checked(id)) {
-                HPEN pen = CreatePen(PS_SOLID, scale(2), palette_.text);
+                HPEN pen = CreatePen(PS_SOLID, scale(2),
+                                     disabled ? palette_.muted : palette_.accent);
                 HGDIOBJ old_pen = SelectObject(draw.hDC, pen);
                 MoveToEx(draw.hDC, box.left + scale(3), box.top + scale(8), nullptr);
                 LineTo(draw.hDC, box.left + scale(7), box.bottom - scale(3));
@@ -2612,6 +2787,12 @@ private:
                     toggle(id, item(id));
                     return 0;
                 }
+                if (mode_ == DialogMode::settings &&
+                    (id == kIoBufferMode || id == kMemoryLimitMode) &&
+                    HIWORD(wparam) == CBN_SELCHANGE) {
+                    update_settings_dependencies();
+                    return 0;
+                }
                 if (id >= kCreateTabBase &&
                     id < kCreateTabBase + static_cast<int>(kCreateTabNames.size())) {
                     select_create_page(id - kCreateTabBase);
@@ -2661,9 +2842,7 @@ private:
                         }
                         return 0;
                     case kApply:
-                        if (mode_ == DialogMode::settings && apply_settings_values()) {
-                            accepted_ = true;
-                        }
+                        if (mode_ == DialogMode::settings) apply_settings_live(false);
                         return 0;
                     case kDefaults:
                         if (mode_ == DialogMode::settings) {
@@ -2825,8 +3004,16 @@ bool show_extract_archive_dialog(HWND owner,
 }
 
 bool show_application_settings_dialog(HWND owner, ApplicationDialogOptions& options) {
+    return show_application_settings_dialog(owner, options, {});
+}
+
+bool show_application_settings_dialog(
+    HWND owner,
+    ApplicationDialogOptions& options,
+    const std::function<void(const ApplicationDialogOptions&)>& apply_callback) {
     OptionsDialog dialog(DialogMode::settings);
     dialog.application_options = options;
+    dialog.settings_apply_callback = apply_callback;
     if (!dialog.show(owner)) return false;
     options = std::move(dialog.application_options);
     return true;

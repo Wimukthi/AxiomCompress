@@ -19,6 +19,8 @@ namespace fs = std::filesystem;
 namespace {
 
 constexpr wchar_t kFeatureDialogClass[] = L"AxiomArchiveFeatureOptionsDialog";
+constexpr wchar_t kPasswordPromptClass[] = L"AxiomArchivePasswordPrompt";
+constexpr wchar_t kCommentEditorClass[] = L"AxiomArchiveCommentEditor";
 
 constexpr int kPageMetadata = 0;
 constexpr int kPageUpdate = 1;
@@ -51,6 +53,9 @@ constexpr int kSfxDestination = 4253;
 constexpr int kBrowseSigningKey = 4254;
 constexpr int kVerifySignature = 4255;
 constexpr int kBrowseSfxDestination = 4256;
+constexpr int kSimplePasswordEdit = 4301;
+constexpr int kSimpleShowPassword = 4302;
+constexpr int kSimpleCommentEdit = 4311;
 
 constexpr std::array<const wchar_t*, 5> kUpdateModeNames{
     L"Create a new archive", L"Add or replace entries",
@@ -94,6 +99,589 @@ std::wstring control_text(HWND window) {
     GetWindowTextW(window, text.data(), length + 1);
     text.resize(static_cast<std::size_t>(length));
     return text;
+}
+
+void clear_sensitive_text(std::wstring& text) {
+    if (!text.empty()) {
+        SecureZeroMemory(text.data(), text.size() * sizeof(wchar_t));
+        text.clear();
+    }
+}
+
+void set_password_visible(HWND edit, bool visible) {
+    if (edit == nullptr) return;
+    SendMessageW(edit, EM_SETPASSWORDCHAR, visible ? 0 : static_cast<WPARAM>(L'\u25CF'), 0);
+    InvalidateRect(edit, nullptr, TRUE);
+}
+
+struct SimplePasswordDialogState {
+    HWND window{};
+    HWND owner{};
+    HWND label{};
+    HWND edit{};
+    HWND show{};
+    HWND ok{};
+    HWND cancel{};
+    HINSTANCE instance{};
+    HFONT font{};
+    HBRUSH background_brush{};
+    HBRUSH control_brush{};
+    UINT dpi{USER_DEFAULT_SCREEN_DPI};
+    bool dark{};
+    bool accepted{};
+    std::wstring password;
+};
+
+std::array<HWND, 5> simple_password_controls(SimplePasswordDialogState* state) {
+    if (state == nullptr) return {};
+    return {state->label, state->edit, state->show, state->ok, state->cancel};
+}
+
+void layout_simple_password_dialog(SimplePasswordDialogState* state) {
+    if (state == nullptr || state->window == nullptr) return;
+    RECT client{};
+    GetClientRect(state->window, &client);
+    const int margin = scale_for_dialog_dpi(24, state->dpi);
+    const int label_width = scale_for_dialog_dpi(90, state->dpi);
+    const int row_height = scale_for_dialog_dpi(30, state->dpi);
+    const int button_width = scale_for_dialog_dpi(88, state->dpi);
+    const int button_height = scale_for_dialog_dpi(30, state->dpi);
+    const int gap = scale_for_dialog_dpi(10, state->dpi);
+    const int edit_left = margin + label_width + scale_for_dialog_dpi(12, state->dpi);
+    const int edit_width = client.right - edit_left - margin;
+    MoveWindow(state->label, margin, margin + scale_for_dialog_dpi(4, state->dpi),
+               label_width, row_height, TRUE);
+    MoveWindow(state->edit, edit_left, margin, edit_width, row_height, TRUE);
+    MoveWindow(state->show, edit_left, margin + scale_for_dialog_dpi(42, state->dpi),
+               scale_for_dialog_dpi(180, state->dpi), scale_for_dialog_dpi(24, state->dpi),
+               TRUE);
+    const int button_top = client.bottom - margin - button_height;
+    MoveWindow(state->cancel, client.right - margin - button_width, button_top,
+               button_width, button_height, TRUE);
+    MoveWindow(state->ok, client.right - margin - button_width * 2 - gap, button_top,
+               button_width, button_height, TRUE);
+    InvalidateRect(state->window, nullptr, TRUE);
+}
+
+void rebuild_simple_password_fonts(SimplePasswordDialogState* state) {
+    delete_dialog_font(state->font);
+    state->font = create_dialog_font(state->dpi);
+    for (HWND control : simple_password_controls(state)) {
+        set_dialog_control_font(control, state->font);
+    }
+}
+
+void apply_simple_password_theme(SimplePasswordDialogState* state) {
+    if (state == nullptr) return;
+    apply_dialog_dark_frame(state->window, state->dark);
+    for (HWND control : simple_password_controls(state)) {
+        apply_dialog_control_theme(control, state->dark);
+    }
+}
+
+LRESULT simple_dialog_control_color(HWND, HBRUSH background, HBRUSH control,
+                                    bool dark, WPARAM wparam, bool edit) {
+    const DialogColors colors = dialog_colors(dark);
+    HDC dc = reinterpret_cast<HDC>(wparam);
+    SetTextColor(dc, colors.text);
+    SetBkColor(dc, edit ? colors.control_background : colors.background);
+    SetBkMode(dc, edit ? OPAQUE : TRANSPARENT);
+    return reinterpret_cast<LRESULT>(edit ? control : background);
+}
+
+LRESULT CALLBACK simple_password_dialog_proc(HWND hwnd, UINT message,
+                                             WPARAM wparam, LPARAM lparam) {
+    auto* state = reinterpret_cast<SimplePasswordDialogState*>(
+        GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+    if (message == WM_NCCREATE) {
+        const auto* create = reinterpret_cast<CREATESTRUCTW*>(lparam);
+        state = create == nullptr
+                    ? nullptr
+                    : static_cast<SimplePasswordDialogState*>(create->lpCreateParams);
+        if (state == nullptr) return FALSE;
+        state->window = hwnd;
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(state));
+    }
+    if (state == nullptr) {
+        return DefWindowProcW(hwnd, message, wparam, lparam);
+    }
+
+    switch (message) {
+        case WM_CREATE: {
+            const DialogColors colors = dialog_colors(state->dark);
+            state->background_brush = CreateSolidBrush(colors.background);
+            state->control_brush = CreateSolidBrush(colors.control_background);
+            state->font = create_dialog_font(state->dpi);
+            state->label = CreateWindowExW(
+                0, L"STATIC", L"Password",
+                WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | SS_NOPREFIX,
+                0, 0, 0, 0, hwnd, nullptr, state->instance, nullptr);
+            state->edit = CreateWindowExW(
+                0, L"EDIT", state->password.c_str(),
+                WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | WS_TABSTOP |
+                    ES_PASSWORD | ES_AUTOHSCROLL,
+                0, 0, 0, 0, hwnd,
+                reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSimplePasswordEdit)),
+                state->instance, nullptr);
+            state->show = CreateWindowExW(
+                0, L"BUTTON", L"Show password",
+                WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | WS_TABSTOP |
+                    BS_OWNERDRAW | BS_CHECKBOX,
+                0, 0, 0, 0, hwnd,
+                reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSimpleShowPassword)),
+                state->instance, nullptr);
+            state->ok = CreateWindowExW(
+                0, L"BUTTON", L"OK",
+                WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | WS_TABSTOP | BS_OWNERDRAW,
+                0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(IDOK),
+                state->instance, nullptr);
+            state->cancel = CreateWindowExW(
+                0, L"BUTTON", L"Cancel",
+                WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | WS_TABSTOP | BS_OWNERDRAW,
+                0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(IDCANCEL),
+                state->instance, nullptr);
+            for (HWND control : simple_password_controls(state)) {
+                set_dialog_control_font(control, state->font);
+            }
+            apply_simple_password_theme(state);
+            set_password_visible(state->edit, false);
+            layout_simple_password_dialog(state);
+            SendMessageW(hwnd, DM_SETDEFID, IDOK, 0);
+            SetFocus(state->edit);
+            SendMessageW(state->edit, EM_SETSEL, 0, -1);
+            return 0;
+        }
+        case WM_SIZE:
+            layout_simple_password_dialog(state);
+            return 0;
+        case WM_DPICHANGED: {
+            state->dpi = HIWORD(wparam);
+            const auto* suggested = reinterpret_cast<const RECT*>(lparam);
+            SetWindowPos(hwnd, nullptr, suggested->left, suggested->top,
+                         suggested->right - suggested->left,
+                         suggested->bottom - suggested->top,
+                         SWP_NOZORDER | SWP_NOACTIVATE);
+            rebuild_simple_password_fonts(state);
+            layout_simple_password_dialog(state);
+            return 0;
+        }
+        case WM_GETMINMAXINFO: {
+            auto* info = reinterpret_cast<MINMAXINFO*>(lparam);
+            info->ptMinTrackSize.x = scale_for_dialog_dpi(420, state->dpi);
+            info->ptMinTrackSize.y = scale_for_dialog_dpi(178, state->dpi);
+            return 0;
+        }
+        case WM_COMMAND:
+            if (LOWORD(wparam) == kSimpleShowPassword) {
+                const bool checked =
+                    SendMessageW(state->show, BM_GETCHECK, 0, 0) != BST_CHECKED;
+                SendMessageW(state->show, BM_SETCHECK,
+                             checked ? BST_CHECKED : BST_UNCHECKED, 0);
+                set_password_visible(state->edit, checked);
+                InvalidateRect(state->show, nullptr, FALSE);
+                return 0;
+            }
+            if (LOWORD(wparam) == IDOK) {
+                state->password = control_text(state->edit);
+                state->accepted = true;
+                SetWindowTextW(state->edit, L"");
+                save_named_window_placement(L"ArchivePasswordPrompt", hwnd);
+                DestroyWindow(hwnd);
+                return 0;
+            }
+            if (LOWORD(wparam) == IDCANCEL) {
+                SetWindowTextW(state->edit, L"");
+                save_named_window_placement(L"ArchivePasswordPrompt", hwnd);
+                DestroyWindow(hwnd);
+                return 0;
+            }
+            break;
+        case WM_CTLCOLORSTATIC:
+            return simple_dialog_control_color(hwnd, state->background_brush,
+                                               state->control_brush, state->dark,
+                                               wparam, false);
+        case WM_CTLCOLOREDIT:
+            return simple_dialog_control_color(hwnd, state->background_brush,
+                                               state->control_brush, state->dark,
+                                               wparam, true);
+        case WM_DRAWITEM:
+            if (lparam != 0) {
+                const auto& draw = *reinterpret_cast<DRAWITEMSTRUCT*>(lparam);
+                if (draw.CtlID == kSimpleShowPassword) {
+                    draw_dialog_checkbox(
+                        draw, state->dark,
+                        SendMessageW(state->show, BM_GETCHECK, 0, 0) == BST_CHECKED);
+                } else {
+                    draw_dialog_button(draw, state->dark);
+                }
+                return TRUE;
+            }
+            break;
+        case WM_ERASEBKGND: {
+            RECT client{};
+            GetClientRect(hwnd, &client);
+            FillRect(reinterpret_cast<HDC>(wparam), &client, state->background_brush);
+            return 1;
+        }
+        case WM_PAINT: {
+            PAINTSTRUCT paint{};
+            HDC dc = BeginPaint(hwnd, &paint);
+            FillRect(dc, &paint.rcPaint, state->background_brush);
+            EndPaint(hwnd, &paint);
+            return 0;
+        }
+        case WM_CLOSE:
+            SetWindowTextW(state->edit, L"");
+            save_named_window_placement(L"ArchivePasswordPrompt", hwnd);
+            DestroyWindow(hwnd);
+            return 0;
+        case WM_NCDESTROY:
+            if (state != nullptr) {
+                delete_dialog_font(state->font);
+                if (state->background_brush != nullptr) DeleteObject(state->background_brush);
+                if (state->control_brush != nullptr) DeleteObject(state->control_brush);
+                state->window = nullptr;
+            }
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+            return 0;
+        default:
+            break;
+    }
+    return DefWindowProcW(hwnd, message, wparam, lparam);
+}
+
+struct SimpleCommentDialogState {
+    HWND window{};
+    HWND owner{};
+    HWND label{};
+    HWND edit{};
+    HWND ok{};
+    HWND cancel{};
+    HINSTANCE instance{};
+    HFONT font{};
+    HBRUSH background_brush{};
+    HBRUSH control_brush{};
+    UINT dpi{USER_DEFAULT_SCREEN_DPI};
+    bool dark{};
+    bool accepted{};
+    std::wstring comment;
+};
+
+std::array<HWND, 4> simple_comment_controls(SimpleCommentDialogState* state) {
+    if (state == nullptr) return {};
+    return {state->label, state->edit, state->ok, state->cancel};
+}
+
+void layout_simple_comment_dialog(SimpleCommentDialogState* state) {
+    if (state == nullptr || state->window == nullptr) return;
+    RECT client{};
+    GetClientRect(state->window, &client);
+    const int margin = scale_for_dialog_dpi(20, state->dpi);
+    const int label_height = scale_for_dialog_dpi(24, state->dpi);
+    const int button_width = scale_for_dialog_dpi(88, state->dpi);
+    const int button_height = scale_for_dialog_dpi(30, state->dpi);
+    const int gap = scale_for_dialog_dpi(10, state->dpi);
+    const int button_top = client.bottom - margin - button_height;
+    MoveWindow(state->label, margin, margin, client.right - margin * 2,
+               label_height, TRUE);
+    MoveWindow(state->edit, margin, margin + label_height + scale_for_dialog_dpi(8, state->dpi),
+               client.right - margin * 2,
+               button_top - margin - label_height - scale_for_dialog_dpi(20, state->dpi),
+               TRUE);
+    MoveWindow(state->cancel, client.right - margin - button_width, button_top,
+               button_width, button_height, TRUE);
+    MoveWindow(state->ok, client.right - margin - button_width * 2 - gap, button_top,
+               button_width, button_height, TRUE);
+    InvalidateRect(state->window, nullptr, TRUE);
+}
+
+void rebuild_simple_comment_fonts(SimpleCommentDialogState* state) {
+    delete_dialog_font(state->font);
+    state->font = create_dialog_font(state->dpi);
+    for (HWND control : simple_comment_controls(state)) {
+        set_dialog_control_font(control, state->font);
+    }
+}
+
+void apply_simple_comment_theme(SimpleCommentDialogState* state) {
+    if (state == nullptr) return;
+    apply_dialog_dark_frame(state->window, state->dark);
+    for (HWND control : simple_comment_controls(state)) {
+        apply_dialog_control_theme(control, state->dark);
+    }
+}
+
+LRESULT CALLBACK simple_comment_dialog_proc(HWND hwnd, UINT message,
+                                            WPARAM wparam, LPARAM lparam) {
+    auto* state = reinterpret_cast<SimpleCommentDialogState*>(
+        GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+    if (message == WM_NCCREATE) {
+        const auto* create = reinterpret_cast<CREATESTRUCTW*>(lparam);
+        state = create == nullptr
+                    ? nullptr
+                    : static_cast<SimpleCommentDialogState*>(create->lpCreateParams);
+        if (state == nullptr) return FALSE;
+        state->window = hwnd;
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(state));
+    }
+    if (state == nullptr) {
+        return DefWindowProcW(hwnd, message, wparam, lparam);
+    }
+
+    switch (message) {
+        case WM_CREATE: {
+            const DialogColors colors = dialog_colors(state->dark);
+            state->background_brush = CreateSolidBrush(colors.background);
+            state->control_brush = CreateSolidBrush(colors.control_background);
+            state->font = create_dialog_font(state->dpi);
+            state->label = CreateWindowExW(
+                0, L"STATIC", L"Archive comment",
+                WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | SS_NOPREFIX,
+                0, 0, 0, 0, hwnd, nullptr, state->instance, nullptr);
+            state->edit = CreateWindowExW(
+                0, L"EDIT", state->comment.c_str(),
+                WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | WS_TABSTOP |
+                    ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN | WS_VSCROLL,
+                0, 0, 0, 0, hwnd,
+                reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSimpleCommentEdit)),
+                state->instance, nullptr);
+            state->ok = CreateWindowExW(
+                0, L"BUTTON", L"OK",
+                WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | WS_TABSTOP | BS_OWNERDRAW,
+                0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(IDOK),
+                state->instance, nullptr);
+            state->cancel = CreateWindowExW(
+                0, L"BUTTON", L"Cancel",
+                WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | WS_TABSTOP | BS_OWNERDRAW,
+                0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(IDCANCEL),
+                state->instance, nullptr);
+            for (HWND control : simple_comment_controls(state)) {
+                set_dialog_control_font(control, state->font);
+            }
+            apply_simple_comment_theme(state);
+            layout_simple_comment_dialog(state);
+            SendMessageW(hwnd, DM_SETDEFID, IDOK, 0);
+            SetFocus(state->edit);
+            SendMessageW(state->edit, EM_SETSEL, 0, -1);
+            return 0;
+        }
+        case WM_SIZE:
+            layout_simple_comment_dialog(state);
+            return 0;
+        case WM_DPICHANGED: {
+            state->dpi = HIWORD(wparam);
+            const auto* suggested = reinterpret_cast<const RECT*>(lparam);
+            SetWindowPos(hwnd, nullptr, suggested->left, suggested->top,
+                         suggested->right - suggested->left,
+                         suggested->bottom - suggested->top,
+                         SWP_NOZORDER | SWP_NOACTIVATE);
+            rebuild_simple_comment_fonts(state);
+            layout_simple_comment_dialog(state);
+            return 0;
+        }
+        case WM_GETMINMAXINFO: {
+            auto* info = reinterpret_cast<MINMAXINFO*>(lparam);
+            info->ptMinTrackSize.x = scale_for_dialog_dpi(520, state->dpi);
+            info->ptMinTrackSize.y = scale_for_dialog_dpi(300, state->dpi);
+            return 0;
+        }
+        case WM_COMMAND:
+            if (LOWORD(wparam) == IDOK) {
+                state->comment = control_text(state->edit);
+                state->accepted = true;
+                save_named_window_placement(L"ArchiveCommentEditor", hwnd);
+                DestroyWindow(hwnd);
+                return 0;
+            }
+            if (LOWORD(wparam) == IDCANCEL) {
+                save_named_window_placement(L"ArchiveCommentEditor", hwnd);
+                DestroyWindow(hwnd);
+                return 0;
+            }
+            break;
+        case WM_CTLCOLORSTATIC:
+            return simple_dialog_control_color(hwnd, state->background_brush,
+                                               state->control_brush, state->dark,
+                                               wparam, false);
+        case WM_CTLCOLOREDIT:
+            return simple_dialog_control_color(hwnd, state->background_brush,
+                                               state->control_brush, state->dark,
+                                               wparam, true);
+        case WM_DRAWITEM:
+            if (lparam != 0) {
+                draw_dialog_button(*reinterpret_cast<DRAWITEMSTRUCT*>(lparam), state->dark);
+                return TRUE;
+            }
+            break;
+        case WM_ERASEBKGND: {
+            RECT client{};
+            GetClientRect(hwnd, &client);
+            FillRect(reinterpret_cast<HDC>(wparam), &client, state->background_brush);
+            return 1;
+        }
+        case WM_PAINT: {
+            PAINTSTRUCT paint{};
+            HDC dc = BeginPaint(hwnd, &paint);
+            FillRect(dc, &paint.rcPaint, state->background_brush);
+            EndPaint(hwnd, &paint);
+            return 0;
+        }
+        case WM_CLOSE:
+            save_named_window_placement(L"ArchiveCommentEditor", hwnd);
+            DestroyWindow(hwnd);
+            return 0;
+        case WM_NCDESTROY:
+            if (state != nullptr) {
+                delete_dialog_font(state->font);
+                if (state->background_brush != nullptr) DeleteObject(state->background_brush);
+                if (state->control_brush != nullptr) DeleteObject(state->control_brush);
+                state->window = nullptr;
+            }
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+            return 0;
+        default:
+            break;
+    }
+    return DefWindowProcW(hwnd, message, wparam, lparam);
+}
+
+bool run_simple_password_dialog(HWND owner, std::wstring& password) {
+    HINSTANCE instance = reinterpret_cast<HINSTANCE>(
+        GetWindowLongPtrW(owner, GWLP_HINSTANCE));
+    if (instance == nullptr) instance = GetModuleHandleW(nullptr);
+    const UINT dpi = owner != nullptr ? GetDpiForWindow(owner) : GetDpiForSystem();
+    SimplePasswordDialogState state{};
+    state.owner = owner;
+    state.instance = instance;
+    state.dpi = dpi;
+    state.dark = dialog_system_prefers_dark_mode();
+    state.password = password;
+
+    WNDCLASSEXW window_class{};
+    window_class.cbSize = sizeof(window_class);
+    window_class.lpfnWndProc = &simple_password_dialog_proc;
+    window_class.hInstance = instance;
+    window_class.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    window_class.lpszClassName = kPasswordPromptClass;
+    assign_axiom_window_class_icons(window_class, instance);
+    if (RegisterClassExW(&window_class) == 0 &&
+        GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+        show_message_dialog(owner, instance, dpi, state.dark, L"Archive password",
+                            last_error_text(), MessageDialogIcon::error);
+        return false;
+    }
+
+    const int width = scale_for_dialog_dpi(430, dpi);
+    const int height = scale_for_dialog_dpi(188, dpi);
+    const POINT position = centered_window_position(owner, width, height);
+    HWND dialog = CreateWindowExW(
+        WS_EX_WINDOWEDGE | WS_EX_CONTROLPARENT, kPasswordPromptClass, L"Archive password",
+        WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_CLIPCHILDREN | WS_CLIPSIBLINGS |
+            WS_THICKFRAME,
+        position.x, position.y, width, height, owner, nullptr, instance, &state);
+    if (dialog == nullptr) {
+        show_message_dialog(owner, instance, dpi, state.dark, L"Archive password",
+                            last_error_text(), MessageDialogIcon::error);
+        return false;
+    }
+    apply_axiom_window_icons(dialog, instance);
+    restore_named_window_placement(dialog, owner, L"ArchivePasswordPrompt");
+    const bool owner_was_enabled = disable_dialog_owner(owner);
+    ShowWindow(dialog, SW_SHOW);
+    UpdateWindow(dialog);
+    MSG message{};
+    while (IsWindow(dialog)) {
+        const BOOL status = GetMessageW(&message, nullptr, 0, 0);
+        if (status <= 0) {
+            if (status == 0) PostQuitMessage(static_cast<int>(message.wParam));
+            break;
+        }
+        if (message_targets_window(dialog, message) &&
+            message.message == WM_KEYDOWN && message.wParam == VK_ESCAPE) {
+            save_named_window_placement(L"ArchivePasswordPrompt", dialog);
+            DestroyWindow(dialog);
+            continue;
+        }
+        if (!IsDialogMessageW(dialog, &message)) {
+            TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
+    }
+    restore_dialog_owner(owner, owner_was_enabled);
+    if (!state.accepted) {
+        clear_sensitive_text(state.password);
+        return false;
+    }
+    password = std::move(state.password);
+    return true;
+}
+
+bool run_simple_comment_dialog(HWND owner, std::wstring& comment) {
+    HINSTANCE instance = reinterpret_cast<HINSTANCE>(
+        GetWindowLongPtrW(owner, GWLP_HINSTANCE));
+    if (instance == nullptr) instance = GetModuleHandleW(nullptr);
+    const UINT dpi = owner != nullptr ? GetDpiForWindow(owner) : GetDpiForSystem();
+    SimpleCommentDialogState state{};
+    state.owner = owner;
+    state.instance = instance;
+    state.dpi = dpi;
+    state.dark = dialog_system_prefers_dark_mode();
+    state.comment = comment;
+
+    WNDCLASSEXW window_class{};
+    window_class.cbSize = sizeof(window_class);
+    window_class.lpfnWndProc = &simple_comment_dialog_proc;
+    window_class.hInstance = instance;
+    window_class.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    window_class.lpszClassName = kCommentEditorClass;
+    assign_axiom_window_class_icons(window_class, instance);
+    if (RegisterClassExW(&window_class) == 0 &&
+        GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+        show_message_dialog(owner, instance, dpi, state.dark, L"Archive comment",
+                            last_error_text(), MessageDialogIcon::error);
+        return false;
+    }
+
+    const int width = scale_for_dialog_dpi(580, dpi);
+    const int height = scale_for_dialog_dpi(380, dpi);
+    const POINT position = centered_window_position(owner, width, height);
+    HWND dialog = CreateWindowExW(
+        WS_EX_WINDOWEDGE | WS_EX_CONTROLPARENT, kCommentEditorClass, L"Archive comment",
+        WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_CLIPCHILDREN | WS_CLIPSIBLINGS |
+            WS_THICKFRAME,
+        position.x, position.y, width, height, owner, nullptr, instance, &state);
+    if (dialog == nullptr) {
+        show_message_dialog(owner, instance, dpi, state.dark, L"Archive comment",
+                            last_error_text(), MessageDialogIcon::error);
+        return false;
+    }
+    apply_axiom_window_icons(dialog, instance);
+    restore_named_window_placement(dialog, owner, L"ArchiveCommentEditor");
+    const bool owner_was_enabled = disable_dialog_owner(owner);
+    ShowWindow(dialog, SW_SHOW);
+    UpdateWindow(dialog);
+    MSG message{};
+    while (IsWindow(dialog)) {
+        const BOOL status = GetMessageW(&message, nullptr, 0, 0);
+        if (status <= 0) {
+            if (status == 0) PostQuitMessage(static_cast<int>(message.wParam));
+            break;
+        }
+        if (message_targets_window(dialog, message) &&
+            message.message == WM_KEYDOWN && message.wParam == VK_ESCAPE) {
+            save_named_window_placement(L"ArchiveCommentEditor", dialog);
+            DestroyWindow(dialog);
+            continue;
+        }
+        if (!IsDialogMessageW(dialog, &message)) {
+            TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
+    }
+    restore_dialog_owner(owner, owner_was_enabled);
+    if (!state.accepted) return false;
+    comment = std::move(state.comment);
+    return true;
 }
 
 std::optional<fs::path> shell_item_path(IShellItem* item) {
@@ -201,6 +789,7 @@ public:
                                   x, y, width, height, owner, nullptr, instance_, this);
         if (window_ == nullptr) return false;
         apply_axiom_window_icons(window_, instance_);
+        restore_named_window_placement(window_, owner, layout_name());
         const bool owner_was_enabled = disable_dialog_owner(owner);
         ShowWindow(window_, SW_SHOW);
         UpdateWindow(window_);
@@ -238,6 +827,27 @@ private:
     }
 
     int scale(int value) const { return scale_for_dialog_dpi(value, dpi_); }
+
+    const wchar_t* layout_name() const {
+        switch (context_) {
+            case ArchiveFeatureDialogContext::create_or_update:
+                return L"ArchiveFeatureOptionsDialog";
+            case ArchiveFeatureDialogContext::extract:
+                return L"ExtractFeatureOptionsDialog";
+            case ArchiveFeatureDialogContext::password_prompt:
+                return L"ArchivePasswordDialog";
+            case ArchiveFeatureDialogContext::comment:
+                return L"ArchiveCommentDialog";
+        }
+        return L"ArchiveFeatureDialog";
+    }
+
+    void close_dialog() {
+        save_named_window_placement(layout_name(), window_);
+        if (window_ != nullptr && IsWindow(window_)) {
+            DestroyWindow(window_);
+        }
+    }
 
     HWND make_control(const wchar_t* type, const wchar_t* text, DWORD style, int id,
                       bool enabled = true) {
@@ -810,7 +1420,7 @@ private:
             if (confirm_password_ != nullptr) SetWindowTextW(confirm_password_, L"");
         }
         accepted_ = true;
-        DestroyWindow(window_);
+        close_dialog();
     }
 
     LRESULT handle_message(UINT message, WPARAM wparam, LPARAM lparam) {
@@ -901,7 +1511,7 @@ private:
                     return 0;
                 }
                 if (id == kCancel) {
-                    DestroyWindow(window_);
+                    close_dialog();
                     return 0;
                 }
                 break;
@@ -911,7 +1521,7 @@ private:
                     SetWindowTextW(password_, L"");
                     if (confirm_password_ != nullptr) SetWindowTextW(confirm_password_, L"");
                 }
-                DestroyWindow(window_);
+                close_dialog();
                 return 0;
             case WM_NCDESTROY:
                 window_ = nullptr;
@@ -1605,6 +2215,7 @@ LRESULT CALLBACK archive_summary_proc(HWND hwnd, UINT message, WPARAM wparam, LP
             return 0;
         case WM_COMMAND:
             if (LOWORD(wparam) == IDOK || LOWORD(wparam) == IDCANCEL) {
+                save_named_window_placement(L"ArchiveSummaryDialog", hwnd);
                 DestroyWindow(hwnd);
                 return 0;
             }
@@ -1625,6 +2236,7 @@ LRESULT CALLBACK archive_summary_proc(HWND hwnd, UINT message, WPARAM wparam, LP
             return 1;
         }
         case WM_CLOSE:
+            save_named_window_placement(L"ArchiveSummaryDialog", hwnd);
             DestroyWindow(hwnd);
             return 0;
         case WM_NCDESTROY:
@@ -1737,6 +2349,7 @@ void show_archive_summary_dialog(HWND owner, ArchiveSummaryDialogData data) {
         return;
     }
     apply_axiom_window_icons(dialog, instance);
+    restore_named_window_placement(dialog, owner, L"ArchiveSummaryDialog");
     const bool owner_was_enabled = disable_dialog_owner(owner);
     ShowWindow(dialog, SW_SHOW);
     UpdateWindow(dialog);
@@ -1749,6 +2362,7 @@ void show_archive_summary_dialog(HWND owner, ArchiveSummaryDialogData data) {
         }
         if (message_targets_window(dialog, message) &&
             message.message == WM_KEYDOWN && message.wParam == VK_ESCAPE) {
+            save_named_window_placement(L"ArchiveSummaryDialog", dialog);
             DestroyWindow(dialog);
             continue;
         }
@@ -1778,29 +2392,11 @@ bool show_archive_feature_options_dialog(
 }
 
 bool show_archive_password_dialog(HWND owner, std::wstring& password) {
-    ArchiveFeatureOptions archive_options;
-    ExtractFeatureOptions extract_options;
-    extract_options.password = password;
-    ArchiveFeatureAvailability availability;
-    availability.encryption = true;
-    ArchiveFeatureDialog dialog(ArchiveFeatureDialogContext::password_prompt,
-                                archive_options, extract_options, availability);
-    if (!dialog.show(owner)) return false;
-    password = dialog.extract_options().password;
-    return true;
+    return run_simple_password_dialog(owner, password);
 }
 
 bool show_archive_comment_dialog(HWND owner, std::wstring& comment) {
-    ArchiveFeatureOptions archive_options;
-    archive_options.comment = comment;
-    ExtractFeatureOptions extract_options;
-    ArchiveFeatureAvailability availability;
-    availability.comments = true;
-    ArchiveFeatureDialog dialog(ArchiveFeatureDialogContext::comment,
-                                archive_options, extract_options, availability);
-    if (!dialog.show(owner)) return false;
-    comment = dialog.archive_options().comment;
-    return true;
+    return run_simple_comment_dialog(owner, comment);
 }
 
 void show_archive_information_dialog(

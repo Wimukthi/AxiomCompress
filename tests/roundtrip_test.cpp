@@ -414,6 +414,36 @@ std::size_t find_bytes(const std::vector<std::uint8_t>& haystack, const std::str
     return static_cast<std::size_t>(it - haystack.begin());
 }
 
+std::uint16_t test_read_le16(const std::vector<std::uint8_t>& bytes, std::size_t offset) {
+    AXIOM_CHECK(offset + 2 <= bytes.size());
+    return static_cast<std::uint16_t>(bytes[offset] |
+                                      (static_cast<std::uint16_t>(bytes[offset + 1]) << 8));
+}
+
+std::uint32_t test_read_le32(const std::vector<std::uint8_t>& bytes, std::size_t offset) {
+    AXIOM_CHECK(offset + 4 <= bytes.size());
+    return static_cast<std::uint32_t>(bytes[offset]) |
+           (static_cast<std::uint32_t>(bytes[offset + 1]) << 8) |
+           (static_cast<std::uint32_t>(bytes[offset + 2]) << 16) |
+           (static_cast<std::uint32_t>(bytes[offset + 3]) << 24);
+}
+
+void test_write_le16(std::vector<std::uint8_t>& bytes, std::size_t offset,
+                     std::uint16_t value) {
+    AXIOM_CHECK(offset + 2 <= bytes.size());
+    bytes[offset] = static_cast<std::uint8_t>(value);
+    bytes[offset + 1] = static_cast<std::uint8_t>(value >> 8);
+}
+
+void test_write_le32(std::vector<std::uint8_t>& bytes, std::size_t offset,
+                     std::uint32_t value) {
+    AXIOM_CHECK(offset + 4 <= bytes.size());
+    bytes[offset] = static_cast<std::uint8_t>(value);
+    bytes[offset + 1] = static_cast<std::uint8_t>(value >> 8);
+    bytes[offset + 2] = static_cast<std::uint8_t>(value >> 16);
+    bytes[offset + 3] = static_cast<std::uint8_t>(value >> 24);
+}
+
 void test_archive_roundtrip() {
     const auto root = make_temp_dir();
     const auto src = root / "src";
@@ -479,6 +509,7 @@ void test_archive_provider_layer() {
     AXIOM_CHECK(capabilities.extract);
     AXIOM_CHECK(capabilities.test);
     AXIOM_CHECK(capabilities.create);
+    AXIOM_CHECK(capabilities.packed_sizes);
     AXIOM_CHECK(capabilities.selective_extract);
     AXIOM_CHECK(capabilities.update);
     AXIOM_CHECK(capabilities.comments);
@@ -488,7 +519,9 @@ void test_archive_provider_layer() {
 
     const auto entries = provider->list(archive);
     AXIOM_CHECK(std::any_of(entries.begin(), entries.end(), [](const axiom::ArchiveEntry& entry) {
-        return entry.path == "src/file.txt";
+        return entry.path == "src/file.txt" &&
+               entry.packed_size.has_value() &&
+               entry.packed_size_estimated;
     }));
     provider->test(archive);
 
@@ -541,17 +574,20 @@ void test_zip_provider_layer() {
     AXIOM_CHECK(capabilities.create);
     AXIOM_CHECK(capabilities.update);
     AXIOM_CHECK(capabilities.delete_entries);
+    AXIOM_CHECK(capabilities.move_entries);
     AXIOM_CHECK(!capabilities.sfx);
 
     const auto entries = provider->list(archive);
     AXIOM_CHECK(entries.size() == 2);
     AXIOM_CHECK(std::any_of(entries.begin(), entries.end(), [](const axiom::ArchiveEntry& entry) {
         return entry.path == "folder/file.txt" && !entry.is_directory &&
-               entry.size == std::strlen("zip provider extraction");
+               entry.size == std::strlen("zip provider extraction") &&
+               entry.packed_size.has_value();
     }));
     AXIOM_CHECK(std::any_of(entries.begin(), entries.end(), [](const axiom::ArchiveEntry& entry) {
         return entry.path == "folder/sub/data.bin" && !entry.is_directory &&
-               entry.size == std::strlen("nested zip payload");
+               entry.size == std::strlen("nested zip payload") &&
+               entry.packed_size.has_value();
     }));
 
     provider->test(archive);
@@ -601,12 +637,253 @@ void test_zip_provider_layer() {
     AXIOM_CHECK(read_all(updated_out / "source" / "alpha.txt") ==
                 bytes_from_string("alpha v2"));
 
-    provider->delete_entries(writable, {"source/nested"}, {});
+    provider->move_entries(writable, {axiom::ArchiveMove{"source/nested", "source/moved"}}, {});
+    const auto moved_out = root / "moved";
+    provider->extract_all(writable, moved_out, {});
+    AXIOM_CHECK(read_all(moved_out / "source" / "moved" / "beta.txt") ==
+                bytes_from_string("beta"));
+    AXIOM_CHECK(!fs::exists(moved_out / "source" / "nested" / "beta.txt"));
+
+    provider->delete_entries(writable, {"source/moved"}, {});
     const auto deleted_out = root / "deleted";
     provider->extract_all(writable, deleted_out, {});
     AXIOM_CHECK(read_all(deleted_out / "source" / "alpha.txt") ==
                 bytes_from_string("alpha v2"));
-    AXIOM_CHECK(!fs::exists(deleted_out / "source" / "nested" / "beta.txt"));
+    AXIOM_CHECK(!fs::exists(deleted_out / "source" / "moved" / "beta.txt"));
+
+    std::error_code ec;
+    fs::remove_all(root, ec);
+}
+
+void test_zip_aes256_encryption() {
+    const auto root = make_temp_dir();
+    const auto first = root / "alpha.txt";
+    const auto second = root / "beta.bin";
+    write_all(first, bytes_from_string("zip aes alpha payload"));
+    write_all(second, bytes_from_string("zip aes beta payload"));
+
+    const auto archive = root / "encrypted.zip";
+    const auto* provider = axiom::archive_provider_for_path(archive);
+    AXIOM_CHECK(provider != nullptr);
+
+    axiom::CompressionOptions options;
+    options.password = "correct horse battery staple";
+    provider->add_mapped({axiom::ArchiveInput{first, "folder/alpha.txt"},
+                          axiom::ArchiveInput{second, "folder/beta.bin"}},
+                         archive, options);
+
+    mz_zip_archive zip{};
+    mz_zip_zero_struct(&zip);
+    AXIOM_CHECK(mz_zip_reader_init_file(&zip, archive.string().c_str(), 0));
+    mz_zip_archive_file_stat stat{};
+    AXIOM_CHECK(mz_zip_reader_file_stat(&zip, 0, &stat));
+    AXIOM_CHECK(stat.m_is_encrypted != 0);
+    AXIOM_CHECK(stat.m_method == 99);
+    AXIOM_CHECK(mz_zip_reader_end(&zip));
+
+    const auto listed = provider->list(archive);
+    AXIOM_CHECK(listed.size() == 2);
+    AXIOM_CHECK(std::all_of(listed.begin(), listed.end(), [](const axiom::ArchiveEntry& entry) {
+        return !entry.is_directory && entry.packed_size.has_value();
+    }));
+
+    const auto locked_caps = provider->capabilities(archive);
+    AXIOM_CHECK(locked_caps.list);
+    AXIOM_CHECK(locked_caps.encryption);
+    AXIOM_CHECK(locked_caps.encrypted);
+    AXIOM_CHECK(!locked_caps.extract);
+    AXIOM_CHECK(!locked_caps.test);
+    AXIOM_CHECK(!locked_caps.selective_extract);
+    AXIOM_CHECK(!locked_caps.update);
+
+    const auto unlocked_caps = provider->capabilities(archive, options.password);
+    AXIOM_CHECK(unlocked_caps.extract);
+    AXIOM_CHECK(unlocked_caps.test);
+    AXIOM_CHECK(unlocked_caps.selective_extract);
+    AXIOM_CHECK(!unlocked_caps.update);
+
+    bool failed_without_password = false;
+    try {
+        provider->test(archive);
+    } catch (const std::exception&) {
+        failed_without_password = true;
+    }
+    AXIOM_CHECK(failed_without_password);
+
+    axiom::DecompressionOptions test_options;
+    test_options.password = options.password;
+    provider->test(archive, test_options);
+
+    axiom::ExtractOptions wrong_options;
+    wrong_options.password = "wrong password";
+    bool failed_wrong_password = false;
+    try {
+        provider->extract_selected(archive, {"folder/alpha.txt"}, root / "wrong",
+                                   wrong_options);
+    } catch (const std::exception&) {
+        failed_wrong_password = true;
+    }
+    AXIOM_CHECK(failed_wrong_password);
+
+    axiom::ExtractOptions extract_options;
+    extract_options.password = options.password;
+    const auto selected = root / "selected";
+    provider->extract_selected(archive, {"folder/alpha.txt"}, selected, extract_options);
+    AXIOM_CHECK(read_all(selected / "folder" / "alpha.txt") ==
+                bytes_from_string("zip aes alpha payload"));
+    AXIOM_CHECK(!fs::exists(selected / "folder" / "beta.bin"));
+
+    const auto full = root / "full";
+    provider->extract_all(archive, full, extract_options);
+    AXIOM_CHECK(read_all(full / "folder" / "alpha.txt") ==
+                bytes_from_string("zip aes alpha payload"));
+    AXIOM_CHECK(read_all(full / "folder" / "beta.bin") ==
+                bytes_from_string("zip aes beta payload"));
+
+    std::error_code ec;
+    fs::remove_all(root, ec);
+}
+
+void add_zip_data_descriptors_for_test(const fs::path& archive) {
+    constexpr std::uint32_t kLocal = 0x04034b50u;
+    constexpr std::uint32_t kCentral = 0x02014b50u;
+    constexpr std::uint32_t kEocd = 0x06054b50u;
+    constexpr std::uint32_t kDescriptor = 0x08074b50u;
+    constexpr std::uint16_t kEncrypted = 0x0001u;
+    constexpr std::uint16_t kDataDescriptor = 0x0008u;
+    constexpr std::uint16_t kAesMethod = 99u;
+
+    struct Entry {
+        std::size_t central_offset = 0;
+        std::uint32_t old_local_offset = 0;
+        std::uint32_t new_local_offset = 0;
+        std::uint32_t compressed_size = 0;
+        std::uint32_t uncompressed_size = 0;
+    };
+
+    const auto input = read_all(archive);
+    AXIOM_CHECK(input.size() >= 22);
+    std::size_t eocd_offset = input.size() - 22;
+    while (test_read_le32(input, eocd_offset) != kEocd) {
+        AXIOM_CHECK(eocd_offset > 0);
+        --eocd_offset;
+    }
+    AXIOM_CHECK(eocd_offset < input.size() && test_read_le32(input, eocd_offset) == kEocd);
+    const std::uint16_t total_entries = test_read_le16(input, eocd_offset + 10);
+    const std::uint32_t cd_size = test_read_le32(input, eocd_offset + 12);
+    const std::uint32_t cd_offset = test_read_le32(input, eocd_offset + 16);
+    AXIOM_CHECK(cd_offset + cd_size <= eocd_offset);
+
+    std::vector<Entry> entries;
+    std::size_t pos = cd_offset;
+    for (std::uint16_t i = 0; i < total_entries; ++i) {
+        AXIOM_CHECK(pos + 46 <= cd_offset + cd_size);
+        AXIOM_CHECK(test_read_le32(input, pos) == kCentral);
+        const std::uint16_t flags = test_read_le16(input, pos + 8);
+        const std::uint16_t method = test_read_le16(input, pos + 10);
+        const std::uint16_t name_size = test_read_le16(input, pos + 28);
+        const std::uint16_t extra_size = test_read_le16(input, pos + 30);
+        const std::uint16_t comment_size = test_read_le16(input, pos + 32);
+        AXIOM_CHECK((flags & kEncrypted) != 0);
+        AXIOM_CHECK(method == kAesMethod);
+        entries.push_back(Entry{pos,
+                                test_read_le32(input, pos + 42),
+                                0,
+                                test_read_le32(input, pos + 20),
+                                test_read_le32(input, pos + 24)});
+        pos += 46u + name_size + extra_size + comment_size;
+    }
+    AXIOM_CHECK(pos == cd_offset + cd_size);
+    std::sort(entries.begin(), entries.end(), [](const Entry& left, const Entry& right) {
+        return left.old_local_offset < right.old_local_offset;
+    });
+
+    std::vector<std::uint8_t> output;
+    output.reserve(input.size() + entries.size() * 16);
+    std::size_t cursor = 0;
+    for (auto& entry : entries) {
+        const std::size_t local_offset = entry.old_local_offset;
+        AXIOM_CHECK(local_offset >= cursor && local_offset + 30 <= cd_offset);
+        AXIOM_CHECK(test_read_le32(input, local_offset) == kLocal);
+        const std::uint16_t name_size = test_read_le16(input, local_offset + 26);
+        const std::uint16_t extra_size = test_read_le16(input, local_offset + 28);
+        const std::size_t data_offset = local_offset + 30u + name_size + extra_size;
+        const std::size_t data_end = data_offset + entry.compressed_size;
+        AXIOM_CHECK(data_end <= cd_offset);
+
+        entry.new_local_offset = static_cast<std::uint32_t>(output.size());
+        output.insert(output.end(),
+                      input.begin() + static_cast<std::ptrdiff_t>(cursor),
+                      input.begin() + static_cast<std::ptrdiff_t>(data_end));
+        test_write_le16(output, entry.new_local_offset + 6,
+                        static_cast<std::uint16_t>(
+                            test_read_le16(output, entry.new_local_offset + 6) |
+                            kDataDescriptor));
+        const std::size_t descriptor_offset = output.size();
+        output.resize(output.size() + 16);
+        test_write_le32(output, descriptor_offset, kDescriptor);
+        test_write_le32(output, descriptor_offset + 4, 0);
+        test_write_le32(output, descriptor_offset + 8, entry.compressed_size);
+        test_write_le32(output, descriptor_offset + 12, entry.uncompressed_size);
+        cursor = data_end;
+    }
+    output.insert(output.end(),
+                  input.begin() + static_cast<std::ptrdiff_t>(cursor),
+                  input.begin() + static_cast<std::ptrdiff_t>(cd_offset));
+
+    const std::uint32_t new_cd_offset = static_cast<std::uint32_t>(output.size());
+    std::vector<std::uint8_t> central(input.begin() + static_cast<std::ptrdiff_t>(cd_offset),
+                                      input.begin() + static_cast<std::ptrdiff_t>(cd_offset + cd_size));
+    for (const auto& entry : entries) {
+        const std::size_t rel = entry.central_offset - cd_offset;
+        test_write_le16(central, rel + 8,
+                        static_cast<std::uint16_t>(
+                            test_read_le16(central, rel + 8) | kDataDescriptor));
+        test_write_le32(central, rel + 42, entry.new_local_offset);
+    }
+    output.insert(output.end(), central.begin(), central.end());
+
+    std::vector<std::uint8_t> tail(input.begin() + static_cast<std::ptrdiff_t>(eocd_offset),
+                                  input.end());
+    test_write_le32(tail, 16, new_cd_offset);
+    output.insert(output.end(), tail.begin(), tail.end());
+    write_all(archive, output);
+}
+
+void test_zip_aes_data_descriptor_compatibility() {
+    const auto root = make_temp_dir();
+    const auto first = root / "alpha.txt";
+    const auto second = root / "beta.bin";
+    write_all(first, bytes_from_string("zip aes descriptor alpha"));
+    write_all(second, bytes_from_string("zip aes descriptor beta"));
+
+    const auto archive = root / "external-style-aes.zip";
+    const auto* provider = axiom::archive_provider_for_path(archive);
+    AXIOM_CHECK(provider != nullptr);
+
+    axiom::CompressionOptions options;
+    options.password = "descriptor password";
+    provider->add_mapped({axiom::ArchiveInput{first, "folder/alpha.txt"},
+                          axiom::ArchiveInput{second, "folder/beta.bin"}},
+                         archive, options);
+    add_zip_data_descriptors_for_test(archive);
+
+    const auto listed = provider->list(archive);
+    AXIOM_CHECK(listed.size() == 2);
+    AXIOM_CHECK(provider->capabilities(archive, options.password).extract);
+
+    axiom::DecompressionOptions test_options;
+    test_options.password = options.password;
+    provider->test(archive, test_options);
+
+    axiom::ExtractOptions extract_options;
+    extract_options.password = options.password;
+    const auto out = root / "out";
+    provider->extract_all(archive, out, extract_options);
+    AXIOM_CHECK(read_all(out / "folder" / "alpha.txt") ==
+                bytes_from_string("zip aes descriptor alpha"));
+    AXIOM_CHECK(read_all(out / "folder" / "beta.bin") ==
+                bytes_from_string("zip aes descriptor beta"));
 
     std::error_code ec;
     fs::remove_all(root, ec);
@@ -1875,6 +2152,8 @@ int main() {
     test_archive_roundtrip();
     test_archive_provider_layer();
     test_zip_provider_layer();
+    test_zip_aes256_encryption();
+    test_zip_aes_data_descriptor_compatibility();
     test_archive_symlinks();
     test_archive_hardlinks();
     test_archive_add();

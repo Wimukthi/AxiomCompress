@@ -57,8 +57,8 @@ void print_usage() {
         "\n"
         "Encryption:\n"
         "  -p, --password STR  encrypt blocks on 'a' (create); supply to read 'x'/'t'/'l'\n"
-        "                      (XChaCha20-Poly1305 per block, Argon2id key derivation)\n"
-        "  --encrypt-names     with -p, also encrypt the directory (hide names; 'l' needs -p)\n"
+        "                      AXAR uses Argon2id + XChaCha20-Poly1305; ZIP uses WinZip AES-256\n"
+        "  --encrypt-names     AXAR only: also encrypt the directory (ZIP names stay visible)\n"
         "\n"
         "Compression options (a, c):\n"
         "  --level N           1=fastest .. 9=max ratio (default 5)\n"
@@ -482,7 +482,11 @@ int run_extract(std::vector<std::string> args) {
     const fs::path archive = positionals[0];
     const fs::path dest = positionals.size() > 1 ? fs::path(positionals[1]) : fs::path(".");
     extract.thread_count = decompression.thread_count;
-    axiom::extract_archive(archive, dest, extract);
+    const auto* provider = axiom::archive_provider_for_path(archive);
+    if (provider == nullptr) {
+        throw std::runtime_error("unsupported archive format: " + archive.string());
+    }
+    provider->extract_all(archive, dest, extract);
     return 0;
 }
 
@@ -508,18 +512,23 @@ int run_list(const std::vector<std::string>& args) {
         return 2;
     }
     const fs::path archive = positionals[0];
+    const auto* provider = axiom::archive_provider_for_path(archive);
+    if (provider == nullptr) {
+        throw std::runtime_error("unsupported archive format: " + archive.string());
+    }
 
-    const std::string comment = axiom::archive_comment(archive, password);
-    if (!comment.empty()) {
-        std::cout << "Comment: " << comment << '\n';
+    const axiom::ArchiveCapabilities capabilities = provider->capabilities(archive, password);
+    if (provider->info().native) {
+        const std::string comment = axiom::archive_comment(archive, password);
+        if (!comment.empty()) {
+            std::cout << "Comment: " << comment << '\n';
+        }
     }
-    if (axiom::archive_is_locked(archive, password)) {
-        std::cout << "[locked: read-only]\n";
-    }
-    if (axiom::archive_is_encrypted(archive)) {
+    if (capabilities.locked) std::cout << "[locked: read-only]\n";
+    if (capabilities.encrypted) {
         std::cout << "[encrypted: password required to extract]\n";
     }
-    const auto entries = axiom::list_archive(archive, password);
+    const auto entries = provider->list(archive, password);
 
     std::uint64_t total_bytes = 0;
     for (const auto& entry : entries) {
@@ -550,7 +559,12 @@ int run_test(std::vector<std::string> args) {
         print_usage();
         return 2;
     }
-    axiom::test_archive(args[0], options);
+    const fs::path archive = args[0];
+    const auto* provider = axiom::archive_provider_for_path(archive);
+    if (provider == nullptr) {
+        throw std::runtime_error("unsupported archive format: " + archive.string());
+    }
+    provider->test(archive, options);
     std::cout << "archive is intact\n";
     return 0;
 }

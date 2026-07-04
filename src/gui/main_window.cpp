@@ -33,6 +33,7 @@
 #include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <cstring>
 #include <cwctype>
 #include <cstdint>
 #include <exception>
@@ -49,6 +50,8 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -71,6 +74,7 @@ constexpr UINT kTableParentMessage = WM_APP + 6;
 constexpr UINT kTableSortMessage = WM_APP + 7;
 constexpr UINT kDirectoryChangedMessage = WM_APP + 8;
 constexpr UINT kTableBeginDragMessage = WM_APP + 9;
+constexpr UINT_PTR kBrowserPopulateTimer = 42;
 constexpr UINT_PTR kDirectoryRefreshTimer = 41;
 
 #ifndef DWMWA_USE_IMMERSIVE_DARK_MODE
@@ -116,6 +120,22 @@ enum ControlId : int {
     kCreateSfx = 1130,
     kFreshenArchive = 1131,
     kBenchmark = 1132,
+    kFind = 1133,
+    kCopyPath = 1134,
+    kCopyCrc32 = 1135,
+    kAddFavorite = 1136,
+    kRemoveFavorite = 1137,
+    kTreeOpen = 1140,
+    kTreeRefresh = 1141,
+    kTreeExpand = 1142,
+    kTreeCollapse = 1143,
+    kTreeOpenInExplorer = 1144,
+    kTreeAddToArchive = 1145,
+    kTreeExtractArchive = 1146,
+    kTreeTestArchive = 1147,
+    kTreeArchiveInfo = 1148,
+    kTreeAddFavorite = 1149,
+    kTreeRemoveFavorite = 1150,
 };
 
 template <typename T>
@@ -221,7 +241,13 @@ void set_text(HWND hwnd, const std::wstring& text) {
 
 std::wstring quote_count(std::size_t count, const wchar_t* singular, const wchar_t* plural) {
     std::wstringstream stream;
-    stream << count << L' ' << (count == 1 ? singular : plural);
+    std::wstring digits = std::to_wstring(count);
+    for (std::ptrdiff_t pos = static_cast<std::ptrdiff_t>(digits.size()) - 3;
+         pos > 0;
+         pos -= 3) {
+        digits.insert(static_cast<std::size_t>(pos), 1, L',');
+    }
+    stream << digits << L' ' << (count == 1 ? singular : plural);
     return stream.str();
 }
 
@@ -243,6 +269,63 @@ std::wstring format_size(std::uint64_t size) {
         stream << size << L" B";
     }
     return stream.str();
+}
+
+std::wstring format_packed_size(const std::optional<std::uint64_t>& size,
+                                bool estimated) {
+    if (!size) return {};
+    return estimated ? (L"\u2248 " + format_size(*size)) : format_size(*size);
+}
+
+std::wstring format_ratio(std::uint64_t packed, std::uint64_t unpacked) {
+    if (unpacked == 0) return L"n/a";
+    std::wstringstream stream;
+    const double stored_percent =
+        (static_cast<double>(packed) * 100.0) / static_cast<double>(unpacked);
+    stream << std::fixed << std::setprecision(1) << stored_percent << L"% of original";
+    if (packed != 0) {
+        const double ratio =
+            static_cast<double>(unpacked) / static_cast<double>(packed);
+        stream << L" (" << std::fixed << std::setprecision(2) << ratio << L"x)";
+    }
+    return stream.str();
+}
+
+std::uint64_t saturated_add(std::uint64_t left, std::uint64_t right) {
+    const auto max = std::numeric_limits<std::uint64_t>::max();
+    return right > max - left ? max : left + right;
+}
+
+struct ArchiveEntryTotals {
+    std::uint64_t unpacked = 0;
+    std::uint64_t packed = 0;
+    std::size_t files = 0;
+    std::size_t directories = 0;
+    bool has_packed = false;
+    bool packed_estimated = false;
+};
+
+ArchiveEntryTotals summarize_archive_entries(
+    const std::vector<axiom::ArchiveEntry>& entries) {
+    ArchiveEntryTotals totals;
+    for (const auto& entry : entries) {
+        if (entry.is_directory) {
+            ++totals.directories;
+            continue;
+        }
+        if (entry.is_symlink || entry.is_hardlink) {
+            continue;
+        }
+        ++totals.files;
+        totals.unpacked = saturated_add(totals.unpacked, entry.size);
+        if (entry.packed_size) {
+            totals.has_packed = true;
+            totals.packed = saturated_add(totals.packed, *entry.packed_size);
+            totals.packed_estimated =
+                totals.packed_estimated || entry.packed_size_estimated;
+        }
+    }
+    return totals;
 }
 
 std::wstring format_crc32(const std::optional<std::uint32_t>& crc) {
@@ -327,6 +410,19 @@ std::optional<std::uint64_t> parse_size_setting(std::wstring text) {
         return std::nullopt;
     }
     return value * multiplier;
+}
+
+std::size_t configured_io_buffer_size(
+    const axiom::gui::ApplicationDialogOptions& options) {
+    if (options.io_buffer_mode != 1) {
+        return 0;
+    }
+    const auto parsed = parse_size_setting(options.io_buffer_size);
+    if (!parsed) {
+        return 0;
+    }
+    return static_cast<std::size_t>(
+        std::min<std::uint64_t>(*parsed, std::numeric_limits<std::size_t>::max()));
 }
 
 bool has_executable_extension(const fs::path& path) {
@@ -447,6 +543,34 @@ ShellIconRef shell_icon_for_path(const fs::path& path, bool drive = false) {
     return shell_icon_for_item(item);
 }
 
+std::wstring lowercase_extension_for_icon(const fs::path& path) {
+    std::wstring extension = path.extension().wstring();
+    std::transform(extension.begin(), extension.end(), extension.begin(),
+                   [](wchar_t value) {
+                       return static_cast<wchar_t>(std::towlower(value));
+                   });
+    return extension;
+}
+
+bool extension_can_have_unique_shell_icon(std::wstring_view extension) {
+    static constexpr std::array<std::wstring_view, 11> extensions{
+        L".exe", L".com", L".scr", L".ico", L".cur", L".ani",
+        L".lnk", L".url", L".appref-ms", L".msi", L".msp",
+    };
+    return std::find(extensions.begin(), extensions.end(), extension) != extensions.end();
+}
+
+bool item_needs_real_shell_icon(const axiom::gui::BrowserItem& item) {
+    if (item.filesystem_path.empty()) return false;
+    if (item.kind == axiom::gui::BrowserItemKind::drive ||
+        item.kind == axiom::gui::BrowserItemKind::directory ||
+        item.kind == axiom::gui::BrowserItemKind::parent) {
+        return false;
+    }
+    return extension_can_have_unique_shell_icon(
+        lowercase_extension_for_icon(item.filesystem_path));
+}
+
 ShellIconRef shell_icon_for_item(const axiom::gui::BrowserItem& item) {
     SHFILEINFOW info{};
     DWORD attributes = item.kind == axiom::gui::BrowserItemKind::drive ||
@@ -460,9 +584,17 @@ ShellIconRef shell_icon_for_item(const axiom::gui::BrowserItem& item) {
                : item.name)
         : item.filesystem_path.wstring();
     UINT flags = SHGFI_SYSICONINDEX | SHGFI_SMALLICON;
-    if (item.kind != axiom::gui::BrowserItemKind::drive) flags |= SHGFI_USEFILEATTRIBUTES;
-    const auto image_list = reinterpret_cast<HIMAGELIST>(
+    const bool needs_real_file = item_needs_real_shell_icon(item);
+    if (item.kind != axiom::gui::BrowserItemKind::drive && !needs_real_file) {
+        flags |= SHGFI_USEFILEATTRIBUTES;
+    }
+    auto image_list = reinterpret_cast<HIMAGELIST>(
         SHGetFileInfoW(query.c_str(), attributes, &info, sizeof(info), flags));
+    if (image_list == nullptr && needs_real_file) {
+        flags |= SHGFI_USEFILEATTRIBUTES;
+        image_list = reinterpret_cast<HIMAGELIST>(
+            SHGetFileInfoW(query.c_str(), attributes, &info, sizeof(info), flags));
+    }
     return {image_list, image_list != nullptr ? info.iIcon : -1};
 }
 
@@ -590,6 +722,7 @@ struct ThemePalette {
     COLORREF selection = GetSysColor(COLOR_HIGHLIGHT);
     COLORREF selection_text = GetSysColor(COLOR_HIGHLIGHTTEXT);
     COLORREF focus = GetSysColor(COLOR_HOTLIGHT);
+    COLORREF accent = GetSysColor(COLOR_HIGHLIGHT);
     COLORREF scrollbar_track = GetSysColor(COLOR_BTNFACE);
     COLORREF scrollbar_thumb = GetSysColor(COLOR_BTNSHADOW);
     COLORREF scrollbar_thumb_pressed = GetSysColor(COLOR_3DDKSHADOW);
@@ -621,11 +754,36 @@ bool system_prefers_dark_mode() {
     return result == ERROR_SUCCESS && apps_use_light_theme == 0;
 }
 
-ThemePalette make_theme(int preference = 0) {
+COLORREF blend_color(COLORREF base, COLORREF overlay, int overlay_percent) {
+    overlay_percent = std::clamp(overlay_percent, 0, 100);
+    const int base_percent = 100 - overlay_percent;
+    return RGB((GetRValue(base) * base_percent + GetRValue(overlay) * overlay_percent) / 100,
+               (GetGValue(base) * base_percent + GetGValue(overlay) * overlay_percent) / 100,
+               (GetBValue(base) * base_percent + GetBValue(overlay) * overlay_percent) / 100);
+}
+
+COLORREF readable_selection_text(COLORREF background) {
+    const int luminance = GetRValue(background) * 299 +
+                          GetGValue(background) * 587 +
+                          GetBValue(background) * 114;
+    return luminance > 150000 ? RGB(0, 0, 0) : RGB(255, 255, 255);
+}
+
+ThemePalette make_theme(int preference = 0,
+                        int accent_mode = 0,
+                        COLORREF custom_accent = RGB(255, 185, 60)) {
     ThemePalette theme;
     theme.dark = preference == 1
         ? true
         : preference == 2 ? false : system_prefers_dark_mode();
+    if (high_contrast_enabled()) {
+        theme.accent = GetSysColor(COLOR_HIGHLIGHT);
+        theme.selection = GetSysColor(COLOR_HIGHLIGHT);
+        theme.selection_text = GetSysColor(COLOR_HIGHLIGHTTEXT);
+        theme.focus = GetSysColor(COLOR_HOTLIGHT);
+        return theme;
+    }
+    theme.accent = axiom::gui::resolve_dialog_accent_color(accent_mode, custom_accent);
     if (theme.dark) {
         theme.window = RGB(32, 32, 32);
         theme.panel = RGB(45, 45, 48);
@@ -634,16 +792,31 @@ ThemePalette make_theme(int preference = 0) {
         theme.muted_text = RGB(180, 180, 180);
         theme.border = RGB(64, 64, 64);
         theme.button = RGB(45, 45, 48);
-        theme.button_hot = RGB(58, 58, 61);
-        theme.button_pressed = RGB(72, 72, 76);
-        theme.selection = RGB(55, 78, 112);
-        theme.selection_text = RGB(255, 255, 255);
-        theme.focus = RGB(78, 115, 158);
+        theme.button_hot = blend_color(theme.button, theme.accent, 16);
+        theme.button_pressed = blend_color(theme.button, theme.accent, 28);
+        theme.selection = blend_color(theme.window, theme.accent, 44);
+        theme.selection_text = readable_selection_text(theme.selection);
+        theme.focus = theme.accent;
         theme.scrollbar_track = RGB(45, 45, 48);
         theme.scrollbar_thumb = RGB(92, 92, 96);
         theme.scrollbar_thumb_pressed = RGB(122, 122, 126);
+    } else {
+        theme.button_hot = blend_color(theme.button, theme.accent, 12);
+        theme.button_pressed = blend_color(theme.button, theme.accent, 22);
+        theme.selection = theme.accent;
+        theme.selection_text = readable_selection_text(theme.selection);
+        theme.focus = theme.accent;
     }
     return theme;
+}
+
+void configure_dialog_appearance(const axiom::gui::ApplicationDialogOptions& options) {
+    axiom::gui::set_dialog_appearance({
+        options.theme_mode,
+        options.accent_color_mode,
+        options.custom_accent_color,
+        options.toolbar_icon_style,
+    });
 }
 
 axiom::gui::OperationWindowTheme make_operation_window_theme(const ThemePalette& theme) {
@@ -741,6 +914,25 @@ void draw_solid_line(HDC dc, int x1, int y1, int x2, int y2, COLORREF color) {
     LineTo(dc, x2, y2);
     SelectObject(dc, old_pen);
     DeleteObject(pen);
+}
+
+std::wstring folded_text(std::wstring_view text) {
+    std::wstring result(text);
+    std::transform(result.begin(), result.end(), result.begin(),
+                   [](wchar_t value) {
+                       return static_cast<wchar_t>(std::towlower(value));
+                   });
+    return result;
+}
+
+bool starts_with_folded(std::wstring_view text, std::wstring_view prefix) {
+    if (prefix.size() > text.size()) return false;
+    return folded_text(text.substr(0, prefix.size())) == folded_text(prefix);
+}
+
+bool contains_folded(std::wstring_view text, std::wstring_view needle) {
+    if (needle.empty()) return true;
+    return folded_text(text).find(folded_text(needle)) != std::wstring::npos;
 }
 
 class PaintBuffer {
@@ -861,6 +1053,15 @@ public:
         invalidate();
     }
 
+    std::vector<int> logical_column_widths() const {
+        std::vector<int> widths;
+        widths.reserve(columns_.size());
+        for (const auto& column : columns_) {
+            widths.push_back(column.logical_width);
+        }
+        return widths;
+    }
+
     void set_image_list(HIMAGELIST image_list) {
         image_list_ = image_list;
         invalidate();
@@ -900,6 +1101,66 @@ public:
         invalidate();
     }
 
+    void reserve_rows(std::size_t count) {
+        rows_.reserve(count);
+        icon_indices_.reserve(count);
+        selected_.reserve(count);
+    }
+
+    void append_rows(std::vector<std::vector<std::wstring>> rows,
+                     std::vector<int> icon_indices,
+                     HIMAGELIST image_list) {
+        if (image_list_ == nullptr && image_list != nullptr) {
+            image_list_ = image_list;
+        }
+        const std::size_t old_size = rows_.size();
+        rows_.reserve(old_size + rows.size());
+        icon_indices_.reserve(old_size + icon_indices.size());
+        selected_.reserve(old_size + rows.size());
+        for (auto& row : rows) {
+            rows_.push_back(std::move(row));
+        }
+        for (int icon_index : icon_indices) {
+            icon_indices_.push_back(icon_index);
+        }
+        if (icon_indices_.size() < rows_.size()) {
+            icon_indices_.resize(rows_.size(), -1);
+        }
+        selected_.resize(rows_.size(), false);
+        clamp_scroll();
+        invalidate();
+    }
+
+    void set_rows(std::vector<std::vector<std::wstring>> rows,
+                  std::vector<int> icon_indices,
+                  HIMAGELIST image_list) {
+        rows_ = std::move(rows);
+        icon_indices_ = std::move(icon_indices);
+        if (icon_indices_.size() < rows_.size()) {
+            icon_indices_.resize(rows_.size(), -1);
+        } else if (icon_indices_.size() > rows_.size()) {
+            icon_indices_.resize(rows_.size());
+        }
+        image_list_ = image_list;
+        selected_.assign(rows_.size(), false);
+        selected_row_ = -1;
+        selection_anchor_ = -1;
+        if (GetCapture() == hwnd_) ReleaseCapture();
+        resizing_column_ = -1;
+        dragging_scrollbar_ = false;
+        dragging_horizontal_scrollbar_ = false;
+        drag_candidate_ = false;
+        drag_started_ = false;
+        collapse_selection_on_click_ = -1;
+        marquee_selecting_ = false;
+        marquee_base_selection_.clear();
+        typeahead_.clear();
+        scroll_y_ = 0;
+        scroll_x_ = 0;
+        clamp_scroll();
+        invalidate();
+    }
+
     std::vector<int> selected_indices() const {
         std::vector<int> result;
         for (int index = 0; index < static_cast<int>(selected_.size()); ++index) {
@@ -910,6 +1171,43 @@ public:
 
     int focused_index() const {
         return selected_row_;
+    }
+
+    int vertical_scroll_position() const {
+        return scroll_y_;
+    }
+
+    int horizontal_scroll_position() const {
+        return scroll_x_;
+    }
+
+    void set_selection_and_scroll(std::vector<int> selected_indices,
+                                  int focused_index,
+                                  int horizontal_scroll,
+                                  int vertical_scroll) {
+        selected_.assign(rows_.size(), false);
+        int first_selected = -1;
+        for (int index : selected_indices) {
+            if (index < 0 || index >= static_cast<int>(rows_.size())) continue;
+            selected_[static_cast<std::size_t>(index)] = true;
+            if (first_selected < 0) first_selected = index;
+        }
+        if (focused_index < 0 || focused_index >= static_cast<int>(rows_.size()) ||
+            (focused_index >= 0 &&
+             focused_index < static_cast<int>(selected_.size()) &&
+             !selected_[static_cast<std::size_t>(focused_index)])) {
+            focused_index = first_selected;
+        }
+        selected_row_ = focused_index;
+        selection_anchor_ = focused_index;
+        scroll_x_ = horizontal_scroll;
+        scroll_y_ = vertical_scroll;
+        clamp_scroll();
+        invalidate();
+    }
+
+    void select_index(int row) {
+        select_row(row, false, false);
     }
 
     int row_at_screen_point(POINT point) const {
@@ -1248,6 +1546,83 @@ private:
         ensure_selected_visible();
         notify_parent(kTableSelectionChangedMessage);
         invalidate();
+    }
+
+    std::wstring row_match_text(int row) const {
+        if (row < 0 || row >= static_cast<int>(rows_.size())) return {};
+        const auto& row_values = rows_[static_cast<std::size_t>(row)];
+        return row_values.empty() ? std::wstring{} : row_values.front();
+    }
+
+    int find_typeahead_match(std::wstring_view needle, bool cycle) const {
+        if (needle.empty() || rows_.empty()) return -1;
+        const int count = static_cast<int>(rows_.size());
+        const int start = cycle && selected_row_ >= 0 ? selected_row_ + 1 : 0;
+        auto scan = [&](auto predicate) {
+            for (int pass = 0; pass < 2; ++pass) {
+                const int first = pass == 0 ? start : 0;
+                const int last = pass == 0 ? count : std::min(start, count);
+                for (int row = first; row < last; ++row) {
+                    if (predicate(row_match_text(row))) return row;
+                }
+            }
+            return -1;
+        };
+        if (const int row = scan([&](std::wstring_view text) {
+                return starts_with_folded(text, needle);
+            }); row >= 0) {
+            return row;
+        }
+        if (const int row = scan([&](std::wstring_view text) {
+                return contains_folded(text, needle);
+            }); row >= 0) {
+            return row;
+        }
+
+        const std::wstring folded_needle = folded_text(needle);
+        int best = -1;
+        std::wstring best_text;
+        for (int row = 0; row < count; ++row) {
+            const std::wstring text = folded_text(row_match_text(row));
+            if (text >= folded_needle && (best < 0 || text < best_text)) {
+                best = row;
+                best_text = text;
+            }
+        }
+        return best;
+    }
+
+    bool handle_typeahead_char(wchar_t character) {
+        if (character == L'\r' || character == L'\n' || character == L'\t') return false;
+        const ULONGLONG now = GetTickCount64();
+        if (now - typeahead_last_tick_ > 1200) {
+            typeahead_.clear();
+        }
+        typeahead_last_tick_ = now;
+
+        if (character == L'\b') {
+            if (!typeahead_.empty()) typeahead_.pop_back();
+            if (typeahead_.empty()) return true;
+            if (const int row = find_typeahead_match(typeahead_, false); row >= 0) {
+                select_row(row, false, false);
+            }
+            return true;
+        }
+        if (character < L' ') return false;
+
+        const bool repeated_single =
+            typeahead_.size() == 1 &&
+            std::towlower(typeahead_.front()) == std::towlower(character);
+        if (repeated_single) {
+            typeahead_.assign(1, character);
+        } else {
+            typeahead_.push_back(character);
+        }
+
+        if (const int row = find_typeahead_match(typeahead_, repeated_single); row >= 0) {
+            select_row(row, false, false);
+        }
+        return true;
     }
 
     bool point_can_select_row(POINT point, int row, const RECT& client) const {
@@ -1809,6 +2184,13 @@ private:
                     return 0;
                 }
                 break;
+            case WM_CHAR:
+                if ((GetKeyState(VK_CONTROL) & 0x8000) == 0 &&
+                    (GetKeyState(VK_MENU) & 0x8000) == 0 &&
+                    handle_typeahead_char(static_cast<wchar_t>(wparam))) {
+                    return 0;
+                }
+                break;
             case WM_CANCELMODE:
                 if (GetCapture() == hwnd_) {
                     ReleaseCapture();
@@ -1886,6 +2268,8 @@ private:
     POINT marquee_start_{};
     POINT marquee_current_{};
     std::vector<bool> marquee_base_selection_;
+    std::wstring typeahead_;
+    ULONGLONG typeahead_last_tick_ = 0;
     PaintBuffer paint_buffer_;
 };
 
@@ -2032,6 +2416,24 @@ public:
         if (notify && select_callback_) {
             select_callback_(*item);
         }
+    }
+
+    DirectoryTreeItem* selected_item() const {
+        return selected_;
+    }
+
+    void set_expanded(DirectoryTreeItem* item, bool expanded) {
+        if (item == nullptr || !item->may_have_children) return;
+        if (expanded) ensure_populated(*item);
+        item->expanded = expanded;
+        refresh();
+    }
+
+    void refresh_item(DirectoryTreeItem* item) {
+        if (item == nullptr) return;
+        clear_children(*item);
+        if (item->expanded) ensure_populated(*item);
+        refresh();
     }
 
     void ensure_visible(DirectoryTreeItem* item) {
@@ -2370,6 +2772,82 @@ private:
         select_item(visible_[static_cast<std::size_t>(index)].item, true);
     }
 
+    int find_typeahead_match(std::wstring_view needle, bool cycle) {
+        rebuild_visible_items();
+        if (needle.empty() || visible_.empty()) return -1;
+        const int count = static_cast<int>(visible_.size());
+        const int selected_index = visible_index(selected_);
+        const int start = cycle && selected_index >= 0 ? selected_index + 1 : 0;
+        auto scan = [&](auto predicate) {
+            for (int pass = 0; pass < 2; ++pass) {
+                const int first = pass == 0 ? start : 0;
+                const int last = pass == 0 ? count : std::min(start, count);
+                for (int row = first; row < last; ++row) {
+                    const auto* item = visible_[static_cast<std::size_t>(row)].item;
+                    if (item != nullptr && predicate(item->text)) return row;
+                }
+            }
+            return -1;
+        };
+        if (const int row = scan([&](std::wstring_view text) {
+                return starts_with_folded(text, needle);
+            }); row >= 0) {
+            return row;
+        }
+        if (const int row = scan([&](std::wstring_view text) {
+                return contains_folded(text, needle);
+            }); row >= 0) {
+            return row;
+        }
+
+        const std::wstring folded_needle = folded_text(needle);
+        int best = -1;
+        std::wstring best_text;
+        for (int row = 0; row < count; ++row) {
+            const auto* item = visible_[static_cast<std::size_t>(row)].item;
+            if (item == nullptr) continue;
+            const std::wstring text = folded_text(item->text);
+            if (text >= folded_needle && (best < 0 || text < best_text)) {
+                best = row;
+                best_text = text;
+            }
+        }
+        return best;
+    }
+
+    bool handle_typeahead_char(wchar_t character) {
+        if (character == L'\r' || character == L'\n' || character == L'\t') return false;
+        const ULONGLONG now = GetTickCount64();
+        if (now - typeahead_last_tick_ > 1200) {
+            typeahead_.clear();
+        }
+        typeahead_last_tick_ = now;
+
+        if (character == L'\b') {
+            if (!typeahead_.empty()) typeahead_.pop_back();
+            if (typeahead_.empty()) return true;
+            if (const int row = find_typeahead_match(typeahead_, false); row >= 0) {
+                select_visible_index(row);
+            }
+            return true;
+        }
+        if (character < L' ') return false;
+
+        const bool repeated_single =
+            typeahead_.size() == 1 &&
+            std::towlower(typeahead_.front()) == std::towlower(character);
+        if (repeated_single) {
+            typeahead_.assign(1, character);
+        } else {
+            typeahead_.push_back(character);
+        }
+
+        if (const int row = find_typeahead_match(typeahead_, repeated_single); row >= 0) {
+            select_visible_index(row);
+        }
+        return true;
+    }
+
     LRESULT handle_message(UINT message, WPARAM wparam, LPARAM lparam) {
         switch (message) {
             case WM_ERASEBKGND:
@@ -2431,6 +2909,27 @@ private:
                     return 0;
                 }
                 break;
+            }
+            case WM_RBUTTONDOWN: {
+                SetFocus(hwnd_);
+                POINT point{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
+                if (DirectoryTreeItem* item = item_at_point(point)) {
+                    select_item(item, false);
+                }
+                return 0;
+            }
+            case WM_CONTEXTMENU: {
+                if (lparam != static_cast<LPARAM>(-1)) {
+                    POINT screen{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
+                    POINT client = screen;
+                    ScreenToClient(hwnd_, &client);
+                    if (DirectoryTreeItem* item = item_at_point(client)) {
+                        select_item(item, false);
+                    }
+                }
+                SendMessageW(GetParent(hwnd_), WM_CONTEXTMENU,
+                             reinterpret_cast<WPARAM>(hwnd_), lparam);
+                return 0;
             }
             case WM_MOUSEMOVE:
                 if (dragging_scrollbar_) {
@@ -2505,6 +3004,13 @@ private:
                 }
                 break;
             }
+            case WM_CHAR:
+                if ((GetKeyState(VK_CONTROL) & 0x8000) == 0 &&
+                    (GetKeyState(VK_MENU) & 0x8000) == 0 &&
+                    handle_typeahead_char(static_cast<wchar_t>(wparam))) {
+                    return 0;
+                }
+                break;
         }
         return DefWindowProcW(hwnd_, message, wparam, lparam);
     }
@@ -2544,7 +3050,517 @@ private:
     bool refresh_pending_ = false;
     PopulateCallback populate_callback_;
     SelectCallback select_callback_;
+    std::wstring typeahead_;
+    ULONGLONG typeahead_last_tick_ = 0;
     PaintBuffer paint_buffer_;
+};
+
+struct FileSearchSourceItem {
+    int browser_index = -1;
+    axiom::gui::BrowserItemKind kind = axiom::gui::BrowserItemKind::file;
+    std::wstring name;
+    std::wstring location;
+    std::wstring type;
+    std::wstring size;
+    std::wstring modified;
+};
+
+struct FileSearchDialogResult {
+    bool accepted = false;
+    int browser_index = -1;
+};
+
+class FileSearchDialog {
+public:
+    FileSearchDialog(HINSTANCE instance,
+                     ThemePalette theme,
+                     UINT dpi,
+                     std::wstring scope,
+                     std::vector<FileSearchSourceItem> source)
+        : instance_(instance),
+          theme_(theme),
+          dpi_(dpi == 0 ? USER_DEFAULT_SCREEN_DPI : dpi),
+          scope_(std::move(scope)),
+          source_(std::move(source)) {}
+
+    FileSearchDialogResult show(HWND owner) {
+        owner_ = owner;
+        if (!register_class(instance_)) {
+            return result_;
+        }
+
+        const int width = scale(820);
+        const int height = scale(560);
+        const POINT position = axiom::gui::centered_window_position(owner, width, height);
+        hwnd_ = CreateWindowExW(
+            WS_EX_WINDOWEDGE | WS_EX_CONTROLPARENT,
+            class_name(), L"Find files",
+            WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME |
+                WS_CLIPCHILDREN | WS_CLIPSIBLINGS,
+            position.x, position.y, width, height, owner, nullptr, instance_, this);
+        if (hwnd_ == nullptr) return result_;
+
+        axiom::gui::apply_axiom_window_icons(hwnd_, instance_);
+        axiom::gui::restore_named_window_placement(hwnd_, owner, L"FileSearchDialog");
+        const bool owner_was_enabled = axiom::gui::disable_dialog_owner(owner);
+        ShowWindow(hwnd_, SW_SHOW);
+        UpdateWindow(hwnd_);
+
+        MSG message{};
+        while (IsWindow(hwnd_)) {
+            const BOOL status = GetMessageW(&message, nullptr, 0, 0);
+            if (status <= 0) {
+                if (status == 0) PostQuitMessage(static_cast<int>(message.wParam));
+                break;
+            }
+            if (axiom::gui::message_targets_window(hwnd_, message) &&
+                message.message == WM_KEYDOWN && message.wParam == VK_ESCAPE) {
+                DestroyWindow(hwnd_);
+                continue;
+            }
+            if (!IsDialogMessageW(hwnd_, &message)) {
+                TranslateMessage(&message);
+                DispatchMessageW(&message);
+            }
+        }
+        axiom::gui::restore_dialog_owner(owner, owner_was_enabled);
+        return result_;
+    }
+
+private:
+    enum : int {
+        kSearchText = 30100,
+        kMatchCase = 30101,
+        kWholeName = 30102,
+        kSearchPath = 30103,
+        kIncludeFiles = 30104,
+        kIncludeFolders = 30105,
+        kIncludeArchives = 30106,
+        kSearchButton = 30107,
+        kGoToButton = 30108,
+        kResultsTable = 30109,
+    };
+
+    static const wchar_t* class_name() {
+        return L"AxiomFileSearchDialog";
+    }
+
+    static bool register_class(HINSTANCE instance) {
+        WNDCLASSEXW wc{};
+        if (GetClassInfoExW(instance, class_name(), &wc)) return true;
+        wc.cbSize = sizeof(wc);
+        wc.hInstance = instance;
+        wc.lpfnWndProc = &FileSearchDialog::window_proc;
+        wc.lpszClassName = class_name();
+        wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        wc.style = CS_DBLCLKS;
+        axiom::gui::assign_axiom_window_class_icons(wc, instance);
+        return RegisterClassExW(&wc) != 0 ||
+               GetLastError() == ERROR_CLASS_ALREADY_EXISTS;
+    }
+
+    int scale(int value) const {
+        return scale_for_dpi(dpi_, value);
+    }
+
+    HWND make_control(const wchar_t* class_name,
+                      const wchar_t* text,
+                      DWORD style,
+                      int id = 0,
+                      DWORD ex_style = 0) {
+        HWND control = CreateWindowExW(
+            ex_style, class_name, text,
+            style | WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS,
+            0, 0, 0, 0, hwnd_,
+            id == 0 ? nullptr : reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),
+            instance_, nullptr);
+        if (control != nullptr) {
+            SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(font_), TRUE);
+            axiom::gui::apply_dialog_control_theme(control, theme_.dark);
+        }
+        return control;
+    }
+
+    std::array<HWND, 14> controls() const {
+        return {title_, scope_label_, query_label_, search_edit_,
+                match_case_, whole_name_, search_path_,
+                include_files_, include_folders_, include_archives_,
+                result_count_, search_button_, go_to_button_, close_button_};
+    }
+
+    bool checkbox_checked(int id) const {
+        switch (id) {
+            case kMatchCase: return match_case_checked_;
+            case kWholeName: return whole_name_checked_;
+            case kSearchPath: return search_path_checked_;
+            case kIncludeFiles: return include_files_checked_;
+            case kIncludeFolders: return include_folders_checked_;
+            case kIncludeArchives: return include_archives_checked_;
+            default: return false;
+        }
+    }
+
+    void set_checkbox(int id, bool checked) {
+        switch (id) {
+            case kMatchCase: match_case_checked_ = checked; break;
+            case kWholeName: whole_name_checked_ = checked; break;
+            case kSearchPath: search_path_checked_ = checked; break;
+            case kIncludeFiles: include_files_checked_ = checked; break;
+            case kIncludeFolders: include_folders_checked_ = checked; break;
+            case kIncludeArchives: include_archives_checked_ = checked; break;
+            default: return;
+        }
+        if (HWND control = GetDlgItem(hwnd_, id)) {
+            InvalidateRect(control, nullptr, FALSE);
+        }
+    }
+
+    void toggle_checkbox(int id) {
+        set_checkbox(id, !checkbox_checked(id));
+        run_search();
+    }
+
+    static bool is_folder_kind(axiom::gui::BrowserItemKind kind) {
+        return kind == axiom::gui::BrowserItemKind::directory ||
+               kind == axiom::gui::BrowserItemKind::drive;
+    }
+
+    static bool is_archive_kind(axiom::gui::BrowserItemKind kind) {
+        return kind == axiom::gui::BrowserItemKind::archive;
+    }
+
+    static bool is_file_kind(axiom::gui::BrowserItemKind kind) {
+        return kind == axiom::gui::BrowserItemKind::file ||
+               kind == axiom::gui::BrowserItemKind::symlink ||
+               kind == axiom::gui::BrowserItemKind::hardlink;
+    }
+
+    bool type_allowed(const FileSearchSourceItem& item) const {
+        if (is_file_kind(item.kind) && include_files_checked_) return true;
+        if (is_folder_kind(item.kind) && include_folders_checked_) return true;
+        if (is_archive_kind(item.kind) && include_archives_checked_) return true;
+        return false;
+    }
+
+    bool text_matches(const FileSearchSourceItem& item, std::wstring_view query) const {
+        if (query.empty()) return true;
+        const std::wstring haystack = search_path_checked_ && !item.location.empty()
+            ? item.location + L"\\" + item.name
+            : item.name;
+
+        if (whole_name_checked_) {
+            return match_case_checked_ ? item.name == query
+                              : folded_text(item.name) == folded_text(query);
+        }
+        if (match_case_checked_) {
+            return haystack.find(query) != std::wstring::npos;
+        }
+        return contains_folded(haystack, query);
+    }
+
+    void run_search() {
+        results_.clear();
+        result_indices_.clear();
+        const std::wstring query = get_text(search_edit_);
+        for (const auto& item : source_) {
+            if (!type_allowed(item) || !text_matches(item, query)) continue;
+            result_indices_.push_back(item.browser_index);
+            results_.append_row({item.name, item.location, item.type, item.size,
+                                 item.modified});
+        }
+        if (!result_indices_.empty()) {
+            results_.select_index(0);
+        }
+        set_text(result_count_,
+                 quote_count(result_indices_.size(), L"match", L"matches"));
+        EnableWindow(go_to_button_, !result_indices_.empty());
+    }
+
+    void accept_selected() {
+        const int row = results_.focused_index();
+        if (row < 0 || row >= static_cast<int>(result_indices_.size())) return;
+        result_.accepted = true;
+        result_.browser_index = result_indices_[static_cast<std::size_t>(row)];
+        DestroyWindow(hwnd_);
+    }
+
+    void layout() {
+        if (hwnd_ == nullptr) return;
+        RECT client{};
+        GetClientRect(hwnd_, &client);
+        const int margin = scale(18);
+        const int label_height = scale(22);
+        const int edit_height = scale(30);
+        const int button_width = scale(92);
+        const int button_height = scale(30);
+        const int gap = scale(10);
+        const int bottom = client.bottom - margin;
+
+        MoveWindow(title_, margin, margin, client.right - margin * 2,
+                   label_height, TRUE);
+        MoveWindow(scope_label_, margin, margin + scale(24),
+                   client.right - margin * 2, label_height, TRUE);
+
+        const int query_top = margin + scale(58);
+        MoveWindow(query_label_, margin, query_top + scale(5), scale(86),
+                   label_height, TRUE);
+        MoveWindow(search_edit_, margin + scale(92), query_top,
+                   client.right - margin * 2 - scale(92) - button_width - gap,
+                   edit_height, TRUE);
+        MoveWindow(search_button_, client.right - margin - button_width, query_top,
+                   button_width, edit_height, TRUE);
+
+        const int options_top = query_top + scale(42);
+        const int check_width = std::max(
+            scale(128),
+            (static_cast<int>(client.right) - margin * 2 - gap * 2) / 3);
+        MoveWindow(match_case_, margin, options_top, check_width, label_height, TRUE);
+        MoveWindow(whole_name_, margin + check_width + gap, options_top,
+                   check_width, label_height, TRUE);
+        MoveWindow(search_path_, margin + (check_width + gap) * 2, options_top,
+                   check_width, label_height, TRUE);
+
+        const int types_top = options_top + scale(28);
+        MoveWindow(include_files_, margin, types_top, check_width, label_height, TRUE);
+        MoveWindow(include_folders_, margin + check_width + gap, types_top,
+                   check_width, label_height, TRUE);
+        MoveWindow(include_archives_, margin + (check_width + gap) * 2, types_top,
+                   check_width, label_height, TRUE);
+
+        const int button_top = bottom - button_height;
+        MoveWindow(close_button_, client.right - margin - button_width, button_top,
+                   button_width, button_height, TRUE);
+        MoveWindow(go_to_button_, client.right - margin - button_width * 2 - gap,
+                   button_top, button_width, button_height, TRUE);
+        MoveWindow(result_count_, margin, button_top + scale(5),
+                   client.right - margin * 3 - button_width * 2 - gap,
+                   label_height, TRUE);
+
+        const int results_top = types_top + scale(36);
+        MoveWindow(results_.hwnd(), margin, results_top,
+                   client.right - margin * 2,
+                   button_top - results_top - scale(12), TRUE);
+        InvalidateRect(hwnd_, nullptr, FALSE);
+    }
+
+    void create_controls() {
+        background_brush_ = CreateSolidBrush(theme_.window);
+        edit_brush_ = CreateSolidBrush(theme_.edit);
+        font_ = axiom::gui::create_dialog_font(dpi_);
+        title_ = make_control(L"STATIC", L"Search current file list", SS_NOPREFIX);
+        scope_label_ = make_control(L"STATIC", scope_.c_str(), SS_NOPREFIX);
+        query_label_ = make_control(L"STATIC", L"Find", SS_NOPREFIX);
+        search_edit_ = make_control(L"EDIT", L"", WS_TABSTOP | ES_AUTOHSCROLL,
+                                    kSearchText);
+        match_case_ = make_control(L"BUTTON", L"Match case",
+                                   WS_TABSTOP | BS_OWNERDRAW | BS_CHECKBOX,
+                                   kMatchCase);
+        whole_name_ = make_control(L"BUTTON", L"Whole name",
+                                   WS_TABSTOP | BS_OWNERDRAW | BS_CHECKBOX,
+                                   kWholeName);
+        search_path_ = make_control(L"BUTTON", L"Search path",
+                                    WS_TABSTOP | BS_OWNERDRAW | BS_CHECKBOX,
+                                    kSearchPath);
+        include_files_ = make_control(L"BUTTON", L"Files",
+                                      WS_TABSTOP | BS_OWNERDRAW | BS_CHECKBOX,
+                                      kIncludeFiles);
+        include_folders_ = make_control(L"BUTTON", L"Folders",
+                                        WS_TABSTOP | BS_OWNERDRAW | BS_CHECKBOX,
+                                        kIncludeFolders);
+        include_archives_ = make_control(L"BUTTON", L"Archives",
+                                         WS_TABSTOP | BS_OWNERDRAW | BS_CHECKBOX,
+                                         kIncludeArchives);
+        result_count_ = make_control(L"STATIC", L"", SS_NOPREFIX);
+        search_button_ = make_control(L"BUTTON", L"Search",
+                                      WS_TABSTOP | BS_OWNERDRAW,
+                                      kSearchButton);
+        go_to_button_ = make_control(L"BUTTON", L"Go to",
+                                     WS_TABSTOP | BS_OWNERDRAW,
+                                     kGoToButton);
+        close_button_ = make_control(L"BUTTON", L"Close",
+                                     WS_TABSTOP | BS_OWNERDRAW,
+                                     IDCANCEL);
+
+        set_checkbox(kIncludeFiles, true);
+        set_checkbox(kIncludeFolders, true);
+        set_checkbox(kIncludeArchives, true);
+
+        results_.create(hwnd_, instance_, kResultsTable);
+        results_.set_theme(theme_);
+        results_.set_font(font_);
+        results_.set_dpi(dpi_);
+        results_.set_columns({
+            {L"Name", 220}, {L"Location", 260}, {L"Type", 110},
+            {L"Size", 90}, {L"Modified", 140},
+        });
+
+        for (HWND control : controls()) {
+            if (control != nullptr) {
+                SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(font_), TRUE);
+            }
+        }
+        EnableWindow(go_to_button_, FALSE);
+        axiom::gui::apply_dialog_dark_frame(hwnd_, theme_.dark);
+        layout();
+        run_search();
+        SetFocus(search_edit_);
+    }
+
+    LRESULT control_color(WPARAM wparam, bool edit) {
+        HDC dc = reinterpret_cast<HDC>(wparam);
+        SetTextColor(dc, theme_.text);
+        SetBkColor(dc, edit ? theme_.edit : theme_.window);
+        SetBkMode(dc, edit ? OPAQUE : TRANSPARENT);
+        return reinterpret_cast<LRESULT>(edit ? edit_brush_ : background_brush_);
+    }
+
+    LRESULT handle_message(UINT message, WPARAM wparam, LPARAM lparam) {
+        switch (message) {
+            case WM_CREATE:
+                create_controls();
+                return 0;
+            case WM_SIZE:
+                layout();
+                return 0;
+            case WM_GETMINMAXINFO: {
+                auto* info = reinterpret_cast<MINMAXINFO*>(lparam);
+                info->ptMinTrackSize.x = scale(700);
+                info->ptMinTrackSize.y = scale(440);
+                return 0;
+            }
+            case WM_COMMAND: {
+                const int id = LOWORD(wparam);
+                const int notification = HIWORD(wparam);
+                switch (id) {
+                    case kSearchText:
+                        if (notification == EN_CHANGE) run_search();
+                        return 0;
+                    case kMatchCase:
+                    case kWholeName:
+                    case kSearchPath:
+                    case kIncludeFiles:
+                    case kIncludeFolders:
+                    case kIncludeArchives:
+                        if (notification == BN_CLICKED) toggle_checkbox(id);
+                        return 0;
+                    case kSearchButton:
+                    case IDOK:
+                        run_search();
+                        return 0;
+                    case kGoToButton:
+                        accept_selected();
+                        return 0;
+                    case IDCANCEL:
+                        DestroyWindow(hwnd_);
+                        return 0;
+                    default:
+                        break;
+                }
+                break;
+            }
+            case kTableActivateMessage:
+                accept_selected();
+                return 0;
+            case WM_CTLCOLORSTATIC:
+            case WM_CTLCOLORBTN:
+                return control_color(wparam, false);
+            case WM_CTLCOLOREDIT:
+                return control_color(wparam, true);
+            case WM_DRAWITEM:
+                if (lparam != 0) {
+                    const auto& draw = *reinterpret_cast<DRAWITEMSTRUCT*>(lparam);
+                    switch (draw.CtlID) {
+                        case kMatchCase:
+                        case kWholeName:
+                        case kSearchPath:
+                        case kIncludeFiles:
+                        case kIncludeFolders:
+                        case kIncludeArchives: {
+                            axiom::gui::draw_dialog_checkbox(
+                                draw, theme_.dark,
+                                checkbox_checked(static_cast<int>(draw.CtlID)));
+                            break;
+                        }
+                        default:
+                            axiom::gui::draw_dialog_button(draw, theme_.dark);
+                            break;
+                    }
+                    return TRUE;
+                }
+                break;
+            case WM_ERASEBKGND: {
+                RECT client{};
+                GetClientRect(hwnd_, &client);
+                FillRect(reinterpret_cast<HDC>(wparam), &client, background_brush_);
+                return 1;
+            }
+            case WM_CLOSE:
+                DestroyWindow(hwnd_);
+                return 0;
+            case WM_NCDESTROY:
+                axiom::gui::save_named_window_placement(L"FileSearchDialog", hwnd_);
+                if (font_ != nullptr) axiom::gui::delete_dialog_font(font_);
+                if (background_brush_ != nullptr) DeleteObject(background_brush_);
+                if (edit_brush_ != nullptr) DeleteObject(edit_brush_);
+                SetWindowLongPtrW(hwnd_, GWLP_USERDATA, 0);
+                hwnd_ = nullptr;
+                return 0;
+            default:
+                break;
+        }
+        return DefWindowProcW(hwnd_, message, wparam, lparam);
+    }
+
+    static LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam) {
+        FileSearchDialog* dialog = nullptr;
+        if (message == WM_NCCREATE) {
+            const auto* create = reinterpret_cast<CREATESTRUCTW*>(lparam);
+            dialog = create == nullptr
+                ? nullptr
+                : static_cast<FileSearchDialog*>(create->lpCreateParams);
+            if (dialog == nullptr) return FALSE;
+            dialog->hwnd_ = hwnd;
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(dialog));
+        } else {
+            dialog = reinterpret_cast<FileSearchDialog*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+        }
+        if (dialog != nullptr) return dialog->handle_message(message, wparam, lparam);
+        return DefWindowProcW(hwnd, message, wparam, lparam);
+    }
+
+    HWND hwnd_ = nullptr;
+    HWND owner_ = nullptr;
+    HINSTANCE instance_ = nullptr;
+    ThemePalette theme_;
+    UINT dpi_ = USER_DEFAULT_SCREEN_DPI;
+    std::wstring scope_;
+    std::vector<FileSearchSourceItem> source_;
+    std::vector<int> result_indices_;
+    FileSearchDialogResult result_;
+    HFONT font_ = nullptr;
+    HBRUSH background_brush_ = nullptr;
+    HBRUSH edit_brush_ = nullptr;
+    bool match_case_checked_ = false;
+    bool whole_name_checked_ = false;
+    bool search_path_checked_ = false;
+    bool include_files_checked_ = true;
+    bool include_folders_checked_ = true;
+    bool include_archives_checked_ = true;
+    HWND title_ = nullptr;
+    HWND scope_label_ = nullptr;
+    HWND query_label_ = nullptr;
+    HWND search_edit_ = nullptr;
+    HWND match_case_ = nullptr;
+    HWND whole_name_ = nullptr;
+    HWND search_path_ = nullptr;
+    HWND include_files_ = nullptr;
+    HWND include_folders_ = nullptr;
+    HWND include_archives_ = nullptr;
+    HWND result_count_ = nullptr;
+    HWND search_button_ = nullptr;
+    HWND go_to_button_ = nullptr;
+    HWND close_button_ = nullptr;
+    DarkTableView results_;
 };
 
 class MainWindow {
@@ -2571,12 +3587,18 @@ public:
         startup_command_ = std::move(startup_command);
         persisted_settings_ = axiom::gui::load_gui_settings();
         application_options_ = persisted_settings_.application;
+        configure_dialog_appearance(application_options_);
+        recent_addresses_ = persisted_settings_.recent_locations;
+        recent_archives_ = persisted_settings_.recent_archives;
+        favorite_locations_ = persisted_settings_.favorite_locations;
         selected_level_ = application_options_.default_level;
         selected_thread_count_ = application_options_.default_thread_count;
         selected_dictionary_size_ = application_options_.default_dictionary_size;
         selected_word_size_ = application_options_.default_word_size;
         selected_solid_block_size_ = application_options_.default_solid_block_size;
-        theme_ = make_theme(application_options_.theme_mode);
+        theme_ = make_theme(application_options_.theme_mode,
+                            application_options_.accent_color_mode,
+                            application_options_.custom_accent_color);
         cleanup_old_temp_directories();
         apply_shell_integration();
         sort_column_ = persisted_settings_.sort_column;
@@ -2620,16 +3642,26 @@ public:
         }
         axiom::gui::apply_axiom_window_icons(hwnd_, instance);
 
+        bool restored_window_placement = false;
         if (application_options_.restore_window_placement &&
-            persisted_settings_.has_placement) {
+            persisted_settings_.has_placement &&
+            axiom::gui::window_placement_is_visible(persisted_settings_.placement)) {
             if (persisted_settings_.placement.showCmd == SW_SHOWMINIMIZED) {
                 persisted_settings_.placement.showCmd = SW_SHOWNORMAL;
             }
             SetWindowPlacement(hwnd_, &persisted_settings_.placement);
+            restored_window_placement = true;
+        } else if (application_options_.restore_window_placement &&
+                   persisted_settings_.has_placement) {
+            RECT rect{};
+            GetWindowRect(hwnd_, &rect);
+            const POINT position = axiom::gui::centered_window_position(
+                nullptr, rect.right - rect.left, rect.bottom - rect.top);
+            SetWindowPos(hwnd_, nullptr, position.x, position.y, 0, 0,
+                         SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
         }
 
-        ShowWindow(hwnd_, application_options_.restore_window_placement &&
-                              persisted_settings_.has_placement
+        ShowWindow(hwnd_, restored_window_placement
                               ? persisted_settings_.placement.showCmd
                               : show_command);
         UpdateWindow(hwnd_);
@@ -2735,7 +3767,10 @@ private:
     }
 
     void apply_theme() {
-        theme_ = make_theme(application_options_.theme_mode);
+        configure_dialog_appearance(application_options_);
+        theme_ = make_theme(application_options_.theme_mode,
+                            application_options_.accent_color_mode,
+                            application_options_.custom_accent_color);
         rebuild_theme_brushes();
         set_dark_title_bar(hwnd_, theme_.dark);
 
@@ -2752,8 +3787,8 @@ private:
         axiom::gui::apply_dialog_control_theme(address_edit_, theme_.dark);
         menu_bar_.set_theme({
             theme_.dark ? RGB(31, 31, 31) : RGB(250, 250, 250),
-            theme_.dark ? RGB(49, 49, 49) : RGB(229, 241, 251),
-            theme_.dark ? RGB(64, 64, 64) : RGB(204, 228, 247),
+            theme_.button_hot,
+            theme_.button_pressed,
             theme_.text,
             theme_.muted_text,
             theme_.dark ? RGB(42, 42, 42) : RGB(210, 210, 210),
@@ -3216,12 +4251,18 @@ private:
         }
 
         const auto icon = toolbar_icon_for_button(draw.CtlID);
-        const COLORREF content_color = disabled ? theme_.muted_text : theme_.text;
+        const int icon_mode = std::clamp(application_options_.toolbar_icon_style, 0, 2);
+        const COLORREF content_color = disabled ? theme_.muted_text
+            : icon_mode == 2 ? theme_.accent : theme_.text;
+        const auto icon_style = !disabled && icon_mode == 1
+            ? axiom::gui::ToolbarIconStyle::colorful
+            : axiom::gui::ToolbarIconStyle::monochrome;
         if (icon == axiom::gui::ToolbarIcon::none) {
             DrawTextW(draw.hDC, text.c_str(), -1, &rect,
                       DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
         } else if (is_icon_only_button(draw.CtlID)) {
-            axiom::gui::draw_toolbar_icon(draw.hDC, icon, rect, content_color, dpi_);
+            axiom::gui::draw_toolbar_icon(draw.hDC, icon, rect, content_color,
+                                          dpi_, 18, icon_style);
         } else {
             SIZE text_size{};
             GetTextExtentPoint32W(draw.hDC, text.c_str(), static_cast<int>(text.size()), &text_size);
@@ -3230,7 +4271,8 @@ private:
             const int content_width = icon_size + gap + static_cast<int>(text_size.cx);
             const int content_left = rect.left + (rect.right - rect.left - content_width) / 2;
             RECT icon_rect{content_left, rect.top, content_left + icon_size, rect.bottom};
-            axiom::gui::draw_toolbar_icon(draw.hDC, icon, icon_rect, content_color, dpi_);
+            axiom::gui::draw_toolbar_icon(draw.hDC, icon, icon_rect, content_color,
+                                          dpi_, 18, icon_style);
 
             RECT text_rect{icon_rect.right + gap, rect.top,
                            icon_rect.right + gap + static_cast<int>(text_size.cx), rect.bottom};
@@ -3330,6 +4372,7 @@ private:
             case kMenuTools:
                 return {
                     {kInfo, L"Archive &information", L"Ctrl+I", has_archive || has_selection},
+                    {kFind, L"&Find files...", L"Ctrl+F", !browser_items_.empty()},
                     {0, L"", L"", false, true},
                     {kBenchmark, L"&Benchmark...", L"", !busy_},
                     {0, L"", L"", false, true},
@@ -3368,6 +4411,8 @@ private:
         const axiom::gui::ArchiveCapabilities capabilities = active_archive_capabilities();
         const bool archive_editable = capabilities.update && !capabilities.locked &&
                                       !capabilities.directory_encrypted;
+        const std::wstring current_location = current_location_value();
+        const bool favorite = favorite_contains(current_location);
         if (point.x == -1 && point.y == -1) {
             RECT list_rect{};
             GetWindowRect(list_, &list_rect);
@@ -3386,15 +4431,152 @@ private:
             {kDelete, browsing_archive ? L"&Delete from archive" : L"&Delete", L"Delete",
              !busy_ && has_selection && (!browsing_archive || archive_editable)},
             {kInfo, L"&Information", L"Ctrl+I", has_selection || has_archive},
+            {kFind, L"&Find files...", L"Ctrl+F", !browser_items_.empty()},
             {kSelectAll, L"Select &all", L"Ctrl+A", !browser_items_.empty()},
+            {0, L"", L"", false, true},
+            {kCopyPath, L"Copy &path", L"", has_selection ||
+                 history_.current().kind != axiom::gui::BrowserLocationKind::computer},
+            {kCopyCrc32, L"Copy CRC-&32", L"", has_selection},
+            {0, L"", L"", false, true},
+            {static_cast<UINT>(favorite ? kRemoveFavorite : kAddFavorite),
+             favorite ? L"Remove current location from &Favorites"
+                      : L"Pin current location to &Favorites",
+             L"", !current_location.empty()},
         };
         const UINT command = menu_bar_.show_context_menu(std::move(items), point);
         if (command != 0) SendMessageW(hwnd_, WM_COMMAND, MAKEWPARAM(command, 0), 0);
     }
 
+    void show_tree_context_menu(POINT point) {
+        DirectoryTreeItem* item = tree_view_.selected_item();
+        if (item == nullptr) return;
+        const DirectoryTreeNode& node = item->node;
+        const bool is_filesystem =
+            node.kind == DirectoryTreeNodeKind::filesystem ||
+            node.kind == DirectoryTreeNodeKind::archive;
+        const bool is_archive =
+            node.kind == DirectoryTreeNodeKind::archive ||
+            node.kind == DirectoryTreeNodeKind::archive_directory;
+        std::optional<fs::path> archive_path;
+        if (node.kind == DirectoryTreeNodeKind::archive) {
+            archive_path = node.filesystem_path;
+        } else if (node.kind == DirectoryTreeNodeKind::archive_directory) {
+            archive_path = node.archive_path;
+        }
+
+        if (point.x == -1 && point.y == -1) {
+            RECT tree_rect{};
+            GetWindowRect(tree_view_.hwnd(), &tree_rect);
+            point = {tree_rect.left + scale(32), tree_rect.top + scale(32)};
+        }
+
+        axiom::gui::ArchiveCapabilities capabilities{};
+        if (archive_path) {
+            if (const auto* provider = axiom::archive_provider_for_path(*archive_path)) {
+                try {
+                    capabilities = provider->capabilities(*archive_path);
+                } catch (...) {
+                    capabilities = {};
+                }
+            }
+        }
+        std::vector<axiom::gui::CustomMenuItem> items{
+            {kTreeOpen, L"&Open", L"Enter", node.kind != DirectoryTreeNodeKind::dummy},
+            {kTreeRefresh, L"&Refresh tree", L"F5", !busy_},
+            {0, L"", L"", false, true},
+            {kTreeExpand, L"E&xpand", L"", item->may_have_children && !item->expanded},
+            {kTreeCollapse, L"Co&llapse", L"", item->may_have_children && item->expanded},
+            {0, L"", L"", false, true},
+            {kTreeOpenInExplorer, L"Open in &Explorer", L"", is_filesystem},
+            {kTreeAddToArchive, L"&Add to archive...", L"", !busy_ && is_filesystem},
+            {0, L"", L"", false, true},
+            {kTreeExtractArchive, L"E&xtract archive...", L"",
+             !busy_ && is_archive && capabilities.extract},
+            {kTreeTestArchive, L"&Test archive", L"", !busy_ && is_archive && capabilities.test},
+            {kTreeArchiveInfo, L"Archive &information", L"", is_archive},
+        };
+        if (const auto location = tree_location_value(node)) {
+            const bool favorite = favorite_contains(*location);
+            items.push_back({0, L"", L"", false, true});
+            items.push_back({
+                static_cast<UINT>(favorite ? kTreeRemoveFavorite : kTreeAddFavorite),
+                favorite ? L"Remove from &Favorites" : L"Pin to &Favorites",
+                L"",
+                true
+            });
+        }
+
+        const UINT command = menu_bar_.show_context_menu(std::move(items), point);
+        if (command == 0) return;
+        switch (command) {
+            case kTreeOpen:
+                on_tree_selection_changed(*item);
+                break;
+            case kTreeRefresh:
+                rebuild_directory_tree();
+                break;
+            case kTreeExpand:
+                tree_view_.set_expanded(item, true);
+                break;
+            case kTreeCollapse:
+                tree_view_.set_expanded(item, false);
+                break;
+            case kTreeOpenInExplorer:
+                if (node.kind == DirectoryTreeNodeKind::archive) {
+                    const std::wstring params =
+                        L"/select,\"" + node.filesystem_path.wstring() + L"\"";
+                    ShellExecuteW(hwnd_, L"open", L"explorer.exe", params.c_str(),
+                                  nullptr, SW_SHOWNORMAL);
+                } else if (node.kind == DirectoryTreeNodeKind::filesystem) {
+                    ShellExecuteW(hwnd_, L"open", node.filesystem_path.c_str(),
+                                  nullptr, nullptr, SW_SHOWNORMAL);
+                }
+                break;
+            case kTreeAddToArchive:
+                if (is_filesystem) {
+                    create_archive_from_paths({node.filesystem_path});
+                }
+                break;
+            case kTreeExtractArchive:
+                if (archive_path) {
+                    navigate_to(axiom::gui::BrowserLocation::archive(*archive_path));
+                    on_extract();
+                }
+                break;
+            case kTreeTestArchive:
+                if (archive_path) {
+                    navigate_to(axiom::gui::BrowserLocation::archive(*archive_path));
+                    on_test();
+                }
+                break;
+            case kTreeArchiveInfo:
+                if (archive_path) {
+                    navigate_to(axiom::gui::BrowserLocation::archive(*archive_path));
+                    on_info();
+                }
+                break;
+            case kTreeAddFavorite:
+                if (const auto location = tree_location_value(node)) {
+                    add_favorite_location(*location);
+                }
+                break;
+            case kTreeRemoveFavorite:
+                if (const auto location = tree_location_value(node)) {
+                    remove_favorite_location(*location);
+                }
+                break;
+        }
+    }
+
     void paint_shell() {
         PAINTSTRUCT paint{};
         HDC dc = BeginPaint(hwnd_, &paint);
+        // Several layout paths intentionally invalidate without erasing to avoid
+        // classic Win32 white flashes.  The parent still owns every exposed pixel
+        // between child windows, so paint the dirty shell area here instead of
+        // relying on WM_ERASEBKGND.  WS_CLIPCHILDREN keeps the custom tree/table
+        // controls out of this fill.
+        fill_rect(dc, paint.rcPaint, theme_.window);
         if (tree_splitter_rect_.right > tree_splitter_rect_.left &&
             tree_splitter_rect_.bottom > tree_splitter_rect_.top) {
             fill_rect(dc, tree_splitter_rect_, theme_.border);
@@ -3408,6 +4590,9 @@ private:
 
     void on_create() {
         update_dpi(GetDpiForWindow(hwnd_));
+        if (persisted_settings_.tree_width > 0) {
+            tree_width_ = scale(persisted_settings_.tree_width);
+        }
 
         menu_bar_.create(
             hwnd_, instance_,
@@ -3460,7 +4645,7 @@ private:
 
         table_.create(hwnd_, instance_, kList);
         list_ = table_.hwnd();
-        table_.set_columns({
+        std::vector<TableColumn> columns{
             {L"Name", 300},
             {L"Size", 105},
             {L"Packed", 105},
@@ -3468,7 +4653,14 @@ private:
             {L"Modified", 150},
             {L"CRC-32", 90},
             {L"Attributes", 90},
-        });
+        };
+        if (persisted_settings_.column_widths.size() == columns.size()) {
+            for (std::size_t index = 0; index < columns.size(); ++index) {
+                columns[index].logical_width =
+                    std::clamp(persisted_settings_.column_widths[index], 48, 2000);
+            }
+        }
+        table_.set_columns(std::move(columns));
         apply_table_options();
         rebuild_directory_tree();
 
@@ -3669,6 +4861,7 @@ private:
         axiom::CompressionOptions options;
         axiom::apply_compression_level(options, selected_level());
         options.thread_count = selected_thread_count_;
+        options.io_buffer_size = configured_io_buffer_size(application_options_);
         if (selected_dictionary_size_ != 0) {
             options.window_size = selected_dictionary_size_;
         }
@@ -3725,11 +4918,124 @@ private:
         }
     }
 
+    static bool same_location_text(const std::wstring& left, const std::wstring& right) {
+        return CompareStringOrdinal(left.c_str(), -1, right.c_str(), -1, TRUE) == CSTR_EQUAL;
+    }
+
+    static std::wstring compact_location_label(const std::wstring& value) {
+        if (_wcsicmp(value.c_str(), L"This PC") == 0) return value;
+        const std::wstring archive_separator = L" :: /";
+        if (const auto separator = value.find(archive_separator);
+            separator != std::wstring::npos) {
+            const fs::path archive = value.substr(0, separator);
+            std::wstring label = archive.filename().empty()
+                ? archive.wstring()
+                : archive.filename().wstring();
+            const std::wstring inner = value.substr(separator + archive_separator.size());
+            label += L" :: /";
+            label += inner;
+            return label;
+        }
+        const fs::path path(value);
+        if (path.has_filename()) return path.filename().wstring();
+        return value;
+    }
+
+    ShellIconRef address_icon_for_value(const std::wstring& value) const {
+        if (_wcsicmp(value.c_str(), L"This PC") == 0) {
+            return shell_icon_for_path(L"folder");
+        }
+        const std::wstring archive_separator = L" :: /";
+        if (const auto separator = value.find(archive_separator);
+            separator != std::wstring::npos) {
+            return shell_icon_for_path(fs::path(value.substr(0, separator)));
+        }
+        const fs::path path(value);
+        if (!path.empty()) return shell_icon_for_path(path);
+        return {};
+    }
+
+    bool favorite_contains(const std::wstring& value) const {
+        return std::any_of(favorite_locations_.begin(), favorite_locations_.end(),
+                           [&](const std::wstring& favorite) {
+                               return same_location_text(favorite, value);
+                           });
+    }
+
+    static void remember_limited_unique(std::vector<std::wstring>& values,
+                                        std::wstring value,
+                                        int limit) {
+        if (value.empty()) return;
+        limit = std::clamp(limit, 0, 50);
+        if (limit == 0) {
+            values.clear();
+            return;
+        }
+        std::erase_if(values, [&](const std::wstring& existing) {
+            return same_location_text(existing, value);
+        });
+        values.insert(values.begin(), std::move(value));
+        if (values.size() > static_cast<std::size_t>(limit)) {
+            values.resize(static_cast<std::size_t>(limit));
+        }
+    }
+
+    void add_favorite_location(std::wstring value) {
+        if (value.empty()) return;
+        if (favorite_contains(value)) {
+            set_status(L"Location is already in Favorites.");
+            return;
+        }
+        favorite_locations_.insert(favorite_locations_.begin(), std::move(value));
+        if (favorite_locations_.size() > 50) favorite_locations_.resize(50);
+        save_current_settings();
+        set_status(L"Added location to Favorites.");
+    }
+
+    void remove_favorite_location(const std::wstring& value) {
+        const auto old_size = favorite_locations_.size();
+        std::erase_if(favorite_locations_, [&](const std::wstring& favorite) {
+            return same_location_text(favorite, value);
+        });
+        if (favorite_locations_.size() != old_size) {
+            save_current_settings();
+            set_status(L"Removed location from Favorites.");
+        } else {
+            set_status(L"Location was not in Favorites.");
+        }
+    }
+
+    std::wstring current_location_value() const {
+        return history_.current().display_name();
+    }
+
+    std::optional<std::wstring> tree_location_value(const DirectoryTreeNode& node) const {
+        switch (node.kind) {
+            case DirectoryTreeNodeKind::computer:
+                return std::wstring(L"This PC");
+            case DirectoryTreeNodeKind::filesystem:
+                return node.filesystem_path.wstring();
+            case DirectoryTreeNodeKind::archive:
+                return axiom::gui::BrowserLocation::archive(node.archive_path).display_name();
+            case DirectoryTreeNodeKind::archive_directory:
+                return axiom::gui::BrowserLocation::archive(
+                    node.archive_path, node.archive_directory).display_name();
+            case DirectoryTreeNodeKind::dummy:
+                break;
+        }
+        return std::nullopt;
+    }
+
     void populate_address_dropdown() {
         if (address_edit_ == nullptr) return;
         const std::wstring current_text = get_text(address_edit_);
         SendMessageW(address_edit_, CB_RESETCONTENT, 0, 0);
         address_entries_.clear();
+
+        for (const std::wstring& favorite : favorite_locations_) {
+            add_address_entry(L"\u2605 " + compact_location_label(favorite),
+                              favorite, address_icon_for_value(favorite));
+        }
 
         if (application_options_.show_address_shell_locations) {
             add_address_entry(L"This PC", L"This PC", shell_icon_for_path(L"folder"));
@@ -3765,7 +5071,12 @@ private:
 
         if (application_options_.show_address_recent_locations) {
             for (const std::wstring& recent : recent_addresses_) {
-                add_address_entry(recent, recent, shell_icon_for_path(recent));
+                add_address_entry(L"Recent: " + compact_location_label(recent),
+                                  recent, address_icon_for_value(recent));
+            }
+            for (const std::wstring& archive : recent_archives_) {
+                add_address_entry(L"Archive: " + compact_location_label(archive),
+                                  archive, address_icon_for_value(archive));
             }
         }
 
@@ -3799,20 +5110,14 @@ private:
     }
 
     void remember_address(std::wstring value) {
-        if (value.empty()) return;
-        const int limit = std::clamp(application_options_.recent_location_count, 0, 50);
-        if (limit == 0) {
-            recent_addresses_.clear();
-            return;
-        }
-        std::erase_if(recent_addresses_, [&](const std::wstring& existing) {
-            return CompareStringOrdinal(existing.c_str(), -1,
-                                        value.c_str(), -1, TRUE) == CSTR_EQUAL;
-        });
-        recent_addresses_.insert(recent_addresses_.begin(), std::move(value));
-        if (recent_addresses_.size() > static_cast<std::size_t>(limit)) {
-            recent_addresses_.resize(static_cast<std::size_t>(limit));
-        }
+        remember_limited_unique(recent_addresses_, std::move(value),
+                                application_options_.recent_location_count);
+    }
+
+    void remember_archive_path(const fs::path& archive) {
+        if (archive.empty()) return;
+        remember_limited_unique(recent_archives_, archive.wstring(),
+                                application_options_.recent_location_count);
     }
 
     void select_address_entry() {
@@ -3871,12 +5176,270 @@ private:
         EnableWindow(navigate_up_, parent_location(history_.current()).has_value());
     }
 
+    struct BrowserStatusTotals {
+        std::size_t items = 0;
+        std::size_t files = 0;
+        std::size_t folders = 0;
+        std::size_t archives = 0;
+        std::size_t drives = 0;
+        std::size_t links = 0;
+        std::uint64_t size = 0;
+        std::uint64_t packed = 0;
+        bool has_size = false;
+        bool has_packed = false;
+        bool packed_estimated = false;
+    };
+
+    struct BrowserViewState {
+        std::vector<std::uint64_t> selected_ids;
+        std::optional<std::uint64_t> focused_id;
+        int horizontal_scroll = 0;
+        int vertical_scroll = 0;
+    };
+
+    static void add_status_size(BrowserStatusTotals& totals, std::uint64_t size) {
+        totals.has_size = true;
+        totals.size = saturated_add(totals.size, size);
+    }
+
+    static void add_status_item(BrowserStatusTotals& totals,
+                                const axiom::gui::BrowserItem& item) {
+        if (item.is_parent()) return;
+        ++totals.items;
+        switch (item.kind) {
+            case axiom::gui::BrowserItemKind::drive:
+                ++totals.drives;
+                add_status_size(totals, item.size);
+                break;
+            case axiom::gui::BrowserItemKind::directory:
+                ++totals.folders;
+                break;
+            case axiom::gui::BrowserItemKind::archive:
+                ++totals.archives;
+                add_status_size(totals, item.size);
+                break;
+            case axiom::gui::BrowserItemKind::symlink:
+            case axiom::gui::BrowserItemKind::hardlink:
+                ++totals.links;
+                break;
+            case axiom::gui::BrowserItemKind::file:
+                ++totals.files;
+                add_status_size(totals, item.size);
+                break;
+            case axiom::gui::BrowserItemKind::parent:
+                break;
+        }
+        if (item.packed_size) {
+            totals.has_packed = true;
+            totals.packed = saturated_add(totals.packed, *item.packed_size);
+            totals.packed_estimated = totals.packed_estimated || item.packed_size_estimated;
+        }
+    }
+
+    BrowserStatusTotals summarize_browser_status(const std::vector<int>* indices) const {
+        BrowserStatusTotals totals;
+        if (indices == nullptr) {
+            for (const auto& item : browser_items_) {
+                add_status_item(totals, item);
+            }
+            return totals;
+        }
+        for (const int index : *indices) {
+            if (index >= 0 && index < static_cast<int>(browser_items_.size())) {
+                add_status_item(totals, browser_items_[static_cast<std::size_t>(index)]);
+            }
+        }
+        return totals;
+    }
+
+    static void append_status_part(std::vector<std::wstring>& parts, std::wstring text) {
+        if (!text.empty()) parts.push_back(std::move(text));
+    }
+
+    static std::wstring join_status_parts(const std::vector<std::wstring>& parts,
+                                          std::wstring_view separator = L", ") {
+        std::wstring result;
+        for (const auto& part : parts) {
+            if (!result.empty()) result += separator;
+            result += part;
+        }
+        return result;
+    }
+
+    static std::wstring status_breakdown(const BrowserStatusTotals& totals) {
+        std::vector<std::wstring> parts;
+        append_status_part(parts, quote_count(totals.drives, L"drive", L"drives"));
+        append_status_part(parts, quote_count(totals.folders, L"folder", L"folders"));
+        append_status_part(parts, quote_count(totals.archives, L"archive", L"archives"));
+        append_status_part(parts, quote_count(totals.files, L"file", L"files"));
+        append_status_part(parts, quote_count(totals.links, L"link", L"links"));
+        std::erase_if(parts, [](const std::wstring& text) {
+            return text.rfind(L"0 ", 0) == 0;
+        });
+        return join_status_parts(parts);
+    }
+
+    std::wstring status_location_suffix() const {
+        const auto& location = history_.current();
+        if (location.kind == axiom::gui::BrowserLocationKind::filesystem) {
+            return location.filesystem_path.wstring();
+        }
+        if (location.kind == axiom::gui::BrowserLocationKind::archive) {
+            std::wstring suffix;
+            if (archive_catalog_ && same_filesystem_path(archive_catalog_->path(),
+                                                         location.archive_path)) {
+                suffix = widen(archive_catalog_->format_info().display_name);
+            } else if (const auto* provider = axiom::archive_provider_for_path(location.archive_path)) {
+                suffix = widen(provider->info().display_name);
+            } else {
+                suffix = L"Archive";
+            }
+            suffix += L": ";
+            suffix += location.archive_path.filename().wstring();
+            suffix += L" :: /";
+            if (!location.archive_directory.empty()) suffix += widen(location.archive_directory);
+            return suffix;
+        }
+        return L"This PC";
+    }
+
+    void update_browser_status(const std::vector<int>* selected_indices = nullptr) {
+        const bool has_selection = selected_indices != nullptr && !selected_indices->empty();
+        const BrowserStatusTotals totals = summarize_browser_status(selected_indices);
+        std::wstring text = has_selection
+            ? quote_count(totals.items, L"item selected", L"items selected")
+            : quote_count(totals.items, L"item", L"items");
+
+        const std::wstring breakdown = status_breakdown(totals);
+        if (!breakdown.empty()) {
+            text += L": ";
+            text += breakdown;
+        }
+        if (totals.has_size) {
+            text += history_.current().kind == axiom::gui::BrowserLocationKind::archive
+                ? L", " + format_size(totals.size) + L" unpacked"
+                : L", " + format_size(totals.size);
+        }
+        if (totals.has_packed) {
+            text += L", ";
+            text += totals.packed_estimated ? L"\u2248 " : L"";
+            text += format_size(totals.packed);
+            text += L" packed";
+        }
+        const std::wstring suffix = status_location_suffix();
+        if (!suffix.empty()) {
+            text += L" | ";
+            text += suffix;
+        }
+        set_status(text);
+    }
+
+    void update_browser_status_for_current_selection() {
+        const std::vector<int> selected = selected_browser_indices();
+        if (selected.empty()) {
+            update_browser_status();
+        } else {
+            update_browser_status(&selected);
+        }
+    }
+
+    static std::wstring folded_extension_key(fs::path path) {
+        std::wstring extension = path.extension().wstring();
+        std::transform(extension.begin(), extension.end(), extension.begin(),
+                       [](wchar_t value) {
+                           return static_cast<wchar_t>(std::towlower(value));
+                       });
+        return extension.empty() ? L"<none>" : extension;
+    }
+
+    static std::wstring folded_path_key(fs::path path) {
+        std::wstring text = path.lexically_normal().wstring();
+        std::transform(text.begin(), text.end(), text.begin(),
+                       [](wchar_t value) {
+                           return static_cast<wchar_t>(std::towlower(value));
+                       });
+        return text;
+    }
+
+    static std::wstring shell_icon_cache_key(const axiom::gui::BrowserItem& item,
+                                             bool prefer_generic_unique_icon = false) {
+        if (item_needs_real_shell_icon(item) && !prefer_generic_unique_icon) {
+            return L"path:" + folded_path_key(item.filesystem_path);
+        }
+        switch (item.kind) {
+            case axiom::gui::BrowserItemKind::parent:
+            case axiom::gui::BrowserItemKind::directory:
+                return L"folder";
+            case axiom::gui::BrowserItemKind::drive:
+                return L"drive:" + item.filesystem_path.root_name().wstring();
+            case axiom::gui::BrowserItemKind::archive:
+                return L"archive:" + folded_extension_key(
+                    item.filesystem_path.empty() ? fs::path(item.name) : item.filesystem_path);
+            case axiom::gui::BrowserItemKind::symlink:
+                return L"symlink:" + folded_extension_key(fs::path(item.name));
+            case axiom::gui::BrowserItemKind::hardlink:
+                return L"hardlink:" + folded_extension_key(fs::path(item.name));
+            case axiom::gui::BrowserItemKind::file:
+                return L"file:" + folded_extension_key(
+                    item.filesystem_path.empty() ? fs::path(item.name) : item.filesystem_path);
+        }
+        return L"file:<none>";
+    }
+
+    ShellIconRef cached_shell_icon_for_item(const axiom::gui::BrowserItem& item,
+                                            bool prefer_generic_unique_icon = false) {
+        const std::wstring key = shell_icon_cache_key(item, prefer_generic_unique_icon);
+        if (const auto found = shell_icon_cache_.find(key); found != shell_icon_cache_.end()) {
+            return found->second;
+        }
+        axiom::gui::BrowserItem icon_item = item;
+        if (prefer_generic_unique_icon && item_needs_real_shell_icon(icon_item)) {
+            icon_item.filesystem_path.clear();
+        }
+        ShellIconRef icon = shell_icon_for_item(icon_item);
+        shell_icon_cache_.emplace(key, icon);
+        return icon;
+    }
+
     std::vector<int> selected_browser_indices() const {
         std::vector<int> result;
         for (int index : table_.selected_indices()) {
             if (index >= 0 && index < static_cast<int>(browser_items_.size())) result.push_back(index);
         }
         return result;
+    }
+
+    BrowserViewState capture_browser_view_state() const {
+        BrowserViewState state;
+        state.horizontal_scroll = table_.horizontal_scroll_position();
+        state.vertical_scroll = table_.vertical_scroll_position();
+        for (int index : selected_browser_indices()) {
+            state.selected_ids.push_back(browser_items_[static_cast<std::size_t>(index)].id);
+        }
+        const int focused = table_.focused_index();
+        if (focused >= 0 && focused < static_cast<int>(browser_items_.size())) {
+            state.focused_id = browser_items_[static_cast<std::size_t>(focused)].id;
+        }
+        return state;
+    }
+
+    void restore_browser_view_state(const BrowserViewState& state) {
+        std::unordered_set<std::uint64_t> selected_ids(state.selected_ids.begin(),
+                                                       state.selected_ids.end());
+        std::vector<int> selected_indices;
+        selected_indices.reserve(state.selected_ids.size());
+        int focused_index = -1;
+        for (int index = 0; index < static_cast<int>(browser_items_.size()); ++index) {
+            const auto id = browser_items_[static_cast<std::size_t>(index)].id;
+            if (selected_ids.find(id) != selected_ids.end()) {
+                selected_indices.push_back(index);
+            }
+            if (state.focused_id && id == *state.focused_id) {
+                focused_index = index;
+            }
+        }
+        table_.set_selection_and_scroll(std::move(selected_indices), focused_index,
+                                        state.horizontal_scroll, state.vertical_scroll);
     }
 
     std::vector<fs::path> selected_filesystem_paths() const {
@@ -3901,6 +5464,97 @@ private:
         return result;
     }
 
+    bool copy_text_to_clipboard(const std::wstring& text) const {
+        if (text.empty()) return false;
+        if (!OpenClipboard(hwnd_)) return false;
+        struct ClipboardGuard {
+            ~ClipboardGuard() { CloseClipboard(); }
+        } guard;
+
+        if (!EmptyClipboard()) return false;
+        const SIZE_T bytes = (text.size() + 1) * sizeof(wchar_t);
+        HGLOBAL memory = GlobalAlloc(GMEM_MOVEABLE, bytes);
+        if (memory == nullptr) return false;
+        void* target = GlobalLock(memory);
+        if (target == nullptr) {
+            GlobalFree(memory);
+            return false;
+        }
+        std::memcpy(target, text.c_str(), bytes);
+        GlobalUnlock(memory);
+        if (SetClipboardData(CF_UNICODETEXT, memory) == nullptr) {
+            GlobalFree(memory);
+            return false;
+        }
+        return true;
+    }
+
+    static std::wstring newline_join(const std::vector<std::wstring>& lines) {
+        std::wstring text;
+        for (const auto& line : lines) {
+            if (line.empty()) continue;
+            if (!text.empty()) text += L"\r\n";
+            text += line;
+        }
+        return text;
+    }
+
+    std::wstring display_path_for_item(const axiom::gui::BrowserItem& item) const {
+        if (!item.filesystem_path.empty()) return item.filesystem_path.wstring();
+        if (!item.archive_path.empty() &&
+            history_.current().kind == axiom::gui::BrowserLocationKind::archive) {
+            return axiom::gui::BrowserLocation::archive(
+                history_.current().archive_path, item.archive_path).display_name();
+        }
+        return {};
+    }
+
+    void on_copy_paths() {
+        std::vector<std::wstring> lines;
+        for (int index : selected_browser_indices()) {
+            const auto& item = browser_items_[static_cast<std::size_t>(index)];
+            if (item.is_parent()) continue;
+            if (auto text = display_path_for_item(item); !text.empty()) {
+                lines.push_back(std::move(text));
+            }
+        }
+        if (lines.empty()) lines.push_back(current_location_value());
+        if (!copy_text_to_clipboard(newline_join(lines))) {
+            show_app_message(L"Could not copy the path text to the clipboard.",
+                             axiom::gui::MessageDialogIcon::error,
+                             L"Copy path");
+            return;
+        }
+        set_status(quote_count(lines.size(), L"path copied.", L"paths copied."));
+    }
+
+    void on_copy_crc32() {
+        std::vector<std::wstring> lines;
+        const auto selection = selected_browser_indices();
+        for (int index : selection) {
+            const auto& item = browser_items_[static_cast<std::size_t>(index)];
+            if (!item.crc32) continue;
+            std::wstring line = format_crc32(item.crc32);
+            if (selection.size() > 1) {
+                line = item.name + L"\t" + line;
+            }
+            lines.push_back(std::move(line));
+        }
+        if (lines.empty()) {
+            show_app_message(L"No selected item has a CRC-32 value.",
+                             axiom::gui::MessageDialogIcon::information,
+                             L"Copy CRC-32");
+            return;
+        }
+        if (!copy_text_to_clipboard(newline_join(lines))) {
+            show_app_message(L"Could not copy the CRC-32 text to the clipboard.",
+                             axiom::gui::MessageDialogIcon::error,
+                             L"Copy CRC-32");
+            return;
+        }
+        set_status(quote_count(lines.size(), L"CRC-32 copied.", L"CRC-32 values copied."));
+    }
+
     static std::string archive_name(std::string_view path) {
         const std::size_t separator = path.find_last_of('/');
         return std::string(separator == std::string_view::npos
@@ -3918,6 +5572,103 @@ private:
         std::error_code error;
         if (fs::equivalent(left, right, error)) return true;
         return CompareStringOrdinal(left.c_str(), -1, right.c_str(), -1, TRUE) == CSTR_EQUAL;
+    }
+
+    static std::wstring sanitize_archive_stem(std::wstring stem) {
+        for (wchar_t& ch : stem) {
+            if (ch < L' ' || ch == L'<' || ch == L'>' || ch == L':' || ch == L'"' ||
+                ch == L'/' || ch == L'\\' || ch == L'|' || ch == L'?' || ch == L'*') {
+                ch = L'_';
+            }
+        }
+        while (!stem.empty() && (stem.back() == L' ' || stem.back() == L'.')) {
+            stem.pop_back();
+        }
+        while (!stem.empty() && stem.front() == L' ') {
+            stem.erase(stem.begin());
+        }
+        if (stem.empty()) return L"Archive";
+
+        std::wstring folded = stem;
+        std::transform(folded.begin(), folded.end(), folded.begin(),
+                       [](wchar_t ch) { return static_cast<wchar_t>(std::towupper(ch)); });
+        static constexpr std::array<std::wstring_view, 4> reserved{
+            L"CON", L"PRN", L"AUX", L"NUL",
+        };
+        if (std::find(reserved.begin(), reserved.end(), folded) != reserved.end() ||
+            (folded.size() == 4 &&
+             (folded.rfind(L"COM", 0) == 0 || folded.rfind(L"LPT", 0) == 0) &&
+             folded[3] >= L'1' && folded[3] <= L'9')) {
+            stem += L"_";
+        }
+        return stem.empty() ? L"Archive" : stem;
+    }
+
+    static bool path_is_directory(const fs::path& path) {
+        std::error_code error;
+        return fs::is_directory(path, error);
+    }
+
+    static std::wstring archive_stem_for_single_input(const fs::path& path) {
+        fs::path name = path.filename();
+        if (name.empty()) {
+            name = path.root_name();
+        }
+        std::wstring stem;
+        if (path_is_directory(path)) {
+            stem = name.wstring();
+        } else {
+            stem = name.stem().wstring();
+            if (stem.empty()) stem = name.wstring();
+        }
+        return sanitize_archive_stem(std::move(stem));
+    }
+
+    static std::wstring archive_stem_for_multiple_inputs(
+        const std::vector<fs::path>& paths,
+        const fs::path& current_folder) {
+        fs::path common_parent = paths.empty() ? fs::path{} : paths.front().parent_path();
+        bool same_parent = !common_parent.empty();
+        for (const auto& path : paths) {
+            if (path.parent_path().empty() ||
+                !same_filesystem_path(common_parent, path.parent_path())) {
+                same_parent = false;
+                break;
+            }
+        }
+        fs::path name = same_parent ? common_parent.filename() : current_folder.filename();
+        if (name.empty() && same_parent) name = common_parent.root_name();
+        if (name.empty()) name = L"Selected items";
+        return sanitize_archive_stem(name.wstring());
+    }
+
+    static std::wstring suggested_archive_stem_for_inputs(
+        const std::vector<fs::path>& paths,
+        const fs::path& current_folder) {
+        if (paths.size() == 1) return archive_stem_for_single_input(paths.front());
+        return archive_stem_for_multiple_inputs(paths, current_folder);
+    }
+
+    static bool output_collides_with_input(const fs::path& output,
+                                           const std::vector<fs::path>& paths) {
+        for (const auto& path : paths) {
+            if (same_filesystem_path(output, path)) return true;
+        }
+        return false;
+    }
+
+    static fs::path avoid_archive_input_collision(fs::path output,
+                                                  const std::vector<fs::path>& paths) {
+        if (!output_collides_with_input(output, paths)) return output;
+        const fs::path parent = output.parent_path();
+        const std::wstring stem = output.stem().wstring();
+        const std::wstring extension = output.extension().wstring();
+        fs::path candidate = parent / (stem + L" archive" + extension);
+        for (int index = 2; output_collides_with_input(candidate, paths) && index < 100;
+             ++index) {
+            candidate = parent / (stem + L" archive " + std::to_wstring(index) + extension);
+        }
+        return candidate;
     }
 
     std::string archive_drop_directory(POINT screen_point) const {
@@ -4152,7 +5903,11 @@ private:
                     std::shared_ptr<axiom::OperationControl> operation) mutable {
                     auto run_options = options;
                     run_options.operation = std::move(operation);
-                    axiom::move_archive_entries(archive, moves, run_options);
+                    const auto* provider = axiom::archive_provider_for_path(archive);
+                    if (provider == nullptr) {
+                        throw std::runtime_error("unsupported archive format");
+                    }
+                    provider->move_entries(archive, moves, run_options);
                 });
             return (allowed & DROPEFFECT_MOVE) != 0 ? DROPEFFECT_MOVE : DROPEFFECT_COPY;
         }
@@ -4235,11 +5990,13 @@ private:
             }
         });
 
-        std::jthread worker([&, control] {
+        const std::size_t io_buffer_size = configured_io_buffer_size(application_options_);
+        std::jthread worker([&, control, io_buffer_size] {
             try {
                 axiom::ExtractOptions options;
                 options.overwrite = axiom::ExtractOptions::Overwrite::overwrite;
                 options.password = password;
+                options.io_buffer_size = io_buffer_size;
                 options.operation = control;
                 provider->extract_selected(archive, entries, staging, options);
             } catch (...) {
@@ -4412,6 +6169,11 @@ private:
 
     void navigate_to(axiom::gui::BrowserLocation location, bool record_history = true) {
         if (!prepare_archive_password(location)) return;
+        cancel_browser_table_population();
+        pending_browser_view_state_.reset();
+        if (displayed_browser_location_ && *displayed_browser_location_ == location) {
+            pending_browser_view_state_ = capture_browser_view_state();
+        }
         directory_watcher_.stop();
         KillTimer(hwnd_, kDirectoryRefreshTimer);
         if (record_history) history_.navigate(location);
@@ -4452,7 +6214,7 @@ private:
             });
     }
 
-    void populate_browser_table() {
+    void sort_browser_items_for_table() {
         const auto rank = [](const axiom::gui::BrowserItem& item) {
             if (item.kind == axiom::gui::BrowserItemKind::parent) return 0;
             if (item.kind == axiom::gui::BrowserItemKind::drive ||
@@ -4485,35 +6247,110 @@ private:
             if (comparison == 0) comparison = _wcsicmp(left.name.c_str(), right.name.c_str());
             return sort_ascending_ ? comparison < 0 : comparison > 0;
         });
+    }
 
-        table_.clear();
+    std::vector<std::wstring> browser_row_for_item(
+        const axiom::gui::BrowserItem& item) const {
+        const bool show_size = item.kind == axiom::gui::BrowserItemKind::file ||
+                               item.kind == axiom::gui::BrowserItemKind::archive ||
+                               item.kind == axiom::gui::BrowserItemKind::drive;
+        return {
+            item.name,
+            show_size ? format_size(item.size) : L"",
+            format_packed_size(item.packed_size, item.packed_size_estimated),
+            item.type,
+            item.modified,
+            format_crc32(item.crc32),
+            item.attributes,
+        };
+    }
+
+    bool append_browser_table_batch() {
+        if (!table_population_active_ ||
+            table_population_generation_ != browser_generation_) {
+            return true;
+        }
+        constexpr std::size_t kBrowserPopulateBatchSize = 512;
+        constexpr std::size_t kGenericIconThreshold = 512;
+        const std::size_t first = table_population_next_;
+        const std::size_t last = std::min(browser_items_.size(),
+                                          first + kBrowserPopulateBatchSize);
+        std::vector<std::vector<std::wstring>> rows;
+        std::vector<int> icon_indices;
+        rows.reserve(last - first);
+        icon_indices.reserve(last - first);
+        HIMAGELIST image_list = nullptr;
+        const bool prefer_generic_unique_icons =
+            browser_items_.size() >= kGenericIconThreshold;
+        for (std::size_t index = first; index < last; ++index) {
+            const auto& item = browser_items_[index];
+            const ShellIconRef icon =
+                cached_shell_icon_for_item(item, prefer_generic_unique_icons);
+            if (image_list == nullptr && icon.image_list != nullptr) image_list = icon.image_list;
+            rows.push_back(browser_row_for_item(item));
+            icon_indices.push_back(icon.index);
+        }
+        table_.append_rows(std::move(rows), std::move(icon_indices), image_list);
+        table_population_next_ = last;
+        return table_population_next_ >= browser_items_.size();
+    }
+
+    void cancel_browser_table_population() {
+        KillTimer(hwnd_, kBrowserPopulateTimer);
+        table_population_active_ = false;
+        table_population_next_ = 0;
+        table_population_generation_ = 0;
+        pending_table_restore_state_.reset();
+    }
+
+    void finish_browser_table_population() {
+        KillTimer(hwnd_, kBrowserPopulateTimer);
+        table_population_active_ = false;
+        if (pending_table_restore_state_) {
+            restore_browser_view_state(*pending_table_restore_state_);
+            pending_table_restore_state_.reset();
+        }
+        update_browser_status_for_current_selection();
+    }
+
+    void begin_browser_table_population(std::optional<BrowserViewState> restore_state) {
+        cancel_browser_table_population();
+        sort_browser_items_for_table();
         table_.set_sort_indicator(sort_column_, sort_ascending_);
-        for (const auto& item : browser_items_) {
-            const bool show_size = item.kind == axiom::gui::BrowserItemKind::file ||
-                                   item.kind == axiom::gui::BrowserItemKind::archive ||
-                                   item.kind == axiom::gui::BrowserItemKind::drive;
-            const ShellIconRef icon = shell_icon_for_item(item);
-            if (icon.image_list != nullptr) table_.set_image_list(icon.image_list);
-            table_.append_row({
-                item.name,
-                show_size ? format_size(item.size) : L"",
-                item.packed_size ? format_size(*item.packed_size) : L"",
-                item.type,
-                item.modified,
-                format_crc32(item.crc32),
-                item.attributes,
-            }, icon.index);
+        table_.clear();
+        table_.reserve_rows(browser_items_.size());
+        pending_table_restore_state_ = std::move(restore_state);
+        table_population_next_ = 0;
+        table_population_generation_ = browser_generation_;
+        table_population_active_ = true;
+        if (browser_items_.empty() || append_browser_table_batch()) {
+            finish_browser_table_population();
+            return;
+        }
+        SetTimer(hwnd_, kBrowserPopulateTimer, 1, nullptr);
+    }
+
+    void on_browser_populate_timer() {
+        if (!table_population_active_) {
+            KillTimer(hwnd_, kBrowserPopulateTimer);
+            return;
+        }
+        if (append_browser_table_batch()) {
+            finish_browser_table_population();
         }
     }
 
     void on_table_sort(int column) {
+        BrowserViewState state = table_population_active_ && pending_table_restore_state_
+            ? *pending_table_restore_state_
+            : capture_browser_view_state();
         if (column == sort_column_) {
             sort_ascending_ = !sort_ascending_;
         } else {
             sort_column_ = column;
             sort_ascending_ = true;
         }
-        populate_browser_table();
+        begin_browser_table_population(std::move(state));
     }
 
     void on_browser_loaded(LPARAM lparam) {
@@ -4533,11 +6370,16 @@ private:
                        item.attributes.find(L'S') != std::wstring::npos;
             });
         }
-        populate_browser_table();
+        std::optional<BrowserViewState> restore_state;
+        if (pending_browser_view_state_) {
+            restore_state = std::move(pending_browser_view_state_);
+            pending_browser_view_state_.reset();
+        }
+        begin_browser_table_population(std::move(restore_state));
+        displayed_browser_location_ = loaded_location;
         if (!result->snapshot.error.empty()) {
             set_status(L"Cannot read location: " + result->snapshot.error);
         } else {
-            set_status(quote_count(browser_items_.size(), L"item", L"items"));
             if (result->snapshot.location.kind == axiom::gui::BrowserLocationKind::filesystem) {
                 directory_watcher_.start(result->snapshot.location.filesystem_path, hwnd_,
                                          kDirectoryChangedMessage);
@@ -4737,13 +6579,10 @@ private:
 
     void on_table_selection_changed() {
         const auto indices = selected_browser_indices();
-        std::uint64_t bytes = 0;
-        for (int index : indices) bytes += browser_items_[index].size;
         if (indices.empty()) {
-            set_status(quote_count(browser_items_.size(), L"item", L"items"));
+            update_browser_status();
         } else {
-            set_status(quote_count(indices.size(), L"item selected", L"items selected") +
-                       (bytes != 0 ? L" (" + format_size(bytes) + L")" : L""));
+            update_browser_status(&indices);
         }
     }
 
@@ -4782,18 +6621,25 @@ private:
         dialog_options.features.create_sfx = application_options_.default_create_sfx;
         dialog_options.features.sign_archive = application_options_.default_sign_archive;
         dialog_options.features.signing_key = application_options_.default_signing_key;
+        const fs::path source_folder =
+            history_.current().kind == axiom::gui::BrowserLocationKind::filesystem
+                ? history_.current().filesystem_path
+                : paths.front().parent_path();
+        const std::wstring archive_file_name =
+            suggested_archive_stem_for_inputs(paths, source_folder) + L".axar";
         const fs::path base = history_.current().kind == axiom::gui::BrowserLocationKind::filesystem
             ? history_.current().filesystem_path
             : paths.front().parent_path();
-        fs::path default_archive = base / L"Archive.axar";
+        fs::path default_archive = base / archive_file_name;
         if (application_options_.archive_output_mode == 1 &&
             !persisted_settings_.last_archive_output_folder.empty()) {
             default_archive =
-                fs::path(persisted_settings_.last_archive_output_folder) / L"Archive.axar";
+                fs::path(persisted_settings_.last_archive_output_folder) / archive_file_name;
         } else if (application_options_.archive_output_mode == 2 &&
             !application_options_.archive_output_folder.empty()) {
-            default_archive = fs::path(application_options_.archive_output_folder) / L"Archive.axar";
+            default_archive = fs::path(application_options_.archive_output_folder) / archive_file_name;
         }
+        default_archive = avoid_archive_input_collision(std::move(default_archive), paths);
         dialog_options.archive_path = target_archive.value_or(default_archive);
         dialog_options.archive_format =
             axiom::archive_provider_for_path(dialog_options.archive_path)
@@ -5117,11 +6963,16 @@ private:
             const auto* provider = active_archive_provider();
             const auto capabilities = active_archive_capabilities();
             std::wstring archive_comment;
+            std::string metadata_password;
             if (provider != nullptr) {
                 details.push_back({L"Format", widen(provider->info().display_name)});
             }
+            std::error_code archive_size_error;
+            const auto archive_file_size = fs::file_size(*archive, archive_size_error);
+            if (!archive_size_error) {
+                details.push_back({L"Packed total", format_size(archive_file_size)});
+            }
             if (provider != nullptr && provider->info().native) {
-                std::string metadata_password;
                 try {
                     const auto encryption = axiom::archive_encryption_mode(*archive);
                     if (encryption == axiom::ArchiveEncryptionMode::data_and_directory) {
@@ -5143,18 +6994,49 @@ private:
                     });
                     archive_comment = widen(axiom::archive_comment(
                         *archive, metadata_password));
-                    secure_clear(metadata_password);
                 } catch (...) {
                     secure_clear(metadata_password);
                     details.push_back({L"State", L"Could not read archive metadata"});
                 }
             } else {
-                details.push_back({L"Provider mode", L"Read-only"});
+                const bool can_write = capabilities.create || capabilities.update ||
+                                       capabilities.delete_entries ||
+                                       capabilities.move_entries;
+                details.push_back({L"Provider mode", can_write ? L"Read/write" : L"Read-only"});
                 details.push_back({L"Full extraction", capabilities.extract ? L"Supported" : L"Not supported"});
                 details.push_back({L"Selective extraction",
                                    capabilities.selective_extract ? L"Supported" : L"Not supported"});
                 details.push_back({L"Integrity test", capabilities.test ? L"Supported" : L"Not supported"});
             }
+            std::vector<axiom::ArchiveEntry> loaded_entries;
+            const std::vector<axiom::ArchiveEntry>* entries = nullptr;
+            if (archive_catalog_ && same_filesystem_path(archive_catalog_->path(), *archive)) {
+                entries = &archive_catalog_->entries();
+            } else if (provider != nullptr && capabilities.list) {
+                try {
+                    loaded_entries = provider->list(*archive, metadata_password);
+                    entries = &loaded_entries;
+                } catch (...) {
+                    entries = nullptr;
+                }
+            }
+            if (entries != nullptr) {
+                const auto totals = summarize_archive_entries(*entries);
+                details.push_back({L"Unpacked total", format_size(totals.unpacked)});
+                if (!archive_size_error) {
+                    details.push_back({
+                        L"Overall ratio",
+                        format_ratio(archive_file_size, totals.unpacked)
+                    });
+                }
+                if (totals.has_packed) {
+                    details.push_back({
+                        totals.packed_estimated ? L"Packed data (estimated)" : L"Packed data",
+                        format_packed_size(totals.packed, totals.packed_estimated)
+                    });
+                }
+            }
+            secure_clear(metadata_password);
             axiom::gui::show_archive_information_dialog(
                 hwnd_, *archive, details, capabilities, std::move(archive_comment));
             return;
@@ -5383,14 +7265,62 @@ private:
         table_.select_all();
     }
 
-    void on_settings() {
+    void on_find_files() {
+        std::vector<FileSearchSourceItem> source;
+        source.reserve(browser_items_.size());
+        for (int index = 0; index < static_cast<int>(browser_items_.size()); ++index) {
+            const auto& item = browser_items_[static_cast<std::size_t>(index)];
+            if (item.is_parent()) continue;
+            FileSearchSourceItem source_item;
+            source_item.browser_index = index;
+            source_item.kind = item.kind;
+            source_item.name = item.name;
+            source_item.type = item.type;
+            source_item.modified = item.modified;
+            if (item.kind != axiom::gui::BrowserItemKind::directory &&
+                item.kind != axiom::gui::BrowserItemKind::drive) {
+                source_item.size = format_size(item.size);
+            }
+
+            if (!item.filesystem_path.empty()) {
+                source_item.location = item.filesystem_path.parent_path().wstring();
+            } else if (!item.archive_path.empty()) {
+                const auto separator = item.archive_path.find_last_of('/');
+                source_item.location = separator == std::string::npos
+                    ? L"/"
+                    : L"/" + widen(std::string_view(item.archive_path).substr(0, separator));
+            } else {
+                source_item.location = history_.current().display_name();
+            }
+            source.push_back(std::move(source_item));
+        }
+
+        if (source.empty()) {
+            show_app_message(L"There are no searchable items in the current file list.",
+                             axiom::gui::MessageDialogIcon::information,
+                             L"Find files");
+            return;
+        }
+
+        FileSearchDialog dialog(instance_, theme_, dpi_,
+                                L"Scope: " + history_.current().display_name(),
+                                std::move(source));
+        const auto result = dialog.show(hwnd_);
+        if (!result.accepted || result.browser_index < 0 ||
+            result.browser_index >= static_cast<int>(browser_items_.size())) {
+            return;
+        }
+        table_.select_index(result.browser_index);
+        SetFocus(list_);
+    }
+
+    void apply_application_options(
+        const axiom::gui::ApplicationDialogOptions& updated_options) {
         const auto previous = application_options_;
-        if (!axiom::gui::show_application_settings_dialog(hwnd_, application_options_)) {
+        if (updated_options == previous) {
             return;
         }
-        if (application_options_ == previous) {
-            return;
-        }
+        application_options_ = updated_options;
 
         selected_level_ = application_options_.default_level;
         selected_thread_count_ = application_options_.default_thread_count;
@@ -5405,7 +7335,11 @@ private:
         }
 
         const bool theme_changed =
-            application_options_.theme_mode != previous.theme_mode;
+            application_options_.theme_mode != previous.theme_mode ||
+            application_options_.accent_color_mode != previous.accent_color_mode ||
+            application_options_.custom_accent_color != previous.custom_accent_color;
+        const bool icon_style_changed =
+            application_options_.toolbar_icon_style != previous.toolbar_icon_style;
         const bool table_options_changed =
             application_options_.show_grid_lines != previous.show_grid_lines ||
             application_options_.show_horizontal_scrollbar !=
@@ -5435,14 +7369,20 @@ private:
             application_options_.context_extract != previous.context_extract ||
             application_options_.context_test != previous.context_test;
 
-        if (theme_changed) apply_theme();
+        if (theme_changed || icon_style_changed) apply_theme();
         if (table_options_changed) apply_table_options();
         if (address_options_changed) {
             const int limit = std::clamp(application_options_.recent_location_count, 0, 50);
             if (limit == 0) {
                 recent_addresses_.clear();
+                recent_archives_.clear();
             } else if (recent_addresses_.size() > static_cast<std::size_t>(limit)) {
                 recent_addresses_.resize(static_cast<std::size_t>(limit));
+                if (recent_archives_.size() > static_cast<std::size_t>(limit)) {
+                    recent_archives_.resize(static_cast<std::size_t>(limit));
+                }
+            } else if (recent_archives_.size() > static_cast<std::size_t>(limit)) {
+                recent_archives_.resize(static_cast<std::size_t>(limit));
             }
             populate_address_dropdown();
         }
@@ -5451,6 +7391,18 @@ private:
 
         save_current_settings();
         if (browser_content_changed) on_navigate_refresh();
+    }
+
+    void on_settings() {
+        auto dialog_options = application_options_;
+        if (!axiom::gui::show_application_settings_dialog(
+                hwnd_, dialog_options,
+                [this](const axiom::gui::ApplicationDialogOptions& applied_options) {
+                    apply_application_options(applied_options);
+                })) {
+            return;
+        }
+        apply_application_options(dialog_options);
     }
 
     void apply_shell_command(bool enabled, const std::wstring& key,
@@ -5510,6 +7462,31 @@ private:
         SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, nullptr, nullptr);
     }
 
+    bool maybe_execute_sfx_archive(const fs::path& path) {
+        if (!axiom::is_axiom_sfx_archive(path)) return false;
+        const int choice = show_app_message(
+            L"This is an Axiom self-extracting archive.\n\n"
+            L"Choose Yes to run the self-extractor, or No to open the embedded archive "
+            L"in Axiom.",
+            axiom::gui::MessageDialogIcon::question,
+            L"Open self-extracting archive",
+            axiom::gui::MessageDialogButtons::yes_no,
+            IDNO);
+        if (choice != IDYES) return false;
+
+        const fs::path working_directory = path.parent_path();
+        HINSTANCE result = ShellExecuteW(
+            hwnd_, L"open", path.c_str(), nullptr,
+            working_directory.empty() ? nullptr : working_directory.c_str(),
+            SW_SHOWNORMAL);
+        if (reinterpret_cast<INT_PTR>(result) <= 32) {
+            show_app_message(L"Could not run the self-extracting archive.",
+                             axiom::gui::MessageDialogIcon::error,
+                             L"Open self-extracting archive");
+        }
+        return true;
+    }
+
     bool open_archive_path(const fs::path& path) {
         if (const auto joined = joined_archive_path_for_volume(path)) {
             try {
@@ -5549,6 +7526,8 @@ private:
             }
         }
         if (!axiom::gui::is_supported_archive(path)) return false;
+        if (maybe_execute_sfx_archive(path)) return true;
+        remember_archive_path(path);
         navigate_to(axiom::gui::BrowserLocation::archive(path));
         return true;
     }
@@ -5583,6 +7562,16 @@ private:
         persisted_settings_.application = application_options_;
         persisted_settings_.sort_column = sort_column_;
         persisted_settings_.sort_ascending = sort_ascending_;
+        persisted_settings_.tree_width =
+            tree_width_ > 0 ? MulDiv(tree_width_, USER_DEFAULT_SCREEN_DPI,
+                                     static_cast<int>(dpi_ == 0
+                                                          ? USER_DEFAULT_SCREEN_DPI
+                                                          : dpi_))
+                            : 0;
+        persisted_settings_.column_widths = table_.logical_column_widths();
+        persisted_settings_.recent_locations = recent_addresses_;
+        persisted_settings_.recent_archives = recent_archives_;
+        persisted_settings_.favorite_locations = favorite_locations_;
         persisted_settings_.last_location = history_.current().display_name();
         persisted_settings_.placement.length = sizeof(WINDOWPLACEMENT);
         persisted_settings_.has_placement = application_options_.restore_window_placement &&
@@ -5773,8 +7762,9 @@ private:
         const bool sign_after = pending_archive_features_.sign_archive;
         const bool create_sfx_after = pending_archive_features_.create_sfx;
         const bool native_archive = archive_provider->info().native;
+        const bool zip_archive = archive_provider->info().format == axiom::ArchiveFormat::zip;
         if (!native_archive &&
-            (pending_archive_features_.encrypt_data ||
+            ((!zip_archive && pending_archive_features_.encrypt_data) ||
              pending_archive_features_.encrypt_names ||
              !pending_archive_features_.comment.empty() ||
              pending_archive_features_.lock_archive ||
@@ -5786,8 +7776,8 @@ private:
              pending_archive_features_.create_sfx)) {
             show_app_message(
                 L"The selected archive format does not support one or more Axiom-only "
-                L"options. Choose Axiom archive format or clear Security, Recovery, "
-                L"SFX/signing, comment, and lock options.",
+                L"options. ZIP supports file-data encryption only; choose Axiom archive "
+                L"format for encrypted names, Recovery, SFX/signing, comment, or lock options.",
                 axiom::gui::MessageDialogIcon::warning,
                 L"Archive format");
             return;
@@ -5934,7 +7924,8 @@ private:
                                 }
                                 if (provider->info().native && create_sfx_after) {
                                     axiom::create_sfx_archive(archive, sfx_stub, sfx_output,
-                                                              operation);
+                                                              operation,
+                                                              options.io_buffer_size);
                                     std::error_code remove_error;
                                     if (!fs::remove(archive, remove_error) && remove_error) {
                                         std::error_code cleanup_error;
@@ -5975,12 +7966,14 @@ private:
             return;
         }
         const fs::path stub = current_executable_path();
+        const std::size_t io_buffer_size = configured_io_buffer_size(application_options_);
         operation_archive_output_.clear();
         start_operation(L"Creating self-extracting archive...",
                         L"Self-extracting archive created: " + output.wstring(),
-                        [archive = *archive, stub, output](
+                        [archive = *archive, stub, output, io_buffer_size](
                             std::shared_ptr<axiom::OperationControl> operation) {
-                            axiom::create_sfx_archive(archive, stub, output, operation);
+                            axiom::create_sfx_archive(archive, stub, output, operation,
+                                                      io_buffer_size);
                         });
     }
 
@@ -6087,6 +8080,7 @@ private:
 
         axiom::ExtractOptions options;
         options.thread_count = dialog_options.thread_count;
+        options.io_buffer_size = configured_io_buffer_size(application_options_);
         options.restore_mtime = dialog_options.restore_mtime;
         options.overwrite = dialog_options.overwrite
             ? axiom::ExtractOptions::Overwrite::overwrite
@@ -6168,6 +8162,7 @@ private:
 
         axiom::DecompressionOptions options;
         options.thread_count = application_options_.default_thread_count;
+        options.io_buffer_size = configured_io_buffer_size(application_options_);
         try {
             const auto capabilities = provider->capabilities(*archive);
             if (!capabilities.test) {
@@ -6313,6 +8308,10 @@ private:
                 }
                 break;
             case WM_CONTEXTMENU:
+                if (reinterpret_cast<HWND>(wparam) == tree_view_.hwnd()) {
+                    show_tree_context_menu({GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)});
+                    return 0;
+                }
                 if (reinterpret_cast<HWND>(wparam) == list_ ||
                     reinterpret_cast<HWND>(wparam) == hwnd_) {
                     show_browser_context_menu({GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)});
@@ -6394,6 +8393,10 @@ private:
                     if (!busy_) on_navigate_refresh();
                     return 0;
                 }
+                if (wparam == kBrowserPopulateTimer) {
+                    on_browser_populate_timer();
+                    return 0;
+                }
                 break;
             case WM_COMMAND:
                 switch (LOWORD(wparam)) {
@@ -6409,6 +8412,11 @@ private:
                     case kView: on_view(); return 0;
                     case kDelete: on_delete_selected(); return 0;
                     case kInfo: on_info(); return 0;
+                    case kFind: on_find_files(); return 0;
+                    case kCopyPath: on_copy_paths(); return 0;
+                    case kCopyCrc32: on_copy_crc32(); return 0;
+                    case kAddFavorite: add_favorite_location(current_location_value()); return 0;
+                    case kRemoveFavorite: remove_favorite_location(current_location_value()); return 0;
                     case kUpdateArchive:
                         on_update_archive(axiom::gui::ArchiveUpdateMode::update_newer);
                         return 0;
@@ -6496,6 +8504,7 @@ private:
                 return 0;
             case WM_DESTROY:
                 KillTimer(hwnd_, kDirectoryRefreshTimer);
+                KillTimer(hwnd_, kBrowserPopulateTimer);
                 drop_target_.revoke();
                 directory_watcher_.stop();
                 browser_thread_.request_stop();
@@ -6572,10 +8581,19 @@ private:
     bool syncing_tree_ = false;
     std::vector<AddressEntry> address_entries_;
     std::vector<std::wstring> recent_addresses_;
+    std::vector<std::wstring> recent_archives_;
+    std::vector<std::wstring> favorite_locations_;
     std::vector<fs::path> inputs_;
     axiom::gui::NavigationHistory history_;
     std::vector<axiom::gui::BrowserItem> browser_items_;
+    std::unordered_map<std::wstring, ShellIconRef> shell_icon_cache_;
     std::shared_ptr<const axiom::gui::ArchiveCatalog> archive_catalog_;
+    std::optional<axiom::gui::BrowserLocation> displayed_browser_location_;
+    std::optional<BrowserViewState> pending_browser_view_state_;
+    std::optional<BrowserViewState> pending_table_restore_state_;
+    std::size_t table_population_next_ = 0;
+    std::uint64_t table_population_generation_ = 0;
+    bool table_population_active_ = false;
     axiom::gui::DirectoryWatcher directory_watcher_;
     axiom::gui::OleDropTarget drop_target_;
     std::vector<TempDirectoryRecord> temp_directories_;
@@ -6597,6 +8615,645 @@ private:
     fs::path pending_archive_path_;
     axiom::gui::ArchiveFeatureOptions pending_archive_features_;
 };
+
+class QuickAddController {
+public:
+    int run(HINSTANCE instance, std::vector<fs::path> inputs) {
+        if (inputs.empty()) return 0;
+        instance_ = instance;
+        inputs_ = std::move(inputs);
+        persisted_settings_ = axiom::gui::load_gui_settings();
+        application_options_ = persisted_settings_.application;
+        configure_dialog_appearance(application_options_);
+        theme_ = make_theme(application_options_.theme_mode,
+                            application_options_.accent_color_mode,
+                            application_options_.custom_accent_color);
+        if (!create_owner()) return 1;
+
+        axiom::gui::CreateArchiveDialogOptions dialog_options;
+        dialog_options.level = application_options_.default_level;
+        dialog_options.thread_count = application_options_.default_thread_count;
+        dialog_options.dictionary_size = application_options_.default_dictionary_size;
+        dialog_options.word_size = application_options_.default_word_size;
+        dialog_options.solid_block_size = application_options_.default_solid_block_size;
+        dialog_options.feature_availability = implemented_feature_availability();
+        dialog_options.features.update_mode = static_cast<axiom::gui::ArchiveUpdateMode>(
+            std::clamp(application_options_.default_update_mode, 0, 4));
+        dialog_options.features.volume_size = application_options_.default_volume_size;
+        dialog_options.features.volume_unit =
+            std::clamp(application_options_.default_volume_unit, 0, 3);
+        dialog_options.features.recovery_percent =
+            std::clamp(application_options_.default_recovery_percent, 0, 100);
+        dialog_options.features.create_recovery_volumes =
+            application_options_.default_recovery_volumes;
+        dialog_options.features.create_sfx = application_options_.default_create_sfx;
+        dialog_options.features.sign_archive = application_options_.default_sign_archive;
+        dialog_options.features.signing_key = application_options_.default_signing_key;
+        dialog_options.archive_path = default_archive_path();
+        dialog_options.archive_format =
+            axiom::archive_provider_for_path(dialog_options.archive_path)
+                ? axiom::archive_provider_for_path(dialog_options.archive_path)->info().format
+                : axiom::ArchiveFormat::axar;
+
+        if (!axiom::gui::show_create_archive_dialog(
+                hwnd_, inputs_.size(), dialog_options)) {
+            DestroyWindow(hwnd_);
+            return 0;
+        }
+
+        if (dialog_options.archive_path.has_parent_path()) {
+            persisted_settings_.last_archive_output_folder =
+                dialog_options.archive_path.parent_path().wstring();
+            axiom::gui::save_gui_settings(persisted_settings_);
+        }
+
+        const bool started = start_create_operation(std::move(dialog_options));
+        if (!started) {
+            DestroyWindow(hwnd_);
+            return 1;
+        }
+
+        MSG message{};
+        while (!done_ && GetMessageW(&message, nullptr, 0, 0) > 0) {
+            TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
+        return exit_code_;
+    }
+
+private:
+    static const wchar_t* class_name() {
+        return L"AxiomQuickAddOwner";
+    }
+
+    static bool register_class(HINSTANCE instance) {
+        static ATOM atom = 0;
+        if (atom != 0) return true;
+        WNDCLASSEXW wc{};
+        wc.cbSize = sizeof(wc);
+        wc.hInstance = instance;
+        wc.lpfnWndProc = &QuickAddController::window_proc;
+        wc.lpszClassName = class_name();
+        wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        atom = RegisterClassExW(&wc);
+        return atom != 0 || GetLastError() == ERROR_CLASS_ALREADY_EXISTS;
+    }
+
+    bool create_owner() {
+        if (!register_class(instance_)) return false;
+        RECT work{};
+        SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
+        const UINT dpi = GetDpiForSystem();
+        const int width = MulDiv(840, static_cast<int>(dpi), USER_DEFAULT_SCREEN_DPI);
+        const int height = MulDiv(650, static_cast<int>(dpi), USER_DEFAULT_SCREEN_DPI);
+        const int x = work.left + ((work.right - work.left) - width) / 2;
+        const int y = work.top + ((work.bottom - work.top) - height) / 2;
+        hwnd_ = CreateWindowExW(WS_EX_TOOLWINDOW, class_name(), L"Axiom",
+                                WS_OVERLAPPED,
+                                x, y, width, height,
+                                nullptr, nullptr, instance_, this);
+        if (hwnd_ == nullptr) return false;
+        set_dark_title_bar(hwnd_, theme_.dark);
+        return true;
+    }
+
+    static LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam) {
+        QuickAddController* controller = nullptr;
+        if (message == WM_NCCREATE) {
+            const auto* create = reinterpret_cast<CREATESTRUCTW*>(lparam);
+            controller = static_cast<QuickAddController*>(create->lpCreateParams);
+            controller->hwnd_ = hwnd;
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(controller));
+        } else {
+            controller = reinterpret_cast<QuickAddController*>(
+                GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+        }
+        if (controller != nullptr) {
+            return controller->handle_message(message, wparam, lparam);
+        }
+        return DefWindowProcW(hwnd, message, wparam, lparam);
+    }
+
+    LRESULT handle_message(UINT message, WPARAM wparam, LPARAM lparam) {
+        switch (message) {
+            case kOperationProgressMessage:
+                on_operation_progress(lparam);
+                return 0;
+            case kOperationDoneMessage:
+                on_operation_done(lparam);
+                return 0;
+            case WM_CLOSE:
+                operation_runner_.cancel();
+                return 0;
+            case WM_DESTROY:
+                operation_runner_.cancel();
+                operation_runner_.finish();
+                if (!done_) {
+                    done_ = true;
+                    exit_code_ = 1;
+                }
+                return 0;
+        }
+        return DefWindowProcW(hwnd_, message, wparam, lparam);
+    }
+
+    int show_message(std::wstring_view message,
+                     axiom::gui::MessageDialogIcon icon,
+                     std::wstring_view title = L"Axiom",
+                     axiom::gui::MessageDialogButtons buttons =
+                         axiom::gui::MessageDialogButtons::ok,
+                     int default_result = IDOK) const {
+        return axiom::gui::show_message_dialog(
+            hwnd_, instance_, GetDpiForWindow(hwnd_), theme_.dark,
+            title, message, icon, buttons, default_result);
+    }
+
+    static axiom::gui::ArchiveFeatureAvailability implemented_feature_availability() {
+        axiom::gui::ArchiveFeatureAvailability availability;
+        availability.metadata = false;
+        availability.update = true;
+        availability.comments = true;
+        availability.lock = true;
+        availability.encryption = true;
+        availability.recovery = true;
+        availability.volumes = true;
+        availability.authenticity = true;
+        availability.sfx = true;
+        availability.posix_metadata = true;
+        availability.header_encryption = true;
+        availability.kdf_presets = false;
+        return availability;
+    }
+
+    static std::optional<std::uint64_t> parse_volume_size(
+        const std::wstring& text, int unit) {
+        if (text.empty()) return std::uint64_t{0};
+        wchar_t* end = nullptr;
+        errno = 0;
+        const unsigned long long value = _wcstoui64(text.c_str(), &end, 10);
+        if (errno == ERANGE || end == text.c_str() || *end != L'\0' || value == 0 ||
+            unit < 0 || unit > 3) {
+            return std::nullopt;
+        }
+        std::uint64_t multiplier = 1024;
+        for (int index = 0; index < unit; ++index) {
+            if (multiplier > std::numeric_limits<std::uint64_t>::max() / 1024) {
+                return std::nullopt;
+            }
+            multiplier *= 1024;
+        }
+        if (value > std::numeric_limits<std::uint64_t>::max() / multiplier) {
+            return std::nullopt;
+        }
+        return static_cast<std::uint64_t>(value) * multiplier;
+    }
+
+    static bool same_filesystem_path(const fs::path& left, const fs::path& right) {
+        std::error_code error;
+        if (fs::equivalent(left, right, error)) return true;
+        return CompareStringOrdinal(left.c_str(), -1, right.c_str(), -1, TRUE) == CSTR_EQUAL;
+    }
+
+    static std::wstring sanitize_archive_stem(std::wstring stem) {
+        for (wchar_t& ch : stem) {
+            if (ch < L' ' || ch == L'<' || ch == L'>' || ch == L':' || ch == L'"' ||
+                ch == L'/' || ch == L'\\' || ch == L'|' || ch == L'?' || ch == L'*') {
+                ch = L'_';
+            }
+        }
+        while (!stem.empty() && (stem.back() == L' ' || stem.back() == L'.')) {
+            stem.pop_back();
+        }
+        while (!stem.empty() && stem.front() == L' ') stem.erase(stem.begin());
+        if (stem.empty()) return L"Archive";
+        return stem;
+    }
+
+    static bool path_is_directory(const fs::path& path) {
+        std::error_code error;
+        return fs::is_directory(path, error);
+    }
+
+    static std::wstring archive_stem_for_inputs(const std::vector<fs::path>& paths,
+                                                const fs::path& current_folder) {
+        if (paths.size() == 1) {
+            fs::path name = paths.front().filename();
+            if (name.empty()) name = paths.front().root_name();
+            std::wstring stem = path_is_directory(paths.front())
+                ? name.wstring()
+                : name.stem().wstring();
+            if (stem.empty()) stem = name.wstring();
+            return sanitize_archive_stem(std::move(stem));
+        }
+        fs::path common_parent = paths.empty() ? fs::path{} : paths.front().parent_path();
+        bool same_parent = !common_parent.empty();
+        for (const auto& path : paths) {
+            if (path.parent_path().empty() ||
+                !same_filesystem_path(common_parent, path.parent_path())) {
+                same_parent = false;
+                break;
+            }
+        }
+        fs::path name = same_parent ? common_parent.filename() : current_folder.filename();
+        if (name.empty() && same_parent) name = common_parent.root_name();
+        if (name.empty()) name = L"Selected items";
+        return sanitize_archive_stem(name.wstring());
+    }
+
+    static bool output_collides_with_input(const fs::path& output,
+                                           const std::vector<fs::path>& paths) {
+        for (const auto& path : paths) {
+            if (same_filesystem_path(output, path)) return true;
+        }
+        return false;
+    }
+
+    static fs::path avoid_archive_input_collision(fs::path output,
+                                                  const std::vector<fs::path>& paths) {
+        if (!output_collides_with_input(output, paths)) return output;
+        const fs::path parent = output.parent_path();
+        const std::wstring stem = output.stem().wstring();
+        const std::wstring extension = output.extension().wstring();
+        fs::path candidate = parent / (stem + L" archive" + extension);
+        for (int index = 2; output_collides_with_input(candidate, paths) && index < 100;
+             ++index) {
+            candidate = parent / (stem + L" archive " + std::to_wstring(index) + extension);
+        }
+        return candidate;
+    }
+
+    fs::path default_archive_path() const {
+        const fs::path source_folder = inputs_.front().parent_path();
+        const std::wstring file_name = archive_stem_for_inputs(inputs_, source_folder) + L".axar";
+        fs::path folder = source_folder;
+        if (application_options_.archive_output_mode == 1 &&
+            !persisted_settings_.last_archive_output_folder.empty()) {
+            folder = persisted_settings_.last_archive_output_folder;
+        } else if (application_options_.archive_output_mode == 2 &&
+                   !application_options_.archive_output_folder.empty()) {
+            folder = application_options_.archive_output_folder;
+        }
+        return avoid_archive_input_collision(folder / file_name, inputs_);
+    }
+
+    axiom::CompressionOptions compression_options(
+        const axiom::gui::CreateArchiveDialogOptions& dialog_options) const {
+        axiom::CompressionOptions options;
+        axiom::apply_compression_level(options, dialog_options.level);
+        options.thread_count = dialog_options.thread_count;
+        options.io_buffer_size = configured_io_buffer_size(application_options_);
+        if (dialog_options.dictionary_size != 0) {
+            options.window_size = dialog_options.dictionary_size;
+        }
+        if (dialog_options.word_size != 0) {
+            options.nice_length = dialog_options.word_size;
+        }
+        if (dialog_options.solid_block_size != 0) {
+            options.block_size = dialog_options.solid_block_size;
+            options.auto_block_size_for_threads = false;
+        }
+        if (application_options_.memory_limit_mode == 1) {
+            if (const auto limit = parse_size_setting(application_options_.memory_limit)) {
+                const std::size_t capped = static_cast<std::size_t>(
+                    std::min<std::uint64_t>(*limit, std::numeric_limits<std::size_t>::max()));
+                const std::size_t practical_cap = std::max<std::size_t>(capped, 64u << 10);
+                options.window_size = std::min(options.window_size, practical_cap);
+                options.block_size = std::min(options.block_size, practical_cap);
+                options.auto_block_size_for_threads = false;
+            }
+        }
+        return options;
+    }
+
+    static fs::path current_executable_path() {
+        std::wstring buffer(32768, L'\0');
+        const DWORD length = GetModuleFileNameW(nullptr, buffer.data(),
+                                                static_cast<DWORD>(buffer.size()));
+        if (length == 0 || length >= buffer.size()) return {};
+        buffer.resize(length);
+        return fs::path(std::move(buffer));
+    }
+
+    void apply_operation_priority() {
+        operation_priority_changed_ = false;
+        previous_priority_class_ = 0;
+        DWORD desired = 0;
+        if (application_options_.worker_priority == 1) {
+            desired = BELOW_NORMAL_PRIORITY_CLASS;
+        } else if (application_options_.worker_priority == 2) {
+            desired = PROCESS_MODE_BACKGROUND_BEGIN;
+        } else {
+            return;
+        }
+        HANDLE process = GetCurrentProcess();
+        previous_priority_class_ = GetPriorityClass(process);
+        if (previous_priority_class_ != 0 && previous_priority_class_ != desired &&
+            SetPriorityClass(process, desired)) {
+            operation_priority_changed_ = true;
+        }
+    }
+
+    void restore_operation_priority() {
+        if (operation_priority_changed_ && previous_priority_class_ != 0) {
+            SetPriorityClass(GetCurrentProcess(), previous_priority_class_);
+        }
+        operation_priority_changed_ = false;
+        previous_priority_class_ = 0;
+    }
+
+    bool start_create_operation(axiom::gui::CreateArchiveDialogOptions dialog_options) {
+        const fs::path archive = dialog_options.archive_path;
+        if (archive.empty()) {
+            show_message(L"Choose an output archive path.",
+                         axiom::gui::MessageDialogIcon::information);
+            return false;
+        }
+        const auto* archive_provider = axiom::archive_provider_for_path(archive);
+        if (archive_provider == nullptr) {
+            show_message(L"Choose a supported archive format (.axar or .zip).",
+                         axiom::gui::MessageDialogIcon::warning, L"Archive format");
+            return false;
+        }
+
+        auto options = compression_options(dialog_options);
+        const auto mode = dialog_options.features.update_mode;
+        options.encrypt_header = dialog_options.features.encrypt_names;
+        options.recovery_percent = static_cast<unsigned>(
+            std::clamp(dialog_options.features.recovery_percent, 0, 100));
+        options.password = dialog_options.features.encrypt_data
+            ? utf8(dialog_options.features.password)
+            : std::string{};
+        const auto volume_size = parse_volume_size(
+            dialog_options.features.volume_size, dialog_options.features.volume_unit);
+        if (!volume_size) {
+            show_message(L"Enter a valid positive split-volume size, or leave it blank.",
+                         axiom::gui::MessageDialogIcon::warning,
+                         L"Recovery and volumes");
+            return false;
+        }
+        const bool split_after = *volume_size != 0;
+        const bool recovery_volumes = dialog_options.features.create_recovery_volumes;
+        if (recovery_volumes && !split_after) {
+            show_message(L"Set a split-volume size before enabling recovery volumes.",
+                         axiom::gui::MessageDialogIcon::warning,
+                         L"Recovery and volumes");
+            return false;
+        }
+
+        const std::string comment = utf8(dialog_options.features.comment);
+        const bool set_comment = mode != axiom::gui::ArchiveUpdateMode::create_new ||
+                                 !comment.empty();
+        const bool repack_after = dialog_options.features.repack_after_update &&
+                                  mode != axiom::gui::ArchiveUpdateMode::create_new;
+        const bool lock_after = dialog_options.features.lock_archive;
+        const bool sign_after = dialog_options.features.sign_archive;
+        const bool create_sfx_after = dialog_options.features.create_sfx;
+        const bool native_archive = archive_provider->info().native;
+        const bool zip_archive = archive_provider->info().format == axiom::ArchiveFormat::zip;
+        if (!native_archive &&
+            ((!zip_archive && dialog_options.features.encrypt_data) ||
+             dialog_options.features.encrypt_names ||
+             !dialog_options.features.comment.empty() ||
+             dialog_options.features.lock_archive ||
+             dialog_options.features.repack_after_update ||
+             dialog_options.features.recovery_percent != 0 ||
+             !dialog_options.features.volume_size.empty() ||
+             dialog_options.features.create_recovery_volumes ||
+             dialog_options.features.sign_archive ||
+             dialog_options.features.create_sfx)) {
+            show_message(
+                L"The selected archive format does not support one or more Axiom-only "
+                L"options. ZIP supports file-data encryption only; choose Axiom archive "
+                L"format for encrypted names, Recovery, SFX/signing, comment, or lock options.",
+                axiom::gui::MessageDialogIcon::warning,
+                L"Archive format");
+            return false;
+        }
+        if (create_sfx_after && split_after) {
+            show_message(L"Self-extracting archives and split volumes are separate output "
+                         L"modes. Disable one of them.",
+                         axiom::gui::MessageDialogIcon::warning,
+                         L"Archive output");
+            return false;
+        }
+        fs::path sfx_output = dialog_options.features.sfx_destination;
+        if (create_sfx_after && sfx_output.empty()) {
+            sfx_output = archive;
+            sfx_output.replace_extension(L".exe");
+        }
+        if (application_options_.confirm_overwrite &&
+            mode == axiom::gui::ArchiveUpdateMode::create_new) {
+            std::error_code exists_error;
+            const fs::path output_path = create_sfx_after ? sfx_output : archive;
+            if (!output_path.empty() && fs::exists(output_path, exists_error)) {
+                if (show_message(
+                        L"Replace the existing output file?\n\n" + output_path.wstring(),
+                        axiom::gui::MessageDialogIcon::warning,
+                        L"Overwrite output",
+                        axiom::gui::MessageDialogButtons::yes_no,
+                        IDNO) != IDYES) {
+                    return false;
+                }
+            }
+        }
+
+        const fs::path sfx_stub = current_executable_path();
+        axiom::ArchiveSigningKey signing_key;
+        if (sign_after) {
+            std::ifstream key_file(dialog_options.features.signing_key, std::ios::binary);
+            if (!key_file ||
+                !key_file.read(reinterpret_cast<char*>(signing_key.secret_key.data()),
+                               static_cast<std::streamsize>(signing_key.secret_key.size())) ||
+                key_file.peek() != std::char_traits<char>::eof()) {
+                show_message(L"Choose a valid 64-byte Axiom signing key.",
+                             axiom::gui::MessageDialogIcon::error,
+                             L"Sign archive");
+                return false;
+            }
+            std::copy_n(signing_key.secret_key.begin() + 32,
+                        signing_key.public_key.size(), signing_key.public_key.begin());
+        }
+        secure_clear(dialog_options.features.password);
+
+        std::wstring running = L"Compressing...";
+        std::wstring success = L"Archive created: " + archive.wstring();
+        if (create_sfx_after) {
+            running = L"Creating self-extracting archive...";
+            success = L"Self-extracting archive created: " + sfx_output.wstring();
+        } else if (split_after) {
+            running = L"Creating split archive volumes...";
+            success = L"Split archive volumes created beside: " + archive.wstring();
+        }
+
+        operation_archive_output_ = archive;
+        if (!operation_window_.create(
+                hwnd_, instance_, running, create_sfx_after ? sfx_output : archive,
+                make_operation_window_theme(theme_),
+                [this](bool paused) {
+                    if (!operation_runner_.running()) return;
+                    operation_runner_.set_paused(paused);
+                },
+                [this] {
+                    if (!operation_runner_.running()) return;
+                    operation_runner_.cancel();
+                    operation_window_.set_cancelling();
+                })) {
+            show_message(L"Could not create the operation progress window.",
+                         axiom::gui::MessageDialogIcon::error);
+            return false;
+        }
+
+        apply_operation_priority();
+        const std::vector<fs::path> inputs = inputs_;
+        const bool started = operation_runner_.start(
+            hwnd_, kOperationDoneMessage, kOperationProgressMessage,
+            running, success,
+            [inputs, archive, options, mode, comment, set_comment,
+             repack_after, lock_after, sign_after, signing_key,
+             create_sfx_after, sfx_output, sfx_stub, split_after,
+             volume_size = *volume_size, recovery_volumes](
+                std::shared_ptr<axiom::OperationControl> operation) mutable {
+                auto run_options = options;
+                run_options.operation = operation;
+                const auto* provider = axiom::archive_provider_for_path(archive);
+                if (provider == nullptr) {
+                    throw std::runtime_error("unsupported archive format");
+                }
+                try {
+                    switch (mode) {
+                        case axiom::gui::ArchiveUpdateMode::add_or_replace:
+                            provider->add(inputs, archive, run_options);
+                            break;
+                        case axiom::gui::ArchiveUpdateMode::update_newer:
+                            provider->update(inputs, archive, run_options, false);
+                            break;
+                        case axiom::gui::ArchiveUpdateMode::fresh_existing:
+                            provider->update(inputs, archive, run_options, true);
+                            break;
+                        case axiom::gui::ArchiveUpdateMode::synchronize:
+                            provider->sync(inputs, archive, run_options);
+                            break;
+                        default:
+                            provider->create(inputs, archive, run_options);
+                            break;
+                    }
+                    if (provider->info().native && set_comment) {
+                        axiom::set_archive_comment(archive, comment, run_options);
+                    }
+                    if (provider->info().native && repack_after) {
+                        axiom::repack_archive(archive, run_options);
+                    }
+                    if (provider->info().native && sign_after) {
+                        axiom::sign_archive(archive, signing_key, run_options);
+                        SecureZeroMemory(signing_key.secret_key.data(),
+                                         signing_key.secret_key.size());
+                    }
+                    if (provider->info().native && lock_after) {
+                        axiom::lock_archive(archive, run_options);
+                    }
+                    if (provider->info().native && split_after) {
+                        const std::uint64_t archive_bytes = fs::file_size(archive);
+                        const std::uint64_t data_volumes = std::max<std::uint64_t>(
+                            1, (archive_bytes + volume_size - 1) / volume_size);
+                        const unsigned recovery_count = recovery_volumes
+                            ? static_cast<unsigned>(std::max<std::uint64_t>(
+                                1, (data_volumes *
+                                    std::max<unsigned>(options.recovery_percent, 10) +
+                                    99) / 100))
+                            : 0;
+                        axiom::create_archive_volumes(
+                            archive, volume_size, recovery_count, operation);
+                        std::error_code remove_error;
+                        if (!fs::remove(archive, remove_error) && remove_error) {
+                            throw fs::filesystem_error(
+                                "could not remove the unsplit archive", archive,
+                                remove_error);
+                        }
+                    }
+                    if (provider->info().native && create_sfx_after) {
+                        axiom::create_sfx_archive(archive, sfx_stub, sfx_output,
+                                                  operation, options.io_buffer_size);
+                        std::error_code remove_error;
+                        if (!fs::remove(archive, remove_error) && remove_error) {
+                            std::error_code cleanup_error;
+                            fs::remove(sfx_output, cleanup_error);
+                            throw fs::filesystem_error(
+                                "could not remove the intermediate SFX archive",
+                                archive, remove_error);
+                        }
+                    }
+                } catch (...) {
+                    if (create_sfx_after &&
+                        mode == axiom::gui::ArchiveUpdateMode::create_new) {
+                        std::error_code cleanup_error;
+                        fs::remove(archive, cleanup_error);
+                    }
+                    throw;
+                }
+            });
+        if (!started) {
+            restore_operation_priority();
+            operation_window_.close();
+            show_message(L"Another operation is already running.",
+                         axiom::gui::MessageDialogIcon::information);
+            return false;
+        }
+        return true;
+    }
+
+    void on_operation_progress(LPARAM lparam) {
+        std::unique_ptr<axiom::OperationProgress> progress(
+            reinterpret_cast<axiom::OperationProgress*>(lparam));
+        if (!progress) return;
+        MSG queued{};
+        while (PeekMessageW(&queued, hwnd_, kOperationProgressMessage,
+                            kOperationProgressMessage, PM_REMOVE)) {
+            progress.reset(reinterpret_cast<axiom::OperationProgress*>(queued.lParam));
+        }
+        operation_window_.set_progress(*progress);
+    }
+
+    void on_operation_done(LPARAM lparam) {
+        std::unique_ptr<axiom::gui::OperationResult> result(
+            reinterpret_cast<axiom::gui::OperationResult*>(lparam));
+        operation_runner_.finish();
+        restore_operation_priority();
+        operation_window_.close();
+        exit_code_ = (!result || result->ok || result->cancelled) ? 0 : 1;
+        done_ = true;
+        if (result && !result->cancelled) {
+            show_message(result->message,
+                         result->ok ? axiom::gui::MessageDialogIcon::information
+                                    : axiom::gui::MessageDialogIcon::error,
+                         result->ok ? L"Axiom" : L"Axiom error");
+        }
+        DestroyWindow(hwnd_);
+    }
+
+    HINSTANCE instance_ = nullptr;
+    HWND hwnd_ = nullptr;
+    ThemePalette theme_;
+    axiom::gui::PersistedGuiSettings persisted_settings_;
+    axiom::gui::ApplicationDialogOptions application_options_;
+    std::vector<fs::path> inputs_;
+    axiom::gui::OperationRunner operation_runner_;
+    axiom::gui::OperationProgressWindow operation_window_;
+    fs::path operation_archive_output_;
+    DWORD previous_priority_class_ = 0;
+    bool operation_priority_changed_ = false;
+    bool done_ = false;
+    int exit_code_ = 0;
+};
+
+int run_quick_add_to_archive(HINSTANCE instance, const std::vector<std::wstring>& paths) {
+    std::vector<fs::path> inputs;
+    inputs.reserve(paths.size());
+    for (const auto& path : paths) {
+        if (!path.empty()) inputs.emplace_back(path);
+    }
+    QuickAddController controller;
+    return controller.run(instance, std::move(inputs));
+}
 
 std::optional<int> run_embedded_sfx(HINSTANCE instance, const std::wstring& requested_destination) {
     constexpr std::array<char, 8> magic = {'A', 'X', 'I', 'O', 'M', 'S', 'F', 'X'};
@@ -6637,11 +9294,16 @@ std::optional<int> run_embedded_sfx(HINSTANCE instance, const std::wstring& requ
     const fs::path temporary = fs::path(temp_path) /
         (L"AxiomSfx-" + std::to_wstring(GetCurrentProcessId()) + L".axar");
     try {
+        const auto persisted = axiom::gui::load_gui_settings();
+        const std::size_t io_buffer_size = configured_io_buffer_size(persisted.application);
         input.clear();
         input.seekg(static_cast<std::streamoff>(archive_offset));
         std::ofstream archive(temporary, std::ios::binary | std::ios::trunc);
         if (!archive) throw std::runtime_error("cannot create the temporary archive");
-        std::array<char, 1u << 16> buffer{};
+        const std::size_t copy_buffer_size = io_buffer_size == 0
+            ? (std::size_t{1} << 20)
+            : std::clamp<std::size_t>(io_buffer_size, 64u << 10, 64u << 20);
+        std::vector<char> buffer(copy_buffer_size);
         std::uint64_t remaining = archive_size;
         while (remaining > 0) {
             const auto count = static_cast<std::streamsize>(
@@ -6697,6 +9359,7 @@ std::optional<int> run_embedded_sfx(HINSTANCE instance, const std::wstring& requ
         options.overwrite = dialog_options.overwrite;
         options.restore_mtime = dialog_options.restore_mtime;
         options.thread_count = dialog_options.thread_count;
+        options.io_buffer_size = io_buffer_size;
 
         auto operation = std::make_shared<axiom::OperationControl>();
         options.operation = operation;
@@ -6711,7 +9374,11 @@ std::optional<int> run_embedded_sfx(HINSTANCE instance, const std::wstring& requ
         std::atomic_bool cancelled = false;
         std::exception_ptr failure;
         axiom::gui::OperationProgressWindow progress_window;
-        const auto operation_theme = make_operation_window_theme(make_theme());
+        configure_dialog_appearance(persisted.application);
+        const auto operation_theme = make_operation_window_theme(
+            make_theme(persisted.application.theme_mode,
+                       persisted.application.accent_color_mode,
+                       persisted.application.custom_accent_color));
         progress_window.create(
             nullptr, instance, L"Extracting archive", {}, operation_theme,
             [operation](bool paused) { operation->set_paused(paused); },
@@ -6807,6 +9474,12 @@ int run_axiom_gui(HINSTANCE instance,
         return *sfx_result;
     }
 
+    if (startup_command.kind == AxiomGuiStartupCommand::Kind::add_to_archive) {
+        const int result = run_quick_add_to_archive(instance, startup_command.paths);
+        OleUninitialize();
+        return result;
+    }
+
     MainWindow window;
     if (!window.create(instance, show_command, std::move(initial_path),
                        std::move(startup_command))) {
@@ -6853,6 +9526,7 @@ int run_axiom_gui(HINSTANCE instance,
                 switch (message.wParam) {
                     case 'A': command = kSelectAll; break;
                     case 'E': command = kExtract; break;
+                    case 'F': command = kFind; break;
                     case 'I': command = kInfo; break;
                     case 'N': command = kAddFiles; break;
                     case 'O': command = kOpenArchive; break;

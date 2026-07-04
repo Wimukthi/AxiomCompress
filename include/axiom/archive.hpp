@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -21,6 +22,8 @@ struct ArchiveEntry {
     bool is_hardlink = false;    // a hard link; link_target is the shared file's path
     std::string link_target;     // symlink target or hardlink path (empty otherwise)
     std::uint64_t size = 0;      // uncompressed bytes (0 for directories/links)
+    std::optional<std::uint64_t> packed_size;  // compressed bytes when the format exposes it
+    bool packed_size_estimated = false;  // true for proportional solid-block estimates
     std::int64_t mtime = 0;      // seconds since Unix epoch
     std::uint32_t crc32 = 0;     // CRC-32 of file bytes (0 for directories/links)
     bool has_blake3 = false;     // whether blake3 below is populated
@@ -77,6 +80,7 @@ struct ExtractOptions {
     Overwrite overwrite = Overwrite::fail;
     bool restore_mtime = true;
     std::size_t thread_count = 0;
+    std::size_t io_buffer_size = 0;  // 0 = automatic.
     std::shared_ptr<OperationControl> operation;
     // Password for an encrypted archive; required to read one, ignored otherwise.
     std::string password;
@@ -87,6 +91,11 @@ struct ExtractOptions {
 // UTF-8, and '/'-separated.
 struct ArchiveInput {
     std::filesystem::path source;
+    std::string destination_path;
+};
+
+struct ArchiveMove {
+    std::string source_path;
     std::string destination_path;
 };
 
@@ -128,17 +137,21 @@ public:
     virtual void delete_entries(const std::filesystem::path& archive_path,
                                 const std::vector<std::string>& paths,
                                 const CompressionOptions& options = {}) const = 0;
+    virtual void move_entries(const std::filesystem::path& archive_path,
+                              const std::vector<ArchiveMove>& moves,
+                              const CompressionOptions& options = {}) const {
+        (void)archive_path;
+        (void)moves;
+        (void)options;
+        throw std::runtime_error("archive format does not support moving entries");
+    }
 };
 
 std::span<const ArchiveFormatInfo> supported_archive_formats();
 const ArchiveProvider* archive_provider_for_path(const std::filesystem::path& path);
 bool is_supported_archive(const std::filesystem::path& path);
 bool is_native_archive(const std::filesystem::path& path);
-
-struct ArchiveMove {
-    std::string source_path;
-    std::string destination_path;
-};
+bool is_axiom_sfx_archive(const std::filesystem::path& path);
 
 enum class ArchiveEncryptionMode {
     none,
@@ -209,7 +222,8 @@ void join_archive_volumes(const std::filesystem::path& any_volume,
 void create_sfx_archive(const std::filesystem::path& archive_path,
                         const std::filesystem::path& stub_executable,
                         const std::filesystem::path& output_executable,
-                        const std::shared_ptr<OperationControl>& operation = nullptr);
+                        const std::shared_ptr<OperationControl>& operation = nullptr,
+                        std::size_t io_buffer_size = 0);
 
 // Build a `.axar` archive from the given files/directories (directories are
 // scanned recursively). Archive paths are stored relative to each input's

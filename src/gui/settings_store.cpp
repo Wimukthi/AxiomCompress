@@ -2,6 +2,9 @@
 
 #include <algorithm>
 #include <array>
+#include <cwchar>
+#include <sstream>
+#include <vector>
 
 namespace axiom::gui {
 namespace {
@@ -29,6 +32,30 @@ std::wstring read_string(HKEY key, const wchar_t* name) {
     return value;
 }
 
+std::vector<std::wstring> read_string_list(HKEY key, const wchar_t* name) {
+    DWORD size = 0;
+    if (RegGetValueW(key, nullptr, name, RRF_RT_REG_MULTI_SZ,
+                     nullptr, nullptr, &size) != ERROR_SUCCESS ||
+        size < sizeof(wchar_t)) {
+        return {};
+    }
+    std::wstring raw(size / sizeof(wchar_t), L'\0');
+    if (RegGetValueW(key, nullptr, name, RRF_RT_REG_MULTI_SZ,
+                     nullptr, raw.data(), &size) != ERROR_SUCCESS) {
+        return {};
+    }
+
+    std::vector<std::wstring> values;
+    const wchar_t* cursor = raw.c_str();
+    const wchar_t* const end = raw.c_str() + raw.size();
+    while (cursor < end && *cursor != L'\0') {
+        const std::size_t length = wcslen(cursor);
+        if (length != 0) values.emplace_back(cursor, length);
+        cursor += length + 1;
+    }
+    return values;
+}
+
 void write_dword(HKEY key, const wchar_t* name, DWORD value) {
     RegSetValueExW(key, name, 0, REG_DWORD,
                    reinterpret_cast<const BYTE*>(&value), sizeof(value));
@@ -40,6 +67,20 @@ void write_string(HKEY key, const wchar_t* name, const std::wstring& value) {
                    static_cast<DWORD>((value.size() + 1) * sizeof(wchar_t)));
 }
 
+void write_string_list(HKEY key, const wchar_t* name,
+                       const std::vector<std::wstring>& values) {
+    std::wstring raw;
+    for (const auto& value : values) {
+        if (value.empty()) continue;
+        raw += value;
+        raw.push_back(L'\0');
+    }
+    raw.push_back(L'\0');
+    RegSetValueExW(key, name, 0, REG_MULTI_SZ,
+                   reinterpret_cast<const BYTE*>(raw.c_str()),
+                   static_cast<DWORD>(raw.size() * sizeof(wchar_t)));
+}
+
 int read_clamped_int(HKEY key, const wchar_t* name, int fallback, int minimum, int maximum) {
     return static_cast<int>(std::clamp<DWORD>(
         read_dword(key, name, static_cast<DWORD>(fallback)),
@@ -48,6 +89,30 @@ int read_clamped_int(HKEY key, const wchar_t* name, int fallback, int minimum, i
 
 bool read_bool(HKEY key, const wchar_t* name, bool fallback) {
     return read_dword(key, name, fallback ? 1u : 0u) != 0;
+}
+
+std::vector<int> read_int_list(HKEY key, const wchar_t* name) {
+    std::vector<int> values;
+    std::wstring text = read_string(key, name);
+    const wchar_t* cursor = text.c_str();
+    while (*cursor != L'\0') {
+        wchar_t* end = nullptr;
+        const long value = std::wcstol(cursor, &end, 10);
+        if (end == cursor) break;
+        values.push_back(static_cast<int>(std::clamp<long>(value, 48, 2000)));
+        cursor = end;
+        while (*cursor == L',' || *cursor == L' ' || *cursor == L'\t') ++cursor;
+    }
+    return values;
+}
+
+std::wstring join_int_list(const std::vector<int>& values) {
+    std::wostringstream out;
+    for (std::size_t index = 0; index < values.size(); ++index) {
+        if (index != 0) out << L',';
+        out << std::clamp(values[index], 48, 2000);
+    }
+    return out.str();
 }
 
 }  // namespace
@@ -79,6 +144,12 @@ PersistedGuiSettings load_gui_settings() {
     settings.application.restore_window_placement =
         read_bool(key, L"RestoreWindowPlacement", true);
     settings.application.theme_mode = read_clamped_int(key, L"ThemeMode", 0, 0, 2);
+    settings.application.accent_color_mode =
+        read_clamped_int(key, L"AccentColorMode", 0, 0, 6);
+    settings.application.custom_accent_color = static_cast<COLORREF>(
+        read_dword(key, L"CustomAccentColor", RGB(255, 185, 60)));
+    settings.application.toolbar_icon_style =
+        read_clamped_int(key, L"ToolbarIconStyle", 0, 0, 2);
     settings.application.startup_location_mode =
         read_clamped_int(key, L"StartupLocationMode", 0, 0, 3);
     settings.application.startup_custom_path = read_string(key, L"StartupCustomPath");
@@ -137,9 +208,15 @@ PersistedGuiSettings load_gui_settings() {
     settings.application.memory_limit = read_string(key, L"MemoryLimit");
     settings.sort_column = static_cast<int>(std::clamp<DWORD>(read_dword(key, L"SortColumn", 0), 0, 6));
     settings.sort_ascending = read_dword(key, L"SortAscending", 1) != 0;
+    settings.tree_width =
+        read_clamped_int(key, L"TreeWidth", 0, 0, 2000);
+    settings.column_widths = read_int_list(key, L"ColumnWidths");
     settings.last_location = read_string(key, L"LastLocation");
     settings.last_archive_output_folder = read_string(key, L"LastArchiveOutputFolder");
     settings.last_extract_destination_folder = read_string(key, L"LastExtractDestinationFolder");
+    settings.recent_locations = read_string_list(key, L"RecentLocations");
+    settings.recent_archives = read_string_list(key, L"RecentArchives");
+    settings.favorite_locations = read_string_list(key, L"FavoriteLocations");
 
     DWORD placement_size = sizeof(settings.placement);
     DWORD type = 0;
@@ -189,6 +266,13 @@ void save_gui_settings(const PersistedGuiSettings& settings) {
                 settings.application.restore_window_placement ? 1 : 0);
     write_dword(key, L"ThemeMode",
                 static_cast<DWORD>(std::clamp(settings.application.theme_mode, 0, 2)));
+    write_dword(key, L"AccentColorMode",
+                static_cast<DWORD>(std::clamp(settings.application.accent_color_mode, 0, 6)));
+    write_dword(key, L"CustomAccentColor",
+                static_cast<DWORD>(settings.application.custom_accent_color));
+    write_dword(key, L"ToolbarIconStyle",
+                static_cast<DWORD>(std::clamp(
+                    settings.application.toolbar_icon_style, 0, 2)));
     write_dword(key, L"StartupLocationMode",
                 static_cast<DWORD>(std::clamp(settings.application.startup_location_mode, 0, 3)));
     write_string(key, L"StartupCustomPath", settings.application.startup_custom_path);
@@ -254,9 +338,15 @@ void save_gui_settings(const PersistedGuiSettings& settings) {
     write_string(key, L"MemoryLimit", settings.application.memory_limit);
     write_dword(key, L"SortColumn", static_cast<DWORD>(settings.sort_column));
     write_dword(key, L"SortAscending", settings.sort_ascending ? 1 : 0);
+    write_dword(key, L"TreeWidth",
+                static_cast<DWORD>(std::clamp(settings.tree_width, 0, 2000)));
+    write_string(key, L"ColumnWidths", join_int_list(settings.column_widths));
     write_string(key, L"LastLocation", settings.last_location);
     write_string(key, L"LastArchiveOutputFolder", settings.last_archive_output_folder);
     write_string(key, L"LastExtractDestinationFolder", settings.last_extract_destination_folder);
+    write_string_list(key, L"RecentLocations", settings.recent_locations);
+    write_string_list(key, L"RecentArchives", settings.recent_archives);
+    write_string_list(key, L"FavoriteLocations", settings.favorite_locations);
     if (settings.has_placement) {
         RegSetValueExW(key, L"WindowPlacement", 0, REG_BINARY,
                        reinterpret_cast<const BYTE*>(&settings.placement),

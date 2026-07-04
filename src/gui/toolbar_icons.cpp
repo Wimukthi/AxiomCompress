@@ -37,6 +37,30 @@ const std::uint8_t* mask_for_icon(ToolbarIcon icon) {
     return nullptr;
 }
 
+COLORREF color_for_icon(ToolbarIcon icon, COLORREF fallback, ToolbarIconStyle style) {
+    if (style != ToolbarIconStyle::colorful) return fallback;
+    switch (icon) {
+        case ToolbarIcon::archive: return RGB(255, 185, 60);
+        case ToolbarIcon::open: return RGB(245, 169, 64);
+        case ToolbarIcon::extract: return RGB(83, 174, 255);
+        case ToolbarIcon::test: return RGB(96, 205, 112);
+        case ToolbarIcon::view: return RGB(124, 185, 255);
+        case ToolbarIcon::delete_item: return RGB(255, 99, 99);
+        case ToolbarIcon::info: return RGB(92, 170, 255);
+        case ToolbarIcon::settings: return RGB(180, 143, 255);
+        case ToolbarIcon::back:
+        case ToolbarIcon::forward:
+        case ToolbarIcon::up:
+        case ToolbarIcon::refresh:
+            return RGB(116, 192, 255);
+        case ToolbarIcon::pause: return RGB(255, 193, 84);
+        case ToolbarIcon::resume: return RGB(96, 205, 112);
+        case ToolbarIcon::cancel: return RGB(255, 99, 99);
+        case ToolbarIcon::none: return fallback;
+    }
+    return fallback;
+}
+
 int scale_for_dpi(int value, UINT dpi) {
     return MulDiv(value, static_cast<int>(dpi == 0 ? USER_DEFAULT_SCREEN_DPI : dpi),
                   USER_DEFAULT_SCREEN_DPI);
@@ -141,8 +165,10 @@ void draw_toolbar_icon(HDC dc,
                        const RECT& bounds,
                        COLORREF color,
                        UINT dpi,
-                       int logical_size) {
+                       int logical_size,
+                       ToolbarIconStyle style) {
     const int size = scale_for_dpi(logical_size, dpi);
+    color = color_for_icon(icon, color, style);
     HBITMAP bitmap = icon_cache().get(icon, color, size);
     if (dc == nullptr || bitmap == nullptr) return;
 

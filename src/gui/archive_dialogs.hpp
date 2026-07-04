@@ -7,6 +7,7 @@
 
 #include <cstddef>
 #include <filesystem>
+#include <functional>
 #include <string>
 
 namespace axiom::gui {
@@ -53,6 +54,9 @@ struct ApplicationDialogOptions {
     bool show_hidden = true;
     bool restore_window_placement = true;
     int theme_mode = 0;  // 0 = system, 1 = dark, 2 = light.
+    int accent_color_mode = 0;  // 0 = Windows accent, 1 = Axiom amber, 2..5 presets, 6 = custom.
+    COLORREF custom_accent_color = RGB(255, 185, 60);
+    int toolbar_icon_style = 0;  // 0 = theme-tinted, 1 = colorful, 2 = accent-colored.
     int startup_location_mode = 0;  // 0 = last, 1 = This PC, 2 = Desktop, 3 = custom.
     std::wstring startup_custom_path;
     int archive_output_mode = 0;  // 0 = source folder, 1 = last used, 2 = custom.
@@ -106,5 +110,9 @@ bool show_extract_archive_dialog(HWND owner,
                                  const std::filesystem::path& archive_path,
                                  ExtractArchiveDialogOptions& options);
 bool show_application_settings_dialog(HWND owner, ApplicationDialogOptions& options);
+bool show_application_settings_dialog(
+    HWND owner,
+    ApplicationDialogOptions& options,
+    const std::function<void(const ApplicationDialogOptions&)>& apply_callback);
 
 }  // namespace axiom::gui

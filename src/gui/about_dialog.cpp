@@ -15,6 +15,9 @@ constexpr wchar_t kAuthor[] = L"Wimukthi Bandara";
 constexpr wchar_t kLicense[] = L"GNU GPLv3";
 constexpr int kAutoUpdateControl = 201;
 constexpr int kCheckUpdatesControl = 202;
+constexpr DWORD kAboutDialogStyle =
+    WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_CLIPCHILDREN;
+constexpr DWORD kAboutDialogExStyle = WS_EX_WINDOWEDGE | WS_EX_CONTROLPARENT;
 
 #define AXIOM_WIDEN2(value) L##value
 #define AXIOM_WIDEN(value) AXIOM_WIDEN2(value)
@@ -29,6 +32,8 @@ struct AboutDialogState {
     HWND title{};
     HWND description{};
     std::array<HWND, 4> metadata{};
+    HWND third_party_title{};
+    HWND third_party{};
     HWND auto_update{};
     HWND check_updates{};
     HWND ok{};
@@ -41,11 +46,20 @@ struct AboutDialogState {
     bool dark{};
 };
 
-std::array<HWND, 9> controls(AboutDialogState* state) {
+SIZE about_window_size_for_client(UINT dpi, int logical_width, int logical_height) {
+    RECT rect{0, 0,
+              scale_for_dialog_dpi(logical_width, dpi),
+              scale_for_dialog_dpi(logical_height, dpi)};
+    AdjustWindowRectExForDpi(&rect, kAboutDialogStyle, FALSE, kAboutDialogExStyle, dpi);
+    return {rect.right - rect.left, rect.bottom - rect.top};
+}
+
+std::array<HWND, 11> controls(AboutDialogState* state) {
     if (state == nullptr) return {};
     return {
         state->title, state->description,
         state->metadata[0], state->metadata[1], state->metadata[2], state->metadata[3],
+        state->third_party_title, state->third_party,
         state->check_updates, state->auto_update, state->ok,
     };
 }
@@ -80,10 +94,13 @@ void layout(AboutDialogState* state) {
     const int icon_size = scale_for_dialog_dpi(56, state->dpi);
     const int title_left = margin + icon_size + scale_for_dialog_dpi(16, state->dpi);
     const int title_height = scale_for_dialog_dpi(32, state->dpi);
-    const int description_top = margin + title_height + scale_for_dialog_dpi(4, state->dpi);
+    const int description_top = margin + scale_for_dialog_dpi(32, state->dpi);
     const int description_height = scale_for_dialog_dpi(42, state->dpi);
-    const int metadata_top = margin + scale_for_dialog_dpi(102, state->dpi);
+    const int metadata_top = margin + scale_for_dialog_dpi(114, state->dpi);
     const int metadata_height = scale_for_dialog_dpi(22, state->dpi);
+    const int third_party_top = metadata_top +
+                                static_cast<int>(state->metadata.size()) * metadata_height +
+                                scale_for_dialog_dpi(14, state->dpi);
     const int button_width = scale_for_dialog_dpi(92, state->dpi);
     const int update_width = scale_for_dialog_dpi(138, state->dpi);
     const int button_height = scale_for_dialog_dpi(30, state->dpi);
@@ -102,6 +119,11 @@ void layout(AboutDialogState* state) {
                    metadata_top + static_cast<int>(index) * metadata_height,
                    client.right - margin * 2, metadata_height, TRUE);
     }
+    MoveWindow(state->third_party_title, margin, third_party_top,
+               client.right - margin * 2, scale_for_dialog_dpi(22, state->dpi), TRUE);
+    MoveWindow(state->third_party, margin,
+               third_party_top + scale_for_dialog_dpi(26, state->dpi),
+               client.right - margin * 2, scale_for_dialog_dpi(92, state->dpi), TRUE);
     MoveWindow(state->auto_update, margin, button_top + scale_for_dialog_dpi(4, state->dpi),
                scale_for_dialog_dpi(190, state->dpi), scale_for_dialog_dpi(22, state->dpi), TRUE);
     MoveWindow(state->check_updates,
@@ -137,7 +159,7 @@ void paint(AboutDialogState* state) {
     RECT client{};
     GetClientRect(state->hwnd, &client);
     const int margin = scale_for_dialog_dpi(20, state->dpi);
-    const int y = scale_for_dialog_dpi(92, state->dpi);
+    const int y = scale_for_dialog_dpi(110, state->dpi);
     HPEN pen = CreatePen(PS_SOLID, 1, colors.border);
     HGDIOBJ old_pen = SelectObject(dc, pen);
     MoveToEx(dc, margin, y, nullptr);
@@ -174,7 +196,7 @@ LRESULT CALLBACK about_dialog_proc(HWND hwnd, UINT message, WPARAM wparam, LPARA
                 0, 0, 0, 0, hwnd, nullptr, state->instance, nullptr);
             state->description = CreateWindowExW(
                 0, L"STATIC",
-                L"A native C++ Win32 archive manager and compression frontend focused on speed, integrity, and a dark-first file browser.",
+                L"A fast, native Windows archive manager for secure, reliable compression.",
                 WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | SS_NOPREFIX,
                 0, 0, 0, 0, hwnd, nullptr, state->instance, nullptr);
             const std::array<std::wstring, 4> metadata_text{
@@ -189,9 +211,21 @@ LRESULT CALLBACK about_dialog_proc(HWND hwnd, UINT message, WPARAM wparam, LPARA
                     WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | SS_NOPREFIX,
                     0, 0, 0, 0, hwnd, nullptr, state->instance, nullptr);
             }
+            state->third_party_title = CreateWindowExW(
+                0, L"STATIC", L"Third-party components",
+                WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | SS_NOPREFIX,
+                0, 0, 0, 0, hwnd, nullptr, state->instance, nullptr);
+            state->third_party = CreateWindowExW(
+                0, L"STATIC",
+                L"miniz - ZIP read/write support - MIT license\r\n"
+                L"Monocypher - cryptographic primitives - BSD 2-Clause license\r\n"
+                L"BLAKE3 - hashing/integrity primitives - CC0/Apache-2.0 license\r\n"
+                L"Fluent UI System Icons - toolbar and dialog icons - MIT license",
+                WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | SS_NOPREFIX,
+                0, 0, 0, 0, hwnd, nullptr, state->instance, nullptr);
             state->auto_update = CreateWindowExW(
                 0, L"BUTTON", L"Check automatically",
-                WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | WS_TABSTOP | BS_AUTOCHECKBOX,
+                WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | WS_TABSTOP | BS_OWNERDRAW,
                 0, 0, 0, 0, hwnd,
                 reinterpret_cast<HMENU>(static_cast<INT_PTR>(kAutoUpdateControl)),
                 state->instance, nullptr);
@@ -219,6 +253,13 @@ LRESULT CALLBACK about_dialog_proc(HWND hwnd, UINT message, WPARAM wparam, LPARA
         case WM_SIZE:
             layout(state);
             return 0;
+        case WM_GETMINMAXINFO: {
+            auto* info = reinterpret_cast<MINMAXINFO*>(lparam);
+            const SIZE minimum = about_window_size_for_client(state->dpi, 540, 450);
+            info->ptMinTrackSize.x = minimum.cx;
+            info->ptMinTrackSize.y = minimum.cy;
+            return 0;
+        }
         case WM_DPICHANGED: {
             state->dpi = HIWORD(wparam);
             const auto* suggested = reinterpret_cast<const RECT*>(lparam);
@@ -239,17 +280,23 @@ LRESULT CALLBACK about_dialog_proc(HWND hwnd, UINT message, WPARAM wparam, LPARA
             return 0;
         case WM_COMMAND:
             if (LOWORD(wparam) == kAutoUpdateControl) {
-                set_automatic_update_checks_enabled(
-                    SendMessageW(state->auto_update, BM_GETCHECK, 0, 0) == BST_CHECKED);
+                const bool checked =
+                    SendMessageW(state->auto_update, BM_GETCHECK, 0, 0) != BST_CHECKED;
+                SendMessageW(state->auto_update, BM_SETCHECK,
+                             checked ? BST_CHECKED : BST_UNCHECKED, 0);
+                set_automatic_update_checks_enabled(checked);
+                InvalidateRect(state->auto_update, nullptr, FALSE);
                 return 0;
             }
             if (LOWORD(wparam) == kCheckUpdatesControl) {
                 PostMessageW(state->owner, WM_COMMAND,
                              MAKEWPARAM(state->check_updates_command, 0), 0);
+                save_named_window_placement(L"AboutDialog", hwnd);
                 DestroyWindow(hwnd);
                 return 0;
             }
             if (LOWORD(wparam) == IDOK || LOWORD(wparam) == IDCANCEL) {
+                save_named_window_placement(L"AboutDialog", hwnd);
                 DestroyWindow(hwnd);
                 return 0;
             }
@@ -259,7 +306,14 @@ LRESULT CALLBACK about_dialog_proc(HWND hwnd, UINT message, WPARAM wparam, LPARA
             return control_color(state, wparam);
         case WM_DRAWITEM:
             if (lparam != 0) {
-                draw_dialog_button(*reinterpret_cast<DRAWITEMSTRUCT*>(lparam), state->dark);
+                const auto& draw = *reinterpret_cast<DRAWITEMSTRUCT*>(lparam);
+                if (draw.CtlID == kAutoUpdateControl) {
+                    draw_dialog_checkbox(
+                        draw, state->dark,
+                        SendMessageW(state->auto_update, BM_GETCHECK, 0, 0) == BST_CHECKED);
+                } else {
+                    draw_dialog_button(draw, state->dark);
+                }
                 return TRUE;
             }
             break;
@@ -270,6 +324,7 @@ LRESULT CALLBACK about_dialog_proc(HWND hwnd, UINT message, WPARAM wparam, LPARA
             return 1;
         }
         case WM_CLOSE:
+            save_named_window_placement(L"AboutDialog", hwnd);
             DestroyWindow(hwnd);
             return 0;
         case WM_NCDESTROY:
@@ -308,8 +363,9 @@ void show_about_dialog(HWND owner, HINSTANCE instance, UINT dpi, bool dark,
     const UINT effective_dpi = dpi == 0 ? GetDpiForWindow(owner) : dpi;
     RECT owner_rect{};
     GetWindowRect(owner, &owner_rect);
-    const int width = scale_for_dialog_dpi(500, effective_dpi);
-    const int height = scale_for_dialog_dpi(324, effective_dpi);
+    const SIZE window_size = about_window_size_for_client(effective_dpi, 540, 450);
+    const int width = window_size.cx;
+    const int height = window_size.cy;
     AboutDialogState state{};
     state.owner = owner;
     state.instance = instance;
@@ -317,8 +373,8 @@ void show_about_dialog(HWND owner, HINSTANCE instance, UINT dpi, bool dark,
     state.check_updates_command = check_updates_command;
     state.dark = dark;
     HWND dialog = CreateWindowExW(
-        WS_EX_WINDOWEDGE | WS_EX_CONTROLPARENT, kAboutDialogClass, L"About Axiom",
-        WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_CLIPCHILDREN,
+        kAboutDialogExStyle, kAboutDialogClass, L"About Axiom",
+        kAboutDialogStyle,
         owner_rect.left + (owner_rect.right - owner_rect.left - width) / 2,
         owner_rect.top + (owner_rect.bottom - owner_rect.top - height) / 2,
         width, height, owner, nullptr, instance, &state);
@@ -328,6 +384,15 @@ void show_about_dialog(HWND owner, HINSTANCE instance, UINT dpi, bool dark,
         return;
     }
     apply_axiom_window_icons(dialog, instance);
+    restore_named_window_placement(dialog, owner, L"AboutDialog");
+    RECT restored_rect{};
+    GetWindowRect(dialog, &restored_rect);
+    int restored_width = restored_rect.right - restored_rect.left;
+    int restored_height = restored_rect.bottom - restored_rect.top;
+    if (restored_width < width) restored_width = width;
+    if (restored_height < height) restored_height = height;
+    SetWindowPos(dialog, nullptr, restored_rect.left, restored_rect.top,
+                 restored_width, restored_height, SWP_NOZORDER | SWP_NOACTIVATE);
     const bool owner_was_enabled = disable_dialog_owner(owner);
     ShowWindow(dialog, SW_SHOW);
     UpdateWindow(dialog);
@@ -340,6 +405,7 @@ void show_about_dialog(HWND owner, HINSTANCE instance, UINT dpi, bool dark,
         }
         if (message_targets_window(dialog, message) &&
             message.message == WM_KEYDOWN && message.wParam == VK_ESCAPE) {
+            save_named_window_placement(L"AboutDialog", dialog);
             DestroyWindow(dialog);
             continue;
         }
@@ -348,6 +414,7 @@ void show_about_dialog(HWND owner, HINSTANCE instance, UINT dpi, bool dark,
             DispatchMessageW(&message);
         }
     }
+    save_named_window_placement(L"AboutDialog", dialog);
     restore_dialog_owner(owner, owner_was_enabled);
 }
 

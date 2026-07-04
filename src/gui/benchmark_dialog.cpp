@@ -60,6 +60,7 @@ constexpr int kBenchmarkInitialWidth = 960;
 constexpr int kBenchmarkMinimumWidth = 940;
 constexpr int kBenchmarkInitialHeight = 640;
 constexpr int kBenchmarkMinimumHeight = 600;
+constexpr wchar_t kBenchmarkLayoutName[] = L"BenchmarkDialog";
 
 constexpr std::array<const wchar_t*, 3> kCorpusNames{
     L"Text/log corpus", L"Mixed files", L"Binary/random"};
@@ -1520,6 +1521,7 @@ void browse_custom_folder(BenchmarkDialogState* state) {
 
 void close_benchmark_dialog(BenchmarkDialogState* state) {
     if (state == nullptr) return;
+    save_named_window_placement(kBenchmarkLayoutName, state->hwnd);
     restore_dialog_owner(state->owner, state->owner_was_enabled);
     state->owner_was_enabled = false;
     if (state->owner != nullptr && IsWindow(state->owner)) {
@@ -1800,6 +1802,7 @@ void show_benchmark_dialog(HWND owner, HINSTANCE instance, UINT dpi, bool dark) 
         return;
     }
     apply_axiom_window_icons(dialog, instance);
+    restore_named_window_placement(dialog, owner, kBenchmarkLayoutName);
     state.owner_was_enabled = disable_dialog_owner(owner);
     ShowWindow(dialog, SW_SHOW);
     UpdateWindow(dialog);

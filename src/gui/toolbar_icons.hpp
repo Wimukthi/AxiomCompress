@@ -23,6 +23,11 @@ enum class ToolbarIcon {
     cancel,
 };
 
+enum class ToolbarIconStyle {
+    monochrome,
+    colorful,
+};
+
 // Draws a theme-tinted Fluent icon centered in bounds. Rasterized bitmaps are
 // cached by icon, DPI, and color so owner-draw hover/focus repaints stay cheap.
 void draw_toolbar_icon(HDC dc,
@@ -30,6 +35,7 @@ void draw_toolbar_icon(HDC dc,
                        const RECT& bounds,
                        COLORREF color,
                        UINT dpi,
-                       int logical_size = 18);
+                       int logical_size = 18,
+                       ToolbarIconStyle style = ToolbarIconStyle::monochrome);
 
 } // namespace axiom::gui

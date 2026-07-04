@@ -274,6 +274,8 @@ const axiom::ArchiveFormatInfo& ArchiveCatalog::format_info() const {
     return provider_->info();
 }
 
+const std::vector<ArchiveEntry>& ArchiveCatalog::entries() const { return entries_; }
+
 const ArchiveCapabilities& ArchiveCatalog::capabilities() const { return capabilities_; }
 
 BrowserSnapshot ArchiveCatalog::list(const BrowserLocation& location, std::stop_token stop) const {
@@ -311,6 +313,8 @@ BrowserSnapshot ArchiveCatalog::list(const BrowserLocation& location, std::stop_
             item.kind = BrowserItemKind::file;
             item.type = extension_type(fs::path(item.name), false);
             item.size = entry.size;
+            item.packed_size = entry.packed_size;
+            item.packed_size_estimated = entry.packed_size_estimated;
             item.crc32 = entry.crc32;
         }
         item.modified = unix_time_text(entry.mtime);
