@@ -57,6 +57,7 @@ jobs:
           for src in $c_srcs; do
             obj="build/fuzz-linux/$(basename "$src").o"
             clang -std=c17 -O1 -g -fsanitize=address \
+              -D_POSIX_C_SOURCE=200809L -D_FILE_OFFSET_BITS=64 \
               -DBLAKE3_NO_AVX512 -DBLAKE3_NO_AVX2 -DBLAKE3_NO_SSE41 -DBLAKE3_NO_SSE2 \
               -Iinclude -Isrc -c "$src" -o "$obj"
             c_objs+=("$obj")
