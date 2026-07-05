@@ -18,6 +18,9 @@ Use this document when you need to know where a feature belongs:
 | `src/core` | Shared utilities: checksums, crypto, filesystem metadata, Reed-Solomon |
 | `src/cli` | `axiomc` command parsing and CLI workflows |
 | `src/gui` | Native Win32 GUI over the public archive APIs |
+| `src/gui/main_window.cpp` | Main window creation, layout, message dispatch, and the `run_axiom_gui` entry point |
+| `src/gui/main_window_*.cpp` | The other main-window method groups: browser/tree wiring, address bar, theming, dark-drawn views, find dialog, commands, file operations, helpers, quick-add/SFX startup |
+| `src/gui/main_window_internal.hpp` | Declarations shared between the main-window translation units |
 | `tests` | Round-trip, safety, and regression tests |
 
 The important design rule is simple: compression may spend more CPU to find a

@@ -88,6 +88,15 @@
   <ItemGroup>
     <ClCompile Include="src\gui\main.cpp" />
     <ClCompile Include="src\gui\main_window.cpp" />
+    <ClCompile Include="src\gui\main_window_address.cpp" />
+    <ClCompile Include="src\gui\main_window_browser.cpp" />
+    <ClCompile Include="src\gui\main_window_commands.cpp" />
+    <ClCompile Include="src\gui\main_window_fileops.cpp" />
+    <ClCompile Include="src\gui\main_window_quickadd.cpp" />
+    <ClCompile Include="src\gui\main_window_search.cpp" />
+    <ClCompile Include="src\gui\main_window_theme.cpp" />
+    <ClCompile Include="src\gui\main_window_util.cpp" />
+    <ClCompile Include="src\gui\main_window_views.cpp" />
     <ClCompile Include="src\gui\custom_menu.cpp" />
     <ClCompile Include="src\gui\toolbar_icons.cpp" />
     <ClCompile Include="src\gui\archive_dialogs.cpp" />
@@ -107,6 +116,7 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="src\gui\browser_model.hpp" />
+    <ClInclude Include="src\gui\main_window_internal.hpp" />
     <ClInclude Include="src\gui\custom_menu.hpp" />
     <ClInclude Include="src\gui\toolbar_icons.hpp" />
     <ClInclude Include="src\gui\toolbar_icon_masks.inc" />

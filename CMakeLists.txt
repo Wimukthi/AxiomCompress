@@ -79,6 +79,15 @@ if(WIN32)
     add_executable(axiom_gui WIN32
         src/gui/main.cpp
         src/gui/main_window.cpp
+        src/gui/main_window_address.cpp
+        src/gui/main_window_browser.cpp
+        src/gui/main_window_commands.cpp
+        src/gui/main_window_fileops.cpp
+        src/gui/main_window_quickadd.cpp
+        src/gui/main_window_search.cpp
+        src/gui/main_window_theme.cpp
+        src/gui/main_window_util.cpp
+        src/gui/main_window_views.cpp
         src/gui/custom_menu.cpp
         src/gui/toolbar_icons.cpp
         src/gui/archive_dialogs.cpp

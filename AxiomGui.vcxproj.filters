@@ -21,6 +21,15 @@
     <ClCompile Include="src\gui\main_window.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="src\gui\main_window_address.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="src\gui\main_window_browser.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="src\gui\main_window_commands.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="src\gui\main_window_fileops.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="src\gui\main_window_quickadd.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="src\gui\main_window_search.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="src\gui\main_window_theme.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="src\gui\main_window_util.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="src\gui\main_window_views.cpp"><Filter>Source Files</Filter></ClCompile>
     <ClCompile Include="src\gui\custom_menu.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -59,6 +68,7 @@
     <ClInclude Include="src\gui\browser_model.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="src\gui\main_window_internal.hpp"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="src\gui\custom_menu.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
