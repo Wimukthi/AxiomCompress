@@ -2072,8 +2072,16 @@ public:
 
     ArchiveCapabilities capabilities(const std::filesystem::path& archive_path,
                                      const std::string& password) const override {
-        ZipReader reader(archive_path);
-        return zip_capabilities_for_plans(read_zip_entry_plans(reader), !password.empty());
+        // A capability query must not throw: the path may be a new archive that
+        // does not exist yet, or an unreadable file. Fall back to the format's
+        // static capabilities (empty entry list) and let the actual operation
+        // report the precise error.
+        try {
+            ZipReader reader(archive_path);
+            return zip_capabilities_for_plans(read_zip_entry_plans(reader), !password.empty());
+        } catch (...) {
+            return zip_capabilities_for_plans({}, !password.empty());
+        }
     }
 
     std::vector<ArchiveEntry> list(const std::filesystem::path& archive_path,

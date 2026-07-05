@@ -527,6 +527,28 @@ void test_archive_provider_layer() {
     AXIOM_CHECK(!capabilities.encrypted);
     AXIOM_CHECK(!capabilities.directory_encrypted);
 
+    // Capability queries must not throw for archives that do not exist yet
+    // (the GUI probes the target path before creating a new archive) and must
+    // still allow creation; archive-state flags stay at their defaults.
+    {
+        const auto missing_axar = root / "missing" / "new.axar";
+        const auto* missing_provider = axiom::archive_provider_for_path(missing_axar);
+        AXIOM_CHECK(missing_provider != nullptr);
+        const auto missing_capabilities = missing_provider->capabilities(missing_axar);
+        AXIOM_CHECK(missing_capabilities.create);
+        AXIOM_CHECK(missing_capabilities.update);
+        AXIOM_CHECK(!missing_capabilities.encrypted);
+        AXIOM_CHECK(!missing_capabilities.locked);
+        AXIOM_CHECK(!missing_capabilities.directory_encrypted);
+
+        const auto missing_zip = root / "missing" / "new.zip";
+        const auto* zip_provider = axiom::archive_provider_for_path(missing_zip);
+        AXIOM_CHECK(zip_provider != nullptr);
+        const auto zip_capabilities = zip_provider->capabilities(missing_zip);
+        AXIOM_CHECK(zip_capabilities.create);
+        AXIOM_CHECK(!zip_capabilities.encrypted);
+    }
+
     const auto entries = provider->list(archive);
     AXIOM_CHECK(std::any_of(entries.begin(), entries.end(), [](const axiom::ArchiveEntry& entry) {
         return entry.path == "src/file.txt" &&

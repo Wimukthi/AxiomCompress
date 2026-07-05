@@ -207,11 +207,21 @@ public:
         result.links = true;
         result.authenticity = true;
         result.sfx = !embedded_sfx;
-        result.encrypted = archive_is_encrypted(archive_path);
-        const auto encryption_mode = archive_encryption_mode(archive_path);
-        result.directory_encrypted = encryption_mode == ArchiveEncryptionMode::data_and_directory;
-        if (!result.directory_encrypted || !password.empty()) {
-            result.locked = archive_is_locked(archive_path, password);
+        // The state flags below require opening the archive, which throws for a
+        // path that does not exist yet (a new archive about to be created) or a
+        // damaged file. A capability query must not throw — callers use it to
+        // enable UI commands before any operation runs — so probe failures
+        // leave the state flags at their defaults and the actual operation
+        // reports the precise error.
+        try {
+            const auto encryption_mode = archive_encryption_mode(archive_path);
+            result.encrypted = encryption_mode != ArchiveEncryptionMode::none;
+            result.directory_encrypted =
+                encryption_mode == ArchiveEncryptionMode::data_and_directory;
+            if (!result.directory_encrypted || !password.empty()) {
+                result.locked = archive_is_locked(archive_path, password);
+            }
+        } catch (...) {
         }
         return result;
     }

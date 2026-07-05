@@ -111,6 +111,11 @@ public:
 
     virtual const ArchiveFormatInfo& info() const = 0;
     virtual bool matches_path(const std::filesystem::path& path) const = 0;
+    // Must not throw: callers query capabilities to enable UI commands, and the
+    // path may name an archive that does not exist yet (about to be created) or
+    // an unreadable file. Implementations fall back to the format's static
+    // capabilities and leave archive-state flags (encrypted, locked, ...) at
+    // their defaults when the file cannot be probed.
     virtual ArchiveCapabilities capabilities(const std::filesystem::path& archive_path,
                                              const std::string& password = {}) const = 0;
     virtual std::vector<ArchiveEntry> list(const std::filesystem::path& archive_path,
