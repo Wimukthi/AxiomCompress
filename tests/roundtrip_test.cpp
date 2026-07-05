@@ -75,6 +75,14 @@ void expect_rans_roundtrip(const std::vector<std::uint8_t>& input) {
     AXIOM_CHECK(restored == input);
 }
 
+void expect_rans_order1_roundtrip(const std::vector<std::uint8_t>& input) {
+    const auto encoded = axiom::entropy::encode_rans_order1(input);
+    AXIOM_CHECK(encoded.has_value());
+
+    const auto restored = axiom::entropy::decode_rans_order1(*encoded, input.size());
+    AXIOM_CHECK(restored == input);
+}
+
 void expect_parallel_block_roundtrip(const std::vector<std::uint8_t>& input) {
     axiom::CompressionOptions options;
     options.block_size = 1024;
@@ -2370,6 +2378,7 @@ int main() {
     expect_huffman_roundtrip(bytes_from_string(repeated));
     expect_order1_roundtrip(bytes_from_string(repeated));
     expect_rans_roundtrip(bytes_from_string(repeated));
+    expect_rans_order1_roundtrip(bytes_from_string(repeated));
     expect_optimal_lz77_roundtrip(bytes_from_string(repeated));
     expect_lazy_lz77_roundtrip(bytes_from_string(repeated));
     expect_tree_lz77_roundtrip(bytes_from_string(repeated));
@@ -2390,6 +2399,7 @@ int main() {
     expect_huffman_roundtrip(binary);
     expect_order1_roundtrip(binary);
     expect_rans_roundtrip(binary);
+    expect_rans_order1_roundtrip(binary);
     expect_optimal_lz77_roundtrip(binary);
     expect_tree_lz77_roundtrip(binary);
     expect_split_stream_roundtrip(binary);
@@ -2420,6 +2430,10 @@ int main() {
     expect_roundtrip(random);
     expect_order1_roundtrip(random);
     expect_rans_roundtrip(random);
+    expect_rans_order1_roundtrip(random);
+    // Below the coder's minimum useful size it declines rather than encodes.
+    AXIOM_CHECK(!axiom::entropy::encode_rans_order1(
+        std::vector<std::uint8_t>(100, 0x41)).has_value());
     expect_tree_lz77_roundtrip(random);
     expect_tree_lz77_windowed_roundtrip(random, 512);
     expect_tree_lz77_windowed_roundtrip(bytes_from_string(rep_heavy), 300);

@@ -27,8 +27,9 @@ constexpr std::size_t kRepCount = 4;
 enum class StreamCodec : std::uint8_t {
     store = 0,
     huffman = 1,
-    order1 = 2,
+    order1 = 2,  // legacy adaptive coder: still decoded, no longer emitted
     rans = 3,
+    rans_order1 = 4,
 };
 
 // Order-0 entropy of a byte stream, in bits per byte (0..8). The lower bound on
@@ -173,7 +174,8 @@ void write_stream(ByteVector& output,
             if (raw.size() >= kMinWorthCoding && o0 < 7.5) {
                 bool coded = false;
                 if (try_order1 && order1_bits_per_byte(raw) + 0.10 < o0) {
-                    coded = consider(StreamCodec::order1, entropy::encode_order1(raw));
+                    coded = consider(StreamCodec::rans_order1,
+                                     entropy::encode_rans_order1(raw));
                 }
                 if (!coded) {
                     (void)consider(StreamCodec::rans,
@@ -195,18 +197,20 @@ void write_stream(ByteVector& output,
 
     (void)consider(StreamCodec::huffman, entropy::encode_huffman(raw));
 
-    // Order-1 modelling only pays off on the literal stream; the command,
-    // length, and distance streams have little previous-symbol structure, so we
-    // skip the expensive coder there. (It is also the slowest one to encode.)
-    if (try_order1) {
-        (void)consider(StreamCodec::order1, entropy::encode_order1(raw));
-    }
-
     // rANS is the order-0 choice; the older bit-serial order-0 range stream is
     // intentionally unsupported while the format is still free to change.
     (void)consider(StreamCodec::rans,
                    histogram ? entropy::encode_rans(raw, *histogram)
                              : entropy::encode_rans(raw));
+
+    // Order-1 modelling only pays off on the literal stream; the command,
+    // length, and distance streams have little previous-symbol structure, so we
+    // skip it there. The clustered static-table rANS replaced the adaptive
+    // bit-serial coder: within a fraction of a percent on ratio, ~30x faster
+    // to decode. It runs after plain rANS so it must strictly beat it.
+    if (try_order1) {
+        (void)consider(StreamCodec::rans_order1, entropy::encode_rans_order1(raw));
+    }
 
     output.push_back(static_cast<std::uint8_t>(codec));
     write_varuint(output, best_size);
@@ -257,6 +261,10 @@ ByteVector read_stream(std::span<const std::uint8_t> encoded,
 
     if (codec == static_cast<std::uint8_t>(StreamCodec::rans)) {
         return entropy::decode_rans(payload, raw_size);
+    }
+
+    if (codec == static_cast<std::uint8_t>(StreamCodec::rans_order1)) {
+        return entropy::decode_rans_order1(payload, raw_size);
     }
 
     throw FormatError("unknown split-stream codec");

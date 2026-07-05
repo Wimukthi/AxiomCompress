@@ -28,4 +28,14 @@ std::optional<ByteVector> encode_rans(
 ByteVector decode_rans(std::span<const std::uint8_t> encoded,
                        std::size_t max_output_size);
 
+// Static order-1 rANS: previous-byte contexts are clustered into a small set
+// of transmitted frequency tables (plus a 256-entry context map), keeping the
+// interleaved table-lookup decode of the order-0 coder while capturing most of
+// the order-1 modelling gain. Returns nullopt for inputs too small for the
+// per-context statistics to pay for the headers.
+std::optional<ByteVector> encode_rans_order1(std::span<const std::uint8_t> input);
+
+ByteVector decode_rans_order1(std::span<const std::uint8_t> encoded,
+                              std::size_t max_output_size);
+
 }  // namespace axiom::entropy
