@@ -232,11 +232,17 @@ inline void apply_compression_level(CompressionOptions& options, int level) {
         case 9:
             // Maximum preset keeps the deepest tree search and uses larger
             // blocks than level 8 so cross-block repetition can improve ratio.
+            // It is also the only preset that turns on the optimal parser:
+            // levels 7 and 8 land within a fraction of a percent of each other
+            // on mixed corpora, so the DP parse is what makes 9 the genuine
+            // max-ratio point (multi-block inputs run it per block on all
+            // workers).
             options.use_tree_matcher = true;
             options.max_chain_depth = 512;
             options.block_size = 64u << 20;
             options.window_size = 64u << 20;
             options.fast_entropy = false;
+            options.enable_optimal_parser = true;
             break;
     }
 }

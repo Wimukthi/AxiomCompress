@@ -232,6 +232,19 @@ ByteVector compress(std::span<const std::uint8_t> input,
     } else {
         auto parallel_options = options;
         parallel_options.block_size = codec::effective_parallel_block_size(input.size(), options);
+        if (options.enable_optimal_parser) {
+            // With the optimal parser on, per-block match windows dominate the
+            // ratio: thread-count auto-sizing can shrink blocks to 1 MiB, which
+            // throws away more ratio than idle workers cost wall time. Keep
+            // thorough blocks at least 4 MiB (bounded by the preset size).
+            constexpr std::size_t kMinThoroughBlock = std::size_t{4} << 20;
+            parallel_options.block_size =
+                std::max(parallel_options.block_size,
+                         std::min(kMinThoroughBlock, options.block_size));
+            // encode_parallel_blocks re-applies thread-count auto-sizing from
+            // its options; pin the chosen size so the floor survives.
+            parallel_options.auto_block_size_for_threads = false;
+        }
         const auto block_size = parallel_options.block_size;
         const auto block_count = (input.size() + block_size - 1) / block_size;
         const auto workers = codec::effective_thread_count(options.thread_count, block_count);
@@ -274,7 +287,18 @@ ByteVector compress(std::span<const std::uint8_t> input,
         }
 
         const auto evaluate_parallel_candidate = block_count > 1 && workers > 1;
-        const bool thorough = options.enable_optimal_parser;
+        // Whole-input serial analysis runs the greedy, tree, and optimal parses
+        // on one core (minutes on large inputs) while the parallel codec runs
+        // the same optimal parse per block on every worker and measures within
+        // a percent of it. So the serial candidates only run where their edge
+        // is real and affordable: single-block/single-worker encodes, and small
+        // inputs whose whole-input window meaningfully beats per-block windows.
+        // A single worker (--threads 1) still forces the full serial analysis.
+        constexpr std::size_t kSerialThoroughLimit = std::size_t{16} << 20;
+        const bool thorough = options.enable_optimal_parser &&
+                              (!evaluate_parallel_candidate ||
+                               (input.size() <= kSerialThoroughLimit &&
+                                input.size() <= options.optimal_parse_limit));
         std::future<ByteVector> block_future;
         if (evaluate_parallel_candidate && thorough) {
             block_future = std::async(std::launch::async, [&input, parallel_options] {
