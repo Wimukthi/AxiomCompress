@@ -1524,11 +1524,6 @@ void close_benchmark_dialog(BenchmarkDialogState* state) {
     save_named_window_placement(kBenchmarkLayoutName, state->hwnd);
     restore_dialog_owner(state->owner, state->owner_was_enabled);
     state->owner_was_enabled = false;
-    if (state->owner != nullptr && IsWindow(state->owner)) {
-        RedrawWindow(state->owner, nullptr, nullptr,
-                     RDW_INVALIDATE | RDW_ALLCHILDREN |
-                         RDW_UPDATENOW | RDW_NOERASE);
-    }
     if (state->hwnd != nullptr && IsWindow(state->hwnd)) {
         DestroyWindow(state->hwnd);
     }

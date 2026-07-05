@@ -443,9 +443,11 @@ LRESULT CALLBACK dark_combo_subclass_proc(HWND window, UINT message,
         case WM_MOUSEMOVE: {
             TRACKMOUSEEVENT tracking{sizeof(tracking), TME_LEAVE, window, 0};
             TrackMouseEvent(&tracking);
-            const LRESULT result = DefSubclassProc(window, message, wparam, lparam);
-            if (reference_data != 0) redraw_dark_combo_now(window);
-            return result;
+            if (reference_data != 0) {
+                draw_dark_combo_frame(window);
+                return 0;
+            }
+            break;
         }
         case WM_MOUSELEAVE:
         case WM_LBUTTONDOWN:
@@ -835,8 +837,9 @@ bool disable_dialog_owner(HWND owner) {
 void restore_dialog_owner(HWND owner, bool was_enabled) {
     if (!was_enabled || owner == nullptr || !IsWindow(owner)) return;
     EnableWindow(owner, TRUE);
-    SetActiveWindow(owner);
-    SetFocus(owner);
+    if (IsWindowVisible(owner)) {
+        SetActiveWindow(owner);
+    }
 }
 
 bool message_targets_window(HWND window, const MSG& message) {
