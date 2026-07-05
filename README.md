@@ -152,11 +152,13 @@ AXAR-only features such as archive comments, locking, recovery records, split
 volumes, signatures, SFX packaging, encrypted names, and Axiom metadata remain
 disabled when ZIP is selected.
 
-On Windows, Axiom also exposes a read-only system archive provider backed by the
-Windows `tar.exe`/libarchive tool. It is used for browsing, testing, and
-extracting common formats such as `.7z`, `.rar`, `.tar`, `.tar.gz`, `.tgz`,
-`.tar.xz`, `.txz`, `.tar.bz2`, `.tbz2`, `.tar.zst`, `.tzst`, `.iso`, and
-`.cab`. These formats never appear as Add-to-archive creation targets.
+On Windows, Axiom also exposes read-only archive providers for common formats.
+ISO browsing uses Axiom's native ISO9660/Joliet directory reader so large images
+display immediately; ISO extraction/test still use the bundled 7-Zip backend.
+The bundled 7-Zip backend also handles `.7z`, `.rar`, and `.cab`; Windows
+`tar.exe` handles `.tar`, `.tar.gz`, `.tgz`, `.tar.xz`, `.txz`, `.tar.bz2`,
+`.tbz2`, `.tar.zst`, and `.tzst`. These formats never appear as Add-to-archive
+creation targets.
 
 See [docs/FORMAT_SUPPORT.md](docs/FORMAT_SUPPORT.md) for the planned split
 between full read/write formats and view/extract-only formats.
@@ -435,8 +437,8 @@ installer\output\AxiomSetup-<version>-win-x64.exe
 ```
 
 GitHub releases also carry a portable zip asset named
-`Axiom-<version>-win-x64.zip` containing `Axiom.exe`, `axiomc.exe`, the license,
-and the user/developer docs.
+`Axiom-<version>-win-x64.zip` containing `Axiom.exe`, `axiomc.exe`, the bundled
+read-only archive backend, the license, and the user/developer docs.
 
 Details: [docs/INSTALLER.md](docs/INSTALLER.md).
 
@@ -446,9 +448,12 @@ AxiomCompress is licensed under the GNU General Public License version 3. See
 [LICENSE](LICENSE).
 
 Vendored third-party components keep their license notices under
-`src/third_party`. Current third-party components include:
+`src/third_party`, `third_party`, and the installed `backends` folder. Current
+third-party components include:
 
 - miniz 3.1.1 for ZIP read/write support, under the MIT license.
+- 7-Zip console backend for read-only 7z/RAR/ISO/CAB support, under LGPL/BSD
+  terms with the upstream unRAR restriction for some RAR code.
 - Monocypher for cryptographic primitives, under the BSD 2-Clause license.
 - BLAKE3 for hashing and integrity primitives, under CC0/Apache-2.0 licensing.
 - A generated subset of Microsoft Fluent UI System Icons for the native GUI,

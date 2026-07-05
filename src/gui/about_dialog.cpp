@@ -218,6 +218,7 @@ LRESULT CALLBACK about_dialog_proc(HWND hwnd, UINT message, WPARAM wparam, LPARA
             state->third_party = CreateWindowExW(
                 0, L"STATIC",
                 L"miniz - ZIP read/write support - MIT license\r\n"
+                L"7-Zip - read-only archive backend - LGPL/BSD/unRAR restriction\r\n"
                 L"Monocypher - cryptographic primitives - BSD 2-Clause license\r\n"
                 L"BLAKE3 - hashing/integrity primitives - CC0/Apache-2.0 license\r\n"
                 L"Fluent UI System Icons - toolbar and dialog icons - MIT license",

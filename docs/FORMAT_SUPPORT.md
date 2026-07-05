@@ -10,11 +10,11 @@ commands that are safe for that format.
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---|
 | AXAR | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Estimated | Native format with encryption, recovery records, split volumes, comments, locking, signatures, metadata, links, and SFX packaging. |
 | ZIP | Yes | Yes | Yes | Yes | Yes, plaintext only | Yes, plaintext only | Yes, plaintext only | Yes | Stored/Deflate ZIP archives. New encrypted ZIPs use WinZip AES-256 file-data encryption. ZIP edits are atomic rewrites. |
-| 7z | Windows | Windows | Windows | No | No | No | No | No | Read-only system provider backed by Windows `tar.exe`/libarchive. Compatibility depends on the OS tool. |
-| RAR/RAR5 | Windows | Windows | Windows | No | No | No | No | No | Read-only system provider. RAR creation is intentionally unsupported. |
+| 7z | Windows | Windows | Windows | No | No | No | No | Yes | Read-only bundled 7-Zip backend. Encrypted 7z archives prompt for a password. |
+| RAR/RAR5 | Windows | Windows | Windows | No | No | No | No | Yes | Read-only bundled 7-Zip backend. RAR creation is intentionally unsupported. |
 | TAR family | Windows | Windows | Windows | No | No | No | No | No | Covers `.tar`, `.tar.gz`, `.tgz`, `.tar.xz`, `.txz`, `.tar.bz2`, `.tbz2`, `.tar.zst`, and `.tzst` when supported by Windows `tar.exe`. |
-| ISO | Windows | Windows | Windows | No | No | No | No | No | Read-only ISO image browsing/extraction through the system provider. |
-| CAB | Windows | Windows | Windows | No | No | No | No | No | Read-only CAB browsing/extraction through the system provider. |
+| ISO | Windows | Windows | Windows | No | No | No | No | Partial | Native ISO9660/Joliet listing for fast browsing; bundled 7-Zip handles extraction/test and fallback cases. |
+| CAB | Windows | Windows | Windows | No | No | No | No | Partial | Read-only bundled 7-Zip backend. |
 
 ZIP stores exact compressed sizes per central-directory entry. AXAR uses solid
 blocks, so per-file Packed values are proportional estimates and the GUI marks
@@ -25,11 +25,13 @@ does not expose AXAR-only services: archive comments, locking, recovery records,
 split volumes, signatures, SFX packaging, encrypted names, and Axiom metadata
 remain disabled when ZIP is selected.
 
-The Windows system provider is intentionally read-only. It uses signature checks
-where possible, falls back to extensions for wrapped/compressed TAR names, and
-routes extraction through a temporary staging directory before copying files into
-the requested destination. It does not currently provide archive passwords,
-comments, packed sizes, write operations, or fine-grained byte progress.
+The Windows system provider is intentionally read-only. It uses a bundled 7-Zip
+console backend for 7z, RAR/RAR5, ISO, and CAB, and Windows `tar.exe` for TAR
+families. It uses signature checks where possible, falls back to extensions for
+wrapped/compressed TAR names, and routes extraction through a temporary staging
+directory before copying files into the requested destination. It does not
+provide comments, write operations, or fine-grained byte progress for these
+read-only formats.
 
 ## Full-support targets
 
@@ -76,10 +78,10 @@ taking in the first pass.
 
 | Format | First scope | Reason |
 |---|---|---|
-| 7z | Browse, extract, test | Implemented on Windows through the system provider; direct SDK integration can improve password/progress support later. |
-| RAR | Browse, extract, test | Implemented on Windows through the system provider; creation remains proprietary and unsupported. |
-| ISO | Browse, extract/test | Implemented on Windows through the system provider. Creation is a separate authoring workflow. |
-| CAB | Browse, extract/test | Implemented on Windows through the system provider. |
+| 7z | Browse, extract, test | Implemented on Windows through the bundled 7-Zip backend. |
+| RAR | Browse, extract, test | Implemented on Windows through the bundled 7-Zip backend; creation remains proprietary and unsupported. |
+| ISO | Browse, extract/test | Browsing uses Axiom's native ISO9660/Joliet reader for immediate directory display. Extraction/test use the bundled 7-Zip backend. Creation is a separate authoring workflow. |
+| CAB | Browse, extract/test | Implemented on Windows through the bundled 7-Zip backend. |
 | GZip/BZip2/XZ single streams | Extract/test, optional create | These are compressed streams, not multi-file archives. Surface them as single-file operations or as TAR codecs. |
 
 ## GUI behavior

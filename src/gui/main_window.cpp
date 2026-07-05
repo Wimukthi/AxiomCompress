@@ -126,6 +126,7 @@ enum ControlId : int {
     kCopyCrc32 = 1135,
     kAddFavorite = 1136,
     kRemoveFavorite = 1137,
+    kToggleTreePane = 1138,
     kTreeOpen = 1140,
     kTreeRefresh = 1141,
     kTreeExpand = 1142,
@@ -3588,6 +3589,7 @@ public:
         startup_command_ = std::move(startup_command);
         persisted_settings_ = axiom::gui::load_gui_settings();
         application_options_ = persisted_settings_.application;
+        tree_pane_visible_ = persisted_settings_.tree_pane_visible;
         configure_dialog_appearance(application_options_);
         recent_addresses_ = persisted_settings_.recent_locations;
         recent_archives_ = persisted_settings_.recent_archives;
@@ -3958,17 +3960,6 @@ private:
         }
     }
 
-    bool archive_directory_has_tree_children(const fs::path& archive,
-                                             const std::string& directory) {
-        auto catalog = tree_archive_catalog(archive);
-        if (!catalog) return true;
-        const auto snapshot = catalog->list(axiom::gui::BrowserLocation::archive(archive, directory),
-                                            std::stop_token{});
-        return std::any_of(snapshot.items.begin(), snapshot.items.end(), [](const auto& item) {
-            return item.kind == axiom::gui::BrowserItemKind::directory;
-        });
-    }
-
     void populate_tree_archive_children(DirectoryTreeItem& item, const fs::path& archive,
                                         const std::string& directory) {
         auto catalog = tree_archive_catalog(archive);
@@ -3989,9 +3980,12 @@ private:
             node.kind = DirectoryTreeNodeKind::archive_directory;
             node.archive_path = archive;
             node.archive_directory = child.archive_path;
+            // Keep archive trees lazy. Large ISO/7z/RAR images can contain thousands of
+            // entries; probing every sibling directory here rescans the full catalog for
+            // each child and can make the GUI look like it crashed while opening.
             insert_tree_item(&item, child.name, std::move(node),
                              tree_icon_for_filesystem(L"folder"),
-                             archive_directory_has_tree_children(archive, child.archive_path));
+                             true);
         }
     }
 
@@ -4126,8 +4120,7 @@ private:
                 node.archive_directory = current_directory;
                 child = insert_tree_item(current, widen(part), std::move(node),
                                          tree_icon_for_filesystem(L"folder"),
-                                         archive_directory_has_tree_children(archive,
-                                                                             current_directory));
+                                         true);
             }
             current = child;
             if (end == std::string::npos) break;
@@ -4392,7 +4385,12 @@ private:
                      !busy_ && has_archive && capabilities.sfx},
                 };
             case kMenuOptions:
-                return {{kSettings, L"&Settings...", L"", !busy_}};
+                return {
+                    {kToggleTreePane, L"Show &tree pane", L"", true, false,
+                     tree_pane_visible_},
+                    {0, L"", L"", false, true},
+                    {kSettings, L"&Settings...", L"", !busy_},
+                };
             case kMenuHelp:
                 return {
                     {kCheckUpdates, L"Check for &Updates...", L""},
@@ -4727,6 +4725,24 @@ private:
         const int content_height = std::max(
             scale(80), static_cast<int>(client.bottom) - y - bottom_height - margin);
         const int content_width = std::max(0, width - 2 * margin);
+        const RECT previous_splitter = tree_splitter_rect_;
+        if (!tree_pane_visible_) {
+            tree_splitter_rect_ = {};
+            if (tree_view_.hwnd() != nullptr) {
+                ShowWindow(tree_view_.hwnd(), SW_HIDE);
+            }
+            MoveWindow(list_, margin, y, content_width, content_height, FALSE);
+            if (invalidate_splitter_only) {
+                RECT dirty = previous_splitter;
+                InflateRect(&dirty, scale(2), 0);
+                InvalidateRect(hwnd_, &dirty, FALSE);
+            }
+            return;
+        }
+
+        if (tree_view_.hwnd() != nullptr) {
+            ShowWindow(tree_view_.hwnd(), SW_SHOW);
+        }
         if (tree_width_ <= 0) tree_width_ = scale(250);
         const int maximum_tree_width = std::max(
             minimum_tree_width,
@@ -4736,7 +4752,6 @@ private:
             tree_width_ = std::max(0, content_width / 3);
         }
 
-        const RECT previous_splitter = tree_splitter_rect_;
         const int tree_x = margin;
         const int tree_w = std::clamp(tree_width_, 0, content_width);
         tree_splitter_rect_ = {
@@ -4765,7 +4780,7 @@ private:
     }
 
     void repaint_browser_panes_now() const {
-        if (tree_view_.hwnd() != nullptr) {
+        if (tree_pane_visible_ && tree_view_.hwnd() != nullptr) {
             RedrawWindow(tree_view_.hwnd(), nullptr, nullptr,
                          RDW_INVALIDATE | RDW_NOERASE | RDW_UPDATENOW);
         }
@@ -4848,10 +4863,25 @@ private:
         EnableWindow(open_archive_, !busy);
         EnableWindow(extract_, !busy);
         EnableWindow(test_, !busy);
-        EnableWindow(tree_view_.hwnd(), !busy);
+        EnableWindow(tree_view_.hwnd(), !busy && tree_pane_visible_);
         EnableWindow(delete_, !busy);
         EnableWindow(settings_, !busy);
         operation_paused_ = false;
+    }
+
+    void toggle_tree_pane() {
+        tree_pane_visible_ = !tree_pane_visible_;
+        if (!tree_pane_visible_ && dragging_tree_splitter_) {
+            dragging_tree_splitter_ = false;
+            if (GetCapture() == hwnd_) ReleaseCapture();
+        }
+        if (!tree_pane_visible_ && GetFocus() == tree_view_.hwnd() && list_ != nullptr) {
+            SetFocus(list_);
+        }
+        EnableWindow(tree_view_.hwnd(), !busy_ && tree_pane_visible_);
+        layout();
+        repaint_browser_panes_now();
+        save_current_settings();
     }
 
     int selected_level() const {
@@ -7633,6 +7663,7 @@ private:
                                                           ? USER_DEFAULT_SCREEN_DPI
                                                           : dpi_))
                             : 0;
+        persisted_settings_.tree_pane_visible = tree_pane_visible_;
         persisted_settings_.column_widths = table_.logical_column_widths();
         persisted_settings_.recent_locations = recent_addresses_;
         persisted_settings_.recent_archives = recent_archives_;
@@ -8389,7 +8420,8 @@ private:
                 }
                 break;
             case WM_CONTEXTMENU:
-                if (reinterpret_cast<HWND>(wparam) == tree_view_.hwnd()) {
+                if (tree_pane_visible_ &&
+                    reinterpret_cast<HWND>(wparam) == tree_view_.hwnd()) {
                     show_tree_context_menu({GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)});
                     return 0;
                 }
@@ -8401,7 +8433,7 @@ private:
                 break;
             case WM_LBUTTONDOWN: {
                 const POINT point{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
-                if (PtInRect(&tree_splitter_rect_, point)) {
+                if (tree_pane_visible_ && PtInRect(&tree_splitter_rect_, point)) {
                     dragging_tree_splitter_ = true;
                     tree_splitter_start_x_ = point.x;
                     tree_width_start_ = tree_width_;
@@ -8438,7 +8470,7 @@ private:
                     SetCursor(LoadCursorW(nullptr, IDC_SIZEWE));
                     return 0;
                 }
-                if (PtInRect(&tree_splitter_rect_, point)) {
+                if (tree_pane_visible_ && PtInRect(&tree_splitter_rect_, point)) {
                     SetCursor(LoadCursorW(nullptr, IDC_SIZEWE));
                     return 0;
                 }
@@ -8459,7 +8491,8 @@ private:
                     POINT point{};
                     GetCursorPos(&point);
                     ScreenToClient(hwnd_, &point);
-                    if (PtInRect(&tree_splitter_rect_, point) || dragging_tree_splitter_) {
+                    if ((tree_pane_visible_ && PtInRect(&tree_splitter_rect_, point)) ||
+                        dragging_tree_splitter_) {
                         SetCursor(LoadCursorW(nullptr, IDC_SIZEWE));
                         return TRUE;
                     }
@@ -8498,6 +8531,7 @@ private:
                     case kCopyCrc32: on_copy_crc32(); return 0;
                     case kAddFavorite: add_favorite_location(current_location_value()); return 0;
                     case kRemoveFavorite: remove_favorite_location(current_location_value()); return 0;
+                    case kToggleTreePane: toggle_tree_pane(); return 0;
                     case kUpdateArchive:
                         on_update_archive(axiom::gui::ArchiveUpdateMode::update_newer);
                         return 0;
@@ -8655,6 +8689,7 @@ private:
     std::vector<HWND> transient_labels_;
     int tree_width_ = 0;
     RECT tree_splitter_rect_{};
+    bool tree_pane_visible_ = true;
     bool dragging_tree_splitter_ = false;
     int tree_splitter_start_x_ = 0;
     int tree_width_start_ = 0;

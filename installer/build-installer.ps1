@@ -102,6 +102,23 @@ function Invoke-CheckedProcess {
     }
 }
 
+function Copy-BundledBackends {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Configuration
+    )
+
+    $backendSource = Join-Path $script:RepoRoot "third_party\7zip\win-x64"
+    if (-not (Test-Path -LiteralPath $backendSource)) {
+        throw "Bundled 7-Zip backend was not found: $backendSource"
+    }
+    $backendDest = Join-Path $script:RepoRoot "out\$Configuration\backends\7zip"
+    New-Item -ItemType Directory -Force -Path $backendDest | Out-Null
+    foreach ($name in @("7z.exe", "7z.dll", "License.txt", "readme.txt")) {
+        Copy-Item -LiteralPath (Join-Path $backendSource $name) -Destination $backendDest -Force
+    }
+}
+
 if ([string]::IsNullOrWhiteSpace($OutputDir)) {
     $OutputDir = Join-Path $script:RepoRoot "installer\output"
 }
@@ -122,6 +139,8 @@ if (-not $SkipBuild) {
         "/m"
     )
 }
+
+Copy-BundledBackends -Configuration $Configuration
 
 if (-not $SkipTests) {
     if (-not (Test-Path -LiteralPath $testExe)) {

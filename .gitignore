@@ -11,6 +11,8 @@ out/
 *.ilk
 *.exe
 *.dll
+!third_party/7zip/win-x64/7z.exe
+!third_party/7zip/win-x64/7z.dll
 *.lib
 *.a
 *.so

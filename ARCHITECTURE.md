@@ -95,10 +95,9 @@ providers are:
   Existing encrypted ZIPs can be listed, tested, and extracted with a password,
   but are not edited in place yet. Existing unchanged plaintext entries are
   preserved by cloning them into an atomically rewritten ZIP.
-- `system-readonly`: a Windows-only read-only provider backed by the OS
-  `tar.exe`/libarchive tool. It handles browse/test/extract for 7z, RAR, TAR
-  family archives, ISO images, and CAB archives when the Windows tool supports
-  that specific file. It never advertises create, update, delete, or move.
+- `system-readonly`: a Windows-only read-only provider. It uses Axiom's bundled
+  7-Zip console backend for 7z, RAR/RAR5, ISO, and CAB, and Windows `tar.exe`
+  for TAR-family archives. It never advertises create, update, delete, or move.
 
 The GUI asks the provider for:
 
@@ -126,10 +125,13 @@ The intended support split is:
 - AXAR and ZIP are the only creation targets in the GUI. The Add-to-archive
   dialog filters out read-only providers even though the Open dialog can browse
   them;
-- 7z/RAR/TAR/ISO/CAB-style support currently starts as view/extract/test via the
-  Windows system provider. A future direct libarchive or 7-Zip SDK backend can
-  replace that implementation behind the same provider interface if better
-  progress reporting, password handling, or compatibility is needed.
+- 7z/RAR/CAB support is view/extract/test through the bundled 7-Zip backend.
+  ISO browsing uses a native ISO9660/Joliet directory reader for immediate
+  display; ISO extraction/test still use the bundled 7-Zip backend.
+  TAR-family support remains view/extract/test through Windows `tar.exe`. A
+  future direct libarchive or 7-Zip SDK backend can replace either
+  implementation behind the same provider interface if better progress reporting
+  or sandboxing is needed.
 
 For ZIP specifically, Axiom currently vendors miniz 3.1.1 because it provides a
 small, build-system-friendly ZIP container reader/writer and Deflate/Inflate

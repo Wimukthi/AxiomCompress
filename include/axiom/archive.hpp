@@ -25,7 +25,8 @@ struct ArchiveEntry {
     std::optional<std::uint64_t> packed_size;  // compressed bytes when the format exposes it
     bool packed_size_estimated = false;  // true for proportional solid-block estimates
     std::int64_t mtime = 0;      // seconds since Unix epoch
-    std::uint32_t crc32 = 0;     // CRC-32 of file bytes (0 for directories/links)
+    std::uint32_t crc32 = 0;     // CRC-32 of file bytes when has_crc32 is true
+    bool has_crc32 = false;      // false when the format/provider does not expose CRC-32
     bool has_blake3 = false;     // whether blake3 below is populated
     std::array<std::uint8_t, 32> blake3{};  // BLAKE3-256 of file bytes
 };

@@ -74,6 +74,7 @@ Recommended contents:
 
 - `Axiom.exe`.
 - `axiomc.exe`.
+- `backends\7zip\` for bundled read-only 7z/RAR/ISO/CAB support.
 - `README.md`.
 - `CLI_GUIDE.md`.
 - `ARCHITECTURE.md`.

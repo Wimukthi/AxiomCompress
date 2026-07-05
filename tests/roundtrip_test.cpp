@@ -34,6 +34,7 @@
 #include <iostream>
 #include <iterator>
 #include <memory>
+#include <optional>
 #include <random>
 #include <string>
 #include <vector>
@@ -661,6 +662,33 @@ bool windows_tar_available() {
     return std::system("tar --version >nul 2>nul") == 0;
 }
 
+std::string quote_for_command(const fs::path& path) {
+    std::string text = path.string();
+    std::string quoted = "\"";
+    for (char ch : text) {
+        if (ch == '"') quoted += "\\\"";
+        else quoted.push_back(ch);
+    }
+    quoted.push_back('"');
+    return quoted;
+}
+
+std::optional<fs::path> bundled_7z_for_tests() {
+    std::vector<fs::path> roots;
+    roots.push_back(fs::current_path());
+    roots.push_back(fs::current_path().parent_path());
+    roots.push_back(fs::current_path() / "out" / "Release");
+    roots.push_back(fs::current_path() / "out" / "Debug");
+    for (const auto& root : roots) {
+        const fs::path bundled = root / "third_party" / "7zip" / "win-x64" / "7z.exe";
+        std::error_code ec;
+        if (fs::exists(bundled, ec)) return bundled;
+        const fs::path staged = root / "backends" / "7zip" / "7z.exe";
+        if (fs::exists(staged, ec)) return staged;
+    }
+    return std::nullopt;
+}
+
 void test_unicode_path_archive_probe() {
     const auto root = make_temp_dir();
     const auto unicode_file = root / L"\u0dc3\u0dd2\u0d82\u0dc4\u0dbd-not-archive.txt";
@@ -674,6 +702,143 @@ void test_unicode_path_archive_probe() {
         threw = true;
     }
     AXIOM_CHECK(!threw);
+
+    std::error_code ec;
+    fs::remove_all(root, ec);
+}
+
+void test_write_be16(std::vector<std::uint8_t>& bytes, std::size_t offset,
+                     std::uint16_t value) {
+    AXIOM_CHECK(offset + 2 <= bytes.size());
+    bytes[offset] = static_cast<std::uint8_t>(value >> 8);
+    bytes[offset + 1] = static_cast<std::uint8_t>(value);
+}
+
+void test_write_be32(std::vector<std::uint8_t>& bytes, std::size_t offset,
+                     std::uint32_t value) {
+    AXIOM_CHECK(offset + 4 <= bytes.size());
+    bytes[offset] = static_cast<std::uint8_t>(value >> 24);
+    bytes[offset + 1] = static_cast<std::uint8_t>(value >> 16);
+    bytes[offset + 2] = static_cast<std::uint8_t>(value >> 8);
+    bytes[offset + 3] = static_cast<std::uint8_t>(value);
+}
+
+std::vector<std::uint8_t> make_iso_directory_record(std::string name,
+                                                    std::uint32_t extent,
+                                                    std::uint32_t size,
+                                                    bool directory) {
+    std::size_t record_size = 33 + name.size();
+    if ((record_size & 1u) != 0) ++record_size;
+    std::vector<std::uint8_t> record(record_size);
+    record[0] = static_cast<std::uint8_t>(record_size);
+    test_write_le32(record, 2, extent);
+    test_write_be32(record, 6, extent);
+    test_write_le32(record, 10, size);
+    test_write_be32(record, 14, size);
+    record[18] = 126;  // 2026
+    record[19] = 7;
+    record[20] = 5;
+    record[21] = 10;
+    record[22] = 30;
+    record[23] = 0;
+    record[24] = 0;
+    record[25] = directory ? 0x02 : 0x00;
+    test_write_le16(record, 28, 1);
+    test_write_be16(record, 30, 1);
+    record[32] = static_cast<std::uint8_t>(name.size());
+    std::copy(name.begin(), name.end(), record.begin() + 33);
+    return record;
+}
+
+void put_iso_record(std::vector<std::uint8_t>& image,
+                    std::size_t sector,
+                    std::size_t& cursor,
+                    const std::vector<std::uint8_t>& record) {
+    constexpr std::size_t kSectorSize = 2048;
+    const std::size_t offset = sector * kSectorSize + cursor;
+    AXIOM_CHECK(offset + record.size() <= image.size());
+    std::copy(record.begin(), record.end(), image.begin() + static_cast<std::ptrdiff_t>(offset));
+    cursor += record.size();
+}
+
+void test_iso_native_listing_provider_layer() {
+    constexpr std::size_t kSectorSize = 2048;
+    constexpr std::uint32_t kRootSector = 18;
+    constexpr std::uint32_t kFolderSector = 19;
+    constexpr std::uint32_t kHelloSector = 20;
+    constexpr std::uint32_t kNestedSector = 21;
+
+    std::vector<std::uint8_t> image(22 * kSectorSize);
+    const auto root_record =
+        make_iso_directory_record(std::string(1, '\0'), kRootSector,
+                                  static_cast<std::uint32_t>(kSectorSize), true);
+
+    const std::size_t primary_offset = 16 * kSectorSize;
+    image[primary_offset] = 1;
+    std::memcpy(image.data() + primary_offset + 1, "CD001", 5);
+    image[primary_offset + 6] = 1;
+    std::copy(root_record.begin(), root_record.end(),
+              image.begin() + static_cast<std::ptrdiff_t>(primary_offset + 156));
+
+    const std::size_t terminator_offset = 17 * kSectorSize;
+    image[terminator_offset] = 255;
+    std::memcpy(image.data() + terminator_offset + 1, "CD001", 5);
+    image[terminator_offset + 6] = 1;
+
+    std::size_t cursor = 0;
+    put_iso_record(image, kRootSector, cursor, root_record);
+    put_iso_record(image, kRootSector, cursor,
+                   make_iso_directory_record(std::string(1, '\1'), kRootSector,
+                                             static_cast<std::uint32_t>(kSectorSize), true));
+    put_iso_record(image, kRootSector, cursor,
+                   make_iso_directory_record("HELLO.TXT;1", kHelloSector, 5, false));
+    put_iso_record(image, kRootSector, cursor,
+                   make_iso_directory_record("FOLDER", kFolderSector,
+                                             static_cast<std::uint32_t>(kSectorSize), true));
+
+    cursor = 0;
+    put_iso_record(image, kFolderSector, cursor,
+                   make_iso_directory_record(std::string(1, '\0'), kFolderSector,
+                                             static_cast<std::uint32_t>(kSectorSize), true));
+    put_iso_record(image, kFolderSector, cursor,
+                   make_iso_directory_record(std::string(1, '\1'), kRootSector,
+                                             static_cast<std::uint32_t>(kSectorSize), true));
+    put_iso_record(image, kFolderSector, cursor,
+                   make_iso_directory_record("NESTED.BIN;1", kNestedSector, 4, false));
+    std::memcpy(image.data() + kHelloSector * kSectorSize, "hello", 5);
+    std::memcpy(image.data() + kNestedSector * kSectorSize, "data", 4);
+
+    const auto root = make_temp_dir();
+    const auto archive = root / "disc-image.without_iso_extension";
+    write_all(archive, image);
+
+    const auto* provider = axiom::archive_provider_for_path(archive);
+    AXIOM_CHECK(provider != nullptr);
+    AXIOM_CHECK(provider->info().format == axiom::ArchiveFormat::iso);
+
+    const auto capabilities = provider->capabilities(archive);
+    AXIOM_CHECK(capabilities.list);
+    AXIOM_CHECK(capabilities.packed_sizes);
+
+    const auto entries = provider->list(archive);
+    AXIOM_CHECK(entries.size() == 3);
+    const auto hello = std::find_if(entries.begin(), entries.end(),
+        [](const axiom::ArchiveEntry& entry) {
+            return entry.path == "HELLO.TXT" && !entry.is_directory;
+        });
+    AXIOM_CHECK(hello != entries.end());
+    AXIOM_CHECK(hello->size == 5);
+    AXIOM_CHECK(hello->packed_size.has_value() && *hello->packed_size == 5);
+    AXIOM_CHECK(!hello->has_crc32);
+    AXIOM_CHECK(std::any_of(entries.begin(), entries.end(),
+        [](const axiom::ArchiveEntry& entry) {
+            return entry.path == "FOLDER" && entry.is_directory;
+        }));
+    AXIOM_CHECK(std::any_of(entries.begin(), entries.end(),
+        [](const axiom::ArchiveEntry& entry) {
+            return entry.path == "FOLDER/NESTED.BIN" && !entry.is_directory &&
+                   entry.size == 4;
+        }));
 
     std::error_code ec;
     fs::remove_all(root, ec);
@@ -731,6 +896,69 @@ void test_system_archive_provider_layer() {
     AXIOM_CHECK(read_all(full / "folder" / "hello.txt") ==
                 bytes_from_string("system archive provider payload"));
     AXIOM_CHECK(read_all(full / "top.txt") == bytes_from_string("top-level payload"));
+
+    std::error_code ec;
+    fs::remove_all(root, ec);
+}
+
+void test_bundled_7z_provider_layer() {
+    const auto seven_zip = bundled_7z_for_tests();
+    if (!seven_zip) {
+        return;
+    }
+
+    const auto root = make_temp_dir();
+    const auto source = root / "source";
+    fs::create_directories(source / "folder");
+    const auto alpha = bytes_from_string("encrypted 7z alpha payload");
+    const auto beta = bytes_from_string("encrypted 7z beta payload");
+    write_all(source / "alpha.txt", alpha);
+    write_all(source / "folder" / "beta.txt", beta);
+
+    const auto archive = root / "encrypted.not7z";
+    const std::string command =
+        "cd /d " + quote_for_command(source) + " && " +
+        quote_for_command(*seven_zip) +
+        " a -t7z -psecret -mhe=on " + quote_for_command(archive) +
+        " alpha.txt folder\\beta.txt >nul";
+    AXIOM_CHECK(std::system(command.c_str()) == 0);
+
+    const auto* provider = axiom::archive_provider_for_path(archive);
+    AXIOM_CHECK(provider != nullptr);
+    AXIOM_CHECK(provider->info().format == axiom::ArchiveFormat::seven_z);
+
+    const auto locked = provider->capabilities(archive);
+    AXIOM_CHECK(locked.encryption);
+    AXIOM_CHECK(locked.encrypted);
+    AXIOM_CHECK(locked.directory_encrypted);
+
+    const auto unlocked = provider->capabilities(archive, "secret");
+    AXIOM_CHECK(unlocked.list);
+    AXIOM_CHECK(unlocked.extract);
+    AXIOM_CHECK(unlocked.test);
+    AXIOM_CHECK(unlocked.selective_extract);
+    AXIOM_CHECK(unlocked.packed_sizes);
+    AXIOM_CHECK(unlocked.encrypted);
+
+    const auto entries = provider->list(archive, "secret");
+    const auto alpha_it = std::find_if(entries.begin(), entries.end(),
+        [&](const axiom::ArchiveEntry& entry) {
+            return entry.path == "alpha.txt";
+        });
+    AXIOM_CHECK(alpha_it != entries.end());
+    AXIOM_CHECK(alpha_it->has_crc32);
+    AXIOM_CHECK(alpha_it->crc32 == axiom::core::crc32(alpha));
+
+    axiom::DecompressionOptions test_options;
+    test_options.password = "secret";
+    provider->test(archive, test_options);
+
+    axiom::ExtractOptions extract_options;
+    extract_options.password = "secret";
+    const auto selected = root / "selected";
+    provider->extract_selected(archive, {"alpha.txt"}, selected, extract_options);
+    AXIOM_CHECK(read_all(selected / "alpha.txt") == alpha);
+    AXIOM_CHECK(!fs::exists(selected / "folder" / "beta.txt"));
 
     std::error_code ec;
     fs::remove_all(root, ec);
@@ -2236,7 +2464,9 @@ int main() {
     test_zip_provider_layer();
 #if defined(_WIN32)
     test_unicode_path_archive_probe();
+    test_iso_native_listing_provider_layer();
     test_system_archive_provider_layer();
+    test_bundled_7z_provider_layer();
 #endif
     test_zip_aes256_encryption();
     test_zip_aes_data_descriptor_compatibility();

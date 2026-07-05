@@ -19,6 +19,7 @@ struct PersistedGuiSettings {
     int sort_column = 0;
     bool sort_ascending = true;
     int tree_width = 0;
+    bool tree_pane_visible = true;
     std::vector<int> column_widths;
     std::vector<std::wstring> recent_locations;
     std::vector<std::wstring> recent_archives;

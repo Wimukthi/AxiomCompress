@@ -9,16 +9,20 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cstdio>
 #include <cstdint>
+#include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <initializer_list>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <unordered_set>
 #include <vector>
 
 namespace axiom {
@@ -299,19 +303,67 @@ std::wstring command_line_for(const fs::path& executable,
     return command;
 }
 
+std::optional<fs::path> path_if_exists(const fs::path& path) {
+    std::error_code ec;
+    if (fs::exists(path, ec) && !fs::is_directory(path, ec)) return path;
+    return std::nullopt;
+}
+
+std::optional<fs::path> find_on_path(std::wstring_view executable_name) {
+    wchar_t found[MAX_PATH]{};
+    if (SearchPathW(nullptr, std::wstring(executable_name).c_str(), nullptr,
+                    MAX_PATH, found, nullptr) > 0) {
+        return fs::path(found);
+    }
+    return std::nullopt;
+}
+
+fs::path current_executable_directory() {
+    std::vector<wchar_t> buffer(MAX_PATH);
+    for (;;) {
+        const DWORD length = GetModuleFileNameW(nullptr, buffer.data(),
+                                                static_cast<DWORD>(buffer.size()));
+        if (length == 0) return {};
+        if (length < buffer.size() - 1) {
+            return fs::path(std::wstring(buffer.data(), buffer.data() + length)).parent_path();
+        }
+        buffer.resize(buffer.size() * 2);
+    }
+}
+
 std::optional<fs::path> system_tar_executable() {
     wchar_t system_dir[MAX_PATH]{};
     const UINT length = GetSystemDirectoryW(system_dir, MAX_PATH);
     if (length != 0 && length < MAX_PATH) {
-        fs::path candidate = fs::path(system_dir) / L"tar.exe";
-        std::error_code ec;
-        if (fs::exists(candidate, ec)) return candidate;
+        if (auto candidate = path_if_exists(fs::path(system_dir) / L"tar.exe")) {
+            return candidate;
+        }
     }
-    wchar_t found[MAX_PATH]{};
-    if (SearchPathW(nullptr, L"tar.exe", nullptr, MAX_PATH, found, nullptr) > 0) {
-        return fs::path(found);
-    }
-    return std::nullopt;
+    return find_on_path(L"tar.exe");
+}
+
+std::optional<fs::path> system_7z_executable() {
+    static const std::optional<fs::path> cached = []() -> std::optional<fs::path> {
+        const fs::path exe_dir = current_executable_directory();
+        if (!exe_dir.empty()) {
+            for (const auto& root : {exe_dir, exe_dir.parent_path()}) {
+                if (auto bundled = path_if_exists(root / L"backends" / L"7zip" / L"7z.exe")) {
+                    return bundled;
+                }
+            }
+        }
+
+        const fs::path cwd = fs::current_path();
+        for (const auto& root : {cwd, cwd.parent_path()}) {
+            if (auto bundled = path_if_exists(root / L"third_party" / L"7zip" /
+                                              L"win-x64" / L"7z.exe")) {
+                return bundled;
+            }
+        }
+
+        return std::nullopt;
+    }();
+    return cached;
 }
 
 struct ProcessResult {
@@ -319,14 +371,11 @@ struct ProcessResult {
     std::string output;
 };
 
-ProcessResult run_tar(const std::vector<std::wstring>& arguments,
-                      bool capture_stdout,
-                      const std::shared_ptr<OperationControl>& operation) {
-    const auto executable = system_tar_executable();
-    if (!executable) {
-        throw std::runtime_error("Windows tar.exe was not found; system archive reader is unavailable");
-    }
-
+ProcessResult run_process(const fs::path& executable,
+                          const std::vector<std::wstring>& arguments,
+                          bool capture_stdout,
+                          const std::shared_ptr<OperationControl>& operation,
+                          std::string_view tool_name) {
     SECURITY_ATTRIBUTES security{};
     security.nLength = sizeof(security);
     security.bInheritHandle = TRUE;
@@ -338,6 +387,15 @@ ProcessResult run_tar(const std::vector<std::wstring>& arguments,
     }
     SetHandleInformation(read_pipe, HANDLE_FLAG_INHERIT, 0);
 
+    HANDLE null_input = CreateFileW(L"NUL", GENERIC_READ,
+                                    FILE_SHARE_READ | FILE_SHARE_WRITE, &security,
+                                    OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (null_input == INVALID_HANDLE_VALUE) {
+        CloseHandle(read_pipe);
+        CloseHandle(write_pipe);
+        throw std::runtime_error("failed to open NUL for system archive reader");
+    }
+
     HANDLE null_output = nullptr;
     if (!capture_stdout) {
         null_output = CreateFileW(L"NUL", GENERIC_WRITE,
@@ -346,6 +404,7 @@ ProcessResult run_tar(const std::vector<std::wstring>& arguments,
         if (null_output == INVALID_HANDLE_VALUE) {
             CloseHandle(read_pipe);
             CloseHandle(write_pipe);
+            CloseHandle(null_input);
             throw std::runtime_error("failed to open NUL for system archive reader");
         }
     }
@@ -353,23 +412,24 @@ ProcessResult run_tar(const std::vector<std::wstring>& arguments,
     STARTUPINFOW startup{};
     startup.cb = sizeof(startup);
     startup.dwFlags = STARTF_USESTDHANDLES;
-    startup.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+    startup.hStdInput = null_input;
     startup.hStdOutput = capture_stdout ? write_pipe : null_output;
     startup.hStdError = write_pipe;
 
     PROCESS_INFORMATION process{};
-    std::wstring command_line = command_line_for(*executable, arguments);
+    std::wstring command_line = command_line_for(executable, arguments);
     std::vector<wchar_t> mutable_command(command_line.begin(), command_line.end());
     mutable_command.push_back(L'\0');
     const BOOL created = CreateProcessW(
-        executable->c_str(), mutable_command.data(), nullptr, nullptr, TRUE,
+        executable.c_str(), mutable_command.data(), nullptr, nullptr, TRUE,
         CREATE_NO_WINDOW, nullptr, nullptr, &startup, &process);
 
     CloseHandle(write_pipe);
+    CloseHandle(null_input);
     if (null_output != nullptr && null_output != INVALID_HANDLE_VALUE) CloseHandle(null_output);
     if (!created) {
         CloseHandle(read_pipe);
-        throw std::runtime_error("failed to start Windows tar.exe");
+        throw std::runtime_error("failed to start " + std::string(tool_name));
     }
     CloseHandle(process.hThread);
 
@@ -424,8 +484,34 @@ ProcessResult run_tar(const std::vector<std::wstring>& arguments,
     return {exit_code, process_output_to_utf8(output)};
 }
 
+ProcessResult run_tar(const std::vector<std::wstring>& arguments,
+                      bool capture_stdout,
+                      const std::shared_ptr<OperationControl>& operation) {
+    const auto executable = system_tar_executable();
+    if (!executable) {
+        throw std::runtime_error("Windows tar.exe was not found; system archive reader is unavailable");
+    }
+    return run_process(*executable, arguments, capture_stdout, operation, "Windows tar.exe");
+}
+
+ProcessResult run_7z(const std::vector<std::wstring>& arguments,
+                     bool capture_stdout,
+                     const std::shared_ptr<OperationControl>& operation) {
+    const auto executable = system_7z_executable();
+    if (!executable) {
+        throw std::runtime_error("Axiom's bundled 7-Zip backend was not found");
+    }
+    return run_process(*executable, arguments, capture_stdout, operation, "7-Zip");
+}
+
 std::runtime_error tar_error(std::string action, const ProcessResult& result) {
     std::string message = "system archive reader failed while " + std::move(action);
+    if (!result.output.empty()) message += ": " + result.output;
+    return std::runtime_error(message);
+}
+
+std::runtime_error seven_zip_error(std::string action, const ProcessResult& result) {
+    std::string message = "7-Zip backend failed while " + std::move(action);
     if (!result.output.empty()) message += ": " + result.output;
     return std::runtime_error(message);
 }
@@ -454,6 +540,53 @@ std::string trim_copy(std::string text) {
         text.pop_back();
     }
     return text;
+}
+
+std::optional<std::uint64_t> parse_u64(std::string text) {
+    text = trim_copy(std::move(text));
+    if (text.empty()) return std::nullopt;
+    try {
+        std::size_t consumed = 0;
+        const auto value = std::stoull(text, &consumed, 10);
+        return consumed == text.size() ? std::optional<std::uint64_t>{value} : std::nullopt;
+    } catch (...) {
+        return std::nullopt;
+    }
+}
+
+std::optional<std::uint32_t> parse_hex_u32(std::string text) {
+    text = trim_copy(std::move(text));
+    if (text.empty()) return std::nullopt;
+    try {
+        std::size_t consumed = 0;
+        const auto value = std::stoul(text, &consumed, 16);
+        if (consumed != text.size() || value > 0xfffffffful) return std::nullopt;
+        return static_cast<std::uint32_t>(value);
+    } catch (...) {
+        return std::nullopt;
+    }
+}
+
+std::int64_t parse_7z_time(const std::string& text) {
+    int year = 0;
+    int month = 0;
+    int day = 0;
+    int hour = 0;
+    int minute = 0;
+    int second = 0;
+    if (sscanf_s(text.c_str(), "%d-%d-%d %d:%d:%d",
+                 &year, &month, &day, &hour, &minute, &second) != 6) {
+        return 0;
+    }
+    std::tm tm{};
+    tm.tm_year = year - 1900;
+    tm.tm_mon = month - 1;
+    tm.tm_mday = day;
+    tm.tm_hour = hour;
+    tm.tm_min = minute;
+    tm.tm_sec = second;
+    tm.tm_isdst = -1;
+    return static_cast<std::int64_t>(std::mktime(&tm));
 }
 
 std::optional<ArchiveEntry> parse_verbose_line(const std::string& line) {
@@ -496,6 +629,403 @@ std::optional<ArchiveEntry> parse_verbose_line(const std::string& line) {
         throw FormatError("archive contains an unsafe path: " + entry.path);
     }
     return entry;
+}
+
+struct SevenZipEntryFields {
+    std::string path;
+    std::string size;
+    std::string packed_size;
+    std::string modified;
+    std::string attributes;
+    std::string crc;
+    std::string encrypted;
+    std::string folder;
+    std::string symlink;
+};
+
+std::string normalize_7z_path(std::string path) {
+    path = trim_copy(std::move(path));
+    std::replace(path.begin(), path.end(), '\\', '/');
+    while (path.size() > 1 && path.back() == '/') path.pop_back();
+    return path;
+}
+
+void assign_7z_field(SevenZipEntryFields& fields,
+                     std::string key,
+                     std::string value) {
+    key = trim_copy(std::move(key));
+    value = trim_copy(std::move(value));
+    if (key == "Path") fields.path = std::move(value);
+    else if (key == "Size") fields.size = std::move(value);
+    else if (key == "Packed Size") fields.packed_size = std::move(value);
+    else if (key == "Modified") fields.modified = std::move(value);
+    else if (key == "Attributes") fields.attributes = std::move(value);
+    else if (key == "CRC") fields.crc = std::move(value);
+    else if (key == "Encrypted") fields.encrypted = std::move(value);
+    else if (key == "Folder") fields.folder = std::move(value);
+    else if (key == "Symbolic Link") fields.symlink = std::move(value);
+}
+
+std::optional<ArchiveEntry> archive_entry_from_7z_fields(const SevenZipEntryFields& fields,
+                                                         bool* encrypted) {
+    if (encrypted != nullptr && trim_copy(fields.encrypted) == "+") {
+        *encrypted = true;
+    }
+    std::string path = normalize_7z_path(fields.path);
+    if (path.empty()) return std::nullopt;
+
+    ArchiveEntry entry;
+    entry.path = std::move(path);
+    entry.is_directory = trim_copy(fields.folder) == "+" ||
+                         fields.attributes.find('D') != std::string::npos;
+    entry.is_symlink = !fields.symlink.empty();
+    entry.link_target = fields.symlink;
+    if (auto size = parse_u64(fields.size)) entry.size = *size;
+    if (auto packed = parse_u64(fields.packed_size)) entry.packed_size = *packed;
+    if (auto crc = parse_hex_u32(fields.crc)) {
+        entry.crc32 = *crc;
+        entry.has_crc32 = true;
+    }
+    entry.mtime = parse_7z_time(fields.modified);
+    if (!is_safe_relative(entry.path)) {
+        throw FormatError("archive contains an unsafe path: " + entry.path);
+    }
+    return entry;
+}
+
+std::vector<ArchiveEntry> parse_7z_slt_listing(std::string_view output,
+                                               bool* any_encrypted = nullptr) {
+    std::vector<ArchiveEntry> entries;
+    SevenZipEntryFields current;
+    bool in_entries = false;
+    bool have_current = false;
+
+    auto commit = [&]() {
+        if (!have_current) return;
+        auto entry = archive_entry_from_7z_fields(current, any_encrypted);
+        if (entry) entries.push_back(std::move(*entry));
+        current = SevenZipEntryFields{};
+        have_current = false;
+    };
+
+    std::size_t start = 0;
+    while (start <= output.size()) {
+        std::size_t end = output.find('\n', start);
+        if (end == std::string_view::npos) end = output.size();
+        std::string line(output.substr(start, end - start));
+        while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) {
+            line.pop_back();
+        }
+        const std::string trimmed = trim_copy(line);
+        if (!in_entries) {
+            if (trimmed == "----------") in_entries = true;
+        } else if (!trimmed.empty()) {
+            const std::size_t separator = line.find(" = ");
+            if (separator != std::string::npos) {
+                std::string key = line.substr(0, separator);
+                std::string value = line.substr(separator + 3);
+                if (trim_copy(key) == "Path") {
+                    commit();
+                    have_current = true;
+                }
+                if (have_current) assign_7z_field(current, std::move(key), std::move(value));
+            }
+        }
+        if (end == output.size()) break;
+        start = end + 1;
+    }
+    commit();
+    return entries;
+}
+
+bool seven_zip_listing_reports_encryption(std::string_view output) {
+    bool encrypted = false;
+    (void)parse_7z_slt_listing(output, &encrypted);
+    return encrypted;
+}
+
+bool seven_zip_error_indicates_encrypted(std::string text) {
+    text = lower_ascii(std::move(text));
+    return text.find("wrong password") != std::string::npos ||
+           text.find("encrypted archive") != std::string::npos ||
+           (text.find("password") != std::string::npos &&
+            text.find("encrypted") != std::string::npos);
+}
+
+constexpr std::uint32_t kIsoSectorSize = 2048;
+
+std::uint32_t iso_le32(const std::vector<std::uint8_t>& bytes, std::size_t offset) {
+    return static_cast<std::uint32_t>(bytes[offset]) |
+           (static_cast<std::uint32_t>(bytes[offset + 1]) << 8) |
+           (static_cast<std::uint32_t>(bytes[offset + 2]) << 16) |
+           (static_cast<std::uint32_t>(bytes[offset + 3]) << 24);
+}
+
+std::uint64_t iso_byte_offset(std::uint32_t extent) {
+    return static_cast<std::uint64_t>(extent) * kIsoSectorSize;
+}
+
+std::vector<std::uint8_t> read_iso_bytes(std::ifstream& stream,
+                                         std::uint64_t file_size,
+                                         std::uint64_t offset,
+                                         std::uint64_t size) {
+    if (size > static_cast<std::uint64_t>(std::numeric_limits<std::streamsize>::max())) {
+        throw FormatError("ISO directory is too large");
+    }
+    if (offset > file_size || size > file_size - offset) {
+        throw FormatError("ISO directory record points outside the image");
+    }
+    std::vector<std::uint8_t> bytes(static_cast<std::size_t>(size));
+    if (bytes.empty()) return bytes;
+    stream.clear();
+    stream.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
+    stream.read(reinterpret_cast<char*>(bytes.data()),
+                static_cast<std::streamsize>(bytes.size()));
+    if (static_cast<std::size_t>(stream.gcount()) != bytes.size()) {
+        throw FormatError("could not read ISO directory data");
+    }
+    return bytes;
+}
+
+std::int64_t parse_iso_recording_time(const std::uint8_t* bytes) {
+    const int year = 1900 + static_cast<int>(bytes[0]);
+    if (year < 1970 || bytes[1] == 0 || bytes[2] == 0) return 0;
+
+    std::tm tm{};
+    tm.tm_year = year - 1900;
+    tm.tm_mon = static_cast<int>(bytes[1]) - 1;
+    tm.tm_mday = static_cast<int>(bytes[2]);
+    tm.tm_hour = static_cast<int>(bytes[3]);
+    tm.tm_min = static_cast<int>(bytes[4]);
+    tm.tm_sec = static_cast<int>(bytes[5]);
+    tm.tm_isdst = 0;
+
+    const auto timestamp = _mkgmtime(&tm);
+    if (timestamp == static_cast<std::time_t>(-1)) return 0;
+    const auto gmt_offset_quarters =
+        static_cast<int>(static_cast<signed char>(bytes[6]));
+    return static_cast<std::int64_t>(timestamp) -
+           static_cast<std::int64_t>(gmt_offset_quarters) * 15 * 60;
+}
+
+std::string strip_iso_version(std::string name) {
+    const std::size_t separator = name.find_last_of(';');
+    if (separator != std::string::npos && separator + 1 < name.size()) {
+        bool version_suffix = true;
+        for (std::size_t index = separator + 1; index < name.size(); ++index) {
+            version_suffix = name[index] >= '0' && name[index] <= '9';
+            if (!version_suffix) break;
+        }
+        if (version_suffix) name.resize(separator);
+    }
+    while (!name.empty() && name.back() == '.') name.pop_back();
+    return name;
+}
+
+std::string decode_iso_identifier(const std::uint8_t* name,
+                                  std::size_t name_size,
+                                  bool joliet) {
+    if (name_size == 1 && (name[0] == 0 || name[0] == 1)) {
+        return name[0] == 0 ? "." : "..";
+    }
+
+    if (joliet) {
+        std::wstring wide;
+        wide.reserve((name_size + 1) / 2);
+        for (std::size_t index = 0; index + 1 < name_size; index += 2) {
+            const auto code_unit =
+                static_cast<wchar_t>((static_cast<unsigned>(name[index]) << 8) |
+                                     static_cast<unsigned>(name[index + 1]));
+            if (code_unit != L'\0') wide.push_back(code_unit);
+        }
+        return strip_iso_version(wide_to_utf8(wide));
+    }
+
+    std::string decoded;
+    decoded.reserve(name_size);
+    for (std::size_t index = 0; index < name_size; ++index) {
+        char ch = static_cast<char>(name[index]);
+        if (ch == '\\') ch = '/';
+        if (static_cast<unsigned char>(ch) < 0x20) ch = '_';
+        decoded.push_back(ch);
+    }
+    return strip_iso_version(std::move(decoded));
+}
+
+struct IsoDirectoryRecord {
+    std::uint32_t extent = 0;
+    std::uint32_t data_length = 0;
+    std::int64_t mtime = 0;
+    bool is_directory = false;
+    std::string name;
+};
+
+IsoDirectoryRecord parse_iso_directory_record(const std::vector<std::uint8_t>& bytes,
+                                              std::size_t offset,
+                                              bool joliet) {
+    const std::uint8_t length = bytes[offset];
+    if (length < 34 || offset + length > bytes.size()) {
+        throw FormatError("ISO directory record is invalid");
+    }
+
+    const std::uint8_t name_length = bytes[offset + 32];
+    if (33u + name_length > length) {
+        throw FormatError("ISO directory record name is invalid");
+    }
+
+    IsoDirectoryRecord record;
+    record.extent = iso_le32(bytes, offset + 2);
+    record.data_length = iso_le32(bytes, offset + 10);
+    record.mtime = parse_iso_recording_time(bytes.data() + offset + 18);
+    record.is_directory = (bytes[offset + 25] & 0x02) != 0;
+    record.name = decode_iso_identifier(bytes.data() + offset + 33,
+                                        name_length, joliet);
+    return record;
+}
+
+struct IsoVolume {
+    IsoDirectoryRecord root;
+    bool joliet = false;
+};
+
+bool is_joliet_descriptor(const std::vector<std::uint8_t>& descriptor) {
+    return descriptor.size() >= 91 &&
+           descriptor[88] == '%' &&
+           descriptor[89] == '/' &&
+           (descriptor[90] == '@' || descriptor[90] == 'C' || descriptor[90] == 'E');
+}
+
+IsoVolume read_iso_volume(std::ifstream& stream, std::uint64_t file_size) {
+    std::optional<IsoVolume> primary;
+    std::optional<IsoVolume> joliet;
+
+    for (std::uint32_t sector = 16;
+         sector < 256 && iso_byte_offset(sector + 1) <= file_size;
+         ++sector) {
+        auto descriptor = read_iso_bytes(stream, file_size,
+                                         iso_byte_offset(sector),
+                                         kIsoSectorSize);
+        if (descriptor[1] != 'C' || descriptor[2] != 'D' ||
+            descriptor[3] != '0' || descriptor[4] != '0' ||
+            descriptor[5] != '1') {
+            continue;
+        }
+
+        const std::uint8_t type = descriptor[0];
+        if (type == 255) break;
+        if (type != 1 && type != 2) continue;
+
+        const bool descriptor_is_joliet = type == 2 && is_joliet_descriptor(descriptor);
+        auto root = parse_iso_directory_record(descriptor, 156, descriptor_is_joliet);
+        if (!root.is_directory || root.extent == 0 || root.data_length == 0) {
+            continue;
+        }
+
+        IsoVolume volume{std::move(root), descriptor_is_joliet};
+        if (descriptor_is_joliet) {
+            joliet = std::move(volume);
+        } else if (type == 1) {
+            primary = std::move(volume);
+        }
+    }
+
+    if (joliet) return *joliet;
+    if (primary) return *primary;
+    throw FormatError("ISO image does not contain a readable ISO9660 volume");
+}
+
+std::vector<ArchiveEntry> list_iso_native(const fs::path& archive_path) {
+    std::ifstream stream(archive_path, std::ios::binary);
+    if (!stream) throw std::runtime_error("could not open ISO image");
+
+    stream.seekg(0, std::ios::end);
+    const auto signed_size = stream.tellg();
+    if (signed_size < 0) throw std::runtime_error("could not determine ISO image size");
+    const auto file_size = static_cast<std::uint64_t>(signed_size);
+    if (file_size < iso_byte_offset(17)) {
+        throw FormatError("ISO image is too small");
+    }
+
+    const IsoVolume volume = read_iso_volume(stream, file_size);
+
+    struct PendingDirectory {
+        std::uint32_t extent = 0;
+        std::uint32_t data_length = 0;
+        std::string path;
+    };
+
+    std::vector<PendingDirectory> pending;
+    pending.push_back({volume.root.extent, volume.root.data_length, {}});
+    std::unordered_set<std::uint64_t> visited;
+    std::vector<ArchiveEntry> entries;
+    entries.reserve(1024);
+
+    for (std::size_t directory_index = 0; directory_index < pending.size();
+         ++directory_index) {
+        const PendingDirectory directory = pending[directory_index];
+        const std::uint64_t key =
+            (static_cast<std::uint64_t>(directory.extent) << 32) |
+            directory.data_length;
+        if (!visited.insert(key).second) continue;
+
+        const auto data = read_iso_bytes(stream, file_size,
+                                         iso_byte_offset(directory.extent),
+                                         directory.data_length);
+        for (std::size_t offset = 0; offset < data.size();) {
+            const std::uint8_t length = data[offset];
+            if (length == 0) {
+                const std::size_t next_sector =
+                    ((offset / kIsoSectorSize) + 1) * kIsoSectorSize;
+                if (next_sector <= offset) break;
+                offset = next_sector;
+                continue;
+            }
+
+            const auto record = parse_iso_directory_record(data, offset, volume.joliet);
+            offset += length;
+            if (record.name == "." || record.name == "..") continue;
+
+            std::string path = directory.path.empty()
+                ? record.name
+                : directory.path + "/" + record.name;
+            std::replace(path.begin(), path.end(), '\\', '/');
+            if (!is_safe_relative(path)) {
+                throw FormatError("ISO image contains an unsafe path: " + path);
+            }
+
+            ArchiveEntry entry;
+            entry.path = std::move(path);
+            entry.is_directory = record.is_directory;
+            entry.size = record.is_directory ? 0 : record.data_length;
+            if (!record.is_directory) {
+                entry.packed_size = record.data_length;
+            }
+            entry.mtime = record.mtime;
+            entries.push_back(entry);
+
+            if (record.is_directory && record.extent != 0 && record.data_length != 0) {
+                pending.push_back({record.extent, record.data_length, entries.back().path});
+            }
+
+            if (entries.size() > 1'000'000) {
+                throw FormatError("ISO image contains too many directory entries");
+            }
+        }
+    }
+
+    return entries;
+}
+
+std::wstring seven_zip_password_argument(const std::string& password) {
+    std::wstring argument = L"-p";
+    argument += utf8_to_wide(password);
+    return argument;
+}
+
+std::vector<std::wstring> seven_zip_list_arguments(const fs::path& archive_path,
+                                                   const std::string& password) {
+    return {L"l", L"-slt", L"-sccUTF-8",
+            seven_zip_password_argument(password), archive_path.wstring()};
 }
 
 bool selected_entry(const ArchiveEntry& entry, const std::vector<std::string>& wanted) {
@@ -549,26 +1079,82 @@ class SystemArchiveProvider final : public ArchiveProvider {
 public:
     SystemArchiveProvider(const ArchiveFormatInfo& info,
                           bool (*signature_match)(const fs::path&),
-                          bool (*extension_match)(const fs::path&))
+                          bool (*extension_match)(const fs::path&),
+                          bool prefer_7z)
         : info_(info), signature_match_(signature_match),
-          extension_match_(extension_match) {}
+          extension_match_(extension_match), prefer_7z_(prefer_7z) {}
 
     const ArchiveFormatInfo& info() const override { return info_; }
     bool matches_path(const fs::path& path) const override { return extension_match_(path); }
     bool matches_signature(const fs::path& path) const { return signature_match_(path); }
 
-    ArchiveCapabilities capabilities(const fs::path&, const std::string&) const override {
+    ArchiveCapabilities capabilities(const fs::path& archive_path,
+                                     const std::string& password) const override {
         ArchiveCapabilities result;
-        result.list = true;
-        result.extract = true;
-        result.test = true;
-        result.selective_extract = true;
         result.metadata = true;
+        const bool has_7z = use_7z_backend();
+        const bool native_iso_listing = info_.format == ArchiveFormat::iso;
+        if (prefer_7z_ && !has_7z && !native_iso_listing) {
+            result.encryption =
+                info_.format == ArchiveFormat::seven_z || info_.format == ArchiveFormat::rar;
+            return result;
+        }
+
+        result.list = true;
+        result.extract = !prefer_7z_ || has_7z;
+        result.test = !prefer_7z_ || has_7z;
+        result.selective_extract = !prefer_7z_ || has_7z;
+        result.packed_sizes = has_7z || native_iso_listing;
+        result.encryption = has_7z &&
+            (info_.format == ArchiveFormat::seven_z || info_.format == ArchiveFormat::rar);
+
+        if (!result.encryption) {
+            return result;
+        }
+
+        std::error_code ec;
+        if (!has_7z || !fs::exists(archive_path, ec) ||
+            fs::is_directory(archive_path, ec)) {
+            return result;
+        }
+
+        const auto listed = run_7z(seven_zip_list_arguments(archive_path, password),
+                                   true, nullptr);
+        if (listed.exit_code == 0) {
+            result.encrypted = seven_zip_listing_reports_encryption(listed.output);
+            result.directory_encrypted = false;
+        } else if (seven_zip_error_indicates_encrypted(listed.output)) {
+            result.encrypted = true;
+            result.directory_encrypted = true;
+        }
         return result;
     }
 
     std::vector<ArchiveEntry> list(const fs::path& archive_path,
-                                   const std::string&) const override {
+                                   const std::string& password) const override {
+        if (info_.format == ArchiveFormat::iso) {
+            try {
+                auto entries = list_iso_native(archive_path);
+                if (!entries.empty() || !use_7z_backend()) return entries;
+            } catch (...) {
+                if (!use_7z_backend()) throw;
+            }
+        }
+
+        if (prefer_7z_ && !use_7z_backend()) {
+            throw std::runtime_error("7-Zip backend is required for this archive format");
+        }
+        if (use_7z_backend()) {
+            const auto result = run_7z(seven_zip_list_arguments(archive_path, password),
+                                       true, nullptr);
+            if (result.exit_code != 0) throw seven_zip_error("listing", result);
+            auto entries = parse_7z_slt_listing(result.output);
+            if (entries.empty() && !result.output.empty()) {
+                throw FormatError("7-Zip archive listing could not be parsed");
+            }
+            return entries;
+        }
+
         const auto result = run_tar({L"-tvf", archive_path.wstring()}, true, nullptr);
         if (result.exit_code != 0) throw tar_error("listing", result);
         std::vector<ArchiveEntry> entries;
@@ -586,9 +1172,20 @@ public:
               const DecompressionOptions& options) const override {
         report_operation(options.operation, OperationStage::testing, 0, 1, 0, 1,
                          wide_to_utf8(archive_path.filename().wstring()));
-        const auto result = run_tar({L"-tf", archive_path.wstring()}, false,
-                                    options.operation);
-        if (result.exit_code != 0) throw tar_error("testing", result);
+        if (prefer_7z_ && !use_7z_backend()) {
+            throw std::runtime_error("7-Zip backend is required for this archive format");
+        }
+        if (use_7z_backend()) {
+            const auto result = run_7z({L"t", L"-y", L"-sccUTF-8",
+                                        seven_zip_password_argument(options.password),
+                                        archive_path.wstring()},
+                                       true, options.operation);
+            if (result.exit_code != 0) throw seven_zip_error("testing", result);
+        } else {
+            const auto result = run_tar({L"-tf", archive_path.wstring()}, false,
+                                        options.operation);
+            if (result.exit_code != 0) throw tar_error("testing", result);
+        }
         report_operation(options.operation, OperationStage::testing, 1, 1, 1, 1,
                          wide_to_utf8(archive_path.filename().wstring()));
     }
@@ -632,6 +1229,10 @@ public:
     }
 
 private:
+    bool use_7z_backend() const {
+        return prefer_7z_ && system_7z_executable().has_value();
+    }
+
     void extract_matching(const fs::path& archive_path,
                           const std::vector<std::string>& wanted,
                           const fs::path& dest_dir,
@@ -676,8 +1277,7 @@ private:
         if (ec) throw std::runtime_error("cannot create extraction staging directory: " + ec.message());
         TempDirectoryGuard staging(staging_path);
 
-        std::vector<std::wstring> arguments{L"-xf", archive_path.wstring(),
-                                            L"-C", staging.path().wstring()};
+        std::vector<std::wstring> arguments;
         fs::path selection_file;
         std::unique_ptr<TempFileGuard> selection_guard;
         if (!wanted.empty()) {
@@ -687,12 +1287,27 @@ private:
             selection_file = unique_temp_path(L"AxiomArchiveSelection");
             write_selection_file(selection_file, names);
             selection_guard = std::make_unique<TempFileGuard>(selection_file);
-            arguments.push_back(L"-T");
-            arguments.push_back(selection_file.wstring());
         }
 
-        const auto result = run_tar(arguments, true, options.operation);
-        if (result.exit_code != 0) throw tar_error("extracting", result);
+        if (use_7z_backend()) {
+            arguments = {L"x", L"-y", L"-sccUTF-8",
+                         seven_zip_password_argument(options.password),
+                         L"-o" + staging.path().wstring(), archive_path.wstring()};
+            if (!selection_file.empty()) {
+                arguments.push_back(L"-scsUTF-8");
+                arguments.push_back(L"@" + selection_file.wstring());
+            }
+            const auto result = run_7z(arguments, true, options.operation);
+            if (result.exit_code != 0) throw seven_zip_error("extracting", result);
+        } else {
+            arguments = {L"-xf", archive_path.wstring(), L"-C", staging.path().wstring()};
+            if (!selection_file.empty()) {
+                arguments.push_back(L"-T");
+                arguments.push_back(selection_file.wstring());
+            }
+            const auto result = run_tar(arguments, true, options.operation);
+            if (result.exit_code != 0) throw tar_error("extracting", result);
+        }
 
         std::uint64_t completed_bytes = 0;
         std::uint64_t completed_items = 0;
@@ -738,13 +1353,14 @@ private:
     const ArchiveFormatInfo& info_;
     bool (*signature_match_)(const fs::path&) = nullptr;
     bool (*extension_match_)(const fs::path&) = nullptr;
+    bool prefer_7z_ = false;
 };
 
-const SystemArchiveProvider kSevenZProvider(kSevenZInfo, &looks_like_7z_file, &has_7z_extension);
-const SystemArchiveProvider kRarProvider(kRarInfo, &looks_like_rar_file, &has_rar_extension);
-const SystemArchiveProvider kTarProvider(kTarInfo, &looks_like_tar_file, &has_tar_extension);
-const SystemArchiveProvider kIsoProvider(kIsoInfo, &looks_like_iso_file, &has_iso_extension);
-const SystemArchiveProvider kCabProvider(kCabInfo, &looks_like_cab_file, &has_cab_extension);
+const SystemArchiveProvider kSevenZProvider(kSevenZInfo, &looks_like_7z_file, &has_7z_extension, true);
+const SystemArchiveProvider kRarProvider(kRarInfo, &looks_like_rar_file, &has_rar_extension, true);
+const SystemArchiveProvider kTarProvider(kTarInfo, &looks_like_tar_file, &has_tar_extension, false);
+const SystemArchiveProvider kIsoProvider(kIsoInfo, &looks_like_iso_file, &has_iso_extension, true);
+const SystemArchiveProvider kCabProvider(kCabInfo, &looks_like_cab_file, &has_cab_extension, true);
 const std::array<const SystemArchiveProvider*, 5> kProviders{
     &kSevenZProvider, &kRarProvider, &kTarProvider, &kIsoProvider, &kCabProvider};
 

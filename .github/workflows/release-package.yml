@@ -20,7 +20,7 @@ jobs:
         uses: microsoft/setup-msbuild@v3
 
       - name: Build Release
-        run: msbuild AxiomCompress.sln /p:Configuration=Release /p:Platform=x64 /m
+        run: .\tools\build_msvc.ps1 -Configuration Release
 
       - name: Test Release
         run: .\out\Release\axiom_roundtrip.exe
@@ -48,6 +48,7 @@ jobs:
 
           Copy-Item -LiteralPath ".\out\Release\Axiom.exe" -Destination $stage
           Copy-Item -LiteralPath ".\out\Release\axiomc.exe" -Destination $stage
+          Copy-Item -LiteralPath ".\out\Release\backends" -Destination (Join-Path $stage "backends") -Recurse
           Copy-Item -LiteralPath ".\README.md" -Destination $stage
           Copy-Item -LiteralPath ".\CLI_GUIDE.md" -Destination $stage
           Copy-Item -LiteralPath ".\ARCHITECTURE.md" -Destination $stage

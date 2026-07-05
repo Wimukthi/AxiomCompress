@@ -3157,6 +3157,7 @@ std::vector<ArchiveEntry> list_archive(const std::filesystem::path& archive_path
         }
         out.mtime = entry.mtime;
         out.crc32 = entry.crc;
+        out.has_crc32 = entry.type == kEntryFile;
         out.has_blake3 = entry.has_blake3;
         out.blake3 = entry.blake3;
         result.push_back(std::move(out));
@@ -4663,6 +4664,7 @@ ArchiveEntry archive_entry_from_zip_stat(const mz_zip_archive_file_stat& stat) {
         ? std::optional<std::uint64_t>{}
         : std::optional<std::uint64_t>{static_cast<std::uint64_t>(stat.m_comp_size)};
     entry.crc32 = entry.is_directory ? 0 : static_cast<std::uint32_t>(stat.m_crc32);
+    entry.has_crc32 = !entry.is_directory;
 #ifndef MINIZ_NO_TIME
     entry.mtime = static_cast<std::int64_t>(stat.m_time);
 #endif
@@ -4704,6 +4706,9 @@ std::vector<ZipEntryPlan> read_zip_entry_plans(ZipReader& reader) {
                     aes->strength == kZipAesStrength256 &&
                     (aes->actual_method == kZipMethodStore ||
                      aes->actual_method == kZipMethodDeflate);
+                if (aes->version == kZipAesVendorVersionAe2) {
+                    plan.entry.has_crc32 = false;
+                }
             }
         }
         plan.zipcrypto_supported = zip_entry_uses_classic_crypto(plan);
@@ -5939,7 +5944,7 @@ void extract_zip_aes_entry(const fs::path& archive_path,
     if (inflate_context.output_offset != plan.entry.size) {
         throw FormatError("ZIP entry decompressed to an unexpected size: " + plan.entry.path);
     }
-    if (plan.entry.crc32 != 0 &&
+    if (plan.entry.has_crc32 &&
         core::crc32_final(inflate_context.crc) != plan.entry.crc32) {
         throw FormatError("ZIP entry CRC check failed: " + plan.entry.path);
     }

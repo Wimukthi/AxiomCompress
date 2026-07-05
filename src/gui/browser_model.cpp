@@ -315,7 +315,7 @@ BrowserSnapshot ArchiveCatalog::list(const BrowserLocation& location, std::stop_
             item.size = entry.size;
             item.packed_size = entry.packed_size;
             item.packed_size_estimated = entry.packed_size_estimated;
-            item.crc32 = entry.crc32;
+            if (entry.has_crc32) item.crc32 = entry.crc32;
         }
         item.modified = unix_time_text(entry.mtime);
         snapshot.items.push_back(std::move(item));
