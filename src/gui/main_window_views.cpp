@@ -4,6 +4,38 @@
 #include "gui/main_window_internal.hpp"
 
 namespace axiom::gui {
+namespace {
+
+std::wstring directory_tree_node_key(const DirectoryTreeNode& node) {
+    switch (node.kind) {
+        case DirectoryTreeNodeKind::computer:
+            return L"computer";
+        case DirectoryTreeNodeKind::filesystem:
+            return L"fs:" + node.filesystem_path.wstring();
+        case DirectoryTreeNodeKind::archive:
+            return L"archive:" + node.archive_path.wstring();
+        case DirectoryTreeNodeKind::archive_directory:
+            return L"archive-dir:" + node.archive_path.wstring() + L"|" +
+                   std::wstring(node.archive_directory.begin(),
+                                node.archive_directory.end());
+        case DirectoryTreeNodeKind::dummy:
+        default:
+            return {};
+    }
+}
+
+DirectoryTreeItem* find_tree_item_by_key(DirectoryTreeItem& item,
+                                         const std::wstring& key) {
+    if (!key.empty() && directory_tree_node_key(item.node) == key) return &item;
+    for (auto& child : item.children) {
+        if (DirectoryTreeItem* found = find_tree_item_by_key(*child, key)) {
+            return found;
+        }
+    }
+    return nullptr;
+}
+
+}  // namespace
 
 bool DarkTableView::create(HWND parent, HINSTANCE instance, int id) {
     if (!register_class(instance)) {
@@ -1372,6 +1404,63 @@ void DarkDirectoryTreeView::ensure_visible(DirectoryTreeItem* item) {
         scroll_y_ = bottom - viewport;
     }
     clamp_scroll();
+}
+
+DirectoryTreeViewState DarkDirectoryTreeView::capture_state() const {
+    DirectoryTreeViewState state;
+    state.vertical_scroll = scroll_y_;
+    if (selected_ != nullptr) {
+        state.selected_key = directory_tree_node_key(selected_->node);
+    }
+
+    const auto visit = [&](const auto& self, const DirectoryTreeItem& item) -> void {
+        if (item.expanded) {
+            const std::wstring key = directory_tree_node_key(item.node);
+            if (!key.empty()) state.expanded_keys.push_back(key);
+        }
+        for (const auto& child : item.children) {
+            self(self, *child);
+        }
+    };
+    for (const auto& root : roots_) {
+        visit(visit, *root);
+    }
+    return state;
+}
+
+void DarkDirectoryTreeView::restore_state(const DirectoryTreeViewState& state) {
+    std::unordered_set<std::wstring> expanded_keys(state.expanded_keys.begin(),
+                                                   state.expanded_keys.end());
+    begin_update();
+    const auto restore_item = [&](const auto& self, DirectoryTreeItem& item) -> void {
+        const std::wstring key = directory_tree_node_key(item.node);
+        item.expanded = item.may_have_children && !key.empty() &&
+                        expanded_keys.find(key) != expanded_keys.end();
+        if (item.expanded) {
+            ensure_populated(item);
+        }
+        for (auto& child : item.children) {
+            self(self, *child);
+        }
+    };
+    for (auto& root : roots_) {
+        restore_item(restore_item, *root);
+    }
+    end_update();
+
+    DirectoryTreeItem* selected = nullptr;
+    if (!state.selected_key.empty()) {
+        for (auto& root : roots_) {
+            selected = find_tree_item_by_key(*root, state.selected_key);
+            if (selected != nullptr) break;
+        }
+    }
+    if (selected != nullptr) {
+        select_item(selected, false);
+    }
+    scroll_y_ = state.vertical_scroll;
+    clamp_scroll();
+    invalidate();
 }
 
 const wchar_t* DarkDirectoryTreeView::class_name() {

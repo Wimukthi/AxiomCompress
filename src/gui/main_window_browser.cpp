@@ -590,6 +590,7 @@ MainWindow::BrowserViewState MainWindow::capture_browser_view_state() const {
     BrowserViewState state;
     state.horizontal_scroll = table_.horizontal_scroll_position();
     state.vertical_scroll = table_.vertical_scroll_position();
+    state.tree = tree_view_.capture_state();
     for (int index : selected_browser_indices()) {
         state.selected_ids.push_back(browser_items_[static_cast<std::size_t>(index)].id);
     }
@@ -617,6 +618,33 @@ void MainWindow::restore_browser_view_state(const BrowserViewState& state) {
     }
     table_.set_selection_and_scroll(std::move(selected_indices), focused_index,
                                     state.horizontal_scroll, state.vertical_scroll);
+}
+
+std::optional<MainWindow::BrowserViewState> MainWindow::current_or_pending_browser_view_state() const {
+    if (table_population_active_ && pending_table_restore_state_) {
+        BrowserViewState state = *pending_table_restore_state_;
+        state.tree = tree_view_.capture_state();
+        return state;
+    }
+    if (displayed_browser_location_ && *displayed_browser_location_ == history_.current()) {
+        return capture_browser_view_state();
+    }
+    return std::nullopt;
+}
+
+void MainWindow::remember_current_history_view_state() {
+    if (browser_history_states_.size() < history_.size()) {
+        browser_history_states_.resize(history_.size());
+    }
+    if (history_.index() >= browser_history_states_.size()) return;
+    if (auto state = current_or_pending_browser_view_state()) {
+        browser_history_states_[history_.index()] = std::move(*state);
+    }
+}
+
+std::optional<MainWindow::BrowserViewState> MainWindow::saved_history_view_state() const {
+    if (history_.index() >= browser_history_states_.size()) return std::nullopt;
+    return browser_history_states_[history_.index()];
 }
 
 std::vector<fs::path> MainWindow::selected_filesystem_paths() const {
@@ -653,14 +681,27 @@ std::wstring MainWindow::display_path_for_item(const axiom::gui::BrowserItem& it
 
 void MainWindow::navigate_to(axiom::gui::BrowserLocation location, bool record_history) {
     if (!prepare_archive_password(location)) return;
+    std::optional<BrowserViewState> restore_state;
+    const bool same_displayed_location =
+        displayed_browser_location_ && *displayed_browser_location_ == location;
+    if (record_history) {
+        remember_current_history_view_state();
+    }
+    if (same_displayed_location) {
+        restore_state = capture_browser_view_state();
+    }
+
     cancel_browser_table_population();
     pending_browser_view_state_.reset();
-    if (displayed_browser_location_ && *displayed_browser_location_ == location) {
-        pending_browser_view_state_ = capture_browser_view_state();
-    }
     directory_watcher_.stop();
     KillTimer(hwnd_, kDirectoryRefreshTimer);
-    if (record_history) history_.navigate(location);
+    if (record_history) {
+        history_.navigate(location);
+        browser_history_states_.resize(history_.size());
+    } else if (!restore_state) {
+        restore_state = saved_history_view_state();
+    }
+    pending_browser_view_state_ = std::move(restore_state);
     update_navigation_buttons();
     set_text(address_edit_, location.display_name());
     remember_address(location.display_name());
@@ -859,6 +900,7 @@ void MainWindow::on_browser_loaded(LPARAM lparam) {
         restore_state = std::move(pending_browser_view_state_);
         pending_browser_view_state_.reset();
     }
+    std::optional<BrowserViewState> tree_restore_state = restore_state;
     begin_browser_table_population(std::move(restore_state));
     displayed_browser_location_ = loaded_location;
     if (!result->snapshot.error.empty()) {
@@ -871,13 +913,18 @@ void MainWindow::on_browser_loaded(LPARAM lparam) {
     }
     update_navigation_buttons();
     sync_tree_to_location(loaded_location);
+    if (tree_restore_state) {
+        tree_view_.restore_state(tree_restore_state->tree);
+    }
 }
 
 void MainWindow::on_navigate_back() {
+    remember_current_history_view_state();
     if (auto location = history_.back()) navigate_to(*location, false);
 }
 
 void MainWindow::on_navigate_forward() {
+    remember_current_history_view_state();
     if (auto location = history_.forward()) navigate_to(*location, false);
 }
 
