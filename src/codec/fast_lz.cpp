@@ -117,9 +117,13 @@ void write_varuint_counted(ByteVector& output,
 void append_range_counted(ByteVector& output,
                           Lz77SplitStreams::Histogram& histogram,
                           std::span<const std::uint8_t> input) {
-    output.reserve(output.size() + input.size());
+    // No exact-size reserve here: insert() grows the vector geometrically.
+    // Reserving output.size() + input.size() per literal run forced a
+    // reallocation and full copy for every run once the stream outgrew its
+    // initial reservation, turning high-entropy blocks quadratic.
+    output.insert(output.end(), input.begin(), input.end());
     for (const auto byte : input) {
-        append_counted(output, histogram, byte);
+        ++histogram[byte];
     }
 }
 
