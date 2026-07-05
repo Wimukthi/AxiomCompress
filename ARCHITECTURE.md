@@ -10,6 +10,11 @@ Use this document when you need to know where a feature belongs:
 |---|---|
 | `src/codec` | Single-block compression and decompression |
 | `src/archive` | `.axar` container, metadata, encryption, recovery, volumes, signing, SFX |
+| `src/archive/container.cpp` | The AXAR engine: directory parsing, solid blocks, encryption, recovery, volumes, signing, SFX |
+| `src/archive/container_zip.cpp` | ZIP read/write: miniz wrappers, ZipCrypto/AES-256 entries, the ZIP provider |
+| `src/archive/container_formats.cpp` | Format detection (magic/extension sniffing) and the provider registry |
+| `src/archive/system_provider.cpp` | Read-only providers backed by bundled 7-Zip and Windows `tar.exe` |
+| `src/archive/container_internal.hpp` | Internal helpers shared between the archive translation units |
 | `src/core` | Shared utilities: checksums, crypto, filesystem metadata, Reed-Solomon |
 | `src/cli` | `axiomc` command parsing and CLI workflows |
 | `src/gui` | Native Win32 GUI over the public archive APIs |

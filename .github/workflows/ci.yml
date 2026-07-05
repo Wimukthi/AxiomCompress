@@ -41,7 +41,8 @@ jobs:
       - name: Build fuzz targets (clang + libFuzzer + ASan)
         run: |
           set -euo pipefail
-          cxx_srcs="src/archive/container.cpp src/archive/system_provider.cpp \
+          cxx_srcs="src/archive/container.cpp src/archive/container_formats.cpp \
+                    src/archive/container_zip.cpp src/archive/system_provider.cpp \
                     src/codec/block.cpp src/codec/fast_lz.cpp \
                     src/codec/lz77.cpp src/codec/lz77_split.cpp src/core/archive.cpp \
                     src/core/checksum.cpp src/core/cpu.cpp src/core/crypto.cpp \
