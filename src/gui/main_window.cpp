@@ -255,6 +255,7 @@ void MainWindow::on_create() {
     apply_theme();
     set_busy(false);
     history_.reset(axiom::gui::BrowserLocation::computer());
+    browser_history_states_.assign(history_.size(), std::nullopt);
     maybe_start_automatic_update_check();
 }
 
@@ -662,6 +663,7 @@ LRESULT MainWindow::handle_message(UINT message, WPARAM wparam, LPARAM lparam) {
                 case kAddFavorite: add_favorite_location(current_location_value()); return 0;
                 case kRemoveFavorite: remove_favorite_location(current_location_value()); return 0;
                 case kToggleTreePane: toggle_tree_pane(); return 0;
+                case kFocusAddress: focus_address_bar(); return 0;
                 case kUpdateArchive:
                     on_update_archive(axiom::gui::ArchiveUpdateMode::update_newer);
                     return 0;
@@ -721,7 +723,11 @@ LRESULT MainWindow::handle_message(UINT message, WPARAM wparam, LPARAM lparam) {
             on_table_selection_changed();
             return 0;
         case kTableParentMessage:
-            on_navigate_up();
+            if (history_.can_back()) {
+                on_navigate_back();
+            } else {
+                on_navigate_up();
+            }
             return 0;
         case kTableSortMessage:
             on_table_sort(static_cast<int>(wparam));
@@ -824,58 +830,7 @@ int run_axiom_gui(HINSTANCE instance,
     MSG message{};
     while (GetMessageW(&message, nullptr, 0, 0) > 0) {
         if (window.translate_menu_message(message)) continue;
-        if (message.message == WM_KEYDOWN) {
-            HWND root = GetAncestor(message.hwnd, GA_ROOT);
-            const bool control = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
-            HWND address = GetDlgItem(root, kAddressEdit);
-            const bool address_target = address != nullptr &&
-                (message.hwnd == address || IsChild(address, message.hwnd));
-            if (message.wParam == VK_RETURN && address_target) {
-                SendMessageW(root, WM_COMMAND, MAKEWPARAM(kAddressGo, BN_CLICKED), 0);
-                continue;
-            }
-            if (message.wParam == VK_F5) {
-                SendMessageW(root, WM_COMMAND, MAKEWPARAM(kNavigateRefresh, BN_CLICKED), 0);
-                continue;
-            }
-            if ((GetKeyState(VK_MENU) & 0x8000) != 0 && message.wParam == VK_LEFT) {
-                SendMessageW(root, WM_COMMAND, MAKEWPARAM(kNavigateBack, BN_CLICKED), 0);
-                continue;
-            }
-            if ((GetKeyState(VK_MENU) & 0x8000) != 0 && message.wParam == VK_RIGHT) {
-                SendMessageW(root, WM_COMMAND, MAKEWPARAM(kNavigateForward, BN_CLICKED), 0);
-                continue;
-            }
-            if (control && message.wParam == 'L') {
-                SetFocus(address);
-                COMBOBOXINFO info{sizeof(info)};
-                if (GetComboBoxInfo(address, &info) && info.hwndItem != nullptr) {
-                    SetFocus(info.hwndItem);
-                    SendMessageW(info.hwndItem, EM_SETSEL, 0, -1);
-                }
-                continue;
-            }
-            UINT command = 0;
-            if (control) {
-                switch (message.wParam) {
-                    case 'A': command = kSelectAll; break;
-                    case 'E': command = kExtract; break;
-                    case 'F': command = kFind; break;
-                    case 'I': command = kInfo; break;
-                    case 'N': command = kAddFiles; break;
-                    case 'O': command = kOpenArchive; break;
-                    case 'T': command = kTest; break;
-                }
-            } else if (message.wParam == VK_DELETE) {
-                command = kDelete;
-            } else if (message.wParam == VK_F1) {
-                command = kAbout;
-            }
-            if (command != 0) {
-                SendMessageW(root, WM_COMMAND, MAKEWPARAM(command, 0), 0);
-                continue;
-            }
-        }
+        if (window.translate_keyboard_shortcut(message)) continue;
         TranslateMessage(&message);
         DispatchMessageW(&message);
     }

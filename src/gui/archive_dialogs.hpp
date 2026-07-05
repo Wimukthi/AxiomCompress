@@ -2,6 +2,7 @@
 
 #include "axiom/archive.hpp"
 #include "gui/archive_feature_options.hpp"
+#include "gui/keyboard_shortcuts.hpp"
 
 #include <windows.h>
 
@@ -9,6 +10,7 @@
 #include <filesystem>
 #include <functional>
 #include <string>
+#include <vector>
 
 namespace axiom::gui {
 
@@ -105,6 +107,7 @@ struct ApplicationDialogOptions {
     std::wstring io_buffer_size;
     int memory_limit_mode = 0;  // 0 = automatic, 1 = custom.
     std::wstring memory_limit;
+    std::vector<CommandShortcutSetting> shortcut_overrides;
 
     bool operator==(const ApplicationDialogOptions&) const = default;
 };

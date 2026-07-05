@@ -132,6 +132,11 @@ constexpr int kIoBufferSize = 2604;
 constexpr int kMemoryLimitMode = 2605;
 constexpr int kMemoryLimit = 2606;
 constexpr int kBrowseLogFolder = 2607;
+constexpr int kShortcutCommand = 2650;
+constexpr int kShortcutValue = 2651;
+constexpr int kShortcutAssign = 2652;
+constexpr int kShortcutClear = 2653;
+constexpr int kShortcutResetAll = 2654;
 constexpr int kAccept = IDOK;
 constexpr int kCancel = IDCANCEL;
 constexpr std::uint64_t kMinIoBufferSize = 64ull << 10;
@@ -158,9 +163,9 @@ constexpr std::array<std::size_t, 10> kSolidBlockValues{
     64u << 20, 128u << 20, 256u << 20, 512u << 20};
 constexpr std::array<const wchar_t*, 5> kCreateTabNames{
     L"Compression", L"General", L"Security", L"Recovery & volumes", L"SFX & signing"};
-constexpr std::array<const wchar_t*, 9> kSettingsTabNames{
+constexpr std::array<const wchar_t*, 10> kSettingsTabNames{
     L"General", L"Compression", L"Paths", L"File list", L"Viewer",
-    L"Security", L"Integration", L"Updates", L"Advanced"};
+    L"Security", L"Integration", L"Updates", L"Shortcuts", L"Advanced"};
 constexpr std::array<const wchar_t*, 5> kUpdateModeNames{
     L"Create a new archive", L"Add or replace entries",
     L"Update entries that are newer", L"Freshen existing entries",
@@ -1004,6 +1009,24 @@ private:
         return combo;
     }
 
+    HWND setting_shortcut_command_combo(int page, int x, int y, int width) {
+        HWND combo = setting_control(
+            page, L"COMBOBOX", L"", WS_TABSTOP | WS_VSCROLL | CBS_DROPDOWNLIST |
+                CBS_OWNERDRAWFIXED | CBS_HASSTRINGS,
+            kShortcutCommand, x, y, width, 320);
+        SendMessageW(combo, CB_SETITEMHEIGHT, 0, scale(24));
+        SendMessageW(combo, CB_SETITEMHEIGHT, static_cast<WPARAM>(-1), scale(24));
+        for (const auto& command : kShortcutCommandCatalog) {
+            const LRESULT item_index = SendMessageW(
+                combo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(command.label));
+            if (item_index != CB_ERR && item_index != CB_ERRSPACE) {
+                SendMessageW(combo, CB_SETITEMDATA, static_cast<WPARAM>(item_index),
+                             reinterpret_cast<LPARAM>(command.id));
+            }
+        }
+        return combo;
+    }
+
     HWND setting_thread_combo(int page, int x, int y, int width) {
         HWND combo = setting_control(
             page, L"COMBOBOX", L"", WS_TABSTOP | WS_VSCROLL | CBS_DROPDOWN |
@@ -1182,20 +1205,41 @@ private:
                       L"disable automatic checks until a release feed is configured.",
                       0, 184, 660, 54, true);
 
-        setting_label(8, L"Advanced", 0, 0, 660);
-        setting_label(8, L"Worker priority", 0, 42, 170);
-        setting_combo(8, kWorkerPriority, kWorkerPriorityNames, 180, 36, 240);
-        setting_checkbox(8, kVerboseLogging, L"Enable verbose operation logging", 180, 80);
-        setting_label(8, L"Log folder", 0, 126, 170);
-        setting_edit(8, kLogFolder, 180, 120, 470);
-        setting_browse(8, kBrowseLogFolder, 660, 120);
-        setting_label(8, L"I/O buffer", 0, 168, 170);
-        setting_combo(8, kIoBufferMode, kAutomaticCustomNames, 180, 162, 180);
-        setting_edit(8, kIoBufferSize, 370, 162, 160);
-        setting_label(8, L"Memory limit", 0, 210, 170);
-        setting_combo(8, kMemoryLimitMode, kAutomaticCustomNames, 180, 204, 180);
-        setting_edit(8, kMemoryLimit, 370, 204, 160);
+        setting_label(8, L"Keyboard shortcuts", 0, 0, 660);
+        setting_label(8, L"Command", 0, 42, 170);
+        setting_shortcut_command_combo(8, 180, 36, 470);
+        setting_label(8, L"Shortcut", 0, 92, 170);
+        setting_edit(8, kShortcutValue, 180, 86, 190);
+        setting_control(8, L"BUTTON", L"Assign", WS_TABSTOP | BS_OWNERDRAW,
+                        kShortcutAssign, 386, 86, 86, 30);
+        setting_control(8, L"BUTTON", L"Clear", WS_TABSTOP | BS_OWNERDRAW,
+                        kShortcutClear, 482, 86, 86, 30);
+        setting_control(8, L"BUTTON", L"Restore defaults", WS_TABSTOP | BS_OWNERDRAW,
+                        kShortcutResetAll, 180, 136, 150, 30);
+        settings_shortcut_default_label_ = setting_label(8, L"", 350, 142, 360, 24);
         setting_label(8,
+                      L"Type shortcuts as text, for example Ctrl+O, Alt+Left, "
+                      L"Ctrl+Shift+R, F5, Delete, or None. Duplicate shortcuts are rejected.",
+                      0, 206, 660, 58, true);
+        setting_label(8,
+                      L"Text boxes keep standard editing shortcuts such as Ctrl+A, Ctrl+C, "
+                      L"Ctrl+V, Delete, Backspace, and Enter.",
+                      0, 276, 660, 58, true);
+
+        setting_label(9, L"Advanced", 0, 0, 660);
+        setting_label(9, L"Worker priority", 0, 42, 170);
+        setting_combo(9, kWorkerPriority, kWorkerPriorityNames, 180, 36, 240);
+        setting_checkbox(9, kVerboseLogging, L"Enable verbose operation logging", 180, 80);
+        setting_label(9, L"Log folder", 0, 126, 170);
+        setting_edit(9, kLogFolder, 180, 120, 470);
+        setting_browse(9, kBrowseLogFolder, 660, 120);
+        setting_label(9, L"I/O buffer", 0, 168, 170);
+        setting_combo(9, kIoBufferMode, kAutomaticCustomNames, 180, 162, 180);
+        setting_edit(9, kIoBufferSize, 370, 162, 160);
+        setting_label(9, L"Memory limit", 0, 210, 170);
+        setting_combo(9, kMemoryLimitMode, kAutomaticCustomNames, 180, 204, 180);
+        setting_edit(9, kMemoryLimit, 370, 204, 160);
+        setting_label(9,
                       L"Worker priority, I/O buffer size, and memory limit are applied to GUI "
                       L"operations. Automatic I/O uses 1 MiB; custom values must be 64 KiB "
                       L"through 64 MiB.",
@@ -1412,6 +1456,108 @@ private:
         SendMessageW(item(id), CB_SETCURSEL, static_cast<WPARAM>(std::max(0, value)), 0);
     }
 
+    const ShortcutCommandInfo* selected_shortcut_command() const {
+        HWND combo = item(kShortcutCommand);
+        const LRESULT selection = SendMessageW(combo, CB_GETCURSEL, 0, 0);
+        if (selection == CB_ERR) return nullptr;
+        const auto id = reinterpret_cast<const wchar_t*>(
+            SendMessageW(combo, CB_GETITEMDATA, static_cast<WPARAM>(selection), 0));
+        if (id == nullptr || reinterpret_cast<INT_PTR>(id) == CB_ERR) return nullptr;
+        return shortcut_command_info(id);
+    }
+
+    static bool shortcut_duplicate_is_contextual_pair(std::wstring_view left,
+                                                      std::wstring_view right) {
+        return (left == L"commands.view" && right == L"navigation.go_address") ||
+               (left == L"navigation.go_address" && right == L"commands.view");
+    }
+
+    bool shortcut_conflict(std::wstring_view command_id,
+                           const KeyboardShortcut& shortcut,
+                           std::wstring& conflicting_command) const {
+        if (shortcut.key == 0) return false;
+        for (const auto& command : kShortcutCommandCatalog) {
+            if (command_id == std::wstring_view(command.id) ||
+                shortcut_duplicate_is_contextual_pair(command_id, command.id)) {
+                continue;
+            }
+            const auto other = parse_keyboard_shortcut(
+                effective_shortcut_for_command(application_options.shortcut_overrides,
+                                               command.id));
+            if (other && other->key != 0 && *other == shortcut) {
+                conflicting_command = command.label;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool commit_shortcut_edit(bool show_errors) {
+        const ShortcutCommandInfo* command = selected_shortcut_command();
+        if (command == nullptr) return true;
+
+        const std::wstring raw = window_text(item(kShortcutValue));
+        const auto canonical = canonical_keyboard_shortcut(raw);
+        if (!canonical) {
+            if (show_errors) {
+                show_message_dialog(window_, instance_, dpi_, palette_.dark,
+                                    L"Keyboard shortcut",
+                                    L"Shortcut text is not valid. Examples: Ctrl+O, "
+                                    L"Alt+Left, Ctrl+Shift+R, F5, Delete, None.",
+                                    MessageDialogIcon::warning);
+            }
+            return false;
+        }
+
+        const auto parsed = parse_keyboard_shortcut(*canonical);
+        std::wstring conflict;
+        if (parsed && shortcut_conflict(command->id, *parsed, conflict)) {
+            if (show_errors) {
+                show_message_dialog(
+                    window_, instance_, dpi_, palette_.dark,
+                    L"Keyboard shortcut",
+                    L"That shortcut is already assigned to:\n\n" + conflict,
+                    MessageDialogIcon::warning);
+            }
+            return false;
+        }
+
+        set_shortcut_override(application_options.shortcut_overrides,
+                              command->id, *canonical);
+        set_window_text(item(kShortcutValue), canonical->empty() ? L"None" : *canonical);
+        update_shortcut_controls();
+        return true;
+    }
+
+    void update_shortcut_controls() {
+        const ShortcutCommandInfo* command = selected_shortcut_command();
+        if (command == nullptr) {
+            set_window_text(item(kShortcutValue), L"");
+            if (settings_shortcut_default_label_ != nullptr) {
+                set_window_text(settings_shortcut_default_label_, L"");
+            }
+            return;
+        }
+        const std::wstring effective = effective_shortcut_for_command(
+            application_options.shortcut_overrides, command->id);
+        set_window_text(item(kShortcutValue), effective.empty() ? L"None" : effective);
+        if (settings_shortcut_default_label_ != nullptr) {
+            const std::wstring default_text = default_shortcut_for_command(command->id);
+            set_window_text(settings_shortcut_default_label_,
+                            L"Default: " +
+                                (default_text.empty() ? std::wstring(L"None") : default_text));
+        }
+    }
+
+    void load_shortcut_controls() {
+        HWND combo = item(kShortcutCommand);
+        if (combo == nullptr) return;
+        if (SendMessageW(combo, CB_GETCURSEL, 0, 0) == CB_ERR) {
+            SendMessageW(combo, CB_SETCURSEL, 0, 0);
+        }
+        update_shortcut_controls();
+    }
+
     int edit_int(int id, int fallback, int minimum, int maximum) const {
         try {
             const std::wstring text = window_text(item(id));
@@ -1503,6 +1649,7 @@ private:
         set_selected_index(kMemoryLimitMode,
                            std::clamp(application_options.memory_limit_mode, 0, 1));
         set_window_text(item(kMemoryLimit), application_options.memory_limit);
+        load_shortcut_controls();
         update_settings_dependencies();
         for (const SettingControl& control : settings_controls_) {
             InvalidateRect(control.window, nullptr, TRUE);
@@ -1516,6 +1663,7 @@ private:
     }
 
     bool apply_settings_values() {
+        if (!commit_shortcut_edit(true)) return false;
         application_options.theme_mode = selected_index(kThemeMode, 0);
         application_options.accent_color_mode = selected_index(kAccentColorMode, 0);
         if (const auto color = color_from_hex(window_text(item(kCustomAccentColor)))) {
@@ -2430,11 +2578,6 @@ private:
         save_named_window_placement(layout_name(), window_);
         restore_dialog_owner(owner_, owner_was_enabled_);
         owner_was_enabled_ = false;
-        if (owner_ != nullptr && IsWindow(owner_)) {
-            RedrawWindow(owner_, nullptr, nullptr,
-                         RDW_INVALIDATE | RDW_ALLCHILDREN |
-                             RDW_UPDATENOW | RDW_NOERASE);
-        }
         if (window_ != nullptr && IsWindow(window_)) {
             DestroyWindow(window_);
         }
@@ -2886,6 +3029,11 @@ private:
                     update_settings_dependencies();
                     return 0;
                 }
+                if (mode_ == DialogMode::settings &&
+                    id == kShortcutCommand && HIWORD(wparam) == CBN_SELCHANGE) {
+                    update_shortcut_controls();
+                    return 0;
+                }
                 if (id >= kCreateTabBase &&
                     id < kCreateTabBase + static_cast<int>(kCreateTabNames.size())) {
                     select_create_page(id - kCreateTabBase);
@@ -2936,6 +3084,21 @@ private:
                         return 0;
                     case kApply:
                         if (mode_ == DialogMode::settings) apply_settings_live(false);
+                        return 0;
+                    case kShortcutAssign:
+                        if (mode_ == DialogMode::settings) commit_shortcut_edit(true);
+                        return 0;
+                    case kShortcutClear:
+                        if (mode_ == DialogMode::settings) {
+                            set_window_text(item(kShortcutValue), L"None");
+                            commit_shortcut_edit(true);
+                        }
+                        return 0;
+                    case kShortcutResetAll:
+                        if (mode_ == DialogMode::settings) {
+                            application_options.shortcut_overrides.clear();
+                            update_shortcut_controls();
+                        }
                         return 0;
                     case kDefaults:
                         if (mode_ == DialogMode::settings) {
@@ -3070,6 +3233,7 @@ private:
     HWND cancel_ = nullptr;
     HWND apply_ = nullptr;
     HWND defaults_ = nullptr;
+    HWND settings_shortcut_default_label_ = nullptr;
 };
 
 }  // namespace

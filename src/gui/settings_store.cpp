@@ -212,6 +212,8 @@ PersistedGuiSettings load_gui_settings() {
     settings.application.memory_limit_mode =
         read_clamped_int(key, L"MemoryLimitMode", 0, 0, 1);
     settings.application.memory_limit = read_string(key, L"MemoryLimit");
+    settings.application.shortcut_overrides =
+        shortcut_overrides_from_strings(read_string_list(key, L"ShortcutOverrides"));
     settings.sort_column = static_cast<int>(std::clamp<DWORD>(read_dword(key, L"SortColumn", 0), 0, 6));
     settings.sort_ascending = read_dword(key, L"SortAscending", 1) != 0;
     settings.tree_width =
@@ -349,6 +351,8 @@ void save_gui_settings(const PersistedGuiSettings& settings) {
     write_dword(key, L"MemoryLimitMode",
                 static_cast<DWORD>(std::clamp(settings.application.memory_limit_mode, 0, 1)));
     write_string(key, L"MemoryLimit", settings.application.memory_limit);
+    write_string_list(key, L"ShortcutOverrides",
+                      shortcut_overrides_to_strings(settings.application.shortcut_overrides));
     write_dword(key, L"SortColumn", static_cast<DWORD>(settings.sort_column));
     write_dword(key, L"SortAscending", settings.sort_ascending ? 1 : 0);
     write_dword(key, L"TreeWidth",

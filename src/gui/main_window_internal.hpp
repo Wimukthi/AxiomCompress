@@ -129,6 +129,7 @@ enum ControlId : int {
     kAddFavorite = 1136,
     kRemoveFavorite = 1137,
     kToggleTreePane = 1138,
+    kFocusAddress = 1139,
     kTreeOpen = 1140,
     kTreeRefresh = 1141,
     kTreeExpand = 1142,
@@ -540,6 +541,11 @@ struct DirectoryTreeItem {
     bool expanded = false;
     bool populated = false;
 };
+struct DirectoryTreeViewState {
+    std::vector<std::wstring> expanded_keys;
+    std::wstring selected_key;
+    int vertical_scroll = 0;
+};
 class DarkDirectoryTreeView {
 
 public:
@@ -570,6 +576,8 @@ public:
     void set_expanded(DirectoryTreeItem* item, bool expanded);
     void refresh_item(DirectoryTreeItem* item);
     void ensure_visible(DirectoryTreeItem* item);
+    DirectoryTreeViewState capture_state() const;
+    void restore_state(const DirectoryTreeViewState& state);
 
 
 private:
@@ -791,6 +799,7 @@ public:
                 std::wstring initial_path,
                 AxiomGuiStartupCommand startup_command = {});
     bool translate_menu_message(const MSG& message);
+    bool translate_keyboard_shortcut(const MSG& message);
 
 
 private:
@@ -860,6 +869,12 @@ private:
         axiom::gui::MessageDialogButtons buttons = axiom::gui::MessageDialogButtons::ok,
         int default_result = IDOK) const;
     std::vector<axiom::gui::CustomMenuItem> menu_items(UINT menu_id) const;
+    std::wstring shortcut_for_command(UINT command) const;
+    bool can_execute_shortcut_command(UINT command) const;
+    bool shortcut_reserved_for_focused_control(UINT command,
+                                               const axiom::gui::KeyboardShortcut& shortcut,
+                                               HWND target) const;
+    void focus_address_bar();
     void show_browser_context_menu(POINT point);
     void show_tree_context_menu(POINT point);
     void paint_shell();
@@ -918,6 +933,7 @@ private:
         std::optional<std::uint64_t> focused_id;
         int horizontal_scroll = 0;
         int vertical_scroll = 0;
+        DirectoryTreeViewState tree;
     };
     static void add_status_size(BrowserStatusTotals& totals, std::uint64_t size);
     static void add_status_item(BrowserStatusTotals& totals,
@@ -939,6 +955,9 @@ private:
     std::vector<int> selected_browser_indices() const;
     BrowserViewState capture_browser_view_state() const;
     void restore_browser_view_state(const BrowserViewState& state);
+    std::optional<BrowserViewState> current_or_pending_browser_view_state() const;
+    void remember_current_history_view_state();
+    std::optional<BrowserViewState> saved_history_view_state() const;
     std::vector<fs::path> selected_filesystem_paths() const;
     std::vector<std::string> selected_archive_paths() const;
     bool copy_text_to_clipboard(const std::wstring& text) const;
@@ -1170,6 +1189,7 @@ private:
     std::vector<fs::path> inputs_;
 
     axiom::gui::NavigationHistory history_;
+    std::vector<std::optional<BrowserViewState>> browser_history_states_;
 
     std::vector<axiom::gui::BrowserItem> browser_items_;
 

@@ -4,6 +4,264 @@
 #include "gui/main_window_internal.hpp"
 
 namespace axiom::gui {
+namespace {
+
+std::wstring_view shortcut_action_for_command(UINT command) {
+    switch (command) {
+        case kOpenArchive: return L"file.open_archive";
+        case kExitApplication: return L"file.exit";
+        case kAddFiles: return L"commands.add";
+        case kExtract: return L"commands.extract";
+        case kTest: return L"commands.test";
+        case kUpdateArchive: return L"commands.update";
+        case kFreshenArchive: return L"commands.freshen";
+        case kSynchronizeArchive: return L"commands.synchronize";
+        case kDeleteArchiveEntries: return L"commands.delete_archive_entries";
+        case kRepackArchive: return L"commands.repack";
+        case kView: return L"commands.view";
+        case kDelete: return L"commands.delete";
+        case kSelectAll: return L"commands.select_all";
+        case kInfo: return L"tools.info";
+        case kFind: return L"tools.find";
+        case kBenchmark: return L"tools.benchmark";
+        case kEditArchiveComment: return L"tools.edit_comment";
+        case kLockArchive: return L"tools.lock";
+        case kRepairArchive: return L"tools.repair";
+        case kCreateRecoveryVolumes: return L"tools.create_recovery_volumes";
+        case kVerifyArchiveSignature: return L"tools.verify_signature";
+        case kCreateSfx: return L"tools.create_sfx";
+        case kNavigateBack: return L"navigation.back";
+        case kNavigateForward: return L"navigation.forward";
+        case kNavigateUp: return L"navigation.up";
+        case kNavigateRefresh: return L"navigation.refresh";
+        case kFocusAddress: return L"navigation.focus_address";
+        case kAddressGo: return L"navigation.go_address";
+        case kToggleTreePane: return L"options.toggle_tree";
+        case kAddFavorite: return L"options.add_favorite";
+        case kRemoveFavorite: return L"options.remove_favorite";
+        case kSettings: return L"options.settings";
+        case kCheckUpdates: return L"help.check_updates";
+        case kAbout: return L"help.about";
+        case kCopyPath: return L"clipboard.copy_path";
+        case kCopyCrc32: return L"clipboard.copy_crc32";
+        default: return {};
+    }
+}
+
+UINT command_for_shortcut_action(std::wstring_view action) {
+    if (action == L"file.open_archive") return kOpenArchive;
+    if (action == L"file.exit") return kExitApplication;
+    if (action == L"commands.add") return kAddFiles;
+    if (action == L"commands.extract") return kExtract;
+    if (action == L"commands.test") return kTest;
+    if (action == L"commands.update") return kUpdateArchive;
+    if (action == L"commands.freshen") return kFreshenArchive;
+    if (action == L"commands.synchronize") return kSynchronizeArchive;
+    if (action == L"commands.delete_archive_entries") return kDeleteArchiveEntries;
+    if (action == L"commands.repack") return kRepackArchive;
+    if (action == L"commands.view") return kView;
+    if (action == L"commands.delete") return kDelete;
+    if (action == L"commands.select_all") return kSelectAll;
+    if (action == L"tools.info") return kInfo;
+    if (action == L"tools.find") return kFind;
+    if (action == L"tools.benchmark") return kBenchmark;
+    if (action == L"tools.edit_comment") return kEditArchiveComment;
+    if (action == L"tools.lock") return kLockArchive;
+    if (action == L"tools.repair") return kRepairArchive;
+    if (action == L"tools.create_recovery_volumes") return kCreateRecoveryVolumes;
+    if (action == L"tools.verify_signature") return kVerifyArchiveSignature;
+    if (action == L"tools.create_sfx") return kCreateSfx;
+    if (action == L"navigation.back") return kNavigateBack;
+    if (action == L"navigation.forward") return kNavigateForward;
+    if (action == L"navigation.up") return kNavigateUp;
+    if (action == L"navigation.refresh") return kNavigateRefresh;
+    if (action == L"navigation.focus_address") return kFocusAddress;
+    if (action == L"navigation.go_address") return kAddressGo;
+    if (action == L"options.toggle_tree") return kToggleTreePane;
+    if (action == L"options.add_favorite") return kAddFavorite;
+    if (action == L"options.remove_favorite") return kRemoveFavorite;
+    if (action == L"options.settings") return kSettings;
+    if (action == L"help.check_updates") return kCheckUpdates;
+    if (action == L"help.about") return kAbout;
+    if (action == L"clipboard.copy_path") return kCopyPath;
+    if (action == L"clipboard.copy_crc32") return kCopyCrc32;
+    return 0;
+}
+
+bool class_name_is(HWND window, const wchar_t* expected) {
+    wchar_t class_name[64]{};
+    GetClassNameW(window, class_name,
+                  static_cast<int>(sizeof(class_name) / sizeof(class_name[0])));
+    return lstrcmpiW(class_name, expected) == 0;
+}
+
+bool is_text_entry_control(HWND window) {
+    if (window == nullptr) return false;
+    if (class_name_is(window, L"Edit") || class_name_is(window, L"ComboBox")) {
+        return true;
+    }
+    HWND parent = GetParent(window);
+    return parent != nullptr && class_name_is(parent, L"ComboBox");
+}
+
+}  // namespace
+
+std::wstring MainWindow::shortcut_for_command(UINT command) const {
+    const std::wstring_view action = shortcut_action_for_command(command);
+    if (action.empty()) return {};
+    return effective_shortcut_for_command(application_options_.shortcut_overrides, action);
+}
+
+bool MainWindow::can_execute_shortcut_command(UINT command) const {
+    const bool has_selection = !selected_browser_indices().empty();
+    const bool has_archive = active_archive_path().has_value();
+    const bool browsing_archive =
+        history_.current().kind == axiom::gui::BrowserLocationKind::archive;
+    const axiom::gui::ArchiveCapabilities capabilities = active_archive_capabilities();
+    const bool archive_editable = capabilities.update && !capabilities.locked &&
+                                  !capabilities.directory_encrypted;
+    const std::wstring current_location = current_location_value();
+    const bool favorite = favorite_contains(current_location);
+    switch (command) {
+        case kOpenArchive:
+        case kBenchmark:
+        case kSettings:
+            return !busy_;
+        case kExitApplication:
+        case kAbout:
+        case kCheckUpdates:
+        case kFocusAddress:
+        case kAddressGo:
+            return true;
+        case kAddFiles:
+            return !busy_ && (!browsing_archive || archive_editable);
+        case kExtract:
+            return !busy_ && has_archive && capabilities.extract;
+        case kTest:
+            return !busy_ && has_archive && capabilities.test;
+        case kUpdateArchive:
+        case kFreshenArchive:
+        case kSynchronizeArchive:
+        case kRepackArchive:
+            return !busy_ && has_archive && archive_editable;
+        case kDeleteArchiveEntries:
+            return !busy_ && browsing_archive && has_selection && archive_editable;
+        case kEditArchiveComment:
+            return !busy_ && has_archive && capabilities.comments && archive_editable;
+        case kLockArchive:
+            return !busy_ && has_archive && capabilities.lock && archive_editable;
+        case kRepairArchive:
+            return !busy_ && has_archive && capabilities.recovery_records;
+        case kCreateRecoveryVolumes:
+            return !busy_ && has_archive && capabilities.recovery_records &&
+                   capabilities.multi_volume && archive_editable;
+        case kVerifyArchiveSignature:
+            return !busy_ && has_archive && capabilities.authenticity;
+        case kCreateSfx:
+            return !busy_ && has_archive && capabilities.sfx;
+        case kView:
+            return has_selection;
+        case kDelete:
+            return !busy_ && has_selection && (!browsing_archive || archive_editable);
+        case kSelectAll:
+            return !browser_items_.empty();
+        case kInfo:
+            return has_archive || has_selection;
+        case kFind:
+            return !browser_items_.empty();
+        case kCopyPath:
+            return has_selection ||
+                   history_.current().kind != axiom::gui::BrowserLocationKind::computer;
+        case kCopyCrc32:
+            return has_selection;
+        case kNavigateBack:
+            return history_.can_back();
+        case kNavigateForward:
+            return history_.can_forward();
+        case kNavigateUp:
+            return parent_location(history_.current()).has_value();
+        case kNavigateRefresh:
+            return !busy_;
+        case kToggleTreePane:
+            return true;
+        case kAddFavorite:
+            return !current_location.empty() && !favorite;
+        case kRemoveFavorite:
+            return !current_location.empty() && favorite;
+        default:
+            return false;
+    }
+}
+
+void MainWindow::focus_address_bar() {
+    if (address_edit_ == nullptr) return;
+    SetFocus(address_edit_);
+    COMBOBOXINFO info{sizeof(info)};
+    if (GetComboBoxInfo(address_edit_, &info) && info.hwndItem != nullptr) {
+        SetFocus(info.hwndItem);
+        SendMessageW(info.hwndItem, EM_SETSEL, 0, -1);
+    }
+}
+
+bool MainWindow::shortcut_reserved_for_focused_control(
+    UINT command,
+    const axiom::gui::KeyboardShortcut& shortcut,
+    HWND target) const {
+    if (!is_text_entry_control(target)) return false;
+    if (command == kFocusAddress) return false;
+    if (command == kAddressGo) {
+        HWND address = GetDlgItem(hwnd_, kAddressEdit);
+        return !(address != nullptr && (target == address || IsChild(address, target)));
+    }
+    if (shortcut.key == VK_RETURN || shortcut.key == VK_DELETE ||
+        shortcut.key == VK_BACK || shortcut.key == VK_TAB) {
+        return true;
+    }
+    if (shortcut.ctrl && !shortcut.alt && !shortcut.shift) {
+        switch (shortcut.key) {
+            case 'A':
+            case 'C':
+            case 'V':
+            case 'X':
+            case 'Z':
+                return true;
+            default:
+                break;
+        }
+    }
+    return false;
+}
+
+bool MainWindow::translate_keyboard_shortcut(const MSG& message) {
+    const auto pressed = keyboard_shortcut_from_message(message);
+    if (!pressed) return false;
+    const HWND root = GetAncestor(message.hwnd, GA_ROOT);
+    if (root != hwnd_) return false;
+
+    for (const auto& shortcut_command : kShortcutCommandCatalog) {
+        const std::wstring shortcut_text = effective_shortcut_for_command(
+            application_options_.shortcut_overrides, shortcut_command.id);
+        const auto shortcut = parse_keyboard_shortcut(shortcut_text);
+        if (!shortcut || shortcut->key == 0 || *shortcut != *pressed) continue;
+
+        const UINT command = command_for_shortcut_action(shortcut_command.id);
+        if (command == 0) return false;
+        if (command == kAddressGo) {
+            HWND address = GetDlgItem(hwnd_, kAddressEdit);
+            if (address == nullptr ||
+                (message.hwnd != address && !IsChild(address, message.hwnd))) {
+                continue;
+            }
+        }
+        if (shortcut_reserved_for_focused_control(command, *shortcut, message.hwnd)) {
+            continue;
+        }
+        if (!can_execute_shortcut_command(command)) return true;
+        SendMessageW(hwnd_, WM_COMMAND, MAKEWPARAM(command, 0), 0);
+        return true;
+    }
+    return false;
+}
 
 std::vector<axiom::gui::CustomMenuItem> MainWindow::menu_items(UINT menu_id) const {
     const bool has_selection = !selected_browser_indices().empty();
@@ -13,72 +271,80 @@ std::vector<axiom::gui::CustomMenuItem> MainWindow::menu_items(UINT menu_id) con
     const axiom::gui::ArchiveCapabilities capabilities = active_archive_capabilities();
     const bool archive_editable = capabilities.update && !capabilities.locked &&
                                   !capabilities.directory_encrypted;
+    const std::wstring current_location = current_location_value();
+    const bool favorite = favorite_contains(current_location);
+    const auto shortcut = [this](UINT command) { return shortcut_for_command(command); };
     switch (menu_id) {
         case kMenuFile:
             return {
-                {kOpenArchive, L"&Open archive...", L"Ctrl+O", !busy_},
+                {kOpenArchive, L"&Open archive...", shortcut(kOpenArchive), !busy_},
                 {0, L"", L"", false, true},
-                {kExitApplication, L"E&xit", L"Alt+F4"},
+                {kExitApplication, L"E&xit", shortcut(kExitApplication)},
             };
         case kMenuCommands:
             return {
-                {kAddFiles, L"&Add to archive...", L"Ctrl+N",
+                {kAddFiles, L"&Add to archive...", shortcut(kAddFiles),
                  !busy_ && (!browsing_archive || archive_editable)},
-                {kExtract, L"&Extract...", L"Ctrl+E",
+                {kExtract, L"&Extract...", shortcut(kExtract),
                  !busy_ && has_archive && capabilities.extract},
-                {kTest, L"&Test archive", L"Ctrl+T",
+                {kTest, L"&Test archive", shortcut(kTest),
                  !busy_ && has_archive && capabilities.test},
                 {0, L"", L"", false, true},
-                {kUpdateArchive, L"&Update archive...", L"",
+                {kUpdateArchive, L"&Update archive...", shortcut(kUpdateArchive),
                   !busy_ && has_archive && archive_editable},
-                {kFreshenArchive, L"&Freshen archive...", L"",
+                {kFreshenArchive, L"&Freshen archive...", shortcut(kFreshenArchive),
                  !busy_ && has_archive && archive_editable},
-                {kSynchronizeArchive, L"S&ynchronize archive...", L"",
+                {kSynchronizeArchive, L"S&ynchronize archive...", shortcut(kSynchronizeArchive),
                   !busy_ && has_archive && archive_editable},
-                {kDeleteArchiveEntries, L"Delete from archive...", L"",
+                {kDeleteArchiveEntries, L"Delete from archive...", shortcut(kDeleteArchiveEntries),
                   !busy_ && browsing_archive && has_selection && archive_editable},
-                {kRepackArchive, L"&Repack archive...", L"",
+                {kRepackArchive, L"&Repack archive...", shortcut(kRepackArchive),
                   !busy_ && has_archive && archive_editable},
                 {0, L"", L"", false, true},
-                {kView, L"&View", L"Enter", has_selection},
+                {kView, L"&View", shortcut(kView), has_selection},
                 {kDelete, browsing_archive ? L"&Delete from archive" : L"&Delete",
-                 L"Delete", !busy_ && has_selection &&
+                 shortcut(kDelete), !busy_ && has_selection &&
                       (!browsing_archive || archive_editable)},
-                {kSelectAll, L"Select &all", L"Ctrl+A", !browser_items_.empty()},
+                {kSelectAll, L"Select &all", shortcut(kSelectAll), !browser_items_.empty()},
             };
         case kMenuTools:
             return {
-                {kInfo, L"Archive &information", L"Ctrl+I", has_archive || has_selection},
-                {kFind, L"&Find files...", L"Ctrl+F", !browser_items_.empty()},
+                {kInfo, L"Archive &information", shortcut(kInfo), has_archive || has_selection},
+                {kFind, L"&Find files...", shortcut(kFind), !browser_items_.empty()},
                 {0, L"", L"", false, true},
-                {kBenchmark, L"&Benchmark...", L"", !busy_},
+                {kBenchmark, L"&Benchmark...", shortcut(kBenchmark), !busy_},
                 {0, L"", L"", false, true},
-                {kEditArchiveComment, L"Edit archive &comment...", L"",
+                {kEditArchiveComment, L"Edit archive &comment...", shortcut(kEditArchiveComment),
                   !busy_ && has_archive && capabilities.comments && archive_editable},
-                {kLockArchive, L"&Lock archive...", L"",
+                {kLockArchive, L"&Lock archive...", shortcut(kLockArchive),
                   !busy_ && has_archive && capabilities.lock && archive_editable},
-                {kRepairArchive, L"&Repair archive...", L"",
+                {kRepairArchive, L"&Repair archive...", shortcut(kRepairArchive),
                  !busy_ && has_archive && capabilities.recovery_records},
-                {kCreateRecoveryVolumes, L"Create recovery &volumes...", L"",
+                {kCreateRecoveryVolumes, L"Create recovery &volumes...", shortcut(kCreateRecoveryVolumes),
                  !busy_ && has_archive && capabilities.recovery_records &&
                      capabilities.multi_volume && archive_editable},
-                {kVerifyArchiveSignature, L"Verify &signature...", L"",
+                {kVerifyArchiveSignature, L"Verify &signature...", shortcut(kVerifyArchiveSignature),
                  !busy_ && has_archive && capabilities.authenticity},
-                {kCreateSfx, L"Create &self-extracting archive...", L"",
+                {kCreateSfx, L"Create &self-extracting archive...", shortcut(kCreateSfx),
                  !busy_ && has_archive && capabilities.sfx},
             };
         case kMenuOptions:
             return {
-                {kToggleTreePane, L"Show &tree pane", L"", true, false,
+                {kToggleTreePane, L"Show &tree pane", shortcut(kToggleTreePane), true, false,
                  tree_pane_visible_},
                 {0, L"", L"", false, true},
-                {kSettings, L"&Settings...", L"", !busy_},
+                {static_cast<UINT>(favorite ? kRemoveFavorite : kAddFavorite),
+                 favorite ? L"Remove current location from &Favorites"
+                          : L"Pin current location to &Favorites",
+                 shortcut(favorite ? kRemoveFavorite : kAddFavorite), !current_location.empty()},
+                {0, L"", L"", false, true},
+                {kSettings, L"&Settings...", shortcut(kSettings), !busy_},
             };
         case kMenuHelp:
             return {
-                {kCheckUpdates, L"Check for &Updates...", L""},
+                {kCheckUpdates, L"Check for &Updates...", shortcut(kCheckUpdates)},
                 {0, L"", L"", false, true},
-                {kAbout, L"&About Axiom", L"F1"},
+                {kAbout, L"&About Axiom", shortcut(kAbout)},
             };
         default:
             return {};
@@ -100,30 +366,31 @@ void MainWindow::show_browser_context_menu(POINT point) {
         GetWindowRect(list_, &list_rect);
         point = {list_rect.left + scale(24), list_rect.top + scale(24)};
     }
+    const auto shortcut = [this](UINT command) { return shortcut_for_command(command); };
     std::vector<axiom::gui::CustomMenuItem> items{
-        {kView, L"&View", L"Enter", has_selection},
+        {kView, L"&View", shortcut(kView), has_selection},
         {0, L"", L"", false, true},
-        {kAddFiles, L"&Add to archive...", L"Ctrl+N",
+        {kAddFiles, L"&Add to archive...", shortcut(kAddFiles),
          !busy_ && has_selection && (!browsing_archive || archive_editable)},
-        {kExtract, L"&Extract...", L"Ctrl+E",
+        {kExtract, L"&Extract...", shortcut(kExtract),
          !busy_ && has_archive && capabilities.extract},
-        {kTest, L"&Test archive", L"Ctrl+T",
+        {kTest, L"&Test archive", shortcut(kTest),
          !busy_ && has_archive && capabilities.test},
         {0, L"", L"", false, true},
-        {kDelete, browsing_archive ? L"&Delete from archive" : L"&Delete", L"Delete",
+        {kDelete, browsing_archive ? L"&Delete from archive" : L"&Delete", shortcut(kDelete),
          !busy_ && has_selection && (!browsing_archive || archive_editable)},
-        {kInfo, L"&Information", L"Ctrl+I", has_selection || has_archive},
-        {kFind, L"&Find files...", L"Ctrl+F", !browser_items_.empty()},
-        {kSelectAll, L"Select &all", L"Ctrl+A", !browser_items_.empty()},
+        {kInfo, L"&Information", shortcut(kInfo), has_selection || has_archive},
+        {kFind, L"&Find files...", shortcut(kFind), !browser_items_.empty()},
+        {kSelectAll, L"Select &all", shortcut(kSelectAll), !browser_items_.empty()},
         {0, L"", L"", false, true},
-        {kCopyPath, L"Copy &path", L"", has_selection ||
+        {kCopyPath, L"Copy &path", shortcut(kCopyPath), has_selection ||
              history_.current().kind != axiom::gui::BrowserLocationKind::computer},
-        {kCopyCrc32, L"Copy CRC-&32", L"", has_selection},
+        {kCopyCrc32, L"Copy CRC-&32", shortcut(kCopyCrc32), has_selection},
         {0, L"", L"", false, true},
         {static_cast<UINT>(favorite ? kRemoveFavorite : kAddFavorite),
          favorite ? L"Remove current location from &Favorites"
                   : L"Pin current location to &Favorites",
-         L"", !current_location.empty()},
+         shortcut(favorite ? kRemoveFavorite : kAddFavorite), !current_location.empty()},
     };
     const UINT command = menu_bar_.show_context_menu(std::move(items), point);
     if (command != 0) SendMessageW(hwnd_, WM_COMMAND, MAKEWPARAM(command, 0), 0);
@@ -163,19 +430,22 @@ void MainWindow::show_tree_context_menu(POINT point) {
         }
     }
     std::vector<axiom::gui::CustomMenuItem> items{
-        {kTreeOpen, L"&Open", L"Enter", node.kind != DirectoryTreeNodeKind::dummy},
-        {kTreeRefresh, L"&Refresh tree", L"F5", !busy_},
+        {kTreeOpen, L"&Open", shortcut_for_command(kView),
+         node.kind != DirectoryTreeNodeKind::dummy},
+        {kTreeRefresh, L"&Refresh tree", shortcut_for_command(kNavigateRefresh), !busy_},
         {0, L"", L"", false, true},
         {kTreeExpand, L"E&xpand", L"", item->may_have_children && !item->expanded},
         {kTreeCollapse, L"Co&llapse", L"", item->may_have_children && item->expanded},
         {0, L"", L"", false, true},
         {kTreeOpenInExplorer, L"Open in &Explorer", L"", is_filesystem},
-        {kTreeAddToArchive, L"&Add to archive...", L"", !busy_ && is_filesystem},
+        {kTreeAddToArchive, L"&Add to archive...", shortcut_for_command(kAddFiles),
+         !busy_ && is_filesystem},
         {0, L"", L"", false, true},
-        {kTreeExtractArchive, L"E&xtract archive...", L"",
+        {kTreeExtractArchive, L"E&xtract archive...", shortcut_for_command(kExtract),
          !busy_ && is_archive && capabilities.extract},
-        {kTreeTestArchive, L"&Test archive", L"", !busy_ && is_archive && capabilities.test},
-        {kTreeArchiveInfo, L"Archive &information", L"", is_archive},
+        {kTreeTestArchive, L"&Test archive", shortcut_for_command(kTest),
+         !busy_ && is_archive && capabilities.test},
+        {kTreeArchiveInfo, L"Archive &information", shortcut_for_command(kInfo), is_archive},
     };
     if (const auto location = tree_location_value(node)) {
         const bool favorite = favorite_contains(*location);
@@ -183,7 +453,7 @@ void MainWindow::show_tree_context_menu(POINT point) {
         items.push_back({
             static_cast<UINT>(favorite ? kTreeRemoveFavorite : kTreeAddFavorite),
             favorite ? L"Remove from &Favorites" : L"Pin to &Favorites",
-            L"",
+            shortcut_for_command(favorite ? kRemoveFavorite : kAddFavorite),
             true
         });
     }

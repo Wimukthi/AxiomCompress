@@ -377,6 +377,8 @@ std::optional<BrowserLocation> NavigationHistory::forward() {
 
 bool NavigationHistory::can_back() const { return !entries_.empty() && index_ > 0; }
 bool NavigationHistory::can_forward() const { return !entries_.empty() && index_ + 1 < entries_.size(); }
+std::size_t NavigationHistory::index() const { return index_; }
+std::size_t NavigationHistory::size() const { return entries_.size(); }
 
 const BrowserLocation& NavigationHistory::current() const {
     static const BrowserLocation computer_location = BrowserLocation::computer();

@@ -101,6 +101,8 @@ public:
 
     bool can_back() const;
     bool can_forward() const;
+    std::size_t index() const;
+    std::size_t size() const;
     const BrowserLocation& current() const;
 
 private:
