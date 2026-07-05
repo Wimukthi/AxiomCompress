@@ -13,8 +13,27 @@
 #include <limits>
 #include <vector>
 
+#if defined(_MSC_VER)
+#include <intrin.h>
+#endif
+
 namespace axiom::codec {
 namespace {
+
+// The binary-tree descent is memory-latency bound: each step needs the next
+// node's child slots, a dependent random load. Prefetching them while the
+// current node's bytes are compared overlaps that miss. Purely a scheduling
+// hint — the token stream is unchanged. (Measured no benefit on the shorter
+// hash-chain walks, so only the tree matcher uses it.)
+inline void prefetch_read(const void* address) {
+#if defined(_MSC_VER)
+    _mm_prefetch(static_cast<const char*>(address), _MM_HINT_T0);
+#elif defined(__GNUC__) || defined(__clang__)
+    __builtin_prefetch(address);
+#else
+    (void)address;
+#endif
+}
 
 constexpr std::uint8_t kLiteralToken = 0;
 constexpr std::uint8_t kMatchToken = 1;
@@ -259,8 +278,9 @@ std::vector<Match> find_matches_at(std::span<const std::uint8_t> input,
     std::size_t depth = 0;
 
     while (candidate != kNoPos && depth < max_chain_depth) {
+        const auto next = previous[candidate];
         if (candidate >= position) {
-            candidate = previous[candidate];
+            candidate = next;
             ++depth;
             continue;
         }
@@ -274,14 +294,14 @@ std::vector<Match> find_matches_at(std::span<const std::uint8_t> input,
             const auto threshold = static_cast<std::size_t>(matches.back().length);
             if (threshold > kMinMatch &&
                 input[candidate + threshold - 1] != input[position + threshold - 1]) {
-                candidate = previous[candidate];
+                candidate = next;
                 ++depth;
                 continue;
             }
         }
 
         if (load_u32_le(input.data() + candidate) != load_u32_le(input.data() + position)) {
-            candidate = previous[candidate];
+            candidate = next;
             ++depth;
             continue;
         }
@@ -296,7 +316,7 @@ std::vector<Match> find_matches_at(std::span<const std::uint8_t> input,
             break;
         }
 
-        candidate = previous[candidate];
+        candidate = next;
         ++depth;
     }
 
@@ -388,8 +408,9 @@ ByteVector encode_lz77_impl(std::span<const std::uint8_t> input,
         // Hash chains keep recent candidates in newest-to-oldest order. Once a
         // candidate falls outside the window, the rest of the chain is older too.
         while (candidate != kNoPos && depth < max_chain_depth) {
+            const auto next = previous[candidate];
             if (candidate >= pos) {
-                candidate = previous[candidate];
+                candidate = next;
                 ++depth;
                 continue;
             }
@@ -415,7 +436,7 @@ ByteVector encode_lz77_impl(std::span<const std::uint8_t> input,
                 }
             }
 
-            candidate = previous[candidate];
+            candidate = next;
             ++depth;
         }
 
@@ -611,6 +632,10 @@ ByteVector encode_lz77_tree(std::span<const std::uint8_t> input,
 
             const auto node_slot =
                 cyclic_pos >= delta ? cyclic_pos - delta : cyclic_pos + cyclic_size - delta;
+
+            // The descent needs this node's children after the byte compare;
+            // fetching them under the compare hides the tree-array miss.
+            prefetch_read(&son[2 * node_slot]);
 
             std::size_t len = std::min(len_smaller, len_larger);
             len += common_prefix(input.data() + np + len, input.data() + p + len, limit - len);
