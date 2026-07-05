@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
@@ -91,11 +92,17 @@ std::size_t effective_solid_block_size(const CompressionOptions& options) {
 
     // The archive container batches files into solid blocks, then the codec splits
     // each solid block internally. Keep the outer block large enough to feed one
-    // independent codec block per detected/requested worker by default.
-    if (threads > std::numeric_limits<std::size_t>::max() / kMinAutoCodecBlockSize) {
+    // independent codec block per detected/requested worker by default. With the
+    // optimal parser on, the codec keeps its sub-blocks at 4 MiB or larger (see
+    // the thorough block floor in core/archive.cpp), so the outer block must
+    // scale with that floor or a many-core machine runs half idle.
+    const auto per_worker = options.enable_optimal_parser
+        ? std::size_t{4} << 20
+        : kMinAutoCodecBlockSize;
+    if (threads > std::numeric_limits<std::size_t>::max() / per_worker) {
         return block_size;
     }
-    return std::max(block_size, threads * kMinAutoCodecBlockSize);
+    return std::max(block_size, threads * per_worker);
 }
 
 // Per-entry "extra area" record types (TLV). The directory stores each entry as a
@@ -1317,7 +1324,29 @@ void compress_items_into(std::ofstream& out, std::uint64_t& written,
         }
         report_operation(operation, OperationStage::compressing, completed_bytes, total_bytes,
                          completed_items, total_items, current_path);
-        auto compressed = compress(buffer, options);
+        // Bytes count as completed when they finish *compressing*, not when they
+        // are read into the block buffer: compression dominates the wall time,
+        // and the codec reports each finished sub-block through the hook below
+        // so a large solid block advances the bar smoothly instead of freezing
+        // for the whole compress() call.
+        const auto block_base = completed_bytes;
+        std::atomic<std::uint64_t> reported{0};
+        auto block_options = options;
+        block_options.encoded_bytes_progress = [&](std::uint64_t done) {
+            // Worker threads deliver cumulative high-water values, possibly out
+            // of order; only an increase is worth reporting.
+            auto previous = reported.load(std::memory_order_relaxed);
+            do {
+                if (done <= previous) {
+                    return;
+                }
+            } while (!reported.compare_exchange_weak(previous, done,
+                                                     std::memory_order_relaxed));
+            report_operation(operation, OperationStage::compressing, block_base + done,
+                             total_bytes, completed_items, total_items, current_path);
+        };
+        auto compressed = compress(buffer, block_options);
+        completed_bytes = block_base + buffer.size();
         if (key != nullptr) {
             // Seal the block, binding its index as associated data so blocks cannot
             // be reordered or transplanted between archives.
@@ -1423,7 +1452,9 @@ void compress_items_into(std::ofstream& out, std::uint64_t& written,
             crc = core::crc32_update(crc, bytes);
             hasher.update(bytes);
             total += static_cast<std::uint64_t>(got);
-            completed_bytes += static_cast<std::uint64_t>(got);
+            // completed_bytes intentionally does not advance here: bytes are
+            // counted when their block finishes compressing (see flush_block),
+            // which is where the wall time actually goes.
             buffer.insert(buffer.end(), bytes.begin(), bytes.end());
             report_operation(operation, OperationStage::reading, completed_bytes, total_bytes,
                              completed_items, total_items, item.archive_path);
@@ -1847,7 +1878,24 @@ void rebuild_archive_keeping(const fs::path& archive_path,
         }
         report_operation(operation, OperationStage::compressing, completed_bytes, total_bytes,
                          completed_items, total_items);
-        auto compressed = compress(buffer, options);
+        // As in compress_items_into: bytes complete as their sub-blocks finish
+        // compressing, so long recompressions tick instead of stalling.
+        const auto block_base = completed_bytes;
+        std::atomic<std::uint64_t> reported{0};
+        auto block_options = options;
+        block_options.encoded_bytes_progress = [&](std::uint64_t done) {
+            auto previous = reported.load(std::memory_order_relaxed);
+            do {
+                if (done <= previous) {
+                    return;
+                }
+            } while (!reported.compare_exchange_weak(previous, done,
+                                                     std::memory_order_relaxed));
+            report_operation(operation, OperationStage::compressing, block_base + done,
+                             total_bytes, completed_items, total_items);
+        };
+        auto compressed = compress(buffer, block_options);
+        completed_bytes = block_base + buffer.size();
         if (key) {
             compressed = core::aead_seal(*key, compressed, block_associated_data(new_blocks.size()));
         }
@@ -1881,7 +1929,7 @@ void rebuild_archive_keeping(const fs::path& archive_path,
             read_file_bytes(source, index.blocks.size(), entry, operation,
                             [&](std::span<const std::uint8_t> chunk) {
                                 buffer.insert(buffer.end(), chunk.begin(), chunk.end());
-                                completed_bytes += chunk.size();
+                                // Counted when the block compresses, not here.
                                 if (buffer.size() >= block_size) {
                                     flush_block();
                                 }

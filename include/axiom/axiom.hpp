@@ -146,6 +146,14 @@ struct CompressionOptions {
     bool force_parallel_blocks = false;
     bool enable_optimal_parser = false;
     std::shared_ptr<OperationControl> operation;
+    // Within-compress progress: when set, the parallel block codec calls this
+    // with the cumulative number of this compress() call's input bytes whose
+    // blocks have finished encoding. Invoked from worker threads, possibly
+    // concurrently and out of order — the callback must be thread-safe and
+    // cheap, and should treat the value as a monotonic high-water mark. The
+    // archive writer uses it to report progress inside large solid blocks;
+    // serial (single-worker) encodes do not call it.
+    std::function<void(std::uint64_t)> encoded_bytes_progress;
     // When non-empty, archive blocks are encrypted: a per-archive key is derived
     // from this password (Argon2id) and each solid block is sealed with
     // XChaCha20-Poly1305. Applies to the archive container, not single-stream

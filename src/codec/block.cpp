@@ -325,6 +325,7 @@ ByteVector encode_parallel_blocks(std::span<const std::uint8_t> input,
     std::vector<BlockResult> results(block_count);
     std::vector<std::uint32_t> block_crcs(crc32 != nullptr ? block_count : 0);
     std::atomic_size_t next_block = 0;
+    std::atomic_uint64_t encoded_bytes = 0;
     const auto worker_count = effective_thread_count(options.thread_count, block_count);
     std::mutex exception_mutex;
     std::exception_ptr first_exception;
@@ -349,6 +350,13 @@ ByteVector encode_parallel_blocks(std::span<const std::uint8_t> input,
                     // CRC. Computing block CRCs here lets large parallel
                     // compressions avoid a later serial pass over the input.
                     block_crcs[block_index] = core::crc32(block_input);
+                }
+                if (options.encoded_bytes_progress) {
+                    // Cumulative bytes whose blocks finished, regardless of
+                    // block order; the callback treats it as a high-water mark.
+                    const auto done =
+                        encoded_bytes.fetch_add(length, std::memory_order_relaxed) + length;
+                    options.encoded_bytes_progress(done);
                 }
                 if (options.operation) {
                     options.operation->checkpoint();
