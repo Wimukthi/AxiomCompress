@@ -671,14 +671,18 @@ std::pair<ByteVector, std::optional<ByteVector>> encode_lz77_split_payloads(
     const auto* distances_hist = streams.has_histograms ? &streams.distances_hist : nullptr;
     const auto* literals_hist = streams.has_histograms ? &streams.literals_hist : nullptr;
 
-    // Encode the streams the two layouts share exactly once.
+    // Encode the streams the two layouts share exactly once. The sequence
+    // streams carry previous-symbol structure (commands repeat in runs, length
+    // varint bytes correlate with their predecessors), so the thorough levels
+    // let the clustered order-1 coder compete for them too; it only wins a
+    // stream when strictly smaller, and it decodes at rANS speed.
     ByteVector shared;
-    write_stream(shared, streams.commands, /*try_order1=*/false, fast, /*prefer_rans=*/fast,
+    write_stream(shared, streams.commands, /*try_order1=*/!fast, fast, /*prefer_rans=*/fast,
                  commands_hist);
-    write_stream(shared, streams.literal_lengths, /*try_order1=*/false, fast, /*prefer_rans=*/fast,
-                 literal_lengths_hist);
-    write_stream(shared, streams.match_lengths, /*try_order1=*/false, fast, /*prefer_rans=*/fast,
-                 match_lengths_hist);
+    write_stream(shared, streams.literal_lengths, /*try_order1=*/!fast, fast,
+                 /*prefer_rans=*/fast, literal_lengths_hist);
+    write_stream(shared, streams.match_lengths, /*try_order1=*/!fast, fast,
+                 /*prefer_rans=*/fast, match_lengths_hist);
 
     ByteVector literals_encoded;
     write_stream(literals_encoded, streams.literals, /*try_order1=*/true, fast,
@@ -728,27 +732,11 @@ std::pair<ByteVector, std::optional<ByteVector>> encode_lz77_split_payloads(
     std::optional<ByteVector> slots;
     if (slots_ok) {
         auto distance_extra = extra.finish();
-        if (!fast) {
-            const auto slot_bits =
-                has_distance_slots_hist
-                    ? order0_bits_per_byte(distance_slots_hist, distance_slots.size())
-                    : order0_bits_per_byte(distance_slots);
-            const auto extra_bits = order0_bits_per_byte(distance_extra);
-            const double slot_distance_lower_bound =
-                stream_entropy_lower_bound(slot_bits, distance_slots.size()) +
-                stream_entropy_lower_bound(extra_bits, distance_extra.size());
-
-            // The slot layout only differs from the plain layout in the distance
-            // streams. If even the entropy lower bound for slot distances cannot
-            // beat the already encoded plain distance stream, the real encoded
-            // slot candidate cannot win. Skip its Huffman/rANS trial work.
-            if (slot_distance_lower_bound >= static_cast<double>(plain_distances.size())) {
-                return {std::move(plain), std::nullopt};
-            }
-        }
-
+        // (An order-0 entropy lower bound used to prune the slot trial here;
+        // with the order-1 coder now competing for the slot stream that bound
+        // no longer limits what the trial can achieve, so it always runs.)
         ByteVector slot_distances;
-        write_stream(slot_distances, distance_slots, /*try_order1=*/false, fast,
+        write_stream(slot_distances, distance_slots, /*try_order1=*/!fast, fast,
                      /*prefer_rans=*/fast,
                      has_distance_slots_hist ? &distance_slots_hist : nullptr);
         write_stream(slot_distances, distance_extra, /*try_order1=*/false, fast);
