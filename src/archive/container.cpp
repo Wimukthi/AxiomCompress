@@ -14,6 +14,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstring>
 #include <fstream>
@@ -22,6 +23,7 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <sstream>
 #include <span>
@@ -1338,32 +1340,45 @@ void compress_items_into(std::ofstream& out, std::uint64_t& written,
                          std::size_t block_size,
                          const std::shared_ptr<OperationControl>& operation,
                          std::uint64_t total_bytes, std::uint64_t total_items,
-                         std::uint64_t& completed_bytes, std::uint64_t& completed_items,
+                         std::uint64_t& completed_bytes_out, std::uint64_t& completed_items_out,
                          const core::CryptoKey* key = nullptr) {
     ByteVector buffer;
     std::uint64_t current_block = blocks.size();
     std::vector<char> io_buffer(effective_io_buffer_size(options.io_buffer_size));
 
+    // Shared progress counters: the reader thread advances items, the pipeline
+    // worker advances bytes (a block's bytes complete when it finishes
+    // compressing). Both threads read them for progress reports.
+    std::atomic<std::uint64_t> completed_bytes{completed_bytes_out};
+    std::atomic<std::uint64_t> completed_items{completed_items_out};
+
     // Maps a file's on-disk identity to the archive path under which its bytes were
     // first stored; later paths sharing that identity become hardlink entries.
     std::map<std::tuple<std::uint64_t, std::uint64_t, std::uint64_t>, std::string> hardlinks;
 
-    auto flush_block = [&](std::string current_path = {}) {
-        if (buffer.empty()) {
-            return;
-        }
+    // Depth-1 compression pipeline: this thread reads and hashes file bytes
+    // into solid blocks while one background worker compresses, seals, and
+    // writes completed blocks in order. compress() is internally parallel, so
+    // the worker keeps every core busy while the reader hides file I/O and
+    // hashing behind it; the depth-1 slot bounds memory to one extra block.
+    struct PendingBlock {
+        ByteVector data;
+        std::string path;
+    };
+    std::mutex pipeline_mutex;
+    std::condition_variable pipeline_cv;
+    std::optional<PendingBlock> pending;
+    bool pipeline_done = false;
+    std::exception_ptr pipeline_error;
+
+    auto compress_and_write = [&](PendingBlock block) {
         report_operation(operation, OperationStage::compressing, completed_bytes, total_bytes,
-                         completed_items, total_items, current_path);
-        // Bytes count as completed when they finish *compressing*, not when they
-        // are read into the block buffer: compression dominates the wall time,
-        // and the codec reports each finished sub-block through the hook below
-        // so a large solid block advances the bar smoothly instead of freezing
-        // for the whole compress() call.
-        const auto block_base = completed_bytes;
+                         completed_items, total_items, block.path);
+        const auto block_base = completed_bytes.load(std::memory_order_relaxed);
         std::atomic<std::uint64_t> reported{0};
         auto block_options = options;
         block_options.encoded_bytes_progress = [&](std::uint64_t done) {
-            // Worker threads deliver cumulative high-water values, possibly out
+            // Codec workers deliver cumulative high-water values, possibly out
             // of order; only an increase is worth reporting.
             auto previous = reported.load(std::memory_order_relaxed);
             do {
@@ -1373,10 +1388,10 @@ void compress_items_into(std::ofstream& out, std::uint64_t& written,
             } while (!reported.compare_exchange_weak(previous, done,
                                                      std::memory_order_relaxed));
             report_operation(operation, OperationStage::compressing, block_base + done,
-                             total_bytes, completed_items, total_items, current_path);
+                             total_bytes, completed_items, total_items, block.path);
         };
-        auto compressed = compress(buffer, block_options);
-        completed_bytes = block_base + buffer.size();
+        auto compressed = compress(block.data, block_options);
+        completed_bytes.store(block_base + block.data.size(), std::memory_order_relaxed);
         if (key != nullptr) {
             // Seal the block, binding its index as associated data so blocks cannot
             // be reordered or transplanted between archives.
@@ -1385,17 +1400,78 @@ void compress_items_into(std::ofstream& out, std::uint64_t& written,
         }
         operation_checkpoint(operation);
         blocks.push_back({written, static_cast<std::uint64_t>(compressed.size()),
-                          static_cast<std::uint64_t>(buffer.size())});
+                          static_cast<std::uint64_t>(block.data.size())});
         out.write(reinterpret_cast<const char*>(compressed.data()),
                   static_cast<std::streamsize>(compressed.size()));
         if (!out) {
             throw std::runtime_error("failed while writing archive blocks");
         }
         written += compressed.size();
-        ++current_block;
-        buffer.clear();
         report_operation(operation, OperationStage::writing, completed_bytes, total_bytes,
-                         completed_items, total_items, std::move(current_path));
+                         completed_items, total_items, std::move(block.path));
+    };
+
+    std::thread pipeline_worker([&] {
+        try {
+            while (true) {
+                PendingBlock block;
+                {
+                    std::unique_lock lock(pipeline_mutex);
+                    pipeline_cv.wait(lock, [&] { return pending.has_value() || pipeline_done; });
+                    if (!pending.has_value()) {
+                        return;  // done and drained
+                    }
+                    block = std::move(*pending);
+                    pending.reset();
+                }
+                pipeline_cv.notify_all();  // the handoff slot is free again
+                compress_and_write(std::move(block));
+            }
+        } catch (...) {
+            {
+                std::lock_guard lock(pipeline_mutex);
+                pipeline_error = std::current_exception();
+                pending.reset();  // unblock a reader waiting on the slot
+            }
+            pipeline_cv.notify_all();
+        }
+    });
+
+    // Stop and join the worker on every exit path (including reader-side
+    // exceptions and cancellation), so the thread never outlives the locals.
+    struct PipelineGuard {
+        std::mutex& mutex;
+        std::condition_variable& cv;
+        bool& done;
+        std::thread& worker;
+        ~PipelineGuard() {
+            {
+                std::lock_guard lock(mutex);
+                done = true;
+            }
+            cv.notify_all();
+            if (worker.joinable()) {
+                worker.join();
+            }
+        }
+    } pipeline_guard{pipeline_mutex, pipeline_cv, pipeline_done, pipeline_worker};
+
+    auto flush_block = [&](std::string current_path = {}) {
+        if (buffer.empty()) {
+            return;
+        }
+        std::unique_lock lock(pipeline_mutex);
+        pipeline_cv.wait(lock, [&] { return !pending.has_value() || pipeline_error; });
+        if (pipeline_error) {
+            const auto error = pipeline_error;
+            lock.unlock();
+            std::rethrow_exception(error);
+        }
+        pending = PendingBlock{std::move(buffer), std::move(current_path)};
+        lock.unlock();
+        pipeline_cv.notify_all();
+        buffer = ByteVector{};
+        ++current_block;
     };
 
     for (const auto& item : items) {
@@ -1504,6 +1580,20 @@ void compress_items_into(std::ofstream& out, std::uint64_t& written,
                          completed_items, total_items, item.archive_path);
     }
     flush_block();
+
+    // Drain the pipeline: the caller reads blocks/written when we return, and a
+    // worker-side failure (compression or archive write) must surface here.
+    {
+        std::lock_guard lock(pipeline_mutex);
+        pipeline_done = true;
+    }
+    pipeline_cv.notify_all();
+    pipeline_worker.join();
+    if (pipeline_error) {
+        std::rethrow_exception(pipeline_error);
+    }
+    completed_bytes_out = completed_bytes;
+    completed_items_out = completed_items;
 }
 
 // Build encryption parameters for a new archive: random salt, default Argon2id cost,
