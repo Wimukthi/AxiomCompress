@@ -68,6 +68,17 @@ std::size_t common_prefix(const std::uint8_t* left,
     return matched;
 }
 
+// One row-hash table per worker thread, reset per encode: blocks are encoded
+// back to back on pool workers, so reallocating the 512 KiB table each pass
+// costs more than re-filling it.
+std::vector<Row>& reset_row_table() {
+    static thread_local std::vector<Row> table;
+    Row empty;
+    empty.fill(kInvalidPos);
+    table.assign(kHashSize, empty);
+    return table;
+}
+
 void remember(std::vector<Row>& table, std::span<const std::uint8_t> input, std::size_t pos) {
     if (pos + kMinMatch > input.size() || pos > kInvalidPos - 1) {
         return;
@@ -307,10 +318,7 @@ ByteVector encode_fast_lz(std::span<const std::uint8_t> input,
         throw FormatError("fast-lz block exceeds position limit");
     }
 
-    std::vector<Row> table(kHashSize);
-    for (auto& row : table) {
-        row.fill(kInvalidPos);
-    }
+    auto& table = reset_row_table();
 
     const auto max_distance = std::min<std::size_t>(
         std::max<std::size_t>(1, options.window_size), 0xFFFFFFu);
@@ -385,10 +393,7 @@ ByteVector encode_fast_lz77(std::span<const std::uint8_t> input,
         throw FormatError("fast-lz block exceeds position limit");
     }
 
-    std::vector<Row> table(kHashSize);
-    for (auto& row : table) {
-        row.fill(kInvalidPos);
-    }
+    auto& table = reset_row_table();
 
     const auto max_distance = std::min<std::size_t>(
         std::max<std::size_t>(1, options.window_size), 0xFFFFFFu);
@@ -571,10 +576,7 @@ FastLz77SplitPayloads encode_fast_lz77_split_payloads(
         throw FormatError("fast-lz block exceeds position limit");
     }
 
-    std::vector<Row> table(kHashSize);
-    for (auto& row : table) {
-        row.fill(kInvalidPos);
-    }
+    auto& table = reset_row_table();
 
     const auto max_distance = std::min<std::size_t>(
         std::max<std::size_t>(1, options.window_size), 0xFFFFFFu);

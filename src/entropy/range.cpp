@@ -514,7 +514,12 @@ std::optional<ByteVector> encode_rans(
     // Four interleaved states preserve the byte-for-byte order at the caller
     // boundary while breaking the decode dependency chain. The format is still
     // order-0 static rANS; it just stores four final states instead of one.
-    std::vector<std::uint8_t> scratch(input.size() * 2 + 64 + kRansLanes * 4);
+    // The backward-write scratch is reused per worker thread across streams —
+    // it can reach twice the literal stream size, so reallocating it for every
+    // trial encode is measurable. resize() keeps capacity; every byte consumed
+    // below is written first.
+    static thread_local std::vector<std::uint8_t> scratch;
+    scratch.resize(input.size() * 2 + 64 + kRansLanes * 4);
     std::size_t head = scratch.size();
     std::array<std::uint32_t, kRansLanes> states{};
     states.fill(kRansLow);
@@ -553,8 +558,11 @@ ByteVector decode_rans(std::span<const std::uint8_t> encoded, std::size_t max_ou
         cumulative[symbol + 1] = cumulative[symbol] + frequencies[symbol];
     }
 
-    // Flat slot -> symbol table for O(1) decode lookups.
-    std::vector<std::uint8_t> slot_to_symbol(kRansTotal);
+    // Flat slot -> symbol table for O(1) decode lookups. Reused per worker
+    // thread; the construction below writes every slot (frequencies sum to
+    // exactly kRansTotal), so no reset is needed.
+    static thread_local std::vector<std::uint8_t> slot_to_symbol;
+    slot_to_symbol.resize(kRansTotal);
     for (std::size_t symbol = 0; symbol < kSymbolCount; ++symbol) {
         for (std::uint32_t slot = cumulative[symbol]; slot < cumulative[symbol + 1]; ++slot) {
             slot_to_symbol[slot] = static_cast<std::uint8_t>(symbol);
@@ -625,7 +633,9 @@ std::optional<ByteVector> encode_rans_order1(std::span<const std::uint8_t> input
     }
 
     // Order-1 joint histogram; the first byte uses context 0, matching decode.
-    std::vector<std::uint32_t> joint(kSymbolCount * kSymbolCount, 0);
+    // Reused per worker thread: 256 KiB re-zeroed is cheaper than re-faulted.
+    static thread_local std::vector<std::uint32_t> joint;
+    joint.assign(kSymbolCount * kSymbolCount, 0);
     std::array<std::uint64_t, kSymbolCount> context_total{};
     {
         std::uint8_t prev = 0;
@@ -767,8 +777,10 @@ std::optional<ByteVector> encode_rans_order1(std::span<const std::uint8_t> input
     }
 
     // Backward interleaved encode, exactly the order-0 scheme with the
-    // frequency table chosen by each position's context cluster.
-    std::vector<std::uint8_t> scratch(input.size() * 2 + 64 + kRansLanes * 4);
+    // frequency table chosen by each position's context cluster. The scratch
+    // is shared with the order-0 encoder's thread-local buffer semantics.
+    static thread_local std::vector<std::uint8_t> scratch;
+    scratch.resize(input.size() * 2 + 64 + kRansLanes * 4);
     std::size_t head = scratch.size();
     std::array<std::uint32_t, kRansLanes> states{};
     states.fill(kRansLow);
@@ -828,14 +840,21 @@ ByteVector decode_rans_order1(std::span<const std::uint8_t> encoded,
         cluster_map[context] = cluster;
     }
 
-    std::vector<std::uint32_t> frequencies(cluster_count * kSymbolCount);
-    std::vector<std::uint32_t> cumulative(cluster_count * (kSymbolCount + 1), 0);
-    std::vector<std::uint8_t> slot_to_symbol(cluster_count * kRansO1Total);
+    // Reused per worker thread. frequencies and the slot tables are fully
+    // overwritten below; cumulative needs its per-cluster base re-zeroed
+    // because the running sums start from cumul[0].
+    static thread_local std::vector<std::uint32_t> frequencies;
+    static thread_local std::vector<std::uint32_t> cumulative;
+    static thread_local std::vector<std::uint8_t> slot_to_symbol;
+    frequencies.resize(cluster_count * kSymbolCount);
+    cumulative.resize(cluster_count * (kSymbolCount + 1));
+    slot_to_symbol.resize(cluster_count * kRansO1Total);
     for (std::size_t j = 0; j < cluster_count; ++j) {
         const auto table = rans_read_table(encoded, cursor, kRansO1Total);
         auto* freq = &frequencies[j * kSymbolCount];
         auto* cumul = &cumulative[j * (kSymbolCount + 1)];
         auto* slots = &slot_to_symbol[j * kRansO1Total];
+        cumul[0] = 0;
         for (std::size_t s = 0; s < kSymbolCount; ++s) {
             freq[s] = table[s];
             cumul[s + 1] = cumul[s] + table[s];

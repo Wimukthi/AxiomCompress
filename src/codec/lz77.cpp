@@ -372,8 +372,14 @@ ByteVector encode_lz77_impl(std::span<const std::uint8_t> input,
     ByteVector output;
     output.reserve(input.size());
 
-    std::vector<Index> hash_heads(kHashSize, kNoPos);
-    std::vector<Index> previous(input.size(), kNoPos);
+    // Pool workers encode blocks back to back; reusing the multi-megabyte
+    // match-finder arrays per thread avoids reallocating and re-faulting them
+    // for every block. assign() keeps capacity while writing the reset values
+    // the old fresh allocations held.
+    static thread_local std::vector<Index> hash_heads;
+    static thread_local std::vector<Index> previous;
+    hash_heads.assign(kHashSize, kNoPos);
+    previous.assign(input.size(), kNoPos);
 
     const auto window_size = std::max<std::size_t>(kMinMatch, options.window_size);
     const auto max_match = std::max<std::size_t>(kMinMatch, options.max_match);
@@ -582,10 +588,13 @@ ByteVector encode_lz77_tree(std::span<const std::uint8_t> input,
     // to the original full-window tree; otherwise memory is bounded to the window.
     const auto cyclic_size = std::min(window_size, n);
 
-    std::vector<Index> head(kHashSize, kNoPos);
+    // Reused per worker thread across blocks (see encode_lz77_impl).
+    static thread_local std::vector<Index> head;
+    static thread_local std::vector<Index> son;
+    head.assign(kHashSize, kNoPos);
     // son[2*slot] smaller subtree, son[2*slot+1] larger subtree, indexed by the
     // candidate's cyclic slot rather than its absolute position.
-    std::vector<Index> son(2 * cyclic_size, kNoPos);
+    son.assign(2 * cyclic_size, kNoPos);
 
     const auto max_match = std::max<std::size_t>(kMinMatch, options.max_match);
     const auto depth_cutoff = std::max<std::size_t>(1, options.max_chain_depth);
@@ -773,15 +782,22 @@ ByteVector optimal_parse_with_costs(std::span<const std::uint8_t> input,
 
     using Index = std::uint32_t;
     constexpr Index kNoPos = std::numeric_limits<Index>::max();
-    std::vector<Index> hash_heads(kHashSize, kNoPos);
-    std::vector<Index> previous(input.size(), kNoPos);
-    std::vector<std::uint64_t> costs(input.size() + 1, kInf);
-    std::vector<ParseDecision> decisions(input.size() + 1);
+    // Reused per worker thread across blocks (see encode_lz77_impl); the DP
+    // arrays here are the largest allocations in the codec.
+    static thread_local std::vector<Index> hash_heads;
+    static thread_local std::vector<Index> previous;
+    static thread_local std::vector<std::uint64_t> costs;
+    static thread_local std::vector<ParseDecision> decisions;
+    hash_heads.assign(kHashSize, kNoPos);
+    previous.assign(input.size(), kNoPos);
+    costs.assign(input.size() + 1, kInf);
+    decisions.assign(input.size() + 1, ParseDecision{});
     // The recent-distance list depends on the path taken, so each position keeps
     // the rep state of the lowest-cost path that reaches it. Because costs[pos]
     // is final once the loop reaches pos (every in-edge comes from an earlier
     // position), the recorded decision lets us settle reps_at[pos] deterministically.
-    std::vector<std::array<std::size_t, kRepCount>> reps_at(input.size() + 1);
+    static thread_local std::vector<std::array<std::size_t, kRepCount>> reps_at;
+    reps_at.assign(input.size() + 1, {});
     costs[0] = 0;
 
     auto insert_position = [&](std::size_t position) {
