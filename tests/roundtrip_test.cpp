@@ -378,6 +378,24 @@ void test_crc32() {
         axiom::core::crc32(left), axiom::core::crc32(right), right.size());
     AXIOM_CHECK(combined == axiom::core::crc32(data));
 
+    // A large buffer takes the folded (PCLMUL) path where available; walking
+    // the same bytes in small prime-sized chunks stays on the scalar path, so
+    // this pins the two implementations to each other. The trailing odd sizes
+    // exercise every head/tail split around the 16-byte folding granularity.
+    data.resize((1u << 20) + 37);
+    for (auto& byte : data) {
+        byte = static_cast<std::uint8_t>(rng());
+    }
+    const auto whole = axiom::core::crc32(data);
+    AXIOM_CHECK(whole == crc32_reference(data));
+    auto chunked = axiom::core::crc32_init();
+    for (std::size_t offset = 0; offset < data.size();) {
+        const auto step = std::min<std::size_t>(61, data.size() - offset);
+        chunked = axiom::core::crc32_update(chunked, std::span(data).subspan(offset, step));
+        offset += step;
+    }
+    AXIOM_CHECK(axiom::core::crc32_final(chunked) == whole);
+
     // CPU detection must at least run and return a string (content is host-specific).
     AXIOM_CHECK(axiom::core::cpu_features_string() != nullptr);
 }

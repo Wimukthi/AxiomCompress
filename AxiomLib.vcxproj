@@ -109,6 +109,7 @@
     <ClCompile Include="src\codec\lz77_split.cpp" />
     <ClCompile Include="src\core\archive.cpp" />
     <ClCompile Include="src\core\checksum.cpp" />
+    <ClCompile Include="src\core\checksum_clmul.cpp" />
     <ClCompile Include="src\core\cpu.cpp" />
     <ClCompile Include="src\core\crypto.cpp" />
     <ClCompile Include="src\core\file_meta.cpp" />

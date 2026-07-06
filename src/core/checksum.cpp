@@ -1,10 +1,27 @@
 #include "core/checksum.hpp"
 
+#include "core/cpu.hpp"
+
 #include <array>
 #include <cstddef>
 #include <cstdint>
 
+#if defined(_M_X64) || defined(_M_IX86) || defined(__x86_64__) || defined(__i386__)
+#define AXIOM_CHECKSUM_X86 1
+#endif
+
 namespace axiom::core {
+
+#if defined(AXIOM_CHECKSUM_X86)
+namespace detail {
+// Defined in checksum_clmul.cpp; requires size >= 64, size % 16 == 0, and a
+// CPU with PCLMUL + SSE4.1 (checked by the caller).
+std::uint32_t crc32_update_pclmul(std::uint32_t state,
+                                  const std::uint8_t* data,
+                                  std::size_t size);
+}  // namespace detail
+#endif
+
 namespace {
 
 // Standard reflected CRC-32 (polynomial 0xEDB88320, as used by zlib/PNG/gzip).
@@ -74,14 +91,26 @@ std::uint32_t crc32_init() {
     return 0xFFFFFFFFu;
 }
 
-// Slice-by-8 reflected CRC-32: consumes eight bytes per iteration through the
-// extended tables, then a byte-at-a-time tail. Portable scalar; several times
-// faster than the classic one-byte-per-step loop and the guaranteed-correct
-// reference for any future SIMD kernel.
+// Reflected CRC-32 update. Large inputs go through the PCLMULQDQ folding
+// kernel when the CPU supports it (an order of magnitude faster than the
+// table method); the remainder and small inputs use slice-by-8, which stays
+// the guaranteed-correct portable reference.
 std::uint32_t crc32_update(std::uint32_t state, std::span<const std::uint8_t> input) {
     const auto& tables = crc_tables();
     const std::uint8_t* data = input.data();
     std::size_t size = input.size();
+
+#if defined(AXIOM_CHECKSUM_X86)
+    if (size >= 64) {
+        const auto& cpu = cpu_features();
+        if (cpu.pclmul && cpu.sse41) {
+            const std::size_t folded = size & ~std::size_t{15};
+            state = detail::crc32_update_pclmul(state, data, folded);
+            data += folded;
+            size -= folded;
+        }
+    }
+#endif
 
     while (size >= 8) {
         const std::uint32_t low = state ^ load_u32_le(data);

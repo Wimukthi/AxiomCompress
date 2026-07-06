@@ -43,6 +43,7 @@ add_library(axiom STATIC
     src/codec/lz77_split.cpp
     src/core/archive.cpp
     src/core/checksum.cpp
+    src/core/checksum_clmul.cpp
     src/core/cpu.cpp
     src/core/crypto.cpp
     src/core/file_meta.cpp
@@ -67,6 +68,9 @@ if(MSVC)
 else()
     target_compile_options(axiom PRIVATE -Wall -Wextra -Wpedantic)
     set_source_files_properties(${BLAKE3_SOURCES} ${MONOCYPHER_SOURCES} ${MINIZ_SOURCES} PROPERTIES COMPILE_OPTIONS -w)
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|i686")
+        set_source_files_properties(src/core/checksum_clmul.cpp PROPERTIES COMPILE_OPTIONS "-msse4.1;-mpclmul")
+    endif()
     set_source_files_properties(src/third_party/blake3/blake3_sse2.c PROPERTIES COMPILE_OPTIONS "-w;-msse2")
     set_source_files_properties(src/third_party/blake3/blake3_sse41.c PROPERTIES COMPILE_OPTIONS "-w;-msse4.1")
     set_source_files_properties(src/third_party/blake3/blake3_avx2.c PROPERTIES COMPILE_OPTIONS "-w;-mavx2")
