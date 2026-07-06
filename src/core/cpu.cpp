@@ -2,6 +2,18 @@
 
 #include <cstdint>
 #include <string>
+#include <thread>
+#include <vector>
+
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 #if defined(_M_X64) || defined(_M_IX86) || defined(__x86_64__) || defined(__i386__)
 #define AXIOM_X86 1
@@ -86,6 +98,46 @@ CpuFeatures detect() {
 const CpuFeatures& cpu_features() {
     static const CpuFeatures features = detect();
     return features;
+}
+
+namespace {
+
+std::size_t detect_physical_cores() {
+    const auto logical = static_cast<std::size_t>(std::thread::hardware_concurrency());
+#if defined(_WIN32)
+    DWORD length = 0;
+    GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &length);
+    if (GetLastError() == ERROR_INSUFFICIENT_BUFFER && length != 0) {
+        std::vector<std::uint8_t> buffer(length);
+        if (GetLogicalProcessorInformationEx(
+                RelationProcessorCore,
+                reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(buffer.data()),
+                &length)) {
+            std::size_t cores = 0;
+            std::size_t offset = 0;
+            while (offset < length) {
+                const auto* info =
+                    reinterpret_cast<const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(
+                        buffer.data() + offset);
+                if (info->Relationship == RelationProcessorCore) {
+                    ++cores;
+                }
+                offset += info->Size;
+            }
+            if (cores != 0) {
+                return cores;
+            }
+        }
+    }
+#endif
+    return logical != 0 ? logical : 1;
+}
+
+}  // namespace
+
+std::size_t physical_core_count() {
+    static const std::size_t cores = detect_physical_cores();
+    return cores;
 }
 
 const char* cpu_features_string() {

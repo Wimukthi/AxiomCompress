@@ -247,7 +247,8 @@ ByteVector compress(std::span<const std::uint8_t> input,
         }
         const auto block_size = parallel_options.block_size;
         const auto block_count = (input.size() + block_size - 1) / block_size;
-        const auto workers = codec::effective_thread_count(options.thread_count, block_count);
+        const auto workers =
+            codec::effective_compression_thread_count(options.thread_count, block_count);
 
         if (options.force_parallel_blocks) {
             std::uint32_t block_crc = 0;

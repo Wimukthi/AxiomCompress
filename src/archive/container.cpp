@@ -3,6 +3,7 @@
 #include "archive/container_internal.hpp"
 #include "archive/fuzz_support.hpp"
 #include "core/checksum.hpp"
+#include "core/cpu.hpp"
 #include "core/crypto.hpp"
 #include "core/file_meta.hpp"
 #include "core/hash.hpp"
@@ -72,11 +73,9 @@ std::size_t effective_io_buffer_size(std::size_t requested) {
 }
 
 std::size_t selected_thread_count(std::size_t requested_threads) {
-    auto threads = requested_threads;
-    if (threads == 0) {
-        threads = std::thread::hardware_concurrency();
-    }
-    return threads == 0 ? 1 : threads;
+    // Solid blocks feed compression workers, which default to physical cores
+    // (SMT siblings measured flat-to-negative for the codec), so size for that.
+    return requested_threads == 0 ? core::physical_core_count() : requested_threads;
 }
 
 std::size_t effective_solid_block_size(const CompressionOptions& options) {
@@ -841,6 +840,18 @@ struct EncodedRecoveryService {
     ByteVector tail;
 };
 
+std::uint64_t recovery_progress_multiply(std::uint64_t left, std::uint64_t right) {
+    if (left != 0 && right > std::numeric_limits<std::uint64_t>::max() / left) {
+        return std::numeric_limits<std::uint64_t>::max();
+    }
+    return left * right;
+}
+
+std::uint64_t recovery_progress_add(std::uint64_t left, std::uint64_t right) {
+    const auto max = std::numeric_limits<std::uint64_t>::max();
+    return right > max - left ? max : left + right;
+}
+
 EncodedRecoveryService encode_recovery_service(
     const ByteSource& source, std::uint64_t protected_size,
     std::uint64_t directory_offset, std::uint64_t directory_size,
@@ -862,6 +873,9 @@ EncodedRecoveryService encode_recovery_service(
     if (shard_size > std::numeric_limits<std::size_t>::max()) {
         throw std::runtime_error("archive is too large for recovery processing");
     }
+    const std::uint64_t parity_work = recovery_progress_multiply(
+        static_cast<std::uint64_t>(parity_count), shard_size);
+    const std::uint64_t total_work = recovery_progress_add(protected_size, parity_work);
 
     std::vector<std::vector<std::uint8_t>> data(
         static_cast<std::size_t>(data_count),
@@ -877,7 +891,7 @@ EncodedRecoveryService encode_recovery_service(
             std::copy(bytes.begin(), bytes.end(), data[static_cast<std::size_t>(i)].begin());
             completed += count;
         }
-        report_operation(operation, OperationStage::finalizing, completed, protected_size,
+        report_operation(operation, OperationStage::finalizing, completed, total_work,
                          static_cast<std::uint64_t>(i + 1),
                          static_cast<std::uint64_t>(data_count + parity_count),
                          "Building recovery record");
@@ -892,7 +906,23 @@ EncodedRecoveryService encode_recovery_service(
     parity_spans.reserve(parity.size());
     for (const auto& shard : data) data_spans.emplace_back(shard);
     for (auto& shard : parity) parity_spans.emplace_back(shard);
-    core::ReedSolomon(data_count, parity_count).encode(data_spans, parity_spans);
+    core::ReedSolomon(data_count, parity_count).encode(
+        data_spans, parity_spans,
+        [&](int parity_index, std::size_t parity_completed, std::size_t parity_total) {
+            operation_checkpoint(operation);
+            const std::uint64_t encoded_before = recovery_progress_multiply(
+                static_cast<std::uint64_t>(std::max(0, parity_index)), shard_size);
+            const std::uint64_t encoded_current = std::min<std::uint64_t>(
+                static_cast<std::uint64_t>(parity_completed), shard_size);
+            const std::uint64_t completed_work = recovery_progress_add(
+                protected_size, recovery_progress_add(encoded_before, encoded_current));
+            const bool parity_done = parity_completed >= parity_total;
+            report_operation(operation, OperationStage::finalizing, completed_work, total_work,
+                             static_cast<std::uint64_t>(
+                                 data_count + parity_index + (parity_done ? 1 : 0)),
+                             static_cast<std::uint64_t>(data_count + parity_count),
+                             "Encoding recovery parity");
+        });
 
     ByteVector body;
     body.insert(body.end(), kRecoveryMagic.begin(), kRecoveryMagic.end());
@@ -2925,11 +2955,30 @@ ArchiveVolumeSetInfo create_archive_volumes(
     std::vector<std::vector<std::uint8_t>> parity(
         static_cast<std::size_t>(parity_count), std::vector<std::uint8_t>(shard_size, 0));
     if (parity_count != 0) {
+        const std::uint64_t parity_work = recovery_progress_multiply(
+            static_cast<std::uint64_t>(parity_count), volume_size);
         std::vector<std::span<const std::uint8_t>> data_spans;
         std::vector<std::span<std::uint8_t>> parity_spans;
         for (const auto& shard : data) data_spans.emplace_back(shard);
         for (auto& shard : parity) parity_spans.emplace_back(shard);
-        core::ReedSolomon(data_count, parity_count).encode(data_spans, parity_spans);
+        core::ReedSolomon(data_count, parity_count).encode(
+            data_spans, parity_spans,
+            [&](int parity_index, std::size_t parity_completed, std::size_t parity_total) {
+                operation_checkpoint(operation);
+                const std::uint64_t encoded_before = recovery_progress_multiply(
+                    static_cast<std::uint64_t>(std::max(0, parity_index)), volume_size);
+                const std::uint64_t encoded_current = std::min<std::uint64_t>(
+                    static_cast<std::uint64_t>(parity_completed), volume_size);
+                const std::uint64_t completed = recovery_progress_add(
+                    encoded_before, encoded_current);
+                const bool parity_done = parity_completed >= parity_total;
+                report_operation(operation, OperationStage::finalizing,
+                                 completed, parity_work,
+                                 static_cast<std::uint64_t>(
+                                     data_count + parity_index + (parity_done ? 1 : 0)),
+                                 static_cast<std::uint64_t>(data_count + parity_count),
+                                 "Encoding recovery volumes");
+            });
     }
 
     fs::path root = archive_path;

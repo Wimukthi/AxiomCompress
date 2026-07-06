@@ -6,6 +6,7 @@
 #include "codec/lz77_split.hpp"
 #include "codec/varint.hpp"
 #include "core/checksum.hpp"
+#include "core/cpu.hpp"
 #include "entropy/huffman.hpp"
 
 #include <algorithm>
@@ -283,6 +284,13 @@ std::size_t effective_thread_count(std::size_t requested_threads, std::size_t wo
     return std::min<std::size_t>(threads, work_items);
 }
 
+std::size_t effective_compression_thread_count(std::size_t requested_threads,
+                                               std::size_t work_items) {
+    return effective_thread_count(
+        requested_threads == 0 ? core::physical_core_count() : requested_threads,
+        work_items);
+}
+
 std::size_t effective_parallel_block_size(std::size_t input_size,
                                           const CompressionOptions& options) {
     auto block_size = std::max<std::size_t>(1, options.block_size);
@@ -292,7 +300,7 @@ std::size_t effective_parallel_block_size(std::size_t input_size,
 
     auto target_threads = options.thread_count;
     if (target_threads == 0) {
-        target_threads = std::thread::hardware_concurrency();
+        target_threads = core::physical_core_count();
     }
     if (target_threads <= 1) {
         return block_size;
@@ -326,7 +334,8 @@ ByteVector encode_parallel_blocks(std::span<const std::uint8_t> input,
     std::vector<std::uint32_t> block_crcs(crc32 != nullptr ? block_count : 0);
     std::atomic_size_t next_block = 0;
     std::atomic_uint64_t encoded_bytes = 0;
-    const auto worker_count = effective_thread_count(options.thread_count, block_count);
+    const auto worker_count =
+        effective_compression_thread_count(options.thread_count, block_count);
     std::mutex exception_mutex;
     std::exception_ptr first_exception;
 
