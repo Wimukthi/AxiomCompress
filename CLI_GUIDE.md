@@ -370,12 +370,18 @@ axiomc a --max maximum-ratio.axar Data
 | Level | Main profile | Typical use |
 |---:|---|---|
 | 1 | Dedicated fast LZ path | Minimum CPU time |
-| 2-3 | Shallow hash-chain search | Fast backups |
-| 4-5 | Balanced hash-chain search | General use |
+| 2-3 | Shallow hash-chain search, price-aware lazy | Fast backups |
+| 4-5 | Balanced hash-chain search, price-aware lazy | General use |
 | 6 | Deep hash-chain search | Better ratio without tree memory |
-| 7 | Binary tree, 8 MiB window/block | High ratio |
-| 8 | Binary tree, 32 MiB window/block | Very high ratio |
-| 9 | Binary tree, 64 MiB window / 16 MiB block | Maximum preset; bounded high-effort search |
+| 7 | Binary tree (greedy), 8 MiB window | Long-range redundancy (inputs with repeats beyond the 1 MiB chain window) |
+| 8 | Binary tree + single-pass optimal parse, 32 MiB window | Very high ratio at moderate time |
+| 9 | Binary tree + two-pass optimal parse, 64 MiB window | Maximum preset |
+
+Levels 8 and 9 run the dynamic-programming optimal parser (candidates come from
+the binary tree); on generic data they compress substantially smaller than
+levels 6-7. Level 7's greedy long-range search only pays off when the input
+actually contains redundancy beyond the hash-chain levels' 1 MiB window — on
+ordinary mixed data level 6 often matches it at half the time.
 
 Explicit tuning options override the level regardless of argument order.
 
@@ -390,10 +396,12 @@ These options apply to commands that create or recompress data: `add`, `update`,
 
 ### Threads: `--threads N`
 
-`0` means all available hardware threads. This is also the default for
-compression, testing, extraction, decompression, and the GUI's automatic thread
-setting. Axiom caps the actual worker count to useful work items, so a small
-archive will not create one busy thread per CPU just to sit idle.
+`0` is the default and means "use the machine": compression uses all physical
+cores (hyperthread siblings measurably contend rather than help on the codec's
+memory-bound hot loops), while decompression, testing, and extraction use all
+logical processors. An explicit `N` is honored as given in both directions.
+Axiom caps the actual worker count to useful work items, so a small archive
+will not create one busy thread per CPU just to sit idle.
 
 ```powershell
 axiomc a --threads 8 archive.axar Data

@@ -49,15 +49,30 @@ container reader
 The codec currently implements:
 
 - Three match finders selected by effort: a **fast 2-way row-hash matcher**
-  (`fast_lz`, level 1), a **lazy hash-chain matcher** (levels 2–6), and an
-  LZMA-style **cyclic-window binary-tree matcher** (`--bt`, levels 7–9), plus an
-  optional bounded **optimal (DP) parser**.
+  (`fast_lz`, level 1), a **price-aware lazy hash-chain matcher** (levels 2–6:
+  the lazy step defers on token-cost comparison and on repeat-offsets available
+  one position ahead, not just on "strictly longer"), and an LZMA-style
+  **cyclic-window binary-tree matcher** (`--bt`, levels 7–9).
+- A bounded **optimal (DP) parser** whose candidates come from the binary tree
+  (LZMA-style `GetMatches`: the descent yields several distinct lengths, each
+  at its nearest distance). Level 9 runs it two-pass (re-parse with measured
+  entropy costs); level 8 runs it single-pass with the cost model measured from
+  the greedy parse, for most of the ratio at roughly half the time.
 - Repeat-offset (rep0–rep3) matches and split LZ77 streams, with an optional
   position-slot distance representation.
-- Entropy via byte-level canonical Huffman, a **4-lane interleaved order-0 rANS**,
-  and a Fenwick-backed adaptive **order-1** range coder. (An earlier bit-serial
-  order-0 *arithmetic* coder was removed once rANS superseded it at the same size
-  and far higher decode speed.)
+- Entropy via byte-level canonical Huffman, a **4-lane interleaved order-0
+  rANS**, and a **clustered static order-1 rANS** (previous-byte contexts
+  grouped into at most 16 transmitted frequency tables; decodes at table-lookup
+  speed). At the thorough levels the order-1 coder competes for the literal,
+  command, length, and distance-slot streams and is kept only when strictly
+  smaller. (A Fenwick-backed adaptive order-1 range coder remains decodable for
+  older archives but is no longer emitted — it decoded ~30x slower for a
+  fraction of a percent; an earlier bit-serial order-0 arithmetic coder was
+  removed entirely once rANS superseded it.)
+- SIMD where it measurably pays: BLAKE3 hashing (SSE2→AVX-512, runtime
+  dispatched), PCLMULQDQ-folded CRC-32, and SWAR match comparison. Integrity
+  hashing and CRC are the vectorized hot spots; the matchers are scalar by
+  measurement, not omission.
 - A threaded independent-block codec, and a multi-file `.axar` container of solid
   blocks with a central directory (see [FORMAT.md](FORMAT.md)). The default
   writer now sizes both archive solid blocks and internal codec blocks from the
@@ -220,37 +235,40 @@ higher-effort ratio tools for levels that explicitly trade speed away.
 A single `--level 1..9` knob selects the speed/ratio operating point (default 5).
 Levels 1–6 drive the hash-chain matcher, raising chain depth and turning on lazy
 matching and the full entropy bake-off as the level rises; levels 7–9 switch to
-the binary-tree matcher with growing windows. Level 9 keeps the deepest default
-tree search but uses bounded solid blocks so mixed random/text archives do not
-spend maximum effort on data that will be stored anyway.
-Individual flags (`--chain-depth`, `--nice`, `--lazy`/`--no-lazy`,
-`--fast-entropy`, `--bt`, `--window`, `--optimal…`) override the preset, so a level
-is just a starting point. The decoder is identical at every level.
+the binary-tree matcher with growing windows, and levels 8–9 add the optimal
+parser (single-pass at 8, two-pass at 9). Individual flags (`--chain-depth`,
+`--nice`, `--lazy`/`--no-lazy`, `--fast-entropy`, `--bt`, `--window`,
+`--optimal…`) override the preset, so a level is just a starting point. The
+decoder is identical at every level.
 
 ### Normal hash-chain parsing
 
-Normal mode is greedy with optional **lazy matching**:
+Normal mode is greedy with optional **price-aware lazy matching**:
 
 1. Find a match at position `p`.
 2. Peek at `p + 1`.
-3. If `p + 1` has a strictly longer match, emit one literal and take that better
-   match next.
+3. Defer (emit one literal) when the deferred path is cheaper per byte under
+   the token cost model — strictly longer matches still defer, and so do
+   similar-length matches that land a much nearer distance — or when any
+   repeat-offset at `p + 1` reaches the current match's length (reps code no
+   distance at all).
 
 This gives shallow chains much of the ratio of deeper chains without making the
 fast levels too slow. Match-length comparison reads eight bytes at a time.
 
 ### Entropy selection
 
-After parsing, Axiom splits the LZ77 data into separate streams. The entropy stage
-then either:
+After parsing, Axiom splits the LZ77 data into separate streams (commands,
+literal lengths, match lengths, distances or distance slots + footer bits, and
+literals). The entropy stage then either:
 
-- trial-encodes every available coder and keeps the smallest result on higher
-  levels, or
+- trial-encodes every available coder per stream and keeps the smallest result
+  on higher levels — including the clustered order-1 rANS for the literal and
+  sequence streams, which carry strong previous-symbol structure — or
 - uses a one-pass order-0 estimate on levels 1-3.
 
-Fast levels code literals with rANS instead of the bit-serial order-1 coder.
-Order-1 can improve text ratio, but it decodes much more slowly and would dominate
-decode time.
+All selected coders decode at table-lookup speed; decode time is flat across
+levels by design.
 
 ### Binary-tree mode
 
@@ -264,27 +282,36 @@ cyclic window.
 
 ### Optimal parser
 
-`--optimal` enables bounded dynamic-programming parsing over the same match
-finder. It scores literals, useful match lengths, and repeat-offset matches, then
-reconstructs the lowest-cost token sequence.
+`--optimal` (and levels 8–9 by preset) enables bounded dynamic-programming
+parsing. It scores literals, useful match lengths, and repeat-offset matches,
+then reconstructs the lowest-cost token sequence. On the tree levels the DP's
+candidates come from the cyclic binary tree itself: advancing a position both
+inserts it and yields each improving (length, distance) pair met during the
+descent, so a bounded search surfaces several distinct lengths at their nearest
+distances — substantially better parses than hash-chain candidates for the
+same work.
 
-The parser runs twice:
+Two effort shapes exist:
 
-1. First pass: use fixed weights.
-2. Measure the output streams.
-3. Second pass: use measured entropy costs.
-4. Keep whichever fully encoded result is smaller.
+- **Two-pass** (level 9, `--optimal`): parse with fixed weights, measure the
+  output streams, re-parse with measured entropy costs, keep whichever fully
+  encoded result is smaller.
+- **Single-pass** (level 8): measure the cost model from the greedy parse the
+  block encoder already computed, then run the DP once — most of the two-pass
+  ratio at roughly half the time.
 
-The default optimal effort uses a shallower chain than greedy parsing so high
-levels stay practical. Use `--optimal-depth` and `--optimal-candidates` only when
-benchmarking or deliberately trading runtime for ratio.
+Use `--optimal-depth` and `--optimal-candidates` only when benchmarking or
+deliberately trading runtime for ratio (deeper descents keep helping slightly).
 
 ## Benchmarking
 
-The standing corpus is **enwik8** (100 MB of English Wikipedia text), the de-facto
-LZMA-class ratio benchmark. `tools\bench_enwik8.ps1` downloads it on first run,
-sweeps the match finders and window sizes, prints a 7-Zip reference, and verifies
-every row by round-trip before reporting a ratio.
+The standing corpora are **enwik8** (100 MB of English Wikipedia text, the
+de-facto LZMA-class ratio benchmark) and the **Silesia corpus** (~212 MB of
+mixed text/binary/medical/database data, benchmarked as a single tar, which is
+what zstd and most modern codecs report against). `tools\bench_enwik8.ps1`
+downloads enwik8 on first run, sweeps the match finders and window sizes,
+prints a 7-Zip reference, and verifies every row by round-trip before reporting
+a ratio. Cross-format Silesia results live in the README's performance section.
 
 For ad-hoc inputs, the Python harness (`bench/bench_7zip.py`) can compare files
 directly; for folders it builds a deterministic byte stream of relative paths and
@@ -304,7 +331,10 @@ Any new feature must keep decompression deterministic and bounded:
 
 ## Threading
 
-`thread_count == 0` means all hardware threads. The codec caps the actual worker
+`thread_count == 0` means "use the machine": compression workers default to the
+**physical core count** (hyperthread siblings measured flat-to-negative on the
+codec's memory-bound hot loops), while decode uses all logical processors.
+Explicit thread counts are honored as given. The codec caps the actual worker
 count to the number of useful work items so small inputs do not create idle
 threads, while large inputs split enough independent blocks to keep the requested
 workers busy.
@@ -325,11 +355,12 @@ runs.
 
 Parallel blocks are independent by design: each block picks store, raw LZ77,
 Huffman-coded LZ77, the level-1 `fast_lz` format, or split-stream LZ77 whose
-substreams can use store, Huffman, **order-0 rANS**, or the adaptive **order-1**
-range coder. The order-1 coder transmits no table; both endpoints evolve identical
-per-context (previous-byte) models. On the speed levels it is skipped in favor of
-rANS even on literals (it decodes bit-serially and would dominate decode time); on
-the ratio levels it is selected per substream only when it is the smallest.
+substreams can use store, Huffman, **order-0 rANS**, or the **clustered static
+order-1 rANS** (previous-byte contexts grouped into at most 16 transmitted
+tables plus a context map; decodes with the same interleaved table-lookup loop
+as order-0). On the speed levels streams go straight to order-0 rANS; on the
+ratio levels every coder competes per substream and the smallest wins. The
+legacy adaptive order-1 range coder remains decodable but is never emitted.
 
 The container-level block payload records enough sizes for deterministic
 reconstruction. Parallel-block encode and decode also compute per-block CRCs on

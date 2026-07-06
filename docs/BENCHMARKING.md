@@ -44,6 +44,13 @@ Include these categories:
 - Already-compressed or random data, where the compressor should fail cheaply.
 - Long-distance repetition, where large windows and solid blocks are useful.
 
+For cross-codec comparisons, the standing corpus is the **Silesia corpus**
+(https://sun.aei.polsl.pl/~sdeor/index.php?page=silesia, ~212 MB of mixed
+text/binary data): pack the twelve files into one uncompressed tar and feed
+that same tar to every codec (`axiomc c`, `zstd`, `7z`, ...) so container
+overhead and file grouping do not skew the comparison. Verify every row by
+round-trip. The README's performance section is measured this way.
+
 If you only need a smoke test, let the script create deterministic sample files:
 
 ```powershell

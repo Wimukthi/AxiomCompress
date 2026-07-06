@@ -5,9 +5,12 @@ line. Its main archive format is `.axar`; the lower-level single-stream format i
 `.axc`.
 
 The current goal is 7-Zip-class solid compression with a simple, bounded decoder.
-The project is not yet at 7-Zip's maximum ratio, but it already has a complete
-archive container, a native Win32 GUI, a scriptable CLI, integrity checks,
-encryption, recovery data, split volumes, signing, and SFX packaging.
+On the Silesia corpus the maximum preset now lands within a few percent of
+`zstd -19` at comparable compression time (see the performance section below);
+7-Zip's LZMA2 maximum still compresses smaller. Beyond the codec, the project
+has a complete archive container, a native Win32 GUI, a scriptable CLI,
+integrity checks, encryption, recovery data, split volumes, signing, and SFX
+packaging.
 
 ## Start here
 
@@ -293,17 +296,19 @@ reference: [CLI_GUIDE.md](CLI_GUIDE.md).
 
 One level chooses the speed/ratio tradeoff:
 
-| Level | Matcher | Intended use |
+| Level | Matcher / parser | Intended use |
 |---|---|---|
 | 1 / `--fast` | Fast row hash | Fastest compression |
-| 2-3 | Shallow hash chain | Fast backups |
-| 4-5 | Lazy hash chain | Balanced default use |
+| 2-3 | Shallow hash chain, price-aware lazy | Fast backups |
+| 4-5 | Lazy hash chain, price-aware lazy | Balanced default use |
 | 6 | Deeper hash chain | Better ratio without tree memory |
-| 7 | Binary tree, 8 MiB window | Long-range matches |
-| 8 | Binary tree, 32 MiB window | Wider long-range search |
-| 9 / `--max` | Binary tree, 64 MiB window | Maximum preset |
+| 7 | Binary tree (greedy), 8 MiB window | Long-range redundancy beyond the chain levels' 1 MiB window |
+| 8 | Binary tree + single-pass optimal parse, 32 MiB window | Very high ratio at moderate time |
+| 9 / `--max` | Binary tree + two-pass optimal parse, 64 MiB window | Maximum preset |
 
-The default is level 5.
+The default is level 5. Levels 8 and 9 run the dynamic-programming optimal
+parser with candidates drawn from the binary tree; on generic data they
+compress substantially smaller than 6-7.
 
 Advanced flags can override the preset:
 
@@ -374,28 +379,49 @@ profile sweeps and repeatable tuning workflow details, see
 
 ## Performance snapshot
 
-Ratios below are for `enwik8` (100 MB English Wikipedia text). They are exact for
-the current codec; throughput depends on hardware and build settings.
+Measured on the **Silesia corpus** (the twelve files packed into one 212 MB
+uncompressed tar, so every codec sees identical input), AMD Ryzen 9 5950X
+(16C/32T), NVMe, warm cache, Release build. Compression is best-of-2, decode
+best-of-3; every row is round-trip verified. Reference tools: zstd 1.5.7
+(`-T0`), lz4 1.10.0, and 7-Zip 26.00 (`-mmt=on`) for LZMA2/xz/zip/bzip2/gzip.
+Axiom runs with default `--threads 0`.
+
+| Codec / level | Compressed | Ratio | Compress | Decompress |
+|---|---:|---:|---:|---:|
+| lz4 -1 | 100.9 MB | 2.10x | 0.12 s | 0.12 s |
+| lz4 -9 (HC) | 78.0 MB | 2.72x | 0.41 s | 0.12 s |
+| zstd -1 | 73.3 MB | 2.89x | 0.11 s | 0.17 s |
+| **axiom -1** | 69.6 MB | 3.05x | 0.51 s | 0.26 s |
+| zstd -3 | 66.2 MB | 3.20x | 0.14 s | 0.19 s |
+| zip/gzip deflate -9 | 64.7 MB | 3.28x | 101 s | 0.85 s |
+| **axiom -3** | 63.0 MB | 3.36x | 1.3 s | 0.26 s |
+| **axiom -5** (default) | 60.5 MB | 3.51x | 2.1 s | 0.27 s |
+| zstd -9 | 59.2 MB | 3.58x | 0.52 s | 0.18 s |
+| **axiom -8** | 56.4 MB | 3.76x | 12.6 s | 0.28 s |
+| **axiom -9** | 55.9 MB | 3.79x | 28.4 s | 0.34 s |
+| bzip2 -9 | 54.2 MB | 3.91x | 7.2 s | 2.16 s |
+| zstd -19 | 52.8 MB | 4.01x | 17.5 s | 0.19 s |
+| zstd -22 --ultra | 52.3 MB | 4.05x | 85.0 s | 0.22 s |
+| 7z LZMA2 -mx5 | 49.6 MB | 4.27x | 18.1 s | 0.84 s |
+| xz / 7z LZMA2 -mx9 | 48.7 MB | 4.35x | 32–33 s | 1.26 s |
+
+Reading the table: Axiom beats zstd level-for-level on ratio at the fast end
+(axiom -1/-3 vs zstd -1/-3) at a few hundred MB/s, its decode speed is a flat
+~0.3 s at every level, and the maximum preset lands within ~6% of `zstd -19`
+at comparable compression time. LZMA2/xz still compress ~13% smaller than
+Axiom's maximum at similar-or-slower speeds and ~4x slower decode — that
+remaining ratio gap (sequence modeling and context literals) is the active
+codec work. Deflate-era formats (zip/gzip) are dominated on every axis.
+
+On `enwik8` (100 MB English Wikipedia text, default `--threads 0`):
 
 | Level | 1 | 3 | 5 default | 6 | 7 | 8 | 9 |
 |---|---|---|---|---|---|---|---|
-| Ratio | 2.68x | 3.01x | 3.09x | 3.10x | 3.17x | 3.33x | 3.47x |
-
-The 0.1.1.0 CPU-scaling pass keeps the archive format unchanged and improves
-throughput by feeding all available workers by default. Local D:\tests corpus
-measurements from the release candidate:
-
-| Corpus / level | Compress before | Compress 0.1.1.0 | Decode-to-NUL 0.1.1.0 | Ratio |
-|---|---:|---:|---:|---:|
-| mixed-64m, level 1 | 211.9 MiB/s | 907.2 MiB/s | 2204.0 MiB/s | 386.14x |
-| mixed-64m, level 8 | 126.2 MiB/s | 255.0 MiB/s | 2059.3 MiB/s | 440.51x |
-| long-distance-112m, level 1 | 127.4 MiB/s | 217.3 MiB/s | 1048.8 MiB/s | 1.17x |
-| mixed-512m, level 1 | 229.8 MiB/s | 1098.1 MiB/s | 3853.7 MiB/s | 409.09x |
-| mixed-512m, level 8 | 127.3 MiB/s | 246.3 MiB/s | 2729.8 MiB/s | 515.30x |
+| Ratio | 2.68x | 3.03x | 3.11x | 3.13x | 3.14x | 3.43x | 3.46x |
 
 Throughput depends on CPU, memory bandwidth, storage, corpus shape, and Release
-build settings. Higher levels still trade compression speed for ratio; the
-remaining gap to 7-Zip maximum ratio is mainly in the entropy stage.
+build settings; re-run `tools\bench_enwik8.ps1` or the method in
+[docs/BENCHMARKING.md](docs/BENCHMARKING.md) on your own hardware.
 
 ## Testing and fuzzing
 
