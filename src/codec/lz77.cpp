@@ -496,15 +496,46 @@ ByteVector encode_lz77_impl(std::span<const std::uint8_t> input,
         bool take_match = !take_rep && best_length >= kMinMatch;
 
         // Lazy matching: a normal match that is not already long enough may be
-        // worse than one starting one byte later. Peek at position+1; if a strictly
-        // longer match begins there, emit a literal now and let the next iteration
-        // take the better match. Rep matches are left eager (they are near-free).
+        // worse than one starting one byte later. Peek at position+1 and defer
+        // (emit a literal now) when the deferred path is actually cheaper under
+        // the token cost model — this keeps the old strictly-longer deferrals
+        // and adds equal-or-similar-length ones that land a much nearer
+        // distance, while refusing barely-longer matches that jump far away.
+        // A repeat-offset available at position+1 also defers: reps code no
+        // distance, so even an equal-length rep beats this match. (Emitting a
+        // literal leaves the recent-distance list unchanged, so reps checked
+        // here are exactly the reps the next iteration will see.)
         if (take_match && options.lazy_matching && best_length < nice_length &&
             position + 1 < input.size()) {
             std::size_t next_length = 0;
             std::size_t next_distance = 0;
             find_best(position + 1, next_length, next_distance);
-            if (next_length > best_length) {
+
+            bool defer = false;
+            if (next_length >= kMinMatch) {
+                // Compare per-byte cost of taking the match now over
+                // best_length bytes vs a literal plus the next match over
+                // 1 + next_length bytes (cross-multiplied to stay integral).
+                const auto take_now = static_cast<std::uint64_t>(
+                    match_cost(best_length, best_distance));
+                const auto deferred = static_cast<std::uint64_t>(literal_cost()) +
+                                      match_cost(next_length, next_distance);
+                defer = deferred * best_length < take_now * (1 + next_length);
+            }
+            if (!defer && position + kMinMatch + 1 <= input.size()) {
+                const auto rep_look_limit =
+                    std::min(max_match, input.size() - (position + 1));
+                for (std::size_t i = 0; i < kRepCount; ++i) {
+                    const auto rep_length =
+                        match_length_at(input, position + 1, reps[i], rep_look_limit);
+                    if (rep_length >= best_length) {
+                        defer = true;
+                        break;
+                    }
+                }
+            }
+
+            if (defer) {
                 take_match = false;  // defer to a literal; position+1 wins next round
                 // The loop advances to position+1 next (a literal consumes one
                 // byte) and nothing is inserted in between, so this search is
