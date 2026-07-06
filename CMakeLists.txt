@@ -9,13 +9,16 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-# Vendored BLAKE3 (portable build — the SSE/AVX backends are intentionally
-# disabled so only blake3_portable.c is needed). Third-party C: keep our strict
-# warnings off it.
+# Vendored BLAKE3 with the x86 SIMD backends (runtime-dispatched by cpuid).
+# Third-party C: keep our strict warnings off it.
 set(BLAKE3_SOURCES
     src/third_party/blake3/blake3.c
     src/third_party/blake3/blake3_dispatch.c
-    src/third_party/blake3/blake3_portable.c)
+    src/third_party/blake3/blake3_portable.c
+    src/third_party/blake3/blake3_sse2.c
+    src/third_party/blake3/blake3_sse41.c
+    src/third_party/blake3/blake3_avx2.c
+    src/third_party/blake3/blake3_avx512.c)
 
 # Vendored Monocypher (XChaCha20-Poly1305 + Argon2id). Single C file; warnings off.
 set(MONOCYPHER_SOURCES
@@ -56,15 +59,18 @@ target_include_directories(axiom
 
 target_compile_features(axiom PUBLIC cxx_std_20)
 
-target_compile_definitions(axiom PRIVATE
-    BLAKE3_NO_AVX512 BLAKE3_NO_AVX2 BLAKE3_NO_SSE41 BLAKE3_NO_SSE2)
-
 if(MSVC)
     target_compile_options(axiom PRIVATE /W4 /permissive-)
     set_source_files_properties(${BLAKE3_SOURCES} ${MONOCYPHER_SOURCES} ${MINIZ_SOURCES} PROPERTIES COMPILE_OPTIONS /w)
+    set_source_files_properties(src/third_party/blake3/blake3_avx2.c PROPERTIES COMPILE_OPTIONS "/w;/arch:AVX2")
+    set_source_files_properties(src/third_party/blake3/blake3_avx512.c PROPERTIES COMPILE_OPTIONS "/w;/arch:AVX512")
 else()
     target_compile_options(axiom PRIVATE -Wall -Wextra -Wpedantic)
     set_source_files_properties(${BLAKE3_SOURCES} ${MONOCYPHER_SOURCES} ${MINIZ_SOURCES} PROPERTIES COMPILE_OPTIONS -w)
+    set_source_files_properties(src/third_party/blake3/blake3_sse2.c PROPERTIES COMPILE_OPTIONS "-w;-msse2")
+    set_source_files_properties(src/third_party/blake3/blake3_sse41.c PROPERTIES COMPILE_OPTIONS "-w;-msse4.1")
+    set_source_files_properties(src/third_party/blake3/blake3_avx2.c PROPERTIES COMPILE_OPTIONS "-w;-mavx2")
+    set_source_files_properties(src/third_party/blake3/blake3_avx512.c PROPERTIES COMPILE_OPTIONS "-w;-mavx512f;-mavx512vl")
 endif()
 
 # Windows CSPRNG (BCryptGenRandom) used by core/crypto.
@@ -105,7 +111,7 @@ if(WIN32)
         src/gui/about_dialog.cpp
         src/gui/update_checker.cpp
         src/gui/axiom_gui.rc)
-    target_link_libraries(axiom_gui PRIVATE axiom Bcrypt Comctl32 Dwmapi Msimg32 Ole32 Shell32 Uxtheme Version Winhttp)
+    target_link_libraries(axiom_gui PRIVATE axiom Bcrypt Comctl32 Dwmapi Msimg32 Ole32 Shell32 Shlwapi Uxtheme Version Winhttp)
     target_include_directories(axiom_gui PRIVATE src)
     target_compile_definitions(axiom_gui PRIVATE UNICODE _UNICODE)
     set_target_properties(axiom_gui PROPERTIES OUTPUT_NAME "Axiom")
