@@ -163,14 +163,17 @@ ReedSolomon::ReedSolomon(int data_shards, int parity_shards)
 }
 
 void ReedSolomon::encode(const std::vector<std::span<const std::uint8_t>>& data,
-                         const std::vector<std::span<std::uint8_t>>& parity) const {
+                         const std::vector<std::span<std::uint8_t>>& parity,
+                         const EncodeProgressCallback& progress) const {
     if (static_cast<int>(data.size()) != data_shards_ ||
         static_cast<int>(parity.size()) != parity_shards_) {
         throw std::invalid_argument("Reed-Solomon encode: wrong shard count");
     }
     const std::size_t len = data.empty() ? 0 : data[0].size();
+    constexpr std::size_t progress_interval = 1u << 20;
     for (int p = 0; p < parity_shards_; ++p) {
         const int row = data_shards_ + p;
+        std::size_t next_progress = progress_interval;
         for (std::size_t byte = 0; byte < len; ++byte) {
             std::uint8_t acc = 0;
             for (int d = 0; d < data_shards_; ++d) {
@@ -178,7 +181,13 @@ void ReedSolomon::encode(const std::vector<std::span<const std::uint8_t>>& data,
                 acc ^= gf_mul(coeff, data[static_cast<std::size_t>(d)][byte]);
             }
             parity[static_cast<std::size_t>(p)][byte] = acc;
+            const std::size_t completed = byte + 1;
+            if (progress && (completed >= next_progress || completed == len)) {
+                progress(p, completed, len);
+                next_progress = completed + progress_interval;
+            }
         }
+        if (progress && len == 0) progress(p, 0, 0);
     }
 }
 

@@ -333,8 +333,22 @@ return command;
 
 ShellIconRef shell_icon_for_path(const fs::path& path, bool drive) {
 axiom::gui::BrowserItem item;
-item.kind = drive ? axiom::gui::BrowserItemKind::drive
-                  : axiom::gui::BrowserItemKind::directory;
+if (drive) {
+    item.kind = axiom::gui::BrowserItemKind::drive;
+} else {
+    const DWORD attributes = GetFileAttributesW(path.c_str());
+    if (attributes != INVALID_FILE_ATTRIBUTES) {
+        const bool directory = (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+        item.kind = directory ? axiom::gui::BrowserItemKind::directory
+                              : axiom::gui::BrowserItemKind::file;
+    } else {
+        // Existing callers pass "folder" when they need the generic folder
+        // shell icon. For real filesystem paths, do not assume directory:
+        // the tree now contains files as first-class items.
+        item.kind = path.has_extension() ? axiom::gui::BrowserItemKind::file
+                                         : axiom::gui::BrowserItemKind::directory;
+    }
+}
 item.filesystem_path = path;
 item.name = path.filename().wstring();
 return shell_icon_for_item(item);
@@ -543,6 +557,23 @@ switch (id) {
     case kOpenArchive:
     case kExtract:
     case kTest:
+    case kUpdateArchive:
+    case kSynchronizeArchive:
+    case kDeleteArchiveEntries:
+    case kRepackArchive:
+    case kEditArchiveComment:
+    case kLockArchive:
+    case kRepairArchive:
+    case kVerifyArchiveSignature:
+    case kCreateSfx:
+    case kFreshenArchive:
+    case kBenchmark:
+    case kFind:
+    case kCopyPath:
+    case kCopyCrc32:
+    case kAddFavorite:
+    case kRemoveFavorite:
+    case kToggleTreePane:
     case kNavigateBack:
     case kNavigateForward:
     case kNavigateUp:
@@ -550,8 +581,10 @@ switch (id) {
     case kAddressGo:
     case kView:
     case kDelete:
+    case kSelectAll:
     case kInfo:
     case kSettings:
+    case kCheckUpdates:
         return true;
     default:
         return false;

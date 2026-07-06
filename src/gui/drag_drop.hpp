@@ -16,8 +16,17 @@ struct ArchiveDragPayload {
     std::vector<std::string> entry_paths;
 };
 
+struct VirtualFileDragItem {
+    std::wstring relative_path;
+    std::uint64_t size = 0;
+    std::int64_t mtime = 0;
+    bool is_directory = false;
+};
+
 struct FileDragSource {
     std::function<std::vector<std::filesystem::path>()> files;
+    std::vector<VirtualFileDragItem> virtual_files;
+    std::function<std::vector<std::filesystem::path>()> virtual_file_paths;
     ArchiveDragPayload archive_payload;
     DWORD preferred_effect = DROPEFFECT_COPY;
     std::wstring* error_message = nullptr;

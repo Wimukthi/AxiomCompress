@@ -3,16 +3,91 @@
 #include "axiom/archive.hpp"
 #include "gui/archive_feature_options.hpp"
 #include "gui/keyboard_shortcuts.hpp"
+#include "gui/toolbar_icons.hpp"
 
 #include <windows.h>
 
+#include <array>
+#include <algorithm>
 #include <cstddef>
 #include <filesystem>
 #include <functional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace axiom::gui {
+
+struct ToolbarCommandInfo {
+    const wchar_t* id;
+    const wchar_t* label;
+    const wchar_t* button_text;
+    ToolbarIcon icon;
+    bool default_visible;
+};
+
+inline constexpr std::array<ToolbarCommandInfo, 27> kToolbarCommandCatalog{{
+    {L"commands.add", L"Add to archive", L"Add", ToolbarIcon::archive, true},
+    {L"commands.extract", L"Extract", L"Extract", ToolbarIcon::extract, true},
+    {L"commands.test", L"Test archive", L"Test", ToolbarIcon::test, true},
+    {L"commands.view", L"View/open selection", L"View", ToolbarIcon::view, true},
+    {L"commands.delete", L"Delete selection", L"Delete", ToolbarIcon::delete_item, true},
+    {L"tools.info", L"Archive information", L"Info", ToolbarIcon::info, true},
+    {L"file.open_archive", L"Open archive", L"Open archive", ToolbarIcon::open, true},
+    {L"options.settings", L"Settings", L"Settings", ToolbarIcon::settings, true},
+    {L"commands.update", L"Update archive", L"Update", ToolbarIcon::update_archive, false},
+    {L"commands.freshen", L"Freshen archive", L"Freshen", ToolbarIcon::freshen_archive, false},
+    {L"commands.synchronize", L"Synchronize archive", L"Sync", ToolbarIcon::synchronize_archive, false},
+    {L"commands.delete_archive_entries", L"Delete archive entries", L"Remove", ToolbarIcon::delete_item, false},
+    {L"commands.repack", L"Repack archive", L"Repack", ToolbarIcon::repack, false},
+    {L"commands.select_all", L"Select all", L"Select all", ToolbarIcon::select_all, false},
+    {L"tools.find", L"Find files", L"Find", ToolbarIcon::find, false},
+    {L"tools.benchmark", L"Benchmark", L"Benchmark", ToolbarIcon::benchmark, false},
+    {L"tools.edit_comment", L"Edit archive comment", L"Comment", ToolbarIcon::comment, false},
+    {L"tools.lock", L"Lock archive", L"Lock", ToolbarIcon::lock, false},
+    {L"tools.repair", L"Repair archive", L"Repair", ToolbarIcon::repair, false},
+    {L"tools.verify_signature", L"Verify signature", L"Verify", ToolbarIcon::verify_signature, false},
+    {L"tools.create_sfx", L"Create self-extracting archive", L"SFX", ToolbarIcon::sfx, false},
+    {L"options.toggle_tree", L"Show/hide tree pane", L"Tree", ToolbarIcon::tree, false},
+    {L"options.add_favorite", L"Add favorite", L"Favorite", ToolbarIcon::favorite, false},
+    {L"options.remove_favorite", L"Remove favorite", L"Unfavorite", ToolbarIcon::unfavorite, false},
+    {L"help.check_updates", L"Check for updates", L"Updates", ToolbarIcon::update_archive, false},
+    {L"clipboard.copy_path", L"Copy path", L"Copy path", ToolbarIcon::copy_path, false},
+    {L"clipboard.copy_crc32", L"Copy CRC-32", L"Copy CRC", ToolbarIcon::copy_crc, false},
+}};
+
+inline bool toolbar_command_exists(std::wstring_view id) {
+    return std::any_of(kToolbarCommandCatalog.begin(), kToolbarCommandCatalog.end(),
+                       [&](const ToolbarCommandInfo& info) {
+                           return id == std::wstring_view(info.id);
+                       });
+}
+
+inline std::vector<std::wstring> default_toolbar_commands() {
+    std::vector<std::wstring> result;
+    for (const ToolbarCommandInfo& command : kToolbarCommandCatalog) {
+        if (command.default_visible) {
+            result.emplace_back(command.id);
+        }
+    }
+    return result;
+}
+
+inline std::vector<std::wstring> normalize_toolbar_commands(
+    const std::vector<std::wstring>& commands) {
+    std::vector<std::wstring> result;
+    result.reserve(commands.size());
+    for (const ToolbarCommandInfo& catalog_command : kToolbarCommandCatalog) {
+        const bool present = std::any_of(commands.begin(), commands.end(),
+                                         [&](const std::wstring& command) {
+                                             return command == catalog_command.id;
+                                         });
+        if (present) {
+            result.emplace_back(catalog_command.id);
+        }
+    }
+    return result;
+}
 
 struct CreateArchiveDialogOptions {
     std::filesystem::path archive_path;
@@ -107,6 +182,7 @@ struct ApplicationDialogOptions {
     std::wstring io_buffer_size;
     int memory_limit_mode = 0;  // 0 = automatic, 1 = custom.
     std::wstring memory_limit;
+    std::vector<std::wstring> toolbar_commands = default_toolbar_commands();
     std::vector<CommandShortcutSetting> shortcut_overrides;
 
     bool operator==(const ApplicationDialogOptions&) const = default;

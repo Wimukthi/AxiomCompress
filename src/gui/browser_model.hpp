@@ -112,6 +112,7 @@ private:
 
 bool is_axiom_archive(const std::filesystem::path& path);
 bool is_supported_archive(const std::filesystem::path& path);
+bool path_has_supported_archive_extension(const std::filesystem::path& path);
 std::optional<BrowserLocation> parent_location(const BrowserLocation& location);
 
 }  // namespace axiom::gui

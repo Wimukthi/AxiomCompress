@@ -2,6 +2,8 @@
 
 #include <shellapi.h>
 #include <shlobj.h>
+#include <shlwapi.h>
+#include <strsafe.h>
 
 #include <algorithm>
 #include <atomic>
@@ -31,10 +33,28 @@ CLIPFORMAT preferred_drop_effect_format() {
     return format;
 }
 
-bool format_matches(const FORMATETC& requested, CLIPFORMAT format) {
+CLIPFORMAT file_descriptor_format() {
+    static const CLIPFORMAT format =
+        static_cast<CLIPFORMAT>(RegisterClipboardFormatW(CFSTR_FILEDESCRIPTORW));
+    return format;
+}
+
+CLIPFORMAT file_contents_format() {
+    static const CLIPFORMAT format =
+        static_cast<CLIPFORMAT>(RegisterClipboardFormatW(CFSTR_FILECONTENTS));
+    return format;
+}
+
+bool format_matches_hglobal(const FORMATETC& requested, CLIPFORMAT format) {
     return requested.cfFormat == format &&
            (requested.tymed & TYMED_HGLOBAL) != 0 &&
            requested.dwAspect == DVASPECT_CONTENT && requested.lindex == -1;
+}
+
+bool format_matches_istream(const FORMATETC& requested, CLIPFORMAT format) {
+    return requested.cfFormat == format &&
+           (requested.tymed & TYMED_ISTREAM) != 0 &&
+           requested.dwAspect == DVASPECT_CONTENT && requested.lindex >= 0;
 }
 
 HGLOBAL make_global(const void* bytes, std::size_t size) {
@@ -82,6 +102,79 @@ HGLOBAL make_drop_files(const std::vector<std::filesystem::path>& paths) {
     *cursor = L'\0';
     GlobalUnlock(global);
     return global;
+}
+
+std::wstring shell_relative_name(std::wstring name) {
+    while (!name.empty() && (name.front() == L'/' || name.front() == L'\\')) {
+        name.erase(name.begin());
+    }
+    for (wchar_t& ch : name) {
+        if (ch == L'/') ch = L'\\';
+    }
+    if (name.empty()) name = L"Archive item";
+    if (name.size() >= MAX_PATH) name.resize(MAX_PATH - 1);
+    return name;
+}
+
+void unix_time_to_filetime(std::int64_t unix_time, FILETIME& file_time) {
+    if (unix_time <= 0) return;
+    constexpr std::uint64_t kWindowsUnixEpochDelta = 11644473600ull;
+    constexpr std::uint64_t kTicksPerSecond = 10000000ull;
+    const auto seconds = static_cast<std::uint64_t>(unix_time);
+    if (seconds > (std::numeric_limits<std::uint64_t>::max() / kTicksPerSecond) -
+                      kWindowsUnixEpochDelta) {
+        return;
+    }
+    const std::uint64_t ticks = (seconds + kWindowsUnixEpochDelta) * kTicksPerSecond;
+    file_time.dwLowDateTime = static_cast<DWORD>(ticks & 0xFFFFFFFFu);
+    file_time.dwHighDateTime = static_cast<DWORD>(ticks >> 32);
+}
+
+HGLOBAL make_file_group_descriptor(const std::vector<VirtualFileDragItem>& items) {
+    if (items.empty() ||
+        items.size() > static_cast<std::size_t>(std::numeric_limits<UINT>::max())) {
+        return nullptr;
+    }
+    const std::size_t bytes = FIELD_OFFSET(FILEGROUPDESCRIPTORW, fgd) +
+                              items.size() * sizeof(FILEDESCRIPTORW);
+    HGLOBAL global = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, bytes);
+    if (global == nullptr) return nullptr;
+    auto* group = static_cast<FILEGROUPDESCRIPTORW*>(GlobalLock(global));
+    if (group == nullptr) {
+        GlobalFree(global);
+        return nullptr;
+    }
+    group->cItems = static_cast<UINT>(items.size());
+    for (std::size_t index = 0; index < items.size(); ++index) {
+        const auto& item = items[index];
+        auto& descriptor = group->fgd[index];
+        descriptor.dwFlags = FD_ATTRIBUTES;
+        descriptor.dwFileAttributes =
+            item.is_directory ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_NORMAL;
+        const std::wstring relative = shell_relative_name(item.relative_path);
+        StringCchCopyW(descriptor.cFileName, ARRAYSIZE(descriptor.cFileName),
+                       relative.c_str());
+        if (!item.is_directory) {
+            descriptor.dwFlags |= FD_FILESIZE;
+            descriptor.nFileSizeHigh = static_cast<DWORD>(item.size >> 32);
+            descriptor.nFileSizeLow = static_cast<DWORD>(item.size & 0xFFFFFFFFu);
+        }
+        if (item.mtime > 0) {
+            descriptor.dwFlags |= FD_WRITESTIME;
+            unix_time_to_filetime(item.mtime, descriptor.ftLastWriteTime);
+        }
+    }
+    GlobalUnlock(global);
+    return global;
+}
+
+HRESULT stream_for_file(const std::filesystem::path& path, IStream** stream) {
+    if (stream == nullptr) return E_POINTER;
+    *stream = nullptr;
+    return SHCreateStreamOnFileEx(path.c_str(),
+                                  STGM_READ | STGM_SHARE_DENY_WRITE,
+                                  FILE_ATTRIBUTE_NORMAL,
+                                  FALSE, nullptr, stream);
 }
 
 void append_wstring(std::vector<std::byte>& bytes, const std::wstring& text) {
@@ -206,7 +299,7 @@ public:
         if (format == nullptr || medium == nullptr) return E_POINTER;
         *medium = {};
         HGLOBAL global = nullptr;
-        if (format_matches(*format, CF_HDROP)) {
+        if (format_matches_hglobal(*format, CF_HDROP) && source_.files) {
             try {
                 if (!files_ready_) {
                     files_ = source_.files ? source_.files() : std::vector<std::filesystem::path>{};
@@ -223,10 +316,43 @@ public:
                 }
                 return E_FAIL;
             }
-        } else if (format_matches(*format, archive_entries_format()) &&
+        } else if (format_matches_hglobal(*format, file_descriptor_format()) &&
+                   !source_.virtual_files.empty()) {
+            global = make_file_group_descriptor(source_.virtual_files);
+        } else if (format_matches_istream(*format, file_contents_format()) &&
+                   !source_.virtual_files.empty()) {
+            const auto index = static_cast<std::size_t>(format->lindex);
+            if (index >= source_.virtual_files.size() ||
+                source_.virtual_files[index].is_directory ||
+                !source_.virtual_file_paths) {
+                return DV_E_LINDEX;
+            }
+            try {
+                if (!virtual_paths_ready_) {
+                    virtual_paths_ = source_.virtual_file_paths();
+                    virtual_paths_ready_ = true;
+                }
+                if (virtual_paths_.size() != source_.virtual_files.size()) return E_FAIL;
+                IStream* stream = nullptr;
+                const HRESULT result = stream_for_file(virtual_paths_[index], &stream);
+                if (FAILED(result)) return result;
+                medium->tymed = TYMED_ISTREAM;
+                medium->pstm = stream;
+                medium->pUnkForRelease = nullptr;
+                return S_OK;
+            } catch (const std::exception& error) {
+                if (source_.error_message != nullptr) *source_.error_message = error_text(error);
+                return E_FAIL;
+            } catch (...) {
+                if (source_.error_message != nullptr) {
+                    *source_.error_message = L"Could not prepare the dragged archive entries.";
+                }
+                return E_FAIL;
+            }
+        } else if (format_matches_hglobal(*format, archive_entries_format()) &&
                    !source_.archive_payload.entry_paths.empty()) {
             global = make_archive_payload(source_.archive_payload);
-        } else if (format_matches(*format, preferred_drop_effect_format())) {
+        } else if (format_matches_hglobal(*format, preferred_drop_effect_format())) {
             global = make_global(&source_.preferred_effect, sizeof(source_.preferred_effect));
         } else {
             return DV_E_FORMATETC;
@@ -242,9 +368,15 @@ public:
     }
     HRESULT STDMETHODCALLTYPE QueryGetData(FORMATETC* format) override {
         if (format == nullptr) return E_POINTER;
-        if (format_matches(*format, CF_HDROP) ||
-            format_matches(*format, preferred_drop_effect_format()) ||
-            (format_matches(*format, archive_entries_format()) &&
+        if ((format_matches_hglobal(*format, CF_HDROP) && source_.files) ||
+            format_matches_hglobal(*format, preferred_drop_effect_format()) ||
+            (format_matches_hglobal(*format, file_descriptor_format()) &&
+             !source_.virtual_files.empty()) ||
+            (format_matches_istream(*format, file_contents_format()) &&
+             static_cast<std::size_t>(format->lindex) < source_.virtual_files.size() &&
+             !source_.virtual_files[static_cast<std::size_t>(format->lindex)].is_directory &&
+             source_.virtual_file_paths) ||
+            (format_matches_hglobal(*format, archive_entries_format()) &&
              !source_.archive_payload.entry_paths.empty())) {
             return S_OK;
         }
@@ -262,10 +394,18 @@ public:
         if (enumerator == nullptr) return E_POINTER;
         *enumerator = nullptr;
         if (direction != DATADIR_GET) return E_NOTIMPL;
-        std::vector<FORMATETC> formats{
-            {CF_HDROP, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL},
-            {preferred_drop_effect_format(), nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL},
-        };
+        std::vector<FORMATETC> formats;
+        if (source_.files) {
+            formats.push_back({CF_HDROP, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL});
+        }
+        if (!source_.virtual_files.empty()) {
+            formats.push_back({file_descriptor_format(), nullptr,
+                               DVASPECT_CONTENT, -1, TYMED_HGLOBAL});
+            formats.push_back({file_contents_format(), nullptr,
+                               DVASPECT_CONTENT, -1, TYMED_ISTREAM});
+        }
+        formats.push_back({preferred_drop_effect_format(), nullptr,
+                           DVASPECT_CONTENT, -1, TYMED_HGLOBAL});
         if (!source_.archive_payload.entry_paths.empty()) {
             formats.push_back({archive_entries_format(), nullptr,
                                DVASPECT_CONTENT, -1, TYMED_HGLOBAL});
@@ -286,6 +426,8 @@ private:
     FileDragSource source_;
     bool files_ready_ = false;
     std::vector<std::filesystem::path> files_;
+    bool virtual_paths_ready_ = false;
+    std::vector<std::filesystem::path> virtual_paths_;
 };
 
 class DropSource final : public IDropSource {

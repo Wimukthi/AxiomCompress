@@ -3,7 +3,100 @@
 
 #include "gui/main_window_internal.hpp"
 
+#include <algorithm>
+#include <unordered_set>
+
 namespace axiom::gui {
+
+namespace {
+
+std::string normalized_drag_archive_path(std::string path) {
+    std::replace(path.begin(), path.end(), '\\', '/');
+    while (!path.empty() && path.front() == '/') path.erase(path.begin());
+    while (!path.empty() && path.back() == '/') path.pop_back();
+    return path;
+}
+
+bool archive_path_is_under_directory(std::string_view path, std::string_view directory) {
+    if (path == directory) return true;
+    return path.size() > directory.size() &&
+           path.compare(0, directory.size(), directory) == 0 &&
+           path[directory.size()] == '/';
+}
+
+std::wstring archive_drag_relative_name(std::string_view archive_path,
+                                        std::string_view current_directory) {
+    std::string relative;
+    if (!current_directory.empty() &&
+        archive_path.size() > current_directory.size() &&
+        archive_path.compare(0, current_directory.size(), current_directory) == 0 &&
+        archive_path[current_directory.size()] == '/') {
+        relative = std::string(archive_path.substr(current_directory.size() + 1));
+    } else {
+        relative = std::string(archive_path);
+    }
+    return widen(relative);
+}
+
+void ensure_virtual_parent_directories(
+    std::string_view archive_path,
+    std::string_view relative_path,
+    std::vector<VirtualFileDragItem>& items,
+    std::vector<std::string>& materialized_archive_paths,
+    std::unordered_set<std::string>& seen_relative_paths) {
+    std::size_t start = 0;
+    while (true) {
+        const std::size_t slash = relative_path.find('/', start);
+        if (slash == std::string_view::npos) break;
+        const std::string relative_parent(relative_path.substr(0, slash));
+        if (!relative_parent.empty() && seen_relative_paths.insert(relative_parent).second) {
+            VirtualFileDragItem parent;
+            parent.relative_path = widen(relative_parent);
+            parent.is_directory = true;
+            items.push_back(std::move(parent));
+            const std::size_t parent_length = static_cast<std::size_t>(
+                relative_parent.size());
+            const std::size_t archive_parent_length =
+                archive_path.size() >= relative_path.size()
+                    ? archive_path.size() - relative_path.size() + parent_length
+                    : parent_length;
+            materialized_archive_paths.push_back(
+                std::string(archive_path.substr(0, archive_parent_length)));
+        }
+        start = slash + 1;
+    }
+}
+
+void add_virtual_archive_item(
+    std::string archive_path,
+    std::string_view current_directory,
+    bool is_directory,
+    std::uint64_t size,
+    std::int64_t mtime,
+    std::vector<VirtualFileDragItem>& items,
+    std::vector<std::string>& materialized_archive_paths,
+    std::unordered_set<std::string>& seen_relative_paths) {
+    archive_path = normalized_drag_archive_path(std::move(archive_path));
+    if (archive_path.empty()) return;
+    const std::wstring relative_wide =
+        archive_drag_relative_name(archive_path, current_directory);
+    std::string relative = utf8(relative_wide);
+    relative = normalized_drag_archive_path(std::move(relative));
+    if (relative.empty()) return;
+    ensure_virtual_parent_directories(archive_path, relative, items,
+                                      materialized_archive_paths,
+                                      seen_relative_paths);
+    if (!seen_relative_paths.insert(relative).second) return;
+    VirtualFileDragItem item;
+    item.relative_path = std::move(relative_wide);
+    item.size = is_directory ? 0 : size;
+    item.mtime = mtime;
+    item.is_directory = is_directory;
+    items.push_back(std::move(item));
+    materialized_archive_paths.push_back(std::move(archive_path));
+}
+
+}  // namespace
 
 std::string MainWindow::archive_name(std::string_view path) {
     const std::size_t separator = path.find_last_of('/');
@@ -511,6 +604,50 @@ void MainWindow::on_table_begin_drag() {
     auto entries = selected_archive_paths();
     if (entries.empty()) return;
     const fs::path archive = history_.current().archive_path;
+    const std::string current_directory =
+        normalized_drag_archive_path(history_.current().archive_directory);
+
+    std::vector<axiom::gui::VirtualFileDragItem> virtual_items;
+    std::vector<std::string> materialized_archive_paths;
+    std::unordered_set<std::string> selected_exact;
+    std::unordered_set<std::string> selected_directories;
+    std::unordered_set<std::string> described_relative_paths;
+    selected_exact.reserve(entries.size());
+    selected_directories.reserve(entries.size());
+    for (const int index : selected_browser_indices()) {
+        const auto& item = browser_items_[static_cast<std::size_t>(index)];
+        if (item.is_parent() || item.archive_path.empty()) continue;
+        const std::string path = normalized_drag_archive_path(item.archive_path);
+        selected_exact.insert(path);
+        if (item.kind == axiom::gui::BrowserItemKind::directory) {
+            selected_directories.insert(path);
+        }
+        add_virtual_archive_item(path, current_directory,
+                                 item.kind == axiom::gui::BrowserItemKind::directory,
+                                 item.size, 0, virtual_items, materialized_archive_paths,
+                                 described_relative_paths);
+    }
+    if (archive_catalog_) {
+        for (const auto& entry : archive_catalog_->entries()) {
+            const std::string path = normalized_drag_archive_path(entry.path);
+            if (path.empty()) continue;
+            bool selected = selected_exact.find(path) != selected_exact.end();
+            if (!selected) {
+                for (const auto& directory : selected_directories) {
+                    if (archive_path_is_under_directory(path, directory)) {
+                        selected = true;
+                        break;
+                    }
+                }
+            }
+            if (!selected) continue;
+            add_virtual_archive_item(path, current_directory, entry.is_directory,
+                                     entry.size, entry.mtime, virtual_items,
+                                     materialized_archive_paths,
+                                     described_relative_paths);
+        }
+    }
+    if (virtual_items.empty()) return;
 
     auto password = password_for_archive_edit(archive);
     if (!password) return;
@@ -518,14 +655,23 @@ void MainWindow::on_table_begin_drag() {
     std::wstring drag_error;
     axiom::gui::FileDragSource source;
     source.archive_payload = {archive, entries};
+    source.virtual_files = virtual_items;
     source.preferred_effect = DROPEFFECT_COPY;
     source.error_message = &drag_error;
-    source.files = [this, archive, entries, password = std::move(*password)]() mutable {
+    source.virtual_file_paths =
+        [this, archive, entries,
+         materialized_archive_paths = std::move(materialized_archive_paths),
+         password = std::move(*password)]() mutable {
         try {
             auto staged = extract_archive_entries_to_staging(
                 archive, entries, password, true, !password.empty());
             secure_clear(password);
-            return staged.paths;
+            std::vector<fs::path> paths;
+            paths.reserve(materialized_archive_paths.size());
+            for (const auto& path : materialized_archive_paths) {
+                paths.push_back(staged.directory / fs::path(widen(path)));
+            }
+            return paths;
         } catch (...) {
             secure_clear(password);
             throw;
@@ -1025,64 +1171,7 @@ void MainWindow::on_repair_archive() {
 }
 
 void MainWindow::on_create_recovery_volumes() {
-    const auto archive = active_archive_path();
-    if (!archive || busy_) return;
-    axiom::gui::ArchiveFeatureOptions archive_options;
-    axiom::gui::ExtractFeatureOptions extract_options;
-    axiom::gui::ArchiveFeatureAvailability availability;
-    availability.recovery = true;
-    availability.volumes = true;
-    try {
-        const auto info = axiom::archive_recovery_info(*archive);
-        archive_options.recovery_percent = info.present
-            ? static_cast<int>(info.percent) : 10;
-    } catch (...) {
-        archive_options.recovery_percent = 10;
-    }
-    if (!axiom::gui::show_archive_feature_options_dialog(
-            hwnd_, axiom::gui::ArchiveFeatureDialogContext::create_or_update,
-            archive_options, extract_options, availability)) {
-        return;
-    }
-    const auto size = parse_volume_size(archive_options.volume_size,
-                                        archive_options.volume_unit);
-    if (!size) {
-        show_app_message(L"Enter a valid positive split-volume size, or leave it blank.",
-                         axiom::gui::MessageDialogIcon::warning,
-                         L"Recovery and volumes");
-        return;
-    }
-    const unsigned percent = static_cast<unsigned>(
-        std::clamp(archive_options.recovery_percent, 0, 100));
-    const bool split = *size != 0;
-    if (archive_options.create_recovery_volumes && !split) {
-        show_app_message(L"Set a split-volume size before enabling recovery volumes.",
-                         axiom::gui::MessageDialogIcon::warning,
-                         L"Recovery and volumes");
-        return;
-    }
-    operation_archive_output_ = *archive;
-    start_operation(
-        split ? L"Creating recovery and split volumes..."
-              : L"Updating archive recovery record...",
-        split ? L"Archive and recovery volumes created beside the source archive."
-              : (percent == 0 ? L"Archive recovery record removed."
-                              : L"Archive recovery record updated."),
-        [archive = *archive, percent, split, volume_size = *size,
-         make_recovery_volumes = archive_options.create_recovery_volumes](
-            std::shared_ptr<axiom::OperationControl> operation) {
-            axiom::set_archive_recovery(archive, percent, operation);
-            if (!split) return;
-            const std::uint64_t archive_bytes = fs::file_size(archive);
-            const std::uint64_t data_count = std::max<std::uint64_t>(
-                1, (archive_bytes + volume_size - 1) / volume_size);
-            const unsigned recovery_count = make_recovery_volumes
-                ? static_cast<unsigned>(std::max<std::uint64_t>(
-                    1, (data_count * std::max(percent, 10u) + 99) / 100))
-                : 0;
-            axiom::create_archive_volumes(
-                archive, volume_size, recovery_count, operation);
-        });
+    set_status(L"Recovery and volume options are configured from Add to archive.");
 }
 
 void MainWindow::apply_operation_priority() {

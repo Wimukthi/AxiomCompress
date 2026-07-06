@@ -27,7 +27,6 @@ std::wstring_view shortcut_action_for_command(UINT command) {
         case kEditArchiveComment: return L"tools.edit_comment";
         case kLockArchive: return L"tools.lock";
         case kRepairArchive: return L"tools.repair";
-        case kCreateRecoveryVolumes: return L"tools.create_recovery_volumes";
         case kVerifyArchiveSignature: return L"tools.verify_signature";
         case kCreateSfx: return L"tools.create_sfx";
         case kNavigateBack: return L"navigation.back";
@@ -68,7 +67,6 @@ UINT command_for_shortcut_action(std::wstring_view action) {
     if (action == L"tools.edit_comment") return kEditArchiveComment;
     if (action == L"tools.lock") return kLockArchive;
     if (action == L"tools.repair") return kRepairArchive;
-    if (action == L"tools.create_recovery_volumes") return kCreateRecoveryVolumes;
     if (action == L"tools.verify_signature") return kVerifyArchiveSignature;
     if (action == L"tools.create_sfx") return kCreateSfx;
     if (action == L"navigation.back") return kNavigateBack;
@@ -112,8 +110,19 @@ std::wstring MainWindow::shortcut_for_command(UINT command) const {
     return effective_shortcut_for_command(application_options_.shortcut_overrides, action);
 }
 
+bool MainWindow::selected_has_crc32() const {
+    for (int index : selected_browser_indices()) {
+        if (index >= 0 && index < static_cast<int>(browser_items_.size()) &&
+            browser_items_[static_cast<std::size_t>(index)].crc32) {
+            return true;
+        }
+    }
+    return false;
+}
+
 bool MainWindow::can_execute_shortcut_command(UINT command) const {
     const bool has_selection = !selected_browser_indices().empty();
+    const bool has_selected_crc32 = selected_has_crc32();
     const bool has_archive = active_archive_path().has_value();
     const bool browsing_archive =
         history_.current().kind == axiom::gui::BrowserLocationKind::archive;
@@ -153,8 +162,7 @@ bool MainWindow::can_execute_shortcut_command(UINT command) const {
         case kRepairArchive:
             return !busy_ && has_archive && capabilities.recovery_records;
         case kCreateRecoveryVolumes:
-            return !busy_ && has_archive && capabilities.recovery_records &&
-                   capabilities.multi_volume && archive_editable;
+            return false;
         case kVerifyArchiveSignature:
             return !busy_ && has_archive && capabilities.authenticity;
         case kCreateSfx:
@@ -173,7 +181,7 @@ bool MainWindow::can_execute_shortcut_command(UINT command) const {
             return has_selection ||
                    history_.current().kind != axiom::gui::BrowserLocationKind::computer;
         case kCopyCrc32:
-            return has_selection;
+            return has_selected_crc32;
         case kNavigateBack:
             return history_.can_back();
         case kNavigateForward:
@@ -320,9 +328,6 @@ std::vector<axiom::gui::CustomMenuItem> MainWindow::menu_items(UINT menu_id) con
                   !busy_ && has_archive && capabilities.lock && archive_editable},
                 {kRepairArchive, L"&Repair archive...", shortcut(kRepairArchive),
                  !busy_ && has_archive && capabilities.recovery_records},
-                {kCreateRecoveryVolumes, L"Create recovery &volumes...", shortcut(kCreateRecoveryVolumes),
-                 !busy_ && has_archive && capabilities.recovery_records &&
-                     capabilities.multi_volume && archive_editable},
                 {kVerifyArchiveSignature, L"Verify &signature...", shortcut(kVerifyArchiveSignature),
                  !busy_ && has_archive && capabilities.authenticity},
                 {kCreateSfx, L"Create &self-extracting archive...", shortcut(kCreateSfx),
@@ -353,6 +358,7 @@ std::vector<axiom::gui::CustomMenuItem> MainWindow::menu_items(UINT menu_id) con
 
 void MainWindow::show_browser_context_menu(POINT point) {
     const bool has_selection = !selected_browser_indices().empty();
+    const bool has_selected_crc32 = selected_has_crc32();
     const bool has_archive = active_archive_path().has_value();
     const bool browsing_archive =
         history_.current().kind == axiom::gui::BrowserLocationKind::archive;
@@ -385,7 +391,7 @@ void MainWindow::show_browser_context_menu(POINT point) {
         {0, L"", L"", false, true},
         {kCopyPath, L"Copy &path", shortcut(kCopyPath), has_selection ||
              history_.current().kind != axiom::gui::BrowserLocationKind::computer},
-        {kCopyCrc32, L"Copy CRC-&32", shortcut(kCopyCrc32), has_selection},
+        {kCopyCrc32, L"Copy CRC-&32", shortcut(kCopyCrc32), has_selected_crc32},
         {0, L"", L"", false, true},
         {static_cast<UINT>(favorite ? kRemoveFavorite : kAddFavorite),
          favorite ? L"Remove current location from &Favorites"
@@ -402,16 +408,18 @@ void MainWindow::show_tree_context_menu(POINT point) {
     const DirectoryTreeNode& node = item->node;
     const bool is_filesystem =
         node.kind == DirectoryTreeNodeKind::filesystem ||
+        node.kind == DirectoryTreeNodeKind::file ||
         node.kind == DirectoryTreeNodeKind::archive;
-    const bool is_archive =
-        node.kind == DirectoryTreeNodeKind::archive ||
-        node.kind == DirectoryTreeNodeKind::archive_directory;
     std::optional<fs::path> archive_path;
     if (node.kind == DirectoryTreeNodeKind::archive) {
         archive_path = node.filesystem_path;
     } else if (node.kind == DirectoryTreeNodeKind::archive_directory) {
         archive_path = node.archive_path;
+    } else if (node.kind == DirectoryTreeNodeKind::file &&
+               axiom::archive_provider_for_path(node.filesystem_path) != nullptr) {
+        archive_path = node.filesystem_path;
     }
+    const bool is_archive = archive_path.has_value();
 
     if (point.x == -1 && point.y == -1) {
         RECT tree_rect{};
@@ -474,7 +482,8 @@ void MainWindow::show_tree_context_menu(POINT point) {
             tree_view_.set_expanded(item, false);
             break;
         case kTreeOpenInExplorer:
-            if (node.kind == DirectoryTreeNodeKind::archive) {
+            if (node.kind == DirectoryTreeNodeKind::archive ||
+                node.kind == DirectoryTreeNodeKind::file) {
                 const std::wstring params =
                     L"/select,\"" + node.filesystem_path.wstring() + L"\"";
                 ShellExecuteW(hwnd_, L"open", L"explorer.exe", params.c_str(),
@@ -709,6 +718,11 @@ void MainWindow::on_info() {
 
 void MainWindow::on_about() {
     axiom::gui::show_about_dialog(hwnd_, instance_, dpi_, theme_.dark, kCheckUpdates);
+    const bool automatic_updates = axiom::gui::automatic_update_checks_enabled();
+    if (application_options_.automatic_update_checks != automatic_updates) {
+        application_options_.automatic_update_checks = automatic_updates;
+        save_current_settings();
+    }
 }
 
 void MainWindow::on_benchmark() {
@@ -899,6 +913,9 @@ void MainWindow::apply_application_options(
         application_options_.custom_accent_color != previous.custom_accent_color;
     const bool icon_style_changed =
         application_options_.toolbar_icon_style != previous.toolbar_icon_style;
+    const bool toolbar_commands_changed =
+        normalize_toolbar_commands(application_options_.toolbar_commands) !=
+        normalize_toolbar_commands(previous.toolbar_commands);
     const bool table_options_changed =
         application_options_.show_grid_lines != previous.show_grid_lines ||
         application_options_.show_horizontal_scrollbar !=
@@ -935,6 +952,10 @@ void MainWindow::apply_application_options(
         application_options_.context_test != previous.context_test;
 
     if (theme_changed || icon_style_changed) apply_theme();
+    if (toolbar_commands_changed) {
+        layout();
+        update_toolbar_button_states();
+    }
     if (table_options_changed) apply_table_options();
     if (address_options_changed) {
         const int limit = std::clamp(application_options_.recent_location_count, 0, 50);

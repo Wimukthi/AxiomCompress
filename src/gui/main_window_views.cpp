@@ -12,6 +12,8 @@ std::wstring directory_tree_node_key(const DirectoryTreeNode& node) {
             return L"computer";
         case DirectoryTreeNodeKind::filesystem:
             return L"fs:" + node.filesystem_path.wstring();
+        case DirectoryTreeNodeKind::file:
+            return L"file:" + node.filesystem_path.wstring();
         case DirectoryTreeNodeKind::archive:
             return L"archive:" + node.archive_path.wstring();
         case DirectoryTreeNodeKind::archive_directory:
@@ -206,8 +208,51 @@ int DarkTableView::horizontal_scroll_position() const {
     return scroll_x_;
 }
 
+std::optional<RECT> DarkTableView::cell_rect(int row, int column) const {
+    if (hwnd_ == nullptr || row < 0 || row >= static_cast<int>(rows_.size()) ||
+        column < 0 || column >= static_cast<int>(columns_.size())) {
+        return std::nullopt;
+    }
+    RECT client{};
+    GetClientRect(hwnd_, &client);
+    const int content_left = table_left(client);
+    const int content_right = table_right(client);
+    const int rows_top = client.top + header_height();
+    const int rows_limit = rows_bottom(client);
+    const int row_h = row_height();
+    RECT row_rect{
+        content_left,
+        rows_top + row * row_h - scroll_y_,
+        content_right,
+        rows_top + (row + 1) * row_h - scroll_y_,
+    };
+    RECT rows_area{content_left, rows_top, content_right, rows_limit};
+    RECT visible_row{};
+    if (!IntersectRect(&visible_row, &row_rect, &rows_area)) {
+        return std::nullopt;
+    }
+    const auto widths = column_widths(client);
+    int x = content_left - scroll_x_;
+    for (int index = 0; index < column; ++index) {
+        x += widths[static_cast<std::size_t>(index)];
+    }
+    RECT cell{
+        x + scale(1),
+        row_rect.top + scale(1),
+        x + widths[static_cast<std::size_t>(column)] - scale(1),
+        row_rect.bottom - scale(1),
+    };
+    RECT visible_cell{};
+    if (!IntersectRect(&visible_cell, &cell, &rows_area)) {
+        return std::nullopt;
+    }
+    MapWindowPoints(hwnd_, GetParent(hwnd_),
+                    reinterpret_cast<POINT*>(&visible_cell), 2);
+    return visible_cell;
+}
+
 void DarkTableView::set_selection_and_scroll(std::vector<int> selected_indices,
-                              int focused_index,
+                                  int focused_index,
                               int horizontal_scroll,
                               int vertical_scroll) {
     selected_.assign(rows_.size(), false);

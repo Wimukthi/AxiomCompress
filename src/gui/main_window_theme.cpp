@@ -103,8 +103,27 @@ switch (id) {
     case kAddressGo: return ToolbarIcon::forward;
     case kView: return ToolbarIcon::view;
     case kDelete: return ToolbarIcon::delete_item;
+    case kDeleteArchiveEntries: return ToolbarIcon::delete_item;
     case kInfo: return ToolbarIcon::info;
+    case kSelectAll: return ToolbarIcon::select_all;
+    case kFind: return ToolbarIcon::find;
+    case kBenchmark: return ToolbarIcon::benchmark;
+    case kUpdateArchive: return ToolbarIcon::update_archive;
+    case kRepackArchive: return ToolbarIcon::repack;
+    case kRepairArchive: return ToolbarIcon::repair;
+    case kFreshenArchive: return ToolbarIcon::freshen_archive;
+    case kSynchronizeArchive: return ToolbarIcon::synchronize_archive;
+    case kEditArchiveComment: return ToolbarIcon::comment;
+    case kLockArchive: return ToolbarIcon::lock;
+    case kVerifyArchiveSignature: return ToolbarIcon::verify_signature;
+    case kCreateSfx: return ToolbarIcon::sfx;
+    case kToggleTreePane: return ToolbarIcon::tree;
+    case kAddFavorite: return ToolbarIcon::favorite;
+    case kRemoveFavorite: return ToolbarIcon::unfavorite;
     case kSettings: return ToolbarIcon::settings;
+    case kCheckUpdates: return ToolbarIcon::update_archive;
+    case kCopyPath: return ToolbarIcon::copy_path;
+    case kCopyCrc32: return ToolbarIcon::copy_crc;
     default: return ToolbarIcon::none;
 }
 }
@@ -140,14 +159,16 @@ void MainWindow::set_control_font(HWND control) const {
 
 void MainWindow::apply_fonts() {
     HWND controls[] = {
-        add_files_, open_archive_, extract_, test_,
         list_, status_,
         navigate_back_, navigate_forward_, navigate_up_, navigate_refresh_,
-        address_edit_, address_go_, view_, delete_, info_, settings_,
+        address_edit_, address_go_,
         tooltip_,
     };
     for (HWND control : controls) {
         set_control_font(control);
+    }
+    for (const ToolbarButton& button : toolbar_buttons_) {
+        set_control_font(button.window);
     }
     menu_bar_.set_font(ui_font_);
     table_.set_font(ui_font_);
@@ -210,14 +231,16 @@ void MainWindow::apply_theme() {
     set_dark_title_bar(hwnd_, theme_.dark);
 
     HWND controls[] = {
-        add_files_, open_archive_, extract_, test_,
         list_, status_,
         navigate_back_, navigate_forward_, navigate_up_, navigate_refresh_,
-        address_edit_, address_go_, view_, delete_, info_, settings_,
+        address_edit_, address_go_,
         tooltip_,
     };
     for (HWND control : controls) {
         apply_theme_to_control(control);
+    }
+    for (const ToolbarButton& button : toolbar_buttons_) {
+        apply_theme_to_control(button.window);
     }
     axiom::gui::apply_dialog_control_theme(address_edit_, theme_.dark);
     menu_bar_.set_theme({

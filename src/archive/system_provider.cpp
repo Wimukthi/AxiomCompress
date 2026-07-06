@@ -17,6 +17,7 @@
 #include <initializer_list>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -739,9 +740,28 @@ std::vector<ArchiveEntry> parse_7z_slt_listing(std::string_view output,
 }
 
 bool seven_zip_listing_reports_encryption(std::string_view output) {
-    bool encrypted = false;
-    (void)parse_7z_slt_listing(output, &encrypted);
-    return encrypted;
+    std::size_t start = 0;
+    while (start <= output.size()) {
+        std::size_t end = output.find('\n', start);
+        if (end == std::string_view::npos) end = output.size();
+        std::string_view line = output.substr(start, end - start);
+        while (!line.empty() && (line.back() == '\r' || line.back() == '\n' ||
+                                 line.back() == ' ' || line.back() == '\t')) {
+            line.remove_suffix(1);
+        }
+        while (!line.empty() && (line.front() == ' ' || line.front() == '\t')) {
+            line.remove_prefix(1);
+        }
+        constexpr std::string_view key = "Encrypted = ";
+        if (line.size() >= key.size() &&
+            line.substr(0, key.size()) == key &&
+            line.substr(key.size()).find('+') != std::string_view::npos) {
+            return true;
+        }
+        if (end == output.size()) break;
+        start = end + 1;
+    }
+    return false;
 }
 
 bool seven_zip_error_indicates_encrypted(std::string text) {
@@ -1028,6 +1048,70 @@ std::vector<std::wstring> seven_zip_list_arguments(const fs::path& archive_path,
             seven_zip_password_argument(password), archive_path.wstring()};
 }
 
+struct SevenZipListCacheEntry {
+    fs::path path;
+    std::uintmax_t file_size = 0;
+    fs::file_time_type modified{};
+    ProcessResult result;
+};
+
+std::mutex& seven_zip_list_cache_mutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
+std::optional<SevenZipListCacheEntry>& seven_zip_list_cache() {
+    static std::optional<SevenZipListCacheEntry> cache;
+    return cache;
+}
+
+std::optional<SevenZipListCacheEntry> seven_zip_cache_key(const fs::path& archive_path) {
+    std::error_code ec;
+    fs::path absolute = fs::absolute(archive_path, ec);
+    if (ec) absolute = archive_path;
+    const auto file_size = fs::file_size(archive_path, ec);
+    if (ec) return std::nullopt;
+    const auto modified = fs::last_write_time(archive_path, ec);
+    if (ec) return std::nullopt;
+    SevenZipListCacheEntry key;
+    key.path = absolute.lexically_normal();
+    key.file_size = file_size;
+    key.modified = modified;
+    return key;
+}
+
+bool same_seven_zip_cache_key(const SevenZipListCacheEntry& left,
+                              const SevenZipListCacheEntry& right) {
+    return left.path == right.path &&
+           left.file_size == right.file_size &&
+           left.modified == right.modified;
+}
+
+ProcessResult run_7z_list_cached(const fs::path& archive_path,
+                                 const std::string& password) {
+    if (!password.empty()) {
+        return run_7z(seven_zip_list_arguments(archive_path, password), true, nullptr);
+    }
+
+    auto key = seven_zip_cache_key(archive_path);
+    if (key) {
+        std::scoped_lock lock(seven_zip_list_cache_mutex());
+        const auto& cache = seven_zip_list_cache();
+        if (cache && same_seven_zip_cache_key(*cache, *key)) {
+            return cache->result;
+        }
+    }
+
+    ProcessResult result = run_7z(seven_zip_list_arguments(archive_path, password),
+                                  true, nullptr);
+    if (key) {
+        key->result = result;
+        std::scoped_lock lock(seven_zip_list_cache_mutex());
+        seven_zip_list_cache() = std::move(*key);
+    }
+    return result;
+}
+
 bool selected_entry(const ArchiveEntry& entry, const std::vector<std::string>& wanted) {
     if (wanted.empty()) return true;
     return std::any_of(wanted.begin(), wanted.end(), [&](const std::string& target) {
@@ -1118,8 +1202,7 @@ public:
             return result;
         }
 
-        const auto listed = run_7z(seven_zip_list_arguments(archive_path, password),
-                                   true, nullptr);
+        const auto listed = run_7z_list_cached(archive_path, password);
         if (listed.exit_code == 0) {
             result.encrypted = seven_zip_listing_reports_encryption(listed.output);
             result.directory_encrypted = false;
@@ -1145,8 +1228,7 @@ public:
             throw std::runtime_error("7-Zip backend is required for this archive format");
         }
         if (use_7z_backend()) {
-            const auto result = run_7z(seven_zip_list_arguments(archive_path, password),
-                                       true, nullptr);
+            const auto result = run_7z_list_cached(archive_path, password);
             if (result.exit_code != 0) throw seven_zip_error("listing", result);
             auto entries = parse_7z_slt_listing(result.output);
             if (entries.empty() && !result.output.empty()) {

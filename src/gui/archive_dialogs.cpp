@@ -2,6 +2,7 @@
 #include "gui/archive_dialogs.hpp"
 #include "gui/dialog_support.hpp"
 #include "gui/archive_feature_dialogs.hpp"
+#include "gui/main_window_internal.hpp"
 #include "gui/message_dialog.hpp"
 
 #include <dwmapi.h>
@@ -22,7 +23,6 @@
 #include <vector>
 
 namespace axiom::gui {
-namespace fs = std::filesystem;
 namespace {
 
 constexpr int kPathEdit = 2001;
@@ -59,8 +59,6 @@ constexpr int kBrowseSigningKey = 2142;
 constexpr int kCreateSfx = 2143;
 constexpr int kSettingsTabs = 2200;
 constexpr int kSettingsTabBase = 2210;
-constexpr int kApply = 2220;
-constexpr int kDefaults = 2221;
 constexpr int kThemeMode = 2230;
 constexpr int kStartupMode = 2231;
 constexpr int kStartupCustomPath = 2232;
@@ -137,6 +135,11 @@ constexpr int kShortcutValue = 2651;
 constexpr int kShortcutAssign = 2652;
 constexpr int kShortcutClear = 2653;
 constexpr int kShortcutResetAll = 2654;
+constexpr int kToolbarList = 2700;
+constexpr int kToolbarResetDefaults = 2790;
+constexpr int kToolbarStatusCombo = 2791;
+constexpr int kApply = 2800;
+constexpr int kDefaults = 2801;
 constexpr int kAccept = IDOK;
 constexpr int kCancel = IDCANCEL;
 constexpr std::uint64_t kMinIoBufferSize = 64ull << 10;
@@ -163,9 +166,9 @@ constexpr std::array<std::size_t, 10> kSolidBlockValues{
     64u << 20, 128u << 20, 256u << 20, 512u << 20};
 constexpr std::array<const wchar_t*, 5> kCreateTabNames{
     L"Compression", L"General", L"Security", L"Recovery & volumes", L"SFX & signing"};
-constexpr std::array<const wchar_t*, 10> kSettingsTabNames{
+constexpr std::array<const wchar_t*, 11> kSettingsTabNames{
     L"General", L"Compression", L"Paths", L"File list", L"Viewer",
-    L"Security", L"Integration", L"Updates", L"Shortcuts", L"Advanced"};
+    L"Security", L"Integration", L"Updates", L"Shortcuts", L"Toolbar", L"Advanced"};
 constexpr std::array<const wchar_t*, 5> kUpdateModeNames{
     L"Create a new archive", L"Add or replace entries",
     L"Update entries that are newer", L"Freshen existing entries",
@@ -195,6 +198,8 @@ constexpr std::array<const wchar_t*, 3> kWorkerPriorityNames{
     L"Normal", L"Below normal", L"Background"};
 constexpr std::array<const wchar_t*, 2> kAutomaticCustomNames{
     L"Automatic", L"Custom"};
+constexpr std::array<const wchar_t*, 2> kToolbarStatusNames{
+    L"Enabled", L"Hidden"};
 
 template <std::size_t Size>
 int value_index(const std::array<std::size_t, Size>& values, std::size_t value) {
@@ -753,6 +758,7 @@ public:
         if (font_) DeleteObject(font_);
         if (window_brush_) DeleteObject(window_brush_);
         if (edit_brush_) DeleteObject(edit_brush_);
+        if (toolbar_image_list_ != nullptr) ImageList_Destroy(toolbar_image_list_);
     }
 
     bool show(HWND owner) {
@@ -794,6 +800,15 @@ public:
         UpdateWindow(window_);
         MSG message{};
         while (IsWindow(window_) && GetMessageW(&message, nullptr, 0, 0) > 0) {
+            if (mode_ == DialogMode::settings &&
+                toolbar_list_.hwnd() != nullptr &&
+                message.message == WM_KEYDOWN &&
+                message.wParam == VK_SPACE &&
+                (message.hwnd == toolbar_list_.hwnd() ||
+                 IsChild(toolbar_list_.hwnd(), message.hwnd))) {
+                toggle_toolbar_settings_row(toolbar_list_.focused_index());
+                continue;
+            }
             if (!IsDialogMessageW(window_, &message)) {
                 TranslateMessage(&message);
                 DispatchMessageW(&message);
@@ -1044,6 +1059,209 @@ private:
         return combo;
     }
 
+    ThemePalette toolbar_table_theme() const {
+        return make_theme(application_options.theme_mode,
+                          application_options.accent_color_mode,
+                          application_options.custom_accent_color);
+    }
+
+    HBITMAP render_toolbar_settings_icon(ToolbarIcon icon, int size) const {
+        if (size <= 0) return nullptr;
+        BITMAPINFO info{};
+        info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        info.bmiHeader.biWidth = size;
+        info.bmiHeader.biHeight = -size;
+        info.bmiHeader.biPlanes = 1;
+        info.bmiHeader.biBitCount = 32;
+        info.bmiHeader.biCompression = BI_RGB;
+        void* pixels = nullptr;
+        HBITMAP bitmap = CreateDIBSection(nullptr, &info, DIB_RGB_COLORS,
+                                          &pixels, nullptr, 0);
+        if (bitmap == nullptr || pixels == nullptr) {
+            if (bitmap != nullptr) DeleteObject(bitmap);
+            return nullptr;
+        }
+
+        HDC screen = GetDC(window_);
+        HDC memory_dc = CreateCompatibleDC(screen);
+        if (memory_dc == nullptr) {
+            if (screen != nullptr) ReleaseDC(window_, screen);
+            DeleteObject(bitmap);
+            return nullptr;
+        }
+        HGDIOBJ old_bitmap = SelectObject(memory_dc, bitmap);
+        RECT bounds{0, 0, size, size};
+        HBRUSH background = CreateSolidBrush(palette_.edit);
+        FillRect(memory_dc, &bounds, background);
+        DeleteObject(background);
+        const int icon_mode = std::clamp(application_options.toolbar_icon_style, 0, 2);
+        const COLORREF color = icon_mode == 2 ? palette_.accent : palette_.text;
+        const ToolbarIconStyle style = icon_mode == 1
+            ? ToolbarIconStyle::colorful
+            : ToolbarIconStyle::monochrome;
+        draw_toolbar_icon(memory_dc, icon, bounds, color, dpi_, 18, style);
+        SelectObject(memory_dc, old_bitmap);
+        DeleteDC(memory_dc);
+        if (screen != nullptr) ReleaseDC(window_, screen);
+        return bitmap;
+    }
+
+    void rebuild_toolbar_settings_image_list() {
+        if (toolbar_image_list_ != nullptr) {
+            ImageList_Destroy(toolbar_image_list_);
+            toolbar_image_list_ = nullptr;
+        }
+        const int icon_size = scale(18);
+        toolbar_image_list_ = ImageList_Create(
+            icon_size, icon_size, ILC_COLOR32 | ILC_MASK,
+            static_cast<int>(kToolbarCommandCatalog.size()), 0);
+        if (toolbar_image_list_ == nullptr) return;
+        ImageList_SetBkColor(toolbar_image_list_, CLR_NONE);
+        for (const ToolbarCommandInfo& command : kToolbarCommandCatalog) {
+            HBITMAP bitmap = render_toolbar_settings_icon(command.icon, icon_size);
+            if (bitmap == nullptr) {
+                ImageList_Add(toolbar_image_list_, nullptr, nullptr);
+                continue;
+            }
+            ImageList_AddMasked(toolbar_image_list_, bitmap, palette_.edit);
+            DeleteObject(bitmap);
+        }
+    }
+
+    bool toolbar_command_enabled(std::wstring_view command_id) const {
+        const auto commands =
+            normalize_toolbar_commands(application_options.toolbar_commands);
+        return std::any_of(commands.begin(), commands.end(),
+                           [&](const std::wstring& command) {
+                               return command == command_id;
+                           });
+    }
+
+    void set_toolbar_command_enabled(int row, bool enabled) {
+        if (row < 0 || row >= static_cast<int>(kToolbarCommandCatalog.size())) return;
+        const wchar_t* command_id =
+            kToolbarCommandCatalog[static_cast<std::size_t>(row)].id;
+        auto commands =
+            normalize_toolbar_commands(application_options.toolbar_commands);
+        commands.erase(std::remove_if(commands.begin(), commands.end(),
+                                      [&](const std::wstring& command) {
+                                          return command == command_id;
+                                      }),
+                       commands.end());
+        if (enabled) {
+            commands.emplace_back(command_id);
+        }
+        application_options.toolbar_commands = normalize_toolbar_commands(commands);
+    }
+
+    void refresh_toolbar_settings_list(int selected_row = -1) {
+        if (toolbar_list_.hwnd() == nullptr) return;
+        const int focused = selected_row >= 0 ? selected_row : toolbar_list_.focused_index();
+        const int scroll_y = toolbar_list_.vertical_scroll_position();
+        const int scroll_x = toolbar_list_.horizontal_scroll_position();
+        std::vector<std::vector<std::wstring>> rows;
+        std::vector<int> icons;
+        rows.reserve(kToolbarCommandCatalog.size());
+        icons.reserve(kToolbarCommandCatalog.size());
+        for (std::size_t index = 0; index < kToolbarCommandCatalog.size(); ++index) {
+            const ToolbarCommandInfo& command = kToolbarCommandCatalog[index];
+            const bool enabled = toolbar_command_enabled(command.id);
+            rows.push_back({
+                L"",
+                command.label,
+                command.button_text,
+                enabled ? L"Enabled" : L"Hidden",
+            });
+            icons.push_back(static_cast<int>(index));
+        }
+        toolbar_list_.set_rows(std::move(rows), std::move(icons), toolbar_image_list_);
+        if (focused >= 0 && focused < static_cast<int>(kToolbarCommandCatalog.size())) {
+            toolbar_list_.set_selection_and_scroll({focused}, focused, scroll_x, scroll_y);
+        }
+        sync_toolbar_status_combo();
+    }
+
+    void create_toolbar_settings_list(int page, int x, int y, int width, int height) {
+        toolbar_list_.create(window_, instance_, kToolbarList);
+        toolbar_list_.set_font(font_);
+        toolbar_list_.set_dpi(dpi_);
+        toolbar_list_.set_theme(toolbar_table_theme());
+        toolbar_list_.set_options({
+            true,
+            true,
+            true,
+        });
+        toolbar_list_.set_columns({
+            {L"Icon", 58},
+            {L"Command", 300},
+            {L"Button text", 170},
+            {L"Status", 110},
+        });
+        rebuild_toolbar_settings_image_list();
+        refresh_toolbar_settings_list();
+        settings_controls_.push_back({toolbar_list_.hwnd(), page, x, y, width, height, false});
+
+        toolbar_status_combo_ = control(
+            L"COMBOBOX", L"",
+            WS_TABSTOP | WS_VSCROLL | CBS_DROPDOWNLIST |
+                CBS_OWNERDRAWFIXED | CBS_HASSTRINGS | CBS_NOINTEGRALHEIGHT,
+            kToolbarStatusCombo);
+        SendMessageW(toolbar_status_combo_, CB_SETITEMHEIGHT, 0, scale(24));
+        SendMessageW(toolbar_status_combo_, CB_SETITEMHEIGHT,
+                     static_cast<WPARAM>(-1), scale(24));
+        for (const wchar_t* item : kToolbarStatusNames) {
+            SendMessageW(toolbar_status_combo_, CB_ADDSTRING, 0,
+                         reinterpret_cast<LPARAM>(item));
+        }
+        SendMessageW(toolbar_status_combo_, CB_SETMINVISIBLE,
+                     static_cast<WPARAM>(kToolbarStatusNames.size()), 0);
+        ShowWindow(toolbar_status_combo_, SW_HIDE);
+    }
+
+    void toggle_toolbar_settings_row(int row) {
+        if (row < 0 || row >= static_cast<int>(kToolbarCommandCatalog.size())) return;
+        const ToolbarCommandInfo& command = kToolbarCommandCatalog[static_cast<std::size_t>(row)];
+        set_toolbar_command_enabled(row, !toolbar_command_enabled(command.id));
+        refresh_toolbar_settings_list(row);
+    }
+
+    void sync_toolbar_status_combo() {
+        if (toolbar_status_combo_ == nullptr) return;
+        if (settings_page_ != 9 || toolbar_list_.hwnd() == nullptr) {
+            ShowWindow(toolbar_status_combo_, SW_HIDE);
+            return;
+        }
+        const int row = toolbar_list_.focused_index();
+        if (row < 0 || row >= static_cast<int>(kToolbarCommandCatalog.size())) {
+            ShowWindow(toolbar_status_combo_, SW_HIDE);
+            return;
+        }
+        const auto rect = toolbar_list_.cell_rect(row, 3);
+        if (!rect || rect->right <= rect->left || rect->bottom <= rect->top) {
+            ShowWindow(toolbar_status_combo_, SW_HIDE);
+            return;
+        }
+        const bool enabled =
+            toolbar_command_enabled(kToolbarCommandCatalog[static_cast<std::size_t>(row)].id);
+        SendMessageW(toolbar_status_combo_, CB_SETCURSEL, enabled ? 0 : 1, 0);
+        MoveWindow(toolbar_status_combo_,
+                   rect->left + scale(3), rect->top + scale(1),
+                   std::max(scale(86), static_cast<int>(rect->right - rect->left) - scale(6)),
+                   scale(120), TRUE);
+        ShowWindow(toolbar_status_combo_, SW_SHOWNA);
+        BringWindowToTop(toolbar_status_combo_);
+    }
+
+    void apply_toolbar_status_combo_selection() {
+        if (toolbar_status_combo_ == nullptr) return;
+        const int row = toolbar_list_.focused_index();
+        if (row < 0 || row >= static_cast<int>(kToolbarCommandCatalog.size())) return;
+        const LRESULT selection = SendMessageW(toolbar_status_combo_, CB_GETCURSEL, 0, 0);
+        if (selection == CB_ERR) return;
+        set_toolbar_command_enabled(row, selection == 0);
+        refresh_toolbar_settings_list(row);
+    }
+
     void create_settings_controls() {
         settings_tabs_ = control(kDarkTabClass, L"", WS_TABSTOP | WS_GROUP,
                                  kSettingsTabs);
@@ -1226,20 +1444,30 @@ private:
                       L"Ctrl+V, Delete, Backspace, and Enter.",
                       0, 276, 660, 58, true);
 
-        setting_label(9, L"Advanced", 0, 0, 660);
-        setting_label(9, L"Worker priority", 0, 42, 170);
-        setting_combo(9, kWorkerPriority, kWorkerPriorityNames, 180, 36, 240);
-        setting_checkbox(9, kVerboseLogging, L"Enable verbose operation logging", 180, 80);
-        setting_label(9, L"Log folder", 0, 126, 170);
-        setting_edit(9, kLogFolder, 180, 120, 470);
-        setting_browse(9, kBrowseLogFolder, 660, 120);
-        setting_label(9, L"I/O buffer", 0, 168, 170);
-        setting_combo(9, kIoBufferMode, kAutomaticCustomNames, 180, 162, 180);
-        setting_edit(9, kIoBufferSize, 370, 162, 160);
-        setting_label(9, L"Memory limit", 0, 210, 170);
-        setting_combo(9, kMemoryLimitMode, kAutomaticCustomNames, 180, 204, 180);
-        setting_edit(9, kMemoryLimit, 370, 204, 160);
+        setting_label(9, L"Toolbar buttons", 0, 0, 660);
         setting_label(9,
+                      L"Choose which commands appear on the main command toolbar. "
+                      L"Buttons keep this order and wrap when needed.",
+                      0, 30, 760, 38, true);
+        create_toolbar_settings_list(9, 0, 76, 2000, 462);
+        setting_control(9, L"BUTTON", L"Restore default toolbar",
+                        WS_TABSTOP | BS_OWNERDRAW,
+                        kToolbarResetDefaults, 0, 552, 180, 30);
+
+        setting_label(10, L"Advanced", 0, 0, 660);
+        setting_label(10, L"Worker priority", 0, 42, 170);
+        setting_combo(10, kWorkerPriority, kWorkerPriorityNames, 180, 36, 240);
+        setting_checkbox(10, kVerboseLogging, L"Enable verbose operation logging", 180, 80);
+        setting_label(10, L"Log folder", 0, 126, 170);
+        setting_edit(10, kLogFolder, 180, 120, 470);
+        setting_browse(10, kBrowseLogFolder, 660, 120);
+        setting_label(10, L"I/O buffer", 0, 168, 170);
+        setting_combo(10, kIoBufferMode, kAutomaticCustomNames, 180, 162, 180);
+        setting_edit(10, kIoBufferSize, 370, 162, 160);
+        setting_label(10, L"Memory limit", 0, 210, 170);
+        setting_combo(10, kMemoryLimitMode, kAutomaticCustomNames, 180, 204, 180);
+        setting_edit(10, kMemoryLimit, 370, 204, 160);
+        setting_label(10,
                       L"Worker priority, I/O buffer size, and memory limit are applied to GUI "
                       L"operations. Automatic I/O uses 1 MiB; custom values must be 64 KiB "
                       L"through 64 MiB.",
@@ -1584,6 +1812,9 @@ private:
                         color_to_hex(application_options.custom_accent_color));
         set_selected_index(kToolbarIconStyle,
                            std::clamp(application_options.toolbar_icon_style, 0, 2));
+        application_options.toolbar_commands =
+            normalize_toolbar_commands(application_options.toolbar_commands);
+        refresh_toolbar_settings_list();
         set_selected_index(kStartupMode,
                            std::clamp(application_options.startup_location_mode, 0, 3));
         set_window_text(item(kStartupCustomPath), application_options.startup_custom_path);
@@ -1677,6 +1908,8 @@ private:
             return false;
         }
         application_options.toolbar_icon_style = selected_index(kToolbarIconStyle, 0);
+        application_options.toolbar_commands =
+            normalize_toolbar_commands(application_options.toolbar_commands);
         application_options.startup_location_mode = selected_index(kStartupMode, 0);
         application_options.startup_custom_path = window_text(item(kStartupCustomPath));
         application_options.recent_location_count =
@@ -1764,6 +1997,11 @@ private:
             InvalidateRect(child, nullptr, FALSE);
             return TRUE;
         }, reinterpret_cast<LPARAM>(this));
+        if (toolbar_list_.hwnd() != nullptr) {
+            toolbar_list_.set_theme(toolbar_table_theme());
+            rebuild_toolbar_settings_image_list();
+            refresh_toolbar_settings_list();
+        }
         InvalidateRect(window_, nullptr, TRUE);
     }
 
@@ -1893,6 +2131,7 @@ private:
                        width, std::min(height, std::max(scale(20), bottom_limit - y)),
                        TRUE);
         }
+        sync_toolbar_status_combo();
     }
 
     int wrapped_height(HWND control_window, int width, int minimum) const {
@@ -2205,6 +2444,7 @@ private:
         }
         SendMessageW(settings_tabs_, kDarkTabSetSelection,
                      static_cast<WPARAM>(settings_page_), 0);
+        sync_toolbar_status_combo();
         InvalidateRect(window_, nullptr, TRUE);
     }
 
@@ -2949,12 +3189,40 @@ private:
             }
             return TRUE;
         }, reinterpret_cast<LPARAM>(this));
+        if (toolbar_list_.hwnd() != nullptr) {
+            toolbar_list_.set_font(font_);
+            toolbar_list_.set_dpi(dpi_);
+            rebuild_toolbar_settings_image_list();
+            refresh_toolbar_settings_list();
+        }
     }
 
     LRESULT handle(UINT message, WPARAM wparam, LPARAM lparam) {
         switch (message) {
             case WM_CREATE: create_controls(); return 0;
             case WM_SIZE: layout(); return 0;
+            case kTableActivateMessage:
+                if (mode_ == DialogMode::settings && settings_page_ == 9) {
+                    sync_toolbar_status_combo();
+                    if (toolbar_status_combo_ != nullptr) {
+                        SetFocus(toolbar_status_combo_);
+                        SendMessageW(toolbar_status_combo_, CB_SHOWDROPDOWN, TRUE, 0);
+                    }
+                    return 0;
+                }
+                break;
+            case kTableSortMessage:
+            case kTableParentMessage:
+                if (mode_ == DialogMode::settings && settings_page_ == 9) {
+                    return 0;
+                }
+                break;
+            case kTableSelectionChangedMessage:
+                if (mode_ == DialogMode::settings && settings_page_ == 9) {
+                    sync_toolbar_status_combo();
+                    return 0;
+                }
+                break;
             case WM_GETMINMAXINFO:
                 if (mode_ == DialogMode::create_archive || mode_ == DialogMode::settings) {
                     auto* limits = reinterpret_cast<MINMAXINFO*>(lparam);
@@ -3034,6 +3302,11 @@ private:
                     update_shortcut_controls();
                     return 0;
                 }
+                if (mode_ == DialogMode::settings &&
+                    id == kToolbarStatusCombo && HIWORD(wparam) == CBN_SELCHANGE) {
+                    apply_toolbar_status_combo_selection();
+                    return 0;
+                }
                 if (id >= kCreateTabBase &&
                     id < kCreateTabBase + static_cast<int>(kCreateTabNames.size())) {
                     select_create_page(id - kCreateTabBase);
@@ -3098,6 +3371,14 @@ private:
                         if (mode_ == DialogMode::settings) {
                             application_options.shortcut_overrides.clear();
                             update_shortcut_controls();
+                        }
+                        return 0;
+                    case kToolbarResetDefaults:
+                        if (mode_ == DialogMode::settings) {
+                            application_options.toolbar_commands =
+                                default_toolbar_commands();
+                            load_settings_values();
+                            InvalidateRect(window_, nullptr, TRUE);
                         }
                         return 0;
                     case kDefaults:
@@ -3176,6 +3457,9 @@ private:
     HWND settings_tabs_ = nullptr;
     std::vector<PageControl> page_controls_;
     std::vector<SettingControl> settings_controls_;
+    DarkTableView toolbar_list_;
+    HIMAGELIST toolbar_image_list_ = nullptr;
+    HWND toolbar_status_combo_ = nullptr;
     HWND summary_ = nullptr;
     HWND path_label_ = nullptr;
     HWND path_edit_ = nullptr;

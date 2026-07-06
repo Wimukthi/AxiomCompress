@@ -62,7 +62,7 @@
       <SubSystem>Windows</SubSystem>
       <ProgramDatabaseFile>$(OutDir)AxiomGui.pdb</ProgramDatabaseFile>
       <ImportLibrary>$(OutDir)AxiomGui.lib</ImportLibrary>
-      <AdditionalDependencies>Bcrypt.lib;Comctl32.lib;Dwmapi.lib;Msimg32.lib;Ole32.lib;Shell32.lib;Uxtheme.lib;Version.lib;Winhttp.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>Bcrypt.lib;Comctl32.lib;Dwmapi.lib;Msimg32.lib;Ole32.lib;Shell32.lib;Shlwapi.lib;Uxtheme.lib;Version.lib;Winhttp.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
@@ -82,7 +82,7 @@
       <OptimizeReferences>true</OptimizeReferences>
       <ProgramDatabaseFile>$(OutDir)AxiomGui.pdb</ProgramDatabaseFile>
       <ImportLibrary>$(OutDir)AxiomGui.lib</ImportLibrary>
-      <AdditionalDependencies>Bcrypt.lib;Comctl32.lib;Dwmapi.lib;Msimg32.lib;Ole32.lib;Shell32.lib;Uxtheme.lib;Version.lib;Winhttp.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>Bcrypt.lib;Comctl32.lib;Dwmapi.lib;Msimg32.lib;Ole32.lib;Shell32.lib;Shlwapi.lib;Uxtheme.lib;Version.lib;Winhttp.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>

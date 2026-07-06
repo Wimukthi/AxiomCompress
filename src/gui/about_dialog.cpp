@@ -44,6 +44,7 @@ struct AboutDialogState {
     UINT dpi{USER_DEFAULT_SCREEN_DPI};
     UINT check_updates_command{};
     bool dark{};
+    bool auto_update_checked{};
 };
 
 SIZE about_window_size_for_client(UINT dpi, int logical_width, int logical_height) {
@@ -231,7 +232,7 @@ LRESULT CALLBACK about_dialog_proc(HWND hwnd, UINT message, WPARAM wparam, LPARA
                 reinterpret_cast<HMENU>(static_cast<INT_PTR>(kAutoUpdateControl)),
                 state->instance, nullptr);
             SendMessageW(state->auto_update, BM_SETCHECK,
-                         automatic_update_checks_enabled() ? BST_CHECKED : BST_UNCHECKED, 0);
+                         state->auto_update_checked ? BST_CHECKED : BST_UNCHECKED, 0);
             state->check_updates = CreateWindowExW(
                 0, L"BUTTON", L"Check for Updates...",
                 WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | WS_TABSTOP | BS_OWNERDRAW,
@@ -280,12 +281,11 @@ LRESULT CALLBACK about_dialog_proc(HWND hwnd, UINT message, WPARAM wparam, LPARA
             paint(state);
             return 0;
         case WM_COMMAND:
-            if (LOWORD(wparam) == kAutoUpdateControl) {
-                const bool checked =
-                    SendMessageW(state->auto_update, BM_GETCHECK, 0, 0) != BST_CHECKED;
+            if (LOWORD(wparam) == kAutoUpdateControl && HIWORD(wparam) == BN_CLICKED) {
+                state->auto_update_checked = !state->auto_update_checked;
                 SendMessageW(state->auto_update, BM_SETCHECK,
-                             checked ? BST_CHECKED : BST_UNCHECKED, 0);
-                set_automatic_update_checks_enabled(checked);
+                             state->auto_update_checked ? BST_CHECKED : BST_UNCHECKED, 0);
+                set_automatic_update_checks_enabled(state->auto_update_checked);
                 InvalidateRect(state->auto_update, nullptr, FALSE);
                 return 0;
             }
@@ -309,9 +309,7 @@ LRESULT CALLBACK about_dialog_proc(HWND hwnd, UINT message, WPARAM wparam, LPARA
             if (lparam != 0) {
                 const auto& draw = *reinterpret_cast<DRAWITEMSTRUCT*>(lparam);
                 if (draw.CtlID == kAutoUpdateControl) {
-                    draw_dialog_checkbox(
-                        draw, state->dark,
-                        SendMessageW(state->auto_update, BM_GETCHECK, 0, 0) == BST_CHECKED);
+                    draw_dialog_checkbox(draw, state->dark, state->auto_update_checked);
                 } else {
                     draw_dialog_button(draw, state->dark);
                 }
@@ -373,6 +371,7 @@ void show_about_dialog(HWND owner, HINSTANCE instance, UINT dpi, bool dark,
     state.dpi = effective_dpi;
     state.check_updates_command = check_updates_command;
     state.dark = dark;
+    state.auto_update_checked = automatic_update_checks_enabled();
     HWND dialog = CreateWindowExW(
         kAboutDialogExStyle, kAboutDialogClass, L"About Axiom",
         kAboutDialogStyle,

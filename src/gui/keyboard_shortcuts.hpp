@@ -35,7 +35,7 @@ struct KeyboardShortcut {
     bool operator==(const KeyboardShortcut&) const = default;
 };
 
-inline constexpr std::array<ShortcutCommandInfo, 36> kShortcutCommandCatalog{{
+inline constexpr std::array<ShortcutCommandInfo, 35> kShortcutCommandCatalog{{
     {L"file.open_archive", L"File: Open archive", L"Ctrl+O"},
     {L"file.exit", L"File: Exit", L"Alt+F4"},
     {L"commands.add", L"Commands: Add to archive", L"Ctrl+N"},
@@ -55,7 +55,6 @@ inline constexpr std::array<ShortcutCommandInfo, 36> kShortcutCommandCatalog{{
     {L"tools.edit_comment", L"Tools: Edit archive comment", L"Ctrl+M"},
     {L"tools.lock", L"Tools: Lock archive", L"Ctrl+Shift+L"},
     {L"tools.repair", L"Tools: Repair archive", L"Ctrl+Shift+P"},
-    {L"tools.create_recovery_volumes", L"Tools: Create recovery volumes", L"Ctrl+Alt+R"},
     {L"tools.verify_signature", L"Tools: Verify signature", L"Ctrl+Shift+V"},
     {L"tools.create_sfx", L"Tools: Create self-extracting archive", L"Ctrl+Shift+X"},
     {L"navigation.back", L"Navigation: Back", L"Alt+Left"},

@@ -91,6 +91,10 @@ bool read_bool(HKEY key, const wchar_t* name, bool fallback) {
     return read_dword(key, name, fallback ? 1u : 0u) != 0;
 }
 
+bool registry_value_exists(HKEY key, const wchar_t* name) {
+    return RegQueryValueExW(key, name, nullptr, nullptr, nullptr, nullptr) == ERROR_SUCCESS;
+}
+
 std::vector<int> read_int_list(HKEY key, const wchar_t* name) {
     std::vector<int> values;
     std::wstring text = read_string(key, name);
@@ -212,6 +216,10 @@ PersistedGuiSettings load_gui_settings() {
     settings.application.memory_limit_mode =
         read_clamped_int(key, L"MemoryLimitMode", 0, 0, 1);
     settings.application.memory_limit = read_string(key, L"MemoryLimit");
+    if (registry_value_exists(key, L"ToolbarCommands")) {
+        settings.application.toolbar_commands =
+            normalize_toolbar_commands(read_string_list(key, L"ToolbarCommands"));
+    }
     settings.application.shortcut_overrides =
         shortcut_overrides_from_strings(read_string_list(key, L"ShortcutOverrides"));
     settings.sort_column = static_cast<int>(std::clamp<DWORD>(read_dword(key, L"SortColumn", 0), 0, 6));
@@ -351,6 +359,8 @@ void save_gui_settings(const PersistedGuiSettings& settings) {
     write_dword(key, L"MemoryLimitMode",
                 static_cast<DWORD>(std::clamp(settings.application.memory_limit_mode, 0, 1)));
     write_string(key, L"MemoryLimit", settings.application.memory_limit);
+    write_string_list(key, L"ToolbarCommands",
+                      normalize_toolbar_commands(settings.application.toolbar_commands));
     write_string_list(key, L"ShortcutOverrides",
                       shortcut_overrides_to_strings(settings.application.shortcut_overrides));
     write_dword(key, L"SortColumn", static_cast<DWORD>(settings.sort_column));

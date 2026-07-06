@@ -127,6 +127,8 @@ std::optional<std::wstring> MainWindow::tree_location_value(const DirectoryTreeN
             return std::wstring(L"This PC");
         case DirectoryTreeNodeKind::filesystem:
             return node.filesystem_path.wstring();
+        case DirectoryTreeNodeKind::file:
+            return node.filesystem_path.wstring();
         case DirectoryTreeNodeKind::archive:
             return axiom::gui::BrowserLocation::archive(node.archive_path).display_name();
         case DirectoryTreeNodeKind::archive_directory:
@@ -247,6 +249,7 @@ void MainWindow::update_navigation_buttons() {
     EnableWindow(navigate_back_, history_.can_back());
     EnableWindow(navigate_forward_, history_.can_forward());
     EnableWindow(navigate_up_, parent_location(history_.current()).has_value());
+    update_toolbar_button_states();
 }
 
 void MainWindow::on_address_go() {

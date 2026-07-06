@@ -4,7 +4,9 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <array>
 #include <cwctype>
+#include <optional>
 #include <string_view>
 #include <unordered_set>
 #include <utility>
@@ -73,11 +75,52 @@ std::wstring attributes_text(DWORD attributes) {
     return result;
 }
 
+std::wstring lower_ascii_wide(std::wstring text) {
+    for (wchar_t& ch : text) {
+        if (ch >= L'A' && ch <= L'Z') ch = static_cast<wchar_t>(ch - L'A' + L'a');
+    }
+    return text;
+}
+
+bool has_ascii_suffix(std::wstring_view text, std::wstring_view suffix) {
+    return text.size() >= suffix.size() &&
+           text.substr(text.size() - suffix.size()) == suffix;
+}
+
+bool has_rar_part_extension(std::wstring_view extension) {
+    return extension.size() == 4 && extension[0] == L'.' && extension[1] == L'r' &&
+           extension[2] >= L'0' && extension[2] <= L'9' &&
+           extension[3] >= L'0' && extension[3] <= L'9';
+}
+
+std::optional<std::wstring> archive_type_from_name(const fs::path& path) {
+    const std::wstring name = lower_ascii_wide(path.filename().wstring());
+    const std::wstring extension = lower_ascii_wide(path.extension().wstring());
+    if (extension == L".axar") return L"Axiom archive";
+    if (extension == L".zip") return L"ZIP archive";
+    if (extension == L".jar") return L"JAR archive";
+    if (extension == L".war") return L"WAR archive";
+    if (extension == L".apk") return L"APK archive";
+    if (extension == L".7z") return L"7z archive";
+    if (extension == L".rar" || has_rar_part_extension(extension) ||
+        (name.find(L".part") != std::wstring::npos && has_ascii_suffix(name, L".rar"))) {
+        return L"RAR archive";
+    }
+    constexpr std::array<std::wstring_view, 9> tar_suffixes{
+        L".tar", L".tar.gz", L".tgz", L".tar.xz", L".txz",
+        L".tar.bz2", L".tbz2", L".tar.zst", L".tzst"};
+    if (std::any_of(tar_suffixes.begin(), tar_suffixes.end(),
+                    [&](std::wstring_view suffix) { return has_ascii_suffix(name, suffix); })) {
+        return L"TAR archive";
+    }
+    if (extension == L".iso") return L"ISO image";
+    if (extension == L".cab") return L"CAB archive";
+    return std::nullopt;
+}
+
 std::wstring extension_type(const fs::path& path, bool directory) {
     if (directory) return L"File folder";
-    if (const auto* provider = axiom::archive_provider_for_path(path)) {
-        return widen(provider->info().file_type_name);
-    }
+    if (auto archive_type = archive_type_from_name(path)) return *archive_type;
     std::wstring extension = path.extension().wstring();
     if (extension.empty()) return L"File";
     std::transform(extension.begin(), extension.end(), extension.begin(),
@@ -167,6 +210,7 @@ BrowserSnapshot load_computer(const BrowserLocation& location, std::stop_token s
 BrowserSnapshot load_filesystem(const BrowserLocation& location, std::stop_token stop) {
     BrowserSnapshot snapshot;
     snapshot.location = location;
+    snapshot.items.reserve(1024);
     snapshot.items.push_back(parent_item());
     const fs::path pattern = location.filesystem_path / L"*";
     WIN32_FIND_DATAW data{};
@@ -186,11 +230,15 @@ BrowserSnapshot load_filesystem(const BrowserLocation& location, std::stop_token
         BrowserItem item;
         item.filesystem_path = location.filesystem_path / data.cFileName;
         item.name = data.cFileName;
-        item.kind = directory
-            ? BrowserItemKind::directory
-            : (is_supported_archive(item.filesystem_path) ? BrowserItemKind::archive
-                                                          : BrowserItemKind::file);
-        item.type = extension_type(item.filesystem_path, directory);
+        const auto archive_type = directory
+            ? std::optional<std::wstring>{}
+            : archive_type_from_name(item.filesystem_path);
+        item.kind = directory ? BrowserItemKind::directory
+                              : (archive_type ? BrowserItemKind::archive
+                                              : BrowserItemKind::file);
+        item.type = directory ? L"File folder"
+                              : (archive_type ? *archive_type
+                                              : extension_type(item.filesystem_path, false));
         item.size = directory ? 0
             : (static_cast<std::uint64_t>(data.nFileSizeHigh) << 32) | data.nFileSizeLow;
         item.modified = file_time_text(data.ftLastWriteTime);
@@ -391,6 +439,10 @@ bool is_axiom_archive(const fs::path& path) {
 
 bool is_supported_archive(const fs::path& path) {
     return axiom::is_supported_archive(path);
+}
+
+bool path_has_supported_archive_extension(const fs::path& path) {
+    return archive_type_from_name(path).has_value();
 }
 
 std::optional<BrowserLocation> parent_location(const BrowserLocation& location) {

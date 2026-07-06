@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <span>
 #include <vector>
 
@@ -14,6 +15,10 @@ namespace axiom::core {
 // slotted in later without changing the on-disk recovery format.
 class ReedSolomon {
 public:
+    using EncodeProgressCallback =
+        std::function<void(int parity_index, std::size_t completed_bytes,
+                           std::size_t total_bytes)>;
+
     ReedSolomon(int data_shards, int parity_shards);
 
     int data_shards() const { return data_shards_; }
@@ -23,7 +28,8 @@ public:
     // Compute the parity shards from the data shards. `data` has `data_shards` entries
     // and `parity` has `parity_shards` entries, all of identical length.
     void encode(const std::vector<std::span<const std::uint8_t>>& data,
-                const std::vector<std::span<std::uint8_t>>& parity) const;
+                const std::vector<std::span<std::uint8_t>>& parity,
+                const EncodeProgressCallback& progress = {}) const;
 
     // Reconstruct missing shards in place. `shards` holds all total_shards() shards
     // (equal length); `present[i]` is false for a missing/corrupt shard, whose buffer

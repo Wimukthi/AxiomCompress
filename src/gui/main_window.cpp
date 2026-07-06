@@ -150,6 +150,144 @@ void MainWindow::add_tooltip(HWND control, const wchar_t* text) const {
     SendMessageW(tooltip_, TTM_ADDTOOLW, 0, reinterpret_cast<LPARAM>(&tool));
 }
 
+UINT MainWindow::toolbar_command_for_action(std::wstring_view action) {
+    if (action == L"file.open_archive") return kOpenArchive;
+    if (action == L"commands.add") return kAddFiles;
+    if (action == L"commands.extract") return kExtract;
+    if (action == L"commands.test") return kTest;
+    if (action == L"commands.update") return kUpdateArchive;
+    if (action == L"commands.freshen") return kFreshenArchive;
+    if (action == L"commands.synchronize") return kSynchronizeArchive;
+    if (action == L"commands.delete_archive_entries") return kDeleteArchiveEntries;
+    if (action == L"commands.repack") return kRepackArchive;
+    if (action == L"commands.view") return kView;
+    if (action == L"commands.delete") return kDelete;
+    if (action == L"commands.select_all") return kSelectAll;
+    if (action == L"tools.info") return kInfo;
+    if (action == L"tools.find") return kFind;
+    if (action == L"tools.benchmark") return kBenchmark;
+    if (action == L"tools.edit_comment") return kEditArchiveComment;
+    if (action == L"tools.lock") return kLockArchive;
+    if (action == L"tools.repair") return kRepairArchive;
+    if (action == L"tools.verify_signature") return kVerifyArchiveSignature;
+    if (action == L"tools.create_sfx") return kCreateSfx;
+    if (action == L"options.toggle_tree") return kToggleTreePane;
+    if (action == L"options.add_favorite") return kAddFavorite;
+    if (action == L"options.remove_favorite") return kRemoveFavorite;
+    if (action == L"options.settings") return kSettings;
+    if (action == L"help.check_updates") return kCheckUpdates;
+    if (action == L"clipboard.copy_path") return kCopyPath;
+    if (action == L"clipboard.copy_crc32") return kCopyCrc32;
+    return 0;
+}
+
+int MainWindow::toolbar_button_width(UINT command) {
+    switch (command) {
+        case kOpenArchive: return 104;
+        case kAddFiles: return 72;
+        case kExtract: return 88;
+        case kTest: return 64;
+        case kUpdateArchive: return 84;
+        case kFreshenArchive: return 92;
+        case kSynchronizeArchive: return 74;
+        case kDeleteArchiveEntries: return 88;
+        case kRepackArchive: return 88;
+        case kView: return 64;
+        case kDelete: return 70;
+        case kSelectAll: return 96;
+        case kInfo: return 60;
+        case kFind: return 66;
+        case kBenchmark: return 104;
+        case kEditArchiveComment: return 94;
+        case kLockArchive: return 68;
+        case kRepairArchive: return 82;
+        case kVerifyArchiveSignature: return 82;
+        case kCreateSfx: return 68;
+        case kToggleTreePane: return 68;
+        case kAddFavorite: return 92;
+        case kRemoveFavorite: return 104;
+        case kSettings: return 82;
+        case kCheckUpdates: return 92;
+        case kCopyPath: return 96;
+        case kCopyCrc32: return 96;
+        default: return 84;
+    }
+}
+
+HWND MainWindow::toolbar_button(UINT command) const {
+    for (const ToolbarButton& button : toolbar_buttons_) {
+        if (button.command == command) return button.window;
+    }
+    return nullptr;
+}
+
+void MainWindow::assign_toolbar_button(UINT command, HWND button) {
+    switch (command) {
+        case kAddFiles: add_files_ = button; break;
+        case kOpenArchive: open_archive_ = button; break;
+        case kExtract: extract_ = button; break;
+        case kTest: test_ = button; break;
+        case kView: view_ = button; break;
+        case kDelete: delete_ = button; break;
+        case kInfo: info_ = button; break;
+        case kSettings: settings_ = button; break;
+        default: break;
+    }
+}
+
+void MainWindow::create_toolbar_buttons() {
+    toolbar_buttons_.clear();
+    for (const axiom::gui::ToolbarCommandInfo& command : kToolbarCommandCatalog) {
+        const UINT id = toolbar_command_for_action(command.id);
+        if (id == 0) continue;
+        HWND button = make_control(
+            L"BUTTON", command.button_text, WS_TABSTOP | BS_OWNERDRAW, static_cast<int>(id));
+        toolbar_buttons_.push_back({id, button});
+        assign_toolbar_button(id, button);
+    }
+}
+
+std::vector<UINT> MainWindow::visible_toolbar_commands() const {
+    std::vector<UINT> result;
+    const auto commands = normalize_toolbar_commands(application_options_.toolbar_commands);
+    result.reserve(commands.size());
+    for (const std::wstring& action : commands) {
+        const UINT command = toolbar_command_for_action(action);
+        if (command != 0 && toolbar_button(command) != nullptr) {
+            result.push_back(command);
+        }
+    }
+    return result;
+}
+
+int MainWindow::command_toolbar_height_for_width(int width) const {
+    const auto commands = visible_toolbar_commands();
+    if (commands.empty()) return 0;
+    const int margin = scale(8);
+    const int gap = scale(6);
+    const int button_height = scale(30);
+    const int right = std::max(margin, width - margin);
+    int rows = 1;
+    int x = margin;
+    for (UINT command : commands) {
+        const int button_width = scale(toolbar_button_width(command));
+        if (x > margin && x + button_width > right) {
+            ++rows;
+            x = margin;
+        }
+        x += button_width + gap;
+    }
+    return rows * button_height + (rows - 1) * gap;
+}
+
+void MainWindow::update_toolbar_button_states() {
+    for (const ToolbarButton& button : toolbar_buttons_) {
+        if (button.window != nullptr) {
+            EnableWindow(button.window, can_execute_shortcut_command(button.command));
+        }
+    }
+}
+
 int MainWindow::show_app_message(
     std::wstring_view message,
     axiom::gui::MessageDialogIcon icon,
@@ -176,10 +314,7 @@ void MainWindow::on_create() {
             SendMessageW(hwnd_, WM_COMMAND, MAKEWPARAM(command, 0), 0);
         });
 
-    add_files_ = make_control(L"BUTTON", L"Add", WS_TABSTOP | BS_OWNERDRAW, kAddFiles);
-    open_archive_ = make_control(L"BUTTON", L"Open archive", WS_TABSTOP | BS_OWNERDRAW, kOpenArchive);
-    extract_ = make_control(L"BUTTON", L"Extract", WS_TABSTOP | BS_OWNERDRAW, kExtract);
-    test_ = make_control(L"BUTTON", L"Test", WS_TABSTOP | BS_OWNERDRAW, kTest);
+    create_toolbar_buttons();
 
     navigate_back_ = make_control(L"BUTTON", L"<", WS_TABSTOP | BS_OWNERDRAW, kNavigateBack);
     navigate_forward_ = make_control(L"BUTTON", L">", WS_TABSTOP | BS_OWNERDRAW, kNavigateForward);
@@ -192,10 +327,6 @@ void MainWindow::on_create() {
         kAddressEdit);
     set_text(address_edit_, L"This PC");
     address_go_ = make_control(L"BUTTON", L"Go", WS_TABSTOP | BS_OWNERDRAW, kAddressGo);
-    view_ = make_control(L"BUTTON", L"View", WS_TABSTOP | BS_OWNERDRAW, kView);
-    delete_ = make_control(L"BUTTON", L"Delete", WS_TABSTOP | BS_OWNERDRAW, kDelete);
-    info_ = make_control(L"BUTTON", L"Info", WS_TABSTOP | BS_OWNERDRAW, kInfo);
-    settings_ = make_control(L"BUTTON", L"Settings", WS_TABSTOP | BS_OWNERDRAW, kSettings);
 
     tree_view_.create(hwnd_, instance_, kTree);
     tree_view_.set_populate_callback([this](DirectoryTreeItem& item) {
@@ -210,6 +341,11 @@ void MainWindow::on_create() {
                                WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX,
                                CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
                                hwnd_, nullptr, instance_, nullptr);
+    for (const axiom::gui::ToolbarCommandInfo& command : kToolbarCommandCatalog) {
+        if (HWND button = toolbar_button(toolbar_command_for_action(command.id))) {
+            add_tooltip(button, command.label);
+        }
+    }
     add_tooltip(navigate_back_, L"Back");
     add_tooltip(navigate_forward_, L"Forward");
     add_tooltip(navigate_up_, L"Up one level");
@@ -284,7 +420,12 @@ void MainWindow::on_initial_navigate() {
 }
 
 int MainWindow::browser_pane_top() const {
-    return menu_bar_.preferred_height() + scale(8) + scale(30) + scale(6) +
+    RECT client{};
+    GetClientRect(hwnd_, &client);
+    const int width = client.right - client.left;
+    const int toolbar_height = command_toolbar_height_for_width(width);
+    return menu_bar_.preferred_height() + scale(8) +
+           toolbar_height + (toolbar_height > 0 ? scale(6) : 0) +
            scale(30) + scale(6);
 }
 
@@ -394,15 +535,25 @@ void MainWindow::layout() {
         x += width_px + gap;
     };
 
-    place(add_files_, 72);
-    place(extract_, 88);
-    place(test_, 64);
-    place(view_, 64);
-    place(delete_, 70);
-    place(info_, 60);
-    place(open_archive_, 104);
-    place(settings_, 82);
-    y += button_height + gap;
+    for (const ToolbarButton& button : toolbar_buttons_) {
+        if (button.window != nullptr) ShowWindow(button.window, SW_HIDE);
+    }
+    const auto toolbar_commands = visible_toolbar_commands();
+    if (!toolbar_commands.empty()) {
+        for (UINT command : toolbar_commands) {
+            HWND button = toolbar_button(command);
+            if (button == nullptr) continue;
+            const int width_px = scale(toolbar_button_width(command));
+            if (x > margin && x + width_px > right) {
+                x = margin;
+                y += button_height + gap;
+            }
+            ShowWindow(button, SW_SHOW);
+            MoveWindow(button, x, y, width_px, button_height, TRUE);
+            x += width_px + gap;
+        }
+        y += button_height + gap;
+    }
 
     x = margin;
     place(navigate_back_, 36);
@@ -433,13 +584,8 @@ void MainWindow::set_status(const std::wstring& text) {
 
 void MainWindow::set_busy(bool busy) {
     busy_ = busy;
-    EnableWindow(add_files_, !busy);
-    EnableWindow(open_archive_, !busy);
-    EnableWindow(extract_, !busy);
-    EnableWindow(test_, !busy);
+    update_toolbar_button_states();
     EnableWindow(tree_view_.hwnd(), !busy && tree_pane_visible_);
-    EnableWindow(delete_, !busy);
-    EnableWindow(settings_, !busy);
     operation_paused_ = false;
 }
 
@@ -678,7 +824,7 @@ LRESULT MainWindow::handle_message(UINT message, WPARAM wparam, LPARAM lparam) {
                 case kEditArchiveComment: on_edit_archive_comment(); return 0;
                 case kLockArchive: on_lock_archive(); return 0;
                 case kRepairArchive: on_repair_archive(); return 0;
-                case kCreateRecoveryVolumes: on_create_recovery_volumes(); return 0;
+                case kCreateRecoveryVolumes: return 0;
                 case kVerifyArchiveSignature: on_verify_archive_signature(); return 0;
                 case kCreateSfx: on_create_sfx(); return 0;
                 case kBenchmark: on_benchmark(); return 0;

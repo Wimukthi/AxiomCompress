@@ -384,6 +384,7 @@ public:
     int focused_index() const;
     int vertical_scroll_position() const;
     int horizontal_scroll_position() const;
+    std::optional<RECT> cell_rect(int row, int column) const;
     void set_selection_and_scroll(std::vector<int> selected_indices,
                                   int focused_index,
                                   int horizontal_scroll,
@@ -521,6 +522,7 @@ enum class DirectoryTreeNodeKind {
     dummy,
     computer,
     filesystem,
+    file,
     archive,
     archive_directory,
 };
@@ -862,6 +864,14 @@ private:
                       DWORD ex_style = 0);
     void apply_edit_margins() const;
     void add_tooltip(HWND control, const wchar_t* text) const;
+    static UINT toolbar_command_for_action(std::wstring_view action);
+    static int toolbar_button_width(UINT command);
+    HWND toolbar_button(UINT command) const;
+    void assign_toolbar_button(UINT command, HWND button);
+    void create_toolbar_buttons();
+    std::vector<UINT> visible_toolbar_commands() const;
+    int command_toolbar_height_for_width(int width) const;
+    void update_toolbar_button_states();
     int show_app_message(
         std::wstring_view message,
         axiom::gui::MessageDialogIcon icon,
@@ -953,6 +963,7 @@ private:
     ShellIconRef cached_shell_icon_for_item(const axiom::gui::BrowserItem& item,
                                             bool prefer_generic_unique_icon = false);
     std::vector<int> selected_browser_indices() const;
+    bool selected_has_crc32() const;
     BrowserViewState capture_browser_view_state() const;
     void restore_browser_view_state(const BrowserViewState& state);
     std::optional<BrowserViewState> current_or_pending_browser_view_state() const;
@@ -1121,6 +1132,13 @@ private:
     HWND list_ = nullptr;
 
     HWND status_ = nullptr;
+
+    struct ToolbarButton {
+        UINT command = 0;
+        HWND window = nullptr;
+    };
+
+    std::vector<ToolbarButton> toolbar_buttons_;
 
     DarkDirectoryTreeView tree_view_;
 

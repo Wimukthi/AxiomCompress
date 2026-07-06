@@ -47,11 +47,8 @@ bool MainWindow::filesystem_has_tree_children(const fs::path& path) const {
     bool found = false;
     do {
         if (!tree_should_show_filesystem_item(data)) continue;
-        const bool directory = (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
-        if (directory || axiom::is_supported_archive(path / data.cFileName)) {
-            found = true;
-            break;
-        }
+        found = true;
+        break;
     } while (FindNextFileW(find, &data));
     FindClose(find);
     return found;
@@ -68,8 +65,7 @@ void MainWindow::populate_tree_filesystem_children(DirectoryTreeItem& item, cons
         if (!tree_should_show_filesystem_item(data)) continue;
         const bool directory = (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
         const fs::path child_path = path / data.cFileName;
-        const bool archive = !directory && axiom::is_supported_archive(child_path);
-        if (!directory && !archive) continue;
+        const bool archive = !directory && path_has_supported_archive_extension(child_path);
         candidates.push_back({data.cFileName, child_path, directory, archive, false});
     } while (FindNextFileW(find, &data));
     FindClose(find);
@@ -82,10 +78,11 @@ void MainWindow::populate_tree_filesystem_children(DirectoryTreeItem& item, cons
     for (const auto& child : candidates) {
         DirectoryTreeNode node;
         node.kind = child.archive ? DirectoryTreeNodeKind::archive
-                                  : DirectoryTreeNodeKind::filesystem;
+                                  : child.directory ? DirectoryTreeNodeKind::filesystem
+                                                    : DirectoryTreeNodeKind::file;
         node.filesystem_path = child.path;
         node.archive_path = child.archive ? child.path : fs::path{};
-        const bool has_children = child.archive || filesystem_has_tree_children(child.path);
+        const bool has_children = child.archive || child.directory;
         insert_tree_item(&item, child.name, std::move(node),
                          child.archive ? tree_icon_for_archive(child.path)
                                        : tree_icon_for_filesystem(child.path),
@@ -196,6 +193,8 @@ void MainWindow::populate_tree_item(DirectoryTreeItem& item) {
         case DirectoryTreeNodeKind::filesystem:
             populate_tree_filesystem_children(item, node.filesystem_path);
             break;
+        case DirectoryTreeNodeKind::file:
+            break;
         case DirectoryTreeNodeKind::archive:
             populate_tree_archive_children(item, node.archive_path, {});
             break;
@@ -216,6 +215,7 @@ DirectoryTreeItem* MainWindow::find_tree_child_by_filesystem_path(DirectoryTreeI
     for (const auto& child : parent.children) {
         const auto& node = child->node;
         if ((node.kind == DirectoryTreeNodeKind::filesystem ||
+             node.kind == DirectoryTreeNodeKind::file ||
              node.kind == DirectoryTreeNodeKind::archive) &&
             same_filesystem_path(node.filesystem_path, path)) {
             return child.get();
@@ -264,11 +264,19 @@ DirectoryTreeItem* MainWindow::ensure_filesystem_tree_path(const fs::path& path)
         current->expanded = true;
         current_path /= part;
         DirectoryTreeItem* child = find_tree_child_by_filesystem_path(*current, current_path);
+        const bool final_component = same_filesystem_path(current_path, path);
         if (child == nullptr) {
             DirectoryTreeNode node;
-            node.kind = axiom::is_supported_archive(current_path)
-                ? DirectoryTreeNodeKind::archive
-                : DirectoryTreeNodeKind::filesystem;
+            const DWORD attributes = GetFileAttributesW(current_path.c_str());
+            const bool directory = attributes != INVALID_FILE_ATTRIBUTES &&
+                                   (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+            const bool archive = !directory &&
+                (path_has_supported_archive_extension(current_path) ||
+                 (final_component &&
+                  axiom::archive_provider_for_path(current_path) != nullptr));
+            node.kind = archive ? DirectoryTreeNodeKind::archive
+                                : directory ? DirectoryTreeNodeKind::filesystem
+                                            : DirectoryTreeNodeKind::file;
             node.filesystem_path = current_path;
             node.archive_path = node.kind == DirectoryTreeNodeKind::archive
                 ? current_path
@@ -278,7 +286,18 @@ DirectoryTreeItem* MainWindow::ensure_filesystem_tree_path(const fs::path& path)
                                          ? tree_icon_for_archive(current_path)
                                          : tree_icon_for_filesystem(current_path),
                                      node.kind == DirectoryTreeNodeKind::archive ||
-                                         filesystem_has_tree_children(current_path));
+                                         (node.kind == DirectoryTreeNodeKind::filesystem &&
+                                          filesystem_has_tree_children(current_path)));
+        } else if (final_component &&
+                   child->node.kind == DirectoryTreeNodeKind::file &&
+                   axiom::archive_provider_for_path(current_path) != nullptr) {
+            child->node.kind = DirectoryTreeNodeKind::archive;
+            child->node.archive_path = current_path;
+            child->icon = tree_icon_for_archive(current_path);
+            child->may_have_children = true;
+            child->populated = false;
+            child->node.populated = false;
+            tree_view_.clear_children(*child);
         }
         current = child;
     }
@@ -362,8 +381,16 @@ void MainWindow::on_tree_selection_changed(const DirectoryTreeItem& item) {
         case DirectoryTreeNodeKind::filesystem:
             navigate_to(axiom::gui::BrowserLocation::filesystem(node.filesystem_path));
             break;
+        case DirectoryTreeNodeKind::file:
+            if (!open_archive_path(node.filesystem_path)) {
+                const fs::path parent = node.filesystem_path.parent_path();
+                if (!parent.empty()) {
+                    navigate_to(axiom::gui::BrowserLocation::filesystem(parent));
+                }
+            }
+            break;
         case DirectoryTreeNodeKind::archive:
-            navigate_to(axiom::gui::BrowserLocation::archive(node.archive_path));
+            open_archive_path(node.filesystem_path);
             break;
         case DirectoryTreeNodeKind::archive_directory:
             navigate_to(axiom::gui::BrowserLocation::archive(node.archive_path,
@@ -1014,6 +1041,9 @@ void MainWindow::activate_browser_item(int index) {
             open_archive_path(item.filesystem_path)) {
             return;
         }
+        if (open_archive_path(item.filesystem_path)) {
+            return;
+        }
         ShellExecuteW(hwnd_, L"open", item.filesystem_path.c_str(), nullptr,
                       item.filesystem_path.parent_path().c_str(), SW_SHOWNORMAL);
     } else if (history_.current().kind == axiom::gui::BrowserLocationKind::archive &&
@@ -1064,6 +1094,7 @@ void MainWindow::on_table_selection_changed() {
     } else {
         update_browser_status(&indices);
     }
+    update_toolbar_button_states();
 }
 
 void MainWindow::on_select_all() {
