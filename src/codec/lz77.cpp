@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <optional>
 #include <vector>
 
 #if defined(_MSC_VER)
@@ -755,6 +756,114 @@ ByteVector encode_lz77_tree(std::span<const std::uint8_t> input,
     return output;
 }
 
+// LZMA-style candidate enumeration over the same cyclic-window binary tree the
+// greedy tree matcher uses: advancing to a position both inserts it and yields
+// the improving (length, distance) pairs met during the descent. Because the
+// tree orders suffixes, a bounded descent surfaces far better candidates than
+// an equally bounded hash-chain walk, which is what the optimal parser's DP
+// wants: several distinct lengths, each at its nearest distance.
+template <typename Index>
+class TreeMatchSource {
+public:
+    TreeMatchSource(std::span<const std::uint8_t> input,
+                    std::size_t window_size,
+                    std::size_t max_match,
+                    std::size_t depth_cutoff)
+        : input_(input),
+          n_(input.size()),
+          cyclic_size_(std::min(std::max<std::size_t>(kMinMatch, window_size),
+                                std::max<std::size_t>(1, n_))),
+          max_match_(max_match),
+          depth_cutoff_(depth_cutoff) {
+        head_.assign(kHashSize, kNoPos);
+        son_.assign(2 * cyclic_size_, kNoPos);
+    }
+
+    // Must be called for every position in increasing order (the tree needs
+    // each position inserted). When `matches` is non-null the improving
+    // candidates are recorded through add_match_candidate.
+    void advance(std::size_t p, std::vector<Match>* matches, std::size_t max_candidates) {
+        const auto cyclic_pos = cyclic_pos_;
+        if (++cyclic_pos_ == cyclic_size_) {
+            cyclic_pos_ = 0;
+        }
+        if (p + kMinMatch > n_) {
+            return;
+        }
+
+        const auto hash = hash4(input_, p);
+        auto node = head_[hash];
+        head_[hash] = static_cast<Index>(p);
+
+        Index* ptr_smaller = &son_[2 * cyclic_pos];
+        Index* ptr_larger = &son_[2 * cyclic_pos + 1];
+        std::size_t len_smaller = 0;
+        std::size_t len_larger = 0;
+        const auto limit = std::min(max_match_, n_ - p);
+        std::size_t cycles = depth_cutoff_;
+        std::size_t best_len = 0;
+
+        while (true) {
+            if (node == kNoPos) {
+                *ptr_smaller = kNoPos;
+                *ptr_larger = kNoPos;
+                return;
+            }
+
+            const std::size_t np = node;
+            const std::size_t delta = p - np;
+            if (delta >= cyclic_size_ || cycles-- == 0) {
+                *ptr_smaller = kNoPos;
+                *ptr_larger = kNoPos;
+                return;
+            }
+
+            const auto node_slot =
+                cyclic_pos >= delta ? cyclic_pos - delta : cyclic_pos + cyclic_size_ - delta;
+            prefetch_read(&son_[2 * node_slot]);
+
+            std::size_t len = std::min(len_smaller, len_larger);
+            len += common_prefix(input_.data() + np + len, input_.data() + p + len,
+                                 limit - len);
+
+            if (matches != nullptr && len > best_len) {
+                best_len = len;
+                add_match_candidate(*matches, len, delta, max_candidates);
+            }
+
+            if (len == limit) {
+                *ptr_smaller = son_[2 * node_slot];
+                *ptr_larger = son_[2 * node_slot + 1];
+                return;
+            }
+
+            if (input_[np + len] < input_[p + len]) {
+                *ptr_smaller = static_cast<Index>(np);
+                ptr_smaller = &son_[2 * node_slot + 1];
+                node = son_[2 * node_slot + 1];
+                len_smaller = len;
+            } else {
+                *ptr_larger = static_cast<Index>(np);
+                ptr_larger = &son_[2 * node_slot];
+                node = son_[2 * node_slot];
+                len_larger = len;
+            }
+        }
+    }
+
+private:
+    static constexpr Index kNoPos = std::numeric_limits<Index>::max();
+
+    std::span<const std::uint8_t> input_;
+    std::size_t n_;
+    std::size_t cyclic_size_;
+    std::size_t max_match_;
+    std::size_t depth_cutoff_;
+    std::size_t cyclic_pos_ = 0;
+    std::vector<Index> head_;
+    std::vector<Index> son_;
+};
+
 ByteVector encode_lz77(std::span<const std::uint8_t> input,
                        const CompressionOptions& options) {
     // 32-bit indices suffice (and halve match-finder memory) until the input
@@ -782,14 +891,25 @@ ByteVector optimal_parse_with_costs(std::span<const std::uint8_t> input,
 
     using Index = std::uint32_t;
     constexpr Index kNoPos = std::numeric_limits<Index>::max();
+    // The tree levels source parser candidates from the sorted-suffix tree:
+    // an equally bounded descent yields several distinct lengths at their
+    // nearest distances, where a hash-chain walk mostly re-visits one length.
+    const bool use_tree = options.use_tree_matcher;
+    std::optional<TreeMatchSource<Index>> tree;
+    if (use_tree) {
+        tree.emplace(input, options.window_size, max_match, max_chain_depth);
+    }
+
     // Reused per worker thread across blocks (see encode_lz77_impl); the DP
     // arrays here are the largest allocations in the codec.
     static thread_local std::vector<Index> hash_heads;
     static thread_local std::vector<Index> previous;
     static thread_local std::vector<std::uint64_t> costs;
     static thread_local std::vector<ParseDecision> decisions;
-    hash_heads.assign(kHashSize, kNoPos);
-    previous.assign(input.size(), kNoPos);
+    if (!use_tree) {
+        hash_heads.assign(kHashSize, kNoPos);
+        previous.assign(input.size(), kNoPos);
+    }
     costs.assign(input.size() + 1, kInf);
     decisions.assign(input.size() + 1, ParseDecision{});
     // The recent-distance list depends on the path taken, so each position keeps
@@ -810,7 +930,12 @@ ByteVector optimal_parse_with_costs(std::span<const std::uint8_t> input,
 
     for (std::size_t position = 0; position < input.size(); ++position) {
         if (costs[position] == kInf) {
-            insert_position(position);
+            // Unreachable position: the match finder still needs it indexed.
+            if (use_tree) {
+                tree->advance(position, nullptr, 0);
+            } else {
+                insert_position(position);
+            }
             continue;
         }
 
@@ -838,14 +963,20 @@ ByteVector optimal_parse_with_costs(std::span<const std::uint8_t> input,
             decisions[position + 1] = ParseDecision{1, 0, ParseKind::literal, 0};
         }
 
-        auto matches = find_matches_at(input,
-                                       hash_heads,
-                                       previous,
-                                       position,
-                                       window_size,
-                                       max_match,
-                                       max_chain_depth,
-                                       max_candidates);
+        std::vector<Match> matches;
+        if (use_tree) {
+            matches.reserve(std::min(max_candidates, kParserCandidateLimit));
+            tree->advance(position, &matches, max_candidates);
+        } else {
+            matches = find_matches_at(input,
+                                      hash_heads,
+                                      previous,
+                                      position,
+                                      window_size,
+                                      max_match,
+                                      max_chain_depth,
+                                      max_candidates);
+        }
 
         // The parser evaluates a bounded set of useful lengths instead of every
         // possible prefix. That keeps the pass linear enough for large blocks.
@@ -901,7 +1032,9 @@ ByteVector optimal_parse_with_costs(std::span<const std::uint8_t> input,
             }
         }
 
-        insert_position(position);
+        if (!use_tree) {
+            insert_position(position);  // tree->advance already indexed it
+        }
     }
 
     ByteVector output;
