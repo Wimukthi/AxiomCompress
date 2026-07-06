@@ -1181,7 +1181,8 @@ ParseCosts measure_costs(std::span<const std::uint8_t> tokens) {
 }
 
 ByteVector encode_lz77_optimal(std::span<const std::uint8_t> input,
-                               const CompressionOptions& options) {
+                               const CompressionOptions& options,
+                               const ByteVector* greedy_tokens) {
     if (input.empty()) {
         return {};
     }
@@ -1189,6 +1190,18 @@ ByteVector encode_lz77_optimal(std::span<const std::uint8_t> input,
     if (input.size() > options.optimal_parse_limit ||
         input.size() >= std::numeric_limits<std::uint32_t>::max()) {
         return encode_lz77(input, options);
+    }
+
+    // Single-pass mode (the mid-effort presets): measure the symbol statistics
+    // from a cheap greedy parse instead of a throwaway first DP pass, then run
+    // the DP once with entropy-aligned costs. Roughly halves the optimal-parse
+    // cost for most of its ratio.
+    if (!options.optimal_two_pass) {
+        if (greedy_tokens != nullptr) {
+            return optimal_parse_with_costs(input, options, measure_costs(*greedy_tokens));
+        }
+        const auto greedy = encode_lz77(input, options);
+        return optimal_parse_with_costs(input, options, measure_costs(greedy));
     }
 
     // Parse once with crude weights, measure the real symbol statistics, then

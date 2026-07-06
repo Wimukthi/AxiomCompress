@@ -15,6 +15,7 @@
 #include <exception>
 #include <limits>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <thread>
 
@@ -170,9 +171,22 @@ BlockResult compress_block(std::span<const std::uint8_t> input,
         }
     };
 
-    consider_lz_payload(encode_lz77(input, options));
-    if (options.enable_optimal_parser && input.size() <= options.optimal_parse_limit) {
-        consider_lz_payload(encode_lz77_optimal(input, options));
+    const bool run_optimal =
+        options.enable_optimal_parser && input.size() <= options.optimal_parse_limit;
+    auto greedy = encode_lz77(input, options);
+    if (run_optimal && !options.optimal_two_pass) {
+        // Single-pass optimal measures its cost model from the greedy tokens,
+        // so they must outlive the parse; two-pass mode releases them first —
+        // keeping the extra buffer live through the long DP measurably hurts
+        // cache behaviour.
+        auto optimal_tokens = encode_lz77_optimal(input, options, &greedy);
+        consider_lz_payload(std::move(greedy));
+        consider_lz_payload(std::move(optimal_tokens));
+    } else {
+        consider_lz_payload(std::move(greedy));
+        if (run_optimal) {
+            consider_lz_payload(encode_lz77_optimal(input, options));
+        }
     }
 
     return finish_best();

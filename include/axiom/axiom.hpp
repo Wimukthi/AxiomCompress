@@ -145,6 +145,12 @@ struct CompressionOptions {
     bool force_store = false;
     bool force_parallel_blocks = false;
     bool enable_optimal_parser = false;
+    // Two-pass optimal parsing re-parses with costs measured from the first DP
+    // pass and keeps the smaller coded result; single-pass (false) measures
+    // costs from the cheap greedy parse and runs the DP once — roughly half
+    // the time for most of the ratio. Level 8 uses single-pass, level 9 and
+    // --optimal keep two passes.
+    bool optimal_two_pass = true;
     std::shared_ptr<OperationControl> operation;
     // Within-compress progress: when set, the parallel block codec calls this
     // with the cumulative number of this compress() call's input bytes whose
@@ -183,6 +189,9 @@ inline void apply_compression_level(CompressionOptions& options, int level) {
     options.use_tree_matcher = false;
     options.use_fast_lz = false;
     options.enable_optimal_parser = false;
+    options.optimal_two_pass = true;
+    options.optimal_chain_depth = 32;
+    options.max_parser_candidates = 8;
     options.auto_block_size_for_threads = true;
 
     switch (level) {
@@ -231,11 +240,18 @@ inline void apply_compression_level(CompressionOptions& options, int level) {
             options.fast_entropy = false;
             break;
         case 8:
+            // Mid-high ratio point: the tree matcher plus a single-pass
+            // optimal parse (costs measured from the greedy parse) reaches
+            // most of level 9's ratio at roughly half its time.
             options.use_tree_matcher = true;
             options.max_chain_depth = 128;
             options.block_size = 32u << 20;
             options.window_size = 32u << 20;
             options.fast_entropy = false;
+            options.enable_optimal_parser = true;
+            options.optimal_two_pass = false;
+            options.optimal_chain_depth = 16;
+            options.max_parser_candidates = 6;
             break;
         case 9:
             // Maximum preset keeps the deepest tree search and uses larger

@@ -365,12 +365,26 @@ ByteVector compress(std::span<const std::uint8_t> input,
             if (options.operation) {
                 options.operation->checkpoint();
             }
-            consider_lz_payload(codec::encode_lz77(input, options));
-            if (thorough && input.size() <= options.optimal_parse_limit) {
+            const bool run_optimal =
+                thorough && input.size() <= options.optimal_parse_limit;
+            auto greedy = codec::encode_lz77(input, options);
+            if (run_optimal && !options.optimal_two_pass) {
                 if (options.operation) {
                     options.operation->checkpoint();
                 }
-                consider_lz_payload(codec::encode_lz77_optimal(input, options));
+                // Single-pass optimal measures its cost model from the greedy
+                // tokens, so they must outlive the parse (see compress_block).
+                auto optimal_tokens = codec::encode_lz77_optimal(input, options, &greedy);
+                consider_lz_payload(std::move(greedy));
+                consider_lz_payload(std::move(optimal_tokens));
+            } else {
+                consider_lz_payload(std::move(greedy));
+                if (run_optimal) {
+                    if (options.operation) {
+                        options.operation->checkpoint();
+                    }
+                    consider_lz_payload(codec::encode_lz77_optimal(input, options));
+                }
             }
             // Max-effort mode also tries the binary-tree finder, whose large
             // effective window typically finds the most (and longest) matches.
