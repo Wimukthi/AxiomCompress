@@ -26,7 +26,7 @@ struct ToolbarCommandInfo {
     bool default_visible;
 };
 
-inline constexpr std::array<ToolbarCommandInfo, 27> kToolbarCommandCatalog{{
+inline constexpr std::array<ToolbarCommandInfo, 34> kToolbarCommandCatalog{{
     {L"commands.add", L"Add to archive", L"Add", ToolbarIcon::archive, true},
     {L"commands.extract", L"Extract", L"Extract", ToolbarIcon::extract, true},
     {L"commands.test", L"Test archive", L"Test", ToolbarIcon::test, true},
@@ -40,12 +40,19 @@ inline constexpr std::array<ToolbarCommandInfo, 27> kToolbarCommandCatalog{{
     {L"commands.synchronize", L"Synchronize archive", L"Sync", ToolbarIcon::synchronize_archive, false},
     {L"commands.delete_archive_entries", L"Delete archive entries", L"Remove", ToolbarIcon::delete_item, false},
     {L"commands.repack", L"Repack archive", L"Repack", ToolbarIcon::repack, false},
+    {L"commands.split", L"Split archive into volumes", L"Split", ToolbarIcon::split, false},
+    {L"commands.join", L"Join archive volumes", L"Join", ToolbarIcon::join, false},
     {L"commands.select_all", L"Select all", L"Select all", ToolbarIcon::select_all, false},
+    {L"file.compress_stream", L"Compress single stream", L"Compress", ToolbarIcon::compress_stream, false},
+    {L"file.decompress_stream", L"Decompress single stream", L"Decompress", ToolbarIcon::decompress_stream, false},
     {L"tools.find", L"Find files", L"Find", ToolbarIcon::find, false},
     {L"tools.benchmark", L"Benchmark", L"Benchmark", ToolbarIcon::benchmark, false},
     {L"tools.edit_comment", L"Edit archive comment", L"Comment", ToolbarIcon::comment, false},
     {L"tools.lock", L"Lock archive", L"Lock", ToolbarIcon::lock, false},
     {L"tools.repair", L"Repair archive", L"Repair", ToolbarIcon::repair, false},
+    {L"tools.recovery_record", L"Edit recovery record", L"Recovery", ToolbarIcon::recovery, false},
+    {L"tools.generate_key", L"Generate signing key", L"Keygen", ToolbarIcon::key, false},
+    {L"tools.sign_archive", L"Sign archive", L"Sign", ToolbarIcon::sign, false},
     {L"tools.verify_signature", L"Verify signature", L"Verify", ToolbarIcon::verify_signature, false},
     {L"tools.create_sfx", L"Create self-extracting archive", L"SFX", ToolbarIcon::sfx, false},
     {L"options.toggle_tree", L"Show/hide tree pane", L"Tree", ToolbarIcon::tree, false},

@@ -152,6 +152,8 @@ void MainWindow::add_tooltip(HWND control, const wchar_t* text) const {
 
 UINT MainWindow::toolbar_command_for_action(std::wstring_view action) {
     if (action == L"file.open_archive") return kOpenArchive;
+    if (action == L"file.compress_stream") return kCompressStream;
+    if (action == L"file.decompress_stream") return kDecompressStream;
     if (action == L"commands.add") return kAddFiles;
     if (action == L"commands.extract") return kExtract;
     if (action == L"commands.test") return kTest;
@@ -160,6 +162,8 @@ UINT MainWindow::toolbar_command_for_action(std::wstring_view action) {
     if (action == L"commands.synchronize") return kSynchronizeArchive;
     if (action == L"commands.delete_archive_entries") return kDeleteArchiveEntries;
     if (action == L"commands.repack") return kRepackArchive;
+    if (action == L"commands.split") return kSplitArchive;
+    if (action == L"commands.join") return kJoinArchive;
     if (action == L"commands.view") return kView;
     if (action == L"commands.delete") return kDelete;
     if (action == L"commands.select_all") return kSelectAll;
@@ -169,6 +173,9 @@ UINT MainWindow::toolbar_command_for_action(std::wstring_view action) {
     if (action == L"tools.edit_comment") return kEditArchiveComment;
     if (action == L"tools.lock") return kLockArchive;
     if (action == L"tools.repair") return kRepairArchive;
+    if (action == L"tools.recovery_record") return kEditRecoveryRecord;
+    if (action == L"tools.generate_key") return kGenerateSigningKey;
+    if (action == L"tools.sign_archive") return kSignArchive;
     if (action == L"tools.verify_signature") return kVerifyArchiveSignature;
     if (action == L"tools.create_sfx") return kCreateSfx;
     if (action == L"options.toggle_tree") return kToggleTreePane;
@@ -184,6 +191,8 @@ UINT MainWindow::toolbar_command_for_action(std::wstring_view action) {
 int MainWindow::toolbar_button_width(UINT command) {
     switch (command) {
         case kOpenArchive: return 104;
+        case kCompressStream: return 108;
+        case kDecompressStream: return 118;
         case kAddFiles: return 72;
         case kExtract: return 88;
         case kTest: return 64;
@@ -192,6 +201,8 @@ int MainWindow::toolbar_button_width(UINT command) {
         case kSynchronizeArchive: return 74;
         case kDeleteArchiveEntries: return 88;
         case kRepackArchive: return 88;
+        case kSplitArchive: return 78;
+        case kJoinArchive: return 80;
         case kView: return 64;
         case kDelete: return 70;
         case kSelectAll: return 96;
@@ -201,6 +212,9 @@ int MainWindow::toolbar_button_width(UINT command) {
         case kEditArchiveComment: return 94;
         case kLockArchive: return 68;
         case kRepairArchive: return 82;
+        case kEditRecoveryRecord: return 100;
+        case kGenerateSigningKey: return 84;
+        case kSignArchive: return 68;
         case kVerifyArchiveSignature: return 82;
         case kCreateSfx: return 68;
         case kToggleTreePane: return 68;
@@ -806,6 +820,8 @@ LRESULT MainWindow::handle_message(UINT message, WPARAM wparam, LPARAM lparam) {
                 case kFind: on_find_files(); return 0;
                 case kCopyPath: on_copy_paths(); return 0;
                 case kCopyCrc32: on_copy_crc32(); return 0;
+                case kCompressStream: on_compress_stream(); return 0;
+                case kDecompressStream: on_decompress_stream(); return 0;
                 case kAddFavorite: add_favorite_location(current_location_value()); return 0;
                 case kRemoveFavorite: remove_favorite_location(current_location_value()); return 0;
                 case kToggleTreePane: toggle_tree_pane(); return 0;
@@ -821,10 +837,14 @@ LRESULT MainWindow::handle_message(UINT message, WPARAM wparam, LPARAM lparam) {
                     return 0;
                 case kDeleteArchiveEntries: on_delete_from_archive(); return 0;
                 case kRepackArchive: on_repack_archive(); return 0;
+                case kSplitArchive: on_split_archive(); return 0;
+                case kJoinArchive: on_join_archive(); return 0;
                 case kEditArchiveComment: on_edit_archive_comment(); return 0;
                 case kLockArchive: on_lock_archive(); return 0;
                 case kRepairArchive: on_repair_archive(); return 0;
-                case kCreateRecoveryVolumes: return 0;
+                case kEditRecoveryRecord: on_edit_recovery_record(); return 0;
+                case kGenerateSigningKey: on_generate_signing_key(); return 0;
+                case kSignArchive: on_sign_archive(); return 0;
                 case kVerifyArchiveSignature: on_verify_archive_signature(); return 0;
                 case kCreateSfx: on_create_sfx(); return 0;
                 case kBenchmark: on_benchmark(); return 0;

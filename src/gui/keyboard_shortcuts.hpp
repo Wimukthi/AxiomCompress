@@ -35,8 +35,10 @@ struct KeyboardShortcut {
     bool operator==(const KeyboardShortcut&) const = default;
 };
 
-inline constexpr std::array<ShortcutCommandInfo, 35> kShortcutCommandCatalog{{
+inline constexpr std::array<ShortcutCommandInfo, 42> kShortcutCommandCatalog{{
     {L"file.open_archive", L"File: Open archive", L"Ctrl+O"},
+    {L"file.compress_stream", L"File: Compress single stream", L"Ctrl+Alt+Z"},
+    {L"file.decompress_stream", L"File: Decompress single stream", L"Ctrl+Alt+X"},
     {L"file.exit", L"File: Exit", L"Alt+F4"},
     {L"commands.add", L"Commands: Add to archive", L"Ctrl+N"},
     {L"commands.extract", L"Commands: Extract", L"Ctrl+E"},
@@ -46,6 +48,8 @@ inline constexpr std::array<ShortcutCommandInfo, 35> kShortcutCommandCatalog{{
     {L"commands.synchronize", L"Commands: Synchronize archive", L"Ctrl+Alt+U"},
     {L"commands.delete_archive_entries", L"Commands: Delete archive entries", L"Shift+Delete"},
     {L"commands.repack", L"Commands: Repack archive", L"Ctrl+Shift+R"},
+    {L"commands.split", L"Commands: Split archive", L"Ctrl+Shift+S"},
+    {L"commands.join", L"Commands: Join archive volumes", L"Ctrl+J"},
     {L"commands.view", L"Commands: View/open selection", L"Enter"},
     {L"commands.delete", L"Commands: Delete selection", L"Delete"},
     {L"commands.select_all", L"Commands: Select all", L"Ctrl+A"},
@@ -55,6 +59,9 @@ inline constexpr std::array<ShortcutCommandInfo, 35> kShortcutCommandCatalog{{
     {L"tools.edit_comment", L"Tools: Edit archive comment", L"Ctrl+M"},
     {L"tools.lock", L"Tools: Lock archive", L"Ctrl+Shift+L"},
     {L"tools.repair", L"Tools: Repair archive", L"Ctrl+Shift+P"},
+    {L"tools.recovery_record", L"Tools: Edit recovery record", L"Ctrl+Shift+Y"},
+    {L"tools.generate_key", L"Tools: Generate signing key", L"Ctrl+Shift+K"},
+    {L"tools.sign_archive", L"Tools: Sign archive", L"Ctrl+Shift+G"},
     {L"tools.verify_signature", L"Tools: Verify signature", L"Ctrl+Shift+V"},
     {L"tools.create_sfx", L"Tools: Create self-extracting archive", L"Ctrl+Shift+X"},
     {L"navigation.back", L"Navigation: Back", L"Alt+Left"},

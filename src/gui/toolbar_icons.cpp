@@ -37,13 +37,19 @@ const std::uint8_t* mask_for_icon(ToolbarIcon icon) {
         case ToolbarIcon::freshen_archive:
         case ToolbarIcon::synchronize_archive:
         case ToolbarIcon::repack:
+        case ToolbarIcon::split:
+        case ToolbarIcon::join:
         case ToolbarIcon::select_all:
+        case ToolbarIcon::compress_stream:
+        case ToolbarIcon::decompress_stream:
         case ToolbarIcon::find:
         case ToolbarIcon::benchmark:
         case ToolbarIcon::comment:
         case ToolbarIcon::lock:
         case ToolbarIcon::repair:
         case ToolbarIcon::recovery:
+        case ToolbarIcon::key:
+        case ToolbarIcon::sign:
         case ToolbarIcon::verify_signature:
         case ToolbarIcon::sfx:
         case ToolbarIcon::tree:
@@ -62,13 +68,19 @@ bool generated_icon(ToolbarIcon icon) {
         case ToolbarIcon::freshen_archive:
         case ToolbarIcon::synchronize_archive:
         case ToolbarIcon::repack:
+        case ToolbarIcon::split:
+        case ToolbarIcon::join:
         case ToolbarIcon::select_all:
+        case ToolbarIcon::compress_stream:
+        case ToolbarIcon::decompress_stream:
         case ToolbarIcon::find:
         case ToolbarIcon::benchmark:
         case ToolbarIcon::comment:
         case ToolbarIcon::lock:
         case ToolbarIcon::repair:
         case ToolbarIcon::recovery:
+        case ToolbarIcon::key:
+        case ToolbarIcon::sign:
         case ToolbarIcon::verify_signature:
         case ToolbarIcon::sfx:
         case ToolbarIcon::tree:
@@ -105,13 +117,19 @@ COLORREF color_for_icon(ToolbarIcon icon, COLORREF fallback, ToolbarIconStyle st
         case ToolbarIcon::freshen_archive: return RGB(96, 205, 112);
         case ToolbarIcon::synchronize_archive: return RGB(72, 214, 198);
         case ToolbarIcon::repack: return RGB(255, 185, 60);
+        case ToolbarIcon::split: return RGB(255, 193, 84);
+        case ToolbarIcon::join: return RGB(72, 214, 198);
         case ToolbarIcon::select_all: return RGB(124, 185, 255);
+        case ToolbarIcon::compress_stream: return RGB(255, 185, 60);
+        case ToolbarIcon::decompress_stream: return RGB(83, 174, 255);
         case ToolbarIcon::find: return RGB(124, 185, 255);
         case ToolbarIcon::benchmark: return RGB(255, 193, 84);
         case ToolbarIcon::comment: return RGB(255, 185, 60);
         case ToolbarIcon::lock: return RGB(255, 193, 84);
         case ToolbarIcon::repair: return RGB(255, 153, 87);
         case ToolbarIcon::recovery: return RGB(96, 205, 112);
+        case ToolbarIcon::key: return RGB(255, 211, 92);
+        case ToolbarIcon::sign: return RGB(96, 205, 112);
         case ToolbarIcon::verify_signature: return RGB(96, 205, 112);
         case ToolbarIcon::sfx: return RGB(180, 143, 255);
         case ToolbarIcon::tree: return RGB(83, 174, 255);
@@ -309,10 +327,46 @@ void draw_generated_toolbar_icon(HDC dc, ToolbarIcon icon, const RECT& bounds,
             icon_dc.line(9, 18, 13, 18);
             icon_dc.line(13, 18, 11, 16);
             break;
+        case ToolbarIcon::split:
+            icon_dc.rect(4, 5, 20, 19);
+            icon_dc.line(12, 5, 12, 19);
+            icon_dc.line(8, 12, 4, 8);
+            icon_dc.line(8, 12, 4, 16);
+            icon_dc.line(16, 12, 20, 8);
+            icon_dc.line(16, 12, 20, 16);
+            break;
+        case ToolbarIcon::join:
+            icon_dc.rect(4, 5, 20, 19);
+            icon_dc.line(12, 5, 12, 19);
+            icon_dc.line(4, 12, 9, 12);
+            icon_dc.line(9, 12, 7, 10);
+            icon_dc.line(9, 12, 7, 14);
+            icon_dc.line(20, 12, 15, 12);
+            icon_dc.line(15, 12, 17, 10);
+            icon_dc.line(15, 12, 17, 14);
+            break;
         case ToolbarIcon::select_all:
             icon_dc.rect(5, 5, 19, 19);
             icon_dc.line(8, 12, 11, 15);
             icon_dc.line(11, 15, 17, 9);
+            break;
+        case ToolbarIcon::compress_stream:
+            icon_dc.rect(5, 4, 19, 20);
+            icon_dc.line(8, 8, 16, 8);
+            icon_dc.line(8, 12, 16, 12);
+            icon_dc.line(8, 16, 16, 16);
+            icon_dc.line(12, 5, 12, 19);
+            icon_dc.line(9, 9, 12, 12);
+            icon_dc.line(15, 9, 12, 12);
+            break;
+        case ToolbarIcon::decompress_stream:
+            icon_dc.rect(5, 4, 19, 20);
+            icon_dc.line(8, 8, 16, 8);
+            icon_dc.line(8, 12, 16, 12);
+            icon_dc.line(8, 16, 16, 16);
+            icon_dc.line(12, 5, 12, 19);
+            icon_dc.line(9, 15, 12, 18);
+            icon_dc.line(15, 15, 12, 18);
             break;
         case ToolbarIcon::find:
             icon_dc.ellipse(5, 5, 15, 15);
@@ -350,6 +404,18 @@ void draw_generated_toolbar_icon(HDC dc, ToolbarIcon icon, const RECT& bounds,
             icon_dc.line(12, 15, 12, 20);
             icon_dc.line(4, 12, 9, 12);
             icon_dc.line(15, 12, 20, 12);
+            break;
+        case ToolbarIcon::key:
+            icon_dc.ellipse(4, 9, 11, 16);
+            icon_dc.line(11, 12, 21, 12);
+            icon_dc.line(17, 12, 17, 16);
+            icon_dc.line(20, 12, 20, 15);
+            break;
+        case ToolbarIcon::sign:
+            icon_dc.rect(5, 4, 19, 20);
+            icon_dc.line(8, 15, 11, 18);
+            icon_dc.line(11, 18, 17, 11);
+            icon_dc.line(8, 8, 16, 8);
             break;
         case ToolbarIcon::verify_signature:
             icon_dc.rect(5, 4, 19, 20);

@@ -10,6 +10,434 @@ namespace axiom::gui {
 
 namespace {
 
+constexpr wchar_t kCommandInputDialogClass[] = L"AxiomCommandInputDialog";
+constexpr int kCommandInputBase = 5200;
+
+struct CommandInputField {
+    std::wstring label;
+    std::wstring value;
+    DWORD style = ES_AUTOHSCROLL;
+};
+
+struct CommandInputDialogState {
+    HWND window{};
+    HWND owner{};
+    HWND heading{};
+    std::vector<HWND> labels;
+    std::vector<HWND> edits;
+    HWND ok{};
+    HWND cancel{};
+    HINSTANCE instance{};
+    HFONT font{};
+    HBRUSH background_brush{};
+    HBRUSH control_brush{};
+    UINT dpi{USER_DEFAULT_SCREEN_DPI};
+    bool dark{};
+    bool accepted{};
+    std::wstring title;
+    std::wstring heading_text;
+    std::wstring placement_name;
+    std::vector<CommandInputField>* fields{};
+};
+
+std::wstring control_text_local(HWND window) {
+    const int length = GetWindowTextLengthW(window);
+    std::wstring text(static_cast<std::size_t>(length) + 1, L'\0');
+    if (length > 0) {
+        GetWindowTextW(window, text.data(), length + 1);
+    }
+    text.resize(static_cast<std::size_t>(length));
+    return text;
+}
+
+std::vector<HWND> command_input_controls(CommandInputDialogState* state) {
+    std::vector<HWND> controls;
+    if (state == nullptr) return controls;
+    controls.reserve(3 + state->labels.size() + state->edits.size());
+    controls.push_back(state->heading);
+    controls.insert(controls.end(), state->labels.begin(), state->labels.end());
+    controls.insert(controls.end(), state->edits.begin(), state->edits.end());
+    controls.push_back(state->ok);
+    controls.push_back(state->cancel);
+    return controls;
+}
+
+void layout_command_input_dialog(CommandInputDialogState* state) {
+    if (state == nullptr || state->window == nullptr) return;
+    RECT client{};
+    GetClientRect(state->window, &client);
+    const int margin = scale_for_dialog_dpi(20, state->dpi);
+    const int label_width = scale_for_dialog_dpi(170, state->dpi);
+    const int row_height = scale_for_dialog_dpi(30, state->dpi);
+    const int row_gap = scale_for_dialog_dpi(12, state->dpi);
+    const int button_width = scale_for_dialog_dpi(88, state->dpi);
+    const int button_height = scale_for_dialog_dpi(30, state->dpi);
+    const int button_gap = scale_for_dialog_dpi(10, state->dpi);
+    const int button_top = client.bottom - margin - button_height;
+    const int heading_height = scale_for_dialog_dpi(82, state->dpi);
+    MoveWindow(state->heading, margin, margin, client.right - margin * 2,
+               heading_height, TRUE);
+    int y = margin + heading_height + scale_for_dialog_dpi(10, state->dpi);
+    const int edit_left = margin + label_width + scale_for_dialog_dpi(12, state->dpi);
+    const int edit_width = std::max(scale_for_dialog_dpi(120, state->dpi),
+                                    static_cast<int>(client.right) - edit_left - margin);
+    for (std::size_t index = 0; index < state->labels.size(); ++index) {
+        MoveWindow(state->labels[index], margin, y + scale_for_dialog_dpi(5, state->dpi),
+                   label_width, row_height, TRUE);
+        MoveWindow(state->edits[index], edit_left, y, edit_width, row_height, TRUE);
+        y += row_height + row_gap;
+    }
+    MoveWindow(state->cancel, client.right - margin - button_width, button_top,
+               button_width, button_height, TRUE);
+    MoveWindow(state->ok, client.right - margin - button_width * 2 - button_gap,
+               button_top, button_width, button_height, TRUE);
+    InvalidateRect(state->window, nullptr, TRUE);
+}
+
+void rebuild_command_input_fonts(CommandInputDialogState* state) {
+    delete_dialog_font(state->font);
+    state->font = create_dialog_font(state->dpi);
+    for (HWND control : command_input_controls(state)) {
+        set_dialog_control_font(control, state->font);
+    }
+}
+
+void apply_command_input_theme(CommandInputDialogState* state) {
+    if (state == nullptr) return;
+    apply_dialog_dark_frame(state->window, state->dark);
+    for (HWND control : command_input_controls(state)) {
+        apply_dialog_control_theme(control, state->dark);
+    }
+}
+
+LRESULT CALLBACK command_input_dialog_proc(HWND hwnd, UINT message,
+                                           WPARAM wparam, LPARAM lparam) {
+    auto* state = reinterpret_cast<CommandInputDialogState*>(
+        GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+    if (message == WM_NCCREATE) {
+        const auto* create = reinterpret_cast<CREATESTRUCTW*>(lparam);
+        state = create == nullptr
+                    ? nullptr
+                    : static_cast<CommandInputDialogState*>(create->lpCreateParams);
+        if (state == nullptr) return FALSE;
+        state->window = hwnd;
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(state));
+    }
+    if (state == nullptr) return DefWindowProcW(hwnd, message, wparam, lparam);
+
+    switch (message) {
+        case WM_CREATE: {
+            const DialogColors colors = dialog_colors(state->dark);
+            state->background_brush = CreateSolidBrush(colors.background);
+            state->control_brush = CreateSolidBrush(colors.control_background);
+            state->font = create_dialog_font(state->dpi);
+            state->heading = CreateWindowExW(
+                0, L"STATIC", state->heading_text.c_str(),
+                WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | SS_NOPREFIX,
+                0, 0, 0, 0, hwnd, nullptr, state->instance, nullptr);
+            const std::size_t field_count = state->fields == nullptr ? 0 : state->fields->size();
+            state->labels.resize(field_count);
+            state->edits.resize(field_count);
+            for (std::size_t index = 0; index < field_count; ++index) {
+                const auto& field = (*state->fields)[index];
+                state->labels[index] = CreateWindowExW(
+                    0, L"STATIC", field.label.c_str(),
+                    WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | SS_NOPREFIX,
+                    0, 0, 0, 0, hwnd, nullptr, state->instance, nullptr);
+                state->edits[index] = CreateWindowExW(
+                    0, L"EDIT", field.value.c_str(),
+                    WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | WS_TABSTOP |
+                        WS_BORDER | field.style,
+                    0, 0, 0, 0, hwnd,
+                    reinterpret_cast<HMENU>(static_cast<INT_PTR>(kCommandInputBase + index)),
+                    state->instance, nullptr);
+                SendMessageW(state->edits[index], EM_SETMARGINS,
+                             EC_LEFTMARGIN | EC_RIGHTMARGIN,
+                             MAKELPARAM(scale_for_dialog_dpi(8, state->dpi),
+                                        scale_for_dialog_dpi(8, state->dpi)));
+            }
+            state->ok = CreateWindowExW(
+                0, L"BUTTON", L"OK",
+                WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | WS_TABSTOP | BS_OWNERDRAW,
+                0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(IDOK),
+                state->instance, nullptr);
+            state->cancel = CreateWindowExW(
+                0, L"BUTTON", L"Cancel",
+                WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | WS_TABSTOP | BS_OWNERDRAW,
+                0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(IDCANCEL),
+                state->instance, nullptr);
+            for (HWND control : command_input_controls(state)) {
+                set_dialog_control_font(control, state->font);
+            }
+            apply_command_input_theme(state);
+            layout_command_input_dialog(state);
+            SendMessageW(hwnd, DM_SETDEFID, IDOK, 0);
+            if (!state->edits.empty()) {
+                SetFocus(state->edits.front());
+                SendMessageW(state->edits.front(), EM_SETSEL, 0, -1);
+            }
+            return 0;
+        }
+        case WM_SIZE:
+            layout_command_input_dialog(state);
+            return 0;
+        case WM_DPICHANGED: {
+            state->dpi = HIWORD(wparam);
+            const auto* suggested = reinterpret_cast<const RECT*>(lparam);
+            SetWindowPos(hwnd, nullptr, suggested->left, suggested->top,
+                         suggested->right - suggested->left,
+                         suggested->bottom - suggested->top,
+                         SWP_NOZORDER | SWP_NOACTIVATE);
+            rebuild_command_input_fonts(state);
+            layout_command_input_dialog(state);
+            return 0;
+        }
+        case WM_GETMINMAXINFO: {
+            auto* info = reinterpret_cast<MINMAXINFO*>(lparam);
+            info->ptMinTrackSize.x = scale_for_dialog_dpi(520, state->dpi);
+            info->ptMinTrackSize.y = scale_for_dialog_dpi(260, state->dpi);
+            return 0;
+        }
+        case WM_COMMAND:
+            if (LOWORD(wparam) == IDOK) {
+                if (state->fields != nullptr) {
+                    for (std::size_t index = 0; index < state->fields->size(); ++index) {
+                        (*state->fields)[index].value = control_text_local(state->edits[index]);
+                    }
+                }
+                state->accepted = true;
+                save_named_window_placement(state->placement_name, hwnd);
+                DestroyWindow(hwnd);
+                return 0;
+            }
+            if (LOWORD(wparam) == IDCANCEL) {
+                save_named_window_placement(state->placement_name, hwnd);
+                DestroyWindow(hwnd);
+                return 0;
+            }
+            break;
+        case WM_CTLCOLORSTATIC: {
+            HDC dc = reinterpret_cast<HDC>(wparam);
+            const DialogColors colors = dialog_colors(state->dark);
+            SetBkMode(dc, TRANSPARENT);
+            SetTextColor(dc, colors.text);
+            return reinterpret_cast<LRESULT>(state->background_brush);
+        }
+        case WM_CTLCOLOREDIT: {
+            HDC dc = reinterpret_cast<HDC>(wparam);
+            const DialogColors colors = dialog_colors(state->dark);
+            SetBkColor(dc, colors.control_background);
+            SetTextColor(dc, colors.text);
+            return reinterpret_cast<LRESULT>(state->control_brush);
+        }
+        case WM_DRAWITEM:
+            if (lparam != 0) {
+                draw_dialog_button(*reinterpret_cast<DRAWITEMSTRUCT*>(lparam), state->dark);
+                return TRUE;
+            }
+            break;
+        case WM_ERASEBKGND: {
+            RECT client{};
+            GetClientRect(hwnd, &client);
+            FillRect(reinterpret_cast<HDC>(wparam), &client, state->background_brush);
+            return 1;
+        }
+        case WM_PAINT: {
+            PAINTSTRUCT paint{};
+            HDC dc = BeginPaint(hwnd, &paint);
+            FillRect(dc, &paint.rcPaint, state->background_brush);
+            EndPaint(hwnd, &paint);
+            return 0;
+        }
+        case WM_CLOSE:
+            save_named_window_placement(state->placement_name, hwnd);
+            DestroyWindow(hwnd);
+            return 0;
+        case WM_NCDESTROY:
+            delete_dialog_font(state->font);
+            if (state->background_brush != nullptr) DeleteObject(state->background_brush);
+            if (state->control_brush != nullptr) DeleteObject(state->control_brush);
+            state->window = nullptr;
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+            return 0;
+        default:
+            break;
+    }
+    return DefWindowProcW(hwnd, message, wparam, lparam);
+}
+
+bool show_command_input_dialog(HWND owner,
+                               HINSTANCE instance,
+                               std::wstring title,
+                               std::wstring heading,
+                               std::vector<CommandInputField>& fields,
+                               std::wstring placement_name) {
+    if (instance == nullptr) instance = GetModuleHandleW(nullptr);
+    const UINT dpi = owner != nullptr ? GetDpiForWindow(owner) : GetDpiForSystem();
+    CommandInputDialogState state{};
+    state.owner = owner;
+    state.instance = instance;
+    state.dpi = dpi;
+    state.dark = dialog_should_use_dark();
+    state.title = std::move(title);
+    state.heading_text = std::move(heading);
+    state.placement_name = std::move(placement_name);
+    state.fields = &fields;
+
+    WNDCLASSEXW window_class{};
+    window_class.cbSize = sizeof(window_class);
+    window_class.lpfnWndProc = &command_input_dialog_proc;
+    window_class.hInstance = instance;
+    window_class.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    window_class.lpszClassName = kCommandInputDialogClass;
+    assign_axiom_window_class_icons(window_class, instance);
+    if (RegisterClassExW(&window_class) == 0 &&
+        GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+        show_message_dialog(owner, instance, dpi, state.dark, state.title,
+                            last_error_text(), MessageDialogIcon::error);
+        return false;
+    }
+
+    const int width = scale_for_dialog_dpi(560, dpi);
+    const int height = scale_for_dialog_dpi(
+        210 + static_cast<int>(fields.size()) * 42, dpi);
+    const POINT position = centered_window_position(owner, width, height);
+    HWND dialog = CreateWindowExW(
+        WS_EX_WINDOWEDGE | WS_EX_CONTROLPARENT, kCommandInputDialogClass,
+        state.title.c_str(),
+        WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_CLIPCHILDREN | WS_CLIPSIBLINGS |
+            WS_THICKFRAME,
+        position.x, position.y, width, height, owner, nullptr, instance, &state);
+    if (dialog == nullptr) {
+        show_message_dialog(owner, instance, dpi, state.dark, state.title,
+                            last_error_text(), MessageDialogIcon::error);
+        return false;
+    }
+    apply_axiom_window_icons(dialog, instance);
+    restore_named_window_placement(dialog, owner, state.placement_name);
+    const bool owner_was_enabled = disable_dialog_owner(owner);
+    ShowWindow(dialog, SW_SHOW);
+    UpdateWindow(dialog);
+    MSG message{};
+    while (IsWindow(dialog)) {
+        const BOOL status = GetMessageW(&message, nullptr, 0, 0);
+        if (status <= 0) {
+            if (status == 0) PostQuitMessage(static_cast<int>(message.wParam));
+            break;
+        }
+        if (message_targets_window(dialog, message) &&
+            message.message == WM_KEYDOWN && message.wParam == VK_ESCAPE) {
+            save_named_window_placement(state.placement_name, dialog);
+            DestroyWindow(dialog);
+            continue;
+        }
+        if (!IsDialogMessageW(dialog, &message)) {
+            TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
+    }
+    restore_dialog_owner(owner, owner_was_enabled);
+    return state.accepted;
+}
+
+void set_dialog_initial_path(IFileDialog* dialog, const fs::path& path) {
+    if (dialog == nullptr || path.empty()) return;
+    const fs::path folder = path.has_filename() ? path.parent_path() : path;
+    if (!folder.empty()) {
+        ComPtr<IShellItem> item;
+        if (SUCCEEDED(SHCreateItemFromParsingName(folder.c_str(), nullptr,
+                                                 IID_PPV_ARGS(item.put())))) {
+            dialog->SetFolder(item.get());
+        }
+    }
+}
+
+std::optional<fs::path> pick_single_file(HWND owner,
+                                         const wchar_t* title,
+                                         const COMDLG_FILTERSPEC* filters = nullptr,
+                                         UINT filter_count = 0) {
+    ComPtr<IFileOpenDialog> dialog;
+    if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER,
+                                IID_PPV_ARGS(dialog.put())))) {
+        return std::nullopt;
+    }
+    DWORD options = 0;
+    dialog->GetOptions(&options);
+    dialog->SetOptions(options | FOS_FORCEFILESYSTEM | FOS_FILEMUSTEXIST);
+    if (title != nullptr) dialog->SetTitle(title);
+    if (filters != nullptr && filter_count != 0) {
+        dialog->SetFileTypes(filter_count, filters);
+    }
+    if (FAILED(dialog->Show(owner))) return std::nullopt;
+    ComPtr<IShellItem> item;
+    if (FAILED(dialog->GetResult(item.put()))) return std::nullopt;
+    return shell_item_path(item.get());
+}
+
+std::optional<fs::path> pick_save_file(HWND owner,
+                                       const wchar_t* title,
+                                       const fs::path& suggested,
+                                       const COMDLG_FILTERSPEC* filters,
+                                       UINT filter_count,
+                                       const wchar_t* default_extension) {
+    ComPtr<IFileSaveDialog> dialog;
+    if (FAILED(CoCreateInstance(CLSID_FileSaveDialog, nullptr, CLSCTX_INPROC_SERVER,
+                                IID_PPV_ARGS(dialog.put())))) {
+        return std::nullopt;
+    }
+    DWORD options = 0;
+    dialog->GetOptions(&options);
+    dialog->SetOptions(options | FOS_FORCEFILESYSTEM | FOS_OVERWRITEPROMPT);
+    if (title != nullptr) dialog->SetTitle(title);
+    if (filters != nullptr && filter_count != 0) {
+        dialog->SetFileTypes(filter_count, filters);
+    }
+    if (default_extension != nullptr) dialog->SetDefaultExtension(default_extension);
+    if (!suggested.empty()) {
+        dialog->SetFileName(suggested.filename().c_str());
+        set_dialog_initial_path(dialog.get(), suggested);
+    }
+    if (FAILED(dialog->Show(owner))) return std::nullopt;
+    ComPtr<IShellItem> item;
+    if (FAILED(dialog->GetResult(item.put()))) return std::nullopt;
+    return shell_item_path(item.get());
+}
+
+std::optional<unsigned> parse_unsigned_field(std::wstring text, unsigned maximum) {
+    text.erase(text.begin(), std::find_if(text.begin(), text.end(), [](wchar_t ch) {
+        return !std::iswspace(ch);
+    }));
+    while (!text.empty() && std::iswspace(text.back())) text.pop_back();
+    if (text.empty()) return std::nullopt;
+    wchar_t* end = nullptr;
+    errno = 0;
+    const unsigned long value = std::wcstoul(text.c_str(), &end, 10);
+    if (errno == ERANGE || end == text.c_str()) return std::nullopt;
+    while (*end != L'\0' && std::iswspace(*end)) ++end;
+    if (*end != L'\0' || value > maximum) return std::nullopt;
+    return static_cast<unsigned>(value);
+}
+
+template <std::size_t Size>
+std::array<std::uint8_t, Size> read_key_file(const fs::path& path) {
+    std::array<std::uint8_t, Size> key{};
+    std::ifstream input(path, std::ios::binary);
+    if (!input || !input.read(reinterpret_cast<char*>(key.data()),
+                              static_cast<std::streamsize>(key.size())) ||
+        input.peek() != std::char_traits<char>::eof()) {
+        throw std::runtime_error("invalid signing key file");
+    }
+    return key;
+}
+
+void write_key_file(const fs::path& path, const std::uint8_t* data, std::size_t size) {
+    std::ofstream output(path, std::ios::binary | std::ios::trunc);
+    if (!output || !output.write(reinterpret_cast<const char*>(data),
+                                 static_cast<std::streamsize>(size))) {
+        throw std::runtime_error("could not write key file");
+    }
+}
+
 std::string normalized_drag_archive_path(std::string path) {
     std::replace(path.begin(), path.end(), '\\', '/');
     while (!path.empty() && path.front() == '/') path.erase(path.begin());
@@ -1170,8 +1598,332 @@ void MainWindow::on_repair_archive() {
         });
 }
 
-void MainWindow::on_create_recovery_volumes() {
-    set_status(L"Recovery and volume options are configured from Add to archive.");
+void MainWindow::on_edit_recovery_record() {
+    const auto archive = active_archive_path();
+    if (!archive || busy_) return;
+    if (!active_archive_is_editable()) return;
+    const auto capabilities = active_archive_capabilities();
+    if (!capabilities.recovery_records) {
+        show_app_message(L"This archive format does not support recovery records.",
+                         axiom::gui::MessageDialogIcon::information,
+                         L"Recovery record");
+        return;
+    }
+
+    axiom::ArchiveRecoveryInfo info;
+    try {
+        info = axiom::archive_recovery_info(*archive);
+    } catch (const std::exception& error) {
+        show_app_message(widen(error.what()), axiom::gui::MessageDialogIcon::error,
+                         L"Recovery record");
+        return;
+    }
+
+    std::wstring heading = info.present
+        ? L"Current recovery record: " + std::to_wstring(info.percent) + L"% (" +
+              std::to_wstring(info.data_shards) + L" data + " +
+              std::to_wstring(info.parity_shards) + L" parity shards, protects " +
+              format_size(info.protected_size) + L").\n\nEnter 1..100 to rebuild, or 0 to remove."
+        : L"This archive has no recovery record.\n\nEnter 1..100 to create one; 0 leaves it disabled.";
+    std::vector<CommandInputField> fields{
+        {L"Recovery percent", info.present ? std::to_wstring(info.percent) : L"0"}
+    };
+    if (!show_command_input_dialog(hwnd_, instance_, L"Recovery record",
+                                   std::move(heading), fields,
+                                   L"Dialog.RecoveryRecord")) {
+        return;
+    }
+    const auto percent = parse_unsigned_field(fields[0].value, 100);
+    if (!percent) {
+        show_app_message(L"Enter a recovery percentage from 0 to 100.",
+                         axiom::gui::MessageDialogIcon::warning,
+                         L"Recovery record");
+        return;
+    }
+    if (*percent == 0 && !info.present) {
+        set_status(L"Archive has no recovery record.");
+        return;
+    }
+    if (*percent == 0 &&
+        show_app_message(L"Remove the recovery record from this archive?",
+                         axiom::gui::MessageDialogIcon::warning,
+                         L"Recovery record",
+                         axiom::gui::MessageDialogButtons::yes_no,
+                         IDNO) != IDYES) {
+        return;
+    }
+
+    operation_archive_output_ = *archive;
+    start_operation(
+        *percent == 0 ? L"Removing recovery record..." : L"Updating recovery record...",
+        *percent == 0 ? L"Recovery record removed." : L"Recovery record updated.",
+        [archive = *archive, percent = *percent](
+            std::shared_ptr<axiom::OperationControl> operation) {
+            axiom::set_archive_recovery(archive, percent, operation);
+        });
+}
+
+void MainWindow::on_split_archive() {
+    fs::path archive;
+    if (const auto active = active_archive_path()) {
+        archive = *active;
+    } else if (const auto picked = pick_open_archive(hwnd_)) {
+        archive = *picked;
+    } else {
+        return;
+    }
+    if (busy_) return;
+    const auto* provider = axiom::archive_provider_for_path(archive);
+    if (provider == nullptr) {
+        show_app_message(L"Choose a supported archive first.",
+                         axiom::gui::MessageDialogIcon::information,
+                         L"Split archive");
+        return;
+    }
+    const auto capabilities = provider->capabilities(archive);
+    if (!capabilities.multi_volume) {
+        show_app_message(L"This archive format does not support Axiom split volumes.",
+                         axiom::gui::MessageDialogIcon::information,
+                         L"Split archive");
+        return;
+    }
+
+    static constexpr std::array<const wchar_t*, 4> kUnitSuffixes{L"K", L"M", L"G", L"T"};
+    std::wstring default_volume = application_options_.default_volume_size.empty()
+        ? L"700M"
+        : application_options_.default_volume_size +
+              kUnitSuffixes[std::clamp(application_options_.default_volume_unit, 0, 3)];
+    std::vector<CommandInputField> fields{
+        {L"Volume size", std::move(default_volume)},
+        {L"Recovery volumes", application_options_.default_recovery_volumes ? L"1" : L"0"},
+    };
+    if (!show_command_input_dialog(
+            hwnd_, instance_, L"Split archive",
+            L"Create numbered archive volumes beside the source archive.\n\n"
+            L"Use K, M, G, or T suffixes for volume size. Recovery volumes are optional.",
+            fields, L"Dialog.SplitArchive")) {
+        return;
+    }
+    const auto volume_size = parse_size_setting(fields[0].value);
+    const auto recovery_count = parse_unsigned_field(fields[1].value, 100000);
+    if (!volume_size || *volume_size == 0 || !recovery_count) {
+        show_app_message(L"Enter a positive volume size and a recovery volume count from 0 to 100000.",
+                         axiom::gui::MessageDialogIcon::warning,
+                         L"Split archive");
+        return;
+    }
+    operation_archive_output_ = archive;
+    start_operation(
+        L"Splitting archive...", L"Archive volumes were created beside the source archive.",
+        [archive, volume_size = *volume_size, recovery_count = *recovery_count](
+            std::shared_ptr<axiom::OperationControl> operation) {
+            axiom::create_archive_volumes(archive, volume_size, recovery_count, operation);
+        });
+}
+
+void MainWindow::on_join_archive() {
+    if (busy_) return;
+    const COMDLG_FILTERSPEC filters[] = {
+        {L"Axiom split volumes", L"*.part*.axar;*.rev*"},
+        {L"Axiom archives", L"*.axar"},
+        {L"All files", L"*.*"},
+    };
+    const auto volume = pick_single_file(hwnd_, L"Choose an Axiom archive volume",
+                                         filters, static_cast<UINT>(std::size(filters)));
+    if (!volume) return;
+    fs::path suggested = joined_archive_path_for_volume(*volume).value_or(
+        volume->parent_path() / (volume->stem().wstring() + L".axar"));
+    const COMDLG_FILTERSPEC save_filters[] = {
+        {L"Axiom archive", L"*.axar"},
+        {L"All files", L"*.*"},
+    };
+    const auto output = pick_save_file(hwnd_, L"Save joined archive", suggested,
+                                       save_filters, static_cast<UINT>(std::size(save_filters)),
+                                       L"axar");
+    if (!output) return;
+    if (same_filesystem_path(*volume, *output)) {
+        show_app_message(L"Choose an output path different from the selected volume.",
+                         axiom::gui::MessageDialogIcon::warning,
+                         L"Join archive volumes");
+        return;
+    }
+    operation_archive_output_ = *output;
+    operation_open_after_ = *output;
+    start_operation(
+        L"Joining archive volumes...", L"Archive volumes joined successfully.",
+        [volume = *volume, output = *output](
+            std::shared_ptr<axiom::OperationControl> operation) {
+            axiom::join_archive_volumes(volume, output, operation);
+        });
+}
+
+void MainWindow::on_generate_signing_key() {
+    if (busy_) return;
+    const COMDLG_FILTERSPEC secret_filters[] = {
+        {L"Axiom secret signing key", L"*.key"},
+        {L"All files", L"*.*"},
+    };
+    const fs::path suggested_secret = application_options_.default_signing_key.empty()
+        ? fs::path(L"axiom-signing.key")
+        : fs::path(application_options_.default_signing_key);
+    const auto secret = pick_save_file(hwnd_, L"Save secret signing key",
+                                       suggested_secret,
+                                       secret_filters,
+                                       static_cast<UINT>(std::size(secret_filters)),
+                                       L"key");
+    if (!secret) return;
+    const COMDLG_FILTERSPEC public_filters[] = {
+        {L"Axiom public signing key", L"*.pub"},
+        {L"All files", L"*.*"},
+    };
+    const fs::path suggested_public =
+        secret->parent_path() / (secret->stem().wstring() + L".pub");
+    const auto public_key = pick_save_file(hwnd_, L"Save public signing key",
+                                           suggested_public, public_filters,
+                                           static_cast<UINT>(std::size(public_filters)),
+                                           L"pub");
+    if (!public_key) return;
+    if (same_filesystem_path(*secret, *public_key)) {
+        show_app_message(L"Choose different paths for the secret and public key files.",
+                         axiom::gui::MessageDialogIcon::warning,
+                         L"Generate signing key");
+        return;
+    }
+
+    start_operation(
+        L"Generating signing key...", L"Signing key files were generated.",
+        [secret = *secret, public_key = *public_key](
+            std::shared_ptr<axiom::OperationControl> operation) {
+            if (operation) operation->checkpoint();
+            auto key = axiom::generate_archive_signing_key();
+            try {
+                write_key_file(secret, key.secret_key.data(), key.secret_key.size());
+                write_key_file(public_key, key.public_key.data(), key.public_key.size());
+            } catch (...) {
+                SecureZeroMemory(key.secret_key.data(), key.secret_key.size());
+                throw;
+            }
+            SecureZeroMemory(key.secret_key.data(), key.secret_key.size());
+        });
+}
+
+void MainWindow::on_sign_archive() {
+    const auto archive = active_archive_path();
+    if (!archive || busy_) return;
+    if (!active_archive_is_editable()) return;
+    const auto capabilities = active_archive_capabilities();
+    if (!capabilities.authenticity) {
+        show_app_message(L"This archive format does not support Axiom signatures.",
+                         axiom::gui::MessageDialogIcon::information,
+                         L"Sign archive");
+        return;
+    }
+    const COMDLG_FILTERSPEC filters[] = {
+        {L"Axiom secret signing key", L"*.key"},
+        {L"All files", L"*.*"},
+    };
+    const auto secret = pick_single_file(hwnd_, L"Choose the secret signing key",
+                                         filters, static_cast<UINT>(std::size(filters)));
+    if (!secret) return;
+    auto password = password_for_archive_edit(*archive);
+    if (!password) return;
+    auto options = compression_options();
+    options.password = std::move(*password);
+    operation_archive_output_ = *archive;
+    start_operation(
+        L"Signing archive...", L"Archive signed successfully.",
+        [archive = *archive, secret = *secret, options](
+            std::shared_ptr<axiom::OperationControl> operation) mutable {
+            auto run_options = options;
+            run_options.operation = std::move(operation);
+            axiom::ArchiveSigningKey key;
+            key.secret_key = read_key_file<64>(secret);
+            std::copy_n(key.secret_key.begin() + 32, key.public_key.size(),
+                        key.public_key.begin());
+            try {
+                axiom::sign_archive(archive, key, run_options);
+            } catch (...) {
+                SecureZeroMemory(key.secret_key.data(), key.secret_key.size());
+                throw;
+            }
+            SecureZeroMemory(key.secret_key.data(), key.secret_key.size());
+        });
+}
+
+void MainWindow::on_compress_stream() {
+    if (busy_) return;
+    const COMDLG_FILTERSPEC input_filters[] = {{L"All files", L"*.*"}};
+    const auto input = pick_single_file(hwnd_, L"Choose file to compress",
+                                        input_filters,
+                                        static_cast<UINT>(std::size(input_filters)));
+    if (!input) return;
+    const fs::path suggested =
+        input->parent_path() / (input->filename().wstring() + L".axc");
+    const COMDLG_FILTERSPEC output_filters[] = {
+        {L"Axiom compressed stream", L"*.axc"},
+        {L"All files", L"*.*"},
+    };
+    const auto output = pick_save_file(hwnd_, L"Save compressed stream", suggested,
+                                       output_filters,
+                                       static_cast<UINT>(std::size(output_filters)),
+                                       L"axc");
+    if (!output) return;
+    if (same_filesystem_path(*input, *output)) {
+        show_app_message(L"Choose an output path different from the input file.",
+                         axiom::gui::MessageDialogIcon::warning,
+                         L"Compress stream");
+        return;
+    }
+    start_operation(
+        L"Compressing stream...", L"Single-stream file compressed.",
+        [input = *input, output = *output, options = compression_options()](
+            std::shared_ptr<axiom::OperationControl> operation) mutable {
+            auto run_options = options;
+            run_options.operation = std::move(operation);
+            axiom::compress_file(input, output, run_options);
+        });
+}
+
+void MainWindow::on_decompress_stream() {
+    if (busy_) return;
+    const COMDLG_FILTERSPEC input_filters[] = {
+        {L"Axiom compressed stream", L"*.axc"},
+        {L"All files", L"*.*"},
+    };
+    const auto input = pick_single_file(hwnd_, L"Choose stream to decompress",
+                                        input_filters,
+                                        static_cast<UINT>(std::size(input_filters)));
+    if (!input) return;
+    fs::path suggested = *input;
+    if (suggested.extension() == L".axc") {
+        suggested.replace_extension();
+        if (suggested.filename().empty()) suggested = input->parent_path() / L"decompressed";
+    } else {
+        suggested += L".out";
+    }
+    const COMDLG_FILTERSPEC output_filters[] = {{L"All files", L"*.*"}};
+    const auto output = pick_save_file(hwnd_, L"Save decompressed file", suggested,
+                                       output_filters,
+                                       static_cast<UINT>(std::size(output_filters)),
+                                       nullptr);
+    if (!output) return;
+    if (same_filesystem_path(*input, *output)) {
+        show_app_message(L"Choose an output path different from the input stream.",
+                         axiom::gui::MessageDialogIcon::warning,
+                         L"Decompress stream");
+        return;
+    }
+    axiom::DecompressionOptions options;
+    options.thread_count = selected_thread_count_;
+    options.io_buffer_size = configured_io_buffer_size(application_options_);
+    start_operation(
+        L"Decompressing stream...", L"Single-stream file decompressed.",
+        [input = *input, output = *output, options](
+            std::shared_ptr<axiom::OperationControl> operation) mutable {
+            auto run_options = options;
+            run_options.operation = std::move(operation);
+            axiom::decompress_file(input, output, run_options);
+        });
 }
 
 void MainWindow::apply_operation_priority() {

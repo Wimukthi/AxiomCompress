@@ -42,11 +42,13 @@
 #include <cstring>
 #include <cwctype>
 #include <cstdint>
+#include <cstdlib>
 #include <exception>
 #include <filesystem>
 #include <fstream>
 #include <functional>
 #include <iomanip>
+#include <iterator>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -118,7 +120,7 @@ enum ControlId : int {
     kEditArchiveComment = 1125,
     kLockArchive = 1126,
     kRepairArchive = 1127,
-    kCreateRecoveryVolumes = 1128,
+    kEditRecoveryRecord = 1128,
     kVerifyArchiveSignature = 1129,
     kCreateSfx = 1130,
     kFreshenArchive = 1131,
@@ -141,6 +143,12 @@ enum ControlId : int {
     kTreeArchiveInfo = 1148,
     kTreeAddFavorite = 1149,
     kTreeRemoveFavorite = 1150,
+    kSplitArchive = 1151,
+    kJoinArchive = 1152,
+    kGenerateSigningKey = 1153,
+    kSignArchive = 1154,
+    kCompressStream = 1155,
+    kDecompressStream = 1156,
 };
 template <typename T>
 class ComPtr {
@@ -1050,7 +1058,13 @@ private:
     void on_delete_selected();
     void on_info();
     void on_repair_archive();
-    void on_create_recovery_volumes();
+    void on_edit_recovery_record();
+    void on_split_archive();
+    void on_join_archive();
+    void on_generate_signing_key();
+    void on_sign_archive();
+    void on_compress_stream();
+    void on_decompress_stream();
     void on_about();
     void on_benchmark();
     void maybe_start_automatic_update_check();

@@ -11,8 +11,8 @@ IDI_ARCHIVE_ISO ICON "..\\..\\Icons\\archive_iso.ico"
 IDI_ARCHIVE_CAB ICON "..\\..\\Icons\\archive_cab.ico"
 
 VS_VERSION_INFO VERSIONINFO
- FILEVERSION 0,2,2,35
- PRODUCTVERSION 0,2,2,35
+ FILEVERSION 0,2,2,36
+ PRODUCTVERSION 0,2,2,36
  FILEFLAGSMASK 0x3fL
 #ifdef _DEBUG
  FILEFLAGS 0x1L
@@ -29,11 +29,11 @@ BEGIN
         BEGIN
             VALUE "CompanyName", "Wimukthi Bandara"
             VALUE "FileDescription", "Axiom native archive manager"
-            VALUE "FileVersion", "0.2.2.35"
+            VALUE "FileVersion", "0.2.2.36"
             VALUE "InternalName", "Axiom"
             VALUE "OriginalFilename", "Axiom.exe"
             VALUE "ProductName", "Axiom"
-            VALUE "ProductVersion", "0.2.2.35"
+            VALUE "ProductVersion", "0.2.2.36"
         END
     END
     BLOCK "VarFileInfo"

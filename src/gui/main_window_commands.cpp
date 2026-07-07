@@ -9,6 +9,8 @@ namespace {
 std::wstring_view shortcut_action_for_command(UINT command) {
     switch (command) {
         case kOpenArchive: return L"file.open_archive";
+        case kCompressStream: return L"file.compress_stream";
+        case kDecompressStream: return L"file.decompress_stream";
         case kExitApplication: return L"file.exit";
         case kAddFiles: return L"commands.add";
         case kExtract: return L"commands.extract";
@@ -18,6 +20,8 @@ std::wstring_view shortcut_action_for_command(UINT command) {
         case kSynchronizeArchive: return L"commands.synchronize";
         case kDeleteArchiveEntries: return L"commands.delete_archive_entries";
         case kRepackArchive: return L"commands.repack";
+        case kSplitArchive: return L"commands.split";
+        case kJoinArchive: return L"commands.join";
         case kView: return L"commands.view";
         case kDelete: return L"commands.delete";
         case kSelectAll: return L"commands.select_all";
@@ -27,6 +31,9 @@ std::wstring_view shortcut_action_for_command(UINT command) {
         case kEditArchiveComment: return L"tools.edit_comment";
         case kLockArchive: return L"tools.lock";
         case kRepairArchive: return L"tools.repair";
+        case kEditRecoveryRecord: return L"tools.recovery_record";
+        case kGenerateSigningKey: return L"tools.generate_key";
+        case kSignArchive: return L"tools.sign_archive";
         case kVerifyArchiveSignature: return L"tools.verify_signature";
         case kCreateSfx: return L"tools.create_sfx";
         case kNavigateBack: return L"navigation.back";
@@ -49,6 +56,8 @@ std::wstring_view shortcut_action_for_command(UINT command) {
 
 UINT command_for_shortcut_action(std::wstring_view action) {
     if (action == L"file.open_archive") return kOpenArchive;
+    if (action == L"file.compress_stream") return kCompressStream;
+    if (action == L"file.decompress_stream") return kDecompressStream;
     if (action == L"file.exit") return kExitApplication;
     if (action == L"commands.add") return kAddFiles;
     if (action == L"commands.extract") return kExtract;
@@ -58,6 +67,8 @@ UINT command_for_shortcut_action(std::wstring_view action) {
     if (action == L"commands.synchronize") return kSynchronizeArchive;
     if (action == L"commands.delete_archive_entries") return kDeleteArchiveEntries;
     if (action == L"commands.repack") return kRepackArchive;
+    if (action == L"commands.split") return kSplitArchive;
+    if (action == L"commands.join") return kJoinArchive;
     if (action == L"commands.view") return kView;
     if (action == L"commands.delete") return kDelete;
     if (action == L"commands.select_all") return kSelectAll;
@@ -67,6 +78,9 @@ UINT command_for_shortcut_action(std::wstring_view action) {
     if (action == L"tools.edit_comment") return kEditArchiveComment;
     if (action == L"tools.lock") return kLockArchive;
     if (action == L"tools.repair") return kRepairArchive;
+    if (action == L"tools.recovery_record") return kEditRecoveryRecord;
+    if (action == L"tools.generate_key") return kGenerateSigningKey;
+    if (action == L"tools.sign_archive") return kSignArchive;
     if (action == L"tools.verify_signature") return kVerifyArchiveSignature;
     if (action == L"tools.create_sfx") return kCreateSfx;
     if (action == L"navigation.back") return kNavigateBack;
@@ -133,6 +147,10 @@ bool MainWindow::can_execute_shortcut_command(UINT command) const {
     const bool favorite = favorite_contains(current_location);
     switch (command) {
         case kOpenArchive:
+        case kCompressStream:
+        case kDecompressStream:
+        case kJoinArchive:
+        case kGenerateSigningKey:
         case kBenchmark:
         case kSettings:
             return !busy_;
@@ -161,8 +179,12 @@ bool MainWindow::can_execute_shortcut_command(UINT command) const {
             return !busy_ && has_archive && capabilities.lock && archive_editable;
         case kRepairArchive:
             return !busy_ && has_archive && capabilities.recovery_records;
-        case kCreateRecoveryVolumes:
-            return false;
+        case kEditRecoveryRecord:
+            return !busy_ && has_archive && capabilities.recovery_records && archive_editable;
+        case kSplitArchive:
+            return !busy_ && has_archive && capabilities.multi_volume;
+        case kSignArchive:
+            return !busy_ && has_archive && capabilities.authenticity && archive_editable;
         case kVerifyArchiveSignature:
             return !busy_ && has_archive && capabilities.authenticity;
         case kCreateSfx:
@@ -287,6 +309,9 @@ std::vector<axiom::gui::CustomMenuItem> MainWindow::menu_items(UINT menu_id) con
             return {
                 {kOpenArchive, L"&Open archive...", shortcut(kOpenArchive), !busy_},
                 {0, L"", L"", false, true},
+                {kCompressStream, L"&Compress single file...", shortcut(kCompressStream), !busy_},
+                {kDecompressStream, L"&Decompress stream...", shortcut(kDecompressStream), !busy_},
+                {0, L"", L"", false, true},
                 {kExitApplication, L"E&xit", shortcut(kExitApplication)},
             };
         case kMenuCommands:
@@ -308,6 +333,9 @@ std::vector<axiom::gui::CustomMenuItem> MainWindow::menu_items(UINT menu_id) con
                   !busy_ && browsing_archive && has_selection && archive_editable},
                 {kRepackArchive, L"&Repack archive...", shortcut(kRepackArchive),
                   !busy_ && has_archive && archive_editable},
+                {kSplitArchive, L"S&plit archive...", shortcut(kSplitArchive),
+                 !busy_ && has_archive && capabilities.multi_volume},
+                {kJoinArchive, L"&Join archive volumes...", shortcut(kJoinArchive), !busy_},
                 {0, L"", L"", false, true},
                 {kView, L"&View", shortcut(kView), has_selection},
                 {kDelete, browsing_archive ? L"&Delete from archive" : L"&Delete",
@@ -328,6 +356,13 @@ std::vector<axiom::gui::CustomMenuItem> MainWindow::menu_items(UINT menu_id) con
                   !busy_ && has_archive && capabilities.lock && archive_editable},
                 {kRepairArchive, L"&Repair archive...", shortcut(kRepairArchive),
                  !busy_ && has_archive && capabilities.recovery_records},
+                {kEditRecoveryRecord, L"Recovery &record...", shortcut(kEditRecoveryRecord),
+                 !busy_ && has_archive && capabilities.recovery_records && archive_editable},
+                {0, L"", L"", false, true},
+                {kGenerateSigningKey, L"&Generate signing key...", shortcut(kGenerateSigningKey),
+                 !busy_},
+                {kSignArchive, L"&Sign archive...", shortcut(kSignArchive),
+                 !busy_ && has_archive && capabilities.authenticity && archive_editable},
                 {kVerifyArchiveSignature, L"Verify &signature...", shortcut(kVerifyArchiveSignature),
                  !busy_ && has_archive && capabilities.authenticity},
                 {kCreateSfx, L"Create &self-extracting archive...", shortcut(kCreateSfx),
@@ -997,9 +1032,14 @@ void MainWindow::apply_shell_integration() const {
     const std::wstring classes = L"Software\\Classes\\";
     const std::wstring file_context = classes + L"*\\shell\\Axiom";
     const std::wstring directory_context = classes + L"Directory\\shell\\Axiom";
+    const std::wstring file_subcommands_id = L"AxiomCompress.ContextMenu.File";
+    const std::wstring directory_subcommands_id = L"AxiomCompress.ContextMenu.Directory";
+    const std::wstring file_subcommands = classes + file_subcommands_id;
+    const std::wstring directory_subcommands = classes + directory_subcommands_id;
     const std::wstring axar_context = classes + L"SystemFileAssociations\\.axar\\shell\\";
 
     const auto icon_value = [&](int icon_id = IDI_AXIOM) {
+        if (icon_id == IDI_AXIOM) return quote_argument(executable);
         return quote_argument(executable) + L",-" + std::to_wstring(icon_id);
     };
     const auto archive_applies_to = [] {
@@ -1047,13 +1087,17 @@ void MainWindow::apply_shell_integration() const {
             set_registry_string(HKEY_CURRENT_USER, key + L"\\command", nullptr, command);
         };
     const auto apply_shell_submenu =
-        [&](const std::wstring& parent, bool enabled, const std::wstring& applies_to = {}) {
+        [&](const std::wstring& parent, const std::wstring& subcommands_id,
+            const std::wstring& subcommands_key, bool enabled,
+            const std::wstring& applies_to = {}) {
             delete_registry_tree(HKEY_CURRENT_USER, parent);
+            delete_registry_tree(HKEY_CURRENT_USER, subcommands_key);
             if (!enabled) return false;
             set_registry_string(HKEY_CURRENT_USER, parent, nullptr, L"Axiom");
             set_registry_string(HKEY_CURRENT_USER, parent, L"MUIVerb", L"Axiom");
             set_registry_string(HKEY_CURRENT_USER, parent, L"Icon", icon_value());
-            set_registry_string(HKEY_CURRENT_USER, parent, L"SubCommands", L"");
+            set_registry_string(HKEY_CURRENT_USER, parent, L"ExtendedSubCommandsKey",
+                                subcommands_id);
             if (!applies_to.empty()) {
                 set_registry_string(HKEY_CURRENT_USER, parent, L"AppliesTo", applies_to);
             }
@@ -1150,36 +1194,37 @@ void MainWindow::apply_shell_integration() const {
         application_options_.context_test;
     const bool file_menu = application_options_.context_add || archive_commands;
     const std::wstring archive_filter = archive_applies_to();
-    if (apply_shell_submenu(file_context, file_menu,
+    if (apply_shell_submenu(file_context, file_subcommands_id, file_subcommands, file_menu,
                             application_options_.context_add ? L"" : archive_filter)) {
         if (application_options_.context_open) {
-            apply_shell_subcommand(file_context, L"010Open",
+            apply_shell_subcommand(file_subcommands, L"010Open",
                                    L"Open with Axiom",
                                    quoted_executable_command(executable, L"\"%1\""),
                                    IDI_AXIOM, archive_filter);
         }
         if (application_options_.context_extract) {
-            apply_shell_subcommand(file_context, L"020Extract",
+            apply_shell_subcommand(file_subcommands, L"020Extract",
                                    L"Extract with Axiom...",
                                    quoted_executable_command(executable, L"--extract \"%1\""),
                                    IDI_ARCHIVE_ZIP, archive_filter);
         }
         if (application_options_.context_test) {
-            apply_shell_subcommand(file_context, L"030Test",
+            apply_shell_subcommand(file_subcommands, L"030Test",
                                    L"Test with Axiom",
                                    quoted_executable_command(executable, L"--test \"%1\""),
                                    IDI_ARCHIVE_ZIP, archive_filter);
         }
         if (application_options_.context_add) {
-            apply_shell_subcommand(file_context, L"040Add",
+            apply_shell_subcommand(file_subcommands, L"040Add",
                                    L"Add to Axiom archive...",
                                    quoted_executable_command(executable, L"--add \"%1\""),
                                    IDI_AXIOM);
         }
     }
 
-    if (apply_shell_submenu(directory_context, application_options_.context_add)) {
-        apply_shell_subcommand(directory_context, L"010Add",
+    if (apply_shell_submenu(directory_context, directory_subcommands_id,
+                            directory_subcommands, application_options_.context_add)) {
+        apply_shell_subcommand(directory_subcommands, L"010Add",
                                L"Add to Axiom archive...",
                                quoted_executable_command(executable, L"--add \"%1\""),
                                IDI_AXIOM);
