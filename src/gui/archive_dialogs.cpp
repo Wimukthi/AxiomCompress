@@ -1401,13 +1401,13 @@ private:
                          L"Associate TAR family files (.tar, .tgz, .txz, .tbz2, .tzst)", 0, 178);
         setting_checkbox(6, kAssociateIso, L"Associate .iso images with Axiom", 0, 212);
         setting_checkbox(6, kAssociateCab, L"Associate .cab archives with Axiom", 0, 246);
-        setting_checkbox(6, kContextOpen, L"Explorer context menu: Open with Axiom", 0, 300);
-        setting_checkbox(6, kContextAdd, L"Explorer context menu: Add to archive", 0, 334);
-        setting_checkbox(6, kContextExtract, L"Explorer context menu: Extract here/to folder", 0, 368);
-        setting_checkbox(6, kContextTest, L"Explorer context menu: Test archive", 0, 402);
+        setting_checkbox(6, kContextOpen, L"Axiom submenu: Open archives", 0, 300);
+        setting_checkbox(6, kContextAdd, L"Axiom submenu: Add files or folders to archive", 0, 334);
+        setting_checkbox(6, kContextExtract, L"Axiom submenu: Extract archives", 0, 368);
+        setting_checkbox(6, kContextTest, L"Axiom submenu: Test archives", 0, 402);
         setting_label(6,
                       L"Integration is written per-user under HKCU and applies/removes Axiom's "
-                      L"own file association and Explorer context-menu entries. Read-only "
+                      L"own file association and Explorer context submenu entries. Read-only "
                       L"formats can be opened, tested, and extracted but not edited.",
                       0, 456, 660, 64, true);
 

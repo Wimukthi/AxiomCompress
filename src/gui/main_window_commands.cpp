@@ -991,22 +991,74 @@ void MainWindow::on_settings() {
     apply_application_options(dialog_options);
 }
 
-void MainWindow::apply_shell_command(bool enabled, const std::wstring& key,
-                         const std::wstring& label,
-                         const std::wstring& command) const {
-    if (!enabled) {
-        delete_registry_tree(HKEY_CURRENT_USER, key);
-        return;
-    }
-    set_registry_string(HKEY_CURRENT_USER, key, nullptr, label);
-    set_registry_string(HKEY_CURRENT_USER, key + L"\\command", nullptr, command);
-}
-
 void MainWindow::apply_shell_integration() const {
     const fs::path executable = current_executable_path();
     if (executable.empty()) return;
     const std::wstring classes = L"Software\\Classes\\";
+    const std::wstring file_context = classes + L"*\\shell\\Axiom";
+    const std::wstring directory_context = classes + L"Directory\\shell\\Axiom";
     const std::wstring axar_context = classes + L"SystemFileAssociations\\.axar\\shell\\";
+
+    const auto icon_value = [&](int icon_id = IDI_AXIOM) {
+        return quote_argument(executable) + L",-" + std::to_wstring(icon_id);
+    };
+    const auto archive_applies_to = [] {
+        return std::wstring(
+            L"System.FileExtension:=\".axar\" OR "
+            L"System.FileExtension:=\".zip\" OR "
+            L"System.FileExtension:=\".jar\" OR "
+            L"System.FileExtension:=\".war\" OR "
+            L"System.FileExtension:=\".apk\" OR "
+            L"System.FileExtension:=\".7z\" OR "
+            L"System.FileExtension:=\".rar\" OR "
+            L"System.FileExtension:=\".r00\" OR "
+            L"System.FileExtension:=\".r01\" OR "
+            L"System.FileExtension:=\".r02\" OR "
+            L"System.FileExtension:=\".r03\" OR "
+            L"System.FileExtension:=\".r04\" OR "
+            L"System.FileExtension:=\".r05\" OR "
+            L"System.FileExtension:=\".r06\" OR "
+            L"System.FileExtension:=\".r07\" OR "
+            L"System.FileExtension:=\".r08\" OR "
+            L"System.FileExtension:=\".r09\" OR "
+            L"System.FileExtension:=\".tar\" OR "
+            L"System.FileExtension:=\".gz\" OR "
+            L"System.FileExtension:=\".xz\" OR "
+            L"System.FileExtension:=\".bz2\" OR "
+            L"System.FileExtension:=\".zst\" OR "
+            L"System.FileExtension:=\".tgz\" OR "
+            L"System.FileExtension:=\".txz\" OR "
+            L"System.FileExtension:=\".tbz2\" OR "
+            L"System.FileExtension:=\".tzst\" OR "
+            L"System.FileExtension:=\".iso\" OR "
+            L"System.FileExtension:=\".cab\"");
+    };
+    const auto apply_shell_subcommand =
+        [&](const std::wstring& parent, const std::wstring& order,
+            const std::wstring& label, const std::wstring& command,
+            int icon_id, const std::wstring& applies_to = {}) {
+            const std::wstring key = parent + L"\\shell\\" + order;
+            set_registry_string(HKEY_CURRENT_USER, key, nullptr, label);
+            set_registry_string(HKEY_CURRENT_USER, key, L"MUIVerb", label);
+            set_registry_string(HKEY_CURRENT_USER, key, L"Icon", icon_value(icon_id));
+            if (!applies_to.empty()) {
+                set_registry_string(HKEY_CURRENT_USER, key, L"AppliesTo", applies_to);
+            }
+            set_registry_string(HKEY_CURRENT_USER, key + L"\\command", nullptr, command);
+        };
+    const auto apply_shell_submenu =
+        [&](const std::wstring& parent, bool enabled, const std::wstring& applies_to = {}) {
+            delete_registry_tree(HKEY_CURRENT_USER, parent);
+            if (!enabled) return false;
+            set_registry_string(HKEY_CURRENT_USER, parent, nullptr, L"Axiom");
+            set_registry_string(HKEY_CURRENT_USER, parent, L"MUIVerb", L"Axiom");
+            set_registry_string(HKEY_CURRENT_USER, parent, L"Icon", icon_value());
+            set_registry_string(HKEY_CURRENT_USER, parent, L"SubCommands", L"");
+            if (!applies_to.empty()) {
+                set_registry_string(HKEY_CURRENT_USER, parent, L"AppliesTo", applies_to);
+            }
+            return true;
+        };
 
     const auto apply_association =
         [&](bool enabled, const std::wstring& extension,
@@ -1083,26 +1135,55 @@ void MainWindow::apply_shell_integration() const {
         }
     }
 
-    apply_shell_command(application_options_.context_open,
-                        axar_context + L"AxiomOpen",
-                        L"Open with Axiom",
-                        quoted_executable_command(executable, L"\"%1\""));
-    apply_shell_command(application_options_.context_extract,
-                        axar_context + L"AxiomExtract",
-                        L"Extract with Axiom...",
-                        quoted_executable_command(executable, L"--extract \"%1\""));
-    apply_shell_command(application_options_.context_test,
-                        axar_context + L"AxiomTest",
-                        L"Test with Axiom",
-                        quoted_executable_command(executable, L"--test \"%1\""));
-    apply_shell_command(application_options_.context_add,
-                        classes + L"*\\shell\\AxiomAdd",
-                        L"Add to Axiom archive...",
-                        quoted_executable_command(executable, L"--add \"%1\""));
-    apply_shell_command(application_options_.context_add,
-                        classes + L"Directory\\shell\\AxiomAdd",
-                        L"Add to Axiom archive...",
-                        quoted_executable_command(executable, L"--add \"%1\""));
+    // Remove pre-submenu flat verbs. Keeping this unconditional lets upgraded
+    // installs migrate cleanly the next time Axiom starts or settings are
+    // applied.
+    delete_registry_tree(HKEY_CURRENT_USER, axar_context + L"AxiomOpen");
+    delete_registry_tree(HKEY_CURRENT_USER, axar_context + L"AxiomExtract");
+    delete_registry_tree(HKEY_CURRENT_USER, axar_context + L"AxiomTest");
+    delete_registry_tree(HKEY_CURRENT_USER, classes + L"*\\shell\\AxiomAdd");
+    delete_registry_tree(HKEY_CURRENT_USER, classes + L"Directory\\shell\\AxiomAdd");
+
+    const bool archive_commands =
+        application_options_.context_open ||
+        application_options_.context_extract ||
+        application_options_.context_test;
+    const bool file_menu = application_options_.context_add || archive_commands;
+    const std::wstring archive_filter = archive_applies_to();
+    if (apply_shell_submenu(file_context, file_menu,
+                            application_options_.context_add ? L"" : archive_filter)) {
+        if (application_options_.context_open) {
+            apply_shell_subcommand(file_context, L"010Open",
+                                   L"Open with Axiom",
+                                   quoted_executable_command(executable, L"\"%1\""),
+                                   IDI_AXIOM, archive_filter);
+        }
+        if (application_options_.context_extract) {
+            apply_shell_subcommand(file_context, L"020Extract",
+                                   L"Extract with Axiom...",
+                                   quoted_executable_command(executable, L"--extract \"%1\""),
+                                   IDI_ARCHIVE_ZIP, archive_filter);
+        }
+        if (application_options_.context_test) {
+            apply_shell_subcommand(file_context, L"030Test",
+                                   L"Test with Axiom",
+                                   quoted_executable_command(executable, L"--test \"%1\""),
+                                   IDI_ARCHIVE_ZIP, archive_filter);
+        }
+        if (application_options_.context_add) {
+            apply_shell_subcommand(file_context, L"040Add",
+                                   L"Add to Axiom archive...",
+                                   quoted_executable_command(executable, L"--add \"%1\""),
+                                   IDI_AXIOM);
+        }
+    }
+
+    if (apply_shell_submenu(directory_context, application_options_.context_add)) {
+        apply_shell_subcommand(directory_context, L"010Add",
+                               L"Add to Axiom archive...",
+                               quoted_executable_command(executable, L"--add \"%1\""),
+                               IDI_AXIOM);
+    }
     SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, nullptr, nullptr);
 }
 

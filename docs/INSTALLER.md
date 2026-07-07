@@ -119,4 +119,4 @@ Axiom binaries can be closed before files are replaced.
 ## File Associations
 
 The installer does not force Axiom as the `.axar` default. Use Axiom's Settings
-dialog to register archive file associations and Explorer context menu actions.
+dialog to register archive file associations and the Explorer Axiom submenu.

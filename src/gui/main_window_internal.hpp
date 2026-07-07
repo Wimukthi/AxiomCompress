@@ -1063,9 +1063,6 @@ private:
     void apply_application_options(
         const axiom::gui::ApplicationDialogOptions& updated_options);
     void on_settings();
-    void apply_shell_command(bool enabled, const std::wstring& key,
-                             const std::wstring& label,
-                             const std::wstring& command) const;
     void apply_shell_integration() const;
     bool maybe_execute_sfx_archive(const fs::path& path);
     bool open_archive_path(const fs::path& path);

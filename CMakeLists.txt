@@ -82,8 +82,15 @@ if(WIN32)
     target_link_libraries(axiom PUBLIC bcrypt)
 endif()
 
-add_executable(axiomc src/cli/main.cpp)
+set(AXIOMC_SOURCES
+    src/cli/main.cpp)
+if(WIN32)
+    list(APPEND AXIOMC_SOURCES src/cli/axiom_cli.rc)
+endif()
+
+add_executable(axiomc ${AXIOMC_SOURCES})
 target_link_libraries(axiomc PRIVATE axiom)
+target_include_directories(axiomc PRIVATE src)
 
 if(WIN32)
     add_executable(axiom_gui WIN32

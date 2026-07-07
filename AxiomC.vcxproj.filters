@@ -4,10 +4,18 @@
     <Filter Include="CLI">
       <UniqueIdentifier>{75D1A84C-4E8B-4C06-A41D-24FB8C10241C}</UniqueIdentifier>
     </Filter>
+    <Filter Include="Resources">
+      <UniqueIdentifier>{9447067B-7E37-4C84-8787-80E6220E8859}</UniqueIdentifier>
+    </Filter>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="src\cli\main.cpp">
       <Filter>CLI</Filter>
     </ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <ResourceCompile Include="src\cli\axiom_cli.rc">
+      <Filter>Resources</Filter>
+    </ResourceCompile>
   </ItemGroup>
 </Project>

@@ -2,13 +2,7 @@
 
 #include "resource.hpp"
 
-IDI_AXIOM ICON "..\\..\\Icons\\axiom.ico"
-IDI_ARCHIVE_ZIP ICON "..\\..\\Icons\\archive_zip.ico"
-IDI_ARCHIVE_7Z ICON "..\\..\\Icons\\archive_7z.ico"
-IDI_ARCHIVE_RAR ICON "..\\..\\Icons\\archive_rar.ico"
-IDI_ARCHIVE_TAR ICON "..\\..\\Icons\\archive_tar.ico"
-IDI_ARCHIVE_ISO ICON "..\\..\\Icons\\archive_iso.ico"
-IDI_ARCHIVE_CAB ICON "..\\..\\Icons\\archive_cab.ico"
+IDI_AXIOMC ICON "..\\..\\Icons\\axiom.ico"
 
 VS_VERSION_INFO VERSIONINFO
  FILEVERSION 0,2,2,35
@@ -28,10 +22,10 @@ BEGIN
         BLOCK "040904b0"
         BEGIN
             VALUE "CompanyName", "Wimukthi Bandara"
-            VALUE "FileDescription", "Axiom native archive manager"
+            VALUE "FileDescription", "Axiom command-line archiver"
             VALUE "FileVersion", "0.2.2.35"
-            VALUE "InternalName", "Axiom"
-            VALUE "OriginalFilename", "Axiom.exe"
+            VALUE "InternalName", "axiomc"
+            VALUE "OriginalFilename", "axiomc.exe"
             VALUE "ProductName", "Axiom"
             VALUE "ProductVersion", "0.2.2.35"
         END

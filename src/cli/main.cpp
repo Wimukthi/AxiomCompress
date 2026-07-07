@@ -1,10 +1,13 @@
 #include "axiom/archive.hpp"
 #include "axiom/axiom.hpp"
+#include "axiom/version.hpp"
+#include "core/cpu.hpp"
 
-#include <ctime>
 #include <array>
 #include <algorithm>
 #include <cctype>
+#include <cstdio>
+#include <ctime>
 #include <fstream>
 #include <exception>
 #include <filesystem>
@@ -16,6 +19,13 @@
 #include <vector>
 
 #ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
 #include <io.h>
 #else
 #include <unistd.h>
@@ -85,15 +95,58 @@ bool stream_is_terminal(FILE* stream) {
 #endif
 }
 
+bool console_colors_enabled() {
+    static const bool enabled = [] {
+        if (!stream_is_terminal(stdout)) {
+            return false;
+        }
+#ifdef _WIN32
+        HANDLE output = GetStdHandle(STD_OUTPUT_HANDLE);
+        if (output == INVALID_HANDLE_VALUE || output == nullptr) {
+            return false;
+        }
+        DWORD mode = 0;
+        if (!GetConsoleMode(output, &mode)) {
+            return false;
+        }
+        if ((mode & ENABLE_VIRTUAL_TERMINAL_PROCESSING) == 0) {
+            if (!SetConsoleMode(output, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING)) {
+                return false;
+            }
+        }
+#endif
+        return true;
+    }();
+    return enabled;
+}
+
+const char* color(const char* sequence) {
+    return console_colors_enabled() ? sequence : "";
+}
+
+constexpr const char* kColorReset = "\x1b[0m";
+constexpr const char* kColorMuted = "\x1b[90m";
+constexpr const char* kColorBright = "\x1b[97;1m";
+constexpr const char* kColorAmber = "\x1b[38;2;255;191;0m";
+
 void print_splash() {
     std::cout <<
+        color(kColorAmber) <<
         "     ___        _                \n"
         "    / _ \\__  __(_) ___  _ __ ___ \n"
         "   / /_)/\\ \\/ /| |/ _ \\| '_ ` _ \\\n"
         "  / ___/  >  < | | (_) | | | | | |\n"
-        "  \\/     /_/\\_\\|_|\\___/|_| |_| |_|\n"
-        "\n"
-        "        Axiom Archive Manager\n"
+        "  \\/     /_/\\_\\|_|\\___/|_| |_| |_|\n" <<
+        color(kColorReset) << '\n' <<
+        color(kColorAmber) << "        Axiom" << color(kColorBright) << " Command Shell"
+        << color(kColorReset) << '\n' <<
+        color(kColorMuted) << "        Native archive tools for Windows and terminals"
+        << color(kColorReset) << "\n\n" <<
+        color(kColorMuted) << "  Version:   " << color(kColorAmber) << axiom::kVersion << '\n' <<
+        color(kColorMuted) << "  Build:     " << color(kColorAmber) << __DATE__ << ' ' << __TIME__ << '\n' <<
+        color(kColorMuted) << "  Author:    " << color(kColorAmber) << axiom::kAuthorName << '\n' <<
+        color(kColorMuted) << "  CPU:       " << color(kColorAmber)
+        << axiom::core::cpu_features_string() << color(kColorReset) << "\n\n"
         "  type \"help\" for commands, \"exit\" to quit\n\n";
 }
 
@@ -803,7 +856,8 @@ int run_interactive_shell() {
     std::string line;
     for (;;) {
         if (stream_is_terminal(stdout)) {
-            std::cout << "axiom> " << std::flush;
+            std::cout << color(kColorAmber) << "axiom" << color(kColorReset) << "> "
+                      << std::flush;
         }
         if (!std::getline(std::cin, line)) {
             std::cout << '\n';

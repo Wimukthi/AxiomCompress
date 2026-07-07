@@ -82,6 +82,9 @@
     <ClCompile Include="src\cli\main.cpp" />
   </ItemGroup>
   <ItemGroup>
+    <ResourceCompile Include="src\cli\axiom_cli.rc" />
+  </ItemGroup>
+  <ItemGroup>
     <ProjectReference Include="AxiomLib.vcxproj">
       <Project>{A16F0B4E-82B2-43BB-A779-0E9563F8EC11}</Project>
     </ProjectReference>

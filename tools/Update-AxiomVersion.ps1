@@ -79,6 +79,31 @@ function Update-VersionText {
     return $updated
 }
 
+function Update-VersionHeader {
+    param(
+        [string]$HeaderPath,
+        [int[]]$Parts
+    )
+
+    if (-not (Test-Path -LiteralPath $HeaderPath)) {
+        return
+    }
+
+    $dotted = Format-DottedVersion -Parts $Parts
+    $text = [System.IO.File]::ReadAllText($HeaderPath)
+    $updated = [regex]::Replace(
+        $text,
+        '(inline\s+constexpr\s+const\s+char\*\s+kVersion\s*=\s*")\d+\.\d+\.\d+\.\d+(")',
+        "`${1}$dotted`${2}",
+        1
+    )
+
+    if ($updated -ne $text) {
+        $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+        [System.IO.File]::WriteAllText($HeaderPath, $updated, $utf8NoBom)
+    }
+}
+
 $resolvedResourceFile = Resolve-Path -LiteralPath $ResourceFile
 $text = [System.IO.File]::ReadAllText($resolvedResourceFile)
 $parts = Get-VersionParts -Text $text
@@ -97,6 +122,26 @@ if ($IncrementBuild) {
 
     $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
     [System.IO.File]::WriteAllText($resolvedResourceFile, $updated, $utf8NoBom)
+
+    $mirrorResourceFiles = @(
+        (Join-Path $PSScriptRoot "..\src\cli\axiom_cli.rc")
+    )
+    foreach ($mirrorResourceFile in $mirrorResourceFiles) {
+        if (-not (Test-Path -LiteralPath $mirrorResourceFile)) {
+            continue
+        }
+        $resolvedMirrorResourceFile = Resolve-Path -LiteralPath $mirrorResourceFile
+        if ($resolvedMirrorResourceFile.Path -eq $resolvedResourceFile.Path) {
+            continue
+        }
+        $mirrorText = [System.IO.File]::ReadAllText($resolvedMirrorResourceFile)
+        $mirrorUpdated = Update-VersionText -Text $mirrorText -Parts $parts
+        if ($mirrorUpdated -ne $mirrorText) {
+            [System.IO.File]::WriteAllText($resolvedMirrorResourceFile, $mirrorUpdated, $utf8NoBom)
+        }
+    }
+
+    Update-VersionHeader -HeaderPath (Join-Path $PSScriptRoot "..\include\axiom\version.hpp") -Parts $parts
 }
 
 if ($PrintVersion -or -not $IncrementBuild) {

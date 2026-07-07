@@ -41,6 +41,7 @@ $libSources = @(
     "src\codec\lz77_split.cpp",
     "src\core\archive.cpp",
     "src\core\checksum.cpp",
+    "src\core\checksum_clmul.cpp",
     "src\core\cpu.cpp",
     "src\core\crypto.cpp",
     "src\core\file_meta.cpp",
