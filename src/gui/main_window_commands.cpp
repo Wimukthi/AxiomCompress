@@ -1038,8 +1038,10 @@ void MainWindow::apply_shell_integration() const {
     const std::wstring directory_subcommands = classes + directory_subcommands_id;
     const std::wstring axar_context = classes + L"SystemFileAssociations\\.axar\\shell\\";
 
+    // Shell icon references need an explicit index. Resource icons are addressed
+    // by negative id (",-100"); a bare path with no index is unreliable across
+    // Explorer versions, so always emit one.
     const auto icon_value = [&](int icon_id = IDI_AXIOM) {
-        if (icon_id == IDI_AXIOM) return quote_argument(executable);
         return quote_argument(executable) + L",-" + std::to_wstring(icon_id);
     };
     const auto archive_applies_to = [] {
@@ -1073,19 +1075,22 @@ void MainWindow::apply_shell_integration() const {
             L"System.FileExtension:=\".iso\" OR "
             L"System.FileExtension:=\".cab\"");
     };
+    // A leaf verb inside an ExtendedSubCommandsKey store. These are static
+    // command definitions, not per-file-class verbs, so a per-item AppliesTo is
+    // ignored by Explorer — filtering must live on the cascade parent instead.
     const auto apply_shell_subcommand =
         [&](const std::wstring& parent, const std::wstring& order,
             const std::wstring& label, const std::wstring& command,
-            int icon_id, const std::wstring& applies_to = {}) {
+            int icon_id) {
             const std::wstring key = parent + L"\\shell\\" + order;
-            set_registry_string(HKEY_CURRENT_USER, key, nullptr, label);
             set_registry_string(HKEY_CURRENT_USER, key, L"MUIVerb", label);
             set_registry_string(HKEY_CURRENT_USER, key, L"Icon", icon_value(icon_id));
-            if (!applies_to.empty()) {
-                set_registry_string(HKEY_CURRENT_USER, key, L"AppliesTo", applies_to);
-            }
             set_registry_string(HKEY_CURRENT_USER, key + L"\\command", nullptr, command);
         };
+    // A cascade parent that points at a shared subcommand store. The parent's
+    // default value must be *empty* for the ExtendedSubCommandsKey cascade to
+    // render (Windows shell requirement); the label comes from MUIVerb. An
+    // AppliesTo here filters the whole submenu by file type, which does work.
     const auto apply_shell_submenu =
         [&](const std::wstring& parent, const std::wstring& subcommands_id,
             const std::wstring& subcommands_key, bool enabled,
@@ -1093,7 +1098,6 @@ void MainWindow::apply_shell_integration() const {
             delete_registry_tree(HKEY_CURRENT_USER, parent);
             delete_registry_tree(HKEY_CURRENT_USER, subcommands_key);
             if (!enabled) return false;
-            set_registry_string(HKEY_CURRENT_USER, parent, nullptr, L"Axiom");
             set_registry_string(HKEY_CURRENT_USER, parent, L"MUIVerb", L"Axiom");
             set_registry_string(HKEY_CURRENT_USER, parent, L"Icon", icon_value());
             set_registry_string(HKEY_CURRENT_USER, parent, L"ExtendedSubCommandsKey",
@@ -1102,6 +1106,23 @@ void MainWindow::apply_shell_integration() const {
                 set_registry_string(HKEY_CURRENT_USER, parent, L"AppliesTo", applies_to);
             }
             return true;
+        };
+    // A single top-level verb (not a cascade). Unlike a cascade parent, a plain
+    // verb takes its label from the default value / MUIVerb and carries its own
+    // command; an AppliesTo filters it by file type.
+    const auto apply_shell_verb =
+        [&](const std::wstring& key, bool enabled, const std::wstring& label,
+            const std::wstring& command, int icon_id,
+            const std::wstring& applies_to = {}) {
+            delete_registry_tree(HKEY_CURRENT_USER, key);
+            if (!enabled) return;
+            set_registry_string(HKEY_CURRENT_USER, key, nullptr, label);
+            set_registry_string(HKEY_CURRENT_USER, key, L"MUIVerb", label);
+            set_registry_string(HKEY_CURRENT_USER, key, L"Icon", icon_value(icon_id));
+            if (!applies_to.empty()) {
+                set_registry_string(HKEY_CURRENT_USER, key, L"AppliesTo", applies_to);
+            }
+            set_registry_string(HKEY_CURRENT_USER, key + L"\\command", nullptr, command);
         };
 
     const auto apply_association =
@@ -1179,56 +1200,54 @@ void MainWindow::apply_shell_integration() const {
         }
     }
 
-    // Remove pre-submenu flat verbs. Keeping this unconditional lets upgraded
-    // installs migrate cleanly the next time Axiom starts or settings are
-    // applied.
+    // Remove pre-submenu flat verbs and any earlier layout. Keeping this
+    // unconditional lets upgraded installs migrate cleanly the next time Axiom
+    // starts or settings are applied.
     delete_registry_tree(HKEY_CURRENT_USER, axar_context + L"AxiomOpen");
     delete_registry_tree(HKEY_CURRENT_USER, axar_context + L"AxiomExtract");
     delete_registry_tree(HKEY_CURRENT_USER, axar_context + L"AxiomTest");
-    delete_registry_tree(HKEY_CURRENT_USER, classes + L"*\\shell\\AxiomAdd");
-    delete_registry_tree(HKEY_CURRENT_USER, classes + L"Directory\\shell\\AxiomAdd");
+    delete_registry_tree(HKEY_CURRENT_USER, directory_context);       // old Directory submenu
+    delete_registry_tree(HKEY_CURRENT_USER, directory_subcommands);   // old Directory store
 
-    const bool archive_commands =
+    // Open/Extract/Test only make sense on an archive, so they live in an
+    // "Axiom" cascade whose parent is filtered to the archive extensions (a
+    // parent-level AppliesTo is honored; a per-subcommand one is not). "Add to
+    // archive" applies to any file or folder, so it is a separate top-level
+    // verb rather than a submenu item — that also avoids it showing twice.
+    const std::wstring archive_filter = archive_applies_to();
+    const bool archive_menu =
         application_options_.context_open ||
         application_options_.context_extract ||
         application_options_.context_test;
-    const bool file_menu = application_options_.context_add || archive_commands;
-    const std::wstring archive_filter = archive_applies_to();
-    if (apply_shell_submenu(file_context, file_subcommands_id, file_subcommands, file_menu,
-                            application_options_.context_add ? L"" : archive_filter)) {
+    if (apply_shell_submenu(file_context, file_subcommands_id, file_subcommands,
+                            archive_menu, archive_filter)) {
         if (application_options_.context_open) {
             apply_shell_subcommand(file_subcommands, L"010Open",
                                    L"Open with Axiom",
                                    quoted_executable_command(executable, L"\"%1\""),
-                                   IDI_AXIOM, archive_filter);
+                                   IDI_AXIOM);
         }
         if (application_options_.context_extract) {
             apply_shell_subcommand(file_subcommands, L"020Extract",
                                    L"Extract with Axiom...",
                                    quoted_executable_command(executable, L"--extract \"%1\""),
-                                   IDI_ARCHIVE_ZIP, archive_filter);
+                                   IDI_ARCHIVE_ZIP);
         }
         if (application_options_.context_test) {
             apply_shell_subcommand(file_subcommands, L"030Test",
                                    L"Test with Axiom",
                                    quoted_executable_command(executable, L"--test \"%1\""),
-                                   IDI_ARCHIVE_ZIP, archive_filter);
-        }
-        if (application_options_.context_add) {
-            apply_shell_subcommand(file_subcommands, L"040Add",
-                                   L"Add to Axiom archive...",
-                                   quoted_executable_command(executable, L"--add \"%1\""),
-                                   IDI_AXIOM);
+                                   IDI_ARCHIVE_ZIP);
         }
     }
 
-    if (apply_shell_submenu(directory_context, directory_subcommands_id,
-                            directory_subcommands, application_options_.context_add)) {
-        apply_shell_subcommand(directory_subcommands, L"010Add",
-                               L"Add to Axiom archive...",
-                               quoted_executable_command(executable, L"--add \"%1\""),
-                               IDI_AXIOM);
-    }
+    apply_shell_verb(classes + L"*\\shell\\AxiomAdd", application_options_.context_add,
+                     L"Add to Axiom archive...",
+                     quoted_executable_command(executable, L"--add \"%1\""), IDI_AXIOM);
+    apply_shell_verb(classes + L"Directory\\shell\\AxiomAdd",
+                     application_options_.context_add, L"Add to Axiom archive...",
+                     quoted_executable_command(executable, L"--add \"%1\""), IDI_AXIOM);
+
     SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, nullptr, nullptr);
 }
 
