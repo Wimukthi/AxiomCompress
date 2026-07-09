@@ -1,7 +1,6 @@
 build/
 out/
 .vs/
-.claude/
 *.user
 *.suo
 *.opensdf
