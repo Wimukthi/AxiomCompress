@@ -6,6 +6,9 @@
 
 namespace axiom {
 
-const ArchiveProvider* system_archive_provider_for_path(const std::filesystem::path& path);
+const ArchiveProvider* system_archive_provider_for_contents(
+    const std::filesystem::path& path);
+const ArchiveProvider* system_archive_provider_for_extension(
+    const std::filesystem::path& path);
 
 }  // namespace axiom

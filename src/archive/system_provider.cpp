@@ -1,4 +1,5 @@
 #include "archive/system_provider.hpp"
+#include "core/windows_time.hpp"
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -8,10 +9,13 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cctype>
+#include <charconv>
 #include <cstdio>
 #include <cstdint>
 #include <ctime>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <initializer_list>
@@ -23,6 +27,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <unordered_set>
 #include <vector>
 
@@ -372,11 +377,54 @@ struct ProcessResult {
     std::string output;
 };
 
+struct ProcessProgressSpec {
+    OperationStage stage = OperationStage::reading;
+    std::uint64_t total_bytes = 0;
+    std::uint64_t total_items = 0;
+};
+
+std::optional<unsigned> latest_7z_percent(std::string_view output) {
+    const std::size_t marker = output.find_last_of('%');
+    if (marker == std::string_view::npos) return std::nullopt;
+    std::size_t start = marker;
+    while (start > 0 && output[start - 1] >= '0' && output[start - 1] <= '9') --start;
+    if (start == marker) return std::nullopt;
+    unsigned value = 0;
+    for (std::size_t index = start; index < marker; ++index) {
+        value = value * 10 + static_cast<unsigned>(output[index] - '0');
+    }
+    return value <= 100 ? std::optional<unsigned>(value) : std::nullopt;
+}
+
+std::string latest_7z_path(std::string_view output) {
+    const std::size_t marker = output.find_last_of('%');
+    if (marker == std::string_view::npos) return {};
+    std::size_t end = output.find_first_of("\r\n\b", marker + 1);
+    if (end == std::string_view::npos) end = output.size();
+    std::string_view suffix = output.substr(marker + 1, end - marker - 1);
+    std::size_t path = suffix.find(" T ");
+    if (path != std::string_view::npos) {
+        suffix.remove_prefix(path + 3);
+    } else if ((path = suffix.find(" - ")) != std::string_view::npos) {
+        suffix.remove_prefix(path + 3);
+    } else {
+        return {};
+    }
+    while (!suffix.empty() && std::isspace(static_cast<unsigned char>(suffix.front()))) {
+        suffix.remove_prefix(1);
+    }
+    while (!suffix.empty() && std::isspace(static_cast<unsigned char>(suffix.back()))) {
+        suffix.remove_suffix(1);
+    }
+    return std::string(suffix);
+}
+
 ProcessResult run_process(const fs::path& executable,
                           const std::vector<std::wstring>& arguments,
                           bool capture_stdout,
                           const std::shared_ptr<OperationControl>& operation,
-                          std::string_view tool_name) {
+                          std::string_view tool_name,
+                          std::optional<ProcessProgressSpec> progress_spec = std::nullopt) {
     SECURITY_ATTRIBUTES security{};
     security.nLength = sizeof(security);
     security.bInheritHandle = TRUE;
@@ -435,53 +483,70 @@ ProcessResult run_process(const fs::path& executable,
     CloseHandle(process.hThread);
 
     std::string output;
-    std::array<char, 4096> buffer{};
-    DWORD exit_code = STILL_ACTIVE;
-    bool running = true;
-    while (true) {
+    std::atomic<bool> output_too_large = false;
+    std::exception_ptr reader_failure;
+    // A blocking reader keeps the anonymous pipe drained continuously. Polling
+    // PeekNamedPipe from the process-wait loop throttled verbose listings to one
+    // small pipe burst per wait interval, even though 7-Zip had data ready.
+    std::thread pipe_reader([&] {
+        try {
+            std::array<char, 64 * 1024> buffer{};
+            DWORD read = 0;
+            unsigned last_percent = 101;
+            while (ReadFile(read_pipe, buffer.data(), static_cast<DWORD>(buffer.size()),
+                            &read, nullptr) && read != 0) {
+                if (output.size() + read > (64u << 20)) {
+                    output_too_large.store(true, std::memory_order_relaxed);
+                    TerminateProcess(process.hProcess, ERROR_NOT_ENOUGH_MEMORY);
+                    break;
+                }
+                output.append(buffer.data(), buffer.data() + read);
+                if (operation && progress_spec) {
+                    const std::size_t tail_start = output.size() > 4096
+                        ? output.size() - 4096 : 0;
+                    const std::string_view tail =
+                        std::string_view(output).substr(tail_start);
+                    if (const auto percent = latest_7z_percent(tail);
+                        percent && *percent != last_percent) {
+                        last_percent = *percent;
+                        report_operation(
+                            operation, progress_spec->stage,
+                            progress_spec->total_bytes * *percent / 100,
+                            progress_spec->total_bytes,
+                            progress_spec->total_items * *percent / 100,
+                            progress_spec->total_items,
+                            latest_7z_path(tail));
+                    }
+                }
+            }
+        } catch (...) {
+            reader_failure = std::current_exception();
+            TerminateProcess(process.hProcess, ERROR_NOT_ENOUGH_MEMORY);
+        }
+    });
+
+    std::exception_ptr operation_failure;
+    while (WaitForSingleObject(process.hProcess, 10) == WAIT_TIMEOUT) {
         try {
             operation_checkpoint(operation);
         } catch (...) {
+            operation_failure = std::current_exception();
             TerminateProcess(process.hProcess, ERROR_CANCELLED);
-            CloseHandle(read_pipe);
-            CloseHandle(process.hProcess);
-            throw;
-        }
-
-        DWORD available = 0;
-        while (PeekNamedPipe(read_pipe, nullptr, 0, nullptr, &available, nullptr) &&
-               available != 0) {
-            DWORD read = 0;
-            if (!ReadFile(read_pipe, buffer.data(),
-                          static_cast<DWORD>(std::min<std::size_t>(buffer.size(), available)),
-                          &read, nullptr) || read == 0) {
-                break;
-            }
-            output.append(buffer.data(), buffer.data() + read);
-            if (output.size() > (64u << 20)) {
-                TerminateProcess(process.hProcess, ERROR_NOT_ENOUGH_MEMORY);
-                CloseHandle(read_pipe);
-                CloseHandle(process.hProcess);
-                throw std::runtime_error("system archive reader produced too much output");
-            }
-        }
-
-        if (running && WaitForSingleObject(process.hProcess, 25) == WAIT_OBJECT_0) {
-            running = false;
-            GetExitCodeProcess(process.hProcess, &exit_code);
-        }
-        if (!running) {
-            DWORD read = 0;
-            while (ReadFile(read_pipe, buffer.data(), static_cast<DWORD>(buffer.size()),
-                            &read, nullptr) && read != 0) {
-                output.append(buffer.data(), buffer.data() + read);
-            }
             break;
         }
     }
-
+    WaitForSingleObject(process.hProcess, INFINITE);
+    DWORD exit_code = STILL_ACTIVE;
+    GetExitCodeProcess(process.hProcess, &exit_code);
+    pipe_reader.join();
     CloseHandle(read_pipe);
     CloseHandle(process.hProcess);
+
+    if (operation_failure) std::rethrow_exception(operation_failure);
+    if (reader_failure) std::rethrow_exception(reader_failure);
+    if (output_too_large.load(std::memory_order_relaxed)) {
+        throw std::runtime_error("system archive reader produced too much output");
+    }
     return {exit_code, process_output_to_utf8(output)};
 }
 
@@ -497,12 +562,14 @@ ProcessResult run_tar(const std::vector<std::wstring>& arguments,
 
 ProcessResult run_7z(const std::vector<std::wstring>& arguments,
                      bool capture_stdout,
-                     const std::shared_ptr<OperationControl>& operation) {
+                     const std::shared_ptr<OperationControl>& operation,
+                     std::optional<ProcessProgressSpec> progress_spec = std::nullopt) {
     const auto executable = system_7z_executable();
     if (!executable) {
         throw std::runtime_error("Axiom's bundled 7-Zip backend was not found");
     }
-    return run_process(*executable, arguments, capture_stdout, operation, "7-Zip");
+    return run_process(*executable, arguments, capture_stdout, operation, "7-Zip",
+                       progress_spec);
 }
 
 std::runtime_error tar_error(std::string action, const ProcessResult& result) {
@@ -543,52 +610,72 @@ std::string trim_copy(std::string text) {
     return text;
 }
 
-std::optional<std::uint64_t> parse_u64(std::string text) {
-    text = trim_copy(std::move(text));
-    if (text.empty()) return std::nullopt;
-    try {
-        std::size_t consumed = 0;
-        const auto value = std::stoull(text, &consumed, 10);
-        return consumed == text.size() ? std::optional<std::uint64_t>{value} : std::nullopt;
-    } catch (...) {
-        return std::nullopt;
+std::string_view trim_view(std::string_view text) {
+    while (!text.empty() && std::isspace(static_cast<unsigned char>(text.front()))) {
+        text.remove_prefix(1);
     }
+    while (!text.empty() && std::isspace(static_cast<unsigned char>(text.back()))) {
+        text.remove_suffix(1);
+    }
+    return text;
 }
 
-std::optional<std::uint32_t> parse_hex_u32(std::string text) {
-    text = trim_copy(std::move(text));
+std::optional<std::uint64_t> parse_u64(std::string_view text) {
+    text = trim_view(text);
     if (text.empty()) return std::nullopt;
-    try {
-        std::size_t consumed = 0;
-        const auto value = std::stoul(text, &consumed, 16);
-        if (consumed != text.size() || value > 0xfffffffful) return std::nullopt;
-        return static_cast<std::uint32_t>(value);
-    } catch (...) {
-        return std::nullopt;
-    }
+    std::uint64_t value = 0;
+    const auto parsed = std::from_chars(text.data(), text.data() + text.size(), value, 10);
+    return parsed.ec == std::errc{} && parsed.ptr == text.data() + text.size()
+        ? std::optional<std::uint64_t>{value}
+        : std::nullopt;
 }
 
-std::int64_t parse_7z_time(const std::string& text) {
-    int year = 0;
-    int month = 0;
-    int day = 0;
-    int hour = 0;
-    int minute = 0;
-    int second = 0;
-    if (sscanf_s(text.c_str(), "%d-%d-%d %d:%d:%d",
-                 &year, &month, &day, &hour, &minute, &second) != 6) {
-        return 0;
-    }
-    std::tm tm{};
-    tm.tm_year = year - 1900;
-    tm.tm_mon = month - 1;
-    tm.tm_mday = day;
-    tm.tm_hour = hour;
-    tm.tm_min = minute;
-    tm.tm_sec = second;
-    tm.tm_isdst = -1;
-    return static_cast<std::int64_t>(std::mktime(&tm));
+std::optional<std::uint32_t> parse_hex_u32(std::string_view text) {
+    text = trim_view(text);
+    if (text.empty()) return std::nullopt;
+    std::uint32_t value = 0;
+    const auto parsed = std::from_chars(text.data(), text.data() + text.size(), value, 16);
+    return parsed.ec == std::errc{} && parsed.ptr == text.data() + text.size()
+        ? std::optional<std::uint32_t>{value}
+        : std::nullopt;
 }
+
+bool parse_fixed_decimal(std::string_view text, std::size_t offset,
+                         std::size_t length, WORD& result) {
+    if (offset + length > text.size()) return false;
+    unsigned value = 0;
+    for (std::size_t index = offset; index < offset + length; ++index) {
+        const char character = text[index];
+        if (character < '0' || character > '9') return false;
+        value = value * 10u + static_cast<unsigned>(character - '0');
+    }
+    if (value > std::numeric_limits<WORD>::max()) return false;
+    result = static_cast<WORD>(value);
+    return true;
+}
+
+struct SevenZipTimeCache {
+    core::LocalTimeConverter converter;
+
+    std::int64_t to_unix(std::string_view text) {
+        text = trim_view(text);
+        if (text.size() < 19 || text[4] != '-' || text[7] != '-' || text[10] != ' ' ||
+            text[13] != ':' || text[16] != ':') {
+            return 0;
+        }
+        SYSTEMTIME local{};
+        if (!parse_fixed_decimal(text, 0, 4, local.wYear) ||
+            !parse_fixed_decimal(text, 5, 2, local.wMonth) ||
+            !parse_fixed_decimal(text, 8, 2, local.wDay) ||
+            !parse_fixed_decimal(text, 11, 2, local.wHour) ||
+            !parse_fixed_decimal(text, 14, 2, local.wMinute) ||
+            !parse_fixed_decimal(text, 17, 2, local.wSecond)) {
+            return 0;
+        }
+
+        return converter.local_to_unix(local);
+    }
+};
 
 std::optional<ArchiveEntry> parse_verbose_line(const std::string& line) {
     std::array<std::string_view, 8> fields{};
@@ -633,43 +720,45 @@ std::optional<ArchiveEntry> parse_verbose_line(const std::string& line) {
 }
 
 struct SevenZipEntryFields {
-    std::string path;
-    std::string size;
-    std::string packed_size;
-    std::string modified;
-    std::string attributes;
-    std::string crc;
-    std::string encrypted;
-    std::string folder;
-    std::string symlink;
+    std::string_view path;
+    std::string_view size;
+    std::string_view packed_size;
+    std::string_view modified;
+    std::string_view attributes;
+    std::string_view crc;
+    std::string_view encrypted;
+    std::string_view folder;
+    std::string_view symlink;
 };
 
-std::string normalize_7z_path(std::string path) {
-    path = trim_copy(std::move(path));
+std::string normalize_7z_path(std::string_view source) {
+    source = trim_view(source);
+    std::string path(source);
     std::replace(path.begin(), path.end(), '\\', '/');
     while (path.size() > 1 && path.back() == '/') path.pop_back();
     return path;
 }
 
 void assign_7z_field(SevenZipEntryFields& fields,
-                     std::string key,
-                     std::string value) {
-    key = trim_copy(std::move(key));
-    value = trim_copy(std::move(value));
-    if (key == "Path") fields.path = std::move(value);
-    else if (key == "Size") fields.size = std::move(value);
-    else if (key == "Packed Size") fields.packed_size = std::move(value);
-    else if (key == "Modified") fields.modified = std::move(value);
-    else if (key == "Attributes") fields.attributes = std::move(value);
-    else if (key == "CRC") fields.crc = std::move(value);
-    else if (key == "Encrypted") fields.encrypted = std::move(value);
-    else if (key == "Folder") fields.folder = std::move(value);
-    else if (key == "Symbolic Link") fields.symlink = std::move(value);
+                     std::string_view key,
+                     std::string_view value) {
+    key = trim_view(key);
+    value = trim_view(value);
+    if (key == "Path") fields.path = value;
+    else if (key == "Size") fields.size = value;
+    else if (key == "Packed Size") fields.packed_size = value;
+    else if (key == "Modified") fields.modified = value;
+    else if (key == "Attributes") fields.attributes = value;
+    else if (key == "CRC") fields.crc = value;
+    else if (key == "Encrypted") fields.encrypted = value;
+    else if (key == "Folder") fields.folder = value;
+    else if (key == "Symbolic Link") fields.symlink = value;
 }
 
 std::optional<ArchiveEntry> archive_entry_from_7z_fields(const SevenZipEntryFields& fields,
-                                                         bool* encrypted) {
-    if (encrypted != nullptr && trim_copy(fields.encrypted) == "+") {
+                                                         bool* encrypted,
+                                                         SevenZipTimeCache& time_cache) {
+    if (encrypted != nullptr && trim_view(fields.encrypted) == "+") {
         *encrypted = true;
     }
     std::string path = normalize_7z_path(fields.path);
@@ -677,17 +766,17 @@ std::optional<ArchiveEntry> archive_entry_from_7z_fields(const SevenZipEntryFiel
 
     ArchiveEntry entry;
     entry.path = std::move(path);
-    entry.is_directory = trim_copy(fields.folder) == "+" ||
+    entry.is_directory = trim_view(fields.folder) == "+" ||
                          fields.attributes.find('D') != std::string::npos;
     entry.is_symlink = !fields.symlink.empty();
-    entry.link_target = fields.symlink;
+    entry.link_target.assign(fields.symlink);
     if (auto size = parse_u64(fields.size)) entry.size = *size;
     if (auto packed = parse_u64(fields.packed_size)) entry.packed_size = *packed;
     if (auto crc = parse_hex_u32(fields.crc)) {
         entry.crc32 = *crc;
         entry.has_crc32 = true;
     }
-    entry.mtime = parse_7z_time(fields.modified);
+    entry.mtime = time_cache.to_unix(fields.modified);
     if (!is_safe_relative(entry.path)) {
         throw FormatError("archive contains an unsafe path: " + entry.path);
     }
@@ -697,13 +786,15 @@ std::optional<ArchiveEntry> archive_entry_from_7z_fields(const SevenZipEntryFiel
 std::vector<ArchiveEntry> parse_7z_slt_listing(std::string_view output,
                                                bool* any_encrypted = nullptr) {
     std::vector<ArchiveEntry> entries;
+    entries.reserve(output.size() / 192u);
+    SevenZipTimeCache time_cache;
     SevenZipEntryFields current;
     bool in_entries = false;
     bool have_current = false;
 
     auto commit = [&]() {
         if (!have_current) return;
-        auto entry = archive_entry_from_7z_fields(current, any_encrypted);
+        auto entry = archive_entry_from_7z_fields(current, any_encrypted, time_cache);
         if (entry) entries.push_back(std::move(*entry));
         current = SevenZipEntryFields{};
         have_current = false;
@@ -713,23 +804,23 @@ std::vector<ArchiveEntry> parse_7z_slt_listing(std::string_view output,
     while (start <= output.size()) {
         std::size_t end = output.find('\n', start);
         if (end == std::string_view::npos) end = output.size();
-        std::string line(output.substr(start, end - start));
+        std::string_view line = output.substr(start, end - start);
         while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) {
-            line.pop_back();
+            line.remove_suffix(1);
         }
-        const std::string trimmed = trim_copy(line);
+        const std::string_view trimmed = trim_view(line);
         if (!in_entries) {
             if (trimmed == "----------") in_entries = true;
         } else if (!trimmed.empty()) {
             const std::size_t separator = line.find(" = ");
             if (separator != std::string::npos) {
-                std::string key = line.substr(0, separator);
-                std::string value = line.substr(separator + 3);
-                if (trim_copy(key) == "Path") {
+                const std::string_view key = line.substr(0, separator);
+                const std::string_view value = line.substr(separator + 3);
+                if (trim_view(key) == "Path") {
                     commit();
                     have_current = true;
                 }
-                if (have_current) assign_7z_field(current, std::move(key), std::move(value));
+                if (have_current) assign_7z_field(current, key, value);
             }
         }
         if (end == output.size()) break;
@@ -1052,7 +1143,7 @@ struct SevenZipListCacheEntry {
     fs::path path;
     std::uintmax_t file_size = 0;
     fs::file_time_type modified{};
-    ProcessResult result;
+    std::shared_ptr<const ProcessResult> result;
 };
 
 std::mutex& seven_zip_list_cache_mutex() {
@@ -1087,10 +1178,11 @@ bool same_seven_zip_cache_key(const SevenZipListCacheEntry& left,
            left.modified == right.modified;
 }
 
-ProcessResult run_7z_list_cached(const fs::path& archive_path,
-                                 const std::string& password) {
+std::shared_ptr<const ProcessResult> run_7z_list_cached(const fs::path& archive_path,
+                                                        const std::string& password) {
     if (!password.empty()) {
-        return run_7z(seven_zip_list_arguments(archive_path, password), true, nullptr);
+        return std::make_shared<const ProcessResult>(
+            run_7z(seven_zip_list_arguments(archive_path, password), true, nullptr));
     }
 
     auto key = seven_zip_cache_key(archive_path);
@@ -1102,8 +1194,8 @@ ProcessResult run_7z_list_cached(const fs::path& archive_path,
         }
     }
 
-    ProcessResult result = run_7z(seven_zip_list_arguments(archive_path, password),
-                                  true, nullptr);
+    auto result = std::make_shared<const ProcessResult>(
+        run_7z(seven_zip_list_arguments(archive_path, password), true, nullptr));
     if (key) {
         key->result = result;
         std::scoped_lock lock(seven_zip_list_cache_mutex());
@@ -1203,10 +1295,10 @@ public:
         }
 
         const auto listed = run_7z_list_cached(archive_path, password);
-        if (listed.exit_code == 0) {
-            result.encrypted = seven_zip_listing_reports_encryption(listed.output);
+        if (listed->exit_code == 0) {
+            result.encrypted = seven_zip_listing_reports_encryption(listed->output);
             result.directory_encrypted = false;
-        } else if (seven_zip_error_indicates_encrypted(listed.output)) {
+        } else if (seven_zip_error_indicates_encrypted(listed->output)) {
             result.encrypted = true;
             result.directory_encrypted = true;
         }
@@ -1229,9 +1321,9 @@ public:
         }
         if (use_7z_backend()) {
             const auto result = run_7z_list_cached(archive_path, password);
-            if (result.exit_code != 0) throw seven_zip_error("listing", result);
-            auto entries = parse_7z_slt_listing(result.output);
-            if (entries.empty() && !result.output.empty()) {
+            if (result->exit_code != 0) throw seven_zip_error("listing", *result);
+            auto entries = parse_7z_slt_listing(result->output);
+            if (entries.empty() && !result->output.empty()) {
                 throw FormatError("7-Zip archive listing could not be parsed");
             }
             return entries;
@@ -1258,10 +1350,11 @@ public:
             throw std::runtime_error("7-Zip backend is required for this archive format");
         }
         if (use_7z_backend()) {
-            const auto result = run_7z({L"t", L"-y", L"-sccUTF-8",
+            const auto result = run_7z({L"t", L"-y", L"-sccUTF-8", L"-bsp1",
                                         seven_zip_password_argument(options.password),
                                         archive_path.wstring()},
-                                       true, options.operation);
+                                       true, options.operation,
+                                       ProcessProgressSpec{OperationStage::testing, 0, 100});
             if (result.exit_code != 0) throw seven_zip_error("testing", result);
         } else {
             const auto result = run_tar({L"-tf", archive_path.wstring()}, false,
@@ -1372,14 +1465,16 @@ private:
         }
 
         if (use_7z_backend()) {
-            arguments = {L"x", L"-y", L"-sccUTF-8",
+            arguments = {L"x", L"-y", L"-sccUTF-8", L"-bsp1",
                          seven_zip_password_argument(options.password),
                          L"-o" + staging.path().wstring(), archive_path.wstring()};
             if (!selection_file.empty()) {
                 arguments.push_back(L"-scsUTF-8");
                 arguments.push_back(L"@" + selection_file.wstring());
             }
-            const auto result = run_7z(arguments, true, options.operation);
+            const auto result = run_7z(
+                arguments, true, options.operation,
+                ProcessProgressSpec{OperationStage::extracting, total_bytes, 0});
             if (result.exit_code != 0) throw seven_zip_error("extracting", result);
         } else {
             arguments = {L"-xf", archive_path.wstring(), L"-C", staging.path().wstring()};
@@ -1450,11 +1545,21 @@ const std::array<const SystemArchiveProvider*, 5> kProviders{
 
 }  // namespace
 
-const ArchiveProvider* system_archive_provider_for_path(const std::filesystem::path& path) {
+const ArchiveProvider* system_archive_provider_for_contents(
+    const std::filesystem::path& path) {
 #ifdef _WIN32
     for (const auto* provider : kProviders) {
         if (provider->matches_signature(path)) return provider;
     }
+#else
+    (void)path;
+#endif
+    return nullptr;
+}
+
+const ArchiveProvider* system_archive_provider_for_extension(
+    const std::filesystem::path& path) {
+#ifdef _WIN32
     for (const auto* provider : kProviders) {
         if (provider->matches_path(path)) return provider;
     }
@@ -1463,5 +1568,6 @@ const ArchiveProvider* system_archive_provider_for_path(const std::filesystem::p
 #endif
     return nullptr;
 }
+
 
 }  // namespace axiom

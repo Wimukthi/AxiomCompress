@@ -9,6 +9,7 @@
 #include <array>
 #include <cstdint>
 #include <filesystem>
+#include <fstream>
 #include <memory>
 #include <optional>
 #include <string>
@@ -120,6 +121,12 @@ void scan_input(const std::filesystem::path& input, std::vector<ScanItem>& items
 void scan_input_at(const ArchiveInput& input, std::vector<ScanItem>& items,
                    const std::shared_ptr<OperationControl>& operation);
 std::uint64_t scanned_file_bytes(const std::vector<ScanItem>& items);
+bool open_input_with_retry(std::ifstream& input,
+                           const std::filesystem::path& path,
+                           unsigned retries,
+                           const std::shared_ptr<OperationControl>& operation);
+void report_skipped_input(const ScanItem& item,
+                          const std::shared_ptr<OperationControl>& operation);
 
 // ---- operation reporting -------------------------------------------------------
 
@@ -129,7 +136,9 @@ void report_operation(const std::shared_ptr<OperationControl>& operation,
                       std::uint64_t total_bytes,
                       std::uint64_t completed_items,
                       std::uint64_t total_items,
-                      std::string current_path = {});
+                      std::string current_path = {},
+                      std::uint64_t current_file_completed_bytes = 0,
+                      std::uint64_t current_file_total_bytes = 0);
 void operation_checkpoint(const std::shared_ptr<OperationControl>& operation);
 
 // ---- archive path safety -------------------------------------------------------
@@ -150,12 +159,14 @@ void reject_symlinked_ancestor(const std::filesystem::path& dest_norm,
 std::int64_t to_unix_seconds(std::filesystem::file_time_type stamp);
 std::filesystem::file_time_type from_unix_seconds(std::int64_t seconds);
 
-// Atomically replace `destination` with `temporary` (rename, with a
-// remove+rename fallback for filesystems that refuse to clobber).
+// Atomically replace `destination` with a completed sibling temporary without
+// deleting the valid destination first.
 void replace_archive_file(const std::filesystem::path& temporary,
                           const std::filesystem::path& destination);
 
 // Offset/size of the archive embedded in an Axiom SFX executable, if any.
+std::optional<std::pair<std::uint64_t, std::uint64_t>> sfx_embedded_payload_range(
+    const std::filesystem::path& path);
 std::optional<std::pair<std::uint64_t, std::uint64_t>> sfx_embedded_archive_range(
     const std::filesystem::path& path);
 

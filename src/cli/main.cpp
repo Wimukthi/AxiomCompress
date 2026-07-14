@@ -2,17 +2,24 @@
 #include "axiom/axiom.hpp"
 #include "axiom/version.hpp"
 #include "core/cpu.hpp"
+#include "core/path_text.hpp"
+#include "core/windows_time.hpp"
 
 #include <array>
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cstdio>
 #include <ctime>
 #include <fstream>
 #include <exception>
 #include <filesystem>
+#include <iomanip>
 #include <iostream>
+#include <memory>
+#include <mutex>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -35,6 +42,7 @@ namespace {
 
 namespace fs = std::filesystem;
 fs::path executable_path;
+bool interactive_command_active = false;
 
 void print_usage() {
     std::cerr <<
@@ -128,6 +136,286 @@ constexpr const char* kColorReset = "\x1b[0m";
 constexpr const char* kColorMuted = "\x1b[90m";
 constexpr const char* kColorBright = "\x1b[97;1m";
 constexpr const char* kColorAmber = "\x1b[38;2;255;191;0m";
+constexpr const char* kColorGreen = "\x1b[32;1m";
+constexpr const char* kColorRed = "\x1b[31;1m";
+
+const char* stage_name(axiom::OperationStage stage) {
+    switch (stage) {
+        case axiom::OperationStage::scanning: return "Scanning";
+        case axiom::OperationStage::estimating: return "Estimating";
+        case axiom::OperationStage::reading: return "Reading";
+        case axiom::OperationStage::compressing: return "Compressing";
+        case axiom::OperationStage::writing: return "Writing";
+        case axiom::OperationStage::testing: return "Testing";
+        case axiom::OperationStage::extracting: return "Extracting";
+        case axiom::OperationStage::transferring: return "Transferring";
+        case axiom::OperationStage::finalizing: return "Finalizing";
+    }
+    return "Working";
+}
+
+std::string format_bytes_per_second(double bytes_per_second) {
+    if (bytes_per_second <= 0.0) return "-";
+    constexpr std::array<const char*, 5> units{"B/s", "KiB/s", "MiB/s", "GiB/s", "TiB/s"};
+    std::size_t unit = 0;
+    while (bytes_per_second >= 1024.0 && unit + 1 < units.size()) {
+        bytes_per_second /= 1024.0;
+        ++unit;
+    }
+    std::ostringstream out;
+    out << std::fixed << std::setprecision(bytes_per_second < 10.0 && unit > 0 ? 1 : 0)
+        << bytes_per_second << ' ' << units[unit];
+    return out.str();
+}
+
+std::string format_bytes(std::uint64_t bytes) {
+    double value = static_cast<double>(bytes);
+    constexpr std::array<const char*, 5> units{"B", "KiB", "MiB", "GiB", "TiB"};
+    std::size_t unit = 0;
+    while (value >= 1024.0 && unit + 1 < units.size()) {
+        value /= 1024.0;
+        ++unit;
+    }
+    std::ostringstream out;
+    out << std::fixed << std::setprecision(value < 10.0 && unit > 0 ? 1 : 0)
+        << value << ' ' << units[unit];
+    return out.str();
+}
+
+int terminal_columns() {
+#ifdef _WIN32
+    HANDLE output = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (output != INVALID_HANDLE_VALUE && output != nullptr) {
+        CONSOLE_SCREEN_BUFFER_INFO info{};
+        if (GetConsoleScreenBufferInfo(output, &info)) {
+            return std::max<int>(40, info.srWindow.Right - info.srWindow.Left + 1);
+        }
+    }
+#endif
+    return 100;
+}
+
+std::string shorten_middle(std::string text, std::size_t maximum) {
+    if (text.size() <= maximum) return text;
+    if (maximum <= 3) return text.substr(0, maximum);
+    const std::size_t head = (maximum - 3) / 2;
+    const std::size_t tail = maximum - 3 - head;
+    return text.substr(0, head) + "..." + text.substr(text.size() - tail);
+}
+
+class TerminalProgressDisplay {
+public:
+    explicit TerminalProgressDisplay(std::string action)
+        : action_(std::move(action)),
+          started_(std::chrono::steady_clock::now()),
+          last_draw_(started_) {}
+
+    void start() {
+        std::lock_guard lock(mutex_);
+        draw_line_locked("Starting " + action_ + "...");
+    }
+
+    void report(const axiom::OperationProgress& progress) {
+        std::lock_guard lock(mutex_);
+        latest_ = progress;
+        const auto now = std::chrono::steady_clock::now();
+        const bool finished = progress.total_bytes > 0 &&
+                              progress.completed_bytes >= progress.total_bytes;
+        const bool item_finished = progress.total_items > 0 &&
+                                   progress.completed_items >= progress.total_items;
+        if (!finished && !item_finished &&
+            now - last_draw_ < std::chrono::milliseconds(80)) {
+            return;
+        }
+        last_draw_ = now;
+        draw_line_locked(render(progress, now));
+    }
+
+    void finish(bool ok) {
+        std::lock_guard lock(mutex_);
+        if (finished_) return;
+        finished_ = true;
+        const auto now = std::chrono::steady_clock::now();
+        const double seconds =
+            std::chrono::duration<double>(now - started_).count();
+        std::ostringstream line;
+        line << (ok ? color(kColorGreen) : color(kColorRed))
+             << (ok ? "Done" : "Stopped") << color(kColorReset)
+             << color(kColorMuted) << "  " << action_ << " in "
+             << std::fixed << std::setprecision(seconds < 10.0 ? 1 : 0)
+             << seconds << 's' << color(kColorReset);
+        draw_line_locked(line.str());
+        std::cout << '\n' << std::flush;
+        line_width_ = 0;
+    }
+
+private:
+    std::string render(const axiom::OperationProgress& progress,
+                       std::chrono::steady_clock::time_point now) const {
+        const bool has_byte_total = progress.total_bytes > 0;
+        const bool has_item_total = progress.total_items > 0;
+        double fraction = 0.0;
+        if (has_byte_total) {
+            fraction = std::min(1.0, static_cast<double>(progress.completed_bytes) /
+                                     static_cast<double>(progress.total_bytes));
+        } else if (has_item_total) {
+            fraction = std::min(1.0, static_cast<double>(progress.completed_items) /
+                                     static_cast<double>(progress.total_items));
+        }
+
+        constexpr int bar_width = 24;
+        const int filled = static_cast<int>(fraction * bar_width + 0.5);
+        std::string bar;
+        bar.reserve(bar_width);
+        for (int index = 0; index < bar_width; ++index) {
+            bar.push_back(index < filled ? '#' : '-');
+        }
+
+        std::ostringstream line;
+        line << color(kColorAmber) << stage_name(progress.stage) << color(kColorReset)
+             << " [" << bar << "] ";
+        if (has_byte_total || has_item_total) {
+            line << std::setw(5) << std::fixed << std::setprecision(1)
+                 << (fraction * 100.0) << "%  ";
+        } else {
+            line << "      ";
+        }
+
+        if (has_byte_total) {
+            line << format_bytes(progress.completed_bytes) << " / "
+                 << format_bytes(progress.total_bytes);
+            const double seconds = std::chrono::duration<double>(now - started_).count();
+            if (seconds > 0.15 && progress.completed_bytes > 0) {
+                line << "  " << format_bytes_per_second(
+                    static_cast<double>(progress.completed_bytes) / seconds);
+            }
+        } else if (progress.completed_bytes > 0) {
+            line << format_bytes(progress.completed_bytes);
+        }
+
+        if (has_item_total) {
+            if (has_byte_total || progress.completed_bytes > 0) line << "  ";
+            line << progress.completed_items << '/' << progress.total_items << " items";
+        } else if (progress.completed_items > 0) {
+            if (has_byte_total || progress.completed_bytes > 0) line << "  ";
+            line << progress.completed_items << " items";
+        }
+
+        if (progress.current_file_total_bytes > 0) {
+            const double file_fraction = std::min(
+                1.0, static_cast<double>(progress.current_file_completed_bytes) /
+                         static_cast<double>(progress.current_file_total_bytes));
+            line << color(kColorMuted) << "  file " << std::fixed << std::setprecision(1)
+                 << (file_fraction * 100.0) << "% "
+                 << format_bytes(progress.current_file_completed_bytes) << " / "
+                 << format_bytes(progress.current_file_total_bytes) << color(kColorReset);
+        }
+
+        if (!progress.current_path.empty()) {
+            std::string current = progress.current_path;
+            std::replace(current.begin(), current.end(), '\\', '/');
+            line << color(kColorMuted) << "  " << shorten_middle(current, 36)
+                 << color(kColorReset);
+        }
+        return line.str();
+    }
+
+    void draw_line_locked(const std::string& line) {
+        std::string visible = line;
+        const int columns = terminal_columns();
+        const std::size_t maximum = columns > 4 ? static_cast<std::size_t>(columns - 1) : 79;
+        if (visible.size() > maximum) visible = shorten_middle(visible, maximum);
+        std::cout << '\r' << visible;
+        const std::size_t clear = line_width_ > visible.size()
+            ? line_width_ - visible.size()
+            : 0;
+        if (clear > 0) {
+            std::cout << std::string(clear, ' ');
+        }
+        std::cout << std::flush;
+        line_width_ = visible.size();
+    }
+
+    std::mutex mutex_;
+    std::string action_;
+    std::chrono::steady_clock::time_point started_;
+    std::chrono::steady_clock::time_point last_draw_;
+    axiom::OperationProgress latest_;
+    std::size_t line_width_ = 0;
+    bool finished_ = false;
+};
+
+class ScopedInteractiveProgress {
+public:
+    explicit ScopedInteractiveProgress(std::string action) {
+        if (!interactive_command_active || !stream_is_terminal(stdout)) return;
+        display_ = std::make_shared<TerminalProgressDisplay>(std::move(action));
+        control_ = std::make_shared<axiom::OperationControl>();
+        telemetry_thread_ = std::jthread(
+            [control = control_, display = display_](std::stop_token stop) {
+                std::uint64_t sequence = 0;
+                while (!stop.stop_requested()) {
+                    if (auto progress = control->latest_progress();
+                        progress && progress->sequence != sequence) {
+                        sequence = progress->sequence;
+                        display->report(*progress);
+                    }
+                    std::this_thread::sleep_for(std::chrono::milliseconds(80));
+                }
+            }
+        );
+        display_->start();
+    }
+
+    ~ScopedInteractiveProgress() {
+        finish(false);
+    }
+
+    ScopedInteractiveProgress(const ScopedInteractiveProgress&) = delete;
+    ScopedInteractiveProgress& operator=(const ScopedInteractiveProgress&) = delete;
+
+    std::shared_ptr<axiom::OperationControl> operation() const {
+        return control_;
+    }
+
+    bool active() const {
+        return control_ != nullptr;
+    }
+
+    void complete() {
+        finish(true);
+    }
+
+private:
+    void finish(bool ok) {
+        if (finished_) return;
+        finished_ = true;
+        telemetry_thread_.request_stop();
+        if (telemetry_thread_.joinable()) telemetry_thread_.join();
+        if (control_) {
+            if (auto progress = control_->latest_progress()) display_->report(*progress);
+        }
+        if (display_) {
+            display_->finish(ok);
+        }
+    }
+
+    std::shared_ptr<TerminalProgressDisplay> display_;
+    std::shared_ptr<axiom::OperationControl> control_;
+    std::jthread telemetry_thread_;
+    bool finished_ = false;
+};
+
+struct InteractiveCommandScope {
+    InteractiveCommandScope() : previous(interactive_command_active) {
+        interactive_command_active = true;
+    }
+    ~InteractiveCommandScope() {
+        interactive_command_active = previous;
+    }
+
+    bool previous = false;
+};
 
 void print_splash() {
     std::cout <<
@@ -241,7 +529,8 @@ std::array<std::uint8_t, Size> read_key(const fs::path& path) {
     if (!input || !input.read(reinterpret_cast<char*>(key.data()),
                               static_cast<std::streamsize>(key.size())) ||
         input.peek() != std::char_traits<char>::eof()) {
-        throw std::runtime_error("invalid signing key file: " + path.string());
+        throw std::runtime_error("invalid signing key file: " +
+                                 axiom::core::path_to_utf8(path));
     }
     return key;
 }
@@ -251,7 +540,8 @@ void write_key(const fs::path& path, const std::array<std::uint8_t, Size>& key) 
     std::ofstream output(path, std::ios::binary | std::ios::trunc);
     if (!output || !output.write(reinterpret_cast<const char*>(key.data()),
                                  static_cast<std::streamsize>(key.size()))) {
-        throw std::runtime_error("cannot write signing key file: " + path.string());
+        throw std::runtime_error("cannot write signing key file: " +
+                                 axiom::core::path_to_utf8(path));
     }
 }
 
@@ -366,18 +656,25 @@ bool take_decompression_flags(std::vector<std::string>& args,
 }
 
 std::string format_time(std::int64_t seconds) {
+#ifdef _WIN32
+    thread_local axiom::core::LocalTimeConverter converter;
+    SYSTEMTIME parts{};
+    if (!converter.unix_to_local(seconds, parts)) return "-";
+    char buffer[32];
+    std::snprintf(buffer, sizeof(buffer), "%04u-%02u-%02u %02u:%02u:%02u",
+                  parts.wYear, parts.wMonth, parts.wDay,
+                  parts.wHour, parts.wMinute, parts.wSecond);
+    return buffer;
+#else
     const auto time = static_cast<std::time_t>(seconds);
     std::tm parts{};
-#ifdef _WIN32
-    localtime_s(&parts, &time);
-#else
     localtime_r(&time, &parts);
-#endif
     char buffer[32];
     if (std::strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", &parts) == 0) {
         return "-";
     }
     return buffer;
+#endif
 }
 
 int run_add(std::vector<std::string> args) {
@@ -392,12 +689,16 @@ int run_add(std::vector<std::string> args) {
 
     const fs::path archive = args.front();
     std::vector<fs::path> inputs(args.begin() + 1, args.end());
+    ScopedInteractiveProgress progress(fs::exists(archive) ? "updating archive"
+                                                           : "creating archive");
+    options.operation = progress.operation();
     // `a` creates a new archive, or adds to (and updates entries in) an existing one.
     if (fs::exists(archive)) {
         axiom::add_to_archive(inputs, archive, options);
     } else {
         axiom::create_archive(inputs, archive, options);
     }
+    progress.complete();
     return 0;
 }
 
@@ -412,7 +713,11 @@ int run_update(std::vector<std::string> args, bool fresh_only) {
     }
     const fs::path archive = args.front();
     std::vector<fs::path> inputs(args.begin() + 1, args.end());
+    ScopedInteractiveProgress progress(fresh_only ? "freshening archive"
+                                                  : "updating archive");
+    options.operation = progress.operation();
     axiom::update_archive(inputs, archive, options, fresh_only);
+    progress.complete();
     return 0;
 }
 
@@ -427,7 +732,10 @@ int run_sync(std::vector<std::string> args) {
     }
     const fs::path archive = args.front();
     std::vector<fs::path> inputs(args.begin() + 1, args.end());
+    ScopedInteractiveProgress progress("synchronizing archive");
+    options.operation = progress.operation();
     axiom::sync_archive(inputs, archive, options);
+    progress.complete();
     return 0;
 }
 
@@ -446,7 +754,11 @@ int run_comment(std::vector<std::string> args) {
         }
         return 0;
     }
-    axiom::set_archive_comment(archive, args[1]);
+    axiom::CompressionOptions options;
+    ScopedInteractiveProgress progress("updating archive comment");
+    options.operation = progress.operation();
+    axiom::set_archive_comment(archive, args[1], options);
+    progress.complete();
     return 0;
 }
 
@@ -455,7 +767,11 @@ int run_lock(std::vector<std::string> args) {
         print_usage();
         return 2;
     }
-    axiom::lock_archive(args.front());
+    axiom::CompressionOptions options;
+    ScopedInteractiveProgress progress("locking archive");
+    options.operation = progress.operation();
+    axiom::lock_archive(args.front(), options);
+    progress.complete();
     return 0;
 }
 
@@ -470,7 +786,10 @@ int run_delete(std::vector<std::string> args) {
     }
     const fs::path archive = args.front();
     const std::vector<std::string> paths(args.begin() + 1, args.end());
+    ScopedInteractiveProgress progress("deleting archive entries");
+    options.operation = progress.operation();
     axiom::delete_from_archive(archive, paths, options);
+    progress.complete();
     return 0;
 }
 
@@ -483,7 +802,10 @@ int run_repack(std::vector<std::string> args) {
         print_usage();
         return 2;
     }
+    ScopedInteractiveProgress progress("repacking archive");
+    options.operation = progress.operation();
     axiom::repack_archive(args.front(), options);
+    progress.complete();
     return 0;
 }
 
@@ -537,9 +859,13 @@ int run_extract(std::vector<std::string> args) {
     extract.thread_count = decompression.thread_count;
     const auto* provider = axiom::archive_provider_for_path(archive);
     if (provider == nullptr) {
-        throw std::runtime_error("unsupported archive format: " + archive.string());
+        throw std::runtime_error("unsupported archive format: " +
+                                 axiom::core::path_to_utf8(archive));
     }
+    ScopedInteractiveProgress progress("extracting archive");
+    extract.operation = progress.operation();
     provider->extract_all(archive, dest, extract);
+    progress.complete();
     return 0;
 }
 
@@ -567,7 +893,8 @@ int run_list(const std::vector<std::string>& args) {
     const fs::path archive = positionals[0];
     const auto* provider = axiom::archive_provider_for_path(archive);
     if (provider == nullptr) {
-        throw std::runtime_error("unsupported archive format: " + archive.string());
+        throw std::runtime_error("unsupported archive format: " +
+                                 axiom::core::path_to_utf8(archive));
     }
 
     const axiom::ArchiveCapabilities capabilities = provider->capabilities(archive, password);
@@ -615,9 +942,13 @@ int run_test(std::vector<std::string> args) {
     const fs::path archive = args[0];
     const auto* provider = axiom::archive_provider_for_path(archive);
     if (provider == nullptr) {
-        throw std::runtime_error("unsupported archive format: " + archive.string());
+        throw std::runtime_error("unsupported archive format: " +
+                                 axiom::core::path_to_utf8(archive));
     }
+    ScopedInteractiveProgress progress("testing archive");
+    options.operation = progress.operation();
     provider->test(archive, options);
+    progress.complete();
     std::cout << "archive is intact\n";
     return 0;
 }
@@ -629,7 +960,9 @@ int run_recovery(const std::vector<std::string>& args) {
     }
     if (args.size() == 2) {
         const auto percent = static_cast<unsigned>(parse_size(args[1]));
-        axiom::set_archive_recovery(args[0], percent);
+        ScopedInteractiveProgress progress("updating recovery record");
+        axiom::set_archive_recovery(args[0], percent, progress.operation());
+        progress.complete();
     }
     const auto info = axiom::archive_recovery_info(args[0]);
     if (!info.present) {
@@ -647,10 +980,13 @@ int run_repair(const std::vector<std::string>& args) {
         print_usage();
         return 2;
     }
-    if (!axiom::repair_archive(args[0])) {
+    ScopedInteractiveProgress progress("repairing archive");
+    if (!axiom::repair_archive(args[0], progress.operation())) {
+        progress.complete();
         std::cout << "archive has no recovery record\n";
         return 3;
     }
+    progress.complete();
     std::cout << "archive repaired and verified recovery data was rebuilt\n";
     return 0;
 }
@@ -662,8 +998,11 @@ int run_split(const std::vector<std::string>& args) {
     }
     const auto recovery_count = args.size() == 3
         ? static_cast<unsigned>(parse_size(args[2])) : 0;
+    ScopedInteractiveProgress progress("creating archive volumes");
     const auto info = axiom::create_archive_volumes(args[0], parse_size(args[1]),
-                                                     recovery_count);
+                                                     recovery_count,
+                                                     progress.operation());
+    progress.complete();
     std::cout << info.data_volumes << " data volume(s), " << info.recovery_volumes
               << " recovery volume(s) created\n";
     return 0;
@@ -674,7 +1013,9 @@ int run_join(const std::vector<std::string>& args) {
         print_usage();
         return 2;
     }
-    axiom::join_archive_volumes(args[0], args[1]);
+    ScopedInteractiveProgress progress("joining archive volumes");
+    axiom::join_archive_volumes(args[0], args[1], progress.operation());
+    progress.complete();
     std::cout << "archive volumes joined\n";
     return 0;
 }
@@ -701,7 +1042,10 @@ int run_sign(std::vector<std::string> args) {
     axiom::ArchiveSigningKey key;
     key.secret_key = read_key<64>(args[1]);
     std::copy_n(key.secret_key.begin() + 32, key.public_key.size(), key.public_key.begin());
+    ScopedInteractiveProgress progress("signing archive");
+    options.operation = progress.operation();
     axiom::sign_archive(args[0], key, options);
+    progress.complete();
     std::fill(key.secret_key.begin(), key.secret_key.end(), std::uint8_t{0});
     std::cout << "archive signed\n";
     return 0;
@@ -741,7 +1085,9 @@ int run_sfx(const std::vector<std::string>& args) {
     const fs::path stub = args.size() == 3
         ? fs::path(args[2])
         : executable_path.parent_path() / "Axiom.exe";
-    axiom::create_sfx_archive(args[0], stub, args[1]);
+    ScopedInteractiveProgress progress("creating self-extractor");
+    axiom::create_sfx_archive(args[0], stub, args[1], progress.operation());
+    progress.complete();
     std::cout << "self-extracting archive created\n";
     return 0;
 }
@@ -755,7 +1101,23 @@ int run_compress(std::vector<std::string> args) {
         print_usage();
         return 2;
     }
+    ScopedInteractiveProgress progress("compressing stream");
+    if (auto operation = progress.operation()) {
+        options.operation = operation;
+        std::error_code size_error;
+        const std::uint64_t total = fs::file_size(args[0], size_error);
+        const std::string path = args[0];
+        if (!size_error) {
+            operation->report({axiom::OperationStage::reading, 0, total, 0, 1, path,
+                               0, total});
+            options.encoded_bytes_progress = [operation, total, path](std::uint64_t done) {
+                operation->report({axiom::OperationStage::compressing, done, total, 0, 1, path,
+                                   done, total});
+            };
+        }
+    }
     axiom::compress_file(args[0], args[1], options);
+    progress.complete();
     return 0;
 }
 
@@ -768,7 +1130,24 @@ int run_decompress(std::vector<std::string> args) {
         print_usage();
         return 2;
     }
+    ScopedInteractiveProgress progress("decompressing stream");
+    if (auto operation = progress.operation()) {
+        options.operation = operation;
+        std::error_code size_error;
+        const std::uint64_t total = fs::file_size(args[0], size_error);
+        const std::string path = args[0];
+        if (!size_error) {
+            operation->report({axiom::OperationStage::reading, 0, total, 0, 1, path,
+                               0, total});
+        }
+        options.decoded_bytes_progress = [operation, path](std::uint64_t done,
+                                                            std::uint64_t total_output) {
+            operation->report({axiom::OperationStage::extracting, done, total_output, 0, 1,
+                               path, done, total_output});
+        };
+    }
     axiom::decompress_file(args[0], args[1], options);
+    progress.complete();
     return 0;
 }
 
@@ -880,7 +1259,7 @@ int run_interactive_shell() {
                 continue;
             }
             if (command == "pwd") {
-                std::cout << fs::current_path().string() << '\n';
+                std::cout << axiom::core::path_to_utf8(fs::current_path()) << '\n';
                 continue;
             }
             if (command == "cd") {
@@ -892,6 +1271,7 @@ int run_interactive_shell() {
                 continue;
             }
 
+            InteractiveCommandScope progress_scope;
             const int exit_code = run_command(command, std::move(tokens));
             if (exit_code != 0) {
                 std::cout << "command failed with exit code " << exit_code << '\n';

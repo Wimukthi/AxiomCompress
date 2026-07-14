@@ -7,6 +7,7 @@
 #include "core/checksum.hpp"
 #include "core/cpu.hpp"
 #include "core/hash.hpp"
+#include "core/file_replace.hpp"
 #include "core/reed_solomon.hpp"
 #include "entropy/huffman.hpp"
 #include "entropy/range.hpp"
@@ -37,12 +38,21 @@
 #include <optional>
 #include <random>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace {
 
+#if defined(_WIN32)
+std::optional<std::filesystem::path> bundled_7z_for_tests();
+#endif
+
 std::vector<std::uint8_t> bytes_from_string(const std::string& text) {
     return {text.begin(), text.end()};
+}
+
+std::string utf8_bytes(std::u8string_view text) {
+    return {reinterpret_cast<const char*>(text.data()), text.size()};
 }
 
 void expect_roundtrip(const std::vector<std::uint8_t>& input) {
@@ -527,6 +537,7 @@ void test_archive_provider_layer() {
 
     const auto* provider = axiom::archive_provider_for_path(archive);
     AXIOM_CHECK(provider != nullptr);
+    AXIOM_CHECK(axiom::archive_provider_for_contents(archive) == provider);
     AXIOM_CHECK(provider->info().native);
     AXIOM_CHECK(axiom::is_supported_archive(archive));
     AXIOM_CHECK(axiom::is_native_archive(archive));
@@ -552,6 +563,7 @@ void test_archive_provider_layer() {
         const auto missing_axar = root / "missing" / "new.axar";
         const auto* missing_provider = axiom::archive_provider_for_path(missing_axar);
         AXIOM_CHECK(missing_provider != nullptr);
+        AXIOM_CHECK(axiom::archive_provider_for_contents(missing_axar) == nullptr);
         const auto missing_capabilities = missing_provider->capabilities(missing_axar);
         AXIOM_CHECK(missing_capabilities.create);
         AXIOM_CHECK(missing_capabilities.update);
@@ -565,6 +577,21 @@ void test_archive_provider_layer() {
         const auto zip_capabilities = zip_provider->capabilities(missing_zip);
         AXIOM_CHECK(zip_capabilities.create);
         AXIOM_CHECK(!zip_capabilities.encrypted);
+    }
+
+    // Content detection is extension-independent and never promotes a filename
+    // alone. The GUI tree uses this distinction for its expandable archive nodes.
+    {
+        const auto renamed = root / "renamed-archive.data";
+        fs::copy_file(archive, renamed);
+        const auto* renamed_provider = axiom::archive_provider_for_contents(renamed);
+        AXIOM_CHECK(renamed_provider != nullptr);
+        AXIOM_CHECK(renamed_provider->info().format == axiom::ArchiveFormat::axar);
+
+        const auto fake_zip = root / "ordinary-file.zip";
+        write_all(fake_zip, bytes_from_string("not an archive"));
+        AXIOM_CHECK(axiom::archive_provider_for_contents(fake_zip) == nullptr);
+        AXIOM_CHECK(axiom::archive_provider_for_path(fake_zip) != nullptr);
     }
 
     const auto entries = provider->list(archive);
@@ -625,7 +652,7 @@ void test_zip_provider_layer() {
     AXIOM_CHECK(capabilities.update);
     AXIOM_CHECK(capabilities.delete_entries);
     AXIOM_CHECK(capabilities.move_entries);
-    AXIOM_CHECK(!capabilities.sfx);
+    AXIOM_CHECK(capabilities.sfx);
 
     const auto entries = provider->list(archive);
     AXIOM_CHECK(entries.size() == 2);
@@ -661,12 +688,95 @@ void test_zip_provider_layer() {
     write_all(source / "nested" / "beta.txt", bytes_from_string("beta"));
     const auto writable = root / "writable.zip";
     provider->create({source}, writable, {});
+    const auto writable_capabilities = provider->capabilities(writable);
+    AXIOM_CHECK(writable_capabilities.can_create_volumes);
+    AXIOM_CHECK(!writable_capabilities.is_multi_volume);
     const auto created_out = root / "created";
     provider->extract_all(writable, created_out, {});
     AXIOM_CHECK(read_all(created_out / "source" / "alpha.txt") ==
                 bytes_from_string("alpha v1"));
     AXIOM_CHECK(read_all(created_out / "source" / "nested" / "beta.txt") ==
                 bytes_from_string("beta"));
+
+#if defined(_WIN32)
+    const auto split_zip = root / "split.zip";
+    fs::copy_file(writable, split_zip);
+    axiom::create_zip_volumes(split_zip, 200);
+    AXIOM_CHECK(fs::exists(root / "split.z01"));
+    AXIOM_CHECK(axiom::archive_provider_for_path(root / "split.z01") == provider);
+    AXIOM_CHECK(provider->list(root / "split.z01").size() >= 2);
+    const auto split_capabilities = provider->capabilities(split_zip);
+    AXIOM_CHECK(split_capabilities.list);
+    AXIOM_CHECK(split_capabilities.extract);
+    AXIOM_CHECK(split_capabilities.is_multi_volume);
+    AXIOM_CHECK(!split_capabilities.can_create_volumes);
+    AXIOM_CHECK(!split_capabilities.update);
+    AXIOM_CHECK(!split_capabilities.delete_entries);
+
+    // Cancellation must leave every member of an existing set byte-identical.
+    const auto z01_before = read_all(root / "split.z01");
+    const auto final_before = read_all(split_zip);
+    auto cancelled_split = std::make_shared<axiom::OperationControl>();
+    cancelled_split->request_cancel();
+    expect_throws([&] {
+        axiom::create_zip_volumes(split_zip, 160, cancelled_split);
+    });
+    AXIOM_CHECK(read_all(root / "split.z01") == z01_before);
+    AXIOM_CHECK(read_all(split_zip) == final_before);
+
+    // Cancellation also applies while the direct split reader is moving
+    // between disks; no complete temporary ZIP is created.
+    axiom::DecompressionOptions cancelled_test_options;
+    cancelled_test_options.operation = std::make_shared<axiom::OperationControl>();
+    cancelled_test_options.operation->request_cancel();
+    expect_throws([&] { provider->test(split_zip, cancelled_test_options); });
+
+    // Even an incomplete set must remain identified as multi-volume/read-only;
+    // a failed direct open must not fall back to editable ZIP capabilities.
+    fs::remove(root / "split.z01");
+    const auto incomplete_capabilities = provider->capabilities(split_zip);
+    AXIOM_CHECK(incomplete_capabilities.is_multi_volume);
+    AXIOM_CHECK(!incomplete_capabilities.can_create_volumes);
+    AXIOM_CHECK(!incomplete_capabilities.update);
+    write_all(root / "split.z01", z01_before);
+
+    // Opening a numbered member without the final .zip must fail clearly and
+    // must not advertise ordinary editable-ZIP capabilities.
+    const auto saved_final = root / "split-final.saved";
+    fs::rename(split_zip, saved_final);
+    const auto missing_final_capabilities = provider->capabilities(root / "split.z01");
+    AXIOM_CHECK(missing_final_capabilities.is_multi_volume);
+    AXIOM_CHECK(!missing_final_capabilities.can_create_volumes);
+    AXIOM_CHECK(!missing_final_capabilities.update);
+    expect_throws([&] { (void)provider->list(root / "split.z01"); });
+    fs::rename(saved_final, split_zip);
+
+    // Re-splitting an existing standard set exercises the staged multi-file
+    // swap; the previous set remains the source until the new set is complete.
+    axiom::create_zip_volumes(split_zip, 240);
+    AXIOM_CHECK(fs::exists(root / "split.z01"));
+    AXIOM_CHECK(provider->capabilities(split_zip).is_multi_volume);
+    const auto split_out = root / "split-out";
+    provider->test(split_zip);
+    provider->extract_all(split_zip, split_out, {});
+    AXIOM_CHECK(read_all(split_out / "source" / "alpha.txt") ==
+                bytes_from_string("alpha v1"));
+    AXIOM_CHECK(read_all(split_out / "source" / "nested" / "beta.txt") ==
+                bytes_from_string("beta"));
+    if (const auto seven_zip = bundled_7z_for_tests()) {
+        const auto interoperability_out = root / "split-7z-out";
+        fs::create_directories(interoperability_out);
+        const std::wstring command = L"call \"" + seven_zip->wstring() +
+            L"\" x -y -o\"" + interoperability_out.wstring() + L"\" \"" +
+            split_zip.wstring() + L"\" >nul 2>nul";
+        AXIOM_CHECK(_wsystem(command.c_str()) == 0);
+        AXIOM_CHECK(read_all(interoperability_out / "source" / "alpha.txt") ==
+                    bytes_from_string("alpha v1"));
+        AXIOM_CHECK(read_all(interoperability_out / "source" / "nested" / "beta.txt") ==
+                    bytes_from_string("beta"));
+    }
+#endif
+
 
     const auto extra = root / "extra.txt";
     write_all(extra, bytes_from_string("extra payload"));
@@ -704,6 +814,89 @@ void test_zip_provider_layer() {
     std::error_code ec;
     fs::remove_all(root, ec);
 }
+
+void test_safe_file_replacement() {
+    const auto root = make_temp_dir();
+    const auto destination = root / "destination.bin";
+    const auto replacement = root / "replacement.bin";
+    write_all(destination, bytes_from_string("old bytes"));
+    write_all(replacement, bytes_from_string("new bytes"));
+    axiom::core::replace_file(replacement, destination, "test file");
+    AXIOM_CHECK(read_all(destination) == bytes_from_string("new bytes"));
+    AXIOM_CHECK(!fs::exists(replacement));
+
+#if defined(_WIN32)
+    write_all(destination, bytes_from_string("preserve me"));
+    write_all(replacement, bytes_from_string("must not replace"));
+    HANDLE locked = CreateFileW(destination.c_str(), GENERIC_READ, FILE_SHARE_READ,
+                                nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    AXIOM_CHECK(locked != INVALID_HANDLE_VALUE);
+    expect_throws([&] {
+        axiom::core::replace_file(replacement, destination, "locked test file");
+    });
+    AXIOM_CHECK(read_all(destination) == bytes_from_string("preserve me"));
+    AXIOM_CHECK(read_all(replacement) == bytes_from_string("must not replace"));
+    CloseHandle(locked);
+#endif
+
+    std::error_code ec;
+    fs::remove_all(root, ec);
+}
+
+#if defined(_WIN32)
+void test_skip_unreadable_archive_inputs() {
+    const auto root = make_temp_dir();
+    const auto source = root / "source";
+    fs::create_directories(source);
+    write_all(source / "readable.txt", bytes_from_string("keep this file"));
+    const auto blocked = source / "blocked.exe";
+    write_all(blocked, bytes_from_string("temporarily unavailable"));
+
+    HANDLE lock = CreateFileW(blocked.c_str(), GENERIC_READ, 0, nullptr,
+                              OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    AXIOM_CHECK(lock != INVALID_HANDLE_VALUE);
+
+    axiom::CompressionOptions strict;
+    strict.input_open_retries = 0;
+    expect_throws([&] { axiom::create_archive({source}, root / "strict.axar", strict); });
+
+    axiom::CompressionOptions tolerant;
+    tolerant.skip_unreadable_files = true;
+    tolerant.input_open_retries = 0;
+    tolerant.operation = std::make_shared<axiom::OperationControl>();
+    const auto axar = root / "tolerant.axar";
+    axiom::create_archive({source}, axar, tolerant);
+    const auto axar_entries = axiom::list_archive(axar);
+    AXIOM_CHECK(std::any_of(axar_entries.begin(), axar_entries.end(), [](const auto& entry) {
+        return entry.path == "source/readable.txt";
+    }));
+    AXIOM_CHECK(std::none_of(axar_entries.begin(), axar_entries.end(), [](const auto& entry) {
+        return entry.path == "source/blocked.exe";
+    }));
+    const auto axar_warnings = tolerant.operation->warnings();
+    AXIOM_CHECK(axar_warnings.size() == 1);
+    AXIOM_CHECK(axar_warnings.front().path == "source/blocked.exe");
+
+    const auto zip = root / "tolerant.zip";
+    const auto* zip_provider = axiom::archive_provider_for_path(zip);
+    AXIOM_CHECK(zip_provider != nullptr);
+    auto zip_options = tolerant;
+    zip_options.operation = std::make_shared<axiom::OperationControl>();
+    zip_provider->create({source}, zip, zip_options);
+    const auto zip_entries = zip_provider->list(zip);
+    AXIOM_CHECK(std::any_of(zip_entries.begin(), zip_entries.end(), [](const auto& entry) {
+        return entry.path == "source/readable.txt";
+    }));
+    AXIOM_CHECK(std::none_of(zip_entries.begin(), zip_entries.end(), [](const auto& entry) {
+        return entry.path == "source/blocked.exe";
+    }));
+    AXIOM_CHECK(zip_options.operation->warnings().size() == 1);
+
+    CloseHandle(lock);
+    std::error_code ec;
+    fs::remove_all(root, ec);
+}
+#endif
 
 #if defined(_WIN32)
 bool windows_tar_available() {
@@ -750,6 +943,54 @@ void test_unicode_path_archive_probe() {
         threw = true;
     }
     AXIOM_CHECK(!threw);
+
+    std::error_code ec;
+    fs::remove_all(root, ec);
+}
+
+void test_unicode_archive_entry_names() {
+    const auto root = make_temp_dir();
+    const auto source = root / L"source";
+    const auto unicode_directory = source / L"\u0dc3\u0dd2\u0d82\u0dc4\u0dbd";
+    const auto unicode_file = unicode_directory / L"\u6587\u4ef6-\U0001f680.txt";
+    fs::create_directories(unicode_directory);
+    write_all(unicode_file, bytes_from_string("unicode archive entry"));
+
+    const std::string expected = utf8_bytes(
+        u8"source/\u0dc3\u0dd2\u0d82\u0dc4\u0dbd/\u6587\u4ef6-\U0001f680.txt");
+    const auto contains_expected = [&expected](const std::vector<axiom::ArchiveEntry>& entries) {
+        return std::any_of(entries.begin(), entries.end(), [&](const auto& entry) {
+            return entry.path == expected;
+        });
+    };
+
+    const auto axar = root / "unicode.axar";
+    axiom::create_archive({source}, axar, {});
+    AXIOM_CHECK(contains_expected(axiom::list_archive(axar)));
+    const auto axar_output = root / "axar-output";
+    axiom::extract_archive(axar, axar_output, {});
+    AXIOM_CHECK(read_all(axar_output / L"source" / L"\u0dc3\u0dd2\u0d82\u0dc4\u0dbd" /
+                         L"\u6587\u4ef6-\U0001f680.txt") ==
+                bytes_from_string("unicode archive entry"));
+
+    const auto zip = root / "unicode.zip";
+    const auto* zip_provider = axiom::archive_provider_for_path(zip);
+    AXIOM_CHECK(zip_provider != nullptr);
+    AXIOM_CHECK(zip_provider->info().format == axiom::ArchiveFormat::zip);
+    zip_provider->create({source}, zip, {});
+    AXIOM_CHECK(contains_expected(zip_provider->list(zip)));
+    const auto zip_output = root / "zip-output";
+    zip_provider->extract_all(zip, zip_output, {});
+    AXIOM_CHECK(read_all(zip_output / L"source" / L"\u0dc3\u0dd2\u0d82\u0dc4\u0dbd" /
+                         L"\u6587\u4ef6-\U0001f680.txt") ==
+                bytes_from_string("unicode archive entry"));
+
+    // Single-file compression also reports progress using UTF-8 path text.
+    const auto single_archive = root / L"\u6587\u4ef6-\U0001f680.axc";
+    axiom::CompressionOptions options;
+    options.operation = std::make_shared<axiom::OperationControl>();
+    axiom::compress_file(unicode_file, single_archive, options);
+    AXIOM_CHECK(fs::exists(single_archive));
 
     std::error_code ec;
     fs::remove_all(root, ec);
@@ -1097,6 +1338,26 @@ void test_zip_aes256_encryption() {
                 bytes_from_string("zip aes alpha payload"));
     AXIOM_CHECK(read_all(full / "folder" / "beta.bin") ==
                 bytes_from_string("zip aes beta payload"));
+
+#if defined(_WIN32)
+    const auto split_archive = root / "encrypted-split.zip";
+    fs::copy_file(archive, split_archive);
+    axiom::create_zip_volumes(split_archive, 160);
+    AXIOM_CHECK(fs::exists(root / "encrypted-split.z01"));
+    const auto split_caps = provider->capabilities(split_archive, options.password);
+    AXIOM_CHECK(split_caps.encrypted);
+    AXIOM_CHECK(split_caps.extract);
+    AXIOM_CHECK(split_caps.is_multi_volume);
+    AXIOM_CHECK(!split_caps.can_create_volumes);
+    AXIOM_CHECK(!split_caps.update);
+    provider->test(split_archive, test_options);
+    const auto split_full = root / "split-full";
+    provider->extract_all(split_archive, split_full, extract_options);
+    AXIOM_CHECK(read_all(split_full / "folder" / "alpha.txt") ==
+                bytes_from_string("zip aes alpha payload"));
+    AXIOM_CHECK(read_all(split_full / "folder" / "beta.bin") ==
+                bytes_from_string("zip aes beta payload"));
+#endif
 
     std::error_code ec;
     fs::remove_all(root, ec);
@@ -1741,8 +2002,38 @@ void test_archive_recovery_and_volumes() {
     const auto part3 = root / "resilient.part003.axar";
     AXIOM_CHECK(axiom::archive_volume_set_info(part1).data_volumes ==
                 volume_info.data_volumes);
+    AXIOM_CHECK(axiom::is_axiom_archive_volume(part1));
+    AXIOM_CHECK(axiom::archive_volume_data_set_complete(part1));
+    AXIOM_CHECK(axiom::archive_volume_primary_path(root / "resilient.rev001") == part1);
+
+    // A complete set is a directly readable, read-only archive. Remove the
+    // original to prove list/test/extract do not fall back to or materialize it.
+    const auto original_archive_bytes = read_all(archive);
     std::error_code error;
+    AXIOM_CHECK(fs::remove(archive, error));
+    const auto* volume_provider = axiom::archive_provider_for_contents(part1);
+    AXIOM_CHECK(volume_provider != nullptr);
+    const auto capabilities = volume_provider->capabilities(part1);
+    AXIOM_CHECK(capabilities.list && capabilities.test && capabilities.extract);
+    AXIOM_CHECK(capabilities.is_multi_volume);
+    AXIOM_CHECK(!capabilities.create && !capabilities.update &&
+                !capabilities.delete_entries && !capabilities.move_entries &&
+                !capabilities.comments && !capabilities.lock &&
+                !capabilities.can_create_volumes);
+    const auto direct_entries = volume_provider->list(part1);
+    AXIOM_CHECK(direct_entries.size() >= 2);
+    volume_provider->test(part1);
+    const auto direct_output = root / "direct-volume-output";
+    volume_provider->extract_all(part1, direct_output);
+    AXIOM_CHECK(read_all(direct_output / "payload.bin") == payload);
+    AXIOM_CHECK(read_all(direct_output / "added.txt") ==
+                bytes_from_string("added after recovery repair"));
+    AXIOM_CHECK(!fs::exists(root / "resilient.axar"));
+    expect_throws([&] { axiom::set_archive_comment(part1, "read only"); });
+
     AXIOM_CHECK(fs::remove(part2, error));
+    AXIOM_CHECK(!axiom::archive_volume_data_set_complete(part1));
+    expect_throws([&] { (void)axiom::list_archive(part1); });
     auto corrupt_volume = read_all(part1);
     AXIOM_CHECK(corrupt_volume.size() > 80);
     corrupt_volume[80] ^= 0x3Cu;
@@ -1750,7 +2041,7 @@ void test_archive_recovery_and_volumes() {
 
     const auto joined = root / "joined.axar";
     axiom::join_archive_volumes(part3, joined);
-    AXIOM_CHECK(read_all(joined) == read_all(archive));
+    AXIOM_CHECK(read_all(joined) == original_archive_bytes);
     axiom::test_archive(joined);
 
     axiom::set_archive_recovery(joined, 0);
@@ -2015,6 +2306,25 @@ void test_archive_encrypted_directory() {
         expect_throws([&] { axiom::test_archive(archive, bad); });
     }
 
+    // Direct volume reads preserve sealed-directory and block encryption. The
+    // original archive is absent, so the password-protected directory and data
+    // must both be read across numbered part boundaries.
+    const auto volume_info = axiom::create_archive_volumes(archive, 300, 1);
+    AXIOM_CHECK(volume_info.data_volumes > 1);
+    const auto first_part = root / "hp.part001.axar";
+    std::error_code remove_error;
+    AXIOM_CHECK(fs::remove(archive, remove_error));
+    AXIOM_CHECK(axiom::list_archive(first_part, opt.password).size() >= 2);
+    axiom::DecompressionOptions direct_test;
+    direct_test.password = opt.password;
+    axiom::test_archive(first_part, direct_test);
+    axiom::ExtractOptions direct_extract;
+    direct_extract.password = opt.password;
+    const auto direct_dest = root / "volume-out";
+    axiom::extract_archive(first_part, direct_dest, direct_extract);
+    AXIOM_CHECK(read_all(direct_dest / "src" / "secret_name.txt") == secret);
+    expect_throws([&] { (void)axiom::list_archive(first_part, "wrong"); });
+
     std::error_code ec;
     fs::remove_all(root, ec);
 }
@@ -2054,6 +2364,37 @@ void test_archive_operation_control() {
     AXIOM_CHECK(reported_total == payload.size());
     AXIOM_CHECK(max_completed == payload.size());
     AXIOM_CHECK(saw_final);
+    const auto final_snapshot = control->latest_progress();
+    AXIOM_CHECK(final_snapshot.has_value());
+    AXIOM_CHECK(final_snapshot->sequence > 0);
+    AXIOM_CHECK(final_snapshot->completed_bytes == final_snapshot->total_bytes);
+
+    // A reader racing a writer must observe one whole telemetry sample, never
+    // fields combined from two reports. This is the contract used by the GUI,
+    // CLI, and benchmark polling displays.
+    auto telemetry = std::make_shared<axiom::OperationControl>();
+    std::atomic_bool writer_done = false;
+    std::atomic_bool incoherent = false;
+    std::jthread writer([&] {
+        for (std::uint64_t value = 1; value <= 10000; ++value) {
+            telemetry->report(axiom::OperationProgress{
+                axiom::OperationStage::compressing, value, 10000,
+                value, 10000, std::to_string(value), value, 10000});
+        }
+        writer_done.store(true, std::memory_order_release);
+    });
+    while (!writer_done.load(std::memory_order_acquire)) {
+        const auto snapshot = telemetry->latest_progress();
+        if (!snapshot) continue;
+        if (snapshot->completed_bytes != snapshot->completed_items ||
+            snapshot->completed_bytes != snapshot->current_file_completed_bytes ||
+            snapshot->current_path != std::to_string(snapshot->completed_bytes)) {
+            incoherent.store(true, std::memory_order_release);
+            break;
+        }
+    }
+    writer.join();
+    AXIOM_CHECK(!incoherent.load(std::memory_order_acquire));
 
     const auto cancelled_archive = root / "cancelled.axar";
     auto cancelled = std::make_shared<axiom::OperationControl>();
@@ -2065,6 +2406,144 @@ void test_archive_operation_control() {
 
     std::error_code ec;
     fs::remove_all(root, ec);
+}
+
+void test_compression_estimator() {
+    const auto root = make_temp_dir();
+    const auto src = root / "estimate-src";
+    fs::create_directories(src / "nested");
+    write_all(src / "repeated.txt", bytes_from_string(std::string(256 * 1024, 'A')));
+    std::vector<std::uint8_t> varied(128 * 1024);
+    for (std::size_t index = 0; index < varied.size(); ++index) {
+        varied[index] = static_cast<std::uint8_t>((index * 131u + index / 17u) & 0xffu);
+    }
+    write_all(src / "nested" / "varied.bin", varied);
+    write_all(src / "empty.dat", {});
+
+    auto control = std::make_shared<axiom::OperationControl>();
+    bool saw_scanning = false;
+    bool saw_estimating = false;
+    control->set_progress_callback([&](const axiom::OperationProgress& progress) {
+        saw_scanning = saw_scanning || progress.stage == axiom::OperationStage::scanning;
+        saw_estimating = saw_estimating || progress.stage == axiom::OperationStage::estimating;
+    });
+
+    axiom::CompressionEstimateOptions options;
+    axiom::apply_compression_level(options.compression, 3);
+    options.compression.operation = control;
+    options.sample_budget = 1u << 20;
+    options.sample_chunk_size = 64u << 10;
+    options.time_budget = std::chrono::seconds(10);
+    std::uint64_t last_snapshot_bytes = 0;
+    std::size_t snapshot_count = 0;
+    bool snapshots_monotonic = true;
+    axiom::CompressionEstimateSnapshot final_snapshot;
+    options.progress_callback = [&](const axiom::CompressionEstimateSnapshot& snapshot) {
+        snapshots_monotonic = snapshots_monotonic &&
+            snapshot.sampled_bytes >= last_snapshot_bytes;
+        last_snapshot_bytes = snapshot.sampled_bytes;
+        final_snapshot = snapshot;
+        ++snapshot_count;
+    };
+    const auto estimate = axiom::estimate_compression({src}, options);
+    AXIOM_CHECK(estimate.source_bytes == 384u * 1024u);
+    AXIOM_CHECK(estimate.sampled_bytes == estimate.source_bytes);
+    AXIOM_CHECK(estimate.file_count == 3);
+    AXIOM_CHECK(estimate.item_count >= estimate.file_count);
+    AXIOM_CHECK(estimate.estimated_archive_bytes > 0);
+    AXIOM_CHECK(estimate.estimated_low_bytes <= estimate.estimated_archive_bytes);
+    AXIOM_CHECK(estimate.estimated_high_bytes >= estimate.estimated_archive_bytes);
+    AXIOM_CHECK(estimate.estimated_ratio > 0.0);
+    AXIOM_CHECK(estimate.sample_coverage == 1.0);
+    AXIOM_CHECK(saw_scanning);
+    AXIOM_CHECK(saw_estimating);
+    AXIOM_CHECK(snapshot_count > 1);
+    AXIOM_CHECK(snapshots_monotonic);
+    AXIOM_CHECK(final_snapshot.sampled_bytes == estimate.sampled_bytes);
+    AXIOM_CHECK(final_snapshot.estimated_archive_bytes ==
+                estimate.estimated_archive_bytes);
+
+    auto actual_options = options.compression;
+    actual_options.operation.reset();
+    const auto actual_axar = root / "estimate-actual.axar";
+    axiom::create_archive({src}, actual_axar, actual_options);
+    const std::uint64_t actual_axar_size = fs::file_size(actual_axar);
+    AXIOM_CHECK(estimate.estimated_archive_bytes <= actual_axar_size * 2);
+    AXIOM_CHECK(actual_axar_size <= estimate.estimated_archive_bytes * 2);
+
+    auto repeated = options;
+    repeated.compression.operation.reset();
+    const auto second = axiom::estimate_compression({src}, repeated);
+    AXIOM_CHECK(second.estimated_archive_bytes == estimate.estimated_archive_bytes);
+    AXIOM_CHECK(second.estimated_low_bytes == estimate.estimated_low_bytes);
+    AXIOM_CHECK(second.estimated_high_bytes == estimate.estimated_high_bytes);
+
+    const auto uniform = root / "adaptive-uniform.bin";
+    write_all(uniform, std::vector<std::uint8_t>(16u << 20, 0x5a));
+    axiom::CompressionEstimateOptions adaptive;
+    axiom::apply_compression_level(adaptive.compression, 1);
+    adaptive.sample_budget = 8u << 20;
+    adaptive.sample_chunk_size = 256u << 10;
+    adaptive.time_budget = std::chrono::seconds(20);
+    const auto adaptive_estimate = axiom::estimate_compression({uniform}, adaptive);
+    AXIOM_CHECK(adaptive_estimate.source_bytes == (16u << 20));
+    AXIOM_CHECK(adaptive_estimate.sampled_bytes >= (4u << 20));
+    AXIOM_CHECK(adaptive_estimate.sampled_bytes < adaptive.sample_budget);
+    AXIOM_CHECK(adaptive_estimate.confidence == axiom::EstimateConfidence::high);
+    AXIOM_CHECK(adaptive_estimate.confidence_margin_percent <= 2.5);
+
+    const auto heterogeneous = root / "adaptive-heterogeneous.bin";
+    std::vector<std::uint8_t> mixed(16u << 20, 0x41);
+    std::uint32_t random = 0x9e3779b9u;
+    for (std::size_t index = mixed.size() / 2; index < mixed.size(); ++index) {
+        random ^= random << 13;
+        random ^= random >> 17;
+        random ^= random << 5;
+        mixed[index] = static_cast<std::uint8_t>(random);
+    }
+    write_all(heterogeneous, mixed);
+    const auto heterogeneous_estimate =
+        axiom::estimate_compression({heterogeneous}, adaptive);
+    AXIOM_CHECK(heterogeneous_estimate.sampled_bytes == adaptive.sample_budget);
+    AXIOM_CHECK(heterogeneous_estimate.confidence != axiom::EstimateConfidence::high);
+    AXIOM_CHECK(heterogeneous_estimate.confidence_margin_percent > 2.5);
+
+    auto zip = repeated;
+    zip.format = axiom::ArchiveFormat::zip;
+    zip.volume_size = 64u << 10;
+    const auto zip_estimate = axiom::estimate_compression({src}, zip);
+    AXIOM_CHECK(zip_estimate.format == axiom::ArchiveFormat::zip);
+    AXIOM_CHECK(zip_estimate.estimated_archive_bytes > 0);
+    AXIOM_CHECK(zip_estimate.volume_count > 0);
+    AXIOM_CHECK(zip_estimate.final_volume_bytes > 0);
+    const auto actual_zip = root / "estimate-actual.zip";
+    const auto* zip_provider = axiom::archive_provider_for_path(actual_zip);
+    AXIOM_CHECK(zip_provider != nullptr);
+    zip_provider->create({src}, actual_zip, actual_options);
+    const std::uint64_t actual_zip_size = fs::file_size(actual_zip);
+    AXIOM_CHECK(zip_estimate.estimated_archive_bytes <= actual_zip_size * 2);
+    AXIOM_CHECK(actual_zip_size <= zip_estimate.estimated_archive_bytes * 2);
+
+    const auto missing = axiom::estimate_compression({root / "missing"}, repeated);
+    AXIOM_CHECK(missing.source_bytes == 0);
+    AXIOM_CHECK(missing.confidence == axiom::EstimateConfidence::low);
+    AXIOM_CHECK(missing.warnings.size() == 1);
+
+    auto cancelled = repeated;
+    cancelled.compression.operation = std::make_shared<axiom::OperationControl>();
+    cancelled.compression.operation->request_cancel();
+    expect_throws([&] { (void)axiom::estimate_compression({src}, cancelled); });
+
+    auto cancelled_live = repeated;
+    cancelled_live.compression.operation = std::make_shared<axiom::OperationControl>();
+    cancelled_live.progress_callback = [operation = cancelled_live.compression.operation](
+        const axiom::CompressionEstimateSnapshot&) {
+        operation->request_cancel();
+    };
+    expect_throws([&] { (void)axiom::estimate_compression({src}, cancelled_live); });
+
+    std::error_code error;
+    fs::remove_all(root, error);
 }
 
 #if defined(_WIN32)
@@ -2469,6 +2948,16 @@ int main() {
     });
     expect_roundtrip(random);
     expect_order1_roundtrip(random);
+    // A grossly truncated adaptive order-1 stream must be rejected: the bit
+    // reader allows only the bounded final-flush overrun before throwing
+    // instead of synthesizing zero bits until the declared size is reached.
+    {
+        const auto encoded = axiom::entropy::encode_order1(random);
+        AXIOM_CHECK(encoded.has_value());
+        const std::vector<std::uint8_t> truncated(
+            encoded->begin(), encoded->begin() + static_cast<std::ptrdiff_t>(encoded->size() / 2));
+        expect_throws([&] { (void)axiom::entropy::decode_order1(truncated, random.size()); });
+    }
     expect_rans_roundtrip(random);
     expect_rans_order1_roundtrip(random);
     // Below the coder's minimum useful size it declines rather than encodes.
@@ -2516,8 +3005,11 @@ int main() {
     test_archive_roundtrip();
     test_archive_provider_layer();
     test_zip_provider_layer();
+    test_safe_file_replacement();
 #if defined(_WIN32)
+    test_skip_unreadable_archive_inputs();
     test_unicode_path_archive_probe();
+    test_unicode_archive_entry_names();
     test_iso_native_listing_provider_layer();
     test_system_archive_provider_layer();
     test_bundled_7z_provider_layer();
@@ -2536,6 +3028,7 @@ int main() {
     test_archive_encryption();
     test_archive_encrypted_directory();
     test_archive_operation_control();
+    test_compression_estimator();
 #if defined(_WIN32)
     test_windows_metadata();
     test_archive_ads();

@@ -182,31 +182,35 @@ public:
     }
 
     bool matches_path(const std::filesystem::path& path) const override {
-        return lower_ascii(path.extension().wstring()) == L".axar";
+        return lower_ascii(path.extension().wstring()) == L".axar" ||
+               is_axiom_archive_volume(path);
     }
 
     ArchiveCapabilities capabilities(const std::filesystem::path& archive_path,
                                      const std::string& password) const override {
         ArchiveCapabilities result;
         const bool embedded_sfx = is_axiom_sfx_archive(archive_path);
+        const bool volume_set = is_axiom_archive_volume(archive_path);
+        const bool writable = !embedded_sfx && !volume_set;
         result.list = true;
         result.extract = true;
         result.test = true;
-        result.create = !embedded_sfx;
+        result.create = writable;
         result.packed_sizes = true;
         result.selective_extract = true;
-        result.update = !embedded_sfx;
-        result.delete_entries = !embedded_sfx;
-        result.move_entries = !embedded_sfx;
-        result.encryption = !embedded_sfx;
-        result.recovery_records = !embedded_sfx;
-        result.multi_volume = !embedded_sfx;
-        result.comments = !embedded_sfx;
-        result.lock = !embedded_sfx;
+        result.update = writable;
+        result.delete_entries = writable;
+        result.move_entries = writable;
+        result.encryption = writable;
+        result.recovery_records = writable;
+        result.can_create_volumes = writable;
+        result.is_multi_volume = volume_set;
+        result.comments = writable;
+        result.lock = writable;
         result.metadata = true;
         result.links = true;
         result.authenticity = true;
-        result.sfx = !embedded_sfx;
+        result.sfx = writable;
         // The state flags below require opening the archive, which throws for a
         // path that does not exist yet (a new archive about to be created) or a
         // damaged file. A capability query must not throw — callers use it to
@@ -304,14 +308,11 @@ std::span<const ArchiveFormatInfo> supported_archive_formats() {
 }
 
 const ArchiveProvider* archive_provider_for_path(const std::filesystem::path& path) {
-    if (looks_like_native_archive_file(path)) {
-        return &kAxarProvider;
-    }
-    if (looks_like_zip_file(path)) {
-        return &zip_archive_provider();
+    if (const auto* provider = archive_provider_for_contents(path)) {
+        return provider;
     }
 #ifdef _WIN32
-    if (const auto* provider = system_archive_provider_for_path(path)) {
+    if (const auto* provider = system_archive_provider_for_extension(path)) {
         return provider;
     }
 #endif
@@ -320,6 +321,21 @@ const ArchiveProvider* archive_provider_for_path(const std::filesystem::path& pa
             return provider;
         }
     }
+    return nullptr;
+}
+
+const ArchiveProvider* archive_provider_for_contents(const std::filesystem::path& path) {
+    if (looks_like_native_archive_file(path) || is_axiom_archive_volume(path)) {
+        return &kAxarProvider;
+    }
+    if (looks_like_zip_file(path)) {
+        return &zip_archive_provider();
+    }
+#ifdef _WIN32
+    if (const auto* provider = system_archive_provider_for_contents(path)) {
+        return provider;
+    }
+#endif
     return nullptr;
 }
 
@@ -333,7 +349,7 @@ bool is_native_archive(const std::filesystem::path& path) {
 }
 
 bool is_axiom_sfx_archive(const std::filesystem::path& path) {
-    return sfx_embedded_archive_range(path).has_value();
+    return sfx_embedded_payload_range(path).has_value();
 }
 
 }  // namespace axiom

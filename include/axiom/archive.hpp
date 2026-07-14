@@ -119,7 +119,10 @@ struct ArchiveCapabilities {
     bool move_entries = false;
     bool encryption = false;
     bool recovery_records = false;
-    bool multi_volume = false;
+    // Format capability versus path-specific state are separate: an ordinary
+    // ZIP can create volumes, while an existing split ZIP is read-only.
+    bool can_create_volumes = false;
+    bool is_multi_volume = false;
     bool comments = false;
     bool lock = false;
     bool metadata = false;
@@ -214,6 +217,10 @@ public:
 };
 
 std::span<const ArchiveFormatInfo> supported_archive_formats();
+// Returns a provider only when the file contents identify a supported archive.
+// Unlike archive_provider_for_path(), this never falls back to the filename
+// extension and is therefore suitable for validating existing files.
+const ArchiveProvider* archive_provider_for_contents(const std::filesystem::path& path);
 const ArchiveProvider* archive_provider_for_path(const std::filesystem::path& path);
 bool is_supported_archive(const std::filesystem::path& path);
 bool is_native_archive(const std::filesystem::path& path);
@@ -279,9 +286,21 @@ ArchiveVolumeSetInfo create_archive_volumes(
     unsigned recovery_volume_count = 0,
     const std::shared_ptr<OperationControl>& operation = nullptr);
 ArchiveVolumeSetInfo archive_volume_set_info(const std::filesystem::path& any_volume);
+// Numbered Axiom volume files are directly readable when every data part is
+// present. Recovery volumes are needed only when a data part is missing or bad.
+bool is_axiom_archive_volume(const std::filesystem::path& path) noexcept;
+bool archive_volume_data_set_complete(const std::filesystem::path& any_volume) noexcept;
+std::filesystem::path archive_volume_primary_path(
+    const std::filesystem::path& any_volume);
 void join_archive_volumes(const std::filesystem::path& any_volume,
                           const std::filesystem::path& output_archive,
                           const std::shared_ptr<OperationControl>& operation = nullptr);
+
+// Rewrite a completed ZIP into the standard .z01, .z02, ..., .zip split-set
+// layout. Compressed/encrypted entry bytes and metadata are preserved.
+void create_zip_volumes(const std::filesystem::path& archive_path,
+                        std::uint64_t volume_size,
+                        const std::shared_ptr<OperationControl>& operation = nullptr);
 
 // Create a Windows self-extracting executable by appending an intact archive and
 // an Axiom SFX trailer to a native Axiom GUI stub.

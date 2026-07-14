@@ -5,9 +5,11 @@
 #include "axiom/archive.hpp"
 
 #include "archive/container_internal.hpp"
+#include "archive/zip_split_backend.hpp"
 #include "core/checksum.hpp"
 #include "core/crypto.hpp"
 #include "core/file_meta.hpp"
+#include "core/path_text.hpp"
 #include "third_party/miniz/miniz.h"
 
 #include <algorithm>
@@ -52,17 +54,81 @@ std::string normalize_zip_entry_path(std::string path) {
 std::uint64_t checked_file_size(const fs::path& path) {
     const auto size = fs::file_size(path);
     if (size > std::numeric_limits<std::uint64_t>::max()) {
-        throw std::runtime_error("ZIP file is too large: " + path.string());
+        throw std::runtime_error("ZIP file is too large: " + core::path_to_utf8(path));
     }
     return static_cast<std::uint64_t>(size);
 }
 
+bool is_numbered_zip_volume(const fs::path& path) {
+    const auto extension = path.extension().wstring();
+    return extension.size() >= 3 && (extension[1] == L'z' || extension[1] == L'Z') &&
+        std::all_of(extension.begin() + 2, extension.end(),
+                    [](wchar_t ch) { return ch >= L'0' && ch <= L'9'; });
+}
+
+fs::path zip_final_volume_path(const fs::path& path) {
+    if (is_numbered_zip_volume(path)) {
+        fs::path final = path;
+        final.replace_extension(L".zip");
+        std::error_code error;
+        if (fs::exists(final, error)) return final;
+    }
+    return path;
+}
+
+bool zip_is_multidisk(const fs::path& path) {
+    std::ifstream input(zip_final_volume_path(path), std::ios::binary);
+    if (!input) return false;
+    input.seekg(0, std::ios::end);
+    const auto end = input.tellg();
+    if (end < std::streamoff(22)) return false;
+    const auto tail_size = static_cast<std::size_t>(
+        std::min<std::uint64_t>(static_cast<std::uint64_t>(end), 65557));
+    ByteVector tail(tail_size);
+    input.seekg(end - static_cast<std::streamoff>(tail_size), std::ios::beg);
+    input.read(reinterpret_cast<char*>(tail.data()), static_cast<std::streamsize>(tail.size()));
+    if (!input) return false;
+    for (std::size_t pos = tail.size() - 22;; --pos) {
+        if (tail[pos] == 'P' && tail[pos + 1] == 'K' && tail[pos + 2] == 5 &&
+            tail[pos + 3] == 6) {
+            const auto disk = static_cast<std::uint16_t>(tail[pos + 4]) |
+                              (static_cast<std::uint16_t>(tail[pos + 5]) << 8);
+            const auto central_disk = static_cast<std::uint16_t>(tail[pos + 6]) |
+                                      (static_cast<std::uint16_t>(tail[pos + 7]) << 8);
+            return disk != 0 || central_disk != 0;
+        }
+        if (pos == 0) break;
+    }
+    return false;
+}
+
+void reject_split_zip_edit(const fs::path& path) {
+    if (zip_is_multidisk(path)) {
+        throw std::runtime_error(
+            "editing a split ZIP in place is not supported; extract or recreate the set");
+    }
+}
+
 class ZipReader final {
 public:
-    explicit ZipReader(const fs::path& path)
-        : path_(path), stream_(path, std::ios::binary), size_(checked_file_size(path)) {
+    explicit ZipReader(const fs::path& path,
+                       const std::shared_ptr<OperationControl>& operation = nullptr)
+        : path_(zip_final_volume_path(path)) {
+        if (is_numbered_zip_volume(path) && path_ == path) {
+            fs::path final = path;
+            final.replace_extension(L".zip");
+            throw FormatError("split ZIP is incomplete; final volume is missing: " +
+                              core::path_to_utf8(final));
+        }
+        if (zip_is_multidisk(path_)) {
+            split_reader_ = std::make_unique<SplitZipReader>(path_, operation);
+            return;
+        }
+        stream_.open(path_, std::ios::binary);
+        size_ = checked_file_size(path_);
         if (!stream_) {
-            throw std::runtime_error("cannot open ZIP archive: " + path.string());
+            throw std::runtime_error("cannot open ZIP archive: " +
+                                     core::path_to_utf8(path));
         }
         mz_zip_zero_struct(&zip_);
         zip_.m_pRead = &ZipReader::read_callback;
@@ -82,12 +148,22 @@ public:
         if (open_) {
             mz_zip_reader_end(&zip_);
         }
+        stream_.close();
     }
 
     mz_zip_archive& zip() { return zip_; }
     const mz_zip_archive& zip() const { return zip_; }
     const fs::path& path() const { return path_; }
     std::uint64_t size() const { return size_; }
+    bool is_split() const { return split_reader_ != nullptr; }
+    const std::vector<SplitZipEntryInfo>& split_entries() const {
+        if (!split_reader_) throw std::logic_error("ZIP is not split");
+        return split_reader_->entries();
+    }
+    ByteVector read_split_raw_entry(std::size_t index) {
+        if (!split_reader_) throw std::logic_error("ZIP is not split");
+        return split_reader_->read_raw_entry(index);
+    }
 
     ByteVector read_bytes(std::uint64_t file_ofs, std::size_t count) {
         ByteVector bytes(count);
@@ -119,6 +195,7 @@ private:
 
     fs::path path_;
     std::ifstream stream_;
+    std::unique_ptr<SplitZipReader> split_reader_;
     std::uint64_t size_ = 0;
     mz_zip_archive zip_{};
     bool open_ = false;
@@ -129,7 +206,8 @@ public:
     explicit ZipWriter(const fs::path& path)
         : stream_(path, std::ios::binary | std::ios::trunc) {
         if (!stream_) {
-            throw std::runtime_error("cannot create ZIP archive: " + path.string());
+            throw std::runtime_error("cannot create ZIP archive: " +
+                                     core::path_to_utf8(path));
         }
         mz_zip_zero_struct(&zip_);
         zip_.m_pWrite = &ZipWriter::write_callback;
@@ -197,6 +275,7 @@ struct ZipEntryPlan {
     bool aes_supported = false;
     mz_uint16 aes_version = 0;
     mz_uint16 aes_actual_method = 0;
+    mz_uint16 zipcrypto_verifier = 0;
     std::uint8_t aes_strength = 0;
 };
 
@@ -782,6 +861,52 @@ ArchiveEntry archive_entry_from_zip_stat(const mz_zip_archive_file_stat& stat) {
 }
 
 std::vector<ZipEntryPlan> read_zip_entry_plans(ZipReader& reader) {
+    if (reader.is_split()) {
+        const auto& entries = reader.split_entries();
+        std::vector<ZipEntryPlan> result;
+        result.reserve(entries.size());
+        for (std::size_t index = 0; index < entries.size(); ++index) {
+            const auto& source = entries[index];
+            ZipEntryPlan plan;
+            plan.index = static_cast<mz_uint>(index);
+            plan.entry.path = normalize_zip_entry_path(source.path);
+            plan.entry.is_directory = source.directory;
+            plan.entry.size = source.directory ? 0 : source.uncompressed_size;
+            plan.entry.packed_size = source.directory
+                ? std::optional<std::uint64_t>{}
+                : std::optional<std::uint64_t>{source.compressed_size};
+            plan.entry.crc32 = source.directory ? 0 : source.crc32;
+            plan.entry.has_crc32 = !source.directory;
+            plan.entry.mtime = source.modified_time;
+            plan.method = source.method;
+            plan.bit_flag = source.flags;
+            plan.compressed_size = source.compressed_size;
+            plan.comment = source.comment;
+            plan.encrypted = (plan.bit_flag & kZipFlagEncrypted) != 0;
+            plan.supported = source.directory || plan.method == kZipMethodStore ||
+                             plan.method == kZipMethodDeflate;
+            plan.zipcrypto_verifier = source.zipcrypto_verifier;
+            if (plan.encrypted && plan.method == kZipMethodAes) {
+                const auto aes = parse_zip_aes_extra(source.extra);
+                if (aes.has_value()) {
+                    plan.aes_version = aes->version;
+                    plan.aes_strength = aes->strength;
+                    plan.aes_actual_method = aes->actual_method;
+                    plan.aes_supported =
+                        (aes->version == 1 || aes->version == kZipAesVendorVersionAe2) &&
+                        aes->strength == kZipAesStrength256 &&
+                        (aes->actual_method == kZipMethodStore ||
+                         aes->actual_method == kZipMethodDeflate);
+                    if (aes->version == kZipAesVendorVersionAe2) {
+                        plan.entry.has_crc32 = false;
+                    }
+                }
+            }
+            plan.zipcrypto_supported = zip_entry_uses_classic_crypto(plan);
+            result.push_back(std::move(plan));
+        }
+        return result;
+    }
     mz_zip_archive& zip = reader.zip();
     const mz_uint count = mz_zip_reader_get_num_files(&zip);
     std::vector<ZipEntryPlan> result;
@@ -848,11 +973,14 @@ void append_zip_range(ByteVector& out,
 
 ByteVector read_zip_file_bytes(const fs::path& path) {
     std::ifstream input(path, std::ios::binary);
-    if (!input) throw std::runtime_error("cannot read ZIP archive: " + path.string());
+    if (!input) {
+        throw std::runtime_error("cannot read ZIP archive: " + core::path_to_utf8(path));
+    }
     input.seekg(0, std::ios::end);
     const auto end = input.tellg();
     if (end < std::streamoff(0)) {
-        throw std::runtime_error("cannot determine ZIP archive size: " + path.string());
+        throw std::runtime_error("cannot determine ZIP archive size: " +
+                                 core::path_to_utf8(path));
     }
     ByteVector bytes(static_cast<std::size_t>(end));
     input.seekg(0, std::ios::beg);
@@ -868,12 +996,16 @@ ByteVector read_zip_file_bytes(const fs::path& path) {
 
 void write_zip_file_bytes(const fs::path& path, std::span<const std::uint8_t> bytes) {
     std::ofstream output(path, std::ios::binary | std::ios::trunc);
-    if (!output) throw std::runtime_error("cannot write ZIP archive: " + path.string());
+    if (!output) {
+        throw std::runtime_error("cannot write ZIP archive: " + core::path_to_utf8(path));
+    }
     if (!bytes.empty()) {
         output.write(reinterpret_cast<const char*>(bytes.data()),
                      static_cast<std::streamsize>(bytes.size()));
     }
-    if (!output) throw std::runtime_error("cannot finish ZIP archive: " + path.string());
+    if (!output) {
+        throw std::runtime_error("cannot finish ZIP archive: " + core::path_to_utf8(path));
+    }
 }
 
 std::size_t find_zip_eocd(std::span<const std::uint8_t> bytes) {
@@ -1149,6 +1281,8 @@ ArchiveCapabilities zip_capabilities_for_plans(const std::vector<ZipEntryPlan>& 
     result.encryption = true;
     result.metadata = true;
     result.packed_sizes = true;
+    result.sfx = true;
+    result.can_create_volumes = true;
 
     bool all_extractable = true;
     bool any_extractable = false;
@@ -1379,7 +1513,8 @@ void add_zip_scan_item(ZipWriter& writer, const ScanItem& item,
                        std::uint64_t& completed_bytes,
                        std::uint64_t total_bytes,
                        std::uint64_t& completed_items,
-                       std::uint64_t total_items) {
+                       std::uint64_t total_items,
+                       bool allow_unreadable_skips) {
     operation_checkpoint(options.operation);
     const std::string archive_path = zip_writer_path(item);
     MZ_TIME_T modified = static_cast<MZ_TIME_T>(scan_item_mtime(item));
@@ -1402,9 +1537,18 @@ void add_zip_scan_item(ZipWriter& writer, const ScanItem& item,
     }
 
     ZipFileReadContext context;
-    context.input.open(item.absolute, std::ios::binary);
-    if (!context.input) {
-        throw std::runtime_error("cannot read ZIP input: " + item.absolute.string());
+    if (!open_input_with_retry(context.input, item.absolute,
+                               options.input_open_retries, options.operation)) {
+        if (!allow_unreadable_skips) {
+            throw std::runtime_error("cannot read ZIP input: " +
+                                     core::path_to_utf8(item.absolute));
+        }
+        report_skipped_input(item, options.operation);
+        ++completed_items;
+        report_operation(options.operation, OperationStage::compressing,
+                         completed_bytes, total_bytes, completed_items,
+                         total_items, item.archive_path);
+        return;
     }
     context.operation = options.operation;
     context.completed_bytes = &completed_bytes;
@@ -1446,7 +1590,7 @@ void rebuild_zip_archive(const fs::path& archive_path,
     TempFileGuard temp_guard(temp_path);
 
     if (existing_archive) {
-        ZipReader reader(archive_path);
+        ZipReader reader(archive_path, options.operation);
         auto plans = read_zip_entry_plans(reader);
         reject_unwritable_zip_entries(plans);
         validate_zip_items(additions, plans, options.operation);
@@ -1487,7 +1631,7 @@ void rebuild_zip_archive(const fs::path& archive_path,
             }
             for (const auto& item : additions) {
                 add_zip_scan_item(writer, item, options, completed_bytes, total_bytes,
-                                  completed_items, total_items);
+                                  completed_items, total_items, false);
             }
             report_operation(options.operation, OperationStage::finalizing,
                              completed_bytes, total_bytes, completed_items, total_items);
@@ -1503,7 +1647,8 @@ void rebuild_zip_archive(const fs::path& archive_path,
             ZipWriter writer(temp_path);
             for (const auto& item : additions) {
                 add_zip_scan_item(writer, item, options, completed_bytes, total_bytes,
-                                  completed_items, total_items);
+                                  completed_items, total_items,
+                                  options.skip_unreadable_files);
             }
             report_operation(options.operation, OperationStage::finalizing,
                              completed_bytes, total_bytes, completed_items, total_items);
@@ -1730,7 +1875,7 @@ void move_zip_entries(const fs::path& archive_path,
     temp_path += ".tmp";
     TempFileGuard temp_guard(temp_path);
     {
-        ZipReader reader(archive_path);
+        ZipReader reader(archive_path, options.operation);
         auto plans = read_zip_entry_plans(reader);
         reject_unwritable_zip_entries(plans);
         validate_zip_moves(normalized, plans, options.operation);
@@ -1810,6 +1955,8 @@ struct ZipExtractCallbackContext {
     std::uint64_t completed_items = 0;
     std::uint64_t total_items = 0;
     std::string current_path;
+    std::uint64_t current_file_bytes = 0;
+    std::uint64_t current_file_total = 0;
     bool cancelled = false;
     bool failed = false;
     std::string error;
@@ -1830,10 +1977,12 @@ size_t zip_extract_write_callback(void* opaque, mz_uint64 file_ofs, const void* 
         }
         if (context->completed_bytes != nullptr) {
             *context->completed_bytes += count;
+            context->current_file_bytes += count;
             report_operation(context->operation, context->stage,
                              *context->completed_bytes, context->total_bytes,
                              context->completed_items, context->total_items,
-                             context->current_path);
+                             context->current_path, context->current_file_bytes,
+                             context->current_file_total);
         }
         return count;
     } catch (const OperationCancelled&) {
@@ -1864,7 +2013,9 @@ ByteVector read_zip_file_range(const fs::path& path, std::uint64_t offset, std::
         throw FormatError("ZIP entry is too large");
     }
     std::ifstream input(path, std::ios::binary);
-    if (!input) throw std::runtime_error("cannot read ZIP archive: " + path.string());
+    if (!input) {
+        throw std::runtime_error("cannot read ZIP archive: " + core::path_to_utf8(path));
+    }
     input.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
     ByteVector bytes(static_cast<std::size_t>(size));
     if (!bytes.empty()) {
@@ -1895,6 +2046,19 @@ ZipLocalHeaderInfo read_zip_local_header_from_file(const fs::path& path,
     const std::uint64_t data_offset = offset + 30u + info.name_size + info.extra_size;
     info.data_offset = checked_zip_offset(data_offset);
     return info;
+}
+
+ByteVector read_zip_entry_raw_bytes(ZipReader& reader,
+                                    const ZipEntryPlan& plan,
+                                    std::uint16_t* local_mod_time = nullptr) {
+    if (reader.is_split()) {
+        if (local_mod_time != nullptr) *local_mod_time = 0;
+        return reader.read_split_raw_entry(plan.index);
+    }
+    const ZipLocalHeaderInfo local =
+        read_zip_local_header_from_file(reader.path(), plan.local_header_ofs);
+    if (local_mod_time != nullptr) *local_mod_time = local.mod_time;
+    return read_zip_file_range(reader.path(), local.data_offset, plan.compressed_size);
 }
 
 struct ZipCryptoInflateContext {
@@ -1933,7 +2097,36 @@ void throw_zipcrypto_context_failure(const ZipExtractCallbackContext& context,
     throw FormatError(std::string(action));
 }
 
-void extract_zipcrypto_entry(const fs::path& archive_path,
+void extract_zip_payload(std::span<const std::uint8_t> compressed,
+                         std::uint16_t method,
+                         const ZipEntryPlan& plan,
+                         ZipExtractCallbackContext& context) {
+    ZipCryptoInflateContext inflate_context;
+    inflate_context.extract = &context;
+    if (method == kZipMethodStore) {
+        if (!zipcrypto_emit_plain(inflate_context, compressed.data(), compressed.size())) {
+            throw_zipcrypto_context_failure(context, "ZIP extraction failed");
+        }
+    } else if (method == kZipMethodDeflate) {
+        std::size_t input_size = compressed.size();
+        const int ok = tinfl_decompress_mem_to_callback(
+            compressed.data(), &input_size, &zipcrypto_tinfl_put_buf, &inflate_context, 0);
+        if (!ok || input_size != compressed.size()) {
+            throw_zipcrypto_context_failure(context, "ZIP decompression failed");
+        }
+    } else {
+        throw FormatError("ZIP entry uses unsupported compression method: " + plan.entry.path);
+    }
+    if (inflate_context.output_offset != plan.entry.size) {
+        throw FormatError("ZIP entry decompressed to an unexpected size: " + plan.entry.path);
+    }
+    if (plan.entry.has_crc32 &&
+        core::crc32_final(inflate_context.crc) != plan.entry.crc32) {
+        throw FormatError("ZIP entry CRC check failed: " + plan.entry.path);
+    }
+}
+
+void extract_zipcrypto_entry(ZipReader& reader,
                              const ZipEntryPlan& plan,
                              const std::string& password,
                              ZipExtractCallbackContext& context) {
@@ -1947,14 +2140,14 @@ void extract_zipcrypto_entry(const fs::path& archive_path,
         throw FormatError("ZIP encrypted entry is truncated: " + plan.entry.path);
     }
 
-    const ZipLocalHeaderInfo local =
-        read_zip_local_header_from_file(archive_path, plan.local_header_ofs);
-    ByteVector encrypted = read_zip_file_range(
-        archive_path, local.data_offset, plan.compressed_size);
+    std::uint16_t local_mod_time = 0;
+    ByteVector encrypted = read_zip_entry_raw_bytes(reader, plan, &local_mod_time);
     zipcrypto_transform(encrypted, password, false);
 
     const std::uint8_t expected_check = (plan.bit_flag & kZipFlagDataDescriptor) != 0
-        ? static_cast<std::uint8_t>(local.mod_time >> 8)
+        ? reader.is_split()
+            ? static_cast<std::uint8_t>(plan.zipcrypto_verifier)
+            : static_cast<std::uint8_t>(local_mod_time >> 8)
         : static_cast<std::uint8_t>(plan.entry.crc32 >> 24);
     if (encrypted.size() < kZipEncryptionHeaderSize ||
         encrypted[kZipEncryptionHeaderSize - 1] != expected_check) {
@@ -1964,32 +2157,11 @@ void extract_zipcrypto_entry(const fs::path& archive_path,
     const auto* compressed = encrypted.data() + kZipEncryptionHeaderSize;
     const std::size_t compressed_size = encrypted.size() - kZipEncryptionHeaderSize;
 
-    ZipCryptoInflateContext inflate_context;
-    inflate_context.extract = &context;
-    if (plan.method == kZipMethodStore) {
-        if (!zipcrypto_emit_plain(inflate_context, compressed, compressed_size)) {
-            throw_zipcrypto_context_failure(context, "ZIP extraction failed");
-        }
-    } else if (plan.method == kZipMethodDeflate) {
-        std::size_t input_size = compressed_size;
-        const int ok = tinfl_decompress_mem_to_callback(
-            compressed, &input_size, &zipcrypto_tinfl_put_buf, &inflate_context, 0);
-        if (!ok || input_size != compressed_size) {
-            throw_zipcrypto_context_failure(context, "ZIP decompression failed");
-        }
-    } else {
-        throw FormatError("ZIP entry uses unsupported compression method: " + plan.entry.path);
-    }
-
-    if (inflate_context.output_offset != plan.entry.size) {
-        throw FormatError("ZIP entry decompressed to an unexpected size: " + plan.entry.path);
-    }
-    if (core::crc32_final(inflate_context.crc) != plan.entry.crc32) {
-        throw FormatError("ZIP entry CRC check failed: " + plan.entry.path);
-    }
+    extract_zip_payload(std::span<const std::uint8_t>(compressed, compressed_size),
+                        plan.method, plan, context);
 }
 
-void extract_zip_aes_entry(const fs::path& archive_path,
+void extract_zip_aes_entry(ZipReader& reader,
                            const ZipEntryPlan& plan,
                            const std::string& password,
                            ZipExtractCallbackContext& context) {
@@ -2003,10 +2175,7 @@ void extract_zip_aes_entry(const fs::path& archive_path,
         throw FormatError("ZIP AES entry is truncated: " + plan.entry.path);
     }
 
-    const ZipLocalHeaderInfo local =
-        read_zip_local_header_from_file(archive_path, plan.local_header_ofs);
-    ByteVector encrypted = read_zip_file_range(
-        archive_path, local.data_offset, plan.compressed_size);
+    ByteVector encrypted = read_zip_entry_raw_bytes(reader, plan);
     const auto salt = std::span<const std::uint8_t>(
         encrypted.data(), kZipAes256SaltSize);
     const auto verifier = std::span<const std::uint8_t>(
@@ -2033,30 +2202,31 @@ void extract_zip_aes_entry(const fs::path& archive_path,
     }
     aes256_ctr_transform(ciphertext, keys.encryption_key);
 
-    ZipCryptoInflateContext inflate_context;
-    inflate_context.extract = &context;
-    const std::uint16_t method = zip_effective_method(plan);
-    if (method == kZipMethodStore) {
-        if (!zipcrypto_emit_plain(inflate_context, ciphertext.data(), ciphertext.size())) {
-            throw_zipcrypto_context_failure(context, "ZIP extraction failed");
-        }
-    } else if (method == kZipMethodDeflate) {
-        std::size_t input_size = ciphertext.size();
-        const int ok = tinfl_decompress_mem_to_callback(
-            ciphertext.data(), &input_size, &zipcrypto_tinfl_put_buf, &inflate_context, 0);
-        if (!ok || input_size != ciphertext.size()) {
-            throw_zipcrypto_context_failure(context, "ZIP decompression failed");
-        }
-    } else {
-        throw FormatError("ZIP entry uses unsupported compression method: " + plan.entry.path);
-    }
+    extract_zip_payload(ciphertext, zip_effective_method(plan), plan, context);
+}
 
-    if (inflate_context.output_offset != plan.entry.size) {
-        throw FormatError("ZIP entry decompressed to an unexpected size: " + plan.entry.path);
+void extract_zip_entry(ZipReader& reader,
+                       const ZipEntryPlan& plan,
+                       const std::string& password,
+                       ZipExtractCallbackContext& context,
+                       std::string_view failure) {
+    if (plan.encrypted) {
+        if (plan.aes_supported) {
+            extract_zip_aes_entry(reader, plan, password, context);
+        } else {
+            extract_zipcrypto_entry(reader, plan, password, context);
+        }
+        return;
     }
-    if (plan.entry.has_crc32 &&
-        core::crc32_final(inflate_context.crc) != plan.entry.crc32) {
-        throw FormatError("ZIP entry CRC check failed: " + plan.entry.path);
+    if (reader.is_split()) {
+        const ByteVector compressed = reader.read_split_raw_entry(plan.index);
+        extract_zip_payload(compressed, plan.method, plan, context);
+        return;
+    }
+    if (!mz_zip_reader_extract_to_callback(&reader.zip(), plan.index,
+                                           &zip_extract_write_callback,
+                                           &context, 0)) {
+        throw_zip_callback_failure(context, reader.zip(), failure);
     }
 }
 
@@ -2067,7 +2237,11 @@ public:
     }
 
     bool matches_path(const std::filesystem::path& path) const override {
-        return lower_ascii(path.extension().wstring()) == L".zip";
+        const auto extension = lower_ascii(path.extension().wstring());
+        return extension == L".zip" ||
+               (extension.size() >= 3 && extension[1] == L'z' &&
+                std::all_of(extension.begin() + 2, extension.end(),
+                            [](wchar_t ch) { return ch >= L'0' && ch <= L'9'; }));
     }
 
     ArchiveCapabilities capabilities(const std::filesystem::path& archive_path,
@@ -2076,16 +2250,38 @@ public:
         // does not exist yet, or an unreadable file. Fall back to the format's
         // static capabilities (empty entry list) and let the actual operation
         // report the precise error.
+        // A numbered member is path-level evidence of a volume set even when
+        // the final .zip member is missing or unreadable. Keep it read-only.
+        const bool multidisk = is_numbered_zip_volume(archive_path) ||
+                               zip_is_multidisk(archive_path);
         try {
             ZipReader reader(archive_path);
-            return zip_capabilities_for_plans(read_zip_entry_plans(reader), !password.empty());
+            auto result = zip_capabilities_for_plans(
+                read_zip_entry_plans(reader), !password.empty());
+            if (multidisk) {
+                result.can_create_volumes = false;
+                result.is_multi_volume = true;
+                result.update = false;
+                result.delete_entries = false;
+                result.move_entries = false;
+            }
+            return result;
         } catch (...) {
-            return zip_capabilities_for_plans({}, !password.empty());
+            auto result = zip_capabilities_for_plans({}, !password.empty());
+            if (multidisk) {
+                result.can_create_volumes = false;
+                result.is_multi_volume = true;
+                result.update = false;
+                result.delete_entries = false;
+                result.move_entries = false;
+            }
+            return result;
         }
     }
 
     std::vector<ArchiveEntry> list(const std::filesystem::path& archive_path,
-                                   const std::string&) const override {
+                                   const std::string& password) const override {
+        (void)password;
         ZipReader reader(archive_path);
         auto plans = read_zip_entry_plans(reader);
         std::vector<ArchiveEntry> result;
@@ -2098,7 +2294,7 @@ public:
 
     void test(const std::filesystem::path& archive_path,
               const DecompressionOptions& options) const override {
-        ZipReader reader(archive_path);
+        ZipReader reader(archive_path, options.operation);
         auto plans = read_zip_entry_plans(reader);
         const auto capabilities = zip_capabilities_for_plans(plans, !options.password.empty());
         if (!capabilities.test) {
@@ -2135,20 +2331,9 @@ public:
             context.completed_items = completed_items;
             context.total_items = total_items;
             context.current_path = plan.entry.path;
-            if (plan.encrypted) {
-                if (plan.aes_supported) {
-                    extract_zip_aes_entry(archive_path, plan, options.password, context);
-                } else {
-                    extract_zipcrypto_entry(archive_path, plan, options.password, context);
-                }
-            } else {
-                if (!mz_zip_reader_extract_to_callback(&reader.zip(), plan.index,
-                                                       &zip_extract_write_callback,
-                                                       &context, 0)) {
-                    throw_zip_callback_failure(context, reader.zip(),
-                                               "ZIP integrity test failed");
-                }
-            }
+            context.current_file_total = plan.entry.size;
+            extract_zip_entry(reader, plan, options.password, context,
+                              "ZIP integrity test failed");
             ++completed_items;
             report_operation(options.operation, OperationStage::testing, completed_bytes,
                              total_bytes, completed_items, total_items, plan.entry.path);
@@ -2185,6 +2370,7 @@ public:
     void add(const std::vector<std::filesystem::path>& inputs,
              const std::filesystem::path& archive_path,
              const CompressionOptions& options) const override {
+        reject_split_zip_edit(archive_path);
         auto items = scan_zip_inputs(inputs, options.operation);
         rebuild_zip_archive(archive_path, items, options,
                             [](const ZipEntryPlan&) { return true; });
@@ -2193,6 +2379,7 @@ public:
     void add_mapped(const std::vector<ArchiveInput>& inputs,
                     const std::filesystem::path& archive_path,
                     const CompressionOptions& options) const override {
+        reject_split_zip_edit(archive_path);
         auto items = scan_zip_inputs(inputs, options.operation);
         rebuild_zip_archive(archive_path, items, options,
                             [](const ZipEntryPlan&) { return true; });
@@ -2202,6 +2389,7 @@ public:
                 const std::filesystem::path& archive_path,
                 const CompressionOptions& options,
                 bool fresh_only) const override {
+        reject_split_zip_edit(archive_path);
         auto items = scan_zip_inputs(inputs, options.operation);
         if (!fs::exists(archive_path)) {
             if (!fresh_only) {
@@ -2252,6 +2440,7 @@ public:
     void sync(const std::vector<std::filesystem::path>& inputs,
               const std::filesystem::path& archive_path,
               const CompressionOptions& options) const override {
+        reject_split_zip_edit(archive_path);
         auto items = scan_zip_inputs(inputs, options.operation);
         if (!fs::exists(archive_path)) {
             rebuild_zip_archive(archive_path, items, options,
@@ -2295,6 +2484,7 @@ public:
     void delete_entries(const std::filesystem::path& archive_path,
                         const std::vector<std::string>& paths,
                         const CompressionOptions& options) const override {
+        reject_split_zip_edit(archive_path);
         std::vector<std::string> targets;
         targets.reserve(paths.size());
         for (auto path : paths) {
@@ -2324,6 +2514,7 @@ public:
     void move_entries(const std::filesystem::path& archive_path,
                       const std::vector<ArchiveMove>& moves,
                       const CompressionOptions& options) const override {
+        reject_split_zip_edit(archive_path);
         move_zip_entries(archive_path, moves, options);
     }
 
@@ -2332,7 +2523,7 @@ private:
                           const std::vector<std::string>& wanted,
                           const std::filesystem::path& dest_dir,
                           const ExtractOptions& options) const {
-        ZipReader reader(archive_path);
+        ZipReader reader(archive_path, options.operation);
         auto plans = read_zip_entry_plans(reader);
 
         std::vector<const ZipEntryPlan*> selected;
@@ -2390,7 +2581,8 @@ private:
             if (!is_safe_relative(entry.path)) {
                 throw FormatError("ZIP archive contains an unsafe path: " + entry.path);
             }
-            const fs::path target = (dest_dir / fs::path(entry.path)).lexically_normal();
+            const fs::path target =
+                (dest_dir / core::path_from_utf8(entry.path)).lexically_normal();
             if (!is_within(dest_norm, target)) {
                 throw FormatError("ZIP archive path escapes the destination: " + entry.path);
             }
@@ -2421,10 +2613,12 @@ private:
                     continue;
                 }
                 if (options.overwrite == ExtractOptions::Overwrite::fail) {
-                    throw std::runtime_error("target already exists: " + target.string());
+                    throw std::runtime_error("target already exists: " +
+                                             core::path_to_utf8(target));
                 }
                 if (fs::is_directory(target, ec)) {
-                    throw std::runtime_error("target is a directory: " + target.string());
+                    throw std::runtime_error("target is a directory: " +
+                                             core::path_to_utf8(target));
                 }
                 fs::remove(target, ec);
             }
@@ -2435,7 +2629,8 @@ private:
             {
                 std::ofstream output(temp_target, std::ios::binary | std::ios::trunc);
                 if (!output) {
-                    throw std::runtime_error("cannot write file: " + temp_target.string());
+                    throw std::runtime_error("cannot write file: " +
+                                             core::path_to_utf8(temp_target));
                 }
                 ZipExtractCallbackContext context;
                 context.output = &output;
@@ -2445,20 +2640,9 @@ private:
                 context.completed_items = completed_items;
                 context.total_items = total_items;
                 context.current_path = entry.path;
-                if (plan.encrypted) {
-                    if (plan.aes_supported) {
-                        extract_zip_aes_entry(archive_path, plan, options.password, context);
-                    } else {
-                        extract_zipcrypto_entry(archive_path, plan, options.password, context);
-                    }
-                } else {
-                    if (!mz_zip_reader_extract_to_callback(&reader.zip(), plan.index,
-                                                           &zip_extract_write_callback,
-                                                           &context, 0)) {
-                        throw_zip_callback_failure(context, reader.zip(),
-                                                   "ZIP extraction failed");
-                    }
-                }
+                context.current_file_total = entry.size;
+                extract_zip_entry(reader, plan, options.password, context,
+                                  "ZIP extraction failed");
             }
 
             fs::rename(temp_target, target, ec);

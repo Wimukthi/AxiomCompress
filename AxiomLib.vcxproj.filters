@@ -33,6 +33,9 @@
     <ClInclude Include="src\archive\system_provider.hpp">
       <Filter>Archive</Filter>
     </ClInclude>
+    <ClInclude Include="src\archive\zip_split_backend.hpp">
+      <Filter>Archive</Filter>
+    </ClInclude>
     <ClInclude Include="src\codec\lz77.hpp">
       <Filter>Codec</Filter>
     </ClInclude>
@@ -69,7 +72,16 @@
     <ClInclude Include="src\core\file_meta.hpp">
       <Filter>Core</Filter>
     </ClInclude>
+    <ClInclude Include="src\core\path_text.hpp">
+      <Filter>Core</Filter>
+    </ClInclude>
+    <ClInclude Include="src\core\file_replace.hpp">
+      <Filter>Core</Filter>
+    </ClInclude>
     <ClInclude Include="src\core\reed_solomon.hpp">
+      <Filter>Core</Filter>
+    </ClInclude>
+    <ClInclude Include="src\core\windows_time.hpp">
       <Filter>Core</Filter>
     </ClInclude>
     <ClInclude Include="src\entropy\huffman.hpp">
@@ -119,6 +131,9 @@
     <ClCompile Include="src\archive\system_provider.cpp">
       <Filter>Archive</Filter>
     </ClCompile>
+    <ClCompile Include="src\archive\zip_split_backend.cpp">
+      <Filter>Archive</Filter>
+    </ClCompile>
     <ClCompile Include="src\codec\lz77.cpp">
       <Filter>Codec</Filter>
     </ClCompile>
@@ -135,6 +150,9 @@
       <Filter>Core</Filter>
     </ClCompile>
     <ClCompile Include="src\core\checksum.cpp">
+      <Filter>Core</Filter>
+    </ClCompile>
+    <ClCompile Include="src\core\compression_estimator.cpp">
       <Filter>Core</Filter>
     </ClCompile>
     <ClCompile Include="src\core\cpu.cpp">

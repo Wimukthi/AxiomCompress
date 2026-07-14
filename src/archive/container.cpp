@@ -6,6 +6,8 @@
 #include "core/cpu.hpp"
 #include "core/crypto.hpp"
 #include "core/file_meta.hpp"
+#include "core/file_replace.hpp"
+#include "core/path_text.hpp"
 #include "core/hash.hpp"
 #include "core/reed_solomon.hpp"
 #include "archive/system_provider.hpp"
@@ -17,6 +19,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <cstring>
+#include <deque>
 #include <fstream>
 #include <functional>
 #include <iomanip>
@@ -342,7 +345,8 @@ void reject_symlinked_ancestor(const fs::path& dest_norm, const fs::path& target
     for (auto it = chain.rbegin(); it != chain.rend(); ++it) {
         if (core::is_reparse_point(*it)) {
             throw FormatError("refusing to extract through a symlinked directory: " +
-                              it->lexically_relative(dest_norm).generic_string());
+                              core::generic_path_to_utf8(
+                                  it->lexically_relative(dest_norm)));
         }
     }
 }
@@ -413,15 +417,15 @@ void scan_input(const fs::path& input, std::vector<ScanItem>& items) {
     const fs::path base = input.has_parent_path() ? input.parent_path() : fs::path(".");
     auto relative_path = [&](const fs::path& path) {
         const fs::path lexical = path.lexically_relative(base);
-        auto rel = lexical.generic_string();
+        auto rel = core::generic_path_to_utf8(lexical);
         if (rel.empty()) {
-            rel = path.filename().generic_string();
+            rel = core::generic_path_to_utf8(path.filename());
         }
         return rel;
     };
     auto symlink_item = [&](const fs::path& path) {
         return ScanItem{path, relative_path(path), false, true,
-                        fs::read_symlink(path, ec).generic_string()};
+                        core::generic_path_to_utf8(fs::read_symlink(path, ec))};
     };
 
     // A symlink given directly is archived as a symlink, not its target — check
@@ -432,7 +436,7 @@ void scan_input(const fs::path& input, std::vector<ScanItem>& items) {
     }
 
     if (!fs::exists(input, ec)) {
-        throw std::runtime_error("input does not exist: " + input.string());
+        throw std::runtime_error("input does not exist: " + core::path_to_utf8(input));
     }
 
     if (fs::is_regular_file(input, ec)) {
@@ -463,7 +467,7 @@ void scan_input(const fs::path& input, std::vector<ScanItem>& items) {
         return;
     }
 
-    throw std::runtime_error("unsupported input type: " + input.string());
+    throw std::runtime_error("unsupported input type: " + core::path_to_utf8(input));
 }
 
 void scan_input_at(const ArchiveInput& input, std::vector<ScanItem>& items,
@@ -478,35 +482,40 @@ void scan_input_at(const ArchiveInput& input, std::vector<ScanItem>& items,
         const fs::path relative = path.lexically_relative(input.source);
         if (relative.empty() || relative.native().empty()) {
             throw std::runtime_error("cannot map input beneath archive destination: " +
-                                     path.string());
+                                     core::path_to_utf8(path));
         }
-        return join_archive_path(destination, relative.generic_string());
+        return join_archive_path(destination, core::generic_path_to_utf8(relative));
     };
     auto add_symlink = [&](const fs::path& path) {
         const fs::path target = fs::read_symlink(path, ec);
         if (ec) {
-            throw std::runtime_error("cannot read symbolic link: " + path.string());
+            throw std::runtime_error("cannot read symbolic link: " +
+                                     core::path_to_utf8(path));
         }
-        items.push_back({path, archive_path_for(path), false, true, target.generic_string()});
+        items.push_back({path, archive_path_for(path), false, true,
+                         core::generic_path_to_utf8(target)});
     };
 
     const fs::file_status status = fs::symlink_status(input.source, ec);
     if (ec) {
-        throw std::runtime_error("cannot inspect input: " + input.source.string());
+        throw std::runtime_error("cannot inspect input: " +
+                                 core::path_to_utf8(input.source));
     }
     if (fs::is_symlink(status)) {
         add_symlink(input.source);
         return;
     }
     if (!fs::exists(status)) {
-        throw std::runtime_error("input does not exist: " + input.source.string());
+        throw std::runtime_error("input does not exist: " +
+                                 core::path_to_utf8(input.source));
     }
     if (fs::is_regular_file(status)) {
         items.push_back({input.source, destination, false});
         return;
     }
     if (!fs::is_directory(status)) {
-        throw std::runtime_error("unsupported input type: " + input.source.string());
+        throw std::runtime_error("unsupported input type: " +
+                                 core::path_to_utf8(input.source));
     }
 
     items.push_back({input.source, destination, true});
@@ -529,7 +538,8 @@ void scan_input_at(const ArchiveInput& input, std::vector<ScanItem>& items,
         }
     }
     if (ec) {
-        throw std::runtime_error("failed while scanning input: " + input.source.string());
+        throw std::runtime_error("failed while scanning input: " +
+                                 core::path_to_utf8(input.source));
     }
 }
 
@@ -615,6 +625,32 @@ std::uint64_t scanned_file_bytes(const std::vector<ScanItem>& items) {
     return total;
 }
 
+bool open_input_with_retry(std::ifstream& input, const fs::path& path,
+                           unsigned retries,
+                           const std::shared_ptr<OperationControl>& operation) {
+    static constexpr std::array<unsigned, 4> kRetryDelayMs{100, 250, 500, 1000};
+    for (unsigned attempt = 0;; ++attempt) {
+        input.clear();
+        input.open(path, std::ios::binary);
+        if (input) return true;
+        input.close();
+        if (attempt >= retries) return false;
+        operation_checkpoint(operation);
+        const unsigned delay = kRetryDelayMs[
+            std::min<std::size_t>(attempt, kRetryDelayMs.size() - 1)];
+        std::this_thread::sleep_for(std::chrono::milliseconds(delay));
+    }
+}
+
+void report_skipped_input(const ScanItem& item,
+                          const std::shared_ptr<OperationControl>& operation) {
+    if (!operation) return;
+    operation->add_warning({
+        item.archive_path,
+        "Skipped because the file disappeared or access remained denied after retries.",
+    });
+}
+
 namespace {
 
 std::uint64_t archive_file_bytes(const ArchiveIndex& index) {
@@ -637,7 +673,9 @@ void report_operation(const std::shared_ptr<OperationControl>& operation,
                       std::uint64_t total_bytes,
                       std::uint64_t completed_items,
                       std::uint64_t total_items,
-                      std::string current_path) {
+                      std::string current_path,
+                      std::uint64_t current_file_completed_bytes,
+                      std::uint64_t current_file_total_bytes) {
     if (operation) {
         operation->report(OperationProgress{
             stage,
@@ -646,6 +684,8 @@ void report_operation(const std::shared_ptr<OperationControl>& operation,
             completed_items,
             total_items,
             std::move(current_path),
+            current_file_completed_bytes,
+            current_file_total_bytes,
         });
     }
 }
@@ -660,17 +700,68 @@ namespace {
 
 // ---- reading ---------------------------------------------------------------
 
+class RandomAccessArchiveSource {
+public:
+    virtual ~RandomAccessArchiveSource() = default;
+    virtual std::uint64_t size() const = 0;
+    virtual ByteVector read(std::uint64_t offset, std::uint64_t length) const = 0;
+    virtual void close() = 0;
+};
+
+std::shared_ptr<RandomAccessArchiveSource> try_open_volume_archive_source(
+    const fs::path& archive_path);
+
+// Owns either an ordinary archive file or a logical archive assembled from
+// direct, random-access reads over its numbered data volumes.
+class ArchiveStream {
+public:
+    ArchiveStream() = default;
+    ArchiveStream(std::ifstream stream, std::uint64_t base_offset,
+                  std::uint64_t size)
+        : stream_(std::move(stream)), base_offset_(base_offset), size_(size) {}
+    explicit ArchiveStream(std::shared_ptr<RandomAccessArchiveSource> source)
+        : source_(std::move(source)), size_(source_->size()) {}
+
+    ArchiveStream(ArchiveStream&&) noexcept = default;
+    ArchiveStream& operator=(ArchiveStream&&) noexcept = default;
+    ArchiveStream(const ArchiveStream&) = delete;
+    ArchiveStream& operator=(const ArchiveStream&) = delete;
+
+    std::uint64_t size() const { return size_; }
+
+    ByteVector read(std::uint64_t offset, std::uint64_t length) {
+        if (source_) return source_->read(offset, length);
+        stream_.clear();
+        stream_.seekg(static_cast<std::streamoff>(base_offset_ + offset), std::ios::beg);
+        ByteVector buffer(static_cast<std::size_t>(length));
+        if (length > 0) {
+            stream_.read(reinterpret_cast<char*>(buffer.data()),
+                         static_cast<std::streamsize>(length));
+            if (static_cast<std::uint64_t>(stream_.gcount()) != length) {
+                throw FormatError("archive is truncated");
+            }
+        }
+        return buffer;
+    }
+
+    void close() {
+        if (source_) source_->close();
+        if (stream_.is_open()) stream_.close();
+    }
+
+private:
+    std::ifstream stream_;
+    std::shared_ptr<RandomAccessArchiveSource> source_;
+    std::uint64_t base_offset_ = 0;
+    std::uint64_t size_ = 0;
+};
+
 // Random-access byte source for an archive, backed by either a file (so large
 // archives are read on demand, not loaded whole) or an in-memory span (used by
 // tests and fuzzers). Every read is bounds-checked.
 class ByteSource {
 public:
-    ByteSource(std::ifstream& stream, std::uint64_t size) : stream_(&stream), size_(size) {
-        const auto position = stream.tellg();
-        if (position > std::streampos(0)) {
-            base_offset_ = static_cast<std::uint64_t>(position);
-        }
-    }
+    ByteSource(ArchiveStream& stream, std::uint64_t size) : stream_(&stream), size_(size) {}
     explicit ByteSource(std::span<const std::uint8_t> data)
         : data_(data), size_(data.size()) {}
 
@@ -681,29 +772,24 @@ public:
             throw FormatError("archive is truncated");
         }
         if (stream_ != nullptr) {
-            stream_->seekg(static_cast<std::streamoff>(base_offset_ + offset), std::ios::beg);
-            ByteVector buffer(static_cast<std::size_t>(length));
-            if (length > 0) {
-                stream_->read(reinterpret_cast<char*>(buffer.data()),
-                              static_cast<std::streamsize>(length));
-                if (static_cast<std::uint64_t>(stream_->gcount()) != length) {
-                    throw FormatError("archive is truncated");
-                }
-            }
-            return buffer;
+            // Archive-test workers may decode different solid blocks in parallel.
+            // Serialize only the short random-access read; decompression happens
+            // after the lock is released.
+            std::lock_guard lock(stream_mutex_);
+            return stream_->read(offset, length);
         }
         return ByteVector(data_.begin() + static_cast<std::ptrdiff_t>(offset),
                           data_.begin() + static_cast<std::ptrdiff_t>(offset + length));
     }
 
 private:
-    std::ifstream* stream_ = nullptr;
+    ArchiveStream* stream_ = nullptr;
     std::span<const std::uint8_t> data_{};
     std::uint64_t size_ = 0;
-    std::uint64_t base_offset_ = 0;
+    mutable std::mutex stream_mutex_;
 };
 
-std::ifstream open_archive(const fs::path& archive_path, std::uint64_t& file_size);
+ArchiveStream open_archive(const fs::path& archive_path, std::uint64_t& file_size);
 
 // Where an archive's fixed structure points: directory location, plus the header
 // flags and (if the directory is encrypted) the plaintext preamble's extent.
@@ -951,19 +1037,22 @@ EncodedRecoveryService encode_recovery_service(
 
 // Shared with the other archive TUs via container_internal.hpp.
 void replace_archive_file(const fs::path& temporary, const fs::path& destination) {
-    std::error_code error;
-    fs::rename(temporary, destination, error);
-    if (!error) return;
-    fs::remove(destination, error);
-    fs::rename(temporary, destination, error);
-    if (error) throw std::runtime_error("failed to install archive: " + error.message());
+    core::replace_file(temporary, destination, "archive");
 }
 
 namespace {
 
+void reject_volume_mutation(const fs::path& archive_path) {
+    if (is_axiom_archive_volume(archive_path)) {
+        throw std::runtime_error(
+            "Axiom volume sets are read-only; join the volumes before modifying the archive");
+    }
+}
+
 void rewrite_recovery_service(const fs::path& archive_path, unsigned percent,
                               const std::shared_ptr<OperationControl>& operation,
                               std::size_t io_buffer_size = 0) {
+    reject_volume_mutation(archive_path);
     std::uint64_t file_size = 0;
     auto input = open_archive(archive_path, file_size);
     const ByteSource source(input, file_size);
@@ -1174,8 +1263,49 @@ inline std::array<std::uint8_t, 8> block_associated_data(std::uint64_t block_ind
     return ad;
 }
 
+ByteVector decode_solid_block(const ByteSource& source,
+                              const ArchiveIndex& index,
+                              std::uint64_t block_index,
+                              std::size_t thread_count,
+                              const std::shared_ptr<OperationControl>& operation,
+                              const std::optional<core::CryptoKey>& key,
+                              const std::function<void(std::uint64_t, std::uint64_t)>&
+                                  decoded_bytes_progress = {}) {
+    operation_checkpoint(operation);
+    if (block_index >= index.blocks.size()) {
+        throw FormatError("block index out of range");
+    }
+
+    const auto& record = index.blocks[block_index];
+    auto compressed = source.read(record.compressed_offset, record.compressed_size);
+    if (key) {
+        // Verify + decrypt before decompressing; the index is the AEAD's AD.
+        std::vector<std::uint8_t> plaintext;
+        if (!core::aead_open(*key, compressed, block_associated_data(block_index), plaintext)) {
+            throw FormatError("block authentication failed (wrong password or corrupt archive)");
+        }
+        compressed = std::move(plaintext);
+    }
+
+    // Bound the decode to this block's declared size; the equality check below
+    // then confirms the block produced exactly what the directory promised.
+    DecompressionOptions decode_options;
+    decode_options.max_output_size = static_cast<std::size_t>(record.uncompressed_size);
+    decode_options.thread_count = thread_count;
+    decode_options.operation = operation;
+    decode_options.decoded_bytes_progress = decoded_bytes_progress;
+    auto decoded = decompress(compressed, decode_options);
+    if (decoded.size() != record.uncompressed_size) {
+        throw FormatError("block expands to an unexpected size");
+    }
+    return decoded;
+}
+
 class BlockSource {
 public:
+    using DecodeProgressCallback =
+        std::function<void(std::uint64_t, std::uint64_t, std::uint64_t)>;
+
     BlockSource(const ByteSource& source,
                 const ArchiveIndex& index,
                 std::size_t thread_count,
@@ -1187,35 +1317,20 @@ public:
           operation_(std::move(operation)),
           key_(std::move(key)) {}
 
+    void set_decode_progress(DecodeProgressCallback callback) {
+        decode_progress_ = std::move(callback);
+    }
+
     const ByteVector& block(std::uint64_t block_index) {
         if (block_index != cached_index_) {
-            operation_checkpoint(operation_);
-            if (block_index >= index_.blocks.size()) {
-                throw FormatError("block index out of range");
-            }
-            const auto& record = index_.blocks[block_index];
-            auto compressed = source_.read(record.compressed_offset, record.compressed_size);
-            if (key_) {
-                // Verify + decrypt before decompressing; the index is the AEAD's AD.
-                std::vector<std::uint8_t> plaintext;
-                if (!core::aead_open(*key_, compressed, block_associated_data(block_index),
-                                     plaintext)) {
-                    throw FormatError(
-                        "block authentication failed (wrong password or corrupt archive)");
-                }
-                compressed = std::move(plaintext);
-            }
-            // Bound the decode to this block's declared size; the equality check
-            // below then confirms the block produced exactly what the directory
-            // promised.
-            DecompressionOptions decode_options;
-            decode_options.max_output_size = static_cast<std::size_t>(record.uncompressed_size);
-            decode_options.thread_count = thread_count_;
-            decode_options.operation = operation_;
-            cached_ = decompress(compressed, decode_options);
-            if (cached_.size() != record.uncompressed_size) {
-                throw FormatError("block expands to an unexpected size");
-            }
+            const auto progress = decode_progress_;
+            cached_ = decode_solid_block(
+                source_, index_, block_index, thread_count_, operation_, key_,
+                [progress, block_index](std::uint64_t done, std::uint64_t total) {
+                    if (progress) {
+                        progress(block_index, done, total);
+                    }
+                });
             cached_index_ = block_index;
         }
         return cached_;
@@ -1227,6 +1342,7 @@ private:
     std::size_t thread_count_ = 0;
     std::shared_ptr<OperationControl> operation_;
     std::optional<core::CryptoKey> key_;
+    DecodeProgressCallback decode_progress_;
     std::uint64_t cached_index_ = std::numeric_limits<std::uint64_t>::max();
     ByteVector cached_;
 };
@@ -1275,13 +1391,13 @@ std::uint64_t read_le64(const std::array<std::uint8_t, 8>& bytes) {
 }  // namespace
 
 // Shared with container_formats.cpp via container_internal.hpp (SFX detection).
-std::optional<std::pair<std::uint64_t, std::uint64_t>> sfx_embedded_archive_range(
+std::optional<std::pair<std::uint64_t, std::uint64_t>> sfx_embedded_payload_range(
     const fs::path& path) {
     std::ifstream stream(path, std::ios::binary);
     if (!stream) return std::nullopt;
     stream.seekg(0, std::ios::end);
     const auto end = stream.tellg();
-    if (end < std::streamoff(kSfxMagic.size() + 8 + kHeaderSize + kFooterSize)) {
+    if (end < std::streamoff(kSfxMagic.size() + 8 + 1)) {
         return std::nullopt;
     }
     const auto physical_size = static_cast<std::uint64_t>(end);
@@ -1297,11 +1413,22 @@ std::optional<std::pair<std::uint64_t, std::uint64_t>> sfx_embedded_archive_rang
     }
     const std::uint64_t archive_size = read_le64(size_bytes);
     const std::uint64_t trailer_size = kSfxMagic.size() + size_bytes.size();
-    if (archive_size < kHeaderSize + kFooterSize ||
-        archive_size > physical_size - trailer_size) {
+    if (archive_size == 0 || archive_size > physical_size - trailer_size) {
         return std::nullopt;
     }
     const std::uint64_t archive_offset = physical_size - trailer_size - archive_size;
+    return std::make_pair(archive_offset, archive_size);
+}
+
+std::optional<std::pair<std::uint64_t, std::uint64_t>> sfx_embedded_archive_range(
+    const fs::path& path) {
+    const auto embedded = sfx_embedded_payload_range(path);
+    if (!embedded || embedded->second < kHeaderSize + kFooterSize) {
+        return std::nullopt;
+    }
+    std::ifstream stream(path, std::ios::binary);
+    if (!stream) return std::nullopt;
+    const std::uint64_t archive_offset = embedded->first;
     stream.seekg(static_cast<std::streamoff>(archive_offset), std::ios::beg);
     std::array<std::uint8_t, 8> header{};
     stream.read(reinterpret_cast<char*>(header.data()),
@@ -1309,15 +1436,20 @@ std::optional<std::pair<std::uint64_t, std::uint64_t>> sfx_embedded_archive_rang
     if (!stream || !std::equal(kArchiveMagic.begin(), kArchiveMagic.end(), header.begin())) {
         return std::nullopt;
     }
-    return std::make_pair(archive_offset, archive_size);
+    return embedded;
 }
 
 namespace {
 
-std::ifstream open_archive(const fs::path& archive_path, std::uint64_t& file_size) {
+ArchiveStream open_archive(const fs::path& archive_path, std::uint64_t& file_size) {
+    if (auto volumes = try_open_volume_archive_source(archive_path)) {
+        file_size = volumes->size();
+        return ArchiveStream(std::move(volumes));
+    }
     std::ifstream stream(archive_path, std::ios::binary);
     if (!stream) {
-        throw std::runtime_error("cannot open archive: " + archive_path.string());
+        throw std::runtime_error("cannot open archive: " +
+                                 core::path_to_utf8(archive_path));
     }
     stream.seekg(0, std::ios::end);
     file_size = static_cast<std::uint64_t>(stream.tellg());
@@ -1326,8 +1458,7 @@ std::ifstream open_archive(const fs::path& archive_path, std::uint64_t& file_siz
         archive_offset = embedded->first;
         file_size = embedded->second;
     }
-    stream.seekg(static_cast<std::streamoff>(archive_offset), std::ios::beg);
-    return stream;
+    return ArchiveStream(std::move(stream), archive_offset, file_size);
 }
 
 // Compress a list of scanned items into solid blocks, appending to `out` and to the
@@ -1341,6 +1472,7 @@ void compress_items_into(std::ofstream& out, std::uint64_t& written,
                          const std::shared_ptr<OperationControl>& operation,
                          std::uint64_t total_bytes, std::uint64_t total_items,
                          std::uint64_t& completed_bytes_out, std::uint64_t& completed_items_out,
+                         bool allow_unreadable_skips,
                          const core::CryptoKey* key = nullptr) {
     ByteVector buffer;
     std::uint64_t current_block = blocks.size();
@@ -1356,122 +1488,234 @@ void compress_items_into(std::ofstream& out, std::uint64_t& written,
     // first stored; later paths sharing that identity become hardlink entries.
     std::map<std::tuple<std::uint64_t, std::uint64_t, std::uint64_t>, std::string> hardlinks;
 
-    // Depth-1 compression pipeline: this thread reads and hashes file bytes
-    // into solid blocks while one background worker compresses, seals, and
-    // writes completed blocks in order. compress() is internally parallel, so
-    // the worker keeps every core busy while the reader hides file I/O and
-    // hashing behind it; the depth-1 slot bounds memory to one extra block.
+    // The usual pipeline overlaps one reader with a codec that consumes all
+    // cores. Thorough profiles are different: their ratio is limited by the
+    // per-codec-block window, so feeding every core from one solid block turns
+    // a 64 MiB solid block into many 4 MiB match windows. Split the core budget
+    // across a few independent solid-block jobs instead. Each job still emits a
+    // normal self-contained .axc block; only scheduling and writer policy vary.
+    const auto thread_budget = selected_thread_count(options.thread_count);
+    const bool use_outer_parallelism =
+        options.enable_optimal_parser && block_size >= (std::size_t{4} << 20) &&
+        thread_budget >= 8;
+    const auto outer_worker_count = use_outer_parallelism
+        // Two outer jobs keep 8 MiB-or-larger inner windows on a 16-core
+        // machine without multiplying the optimal parser's large working set
+        // into a cache and memory-bandwidth bottleneck.
+        ? std::min<std::size_t>(2, thread_budget / 4)
+        : std::size_t{1};
+    const auto inner_thread_count = std::max<std::size_t>(
+        1, thread_budget / outer_worker_count);
+    const auto max_inflight_blocks = outer_worker_count * 2;
+
     struct PendingBlock {
+        std::uint64_t index = 0;
         ByteVector data;
         std::string path;
     };
-    std::mutex pipeline_mutex;
-    std::condition_variable pipeline_cv;
-    std::optional<PendingBlock> pending;
-    bool pipeline_done = false;
-    std::exception_ptr pipeline_error;
-
-    auto compress_and_write = [&](PendingBlock block) {
-        report_operation(operation, OperationStage::compressing, completed_bytes, total_bytes,
-                         completed_items, total_items, block.path);
-        const auto block_base = completed_bytes.load(std::memory_order_relaxed);
-        std::atomic<std::uint64_t> reported{0};
-        auto block_options = options;
-        block_options.encoded_bytes_progress = [&](std::uint64_t done) {
-            // Codec workers deliver cumulative high-water values, possibly out
-            // of order; only an increase is worth reporting.
-            auto previous = reported.load(std::memory_order_relaxed);
-            do {
-                if (done <= previous) {
-                    return;
-                }
-            } while (!reported.compare_exchange_weak(previous, done,
-                                                     std::memory_order_relaxed));
-            report_operation(operation, OperationStage::compressing, block_base + done,
-                             total_bytes, completed_items, total_items, block.path);
-        };
-        auto compressed = compress(block.data, block_options);
-        completed_bytes.store(block_base + block.data.size(), std::memory_order_relaxed);
-        if (key != nullptr) {
-            // Seal the block, binding its index as associated data so blocks cannot
-            // be reordered or transplanted between archives.
-            const auto ad = block_associated_data(blocks.size());
-            compressed = core::aead_seal(*key, compressed, ad);
-        }
-        operation_checkpoint(operation);
-        blocks.push_back({written, static_cast<std::uint64_t>(compressed.size()),
-                          static_cast<std::uint64_t>(block.data.size())});
-        out.write(reinterpret_cast<const char*>(compressed.data()),
-                  static_cast<std::streamsize>(compressed.size()));
-        if (!out) {
-            throw std::runtime_error("failed while writing archive blocks");
-        }
-        written += compressed.size();
-        report_operation(operation, OperationStage::writing, completed_bytes, total_bytes,
-                         completed_items, total_items, std::move(block.path));
+    struct CompletedBlock {
+        std::uint64_t index = 0;
+        std::uint64_t original_size = 0;
+        ByteVector payload;
+        std::string path;
     };
 
-    std::thread pipeline_worker([&] {
+    std::mutex pipeline_mutex;
+    std::condition_variable pipeline_cv;
+    std::deque<PendingBlock> pending;
+    std::map<std::uint64_t, CompletedBlock> completed;
+    std::size_t inflight_blocks = 0;
+    bool pipeline_done = false;
+    std::exception_ptr pipeline_error;
+    std::uint64_t next_write_block = current_block;
+    std::atomic<std::uint64_t> reported_progress{completed_bytes_out};
+    // Bytes the in-flight solid blocks' encoders have scanned so far, summed
+    // across the concurrent jobs. Each block contributes its own monotonic
+    // share; a shared base+done high-water mark would let the furthest block's
+    // first tick swallow every earlier block's progress and reduce the bar to
+    // solid-block-sized jumps.
+    std::atomic<std::uint64_t> inflight_done{0};
+
+    auto publish_progress = [&](const std::string& path) {
+        const auto total = completed_bytes.load(std::memory_order_relaxed) +
+                           inflight_done.load(std::memory_order_relaxed);
+        // Max-clamp the displayed value: the completed/in-flight handoff below
+        // is two atomics, so a racing reader could otherwise glimpse a dip.
+        auto previous = reported_progress.load(std::memory_order_relaxed);
+        do {
+            if (total <= previous) {
+                return;
+            }
+        } while (!reported_progress.compare_exchange_weak(previous, total,
+                                                          std::memory_order_relaxed));
+        report_operation(operation, OperationStage::compressing, total,
+                         total_bytes, completed_items, total_items, path);
+    };
+
+    auto compress_block = [&](PendingBlock block) {
+        report_operation(operation, OperationStage::compressing,
+                         reported_progress.load(std::memory_order_relaxed), total_bytes,
+                         completed_items, total_items, block.path);
+        auto block_options = options;
+        block_options.thread_count = inner_thread_count;
+        auto block_done = std::make_shared<std::atomic<std::uint64_t>>(0);
+        block_options.encoded_bytes_progress =
+            [&, block_done, path = block.path](std::uint64_t done) {
+                // The codec reports cumulative scanned bytes for this block,
+                // possibly out of order across its workers: keep the per-block
+                // maximum and add only the increase to the shared sum.
+                auto previous = block_done->load(std::memory_order_relaxed);
+                do {
+                    if (done <= previous) {
+                        return;
+                    }
+                } while (!block_done->compare_exchange_weak(previous, done,
+                                                            std::memory_order_relaxed));
+                inflight_done.fetch_add(done - previous, std::memory_order_relaxed);
+                publish_progress(path);
+            };
+        auto compressed = compress(block.data, block_options);
+        if (key != nullptr) {
+            // The block index is allocated at dispatch, so parallel completion
+            // cannot change the AEAD associated data or archive byte order.
+            const auto ad = block_associated_data(block.index);
+            compressed = core::aead_seal(*key, compressed, ad);
+        }
+        // Move this block from in-flight to completed; subtracting first keeps
+        // the max-clamped display from overshooting the true total.
+        inflight_done.fetch_sub(block_done->load(std::memory_order_relaxed),
+                                std::memory_order_relaxed);
+        completed_bytes.fetch_add(block.data.size(), std::memory_order_relaxed);
+        publish_progress(block.path);
+        return CompletedBlock{block.index, static_cast<std::uint64_t>(block.data.size()),
+                              std::move(compressed), std::move(block.path)};
+    };
+
+    auto pipeline_worker = [&] {
         try {
             while (true) {
                 PendingBlock block;
                 {
                     std::unique_lock lock(pipeline_mutex);
-                    pipeline_cv.wait(lock, [&] { return pending.has_value() || pipeline_done; });
-                    if (!pending.has_value()) {
-                        return;  // done and drained
+                    pipeline_cv.wait(lock, [&] {
+                        return pipeline_error || !pending.empty() || pipeline_done;
+                    });
+                    if (pipeline_error || pending.empty()) {
+                        return;  // failed, or done and drained
                     }
-                    block = std::move(*pending);
-                    pending.reset();
+                    block = std::move(pending.front());
+                    pending.pop_front();
                 }
-                pipeline_cv.notify_all();  // the handoff slot is free again
-                compress_and_write(std::move(block));
+                pipeline_cv.notify_all();
+
+                auto result = compress_block(std::move(block));
+                {
+                    std::lock_guard lock(pipeline_mutex);
+                    completed.emplace(result.index, std::move(result));
+                }
+                pipeline_cv.notify_all();
             }
         } catch (...) {
             {
                 std::lock_guard lock(pipeline_mutex);
                 pipeline_error = std::current_exception();
-                pending.reset();  // unblock a reader waiting on the slot
+                pending.clear();  // unblock a reader waiting on capacity
             }
             pipeline_cv.notify_all();
         }
-    });
+    };
 
-    // Stop and join the worker on every exit path (including reader-side
-    // exceptions and cancellation), so the thread never outlives the locals.
+    std::vector<std::thread> pipeline_workers;
+    pipeline_workers.reserve(outer_worker_count);
+    for (std::size_t i = 0; i < outer_worker_count; ++i) {
+        pipeline_workers.emplace_back(pipeline_worker);
+    }
+
+    // Stop and join workers on every exit path (including reader-side
+    // exceptions and cancellation), so no task can outlive these locals.
     struct PipelineGuard {
         std::mutex& mutex;
         std::condition_variable& cv;
         bool& done;
-        std::thread& worker;
+        std::deque<PendingBlock>& pending;
+        std::vector<std::thread>& workers;
         ~PipelineGuard() {
             {
                 std::lock_guard lock(mutex);
                 done = true;
+                pending.clear();
             }
             cv.notify_all();
-            if (worker.joinable()) {
-                worker.join();
+            for (auto& worker : workers) {
+                if (worker.joinable()) {
+                    worker.join();
+                }
             }
         }
-    } pipeline_guard{pipeline_mutex, pipeline_cv, pipeline_done, pipeline_worker};
+    } pipeline_guard{pipeline_mutex, pipeline_cv, pipeline_done, pending, pipeline_workers};
+
+    auto drain_completed = [&] {
+        while (true) {
+            CompletedBlock block;
+            {
+                std::lock_guard lock(pipeline_mutex);
+                const auto found = completed.find(next_write_block);
+                if (found == completed.end()) {
+                    return;
+                }
+                block = std::move(found->second);
+                completed.erase(found);
+                --inflight_blocks;
+                ++next_write_block;
+            }
+            pipeline_cv.notify_all();
+
+            operation_checkpoint(operation);
+            blocks.push_back({written, static_cast<std::uint64_t>(block.payload.size()),
+                              block.original_size});
+            out.write(reinterpret_cast<const char*>(block.payload.data()),
+                      static_cast<std::streamsize>(block.payload.size()));
+            if (!out) {
+                throw std::runtime_error("failed while writing archive blocks");
+            }
+            written += block.payload.size();
+            report_operation(operation, OperationStage::writing,
+                             completed_bytes.load(std::memory_order_relaxed), total_bytes,
+                             completed_items, total_items, std::move(block.path));
+        }
+    };
 
     auto flush_block = [&](std::string current_path = {}) {
         if (buffer.empty()) {
             return;
         }
-        std::unique_lock lock(pipeline_mutex);
-        pipeline_cv.wait(lock, [&] { return !pending.has_value() || pipeline_error; });
-        if (pipeline_error) {
-            const auto error = pipeline_error;
-            lock.unlock();
-            std::rethrow_exception(error);
+
+        while (true) {
+            drain_completed();
+            std::unique_lock lock(pipeline_mutex);
+            if (pipeline_error) {
+                const auto error = pipeline_error;
+                lock.unlock();
+                std::rethrow_exception(error);
+            }
+            if (inflight_blocks < max_inflight_blocks) {
+                const auto index = current_block++;
+                pending.push_back(PendingBlock{index, std::move(buffer),
+                                               std::move(current_path)});
+                ++inflight_blocks;
+                lock.unlock();
+                pipeline_cv.notify_one();
+                buffer = ByteVector{};
+                return;
+            }
+
+            // Only the reader writes blocks. Wait until the next ordered
+            // completion is available, then drain it before accepting more
+            // input so memory remains bounded by max_inflight_blocks.
+            pipeline_cv.wait(lock, [&] {
+                return pipeline_error || completed.contains(next_write_block);
+            });
         }
-        pending = PendingBlock{std::move(buffer), std::move(current_path)};
-        lock.unlock();
-        pipeline_cv.notify_all();
-        buffer = ByteVector{};
-        ++current_block;
     };
 
     for (const auto& item : items) {
@@ -1512,6 +1756,21 @@ void compress_items_into(std::ofstream& out, std::uint64_t& written,
             continue;
         }
 
+        std::ifstream in;
+        if (!open_input_with_retry(in, item.absolute, options.input_open_retries,
+                                   operation)) {
+            if (!allow_unreadable_skips) {
+                throw std::runtime_error("cannot read input file: " +
+                                         core::path_to_utf8(item.absolute));
+            }
+            report_skipped_input(item, operation);
+            ++completed_items;
+            report_operation(operation, OperationStage::reading, completed_bytes,
+                             total_bytes, completed_items, total_items,
+                             item.archive_path);
+            continue;
+        }
+
         // A regular file that shares its identity with one already stored is a hard
         // link: record a reference to the first path instead of duplicating bytes.
         if (auto id = core::hardlink_identity(item.absolute)) {
@@ -1535,16 +1794,16 @@ void compress_items_into(std::ofstream& out, std::uint64_t& written,
         entry.first_block = current_block;
         entry.offset = buffer.size();
 
-        std::ifstream in(item.absolute, std::ios::binary);
-        if (!in) {
-            throw std::runtime_error("cannot read input file: " + item.absolute.string());
-        }
-
         auto crc = core::crc32_init();
         core::Blake3 hasher;
         std::uint64_t total = 0;
+        std::error_code size_error;
+        std::uint64_t file_total = fs::file_size(item.absolute, size_error);
+        if (size_error) {
+            file_total = 0;
+        }
         report_operation(operation, OperationStage::reading, completed_bytes, total_bytes,
-                         completed_items, total_items, item.archive_path);
+                         completed_items, total_items, item.archive_path, 0, file_total);
         while (in) {
             operation_checkpoint(operation);
             in.read(io_buffer.data(), static_cast<std::streamsize>(io_buffer.size()));
@@ -1563,10 +1822,15 @@ void compress_items_into(std::ofstream& out, std::uint64_t& written,
             // which is where the wall time actually goes.
             buffer.insert(buffer.end(), bytes.begin(), bytes.end());
             report_operation(operation, OperationStage::reading, completed_bytes, total_bytes,
-                             completed_items, total_items, item.archive_path);
+                             completed_items, total_items, item.archive_path, total,
+                             std::max(total, file_total));
             if (buffer.size() >= block_size) {
                 flush_block(item.archive_path);
             }
+        }
+        if (in.bad()) {
+            throw std::runtime_error("failed while reading input file: " +
+                                     core::path_to_utf8(item.absolute));
         }
 
         entry.size = total;
@@ -1577,20 +1841,39 @@ void compress_items_into(std::ofstream& out, std::uint64_t& written,
         entries.push_back(std::move(entry));
         ++completed_items;
         report_operation(operation, OperationStage::reading, completed_bytes, total_bytes,
-                         completed_items, total_items, item.archive_path);
+                         completed_items, total_items, item.archive_path, total, total);
     }
     flush_block();
 
-    // Drain the pipeline: the caller reads blocks/written when we return, and a
-    // worker-side failure (compression or archive write) must surface here.
+    // Stop accepting work, then drain completed blocks in their original order.
+    // The central directory records those block indices, so writing in completion
+    // order would be a valid but non-deterministic archive layout.
     {
         std::lock_guard lock(pipeline_mutex);
         pipeline_done = true;
     }
     pipeline_cv.notify_all();
-    pipeline_worker.join();
-    if (pipeline_error) {
-        std::rethrow_exception(pipeline_error);
+
+    while (true) {
+        drain_completed();
+        std::unique_lock lock(pipeline_mutex);
+        if (pipeline_error) {
+            const auto error = pipeline_error;
+            lock.unlock();
+            std::rethrow_exception(error);
+        }
+        if (inflight_blocks == 0) {
+            break;
+        }
+        pipeline_cv.wait(lock, [&] {
+            return pipeline_error || completed.contains(next_write_block);
+        });
+    }
+
+    for (auto& worker : pipeline_workers) {
+        if (worker.joinable()) {
+            worker.join();
+        }
     }
     completed_bytes_out = completed_bytes;
     completed_items_out = completed_items;
@@ -1934,6 +2217,7 @@ void write_directory_and_footer(std::ofstream& out, std::uint64_t written,
 void rebuild_archive_keeping(const fs::path& archive_path,
                              const std::function<bool(const EntryRec&)>& keep,
                              const CompressionOptions& options) {
+    reject_volume_mutation(archive_path);
     const auto operation = options.operation;
 
     std::uint64_t file_size = 0;
@@ -1974,7 +2258,8 @@ void rebuild_archive_keeping(const fs::path& archive_path,
     TempFileGuard temp_guard(temp_path);
     std::ofstream out(temp_path, std::ios::binary | std::ios::trunc);
     if (!out) {
-        throw std::runtime_error("cannot create archive: " + temp_path.string());
+        throw std::runtime_error("cannot create archive: " +
+                                 core::path_to_utf8(temp_path));
     }
 
     ByteVector header;
@@ -2100,6 +2385,7 @@ void rebuild_archive_keeping(const fs::path& archive_path,
 void append_items_to_archive(const fs::path& archive_path, const std::vector<ScanItem>& items,
                              const CompressionOptions& options,
                              const ArchiveMeta* meta_override = nullptr) {
+    reject_volume_mutation(archive_path);
     const auto operation = options.operation;
 
     // Read the existing archive's directory; new solid blocks are appended after its
@@ -2163,7 +2449,8 @@ void append_items_to_archive(const fs::path& archive_path, const std::vector<Sca
     TempFileGuard temp_guard(temp_path);
     std::ofstream out(temp_path, std::ios::binary | std::ios::trunc);
     if (!out) {
-        throw std::runtime_error("cannot create archive: " + temp_path.string());
+        throw std::runtime_error("cannot create archive: " +
+                                 core::path_to_utf8(temp_path));
     }
 
     // Copy the existing header + block region verbatim — the existing files are not
@@ -2171,7 +2458,8 @@ void append_items_to_archive(const fs::path& archive_path, const std::vector<Sca
     {
         std::ifstream src(archive_path, std::ios::binary);
         if (!src) {
-            throw std::runtime_error("cannot open archive: " + archive_path.string());
+            throw std::runtime_error("cannot open archive: " +
+                                     core::path_to_utf8(archive_path));
         }
         std::uint64_t remaining = block_region_end;
         std::vector<char> chunk(effective_io_buffer_size(options.io_buffer_size));
@@ -2191,7 +2479,8 @@ void append_items_to_archive(const fs::path& archive_path, const std::vector<Sca
     std::uint64_t written = block_region_end;
 
     compress_items_into(out, written, blocks, entries, items, options, block_size, operation,
-                        total_bytes, total_items, completed_bytes, completed_items, key_ptr);
+                        total_bytes, total_items, completed_bytes, completed_items, false,
+                        key_ptr);
     if (key) {
         core::secure_wipe(*key);
     }
@@ -2222,6 +2511,7 @@ void append_items_to_archive(const fs::path& archive_path, const std::vector<Sca
 
 void rewrite_archive_directory(const fs::path& archive_path, ArchiveIndex index,
                                const CompressionOptions& options) {
+    reject_volume_mutation(archive_path);
     const auto operation = options.operation;
     std::uint64_t file_size = 0;
     auto in = open_archive(archive_path, file_size);
@@ -2250,29 +2540,24 @@ void rewrite_archive_directory(const fs::path& archive_path, ArchiveIndex index,
     TempFileGuard temp_guard(temp_path);
     std::ofstream out(temp_path, std::ios::binary | std::ios::trunc);
     if (!out) {
-        throw std::runtime_error("cannot create archive: " + temp_path.string());
+        throw std::runtime_error("cannot create archive: " +
+                                 core::path_to_utf8(temp_path));
     }
 
     std::uint64_t copied = 0;
     const std::uint64_t total_items = index.entries.size();
     report_operation(operation, OperationStage::writing, 0, block_region_end, 0, total_items);
-    in.clear();
-    in.seekg(0, std::ios::beg);
-    std::vector<char> chunk(effective_io_buffer_size(options.io_buffer_size));
+    const auto chunk_size = effective_io_buffer_size(options.io_buffer_size);
     while (copied < block_region_end) {
         operation_checkpoint(operation);
-        const auto want = static_cast<std::streamsize>(
-            std::min<std::uint64_t>(block_region_end - copied, chunk.size()));
-        in.read(chunk.data(), want);
-        const auto got = in.gcount();
-        if (got <= 0) {
-            throw std::runtime_error("archive truncated while copying blocks");
-        }
-        out.write(chunk.data(), got);
+        const auto want = std::min<std::uint64_t>(block_region_end - copied, chunk_size);
+        const auto chunk = source.read(copied, want);
+        out.write(reinterpret_cast<const char*>(chunk.data()),
+                  static_cast<std::streamsize>(chunk.size()));
         if (!out) {
             throw std::runtime_error("failed while copying archive blocks");
         }
-        copied += static_cast<std::uint64_t>(got);
+        copied += want;
         report_operation(operation, OperationStage::writing, copied, block_region_end,
                          0, total_items);
     }
@@ -2308,6 +2593,7 @@ void rewrite_archive_directory(const fs::path& archive_path, ArchiveIndex index,
 void create_archive(const std::vector<std::filesystem::path>& inputs,
                     const std::filesystem::path& archive_path,
                     const CompressionOptions& options) {
+    reject_volume_mutation(archive_path);
     const auto operation = options.operation;
     report_operation(operation, OperationStage::scanning, 0, 0, 0, inputs.size());
 
@@ -2331,7 +2617,8 @@ void create_archive(const std::vector<std::filesystem::path>& inputs,
     TempFileGuard temp_guard(temp_path);
     std::ofstream out(temp_path, std::ios::binary | std::ios::trunc);
     if (!out) {
-        throw std::runtime_error("cannot create archive: " + temp_path.string());
+        throw std::runtime_error("cannot create archive: " +
+                                 core::path_to_utf8(temp_path));
     }
 
     // Encryption (optional). Derive the key + key-check first so we can flag the
@@ -2366,7 +2653,8 @@ void create_archive(const std::vector<std::filesystem::path>& inputs,
     std::vector<BlockRec> blocks;
     std::vector<EntryRec> entries;
     compress_items_into(out, written, blocks, entries, items, options, block_size, operation,
-                        total_bytes, total_items, completed_bytes, completed_items, key_ptr);
+                        total_bytes, total_items, completed_bytes, completed_items,
+                        options.skip_unreadable_files, key_ptr);
 
     report_operation(operation, OperationStage::finalizing, completed_bytes, total_bytes,
                      completed_items, total_items);
@@ -2807,7 +3095,10 @@ ByteVector serialize_volume_header(const VolumeHeader& header) {
 
 VolumeHeader read_volume_header(const fs::path& path) {
     std::ifstream input(path, std::ios::binary);
-    if (!input) throw std::runtime_error("cannot open archive volume: " + path.string());
+    if (!input) {
+        throw std::runtime_error("cannot open archive volume: " +
+                                 core::path_to_utf8(path));
+    }
     ByteVector bytes(kVolumeHeaderSize);
     input.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
     if (input.gcount() != static_cast<std::streamsize>(bytes.size()) ||
@@ -2862,11 +3153,120 @@ fs::path recovery_volume_path(const fs::path& root, unsigned index) {
     return fs::path(root.wstring() + L".rev" + three_digit(index + 1));
 }
 
+bool compatible_volume_header(const VolumeHeader& header, const VolumeHeader& seed,
+                              bool recovery, std::uint32_t index) {
+    return header.recovery == recovery && header.index == index &&
+           header.data_count == seed.data_count &&
+           header.parity_count == seed.parity_count &&
+           header.shard_size == seed.shard_size &&
+           header.archive_size == seed.archive_size && header.digest == seed.digest;
+}
+
+class DirectVolumeArchiveSource final : public RandomAccessArchiveSource {
+public:
+    DirectVolumeArchiveSource(fs::path root, VolumeHeader seed)
+        : root_(std::move(root)), seed_(std::move(seed)), streams_(seed_.data_count) {
+        const std::uint64_t expected_data_count = seed_.archive_size == 0 ? 0 :
+            1 + (seed_.archive_size - 1) / seed_.shard_size;
+        if (expected_data_count != seed_.data_count) {
+            throw FormatError("archive volume set has inconsistent size parameters");
+        }
+        paths_.reserve(seed_.data_count);
+        for (std::uint32_t index = 0; index < seed_.data_count; ++index) {
+            const fs::path path = data_volume_path(root_, index);
+            std::error_code error;
+            if (!fs::is_regular_file(path, error)) {
+                throw FormatError("archive data volume " + std::to_string(index + 1) +
+                                  " is missing; reconstruct the set with its recovery volumes");
+            }
+            const auto header = read_volume_header(path);
+            if (!compatible_volume_header(header, seed_, false, index)) {
+                throw FormatError("archive data volume " + std::to_string(index + 1) +
+                                  " belongs to a different volume set");
+            }
+            const std::uint64_t offset = static_cast<std::uint64_t>(index) * seed_.shard_size;
+            const std::uint64_t payload_size = std::min(seed_.shard_size,
+                                                        seed_.archive_size - offset);
+            const auto physical_size = fs::file_size(path, error);
+            if (error || physical_size != kVolumeHeaderSize + payload_size) {
+                throw FormatError("archive data volume " + std::to_string(index + 1) +
+                                  " is truncated; reconstruct the set with its recovery volumes");
+            }
+            paths_.push_back(path);
+        }
+    }
+
+    std::uint64_t size() const override { return seed_.archive_size; }
+
+    ByteVector read(std::uint64_t offset, std::uint64_t length) const override {
+        if (length > seed_.archive_size || offset > seed_.archive_size - length) {
+            throw FormatError("archive is truncated");
+        }
+        ByteVector bytes(static_cast<std::size_t>(length));
+        std::uint64_t remaining = length;
+        std::uint64_t logical = offset;
+        std::size_t output_offset = 0;
+        while (remaining != 0) {
+            const auto index = static_cast<std::size_t>(logical / seed_.shard_size);
+            const std::uint64_t within = logical % seed_.shard_size;
+            const std::uint64_t count = std::min(remaining, seed_.shard_size - within);
+            auto& stream = streams_[index];
+            if (!stream) {
+                stream = std::make_unique<std::ifstream>(paths_[index], std::ios::binary);
+                if (!*stream) {
+                    throw std::runtime_error("cannot open archive data volume: " +
+                                             core::path_to_utf8(paths_[index]));
+                }
+            }
+            stream->clear();
+            stream->seekg(static_cast<std::streamoff>(kVolumeHeaderSize + within),
+                          std::ios::beg);
+            stream->read(reinterpret_cast<char*>(bytes.data() + output_offset),
+                         static_cast<std::streamsize>(count));
+            if (static_cast<std::uint64_t>(stream->gcount()) != count) {
+                throw FormatError("archive data volume " + std::to_string(index + 1) +
+                                  " became truncated while it was being read");
+            }
+            logical += count;
+            remaining -= count;
+            output_offset += static_cast<std::size_t>(count);
+        }
+        return bytes;
+    }
+
+    void close() override {
+        for (auto& stream : streams_) stream.reset();
+    }
+
+private:
+    fs::path root_;
+    VolumeHeader seed_;
+    std::vector<fs::path> paths_;
+    mutable std::vector<std::unique_ptr<std::ifstream>> streams_;
+};
+
+std::shared_ptr<RandomAccessArchiveSource> try_open_volume_archive_source(
+    const fs::path& archive_path) {
+    std::ifstream probe(archive_path, std::ios::binary);
+    if (!probe) return nullptr;
+    std::array<std::uint8_t, kVolumeMagic.size()> magic{};
+    probe.read(reinterpret_cast<char*>(magic.data()),
+               static_cast<std::streamsize>(magic.size()));
+    if (probe.gcount() != static_cast<std::streamsize>(magic.size()) ||
+        magic != kVolumeMagic) {
+        return nullptr;
+    }
+    const auto seed = read_volume_header(archive_path);
+    return std::make_shared<DirectVolumeArchiveSource>(volume_root(archive_path), seed);
+}
+
 core::Blake3Digest hash_file(const fs::path& path,
                              const std::shared_ptr<OperationControl>& operation = nullptr,
                              std::size_t io_buffer_size = 0) {
     std::ifstream input(path, std::ios::binary);
-    if (!input) throw std::runtime_error("cannot open archive: " + path.string());
+    if (!input) {
+        throw std::runtime_error("cannot open archive: " + core::path_to_utf8(path));
+    }
     core::Blake3 hash;
     std::vector<std::uint8_t> buffer(effective_io_buffer_size(io_buffer_size));
     while (input) {
@@ -2917,6 +3317,7 @@ void set_archive_recovery(const std::filesystem::path& archive_path, unsigned pe
 
 bool repair_archive(const std::filesystem::path& archive_path,
                     const std::shared_ptr<OperationControl>& operation) {
+    reject_volume_mutation(archive_path);
     std::uint64_t file_size = 0;
     auto input = open_archive(archive_path, file_size);
     const ByteSource source(input, file_size);
@@ -3010,6 +3411,7 @@ ArchiveVolumeSetInfo create_archive_volumes(
     const std::filesystem::path& archive_path, std::uint64_t volume_size,
     unsigned recovery_volume_count,
     const std::shared_ptr<OperationControl>& operation) {
+    reject_volume_mutation(archive_path);
     if (volume_size == 0 || volume_size > std::numeric_limits<std::size_t>::max()) {
         throw std::invalid_argument("volume size is out of range");
     }
@@ -3090,7 +3492,8 @@ ArchiveVolumeSetInfo create_archive_volumes(
             created.push_back(path);
             report_operation(operation, OperationStage::writing,
                              std::min(archive_size, offset + actual), archive_size,
-                             index + 1, data_count + parity_count, path.filename().string());
+                             index + 1, data_count + parity_count,
+                             core::path_to_utf8(path.filename()));
         }
         for (int index = 0; index < parity_count; ++index) {
             VolumeHeader header{true, static_cast<std::uint32_t>(index),
@@ -3112,6 +3515,29 @@ ArchiveVolumeSetInfo create_archive_volumes(
 ArchiveVolumeSetInfo archive_volume_set_info(const std::filesystem::path& any_volume) {
     const auto header = read_volume_header(any_volume);
     return {header.data_count, header.parity_count, header.shard_size, header.archive_size};
+}
+
+bool is_axiom_archive_volume(const std::filesystem::path& path) noexcept {
+    try {
+        (void)read_volume_header(path);
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+bool archive_volume_data_set_complete(const std::filesystem::path& any_volume) noexcept {
+    try {
+        return try_open_volume_archive_source(any_volume) != nullptr;
+    } catch (...) {
+        return false;
+    }
+}
+
+std::filesystem::path archive_volume_primary_path(
+    const std::filesystem::path& any_volume) {
+    (void)read_volume_header(any_volume);
+    return data_volume_path(volume_root(any_volume), 0);
 }
 
 void join_archive_volumes(const std::filesystem::path& any_volume,
@@ -3155,7 +3581,13 @@ void join_archive_volumes(const std::filesystem::path& any_volume,
             return recovery_crc(shard) == header.payload_crc;
         } catch (const FormatError&) {
             throw;
-        } catch (...) {
+        } catch (const OperationCancelled&) {
+            throw;
+        } catch (const std::bad_alloc&) {
+            throw;
+        } catch (const std::exception&) {
+            // I/O failures reading a shard mean this volume is unusable, which
+            // recovery treats the same as a missing volume.
             return false;
         }
     };
@@ -3193,7 +3625,8 @@ void join_archive_volumes(const std::filesystem::path& any_volume,
             shards[static_cast<std::size_t>(index)].data(), count));
         written += count;
         report_operation(operation, OperationStage::writing, written, seed.archive_size,
-                         index + 1, data_count, output_archive.filename().string());
+                         index + 1, data_count,
+                         core::path_to_utf8(output_archive.filename()));
     }
     output.close();
     if (!output) throw std::runtime_error("failed to join archive volumes");
@@ -3210,6 +3643,7 @@ ArchiveSigningKey generate_archive_signing_key() {
 void sign_archive(const std::filesystem::path& archive_path,
                   const ArchiveSigningKey& key,
                   const CompressionOptions& options) {
+    reject_volume_mutation(archive_path);
     std::uint64_t file_size = 0;
     auto stream = open_archive(archive_path, file_size);
     const ByteSource source(stream, file_size);
@@ -3280,10 +3714,14 @@ void create_sfx_archive(const std::filesystem::path& archive_path,
     const std::size_t io_chunk = effective_io_buffer_size(io_buffer_size);
     auto copy = [&](const fs::path& path) {
         std::ifstream input(path, std::ios::binary);
-        if (!input) throw std::runtime_error("cannot read SFX input: " + path.string());
+        if (!input) {
+            throw std::runtime_error("cannot read SFX input: " +
+                                     core::path_to_utf8(path));
+        }
         std::vector<char> chunk(io_chunk);
         while (input) {
-            operation_checkpoint(operation);
+    reject_volume_mutation(archive_path);
+    operation_checkpoint(operation);
             input.read(chunk.data(), static_cast<std::streamsize>(chunk.size()));
             const auto count = input.gcount();
             if (count <= 0) break;
@@ -3291,7 +3729,7 @@ void create_sfx_archive(const std::filesystem::path& archive_path,
             if (!output) throw std::runtime_error("failed while writing SFX output");
             completed += static_cast<std::uint64_t>(count);
             report_operation(operation, OperationStage::writing, completed, total, 0, 2,
-                             path.filename().string());
+                             core::path_to_utf8(path.filename()));
         }
     };
     copy(stub_executable);
@@ -3411,8 +3849,6 @@ void test_archive(const std::filesystem::path& archive_path,
     if (index.meta.encryption.enabled && !loaded.key) {
         throw std::runtime_error("archive is encrypted; a password is required");
     }
-    BlockSource source(bytes, index, options.thread_count, operation, loaded.key);
-
     const auto total_bytes = archive_file_bytes(index);
     const auto total_items = static_cast<std::uint64_t>(index.entries.size());
     std::uint64_t completed_bytes = 0;
@@ -3420,38 +3856,136 @@ void test_archive(const std::filesystem::path& archive_path,
     report_operation(operation, OperationStage::testing, completed_bytes, total_bytes,
                      completed_items, total_items);
 
-    for (const auto& entry : index.entries) {
-        operation_checkpoint(operation);
-        if (entry.type == kEntryDir || entry.type == kEntrySymlink ||
-            entry.type == kEntryHardlink) {
-            // No block content to verify (links carry only a target, not bytes).
+    // A test checks every file hash, so the old on-demand cache serialised all
+    // solid-block decodes before it could visit their file slices. For moderate
+    // archives, decode each independent solid block concurrently, then retain
+    // the validated bytes long enough to run the existing per-file CRC/BLAKE3
+    // checks. The cap preserves the archive reader's bounded-memory behavior
+    // for large backups, which continue to use the one-block cache below.
+    constexpr std::uint64_t kParallelTestDecodeLimit = std::uint64_t{512} << 20;
+    auto decode_budget = options.thread_count;
+    if (decode_budget == 0) {
+        decode_budget = std::thread::hardware_concurrency();
+    }
+    if (decode_budget == 0) {
+        decode_budget = 1;
+    }
+    const auto outer_decode_workers = std::min<std::size_t>(
+        index.blocks.size(), std::min<std::size_t>(4, decode_budget));
+    const bool use_parallel_test_decode =
+        outer_decode_workers > 1 && total_bytes <= kParallelTestDecodeLimit;
+
+    auto verify_entries = [&](auto&& read_entry) {
+        for (const auto& entry : index.entries) {
+            operation_checkpoint(operation);
+            if (entry.type == kEntryDir || entry.type == kEntrySymlink ||
+                entry.type == kEntryHardlink) {
+                // No block content to verify (links carry only a target, not bytes).
+                ++completed_items;
+                report_operation(operation, OperationStage::testing, completed_bytes, total_bytes,
+                                 completed_items, total_items, entry.path);
+                continue;
+            }
+            auto crc = core::crc32_init();
+            core::Blake3 hasher;
+            std::uint64_t current_file_bytes = 0;
+            read_entry(entry, [&](std::span<const std::uint8_t> file_bytes) {
+                crc = core::crc32_update(crc, file_bytes);
+                hasher.update(file_bytes);
+                completed_bytes += file_bytes.size();
+                current_file_bytes += file_bytes.size();
+                report_operation(operation, OperationStage::testing,
+                                 completed_bytes, total_bytes,
+                                 completed_items, total_items, entry.path,
+                                 current_file_bytes, entry.size);
+            });
+            if (core::crc32_final(crc) != entry.crc) {
+                throw FormatError("checksum mismatch for archived file: " + entry.path);
+            }
+            if (entry.has_blake3 && hasher.finalize() != entry.blake3) {
+                throw FormatError("BLAKE3 mismatch for archived file: " + entry.path);
+            }
             ++completed_items;
             report_operation(operation, OperationStage::testing, completed_bytes, total_bytes,
                              completed_items, total_items, entry.path);
-            continue;
         }
-        auto crc = core::crc32_init();
-        core::Blake3 hasher;
-        read_file_bytes(source, index.blocks.size(), entry, operation,
-                        [&](std::span<const std::uint8_t> bytes) {
-                            crc = core::crc32_update(crc, bytes);
-                            hasher.update(bytes);
-                            completed_bytes += bytes.size();
-                            report_operation(operation, OperationStage::testing,
-                                             completed_bytes, total_bytes,
-                                             completed_items, total_items, entry.path);
-                        },
-                        options.io_buffer_size);
-        if (core::crc32_final(crc) != entry.crc) {
-            throw FormatError("checksum mismatch for archived file: " + entry.path);
-        }
-        if (entry.has_blake3 && hasher.finalize() != entry.blake3) {
-            throw FormatError("BLAKE3 mismatch for archived file: " + entry.path);
-        }
-        ++completed_items;
-        report_operation(operation, OperationStage::testing, completed_bytes, total_bytes,
-                         completed_items, total_items, entry.path);
+    };
+
+    if (!use_parallel_test_decode) {
+        BlockSource source(bytes, index, options.thread_count, operation, loaded.key);
+        verify_entries([&](const EntryRec& entry, const auto& sink) {
+            read_file_bytes(source, index.blocks.size(), entry, operation, sink,
+                            options.io_buffer_size);
+        });
+        return;
     }
+
+    std::vector<ByteVector> decoded(index.blocks.size());
+    std::atomic_size_t next_block = 0;
+    std::atomic_bool failed = false;
+    std::mutex exception_mutex;
+    std::exception_ptr first_exception;
+    const auto inner_decode_threads = std::max<std::size_t>(
+        1, decode_budget / outer_decode_workers);
+    auto decode_worker = [&] {
+        try {
+            while (!failed.load(std::memory_order_relaxed)) {
+                const auto block_index = next_block.fetch_add(1, std::memory_order_relaxed);
+                if (block_index >= index.blocks.size()) {
+                    return;
+                }
+                decoded[block_index] = decode_solid_block(bytes, index, block_index,
+                                                          inner_decode_threads, operation,
+                                                          loaded.key);
+            }
+        } catch (...) {
+            failed.store(true, std::memory_order_relaxed);
+            std::lock_guard lock(exception_mutex);
+            if (!first_exception) {
+                first_exception = std::current_exception();
+            }
+        }
+    };
+
+    std::vector<std::thread> decode_workers;
+    decode_workers.reserve(outer_decode_workers);
+    for (std::size_t i = 0; i < outer_decode_workers; ++i) {
+        decode_workers.emplace_back(decode_worker);
+    }
+    for (auto& worker : decode_workers) {
+        worker.join();
+    }
+    if (first_exception) {
+        std::rethrow_exception(first_exception);
+    }
+
+    verify_entries([&](const EntryRec& entry, const auto& sink) {
+        std::uint64_t remaining = entry.size;
+        std::uint64_t block_index = entry.first_block;
+        std::uint64_t within = entry.offset;
+        const auto io_chunk = effective_io_buffer_size(options.io_buffer_size);
+        while (remaining > 0) {
+            operation_checkpoint(operation);
+            if (block_index >= decoded.size()) {
+                throw FormatError("file extends past the last block");
+            }
+            const auto& block = decoded[block_index];
+            if (within > block.size()) {
+                throw FormatError("file offset lies past its block");
+            }
+            const auto available = static_cast<std::uint64_t>(block.size()) - within;
+            const auto take = std::min<std::uint64_t>(
+                std::min<std::uint64_t>(available, remaining), io_chunk);
+            sink(std::span<const std::uint8_t>(block.data() + within,
+                                               static_cast<std::size_t>(take)));
+            remaining -= take;
+            within += take;
+            if (within >= block.size()) {
+                within = 0;
+                ++block_index;
+            }
+        }
+    });
 }
 
 namespace {
@@ -3555,7 +4089,8 @@ void extract_entries_impl(const std::filesystem::path& archive_path,
         if (!is_safe_relative(entry.path)) {
             throw FormatError("archive contains an unsafe path: " + entry.path);
         }
-        const fs::path target = (dest_dir / fs::path(entry.path)).lexically_normal();
+        const fs::path target =
+            (dest_dir / core::path_from_utf8(entry.path)).lexically_normal();
         if (!is_within(dest_norm, target)) {
             throw FormatError("archive path escapes the destination: " + entry.path);
         }
@@ -3573,7 +4108,8 @@ void extract_entries_impl(const std::filesystem::path& archive_path,
                     continue;
                 }
                 if (options.overwrite == ExtractOptions::Overwrite::fail) {
-                    throw std::runtime_error("target already exists: " + target.string());
+                    throw std::runtime_error("target already exists: " +
+                                             core::path_to_utf8(target));
                 }
                 fs::remove(target, ec);
             }
@@ -3610,7 +4146,8 @@ void extract_entries_impl(const std::filesystem::path& archive_path,
             } else {
             // The canonical file precedes its hard links in the directory, so its
             // target already exists on disk by the time we reach this entry.
-            const fs::path link_to = (dest_dir / fs::path(entry.link_target)).lexically_normal();
+            const fs::path link_to =
+                (dest_dir / core::path_from_utf8(entry.link_target)).lexically_normal();
             if (!is_within(dest_norm, link_to)) {
                 throw FormatError("hardlink target escapes the destination: " +
                                   entry.link_target);
@@ -3624,7 +4161,8 @@ void extract_entries_impl(const std::filesystem::path& archive_path,
                     continue;
                 }
                 if (options.overwrite == ExtractOptions::Overwrite::fail) {
-                    throw std::runtime_error("target already exists: " + target.string());
+                    throw std::runtime_error("target already exists: " +
+                                             core::path_to_utf8(target));
                 }
                 fs::remove(target, ec);
             }
@@ -3666,7 +4204,8 @@ void extract_entries_impl(const std::filesystem::path& archive_path,
                 continue;
             }
             if (options.overwrite == ExtractOptions::Overwrite::fail) {
-                throw std::runtime_error("target already exists: " + target.string());
+                throw std::runtime_error("target already exists: " +
+                                         core::path_to_utf8(target));
             }
         }
 
@@ -3676,20 +4215,83 @@ void extract_entries_impl(const std::filesystem::path& archive_path,
         {
             std::ofstream file_out(temp_target, std::ios::binary | std::ios::trunc);
             if (!file_out) {
-                throw std::runtime_error("cannot write file: " + temp_target.string());
+                throw std::runtime_error("cannot write file: " +
+                                         core::path_to_utf8(temp_target));
             }
+            std::uint64_t current_file_bytes = 0;
+            // A solid block can span several files. While its inner blocks are
+            // decoding, map their cumulative bytes onto the current file's
+            // overlap so the file bar continues moving before the first output
+            // write is available. The mapping is deliberately conservative and
+            // is superseded by exact byte counts in the write callback below.
+            auto visible_file_bytes = std::make_shared<std::atomic<std::uint64_t>>(0);
+            const auto advance_file_progress = [visible_file_bytes](std::uint64_t value) {
+                auto previous = visible_file_bytes->load(std::memory_order_relaxed);
+                while (value > previous &&
+                       !visible_file_bytes->compare_exchange_weak(
+                           previous, value, std::memory_order_relaxed)) {
+                }
+                return std::max(value, previous);
+            };
+            source.set_decode_progress(
+                [&, file_entry, advance_file_progress](std::uint64_t decoded_block,
+                                                        std::uint64_t decoded,
+                                                        std::uint64_t block_total) {
+                    if (decoded_block < file_entry->first_block || block_total == 0) {
+                        return;
+                    }
+                    std::uint64_t remaining = file_entry->size;
+                    std::uint64_t within = file_entry->offset;
+                    std::uint64_t block = file_entry->first_block;
+                    std::uint64_t before = 0;
+                    while (block < decoded_block && remaining > 0 &&
+                           block < index.blocks.size()) {
+                        const auto& record = index.blocks[static_cast<std::size_t>(block++)];
+                        if (within > record.uncompressed_size) {
+                            return;
+                        }
+                        const auto take = std::min(remaining, record.uncompressed_size - within);
+                        before += take;
+                        remaining -= take;
+                        within = 0;
+                    }
+                    if (block != decoded_block || remaining == 0 ||
+                        block >= index.blocks.size()) {
+                        return;
+                    }
+                    const auto& record = index.blocks[static_cast<std::size_t>(block)];
+                    if (within > record.uncompressed_size) {
+                        return;
+                    }
+                    const auto overlap = std::min(remaining, record.uncompressed_size - within);
+                    const auto decoded_in_file = decoded >= block_total
+                        ? overlap
+                        : static_cast<std::uint64_t>(
+                              static_cast<long double>(decoded) * overlap / block_total);
+                    const auto file_done = advance_file_progress(
+                        std::min(file_entry->size, before + decoded_in_file));
+                    report_operation(operation, OperationStage::extracting,
+                                     completed_bytes, total_bytes,
+                                     completed_items, total_items, entry.path,
+                                     file_done, file_entry->size);
+                });
             read_file_bytes(source, index.blocks.size(), *file_entry, operation,
                             [&](std::span<const std::uint8_t> bytes) {
                                 operation_checkpoint(operation);
                                 file_out.write(reinterpret_cast<const char*>(bytes.data()),
                                                static_cast<std::streamsize>(bytes.size()));
                                 if (!file_out) {
-                                    throw std::runtime_error("failed writing file: " + temp_target.string());
+                                    throw std::runtime_error(
+                                        "failed writing file: " +
+                                        core::path_to_utf8(temp_target));
                                 }
                                 completed_bytes += bytes.size();
+                                current_file_bytes += bytes.size();
+                                const auto file_done = advance_file_progress(current_file_bytes);
                                 report_operation(operation, OperationStage::extracting,
                                                  completed_bytes, total_bytes,
-                                                 completed_items, total_items, entry.path);
+                                                 completed_items, total_items, entry.path,
+                                                 file_done, file_entry->size);
                             },
                             options.io_buffer_size);
         }

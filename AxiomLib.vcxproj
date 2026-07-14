@@ -85,7 +85,10 @@
     <ClInclude Include="src\core\cpu.hpp" />
     <ClInclude Include="src\core\crypto.hpp" />
     <ClInclude Include="src\core\file_meta.hpp" />
+    <ClInclude Include="src\core\path_text.hpp" />
+    <ClInclude Include="src\core\file_replace.hpp" />
     <ClInclude Include="src\core\reed_solomon.hpp" />
+    <ClInclude Include="src\core\windows_time.hpp" />
     <ClInclude Include="src\entropy\huffman.hpp" />
     <ClInclude Include="src\entropy\range.hpp" />
     <ClInclude Include="src\third_party\blake3\blake3.h" />
@@ -96,6 +99,18 @@
     <ClInclude Include="src\third_party\miniz\miniz_tdef.h" />
     <ClInclude Include="src\third_party\miniz\miniz_tinfl.h" />
     <ClInclude Include="src\third_party\miniz\miniz_zip.h" />
+    <ClInclude Include="src\archive\zip_split_backend.hpp" />
+    <ClInclude Include="src\third_party\minizip-ng\mz.h" />
+    <ClInclude Include="src\third_party\minizip-ng\mz_config.h" />
+    <ClInclude Include="src\third_party\minizip-ng\mz_crypt.h" />
+    <ClInclude Include="src\third_party\minizip-ng\mz_os.h" />
+    <ClInclude Include="src\third_party\minizip-ng\mz_strm.h" />
+    <ClInclude Include="src\third_party\minizip-ng\mz_strm_buf.h" />
+    <ClInclude Include="src\third_party\minizip-ng\mz_strm_mem.h" />
+    <ClInclude Include="src\third_party\minizip-ng\mz_strm_os.h" />
+    <ClInclude Include="src\third_party\minizip-ng\mz_strm_split.h" />
+    <ClInclude Include="src\third_party\minizip-ng\mz_zip.h" />
+    <ClInclude Include="src\third_party\minizip-ng\mz_zip_rw.h" />
     <ClInclude Include="src\third_party\monocypher\monocypher.h" />
   </ItemGroup>
   <ItemGroup>
@@ -110,6 +125,7 @@
     <ClCompile Include="src\core\archive.cpp" />
     <ClCompile Include="src\core\checksum.cpp" />
     <ClCompile Include="src\core\checksum_clmul.cpp" />
+    <ClCompile Include="src\core\compression_estimator.cpp" />
     <ClCompile Include="src\core\cpu.cpp" />
     <ClCompile Include="src\core\crypto.cpp" />
     <ClCompile Include="src\core\file_meta.cpp" />
@@ -162,6 +178,17 @@
       <CompileAs>CompileAsC</CompileAs>
       <WarningLevel>TurnOffAllWarnings</WarningLevel>
     </ClCompile>
+    <ClCompile Include="src\archive\zip_split_backend.cpp" />
+    <ClCompile Include="src\third_party\minizip-ng\mz_crypt.c"><PreprocessorDefinitions>MZ_ZIP_NO_CRYPTO;_CRT_SECURE_NO_DEPRECATE;_CRT_NONSTDC_NO_DEPRECATE;%(PreprocessorDefinitions)</PreprocessorDefinitions><DisableSpecificWarnings>4100;4244;4267;4706;%(DisableSpecificWarnings)</DisableSpecificWarnings></ClCompile>
+    <ClCompile Include="src\third_party\minizip-ng\mz_os.c"><PreprocessorDefinitions>MZ_ZIP_NO_CRYPTO;_CRT_SECURE_NO_DEPRECATE;_CRT_NONSTDC_NO_DEPRECATE;%(PreprocessorDefinitions)</PreprocessorDefinitions></ClCompile>
+    <ClCompile Include="src\third_party\minizip-ng\mz_os_win32.c"><PreprocessorDefinitions>MZ_ZIP_NO_CRYPTO;_CRT_SECURE_NO_DEPRECATE;_CRT_NONSTDC_NO_DEPRECATE;%(PreprocessorDefinitions)</PreprocessorDefinitions></ClCompile>
+    <ClCompile Include="src\third_party\minizip-ng\mz_strm.c"><PreprocessorDefinitions>MZ_ZIP_NO_CRYPTO;_CRT_SECURE_NO_DEPRECATE;_CRT_NONSTDC_NO_DEPRECATE;%(PreprocessorDefinitions)</PreprocessorDefinitions></ClCompile>
+    <ClCompile Include="src\third_party\minizip-ng\mz_strm_buf.c"><PreprocessorDefinitions>MZ_ZIP_NO_CRYPTO;_CRT_SECURE_NO_DEPRECATE;_CRT_NONSTDC_NO_DEPRECATE;%(PreprocessorDefinitions)</PreprocessorDefinitions></ClCompile>
+    <ClCompile Include="src\third_party\minizip-ng\mz_strm_mem.c"><PreprocessorDefinitions>MZ_ZIP_NO_CRYPTO;_CRT_SECURE_NO_DEPRECATE;_CRT_NONSTDC_NO_DEPRECATE;%(PreprocessorDefinitions)</PreprocessorDefinitions></ClCompile>
+    <ClCompile Include="src\third_party\minizip-ng\mz_strm_os_win32.c"><PreprocessorDefinitions>MZ_ZIP_NO_CRYPTO;_CRT_SECURE_NO_DEPRECATE;_CRT_NONSTDC_NO_DEPRECATE;%(PreprocessorDefinitions)</PreprocessorDefinitions></ClCompile>
+    <ClCompile Include="src\third_party\minizip-ng\mz_strm_split.c"><PreprocessorDefinitions>MZ_ZIP_NO_CRYPTO;_CRT_SECURE_NO_DEPRECATE;_CRT_NONSTDC_NO_DEPRECATE;%(PreprocessorDefinitions)</PreprocessorDefinitions></ClCompile>
+    <ClCompile Include="src\third_party\minizip-ng\mz_zip.c"><PreprocessorDefinitions>MZ_ZIP_NO_CRYPTO;_CRT_SECURE_NO_DEPRECATE;_CRT_NONSTDC_NO_DEPRECATE;%(PreprocessorDefinitions)</PreprocessorDefinitions></ClCompile>
+    <ClCompile Include="src\third_party\minizip-ng\mz_zip_rw.c"><PreprocessorDefinitions>MZ_ZIP_NO_CRYPTO;_CRT_SECURE_NO_DEPRECATE;_CRT_NONSTDC_NO_DEPRECATE;%(PreprocessorDefinitions)</PreprocessorDefinitions></ClCompile>
     <ClCompile Include="src\third_party\monocypher\monocypher.c">
       <CompileAs>CompileAsC</CompileAs>
       <WarningLevel>TurnOffAllWarnings</WarningLevel>
