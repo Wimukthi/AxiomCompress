@@ -7,6 +7,7 @@
 #include <chrono>
 #include <filesystem>
 #include <functional>
+#include <deque>
 #include <string>
 
 namespace axiom::gui {
@@ -42,10 +43,12 @@ public:
                 std::filesystem::path output_path,
                 const OperationWindowTheme& theme,
                 PauseHandler pause_handler,
-                CancelHandler cancel_handler);
+                CancelHandler cancel_handler,
+                bool pause_available = true);
 
     void set_theme(const OperationWindowTheme& theme);
     void set_progress(const OperationProgress& progress);
+    void set_progress_source(std::shared_ptr<OperationControl> source);
     void set_cancelling();
     void close();
 
@@ -86,12 +89,20 @@ private:
     std::wstring title_;
     std::filesystem::path output_path_;
     OperationProgress progress_{};
+    std::shared_ptr<OperationControl> progress_source_;
+    std::deque<std::pair<std::chrono::steady_clock::time_point, std::uint64_t>>
+        rate_samples_;
+    std::uint64_t last_progress_sequence_{};
+    double current_rate_{};
     bool has_progress_{false};
     bool progress_dirty_{false};
     bool paused_{false};
     bool cancelling_{false};
+    bool pause_available_{true};
     int pulse_{};
     std::chrono::steady_clock::time_point started_{};
+    std::chrono::steady_clock::time_point last_progress_time_{};
+    std::chrono::steady_clock::time_point last_heartbeat_paint_{};
 };
 
 } // namespace axiom::gui

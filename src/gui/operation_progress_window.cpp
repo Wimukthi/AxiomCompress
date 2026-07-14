@@ -1,12 +1,14 @@
 #define NOMINMAX
 #include "gui/operation_progress_window.hpp"
 
+#include "gui/dialog_support.hpp"
 #include "gui/toolbar_icons.hpp"
 
 #include <dwmapi.h>
 #include <uxtheme.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <sstream>
@@ -60,11 +62,13 @@ std::wstring widen(std::string_view text) {
 std::wstring stage_text(OperationStage stage) {
     switch (stage) {
         case OperationStage::scanning: return L"Scanning";
+        case OperationStage::estimating: return L"Estimating compression";
         case OperationStage::reading: return L"Reading";
         case OperationStage::compressing: return L"Compressing";
         case OperationStage::writing: return L"Writing";
         case OperationStage::testing: return L"Testing";
         case OperationStage::extracting: return L"Extracting";
+        case OperationStage::transferring: return L"Transferring";
         case OperationStage::finalizing: return L"Finalizing";
     }
     return L"Working";
@@ -105,7 +109,8 @@ bool OperationProgressWindow::create(HWND owner,
                                      std::filesystem::path output_path,
                                      const OperationWindowTheme& theme,
                                      PauseHandler pause_handler,
-                                     CancelHandler cancel_handler) {
+                                     CancelHandler cancel_handler,
+                                     bool pause_available) {
     close();
     owner_ = owner;
     instance_ = instance;
@@ -114,7 +119,14 @@ bool OperationProgressWindow::create(HWND owner,
     theme_ = theme;
     pause_handler_ = std::move(pause_handler);
     cancel_handler_ = std::move(cancel_handler);
+    pause_available_ = pause_available;
     started_ = std::chrono::steady_clock::now();
+    last_progress_time_ = started_;
+    last_heartbeat_paint_ = started_;
+    progress_source_.reset();
+    rate_samples_.clear();
+    last_progress_sequence_ = 0;
+    current_rate_ = 0.0;
     paused_ = false;
     cancelling_ = false;
     has_progress_ = false;
@@ -125,7 +137,7 @@ bool OperationProgressWindow::create(HWND owner,
 
     constexpr DWORD kWindowStyle = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU |
                                    WS_MINIMIZEBOX | WS_CLIPCHILDREN;
-    RECT window_rect{0, 0, scale(590), scale(250)};
+    RECT window_rect{0, 0, scale(590), scale(290)};
     AdjustWindowRectExForDpi(&window_rect, kWindowStyle, FALSE, 0, dpi_);
     const int width = window_rect.right - window_rect.left;
     const int height = window_rect.bottom - window_rect.top;
@@ -140,6 +152,7 @@ bool OperationProgressWindow::create(HWND owner,
                             kWindowStyle,
                             x, y, width, height, owner, nullptr, instance, this);
     if (hwnd_ == nullptr) return false;
+    apply_axiom_window_icons(hwnd_, instance_);
     ShowWindow(hwnd_, SW_SHOWNORMAL);
     UpdateWindow(hwnd_);
     return true;
@@ -181,6 +194,7 @@ void OperationProgressWindow::create_controls() {
                                      reinterpret_cast<HMENU>(static_cast<INT_PTR>(kCancelButton)), instance_, nullptr);
     SendMessageW(pause_button_, WM_SETFONT, reinterpret_cast<WPARAM>(font_), TRUE);
     SendMessageW(cancel_button_, WM_SETFONT, reinterpret_cast<WPARAM>(font_), TRUE);
+    if (!pause_available_) ShowWindow(pause_button_, SW_HIDE);
 }
 
 void OperationProgressWindow::apply_theme() {
@@ -207,14 +221,47 @@ void OperationProgressWindow::layout() {
     const int bottom = client.bottom - margin;
     MoveWindow(cancel_button_, client.right - margin - button_width,
                bottom - button_height, button_width, button_height, TRUE);
-    MoveWindow(pause_button_, client.right - margin - button_width * 2 - gap,
-               bottom - button_height, button_width, button_height, TRUE);
+    if (pause_available_) {
+        MoveWindow(pause_button_, client.right - margin - button_width * 2 - gap,
+                   bottom - button_height, button_width, button_height, TRUE);
+    }
 }
 
 void OperationProgressWindow::set_progress(const OperationProgress& progress) {
+    const auto now = std::chrono::steady_clock::now();
+    const bool new_phase = !has_progress_ || progress.stage != progress_.stage ||
+                           progress.completed_bytes < progress_.completed_bytes;
     progress_ = progress;
     has_progress_ = true;
     progress_dirty_ = true;
+    last_progress_time_ = now;
+    last_progress_sequence_ = progress.sequence;
+    if (new_phase) {
+        rate_samples_.clear();
+        current_rate_ = 0.0;
+    }
+    rate_samples_.emplace_back(now, progress.completed_bytes);
+    while (rate_samples_.size() > 2 &&
+           now - rate_samples_.front().first > std::chrono::seconds(4)) {
+        rate_samples_.pop_front();
+    }
+    if (rate_samples_.size() >= 2) {
+        const double seconds = std::chrono::duration<double>(
+            rate_samples_.back().first - rate_samples_.front().first).count();
+        const auto first = rate_samples_.front().second;
+        const auto last = rate_samples_.back().second;
+        if (seconds > 0.1 && last >= first) {
+            current_rate_ = static_cast<double>(last - first) / seconds;
+        }
+    }
+}
+
+void OperationProgressWindow::set_progress_source(
+    std::shared_ptr<OperationControl> source) {
+    progress_source_ = std::move(source);
+    if (progress_source_) {
+        if (auto snapshot = progress_source_->latest_progress()) set_progress(*snapshot);
+    }
 }
 
 void OperationProgressWindow::invalidate_progress_area() {
@@ -222,7 +269,7 @@ void OperationProgressWindow::invalidate_progress_area() {
     RECT client{};
     GetClientRect(hwnd_, &client);
     RECT progress_area{0, 0, client.right,
-                       std::min(client.bottom, static_cast<LONG>(scale(170)))};
+                       std::min(client.bottom, static_cast<LONG>(scale(210)))};
     InvalidateRect(hwnd_, &progress_area, FALSE);
 }
 
@@ -275,6 +322,7 @@ void OperationProgressWindow::set_cancelling() {
 }
 
 void OperationProgressWindow::toggle_pause() {
+    if (!pause_available_) return;
     if (cancelling_) return;
     paused_ = !paused_;
     SetWindowTextW(pause_button_, paused_ ? L"Resume" : L"Pause");
@@ -345,6 +393,11 @@ void OperationProgressWindow::paint() {
     std::wstring heading = cancelling_ ? L"Cancelling..."
         : paused_ ? L"Paused - " + (has_progress_ ? stage_text(progress_.stage) : title_)
                   : has_progress_ ? stage_text(progress_.stage) : title_;
+    if (!paused_ && !cancelling_) {
+        static constexpr std::array<std::wstring_view, 4> activity{
+            L"   ", L".  ", L".. ", L"..."};
+        heading += L" " + std::wstring(activity[(pulse_ / std::max(1, scale(5))) % activity.size()]);
+    }
     RECT heading_rect{margin, scale(17), client.right - margin, scale(43)};
     SetTextColor(dc, theme_.text);
     DrawTextW(dc, heading.c_str(), -1, &heading_rect, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
@@ -355,18 +408,21 @@ void OperationProgressWindow::paint() {
     DrawTextW(dc, path.c_str(), -1, &path_rect,
               DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
 
-    RECT track{margin, scale(77), client.right - margin, scale(99)};
-    fill_rect(dc, track, theme_.progress_track);
-    frame_rect(dc, track, theme_.border);
-    RECT inner = track;
-    InflateRect(&inner, -scale(2), -scale(2));
-    if (has_progress_ && progress_.total_bytes > 0) {
-        const double fraction = std::clamp(
-            static_cast<double>(progress_.completed_bytes) / progress_.total_bytes, 0.0, 1.0);
-        RECT filled = inner;
-        filled.right = filled.left + static_cast<int>((inner.right - inner.left) * fraction);
-        fill_rect(dc, filled, theme_.progress_fill);
-    } else {
+    const auto draw_progress_bar = [&](RECT track, std::uint64_t completed,
+                                       std::uint64_t total) {
+        fill_rect(dc, track, theme_.progress_track);
+        frame_rect(dc, track, theme_.border);
+        RECT inner = track;
+        InflateRect(&inner, -scale(2), -scale(2));
+        if (total > 0) {
+            const double fraction = std::clamp(
+                static_cast<double>(completed) / total, 0.0, 1.0);
+            RECT filled = inner;
+            filled.right = filled.left +
+                static_cast<int>((inner.right - inner.left) * fraction);
+            fill_rect(dc, filled, theme_.progress_fill);
+            return;
+        }
         const int width = inner.right - inner.left;
         const int block_width = std::max(scale(40), width / 4);
         const int travel = width + block_width;
@@ -374,9 +430,19 @@ void OperationProgressWindow::paint() {
         RECT block{inner.left + offset, inner.top, inner.left + offset + block_width, inner.bottom};
         RECT clipped{};
         if (IntersectRect(&clipped, &inner, &block)) fill_rect(dc, clipped, theme_.progress_fill);
-    }
+    };
 
-    std::wstring amount = L"Waiting for progress data";
+    const std::uint64_t stage_completed = has_progress_
+        ? (progress_.total_bytes > 0 ? progress_.completed_bytes
+                                     : progress_.completed_items) : 0;
+    const std::uint64_t stage_total = has_progress_
+        ? (progress_.total_bytes > 0 ? progress_.total_bytes
+                                     : progress_.total_items) : 0;
+    draw_progress_bar({margin, scale(77), client.right - margin, scale(99)},
+                      stage_completed, stage_total);
+
+    std::wstring amount = L"Stage progress: waiting for measurable data";
+    std::wstring file_amount = L"Backend activity: waiting for first checkpoint";
     std::wstring details;
     if (has_progress_) {
         if (progress_.total_bytes > 0) {
@@ -387,49 +453,71 @@ void OperationProgressWindow::paint() {
             stream.precision(1);
             stream << percent << L"%   " << format_size(progress_.completed_bytes)
                    << L" / " << format_size(progress_.total_bytes);
-            amount = stream.str();
+            amount = L"Stage progress: " + stream.str();
+        } else if (progress_.total_items > 0) {
+            const double percent = static_cast<double>(progress_.completed_items) * 100.0 /
+                                   progress_.total_items;
+            std::wstringstream stream;
+            stream.setf(std::ios::fixed);
+            stream.precision(1);
+            stream << percent << L"%";
+            amount = L"Stage progress: " + stream.str();
         } else {
-            amount = format_size(progress_.completed_bytes);
+            amount = L"Stage progress: " + format_size(progress_.completed_bytes);
         }
         if (progress_.total_items > 0) {
             amount += L"   Items " + std::to_wstring(progress_.completed_items) + L" / " +
                       std::to_wstring(progress_.total_items);
         }
 
-        const double elapsed = std::chrono::duration<double>(
-            std::chrono::steady_clock::now() - started_).count();
-        if (elapsed >= 0.25 && progress_.completed_bytes > 0) {
-            const auto speed = static_cast<std::uint64_t>(progress_.completed_bytes / elapsed);
+        if (progress_.current_file_total_bytes > 0) {
+            const double percent = static_cast<double>(progress_.current_file_completed_bytes) *
+                               100.0 / progress_.current_file_total_bytes;
+            std::wstringstream stream;
+            stream.setf(std::ios::fixed);
+            stream.precision(1);
+            stream << L"Current file: " << percent << L"%   "
+                   << format_size(progress_.current_file_completed_bytes) << L" / "
+                   << format_size(progress_.current_file_total_bytes);
+            file_amount = stream.str();
+        } else if (!progress_.current_path.empty()) {
+            file_amount = L"Current file: processing solid archive data";
+        } else {
+            file_amount = L"Backend activity: processing archive data";
+        }
+
+        const auto now = std::chrono::steady_clock::now();
+        const double elapsed = std::chrono::duration<double>(now - started_).count();
+        if (current_rate_ > 0.0) {
+            const auto speed = static_cast<std::uint64_t>(current_rate_);
             details = format_size(speed) + L"/s";
             if (progress_.total_bytes > progress_.completed_bytes && speed > 0) {
                 details += L"   ETA " + format_duration(
                     (progress_.total_bytes - progress_.completed_bytes) / speed);
             }
         }
-        if (!output_path_.empty()) {
-            std::filesystem::path temporary = output_path_;
-            temporary += L".tmp";
-            std::error_code error;
-            const auto output_bytes = std::filesystem::file_size(temporary, error);
-            if (!error && output_bytes > 0) {
-                details += (details.empty() ? L"" : L"   ") +
-                           (L"Output " + format_size(output_bytes));
-                if (progress_.completed_bytes > 0) {
-                    std::wstringstream ratio;
-                    ratio.setf(std::ios::fixed);
-                    ratio.precision(2);
-                    ratio << static_cast<double>(progress_.completed_bytes) / output_bytes;
-                    details += L"   Ratio " + ratio.str() + L"x";
-                }
-            }
+        details += (details.empty() ? L"" : L"   ") +
+                   (L"Elapsed " + format_duration(
+                       static_cast<std::uint64_t>(elapsed)));
+        const auto quiet_seconds = std::chrono::duration_cast<std::chrono::seconds>(
+            now - last_progress_time_).count();
+        if (!paused_ && !cancelling_ && quiet_seconds >= 2) {
+            details = L"Working - awaiting next measurable checkpoint (" +
+                      std::to_wstring(quiet_seconds) + L"s)   " + details;
         }
     }
 
-    RECT amount_rect{margin, scale(108), client.right - margin, scale(134)};
+    RECT amount_rect{margin, scale(105), client.right - margin, scale(130)};
     SetTextColor(dc, theme_.text);
     DrawTextW(dc, amount.c_str(), -1, &amount_rect, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-    RECT details_rect{margin, scale(134), client.right - margin, scale(160)};
+    RECT file_amount_rect{margin, scale(130), client.right - margin, scale(151)};
     SetTextColor(dc, theme_.muted_text);
+    DrawTextW(dc, file_amount.c_str(), -1, &file_amount_rect,
+              DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    draw_progress_bar({margin, scale(153), client.right - margin, scale(171)},
+                      has_progress_ ? progress_.current_file_completed_bytes : 0,
+                      has_progress_ ? progress_.current_file_total_bytes : 0);
+    RECT details_rect{margin, scale(177), client.right - margin, scale(203)};
     DrawTextW(dc, details.c_str(), -1, &details_rect, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
 
     SelectObject(dc, old_font);
@@ -444,6 +532,7 @@ void OperationProgressWindow::paint() {
 
 void OperationProgressWindow::close() {
     if (hwnd_ != nullptr) DestroyWindow(hwnd_);
+    progress_source_.reset();
 }
 
 LRESULT OperationProgressWindow::handle_message(UINT message, WPARAM wparam, LPARAM lparam) {
@@ -463,6 +552,7 @@ LRESULT OperationProgressWindow::handle_message(UINT message, WPARAM wparam, LPA
                          suggested->right - suggested->left,
                          suggested->bottom - suggested->top,
                          SWP_NOZORDER | SWP_NOACTIVATE);
+            apply_axiom_window_icons(hwnd_, instance_);
             rebuild_font();
             SendMessageW(pause_button_, WM_SETFONT, reinterpret_cast<WPARAM>(font_), TRUE);
             SendMessageW(cancel_button_, WM_SETFONT, reinterpret_cast<WPARAM>(font_), TRUE);
@@ -471,9 +561,22 @@ LRESULT OperationProgressWindow::handle_message(UINT message, WPARAM wparam, LPA
         }
         case WM_ERASEBKGND: return 1;
         case WM_PAINT: paint(); return 0;
-        case WM_TIMER:
+        case WM_TIMER: {
+            if (progress_source_) {
+                if (auto snapshot = progress_source_->latest_progress();
+                    snapshot && snapshot->sequence != last_progress_sequence_) {
+                    set_progress(*snapshot);
+                }
+            }
+            pulse_ += scale(5);
             if (!has_progress_ || progress_.total_bytes == 0) {
-                pulse_ += scale(5);
+                progress_dirty_ = true;
+            }
+            // A heartbeat repaint makes liveness explicit even during backend
+            // calls that cannot expose byte-level checkpoints.
+            const auto now = std::chrono::steady_clock::now();
+            if (now - last_heartbeat_paint_ >= std::chrono::milliseconds(250)) {
+                last_heartbeat_paint_ = now;
                 progress_dirty_ = true;
             }
             if (progress_dirty_) {
@@ -481,6 +584,7 @@ LRESULT OperationProgressWindow::handle_message(UINT message, WPARAM wparam, LPA
                 invalidate_progress_area();
             }
             return 0;
+        }
         case WM_DRAWITEM:
             draw_button(*reinterpret_cast<const DRAWITEMSTRUCT*>(lparam));
             return TRUE;

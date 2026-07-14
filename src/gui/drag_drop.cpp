@@ -6,6 +6,7 @@
 #include <strsafe.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -177,6 +178,204 @@ HRESULT stream_for_file(const std::filesystem::path& path, IStream** stream) {
                                   FALSE, nullptr, stream);
 }
 
+struct TransferProgressState {
+    std::shared_ptr<OperationControl> operation;
+    std::uint64_t total_bytes = 0;
+    std::uint64_t total_files = 0;
+    std::atomic_uint64_t completed_bytes{0};
+    std::atomic_uint64_t completed_files{0};
+};
+
+class ProgressReadStream final : public IStream {
+public:
+    ProgressReadStream(IStream* inner,
+                       std::shared_ptr<TransferProgressState> progress,
+                       std::wstring relative_path,
+                       std::uint64_t size)
+        : inner_(inner), progress_(std::move(progress)),
+          relative_path_(std::move(relative_path)), size_(size) {
+        const int needed = WideCharToMultiByte(
+            CP_UTF8, WC_ERR_INVALID_CHARS, relative_path_.data(),
+            static_cast<int>(relative_path_.size()), nullptr, 0, nullptr, nullptr);
+        if (needed > 0) {
+            relative_path_utf8_.resize(static_cast<std::size_t>(needed));
+            WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, relative_path_.data(),
+                                static_cast<int>(relative_path_.size()),
+                                relative_path_utf8_.data(), needed, nullptr, nullptr);
+        }
+    }
+
+    ~ProgressReadStream() {
+        if (inner_ != nullptr) inner_->Release();
+    }
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** object) override {
+        if (object == nullptr) return E_POINTER;
+        *object = nullptr;
+        if (iid == IID_IUnknown || iid == IID_ISequentialStream || iid == IID_IStream) {
+            *object = static_cast<IStream*>(this);
+            AddRef();
+            return S_OK;
+        }
+        return E_NOINTERFACE;
+    }
+
+    ULONG STDMETHODCALLTYPE AddRef() override { return ++references_; }
+    ULONG STDMETHODCALLTYPE Release() override {
+        const ULONG references = --references_;
+        if (references == 0) delete this;
+        return references;
+    }
+
+    HRESULT STDMETHODCALLTYPE Read(void* buffer, ULONG count, ULONG* bytes_read) override {
+        if (inner_ == nullptr) return STG_E_REVERTED;
+        try {
+            if (progress_ && progress_->operation) progress_->operation->checkpoint();
+        } catch (const OperationCancelled&) {
+            if (bytes_read) *bytes_read = 0;
+            return HRESULT_FROM_WIN32(ERROR_CANCELLED);
+        }
+        ULONG actual = 0;
+        const HRESULT result = inner_->Read(buffer, count, &actual);
+        if (bytes_read) *bytes_read = actual;
+        if (FAILED(result)) return result;
+        const std::uint64_t read_start = position_;
+        position_ += actual;
+        if (position_ > high_water_) {
+            const std::uint64_t delta = position_ - std::max(high_water_, read_start);
+            high_water_ = position_;
+            transferred_ += delta;
+            const auto overall = progress_->completed_bytes.fetch_add(
+                                     delta, std::memory_order_relaxed) + delta;
+            if (transferred_ - last_reported_ >= (1u << 20)) {
+                last_reported_ = transferred_;
+                publish(overall);
+            }
+        }
+        if (actual == 0 || position_ >= size_) complete_file();
+        return result;
+    }
+
+    HRESULT STDMETHODCALLTYPE Write(const void*, ULONG, ULONG*) override {
+        return STG_E_ACCESSDENIED;
+    }
+
+    HRESULT STDMETHODCALLTYPE Seek(LARGE_INTEGER move, DWORD origin,
+                                   ULARGE_INTEGER* new_position) override {
+        if (inner_ == nullptr) return STG_E_REVERTED;
+        ULARGE_INTEGER position{};
+        const HRESULT result = inner_->Seek(move, origin, &position);
+        if (SUCCEEDED(result)) {
+            position_ = position.QuadPart;
+            if (new_position) *new_position = position;
+        }
+        return result;
+    }
+
+    HRESULT STDMETHODCALLTYPE SetSize(ULARGE_INTEGER) override { return STG_E_ACCESSDENIED; }
+
+    HRESULT STDMETHODCALLTYPE CopyTo(IStream* target, ULARGE_INTEGER count,
+                                     ULARGE_INTEGER* bytes_read,
+                                     ULARGE_INTEGER* bytes_written) override {
+        if (target == nullptr) return STG_E_INVALIDPOINTER;
+        std::array<std::byte, 256 * 1024> buffer{};
+        std::uint64_t read_total = 0;
+        std::uint64_t written_total = 0;
+        HRESULT result = S_OK;
+        while (read_total < count.QuadPart) {
+            const ULONG wanted = static_cast<ULONG>(std::min<std::uint64_t>(
+                buffer.size(), count.QuadPart - read_total));
+            ULONG read = 0;
+            result = Read(buffer.data(), wanted, &read);
+            if (FAILED(result) || read == 0) break;
+            read_total += read;
+            ULONG offset = 0;
+            while (offset < read) {
+                ULONG written = 0;
+                result = target->Write(buffer.data() + offset, read - offset, &written);
+                if (FAILED(result) || written == 0) break;
+                offset += written;
+                written_total += written;
+            }
+            if (FAILED(result) || offset != read) break;
+        }
+        if (bytes_read) bytes_read->QuadPart = read_total;
+        if (bytes_written) bytes_written->QuadPart = written_total;
+        return result;
+    }
+
+    HRESULT STDMETHODCALLTYPE Commit(DWORD flags) override { return inner_->Commit(flags); }
+    HRESULT STDMETHODCALLTYPE Revert() override { return inner_->Revert(); }
+    HRESULT STDMETHODCALLTYPE LockRegion(ULARGE_INTEGER offset, ULARGE_INTEGER count,
+                                         DWORD type) override {
+        return inner_->LockRegion(offset, count, type);
+    }
+    HRESULT STDMETHODCALLTYPE UnlockRegion(ULARGE_INTEGER offset, ULARGE_INTEGER count,
+                                           DWORD type) override {
+        return inner_->UnlockRegion(offset, count, type);
+    }
+    HRESULT STDMETHODCALLTYPE Stat(STATSTG* stat, DWORD flags) override {
+        return inner_->Stat(stat, flags);
+    }
+    HRESULT STDMETHODCALLTYPE Clone(IStream**) override { return E_NOTIMPL; }
+
+private:
+    void publish(std::uint64_t overall) {
+        if (!progress_ || !progress_->operation) return;
+        OperationProgress snapshot;
+        snapshot.stage = OperationStage::transferring;
+        snapshot.completed_bytes = std::min(overall, progress_->total_bytes);
+        snapshot.total_bytes = progress_->total_bytes;
+        snapshot.completed_items = progress_->completed_files.load(std::memory_order_relaxed);
+        snapshot.total_items = progress_->total_files;
+        snapshot.current_path = relative_path_utf8_;
+        snapshot.current_file_completed_bytes = std::min(transferred_, size_);
+        snapshot.current_file_total_bytes = size_;
+        progress_->operation->report(snapshot);
+    }
+
+    void complete_file() {
+        if (completed_.exchange(true, std::memory_order_acq_rel) || !progress_) return;
+        const auto files = progress_->completed_files.fetch_add(
+                               1, std::memory_order_relaxed) + 1;
+        const auto overall = progress_->completed_bytes.load(std::memory_order_relaxed);
+        publish(overall);
+        (void)files;
+    }
+
+    std::atomic_ulong references_{1};
+    IStream* inner_ = nullptr;
+    std::shared_ptr<TransferProgressState> progress_;
+    std::wstring relative_path_;
+    std::string relative_path_utf8_;
+    std::uint64_t size_ = 0;
+    std::uint64_t position_ = 0;
+    std::uint64_t high_water_ = 0;
+    std::uint64_t transferred_ = 0;
+    std::uint64_t last_reported_ = 0;
+    std::atomic_bool completed_{false};
+};
+
+HRESULT progress_stream_for_file(const std::filesystem::path& path,
+                                 const VirtualFileDragItem& item,
+                                 const std::shared_ptr<TransferProgressState>& progress,
+                                 IStream** stream) {
+    if (stream == nullptr) return E_POINTER;
+    *stream = nullptr;
+    if (!progress) return stream_for_file(path, stream);
+    IStream* inner = nullptr;
+    const HRESULT result = stream_for_file(path, &inner);
+    if (FAILED(result)) return result;
+    auto* wrapped = new (std::nothrow) ProgressReadStream(
+        inner, progress, item.relative_path, item.size);
+    if (wrapped == nullptr) {
+        inner->Release();
+        return E_OUTOFMEMORY;
+    }
+    *stream = wrapped;
+    return S_OK;
+}
+
 void append_wstring(std::vector<std::byte>& bytes, const std::wstring& text) {
     const std::size_t old_size = bytes.size();
     bytes.resize(old_size + (text.size() + 1) * sizeof(wchar_t));
@@ -277,7 +476,26 @@ private:
 
 class FileDataObject final : public IDataObject {
 public:
-    explicit FileDataObject(FileDragSource source) : source_(std::move(source)) {}
+    explicit FileDataObject(FileDragSource source) : source_(std::move(source)) {
+        if (source_.transfer_operation && !source_.virtual_files.empty()) {
+            transfer_progress_ = std::make_shared<TransferProgressState>();
+            transfer_progress_->operation = source_.transfer_operation;
+            for (const auto& item : source_.virtual_files) {
+                if (item.is_directory) continue;
+                transfer_progress_->total_bytes = item.size >
+                        std::numeric_limits<std::uint64_t>::max() -
+                            transfer_progress_->total_bytes
+                    ? std::numeric_limits<std::uint64_t>::max()
+                    : transfer_progress_->total_bytes + item.size;
+                ++transfer_progress_->total_files;
+            }
+            OperationProgress initial;
+            initial.stage = OperationStage::transferring;
+            initial.total_bytes = transfer_progress_->total_bytes;
+            initial.total_items = transfer_progress_->total_files;
+            transfer_progress_->operation->report(initial);
+        }
+    }
 
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** object) override {
         if (object == nullptr) return E_POINTER;
@@ -334,7 +552,9 @@ public:
                 }
                 if (virtual_paths_.size() != source_.virtual_files.size()) return E_FAIL;
                 IStream* stream = nullptr;
-                const HRESULT result = stream_for_file(virtual_paths_[index], &stream);
+                const HRESULT result = progress_stream_for_file(
+                    virtual_paths_[index], source_.virtual_files[index],
+                    transfer_progress_, &stream);
                 if (FAILED(result)) return result;
                 medium->tymed = TYMED_ISTREAM;
                 medium->pstm = stream;
@@ -428,6 +648,7 @@ private:
     std::vector<std::filesystem::path> files_;
     bool virtual_paths_ready_ = false;
     std::vector<std::filesystem::path> virtual_paths_;
+    std::shared_ptr<TransferProgressState> transfer_progress_;
 };
 
 class DropSource final : public IDropSource {

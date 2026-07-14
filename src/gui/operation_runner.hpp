@@ -6,6 +6,7 @@
 
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <thread>
 
@@ -14,6 +15,7 @@ namespace axiom::gui {
 struct OperationResult {
     bool ok = false;
     bool cancelled = false;
+    bool has_warnings = false;
     std::wstring title;
     std::wstring message;
 };
@@ -30,7 +32,6 @@ public:
 
     bool start(HWND target,
                UINT done_message,
-               UINT progress_message,
                std::wstring running_label,
                std::wstring success,
                Work work);
@@ -39,6 +40,7 @@ public:
     void finish();
 
     bool running() const;
+    std::shared_ptr<OperationControl> control() const { return control_; }
 
 private:
     std::shared_ptr<OperationControl> control_;

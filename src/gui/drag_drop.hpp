@@ -4,6 +4,8 @@
 #include <windows.h>
 #include <objidl.h>
 
+#include "axiom/axiom.hpp"
+
 #include <filesystem>
 #include <functional>
 #include <string>
@@ -27,6 +29,7 @@ struct FileDragSource {
     std::function<std::vector<std::filesystem::path>()> files;
     std::vector<VirtualFileDragItem> virtual_files;
     std::function<std::vector<std::filesystem::path>()> virtual_file_paths;
+    std::shared_ptr<OperationControl> transfer_operation;
     ArchiveDragPayload archive_payload;
     DWORD preferred_effect = DROPEFFECT_COPY;
     std::wstring* error_message = nullptr;
