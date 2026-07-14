@@ -3,6 +3,7 @@
 #include "axiom/axiom.hpp"
 
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <optional>
@@ -39,6 +40,60 @@ enum class ArchiveFormat {
     tar,
     iso,
     cab,
+};
+
+enum class EstimateConfidence {
+    low,
+    medium,
+    high,
+};
+
+struct CompressionEstimateSnapshot {
+    std::uint64_t source_bytes = 0;
+    std::uint64_t sampled_bytes = 0;
+    std::uint64_t planned_sample_bytes = 0;
+    std::uint64_t estimated_archive_bytes = 0;
+    std::uint64_t completed_probes = 0;
+    std::uint64_t total_probes = 0;
+    double estimated_ratio = 0.0;
+    double estimated_savings_percent = 0.0;
+};
+
+// A bounded, read-only compression prognosis. The estimator samples source data
+// with the real codec and projects the result; it never creates an archive.
+struct CompressionEstimateOptions {
+    ArchiveFormat format = ArchiveFormat::axar;
+    CompressionOptions compression;
+    // Hard ceiling for adaptive sampling. The estimator may stop earlier once
+    // representative batches converge or the time budget expires.
+    std::size_t sample_budget = 8u << 20;
+    std::size_t sample_chunk_size = 512u << 10;
+    std::chrono::milliseconds time_budget{5000};
+    std::uint64_t volume_size = 0;
+    // Called after each completed probe. It reports the cumulative prognosis,
+    // not operation completion; frontends can render a live savings meter.
+    std::function<void(const CompressionEstimateSnapshot&)> progress_callback;
+};
+
+struct CompressionEstimateResult {
+    ArchiveFormat format = ArchiveFormat::axar;
+    EstimateConfidence confidence = EstimateConfidence::low;
+    std::uint64_t source_bytes = 0;
+    std::uint64_t sampled_bytes = 0;
+    std::uint64_t estimated_archive_bytes = 0;
+    std::uint64_t estimated_low_bytes = 0;
+    std::uint64_t estimated_high_bytes = 0;
+    std::uint64_t estimated_seconds = 0;
+    std::uint64_t file_count = 0;
+    std::uint64_t item_count = 0;
+    std::uint64_t volume_count = 0;
+    std::uint64_t final_volume_bytes = 0;
+    double estimated_ratio = 0.0;
+    double estimated_savings_percent = 0.0;
+    // 95% half-width in percentage points for the sampled payload ratio.
+    double confidence_margin_percent = 0.0;
+    double sample_coverage = 0.0;
+    std::vector<OperationWarning> warnings;
 };
 
 struct ArchiveFormatInfo {
@@ -242,6 +297,10 @@ void create_sfx_archive(const std::filesystem::path& archive_path,
 void create_archive(const std::vector<std::filesystem::path>& inputs,
                     const std::filesystem::path& archive_path,
                     const CompressionOptions& options = {});
+
+CompressionEstimateResult estimate_compression(
+    const std::vector<std::filesystem::path>& inputs,
+    const CompressionEstimateOptions& options = {});
 
 // Add files/directories to an existing archive. Existing files are not
 // recompressed — their solid blocks are copied verbatim and new files become new
