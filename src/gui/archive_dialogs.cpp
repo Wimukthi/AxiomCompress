@@ -456,7 +456,7 @@ std::optional<fs::path> browse_save_archive(HWND owner,
         {L"ZIP archives", L"*.zip"},
         {L"All files", L"*.*"}};
     const COMDLG_FILTERSPEC executable_filters[] = {
-        {L"Axiom self-extractors", L"*.exe"}, {L"All files", L"*.*"}};
+        {L"Self-extracting archives", L"*.exe"}, {L"All files", L"*.*"}};
     const auto* filters = executable ? executable_filters : archive_filters;
     dialog->SetFileTypes(executable ? 2 : 3, filters);
     if (!executable) {
@@ -1759,7 +1759,7 @@ private:
         sfx_info_ = page_label(
             4,
             L"When SFX is enabled, the Output field becomes an .exe path. The completed archive "
-            L"is merged into that executable and no separate .axar is retained.", true);
+            L"is merged into that executable and no separate archive is retained.", true);
 
         output_preview_ = control(L"STATIC", L"",
                                   SS_LEFT | SS_NOPREFIX | SS_PATHELLIPSIS, 0);
@@ -2762,8 +2762,7 @@ private:
         const auto available = selected_format_availability();
         const bool updating = create_options.features.update_mode != ArchiveUpdateMode::create_new;
         const bool native = selected_format_is_native();
-        EnableWindow(format_combo_, !create_options.fixed_archive_format &&
-                                    !create_options.features.create_sfx);
+        EnableWindow(format_combo_, !create_options.fixed_archive_format);
         EnableWindow(level_combo_, TRUE);
         EnableWindow(dictionary_combo_, native);
         EnableWindow(word_size_combo_, native);
@@ -2844,7 +2843,8 @@ private:
         if (sfx) {
             output.replace_extension(L".exe");
         } else if (lstrcmpiW(output.extension().c_str(), L".exe") == 0) {
-            output.replace_extension(L".axar");
+            output.replace_extension(
+                widen_ascii(archive_format_info(selected_archive_format()).default_extension));
         }
         set_window_text(path_edit_, output.wstring());
     }
@@ -2996,8 +2996,9 @@ private:
             displayed_output.replace_extension(L".exe");
             create_options.features.sfx_destination = displayed_output.wstring();
             create_options.archive_path = displayed_output;
-            create_options.archive_path.replace_extension(L".axar");
-            create_options.archive_format = axiom::ArchiveFormat::axar;
+            create_options.archive_path.replace_extension(
+                widen_ascii(archive_format_info(create_options.archive_format)
+                                .default_extension));
             create_options.features.volume_size.clear();
             create_options.features.create_recovery_volumes = false;
         } else {
@@ -3238,10 +3239,6 @@ private:
             case kCreateSfx:
                 create_options.features.create_sfx = !create_options.features.create_sfx;
                 if (create_options.features.create_sfx) {
-                    create_options.archive_format = axiom::ArchiveFormat::axar;
-                    SendMessageW(format_combo_, CB_SETCURSEL,
-                                 static_cast<WPARAM>(creatable_archive_format_index(
-                                     create_options.archive_format)), 0);
                     create_options.features.create_recovery_volumes = false;
                     create_options.features.volume_size.clear();
                     SetWindowTextW(volume_size_edit_, L"");
