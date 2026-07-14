@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <cstdint>
 #include <cwctype>
 
@@ -41,6 +42,49 @@ struct PopupItemLayout : CustomMenuItem {
     RECT rect{};
 };
 
+struct PaintBuffer {
+    HDC dc{};
+    HBITMAP bitmap{};
+    HGDIOBJ old_bitmap{};
+    int width{};
+    int height{};
+
+    PaintBuffer() = default;
+    PaintBuffer(const PaintBuffer&) = delete;
+    PaintBuffer& operator=(const PaintBuffer&) = delete;
+    ~PaintBuffer() { release(); }
+
+    void release() {
+        if (dc != nullptr && old_bitmap != nullptr) SelectObject(dc, old_bitmap);
+        if (bitmap != nullptr) DeleteObject(bitmap);
+        if (dc != nullptr) DeleteDC(dc);
+        dc = nullptr;
+        bitmap = nullptr;
+        old_bitmap = nullptr;
+        width = 0;
+        height = 0;
+    }
+
+    bool ensure(HDC reference, int requested_width, int requested_height) {
+        if (dc != nullptr && bitmap != nullptr && width == requested_width &&
+            height == requested_height) {
+            return true;
+        }
+        release();
+        if (reference == nullptr || requested_width <= 0 || requested_height <= 0) return false;
+        dc = CreateCompatibleDC(reference);
+        bitmap = CreateCompatibleBitmap(reference, requested_width, requested_height);
+        if (dc == nullptr || bitmap == nullptr) {
+            release();
+            return false;
+        }
+        old_bitmap = SelectObject(dc, bitmap);
+        width = requested_width;
+        height = requested_height;
+        return true;
+    }
+};
+
 struct PopupState {
     HWND hwnd{};
     HWND owner{};
@@ -51,6 +95,20 @@ struct PopupState {
     std::vector<PopupItemLayout> items;
     int hot_index{-1};
     UINT command{};
+    PaintBuffer paint_buffer;
+    HBRUSH background_brush{};
+    HBRUSH hot_brush{};
+    HBRUSH border_brush{};
+    HPEN separator_pen{};
+    HPEN check_pen{};
+
+    ~PopupState() {
+        if (background_brush != nullptr) DeleteObject(background_brush);
+        if (hot_brush != nullptr) DeleteObject(hot_brush);
+        if (border_brush != nullptr) DeleteObject(border_brush);
+        if (separator_pen != nullptr) DeleteObject(separator_pen);
+        if (check_pen != nullptr) DeleteObject(check_pen);
+    }
 };
 
 struct ShadowMetrics {
@@ -103,6 +161,49 @@ BYTE shadow_alpha(const ShadowMetrics& metrics, int x, int y) {
     return static_cast<BYTE>(metrics.max_alpha * falloff * falloff);
 }
 
+struct ShadowCacheEntry {
+    SIZE size{};
+    UINT dpi{};
+    std::vector<std::uint32_t> pixels;
+    std::uint64_t use_serial{};
+};
+
+const std::vector<std::uint32_t>& cached_shadow_pixels(const ShadowMetrics& metrics, UINT dpi) {
+    constexpr std::size_t kMaximumEntries = 12;
+    static std::vector<ShadowCacheEntry> cache;
+    static std::uint64_t serial = 0;
+    ++serial;
+    for (auto& entry : cache) {
+        if (entry.dpi == dpi && entry.size.cx == metrics.window_size.cx &&
+            entry.size.cy == metrics.window_size.cy) {
+            entry.use_serial = serial;
+            return entry.pixels;
+        }
+    }
+
+    ShadowCacheEntry entry;
+    entry.size = metrics.window_size;
+    entry.dpi = dpi;
+    entry.use_serial = serial;
+    entry.pixels.resize(static_cast<std::size_t>(entry.size.cx) * entry.size.cy);
+    for (int y = 0; y < entry.size.cy; ++y) {
+        for (int x = 0; x < entry.size.cx; ++x) {
+            entry.pixels[static_cast<std::size_t>(y) * entry.size.cx + x] =
+                static_cast<std::uint32_t>(shadow_alpha(metrics, x, y)) << 24;
+        }
+    }
+    if (cache.size() >= kMaximumEntries) {
+        const auto oldest = std::min_element(cache.begin(), cache.end(),
+            [](const auto& left, const auto& right) {
+                return left.use_serial < right.use_serial;
+            });
+        *oldest = std::move(entry);
+        return oldest->pixels;
+    }
+    cache.push_back(std::move(entry));
+    return cache.back().pixels;
+}
+
 LRESULT CALLBACK shadow_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam) {
     if (message == WM_NCHITTEST) return HTTRANSPARENT;
     if (message == WM_MOUSEACTIVATE) return MA_NOACTIVATE;
@@ -150,13 +251,8 @@ HWND create_shadow(HWND owner, HINSTANCE instance, POINT position, SIZE popup_si
         return nullptr;
     }
 
-    auto* pixels = static_cast<std::uint32_t*>(bits);
-    for (int y = 0; y < metrics.window_size.cy; ++y) {
-        for (int x = 0; x < metrics.window_size.cx; ++x) {
-            pixels[static_cast<std::size_t>(y) * metrics.window_size.cx + x] =
-                static_cast<std::uint32_t>(shadow_alpha(metrics, x, y)) << 24;
-        }
-    }
+    const auto& pixels = cached_shadow_pixels(metrics, dpi);
+    std::memcpy(bits, pixels.data(), pixels.size() * sizeof(pixels.front()));
 
     HDC memory_dc = CreateCompatibleDC(screen_dc);
     HGDIOBJ old_bitmap = SelectObject(memory_dc, bitmap);
@@ -196,8 +292,13 @@ void select_adjacent(PopupState* state, int direction) {
         if (index >= static_cast<int>(state->items.size())) index = 0;
         const auto& item = state->items[static_cast<std::size_t>(index)];
         if (!item.separator && item.enabled) {
+            RECT dirty = item.rect;
+            if (state->hot_index >= 0) {
+                UnionRect(&dirty, &dirty,
+                          &state->items[static_cast<std::size_t>(state->hot_index)].rect);
+            }
             state->hot_index = index;
-            InvalidateRect(state->hwnd, nullptr, FALSE);
+            InvalidateRect(state->hwnd, &dirty, FALSE);
             return;
         }
     }
@@ -210,61 +311,75 @@ void paint_popup(PopupState* state) {
     if (dc == nullptr) return;
     RECT client{};
     GetClientRect(state->hwnd, &client);
-    HBRUSH brush = CreateSolidBrush(state->theme.border);
-    FillRect(dc, &client, brush);
-    DeleteObject(brush);
+    const int width = client.right - client.left;
+    const int height = client.bottom - client.top;
+    if (width <= 0 || height <= 0) {
+        EndPaint(state->hwnd, &paint);
+        return;
+    }
+    HDC target = state->paint_buffer.ensure(dc, width, height)
+        ? state->paint_buffer.dc : dc;
+    const RECT dirty = paint.rcPaint;
+    const int saved_dc = SaveDC(target);
+    IntersectClipRect(target, dirty.left, dirty.top, dirty.right, dirty.bottom);
+    FillRect(target, &dirty, state->border_brush);
     RECT body = client;
     InflateRect(&body, -1, -1);
-    brush = CreateSolidBrush(state->theme.background);
-    FillRect(dc, &body, brush);
-    DeleteObject(brush);
+    RECT body_dirty{};
+    if (IntersectRect(&body_dirty, &body, &dirty)) {
+        FillRect(target, &body_dirty, state->background_brush);
+    }
 
-    HGDIOBJ old_font = SelectObject(dc, state->font != nullptr
+    HGDIOBJ old_font = SelectObject(target, state->font != nullptr
         ? state->font : GetStockObject(DEFAULT_GUI_FONT));
-    SetBkMode(dc, TRANSPARENT);
+    SetBkMode(target, TRANSPARENT);
     for (std::size_t index = 0; index < state->items.size(); ++index) {
         const auto& item = state->items[index];
+        RECT item_dirty{};
+        if (!IntersectRect(&item_dirty, &item.rect, &dirty)) continue;
         if (item.separator) {
             const int y = item.rect.top + (item.rect.bottom - item.rect.top) / 2;
-            HPEN pen = CreatePen(PS_SOLID, 1, state->theme.separator);
-            HGDIOBJ old_pen = SelectObject(dc, pen);
-            MoveToEx(dc, item.rect.left + scale_for_dpi(30, state->dpi), y, nullptr);
-            LineTo(dc, item.rect.right - scale_for_dpi(8, state->dpi), y);
-            SelectObject(dc, old_pen);
-            DeleteObject(pen);
+            HGDIOBJ old_pen = SelectObject(target, state->separator_pen);
+            MoveToEx(target, item.rect.left + scale_for_dpi(30, state->dpi), y, nullptr);
+            LineTo(target, item.rect.right - scale_for_dpi(8, state->dpi), y);
+            SelectObject(target, old_pen);
             continue;
         }
 
         const bool selected = static_cast<int>(index) == state->hot_index && item.enabled;
-        brush = CreateSolidBrush(selected ? state->theme.hot : state->theme.background);
-        FillRect(dc, &item.rect, brush);
-        DeleteObject(brush);
-        SetTextColor(dc, item.enabled ? state->theme.text : state->theme.disabled_text);
+        FillRect(target, &item.rect, selected ? state->hot_brush : state->background_brush);
+        SetTextColor(target, item.enabled ? state->theme.text : state->theme.disabled_text);
 
         if (item.checked) {
-            HPEN pen = CreatePen(PS_SOLID, std::max(1, scale_for_dpi(2, state->dpi)),
-                                 item.enabled ? state->theme.text : state->theme.disabled_text);
-            HGDIOBJ old_pen = SelectObject(dc, pen);
+            HPEN check_pen = item.enabled ? state->check_pen
+                : CreatePen(PS_SOLID, std::max(1, scale_for_dpi(2, state->dpi)),
+                            state->theme.disabled_text);
+            HGDIOBJ old_pen = SelectObject(target, check_pen);
             const int left = item.rect.left + scale_for_dpi(9, state->dpi);
             const int middle = item.rect.top + (item.rect.bottom - item.rect.top) / 2;
-            MoveToEx(dc, left, middle, nullptr);
-            LineTo(dc, left + scale_for_dpi(4, state->dpi), middle + scale_for_dpi(4, state->dpi));
-            LineTo(dc, left + scale_for_dpi(12, state->dpi), middle - scale_for_dpi(5, state->dpi));
-            SelectObject(dc, old_pen);
-            DeleteObject(pen);
+            MoveToEx(target, left, middle, nullptr);
+            LineTo(target, left + scale_for_dpi(4, state->dpi), middle + scale_for_dpi(4, state->dpi));
+            LineTo(target, left + scale_for_dpi(12, state->dpi), middle - scale_for_dpi(5, state->dpi));
+            SelectObject(target, old_pen);
+            if (!item.enabled) DeleteObject(check_pen);
         }
 
         RECT text_rect = item.rect;
         text_rect.left += scale_for_dpi(30, state->dpi);
         text_rect.right -= scale_for_dpi(12, state->dpi);
-        DrawTextW(dc, item.label.c_str(), -1, &text_rect,
+        DrawTextW(target, item.label.c_str(), -1, &text_rect,
                   DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
         if (!item.shortcut.empty()) {
-            DrawTextW(dc, item.shortcut.c_str(), -1, &text_rect,
+            DrawTextW(target, item.shortcut.c_str(), -1, &text_rect,
                       DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
         }
     }
-    SelectObject(dc, old_font);
+    SelectObject(target, old_font);
+    RestoreDC(target, saved_dc);
+    if (target != dc) {
+        BitBlt(dc, dirty.left, dirty.top, dirty.right - dirty.left,
+               dirty.bottom - dirty.top, target, dirty.left, dirty.top, SRCCOPY);
+    }
     EndPaint(state->hwnd, &paint);
 }
 
@@ -283,8 +398,23 @@ LRESULT CALLBACK popup_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpara
             POINT point{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
             const int hit = popup_hit_test(state, point);
             if (state != nullptr && state->hot_index != hit) {
+                RECT dirty{};
+                bool has_dirty = false;
+                if (state->hot_index >= 0) {
+                    dirty = state->items[static_cast<std::size_t>(state->hot_index)].rect;
+                    has_dirty = true;
+                }
+                if (hit >= 0) {
+                    if (has_dirty) {
+                        UnionRect(&dirty, &dirty,
+                                  &state->items[static_cast<std::size_t>(hit)].rect);
+                    } else {
+                        dirty = state->items[static_cast<std::size_t>(hit)].rect;
+                        has_dirty = true;
+                    }
+                }
                 state->hot_index = hit;
-                InvalidateRect(hwnd, nullptr, FALSE);
+                if (has_dirty) InvalidateRect(hwnd, &dirty, FALSE);
             }
             return 0;
         }
@@ -379,6 +509,11 @@ UINT show_popup(HWND owner, HINSTANCE instance, UINT dpi, HFONT font,
     state.dpi = dpi;
     state.font = font;
     state.theme = theme;
+    state.background_brush = CreateSolidBrush(theme.background);
+    state.hot_brush = CreateSolidBrush(theme.hot);
+    state.border_brush = CreateSolidBrush(theme.border);
+    state.separator_pen = CreatePen(PS_SOLID, 1, theme.separator);
+    state.check_pen = CreatePen(PS_SOLID, std::max(1, scale_for_dpi(2, dpi)), theme.text);
     state.items.reserve(source.size());
     for (auto& item : source) {
         item.label = display_text(std::move(item.label));
@@ -427,6 +562,11 @@ UINT show_popup(HWND owner, HINSTANCE instance, UINT dpi, HFONT font,
 
 } // namespace
 
+CustomMenuBar::~CustomMenuBar() {
+    release_paint_buffer();
+    release_theme_objects();
+}
+
 bool CustomMenuBar::create(HWND parent,
                            HINSTANCE instance,
                            std::vector<std::pair<UINT, std::wstring>> entries,
@@ -449,21 +589,92 @@ int CustomMenuBar::preferred_height() const { return scale_for_dpi(25, dpi_); }
 
 void CustomMenuBar::set_dpi(UINT dpi) {
     dpi_ = dpi == 0 ? USER_DEFAULT_SCREEN_DPI : dpi;
-    InvalidateRect(hwnd_, nullptr, TRUE);
+    layout_dirty_ = true;
+    InvalidateRect(hwnd_, nullptr, FALSE);
 }
 
 void CustomMenuBar::set_font(HFONT font) {
     font_ = font;
+    layout_dirty_ = true;
     if (hwnd_ != nullptr) SendMessageW(hwnd_, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
 }
 
 void CustomMenuBar::set_theme(const CustomMenuTheme& theme) {
     theme_ = theme;
-    InvalidateRect(hwnd_, nullptr, TRUE);
+    release_theme_objects();
+    ensure_theme_objects();
+    InvalidateRect(hwnd_, nullptr, FALSE);
 }
 
 void CustomMenuBar::move(int x, int y, int width, int height) {
-    MoveWindow(hwnd_, x, y, width, height, TRUE);
+    RECT current{};
+    GetClientRect(hwnd_, &current);
+    if (current.right - current.left != width) layout_dirty_ = true;
+    MoveWindow(hwnd_, x, y, width, height, FALSE);
+    InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
+bool CustomMenuBar::ensure_paint_buffer(HDC reference, int width, int height) {
+    if (paint_dc_ != nullptr && paint_bitmap_ != nullptr &&
+        paint_width_ == width && paint_height_ == height) {
+        return true;
+    }
+    release_paint_buffer();
+    if (reference == nullptr || width <= 0 || height <= 0) return false;
+    paint_dc_ = CreateCompatibleDC(reference);
+    paint_bitmap_ = CreateCompatibleBitmap(reference, width, height);
+    if (paint_dc_ == nullptr || paint_bitmap_ == nullptr) {
+        release_paint_buffer();
+        return false;
+    }
+    paint_old_bitmap_ = SelectObject(paint_dc_, paint_bitmap_);
+    paint_width_ = width;
+    paint_height_ = height;
+    return true;
+}
+
+void CustomMenuBar::release_paint_buffer() {
+    if (paint_dc_ != nullptr && paint_old_bitmap_ != nullptr) {
+        SelectObject(paint_dc_, paint_old_bitmap_);
+    }
+    if (paint_bitmap_ != nullptr) DeleteObject(paint_bitmap_);
+    if (paint_dc_ != nullptr) DeleteDC(paint_dc_);
+    paint_dc_ = nullptr;
+    paint_bitmap_ = nullptr;
+    paint_old_bitmap_ = nullptr;
+    paint_width_ = 0;
+    paint_height_ = 0;
+}
+
+void CustomMenuBar::ensure_theme_objects() {
+    if (background_brush_ == nullptr) background_brush_ = CreateSolidBrush(theme_.background);
+    if (hot_brush_ == nullptr) hot_brush_ = CreateSolidBrush(theme_.hot);
+    if (pressed_brush_ == nullptr) pressed_brush_ = CreateSolidBrush(theme_.pressed);
+    if (border_pen_ == nullptr) border_pen_ = CreatePen(PS_SOLID, 1, theme_.border);
+}
+
+void CustomMenuBar::release_theme_objects() {
+    if (background_brush_ != nullptr) DeleteObject(background_brush_);
+    if (hot_brush_ != nullptr) DeleteObject(hot_brush_);
+    if (pressed_brush_ != nullptr) DeleteObject(pressed_brush_);
+    if (border_pen_ != nullptr) DeleteObject(border_pen_);
+    background_brush_ = nullptr;
+    hot_brush_ = nullptr;
+    pressed_brush_ = nullptr;
+    border_pen_ = nullptr;
+}
+
+void CustomMenuBar::invalidate_entry(int index) const {
+    if (hwnd_ == nullptr || index < 0 || index >= static_cast<int>(entries_.size())) return;
+    InvalidateRect(hwnd_, &entries_[static_cast<std::size_t>(index)].rect, FALSE);
+}
+
+void CustomMenuBar::set_hot_index(int index) {
+    if (hot_index_ == index) return;
+    const int previous = hot_index_;
+    hot_index_ = index;
+    invalidate_entry(previous);
+    invalidate_entry(hot_index_);
 }
 
 void CustomMenuBar::layout_entries(HDC dc, int width) {
@@ -486,32 +697,51 @@ void CustomMenuBar::paint() {
     if (dc == nullptr) return;
     RECT client{};
     GetClientRect(hwnd_, &client);
-    HBRUSH brush = CreateSolidBrush(theme_.background);
-    FillRect(dc, &client, brush);
-    DeleteObject(brush);
-    HGDIOBJ old_font = SelectObject(dc, font_ != nullptr ? font_ : GetStockObject(DEFAULT_GUI_FONT));
-    SetBkMode(dc, TRANSPARENT);
-    layout_entries(dc, client.right);
+    const int width = client.right - client.left;
+    const int height = client.bottom - client.top;
+    if (width <= 0 || height <= 0) {
+        EndPaint(hwnd_, &paint);
+        return;
+    }
+    HDC target = ensure_paint_buffer(dc, width, height) ? paint_dc_ : dc;
+    ensure_theme_objects();
+    const RECT dirty = paint.rcPaint;
+    const int saved_dc = SaveDC(target);
+    IntersectClipRect(target, dirty.left, dirty.top, dirty.right, dirty.bottom);
+    FillRect(target, &dirty, background_brush_);
+    HGDIOBJ old_font = SelectObject(target, font_ != nullptr
+        ? font_ : GetStockObject(DEFAULT_GUI_FONT));
+    SetBkMode(target, TRANSPARENT);
+    if (layout_dirty_ || layout_width_ != width) {
+        layout_entries(target, width);
+        layout_width_ = width;
+        layout_dirty_ = false;
+    }
     for (std::size_t index = 0; index < entries_.size(); ++index) {
         const auto& entry = entries_[index];
+        RECT item_dirty{};
+        if (!IntersectRect(&item_dirty, &entry.rect, &dirty)) continue;
         const COLORREF background = active_index_ == static_cast<int>(index) ? theme_.pressed
             : hot_index_ == static_cast<int>(index) ? theme_.hot : theme_.background;
-        brush = CreateSolidBrush(background);
-        FillRect(dc, &entry.rect, brush);
-        DeleteObject(brush);
-        SetTextColor(dc, theme_.text);
+        HBRUSH item_brush = background == theme_.pressed ? pressed_brush_
+            : background == theme_.hot ? hot_brush_ : background_brush_;
+        FillRect(target, &entry.rect, item_brush);
+        SetTextColor(target, theme_.text);
         RECT text_rect = entry.rect;
-        DrawTextW(dc, entry.text.c_str(), -1, &text_rect,
+        DrawTextW(target, entry.text.c_str(), -1, &text_rect,
                   DT_CENTER | DT_VCENTER | DT_SINGLELINE |
                   (keyboard_cues_ ? 0u : DT_HIDEPREFIX));
     }
-    HPEN pen = CreatePen(PS_SOLID, 1, theme_.border);
-    HGDIOBJ old_pen = SelectObject(dc, pen);
-    MoveToEx(dc, client.left, client.bottom - 1, nullptr);
-    LineTo(dc, client.right, client.bottom - 1);
-    SelectObject(dc, old_pen);
-    DeleteObject(pen);
-    SelectObject(dc, old_font);
+    HGDIOBJ old_pen = SelectObject(target, border_pen_);
+    MoveToEx(target, client.left, client.bottom - 1, nullptr);
+    LineTo(target, client.right, client.bottom - 1);
+    SelectObject(target, old_pen);
+    SelectObject(target, old_font);
+    RestoreDC(target, saved_dc);
+    if (target != dc) {
+        BitBlt(dc, dirty.left, dirty.top, dirty.right - dirty.left,
+               dirty.bottom - dirty.top, target, dirty.left, dirty.top, SRCCOPY);
+    }
     EndPaint(hwnd_, &paint);
 }
 
@@ -546,8 +776,7 @@ void CustomMenuBar::set_keyboard_index(int index) {
     const int count = static_cast<int>(entries_.size());
     while (index < 0) index += count;
     keyboard_index_ = index % count;
-    hot_index_ = keyboard_index_;
-    InvalidateRect(hwnd_, nullptr, FALSE);
+    set_hot_index(keyboard_index_);
 }
 
 void CustomMenuBar::enter_keyboard_mode(int index) {
@@ -560,7 +789,7 @@ void CustomMenuBar::enter_keyboard_mode(int index) {
 void CustomMenuBar::exit_keyboard_mode(bool restore_focus) {
     keyboard_cues_ = false;
     keyboard_index_ = -1;
-    if (active_index_ < 0) hot_index_ = -1;
+    if (active_index_ < 0) set_hot_index(-1);
     InvalidateRect(hwnd_, nullptr, FALSE);
     if (restore_focus && previous_focus_ != nullptr && IsWindow(previous_focus_)) {
         SetFocus(previous_focus_);
@@ -571,8 +800,8 @@ void CustomMenuBar::exit_keyboard_mode(bool restore_focus) {
 void CustomMenuBar::show_menu(int index) {
     if (index < 0 || index >= static_cast<int>(entries_.size()) || !item_provider_) return;
     active_index_ = index;
-    hot_index_ = index;
-    InvalidateRect(hwnd_, nullptr, FALSE);
+    set_hot_index(index);
+    invalidate_entry(index);
     UpdateWindow(hwnd_);
     RECT anchor = entries_[static_cast<std::size_t>(index)].rect;
     MapWindowPoints(hwnd_, HWND_DESKTOP, reinterpret_cast<POINT*>(&anchor), 2);
@@ -581,7 +810,7 @@ void CustomMenuBar::show_menu(int index) {
                                     item_provider_(entries_[static_cast<std::size_t>(index)].id),
                                     {anchor.left, anchor.bottom});
     active_index_ = -1;
-    hot_index_ = -1;
+    set_hot_index(-1);
     mouse_tracking_ = false;
     exit_keyboard_mode(true);
     if (command != 0 && command_handler_) command_handler_(command);
@@ -652,13 +881,12 @@ LRESULT CustomMenuBar::handle_message(UINT message, WPARAM wparam, LPARAM lparam
         case WM_MOUSEMOVE: {
             track_mouse_leave();
             const int hit = hit_test({GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)});
-            if (hit != hot_index_) { hot_index_ = hit; InvalidateRect(hwnd_, nullptr, FALSE); }
+            set_hot_index(hit);
             return 0;
         }
         case WM_MOUSELEAVE:
             mouse_tracking_ = false;
-            hot_index_ = -1;
-            InvalidateRect(hwnd_, nullptr, FALSE);
+            set_hot_index(-1);
             return 0;
         case WM_LBUTTONUP: {
             const int hit = hit_test({GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)});
@@ -666,6 +894,9 @@ LRESULT CustomMenuBar::handle_message(UINT message, WPARAM wparam, LPARAM lparam
             return 0;
         }
         case WM_SETCURSOR: SetCursor(LoadCursorW(nullptr, IDC_ARROW)); return TRUE;
+        case WM_NCDESTROY:
+            release_paint_buffer();
+            return DefWindowProcW(hwnd_, message, wparam, lparam);
     }
     return DefWindowProcW(hwnd_, message, wparam, lparam);
 }

@@ -34,6 +34,7 @@ public:
     using CommandHandler = std::function<void(UINT)>;
 
     CustomMenuBar() = default;
+    ~CustomMenuBar();
     CustomMenuBar(const CustomMenuBar&) = delete;
     CustomMenuBar& operator=(const CustomMenuBar&) = delete;
 
@@ -68,6 +69,12 @@ private:
 
     void paint();
     void layout_entries(HDC dc, int width);
+    bool ensure_paint_buffer(HDC reference, int width, int height);
+    void release_paint_buffer();
+    void ensure_theme_objects();
+    void release_theme_objects();
+    void invalidate_entry(int index) const;
+    void set_hot_index(int index);
     void track_mouse_leave();
     void set_keyboard_index(int index);
     void enter_keyboard_mode(int index = 0);
@@ -92,6 +99,17 @@ private:
     bool mouse_tracking_{false};
     bool keyboard_cues_{false};
     HWND previous_focus_{};
+    HDC paint_dc_{};
+    HBITMAP paint_bitmap_{};
+    HGDIOBJ paint_old_bitmap_{};
+    int paint_width_{};
+    int paint_height_{};
+    int layout_width_{-1};
+    bool layout_dirty_{true};
+    HBRUSH background_brush_{};
+    HBRUSH hot_brush_{};
+    HBRUSH pressed_brush_{};
+    HPEN border_pen_{};
 };
 
 } // namespace axiom::gui
