@@ -52,7 +52,9 @@ The codec currently implements:
   (`fast_lz`, level 1), a **price-aware lazy hash-chain matcher** (levels 2–6:
   the lazy step defers on token-cost comparison and on repeat-offsets available
   one position ahead, not just on "strictly longer"), and an LZMA-style
-  **cyclic-window binary-tree matcher** (`--bt`, levels 7–9).
+  **cyclic-window binary-tree matcher** (`--bt`, levels 7–9). Level 7 applies
+  the same cost-aware one-byte lookahead through a non-mutating tree search;
+  levels 8–9 use the optimal parser instead.
 - A bounded **optimal (DP) parser** whose candidates come from the binary tree
   (LZMA-style `GetMatches`: the descent yields several distinct lengths, each
   at its nearest distance). Level 9 runs it two-pass (re-parse with measured
@@ -211,13 +213,20 @@ The archive header stores:
 
 - Magic and version.
 - Codec identifier.
+- Version-5 transform-present flags and a bounded transform-range section.
 - Original size.
 - Payload size.
 - CRC-32 of the uncompressed data.
 
+The current transform layer supports independently reset x86/x64 relative-branch
+conversion and byte-delta ranges. PE, PCM WAV, and uncompressed BMP signatures
+provide candidate hints; a fast trial encode enables the filter only when it is
+expected to beat the unfiltered representation. AXAR passes one range per file or
+file fragment so mixed solid blocks remain reversible, while the final AXC CRC
+continues to authenticate the original bytes.
+
 Future block headers should add:
 
-- Transform chain.
 - Dictionary identifier.
 - Codec parameters.
 - Per-block checksums.
@@ -247,9 +256,9 @@ higher-effort ratio tools for levels that explicitly trade speed away.
 
 A single `--level 1..9` knob selects the speed/ratio operating point (default 5).
 Levels 1–6 drive the hash-chain matcher, raising chain depth and turning on lazy
-matching and the full entropy bake-off as the level rises; levels 7–9 switch to
-the binary-tree matcher with growing windows, and levels 8–9 add the optimal
-parser (single-pass at 8, two-pass at 9). Individual flags (`--chain-depth`,
+matching and the full entropy bake-off as the level rises; level 7 switches to
+a cost-aware lazy binary tree, and levels 8–9 use growing tree windows plus the
+optimal parser (single-pass at 8, two-pass at 9). Individual flags (`--chain-depth`,
 `--nice`, `--lazy`/`--no-lazy`, `--fast-entropy`, `--bt`, `--window`,
 `--optimal…`) override the preset, so a level is just a starting point. The
 decoder is identical at every level.
@@ -292,6 +301,8 @@ cyclic window.
 - A descent stops when a candidate falls outside the configured window.
 - Memory stays proportional to `--window`, not to the whole input.
 - Set `--window` as large as the block to search the full block.
+- Level 7 searches `p + 1` without inserting it and defers the current match
+  when the next path is cheaper per byte or exposes an equal-length rep match.
 
 ### Optimal parser
 
@@ -322,14 +333,14 @@ The standing corpora are **enwik8** (100 MB of English Wikipedia text, the
 de-facto LZMA-class ratio benchmark) and the **Silesia corpus** (~212 MB of
 mixed text/binary/medical/database data, benchmarked as a single tar, which is
 what zstd and most modern codecs report against). `tools\bench_enwik8.ps1`
-downloads enwik8 on first run, sweeps the match finders and window sizes,
-prints a 7-Zip reference, and verifies every row by round-trip before reporting
-a ratio. Cross-format Silesia results live in the README's performance section.
+downloads enwik8 on first run, sweeps Axiom's match finders and window sizes,
+and verifies every row by round-trip before reporting a ratio.
 
-For ad-hoc inputs, the Python harness (`bench/bench_7zip.py`) can compare files
-directly; for folders it builds a deterministic byte stream of relative paths and
-file bytes and feeds that same stream to Axiom and 7-Zip, which keeps multi-file
-measurements fair until the container exposes native solid blocks to the harness.
+The cross-codec harness (`bench/bench_codecs.py`) compares Axiom levels against
+available LZ4, zstd, Deflate, bzip2, and LZMA2 profiles. For folders it builds a
+deterministic byte stream of relative paths and file bytes, then feeds that same
+stream to every codec. Each reported row is restored and compared byte-for-byte,
+keeping multi-file container differences out of codec measurements.
 
 ## Decoder Rule
 

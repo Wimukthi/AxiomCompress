@@ -1,18 +1,16 @@
 # Standing benchmark for AxiomCompress: enwik8 (100 MB English Wikipedia text).
 #
-# Downloads enwik8 on first run, sweeps the effort levels and the match
-# finder/window detail, and (if 7-Zip is present) prints a 7-Zip reference row.
-# Every row is verified by decompressing and comparing a hash against the source,
-# so a ratio is never reported for a build that does not round-trip.
+# Downloads enwik8 on first run and sweeps Axiom effort levels plus match-finder
+# and window detail. Use bench/bench_codecs.py when comparing against external
+# codecs. Every row here is verified by decompressing and comparing a hash.
 #
-#   tools\bench_enwik8.ps1 [-Axiomc <path>] [-SevenZip <path>] [-Scratch <dir>] [-Quick]
+#   tools\bench_enwik8.ps1 [-Axiomc <path>] [-Scratch <dir>] [-Quick]
 #
 # Corpus and scratch live under -Scratch, which defaults to a LOCAL path off any
 # cloud-synced tree: background sync of the repo otherwise contends for cores and
 # makes the timings noisy (ratios stay exact either way). -Quick skips slow rows.
 param(
     [string]$Axiomc = "",
-    [string]$SevenZip = "C:\Program Files\7-Zip\7z.exe",
     [string]$Scratch = (Join-Path $env:LOCALAPPDATA "axiom-bench"),
     [switch]$Quick
 )
@@ -38,8 +36,7 @@ if (-not (Test-Path $Enwik8)) {
     $zip = Join-Path $Corpus "enwik8.zip"
     Write-Host "Downloading enwik8 (~36 MB)..."
     Invoke-WebRequest -Uri "http://mattmahoney.net/dc/enwik8.zip" -OutFile $zip -TimeoutSec 600 -UseBasicParsing
-    if (Test-Path $SevenZip) { & $SevenZip x $zip "-o$Corpus" -y | Out-Null }
-    else { Expand-Archive -Path $zip -DestinationPath $Corpus -Force }
+    Expand-Archive -Path $zip -DestinationPath $Corpus -Force
 }
 $srcLen = (Get-Item $Enwik8).Length
 $srcHash = (Get-FileHash $Enwik8 -Algorithm SHA256).Hash
@@ -80,30 +77,6 @@ Axiom-Row "bt single w=8M"           @("--bt","--block-size","128M","--window","
 Axiom-Row "bt single w=32M"          @("--bt","--block-size","128M","--window","32M")
 if (-not $Quick) {
     Axiom-Row "bt single w=128M (full)" @("--bt","--block-size","128M","--window","128M")
-}
-
-if (Test-Path $SevenZip) {
-    Write-Host "`n7-Zip reference:"
-    function SevenZip-Row($label, $level) {
-        $arc = Join-Path $Work "ref.7z"
-        Remove-Item $arc -ErrorAction SilentlyContinue
-        $sw = [System.Diagnostics.Stopwatch]::StartNew()
-        & $SevenZip a -t7z $level $arc $Enwik8 | Out-Null
-        $sw.Stop(); $ct = $sw.Elapsed.TotalSeconds
-        $csize = (Get-Item $arc).Length
-        $sw.Restart()
-        & $SevenZip t $arc | Out-Null   # decode-only timing proxy
-        $sw.Stop(); $dt = $sw.Elapsed.TotalSeconds
-        $script:rows += [pscustomobject]@{
-            config = $label; ratio = $srcLen / $csize
-            comp_MBps = ($srcLen / 1MB) / $ct; decomp_MBps = ($srcLen / 1MB) / $dt
-            roundtrip = $true
-        }
-        Write-Host ("  {0,-26} ratio={1,5:N2}x  c={2,6:N1} MB/s  d={3,6:N1} MB/s" -f `
-            $label, ($srcLen/$csize), (($srcLen/1MB)/$ct), (($srcLen/1MB)/$dt))
-    }
-    SevenZip-Row "7-Zip -mx1" "-mx1"
-    SevenZip-Row "7-Zip -mx9" "-mx9"
 }
 
 Write-Host "`n--- markdown ---"

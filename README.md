@@ -4,11 +4,13 @@ AxiomCompress is an experimental archive compressor for Windows and the command
 line. Its main archive format is `.axar`; the lower-level single-stream format is
 `.axc`.
 
-The current goal is 7-Zip-class solid compression with a simple, bounded decoder.
-On the Silesia corpus the maximum preset now lands within a few percent of
-`zstd -19` at comparable compression time (see the performance section below);
-7-Zip's LZMA2 maximum still compresses smaller. Beyond the codec, the project
-has a complete archive container, a native Win32 GUI, a scriptable CLI,
+The current goal is competitive modern solid compression with a simple, bounded
+decoder. Axiom is measured across LZ4, zstd, Deflate, bzip2, and LZMA2 rather
+than treating any one format as the sole target. On the Silesia corpus the
+maximum preset sits between zstd's mid/high-ratio profiles and bzip2/LZMA2 in
+ratio, while retaining much faster decode than bzip2 and LZMA2 (see the
+performance section below). Beyond the codec, the project has a complete
+archive container, a native Win32 GUI, a scriptable CLI,
 integrity checks, encryption, recovery data, split volumes, signing, and SFX
 packaging.
 
@@ -32,6 +34,8 @@ Most users need one of these paths:
   streams, symlinks, hardlinks, comments, locking, and archive editing.
 - Solid blocks for cross-file compression while keeping each block independently
   decodable for selective extraction.
+- Automatic file-type grouping plus reversible x86 branch and PCM/raster delta
+  filters. A fast trial keeps a filter only when it predicts a net size win.
 - Per-block CRC checks, per-file CRC-32, and per-file BLAKE3-256 hashes.
 - Optional password encryption using Monocypher Argon2id and
   XChaCha20-Poly1305.
@@ -305,7 +309,7 @@ One level chooses the speed/ratio tradeoff:
 | 2-3 | Shallow hash chain, price-aware lazy | Fast backups |
 | 4-5 | Lazy hash chain, price-aware lazy | Balanced default use |
 | 6 | Deeper hash chain | Better ratio without tree memory |
-| 7 | Binary tree (greedy), 8 MiB window | Long-range redundancy beyond the chain levels' 1 MiB window |
+| 7 | Binary tree + cost-aware lazy lookahead, 8 MiB window | Long-range redundancy without optimal-parse cost |
 | 8 | Binary tree + single-pass optimal parse, 32 MiB window | Very high ratio at moderate time |
 | 9 / `--max` | Binary tree + two-pass optimal parse, 64 MiB window | Maximum preset |
 
@@ -340,13 +344,17 @@ The standard text benchmark is `enwik8`:
 .\tools\bench_enwik8.ps1 -Axiomc out\Release\axiomc.exe
 ```
 
-For custom files or folders:
+For a round-trip-verified cross-codec comparison on a file or folder:
 
 ```powershell
-python bench/bench_7zip.py --axiom out/Release/axiomc.exe --input path/to/corpus
-python bench/bench_7zip.py --axiom out/Release/axiomc.exe --input path/to/corpus --axiom-threads 0
-python bench/bench_7zip.py --axiom out/Release/axiomc.exe --input path/to/corpus --axiom-optimal --axiom-threads 0
+python bench/bench_codecs.py --axiom out/Release/axiomc.exe --input path/to/corpus
+python bench/bench_codecs.py --axiom out/Release/axiomc.exe --input path/to/corpus --output results.csv
+python bench/bench_codecs.py --axiom out/Release/axiomc.exe --input path/to/corpus --quick
 ```
+
+The harness auto-detects available LZ4, zstd, and 7-Zip executables and accepts
+explicit `--lz4`, `--zstd`, and `--sevenzip` paths. Every reported row is
+decompressed and compared byte-for-byte with the shared input stream.
 
 `--threads 0` is the default and means all detected hardware threads. Supplying
 `--block-size` is useful for controlled experiments, but it disables the default
@@ -382,45 +390,51 @@ profile sweeps and repeatable tuning workflow details, see
 
 ## Performance snapshot
 
-Measured on the **Silesia corpus** (the twelve files packed into one 212 MB
+Measured on the **Silesia corpus** (the twelve files packed into one 211.9 MB
 uncompressed tar, so every codec sees identical input), AMD Ryzen 9 5950X
 (16C/32T), NVMe, warm cache, Release build. Compression is best-of-2, decode
 best-of-3; every row is round-trip verified. Reference tools: zstd 1.5.7
-(`-T0`), lz4 1.10.0, and 7-Zip 26.00 (`-mmt=on`) for LZMA2/xz/zip/bzip2/gzip.
-Axiom runs with default `--threads 0`.
+(`-T0`), LZ4 1.10.0, and 7-Zip 26.02 (`-mmt=on`) for LZMA2, bzip2, and gzip.
+Axiom runs with default `--threads 0`. These are direct codec comparisons on
+one tar stream; the separate AXAR filter tests exercise per-file transforms.
 
 | Codec / level | Compressed | Ratio | Compress | Decompress |
 |---|---:|---:|---:|---:|
-| lz4 -1 | 100.9 MB | 2.10x | 0.12 s | 0.12 s |
-| lz4 -9 (HC) | 78.0 MB | 2.72x | 0.41 s | 0.12 s |
-| zstd -1 | 73.3 MB | 2.89x | 0.11 s | 0.17 s |
-| **axiom -1** | 69.6 MB | 3.05x | 0.51 s | 0.26 s |
-| zstd -3 | 66.2 MB | 3.20x | 0.14 s | 0.19 s |
-| zip/gzip deflate -9 | 64.7 MB | 3.28x | 101 s | 0.85 s |
-| **axiom -3** | 63.0 MB | 3.36x | 1.3 s | 0.26 s |
-| **axiom -5** (default) | 60.5 MB | 3.51x | 2.1 s | 0.27 s |
-| zstd -9 | 59.2 MB | 3.58x | 0.52 s | 0.18 s |
-| **axiom -8** | 56.4 MB | 3.76x | 12.6 s | 0.28 s |
-| **axiom -9** | 55.9 MB | 3.79x | 28.4 s | 0.34 s |
-| bzip2 -9 | 54.2 MB | 3.91x | 7.2 s | 2.16 s |
-| zstd -19 | 52.8 MB | 4.01x | 17.5 s | 0.19 s |
-| zstd -22 --ultra | 52.3 MB | 4.05x | 85.0 s | 0.22 s |
-| 7z LZMA2 -mx5 | 49.6 MB | 4.27x | 18.1 s | 0.84 s |
-| xz / 7z LZMA2 -mx9 | 48.7 MB | 4.35x | 32–33 s | 1.26 s |
+| LZ4 -1 | 100.9 MB | 2.10x | 0.42 s | 0.42 s |
+| LZ4 -9 (HC) | 78.0 MB | 2.72x | 0.64 s | 0.45 s |
+| zstd -1 | 73.3 MB | 2.89x | 0.08 s | 0.15 s |
+| **Axiom -1** | 69.6 MB | 3.05x | 0.50 s | 0.18 s |
+| zstd -3 | 66.2 MB | 3.20x | 0.13 s | 0.17 s |
+| gzip Deflate -9 | 64.7 MB | 3.28x | 92.44 s | 0.82 s |
+| **Axiom -2** | 63.8 MB | 3.32x | 1.27 s | 0.18 s |
+| **Axiom -3** | 63.0 MB | 3.36x | 1.50 s | 0.18 s |
+| **Axiom -4** | 60.9 MB | 3.48x | 1.91 s | 0.18 s |
+| **Axiom -5** (default) | 60.5 MB | 3.51x | 2.43 s | 0.19 s |
+| **Axiom -6** | 60.2 MB | 3.52x | 3.19 s | 0.19 s |
+| zstd -9 | 59.2 MB | 3.58x | 0.56 s | 0.16 s |
+| **Axiom -7** | 58.7 MB | 3.61x | 5.57 s | 0.19 s |
+| **Axiom -8** | 56.2 MB | 3.77x | 15.30 s | 0.20 s |
+| **Axiom -9** | 55.4 MB | 3.83x | 28.94 s | 0.20 s |
+| bzip2 -9 | 54.2 MB | 3.91x | 7.53 s | 2.18 s |
+| zstd -19 | 52.8 MB | 4.01x | 19.41 s | 0.18 s |
+| zstd -22 --ultra | 52.3 MB | 4.05x | 96.02 s | 0.20 s |
+| LZMA2 -mx5 | 49.6 MB | 4.27x | 19.81 s | 0.82 s |
+| LZMA2 -mx9 | 48.7 MB | 4.35x | 40.03 s | 1.26 s |
 
-Reading the table: Axiom beats zstd level-for-level on ratio at the fast end
-(axiom -1/-3 vs zstd -1/-3) at a few hundred MB/s, its decode speed is a flat
-~0.3 s at every level, and the maximum preset lands within ~6% of `zstd -19`
-at comparable compression time. LZMA2/xz still compress ~13% smaller than
-Axiom's maximum at similar-or-slower speeds and ~4x slower decode — that
-remaining ratio gap (sequence modeling and context literals) is the active
-codec work. Deflate-era formats (zip/gzip) are dominated on every axis.
+Reading the table: Axiom's fast presets trade zstd's throughput for a smaller
+result, while levels 4–7 fill the ratio gap between zstd -3 and zstd -9. The
+maximum preset is 4.8% larger and slower to encode than zstd -19 on this run,
+but decodes at essentially the same speed. LZMA2 -mx9 is 12% smaller than Axiom
+-9 and encodes more slowly, while Axiom decodes about six times faster. bzip2
+also beats Axiom -9 on ratio and encode time here, but decodes roughly eleven
+times slower. These cross-codec tradeoffs—not one 7-Zip row—define the active
+ratio, speed, and decoder-complexity work.
 
 On `enwik8` (100 MB English Wikipedia text, default `--threads 0`):
 
 | Level | 1 | 3 | 5 default | 6 | 7 | 8 | 9 |
 |---|---|---|---|---|---|---|---|
-| Ratio | 2.68x | 3.03x | 3.11x | 3.13x | 3.14x | 3.43x | 3.46x |
+| Ratio | 2.68x | 3.03x | 3.11x | 3.13x | 3.23x | 3.43x | 3.46x |
 
 Throughput depends on CPU, memory bandwidth, storage, corpus shape, and Release
 build settings; re-run `tools\bench_enwik8.ps1` or the method in

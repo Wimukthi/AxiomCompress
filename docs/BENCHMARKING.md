@@ -2,7 +2,7 @@
 
 Use this guide when changing compression speed, decompression speed, memory use,
 or compression-ratio presets. The benchmark scripts do not change the archive
-format; they only run `axiomc.exe`, verify round-trips, and write CSV results.
+format; they run codecs, verify round-trips, and write CSV results.
 
 ## Build first
 
@@ -50,6 +50,25 @@ text/binary data): pack the twelve files into one uncompressed tar and feed
 that same tar to every codec (`axiomc c`, `zstd`, `7z`, ...) so container
 overhead and file grouping do not skew the comparison. Verify every row by
 round-trip. The README's performance section is measured this way.
+
+## Cross-codec suite
+
+Use the codec-neutral harness for the published comparison. It runs Axiom levels
+1–9 and any available LZ4, zstd, Deflate, bzip2, and LZMA2 profiles against the
+same byte stream:
+
+```powershell
+python .\bench\bench_codecs.py `
+  --axiom .\out\Release\axiomc.exe `
+  --input D:\tests\axiom-perf\silesia.tar `
+  --output D:\tests\axiom-perf\results\silesia-codecs.csv
+```
+
+The harness auto-detects tools on `PATH` and common Windows install locations.
+Use `--lz4`, `--zstd`, or `--sevenzip` for explicit executable paths. Missing
+reference tools are reported and skipped; Axiom is always required. The default
+protocol is best-of-two compression and best-of-three decompression, with every
+restore compared byte-for-byte. `--quick` selects a short smoke-test profile.
 
 If you only need a smoke test, let the script create deterministic sample files:
 
