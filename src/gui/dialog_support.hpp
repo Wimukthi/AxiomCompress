@@ -26,6 +26,8 @@ struct DialogAppearance {
 };
 
 int scale_for_dialog_dpi(int value, UINT dpi);
+SIZE dialog_window_size_for_client(int logical_width, int logical_height,
+                                   DWORD style, DWORD extended_style, UINT dpi);
 HFONT create_dialog_font(UINT dpi);
 void delete_dialog_font(HFONT font);
 
@@ -47,7 +49,7 @@ void set_dialog_control_font(HWND control, HFONT font);
 void draw_dialog_button(const DRAWITEMSTRUCT& draw, bool dark);
 void draw_dialog_checkbox(const DRAWITEMSTRUCT& draw, bool dark, bool checked);
 void draw_dialog_combo_item(const DRAWITEMSTRUCT& draw, bool dark);
-bool disable_dialog_owner(HWND owner);
+bool disable_dialog_owner(HWND owner, HWND dialog);
 void restore_dialog_owner(HWND owner, bool was_enabled);
 bool message_targets_window(HWND window, const MSG& message);
 bool window_placement_is_visible(const WINDOWPLACEMENT& placement);

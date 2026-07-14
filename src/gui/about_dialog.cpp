@@ -124,7 +124,7 @@ void layout(AboutDialogState* state) {
                client.right - margin * 2, scale_for_dialog_dpi(22, state->dpi), TRUE);
     MoveWindow(state->third_party, margin,
                third_party_top + scale_for_dialog_dpi(26, state->dpi),
-               client.right - margin * 2, scale_for_dialog_dpi(92, state->dpi), TRUE);
+               client.right - margin * 2, scale_for_dialog_dpi(110, state->dpi), TRUE);
     MoveWindow(state->auto_update, margin, button_top + scale_for_dialog_dpi(4, state->dpi),
                scale_for_dialog_dpi(190, state->dpi), scale_for_dialog_dpi(22, state->dpi), TRUE);
     MoveWindow(state->check_updates,
@@ -219,6 +219,7 @@ LRESULT CALLBACK about_dialog_proc(HWND hwnd, UINT message, WPARAM wparam, LPARA
             state->third_party = CreateWindowExW(
                 0, L"STATIC",
                 L"miniz - ZIP read/write support - MIT license\r\n"
+                L"minizip-ng - standard split-ZIP support - zlib license\r\n"
                 L"7-Zip - read-only archive backend - LGPL/BSD/unRAR restriction\r\n"
                 L"Monocypher - cryptographic primitives - BSD 2-Clause license\r\n"
                 L"BLAKE3 - hashing/integrity primitives - CC0/Apache-2.0 license\r\n"
@@ -269,6 +270,7 @@ LRESULT CALLBACK about_dialog_proc(HWND hwnd, UINT message, WPARAM wparam, LPARA
                          suggested->right - suggested->left,
                          suggested->bottom - suggested->top,
                          SWP_NOZORDER | SWP_NOACTIVATE);
+            apply_axiom_window_icons(hwnd, state->instance);
             rebuild_fonts(state);
             SendMessageW(state->icon, STM_SETICON,
                          reinterpret_cast<WPARAM>(load_axiom_icon(
@@ -362,7 +364,7 @@ void show_about_dialog(HWND owner, HINSTANCE instance, UINT dpi, bool dark,
     const UINT effective_dpi = dpi == 0 ? GetDpiForWindow(owner) : dpi;
     RECT owner_rect{};
     GetWindowRect(owner, &owner_rect);
-    const SIZE window_size = about_window_size_for_client(effective_dpi, 540, 450);
+    const SIZE window_size = about_window_size_for_client(effective_dpi, 540, 470);
     const int width = window_size.cx;
     const int height = window_size.cy;
     AboutDialogState state{};
@@ -389,11 +391,13 @@ void show_about_dialog(HWND owner, HINSTANCE instance, UINT dpi, bool dark,
     GetWindowRect(dialog, &restored_rect);
     int restored_width = restored_rect.right - restored_rect.left;
     int restored_height = restored_rect.bottom - restored_rect.top;
-    if (restored_width < width) restored_width = width;
-    if (restored_height < height) restored_height = height;
+    const SIZE restored_minimum = about_window_size_for_client(
+        GetDpiForWindow(dialog), 540, 470);
+    if (restored_width < restored_minimum.cx) restored_width = restored_minimum.cx;
+    if (restored_height < restored_minimum.cy) restored_height = restored_minimum.cy;
     SetWindowPos(dialog, nullptr, restored_rect.left, restored_rect.top,
                  restored_width, restored_height, SWP_NOZORDER | SWP_NOACTIVATE);
-    const bool owner_was_enabled = disable_dialog_owner(owner);
+    const bool owner_was_enabled = disable_dialog_owner(owner, dialog);
     ShowWindow(dialog, SW_SHOW);
     UpdateWindow(dialog);
     MSG message{};

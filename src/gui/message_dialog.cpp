@@ -433,7 +433,7 @@ int show_message_dialog(HWND owner, HINSTANCE instance, UINT dpi, bool dark,
         return safe_result;
     }
 
-    const bool owner_was_enabled = disable_dialog_owner(owner);
+    const bool owner_was_enabled = disable_dialog_owner(owner, dialog);
     ShowWindow(dialog, SW_SHOW);
     UpdateWindow(dialog);
 

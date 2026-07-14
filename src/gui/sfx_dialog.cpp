@@ -128,7 +128,7 @@ public:
                                   x, y, width, height, owner, nullptr, instance, this);
         if (window_ == nullptr) return false;
         restore_named_window_placement(window_, owner, L"SfxExtractDialog");
-        const bool owner_was_enabled = disable_dialog_owner(owner);
+        const bool owner_was_enabled = disable_dialog_owner(owner, window_);
         ShowWindow(window_, SW_SHOW);
         UpdateWindow(window_);
 
@@ -375,6 +375,7 @@ private:
                              suggested->right - suggested->left,
                              suggested->bottom - suggested->top,
                              SWP_NOZORDER | SWP_NOACTIVATE);
+                apply_axiom_window_icons(window_, instance_);
                 rebuild_font();
                 layout();
                 return 0;

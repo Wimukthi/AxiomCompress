@@ -33,6 +33,9 @@
     <ClCompile Include="src\gui\custom_menu.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="src\gui\compression_estimate_dialog.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="src\gui\toolbar_icons.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -70,6 +73,9 @@
     </ClInclude>
     <ClInclude Include="src\gui\main_window_internal.hpp"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="src\gui\custom_menu.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\gui\compression_estimate_dialog.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="src\gui\toolbar_icons.hpp">

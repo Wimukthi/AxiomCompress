@@ -5,8 +5,10 @@
 
 #include <algorithm>
 #include <commctrl.h>
+#include <windowsx.h>
 #include <cwctype>
 #include <dwmapi.h>
+#include <new>
 #include <string>
 #include <uxtheme.h>
 
@@ -15,12 +17,52 @@ namespace {
 
 constexpr DWORD kOlderImmersiveDarkMode = 19;
 constexpr UINT_PTR kDarkComboSubclass = 1;
+constexpr UINT_PTR kModalOwnerSubclass = 2;
 constexpr const wchar_t* kSavedComboStyleProperty = L"AxiomSavedComboStyle";
 constexpr const wchar_t* kSavedComboExStyleProperty = L"AxiomSavedComboExStyle";
+constexpr const wchar_t* kDarkComboHotProperty = L"AxiomDarkComboHot";
+constexpr const wchar_t* kDarkComboTrackingProperty = L"AxiomDarkComboTracking";
 constexpr const wchar_t* kWindowLayoutsRegistryPath =
     L"Software\\AxiomCompress\\GUI\\WindowLayouts";
 
 DialogAppearance g_dialog_appearance{};
+
+struct ModalOwnerState {
+    HWND owner = nullptr;
+    bool restored = false;
+};
+
+void activate_restored_owner(HWND owner) {
+    if (owner == nullptr || !IsWindow(owner)) return;
+    EnableWindow(owner, TRUE);
+    if (!IsWindowVisible(owner) || IsIconic(owner)) return;
+
+    // SetActiveWindow alone cannot recover after Windows has already selected
+    // another application's window. Calling this while the modal child is still
+    // being destroyed keeps the foreground transition within Axiom.
+    SetActiveWindow(owner);
+    if (GetForegroundWindow() != owner) SetForegroundWindow(owner);
+}
+
+LRESULT CALLBACK modal_owner_subclass_proc(HWND window, UINT message,
+                                            WPARAM wparam, LPARAM lparam,
+                                            UINT_PTR subclass_id,
+                                            DWORD_PTR reference_data) {
+    auto* state = reinterpret_cast<ModalOwnerState*>(reference_data);
+    if (message == WM_DESTROY && state != nullptr && !state->restored) {
+        state->restored = true;
+        activate_restored_owner(state->owner);
+    }
+    if (message == WM_NCDESTROY) {
+        if (state != nullptr && !state->restored) {
+            state->restored = true;
+            activate_restored_owner(state->owner);
+        }
+        RemoveWindowSubclass(window, modal_owner_subclass_proc, subclass_id);
+        delete state;
+    }
+    return DefSubclassProc(window, message, wparam, lparam);
+}
 
 bool high_contrast_enabled() {
     HIGHCONTRASTW contrast{sizeof(contrast)};
@@ -202,7 +244,8 @@ std::wstring layout_registry_path(std::wstring_view name) {
     return path;
 }
 
-bool read_window_placement(std::wstring_view name, WINDOWPLACEMENT& placement) {
+bool read_window_placement(std::wstring_view name, WINDOWPLACEMENT& placement,
+                           UINT& saved_dpi) {
     const std::wstring path = layout_registry_path(name);
     HKEY key = nullptr;
     if (RegOpenKeyExW(HKEY_CURRENT_USER, path.c_str(), 0, KEY_QUERY_VALUE, &key) !=
@@ -215,6 +258,13 @@ bool read_window_placement(std::wstring_view name, WINDOWPLACEMENT& placement) {
     const LSTATUS status = RegQueryValueExW(
         key, L"WindowPlacement", nullptr, &type,
         reinterpret_cast<BYTE*>(&placement), &size);
+    DWORD dpi_type = 0;
+    DWORD dpi_size = sizeof(saved_dpi);
+    if (RegQueryValueExW(key, L"WindowDpi", nullptr, &dpi_type,
+                         reinterpret_cast<BYTE*>(&saved_dpi), &dpi_size) != ERROR_SUCCESS ||
+        dpi_type != REG_DWORD || dpi_size != sizeof(saved_dpi)) {
+        saved_dpi = 0;
+    }
     RegCloseKey(key);
     if (status != ERROR_SUCCESS || type != REG_BINARY || size != sizeof(WINDOWPLACEMENT)) {
         return false;
@@ -259,20 +309,28 @@ bool combo_is_dropdown_list(HWND window) {
     return (style & CBS_DROPDOWNLIST) == CBS_DROPDOWNLIST;
 }
 
+RECT dark_combo_arrow_rect(HWND window) {
+    RECT client{};
+    if (!GetClientRect(window, &client)) return {};
+
+    const UINT dpi = GetDpiForWindow(window);
+    const int arrow_width = (std::max)(
+        scale_for_dialog_dpi(18, dpi), GetSystemMetricsForDpi(SM_CXVSCROLL, dpi));
+    return RECT{
+        (std::max)(client.left + 1, client.right - arrow_width),
+        client.top + 1,
+        client.right - 1,
+        client.bottom - 1,
+    };
+}
+
 void paint_dark_combo(HWND window, HDC dc) {
     RECT client{};
     if (!GetClientRect(window, &client)) return;
 
     const DialogColors colors = dialog_colors(true);
     const UINT dpi = GetDpiForWindow(window);
-    const int arrow_width = (std::max)(
-        scale_for_dialog_dpi(18, dpi), GetSystemMetricsForDpi(SM_CXVSCROLL, dpi));
-    RECT arrow{
-        (std::max)(client.left + 1, client.right - arrow_width),
-        client.top + 1,
-        client.right - 1,
-        client.bottom - 1,
-    };
+    const RECT arrow = dark_combo_arrow_rect(window);
 
     POINT cursor{};
     GetCursorPos(&cursor);
@@ -441,15 +499,40 @@ LRESULT CALLBACK dark_combo_subclass_proc(HWND window, UINT message,
             return result;
         }
         case WM_MOUSEMOVE: {
-            TRACKMOUSEEVENT tracking{sizeof(tracking), TME_LEAVE, window, 0};
-            TrackMouseEvent(&tracking);
             if (reference_data != 0) {
-                draw_dark_combo_frame(window);
+                if (GetPropW(window, kDarkComboTrackingProperty) == nullptr) {
+                    TRACKMOUSEEVENT tracking{sizeof(tracking), TME_LEAVE, window, 0};
+                    if (TrackMouseEvent(&tracking)) {
+                        SetPropW(window, kDarkComboTrackingProperty,
+                                 reinterpret_cast<HANDLE>(1));
+                    }
+                }
+                const POINT point{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
+                const RECT arrow = dark_combo_arrow_rect(window);
+                const bool hot = PtInRect(&arrow, point) != FALSE;
+                const bool was_hot = GetPropW(window, kDarkComboHotProperty) != nullptr;
+                if (hot != was_hot) {
+                    if (hot) {
+                        SetPropW(window, kDarkComboHotProperty,
+                                 reinterpret_cast<HANDLE>(1));
+                    } else {
+                        RemovePropW(window, kDarkComboHotProperty);
+                    }
+                    InvalidateRect(window, &arrow, FALSE);
+                }
                 return 0;
             }
             break;
         }
-        case WM_MOUSELEAVE:
+        case WM_MOUSELEAVE: {
+            const bool was_hot = RemovePropW(window, kDarkComboHotProperty) != nullptr;
+            RemovePropW(window, kDarkComboTrackingProperty);
+            if (reference_data != 0 && was_hot) {
+                const RECT arrow = dark_combo_arrow_rect(window);
+                InvalidateRect(window, &arrow, FALSE);
+            }
+            return 0;
+        }
         case WM_LBUTTONDOWN:
         case WM_LBUTTONUP:
         case WM_ENABLE:
@@ -461,6 +544,8 @@ LRESULT CALLBACK dark_combo_subclass_proc(HWND window, UINT message,
             return result;
         }
         case WM_NCDESTROY:
+            RemovePropW(window, kDarkComboHotProperty);
+            RemovePropW(window, kDarkComboTrackingProperty);
             RemoveWindowSubclass(window, dark_combo_subclass_proc, subclass_id);
             break;
     }
@@ -534,6 +619,16 @@ DialogColors dialog_colors(bool dark) {
         accent, readable_text_color(accent), RGB(120, 120, 120),
         RGB(170, 170, 170), accent,
     };
+}
+
+SIZE dialog_window_size_for_client(int logical_width, int logical_height,
+                                   DWORD style, DWORD extended_style, UINT dpi) {
+    const UINT effective_dpi = dpi == 0 ? USER_DEFAULT_SCREEN_DPI : dpi;
+    RECT rect{0, 0,
+              scale_for_dialog_dpi(logical_width, effective_dpi),
+              scale_for_dialog_dpi(logical_height, effective_dpi)};
+    AdjustWindowRectExForDpi(&rect, style, FALSE, extended_style, effective_dpi);
+    return {rect.right - rect.left, rect.bottom - rect.top};
 }
 
 bool dialog_system_prefers_dark_mode() {
@@ -826,20 +921,26 @@ void draw_dialog_combo_item(const DRAWITEMSTRUCT& draw, bool dark) {
     }
 }
 
-bool disable_dialog_owner(HWND owner) {
+bool disable_dialog_owner(HWND owner, HWND dialog) {
     if (owner == nullptr || !IsWindow(owner)) return false;
     const bool was_enabled = IsWindowEnabled(owner) != FALSE;
     if (!was_enabled) return false;
     EnableWindow(owner, FALSE);
+    if (dialog != nullptr && IsWindow(dialog)) {
+        auto* state = new (std::nothrow) ModalOwnerState{owner, false};
+        if (state != nullptr &&
+            !SetWindowSubclass(dialog, modal_owner_subclass_proc,
+                               kModalOwnerSubclass,
+                               reinterpret_cast<DWORD_PTR>(state))) {
+            delete state;
+        }
+    }
     return true;
 }
 
 void restore_dialog_owner(HWND owner, bool was_enabled) {
     if (!was_enabled || owner == nullptr || !IsWindow(owner)) return;
-    EnableWindow(owner, TRUE);
-    if (IsWindowVisible(owner)) {
-        SetActiveWindow(owner);
-    }
+    activate_restored_owner(owner);
 }
 
 bool message_targets_window(HWND window, const MSG& message) {
@@ -866,8 +967,30 @@ POINT centered_window_position(HWND owner, int width, int height) {
 void restore_named_window_placement(HWND window, HWND owner, std::wstring_view name) {
     if (window == nullptr) return;
     WINDOWPLACEMENT placement{sizeof(placement)};
-    if (read_window_placement(name, placement) && window_placement_is_visible(placement)) {
+    UINT saved_dpi = 0;
+    if (read_window_placement(name, placement, saved_dpi) &&
+        window_placement_is_visible(placement)) {
         if (placement.showCmd == SW_SHOWMINIMIZED) placement.showCmd = SW_SHOWNORMAL;
+
+        // WINDOWPLACEMENT stores physical pixels for a per-monitor-aware window.
+        // Move first so Windows establishes the destination monitor DPI, then
+        // convert the persisted normal size from its saved DPI exactly once.
+        SetWindowPos(window, nullptr,
+                     placement.rcNormalPosition.left,
+                     placement.rcNormalPosition.top,
+                     0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        const UINT target_dpi = GetDpiForWindow(window);
+        if (saved_dpi >= 48 && saved_dpi <= 768 && target_dpi != 0 &&
+            target_dpi != saved_dpi) {
+            const int width = MulDiv(
+                placement.rcNormalPosition.right - placement.rcNormalPosition.left,
+                static_cast<int>(target_dpi), static_cast<int>(saved_dpi));
+            const int height = MulDiv(
+                placement.rcNormalPosition.bottom - placement.rcNormalPosition.top,
+                static_cast<int>(target_dpi), static_cast<int>(saved_dpi));
+            placement.rcNormalPosition.right = placement.rcNormalPosition.left + width;
+            placement.rcNormalPosition.bottom = placement.rcNormalPosition.top + height;
+        }
         SetWindowPlacement(window, &placement);
         return;
     }
@@ -894,6 +1017,9 @@ void save_named_window_placement(std::wstring_view name, HWND window) {
     }
     RegSetValueExW(key, L"WindowPlacement", 0, REG_BINARY,
                    reinterpret_cast<const BYTE*>(&placement), sizeof(placement));
+    const DWORD dpi = GetDpiForWindow(window);
+    RegSetValueExW(key, L"WindowDpi", 0, REG_DWORD,
+                   reinterpret_cast<const BYTE*>(&dpi), sizeof(dpi));
     RegCloseKey(key);
 }
 

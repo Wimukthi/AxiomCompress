@@ -3,6 +3,7 @@
 
 #include "axiom/archive.hpp"
 #include "core/cpu.hpp"
+#include "core/path_text.hpp"
 #include "gui/dialog_support.hpp"
 #include "gui/message_dialog.hpp"
 #include "gui/update_checker.hpp"
@@ -40,6 +41,7 @@ constexpr wchar_t kBenchmarkDialogClass[] = L"AxiomBenchmarkDialog";
 constexpr wchar_t kBenchmarkReportClass[] = L"AxiomBenchmarkReportView";
 constexpr UINT kProgressMessage = WM_APP + 140;
 constexpr UINT kDoneMessage = WM_APP + 141;
+constexpr UINT_PTR kTelemetryTimer = 142;
 
 constexpr int kCorpusCombo = 3101;
 constexpr int kSizeCombo = 3102;
@@ -61,6 +63,10 @@ constexpr int kBenchmarkMinimumWidth = 940;
 constexpr int kBenchmarkInitialHeight = 640;
 constexpr int kBenchmarkMinimumHeight = 600;
 constexpr wchar_t kBenchmarkLayoutName[] = L"BenchmarkDialog";
+constexpr DWORD kBenchmarkDialogStyle =
+    WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_CLIPCHILDREN;
+constexpr DWORD kBenchmarkDialogExStyle =
+    WS_EX_WINDOWEDGE | WS_EX_CONTROLPARENT;
 
 constexpr std::array<const wchar_t*, 3> kCorpusNames{
     L"Text/log corpus", L"Mixed files", L"Binary/random"};
@@ -182,6 +188,7 @@ struct BenchmarkDialogState {
     HWND copy{};
     HWND close{};
     std::shared_ptr<axiom::OperationControl> operation;
+    std::shared_ptr<BenchmarkLiveState> live;
     std::thread worker;
     std::atomic_bool running = false;
     bool paused = false;
@@ -530,11 +537,13 @@ std::uint64_t estimate_memory_usage(const axiom::CompressionOptions& options,
 std::wstring stage_text(axiom::OperationStage stage) {
     switch (stage) {
         case axiom::OperationStage::scanning: return L"Scanning";
+        case axiom::OperationStage::estimating: return L"Estimating";
         case axiom::OperationStage::reading: return L"Reading";
         case axiom::OperationStage::compressing: return L"Compressing";
         case axiom::OperationStage::writing: return L"Writing";
         case axiom::OperationStage::testing: return L"Testing";
         case axiom::OperationStage::extracting: return L"Extracting";
+        case axiom::OperationStage::transferring: return L"Transferring";
         case axiom::OperationStage::finalizing: return L"Finalizing";
     }
     return L"Working";
@@ -754,7 +763,7 @@ void write_text_bytes(const fs::path& path, std::uint64_t bytes,
         written += count;
         if ((written & ((1ull << 20) - 1)) == 0 || written == bytes) {
             operation->report({axiom::OperationStage::writing, written, bytes, 0, 0,
-                               path.string()});
+                               axiom::core::path_to_utf8(path)});
         }
     }
 }
@@ -780,7 +789,7 @@ void write_binary_bytes(const fs::path& path, std::uint64_t bytes,
         written += count;
         if (written >= next_report || written == bytes) {
             operation->report({axiom::OperationStage::writing, written, bytes, 0, 0,
-                               path.string()});
+                               axiom::core::path_to_utf8(path)});
             next_report = written + (1ull << 20);
         }
     }
@@ -805,7 +814,7 @@ void write_repeated_binary_bytes(const fs::path& path, std::uint64_t bytes,
         written += count;
         if (written >= next_report || written == bytes) {
             operation->report({axiom::OperationStage::writing, written, bytes, 0, 0,
-                               path.string()});
+                               axiom::core::path_to_utf8(path)});
             next_report = written + (1ull << 20);
         }
     }
@@ -870,10 +879,10 @@ void post_done(HWND hwnd, bool success, const std::wstring& text) {
 }
 
 void benchmark_worker(HWND hwnd, BenchmarkParams params,
-                      std::shared_ptr<axiom::OperationControl> operation) {
+                      std::shared_ptr<axiom::OperationControl> operation,
+                      std::shared_ptr<BenchmarkLiveState> live) {
     const auto started = std::chrono::steady_clock::now();
     fs::path workspace;
-    auto live = std::make_shared<BenchmarkLiveState>();
     {
         std::lock_guard lock(live->mutex);
         live->params = params;
@@ -918,26 +927,6 @@ void benchmark_worker(HWND hwnd, BenchmarkParams params,
         const fs::path archive = workspace / L"bench.axar";
         const fs::path extract = workspace / L"extract";
         fs::create_directories(workspace);
-
-        operation->set_progress_callback([hwnd, live](const axiom::OperationProgress& progress) {
-            std::wstring text;
-            {
-                std::lock_guard lock(live->mutex);
-                live->progress = progress;
-                std::wostringstream status;
-                status << stage_text(progress.stage);
-                if (progress.total_bytes != 0) {
-                    status << L" " << format_bytes(progress.completed_bytes)
-                           << L" / " << format_bytes(progress.total_bytes);
-                }
-                if (!progress.current_path.empty()) {
-                    status << L"  " << progress.current_path.c_str();
-                }
-                live->status = status.str();
-                text = render_benchmark_report(*live);
-            }
-            post_text(hwnd, text);
-        });
 
         begin_phase(BenchmarkPhase::preparing, 0,
                     params.custom_input ? L"Scanning input..." : L"Preparing corpus...");
@@ -1470,9 +1459,12 @@ void start_benchmark(BenchmarkDialogState* state) {
         return;
     }
     state->operation = std::make_shared<axiom::OperationControl>();
+    state->live = std::make_shared<BenchmarkLiveState>();
     set_results_text(state, L"Starting benchmark...");
     set_running(state, true);
-    state->worker = std::thread(benchmark_worker, state->hwnd, params, state->operation);
+    SetTimer(state->hwnd, kTelemetryTimer, 200, nullptr);
+    state->worker = std::thread(benchmark_worker, state->hwnd, params,
+                                state->operation, state->live);
 }
 
 void browse_custom_input(BenchmarkDialogState* state) {
@@ -1522,11 +1514,13 @@ void browse_custom_folder(BenchmarkDialogState* state) {
 void close_benchmark_dialog(BenchmarkDialogState* state) {
     if (state == nullptr) return;
     save_named_window_placement(kBenchmarkLayoutName, state->hwnd);
-    restore_dialog_owner(state->owner, state->owner_was_enabled);
+    HWND owner = state->owner;
+    const bool owner_was_enabled = state->owner_was_enabled;
     state->owner_was_enabled = false;
     if (state->hwnd != nullptr && IsWindow(state->hwnd)) {
         DestroyWindow(state->hwnd);
     }
+    restore_dialog_owner(owner, owner_was_enabled);
 }
 
 LRESULT CALLBACK benchmark_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam) {
@@ -1619,14 +1613,18 @@ LRESULT CALLBACK benchmark_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM l
                          suggested->right - suggested->left,
                          suggested->bottom - suggested->top,
                          SWP_NOZORDER | SWP_NOACTIVATE);
+            apply_axiom_window_icons(hwnd, state->instance);
             rebuild_fonts(state);
             layout(state);
             return 0;
         }
         case WM_GETMINMAXINFO: {
             auto* info = reinterpret_cast<MINMAXINFO*>(lparam);
-            info->ptMinTrackSize.x = scale_for_dialog_dpi(kBenchmarkMinimumWidth, state->dpi);
-            info->ptMinTrackSize.y = scale_for_dialog_dpi(kBenchmarkMinimumHeight, state->dpi);
+            const SIZE minimum = dialog_window_size_for_client(
+                kBenchmarkMinimumWidth, kBenchmarkMinimumHeight,
+                kBenchmarkDialogStyle, kBenchmarkDialogExStyle, state->dpi);
+            info->ptMinTrackSize.x = minimum.cx;
+            info->ptMinTrackSize.y = minimum.cy;
             return 0;
         }
         case WM_PAINT: {
@@ -1723,11 +1721,37 @@ LRESULT CALLBACK benchmark_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM l
             std::unique_ptr<BenchmarkDone> done(reinterpret_cast<BenchmarkDone*>(lparam));
             if (state->worker.joinable()) state->worker.join();
             set_running(state, false);
+            KillTimer(hwnd, kTelemetryTimer);
             if (done) {
                 set_results_text(state, std::move(done->text));
             }
             return 0;
         }
+        case WM_TIMER:
+            if (wparam == kTelemetryTimer && state->running && state->operation &&
+                state->live) {
+                if (auto progress = state->operation->latest_progress()) {
+                    std::wstring text;
+                    {
+                        std::lock_guard lock(state->live->mutex);
+                        state->live->progress = *progress;
+                        std::wostringstream status;
+                        status << stage_text(progress->stage);
+                        if (progress->total_bytes != 0) {
+                            status << L" " << format_bytes(progress->completed_bytes)
+                                   << L" / " << format_bytes(progress->total_bytes);
+                        }
+                        if (!progress->current_path.empty()) {
+                            status << L"  " << progress->current_path.c_str();
+                        }
+                        state->live->status = status.str();
+                        text = render_benchmark_report(*state->live);
+                    }
+                    set_results_text(state, std::move(text));
+                }
+                return 0;
+            }
+            break;
         case WM_CLOSE:
             if (state->running && state->operation) {
                 state->operation->request_cancel();
@@ -1737,6 +1761,7 @@ LRESULT CALLBACK benchmark_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM l
             return 0;
         case WM_NCDESTROY:
             if (state != nullptr) {
+                KillTimer(hwnd, kTelemetryTimer);
                 if (state->operation) state->operation->request_cancel();
                 if (state->worker.joinable()) state->worker.join();
                 delete_dialog_font(state->font);
@@ -1778,16 +1803,19 @@ void show_benchmark_dialog(HWND owner, HINSTANCE instance, UINT dpi, bool dark) 
     const UINT effective_dpi = dpi == 0 ? GetDpiForWindow(owner) : dpi;
     RECT owner_rect{};
     GetWindowRect(owner, &owner_rect);
-    const int width = scale_for_dialog_dpi(kBenchmarkInitialWidth, effective_dpi);
-    const int height = scale_for_dialog_dpi(kBenchmarkInitialHeight, effective_dpi);
+    const SIZE window_size = dialog_window_size_for_client(
+        kBenchmarkInitialWidth, kBenchmarkInitialHeight,
+        kBenchmarkDialogStyle, kBenchmarkDialogExStyle, effective_dpi);
+    const int width = window_size.cx;
+    const int height = window_size.cy;
     BenchmarkDialogState state{};
     state.owner = owner;
     state.instance = instance;
     state.dpi = effective_dpi;
     state.dark = dark;
     HWND dialog = CreateWindowExW(
-        WS_EX_WINDOWEDGE | WS_EX_CONTROLPARENT, kBenchmarkDialogClass, L"Axiom Benchmark",
-        WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_CLIPCHILDREN,
+        kBenchmarkDialogExStyle, kBenchmarkDialogClass, L"Axiom Benchmark",
+        kBenchmarkDialogStyle,
         owner_rect.left + (owner_rect.right - owner_rect.left - width) / 2,
         owner_rect.top + (owner_rect.bottom - owner_rect.top - height) / 2,
         width, height, owner, nullptr, instance, &state);
@@ -1798,7 +1826,7 @@ void show_benchmark_dialog(HWND owner, HINSTANCE instance, UINT dpi, bool dark) 
     }
     apply_axiom_window_icons(dialog, instance);
     restore_named_window_placement(dialog, owner, kBenchmarkLayoutName);
-    state.owner_was_enabled = disable_dialog_owner(owner);
+    state.owner_was_enabled = disable_dialog_owner(owner, dialog);
     ShowWindow(dialog, SW_SHOW);
     UpdateWindow(dialog);
     MSG message{};

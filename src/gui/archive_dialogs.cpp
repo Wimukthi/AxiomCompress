@@ -1,7 +1,6 @@
 #define NOMINMAX
 #include "gui/archive_dialogs.hpp"
 #include "gui/dialog_support.hpp"
-#include "gui/archive_feature_dialogs.hpp"
 #include "gui/main_window_internal.hpp"
 #include "gui/message_dialog.hpp"
 
@@ -33,7 +32,6 @@ constexpr int kOverwrite = 2007;
 constexpr int kRestoreTime = 2008;
 constexpr int kConfirmDelete = 2009;
 constexpr int kShowHidden = 2010;
-constexpr int kAdvancedFeatures = 2011;
 constexpr int kDictionarySize = 2012;
 constexpr int kWordSize = 2013;
 constexpr int kSolidBlockSize = 2014;
@@ -546,6 +544,7 @@ std::optional<fs::path> browse_executable(HWND owner, const fs::path& initial = 
 }
 
 constexpr wchar_t kDarkTabClass[] = L"AxiomDarkTabControl";
+constexpr wchar_t kSettingsNavClass[] = L"AxiomSettingsNavigation";
 constexpr UINT kDarkTabSetSelection = WM_APP + 41;
 
 struct DarkTabState {
@@ -728,6 +727,199 @@ bool register_dark_tab_class(HINSTANCE instance) {
            GetLastError() == ERROR_CLASS_ALREADY_EXISTS;
 }
 
+struct SettingsNavState {
+    int selected = 0;
+    int hot = -1;
+    HFONT font = nullptr;
+    bool tracking_mouse = false;
+};
+
+int scale_for_window(HWND window, int value) {
+    return MulDiv(value, static_cast<int>(GetDpiForWindow(window)),
+                  USER_DEFAULT_SCREEN_DPI);
+}
+
+int settings_nav_item_height(HWND window) {
+    return scale_for_window(window, 38);
+}
+
+int settings_nav_index_at_position(HWND window, int y) {
+    if (y < 0) return -1;
+    const int index = y / std::max(1, settings_nav_item_height(window));
+    const int count = dark_tab_count(window);
+    return index >= 0 && index < count ? index : -1;
+}
+
+void select_settings_nav(HWND window, SettingsNavState& state, int selection,
+                         bool notify_parent) {
+    selection = std::clamp(selection, 0, dark_tab_count(window) - 1);
+    if (selection == state.selected && !notify_parent) return;
+    state.selected = selection;
+    InvalidateRect(window, nullptr, FALSE);
+    if (notify_parent) {
+        SendMessageW(GetParent(window), WM_COMMAND,
+                     MAKEWPARAM(dark_tab_command_base(window) + selection, BN_CLICKED),
+                     reinterpret_cast<LPARAM>(window));
+    }
+}
+
+LRESULT CALLBACK settings_nav_window_proc(HWND window, UINT message,
+                                          WPARAM wparam, LPARAM lparam) {
+    auto* state = reinterpret_cast<SettingsNavState*>(
+        GetWindowLongPtrW(window, GWLP_USERDATA));
+    if (message == WM_NCCREATE) {
+        state = new SettingsNavState{};
+        SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(state));
+    }
+    if (state == nullptr) return DefWindowProcW(window, message, wparam, lparam);
+
+    switch (message) {
+        case WM_SETFONT:
+            state->font = reinterpret_cast<HFONT>(wparam);
+            if (LOWORD(lparam) != 0) InvalidateRect(window, nullptr, FALSE);
+            return 0;
+        case WM_GETFONT:
+            return reinterpret_cast<LRESULT>(state->font);
+        case kDarkTabSetSelection:
+            select_settings_nav(window, *state, static_cast<int>(wparam), false);
+            return 0;
+        case WM_GETDLGCODE:
+            return DLGC_WANTARROWS | DLGC_WANTCHARS;
+        case WM_KEYDOWN: {
+            int selection = state->selected;
+            if (wparam == VK_UP) --selection;
+            else if (wparam == VK_DOWN) ++selection;
+            else if (wparam == VK_HOME) selection = 0;
+            else if (wparam == VK_END) selection = dark_tab_count(window) - 1;
+            else if (wparam == VK_PRIOR) selection -= 3;
+            else if (wparam == VK_NEXT) selection += 3;
+            else if (wparam == VK_SPACE || wparam == VK_RETURN) {
+                select_settings_nav(window, *state, state->selected, true);
+                return 0;
+            } else {
+                break;
+            }
+            select_settings_nav(window, *state, selection, true);
+            return 0;
+        }
+        case WM_LBUTTONDOWN: {
+            const int index = settings_nav_index_at_position(
+                window, GET_Y_LPARAM(lparam));
+            SetFocus(window);
+            if (index >= 0) select_settings_nav(window, *state, index, true);
+            return 0;
+        }
+        case WM_MOUSEMOVE: {
+            if (!state->tracking_mouse) {
+                TRACKMOUSEEVENT tracking{sizeof(tracking), TME_LEAVE, window, 0};
+                TrackMouseEvent(&tracking);
+                state->tracking_mouse = true;
+            }
+            const int hot = settings_nav_index_at_position(
+                window, GET_Y_LPARAM(lparam));
+            if (hot != state->hot) {
+                state->hot = hot;
+                InvalidateRect(window, nullptr, FALSE);
+            }
+            return 0;
+        }
+        case WM_MOUSELEAVE:
+            state->tracking_mouse = false;
+            state->hot = -1;
+            InvalidateRect(window, nullptr, FALSE);
+            return 0;
+        case WM_SETFOCUS:
+        case WM_KILLFOCUS:
+            InvalidateRect(window, nullptr, FALSE);
+            return 0;
+        case WM_ERASEBKGND:
+            return 1;
+        case WM_PAINT: {
+            PAINTSTRUCT paint{};
+            HDC target = BeginPaint(window, &paint);
+            RECT client{};
+            GetClientRect(window, &client);
+            HDC memory = CreateCompatibleDC(target);
+            HBITMAP bitmap = CreateCompatibleBitmap(
+                target, std::max(1, static_cast<int>(client.right)),
+                std::max(1, static_cast<int>(client.bottom)));
+            HGDIOBJ old_bitmap = SelectObject(memory, bitmap);
+            const Palette colors = make_palette();
+            HBRUSH background = CreateSolidBrush(colors.window);
+            FillRect(memory, &client, background);
+            DeleteObject(background);
+
+            HFONT font = state->font != nullptr
+                ? state->font
+                : reinterpret_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
+            HGDIOBJ old_font = SelectObject(memory, font);
+            SetBkMode(memory, TRANSPARENT);
+            SetTextColor(memory, colors.text);
+
+            const int count = dark_tab_count(window);
+            const int item_height = settings_nav_item_height(window);
+            const int text_pad_x = scale_for_window(window, 14);
+            for (int index = 0; index < count; ++index) {
+                RECT item{0, item_height * index,
+                          client.right, item_height * (index + 1)};
+                if (item.top >= client.bottom) break;
+                const bool selected = index == state->selected;
+                const bool hot = index == state->hot;
+                const COLORREF fill = selected ? colors.focus
+                    : hot ? colors.hot : colors.button;
+                HBRUSH brush = CreateSolidBrush(fill);
+                FillRect(memory, &item, brush);
+                DeleteObject(brush);
+
+                HBRUSH border = CreateSolidBrush(colors.border);
+                FrameRect(memory, &item, border);
+                DeleteObject(border);
+
+                RECT text_rect = item;
+                text_rect.left += text_pad_x;
+                text_rect.right -= text_pad_x;
+                DrawTextW(memory, dark_tab_text(window, index), -1, &text_rect,
+                          DT_LEFT | DT_VCENTER | DT_SINGLELINE |
+                              DT_NOPREFIX | DT_END_ELLIPSIS);
+                if (selected && GetFocus() == window) {
+                    RECT focus_rect = item;
+                    InflateRect(&focus_rect, -3, -3);
+                    DrawFocusRect(memory, &focus_rect);
+                }
+            }
+
+            RECT divider{client.right - 1, 0, client.right, client.bottom};
+            HBRUSH divider_brush = CreateSolidBrush(colors.border);
+            FillRect(memory, &divider, divider_brush);
+            DeleteObject(divider_brush);
+
+            SelectObject(memory, old_font);
+            BitBlt(target, 0, 0, client.right, client.bottom, memory, 0, 0, SRCCOPY);
+            SelectObject(memory, old_bitmap);
+            DeleteObject(bitmap);
+            DeleteDC(memory);
+            EndPaint(window, &paint);
+            return 0;
+        }
+        case WM_NCDESTROY:
+            SetWindowLongPtrW(window, GWLP_USERDATA, 0);
+            delete state;
+            return 0;
+    }
+    return DefWindowProcW(window, message, wparam, lparam);
+}
+
+bool register_settings_nav_class(HINSTANCE instance) {
+    WNDCLASSEXW window_class{sizeof(window_class)};
+    window_class.style = CS_HREDRAW | CS_VREDRAW;
+    window_class.lpfnWndProc = settings_nav_window_proc;
+    window_class.hInstance = instance;
+    window_class.hCursor = LoadCursorW(nullptr, IDC_HAND);
+    window_class.lpszClassName = kSettingsNavClass;
+    return RegisterClassExW(&window_class) != 0 ||
+           GetLastError() == ERROR_CLASS_ALREADY_EXISTS;
+}
+
 std::optional<fs::path> browse_folder(HWND owner,
                                       const wchar_t* title = L"Choose folder",
                                       const fs::path& initial = {}) {
@@ -766,12 +958,19 @@ public:
         instance_ = reinterpret_cast<HINSTANCE>(GetWindowLongPtrW(owner, GWLP_HINSTANCE));
         dpi_ = GetDpiForWindow(owner);
         if (!register_class()) return false;
-        int width = scale(mode_ == DialogMode::create_archive
-            ? 840
-            : mode_ == DialogMode::settings ? 900 : 540);
-        int height = scale(mode_ == DialogMode::create_archive
-            ? 650
-            : mode_ == DialogMode::settings ? 740 : 290);
+        const DWORD window_style = WS_POPUP | WS_CAPTION | WS_SYSMENU |
+            WS_CLIPCHILDREN |
+            (mode_ == DialogMode::create_archive || mode_ == DialogMode::settings
+                 ? WS_THICKFRAME | WS_MAXIMIZEBOX : 0);
+        const DWORD extended_style = WS_EX_DLGMODALFRAME;
+        const SIZE initial_size = dialog_window_size_for_client(
+            mode_ == DialogMode::create_archive
+                ? 840 : mode_ == DialogMode::settings ? 1040 : 540,
+            mode_ == DialogMode::create_archive
+                ? 650 : mode_ == DialogMode::settings ? 760 : 290,
+            window_style, extended_style, dpi_);
+        int width = initial_size.cx;
+        int height = initial_size.cy;
         RECT owner_rect{};
         GetWindowRect(owner, &owner_rect);
         MONITORINFO monitor{sizeof(monitor)};
@@ -785,17 +984,12 @@ public:
         const int y = owner_rect.top + ((owner_rect.bottom - owner_rect.top) - height) / 2;
         const wchar_t* title = mode_ == DialogMode::create_archive ? L"Add to archive"
             : (mode_ == DialogMode::extract_archive ? L"Extract archive" : L"Axiom settings");
-        const DWORD window_style = WS_POPUP | WS_CAPTION | WS_SYSMENU |
-            WS_CLIPCHILDREN |
-            (mode_ == DialogMode::create_archive || mode_ == DialogMode::settings
-                 ? WS_THICKFRAME | WS_MAXIMIZEBOX : 0);
-        const DWORD extended_style = WS_EX_DLGMODALFRAME;
         window_ = CreateWindowExW(extended_style, class_name(), title,
                                   window_style,
                                   x, y, width, height, owner, nullptr, instance_, this);
         if (!window_) return false;
         restore_named_window_placement(window_, owner, layout_name());
-        owner_was_enabled_ = disable_dialog_owner(owner);
+        owner_was_enabled_ = disable_dialog_owner(owner, window_);
         ShowWindow(window_, SW_SHOW);
         UpdateWindow(window_);
         MSG message{};
@@ -851,7 +1045,8 @@ private:
             dialog_registered = atom != 0 ||
                                 GetLastError() == ERROR_CLASS_ALREADY_EXISTS;
         }
-        return dialog_registered && register_dark_tab_class(instance_);
+        return dialog_registered && register_dark_tab_class(instance_) &&
+               register_settings_nav_class(instance_);
     }
 
     int scale(int value) const {
@@ -1263,7 +1458,7 @@ private:
     }
 
     void create_settings_controls() {
-        settings_tabs_ = control(kDarkTabClass, L"", WS_TABSTOP | WS_GROUP,
+        settings_tabs_ = control(kSettingsNavClass, L"", WS_TABSTOP | WS_GROUP,
                                  kSettingsTabs);
 
         setting_label(0, L"Application behavior", 0, 0, 660);
@@ -1603,8 +1798,6 @@ private:
             path_label_ = label(mode_ == DialogMode::create_archive ? L"Archive path" : L"Destination");
             path_edit_ = control(L"EDIT", L"", WS_TABSTOP | ES_AUTOHSCROLL, kPathEdit);
             browse_ = control(L"BUTTON", L"Browse...", WS_TABSTOP | BS_OWNERDRAW, kBrowse);
-            advanced_features_ = control(L"BUTTON", L"Advanced features...",
-                                         WS_TABSTOP | BS_OWNERDRAW, kAdvancedFeatures);
         }
         level_label_ = label(L"Compression level");
         level_combo_ = selection_combo(kLevel, kLevelNames);
@@ -2080,9 +2273,6 @@ private:
         }
         const int button_width = scale(86);
         const int button_y = client.bottom - margin - row_height;
-        if (advanced_features_ != nullptr) {
-            MoveWindow(advanced_features_, margin, button_y, scale(154), row_height, TRUE);
-        }
         MoveWindow(cancel_, client.right - margin - button_width, button_y, button_width, row_height, TRUE);
         MoveWindow(accept_, client.right - margin - button_width * 2 - scale(8),
                    button_y, button_width, row_height, TRUE);
@@ -2103,12 +2293,15 @@ private:
         MoveWindow(accept_, client.right - margin - button_width * 3 - scale(16),
                    button_y, button_width, row, TRUE);
 
-        MoveWindow(settings_tabs_, margin, margin,
-                   client.right - margin * 2, scale(38), TRUE);
-        const int content_left = margin;
-        const int content_top = margin + scale(56);
-        const int content_width = client.right - margin * 2;
         const int bottom_limit = button_y - scale(12);
+        const int nav_width = scale(178);
+        const int nav_gap = scale(22);
+        MoveWindow(settings_tabs_, margin, margin, nav_width,
+                   std::max(row, bottom_limit - margin), TRUE);
+        const int content_left = margin + nav_width + nav_gap;
+        const int content_top = margin;
+        const int content_width = std::max(
+            scale(360), static_cast<int>(client.right) - margin - content_left);
         for (const SettingControl& control : settings_controls_) {
             const int available_width = std::max(
                 scale(80), content_width - scale(control.x));
@@ -2483,12 +2676,12 @@ private:
             available.encryption = zip;
             available.header_encryption = false;
             available.kdf_presets = false;
-            available.volumes = false;
+            available.volumes = zip && available.volumes;
             available.recovery = false;
             available.authenticity = false;
-            available.sfx = false;
+            available.sfx = zip;
             available.posix_metadata = false;
-            available.update = true;
+            available.update = zip && available.update;
         }
         return available;
     }
@@ -2508,15 +2701,19 @@ private:
             set_window_text(confirm_password_edit_, L"");
         }
         create_options.features.encrypt_names = false;
-        create_options.features.volume_size.clear();
+        if (!zip) {
+            create_options.features.volume_size.clear();
+            set_window_text(volume_size_edit_, L"");
+        }
         create_options.features.recovery_percent = 0;
         create_options.features.create_recovery_volumes = false;
         create_options.features.sign_archive = false;
         create_options.features.signing_key.clear();
-        create_options.features.create_sfx = false;
-        create_options.features.sfx_destination.clear();
+        if (!zip) {
+            create_options.features.create_sfx = false;
+            create_options.features.sfx_destination.clear();
+        }
         set_window_text(comment_edit_, L"");
-        set_window_text(volume_size_edit_, L"");
         set_window_text(recovery_percent_edit_, L"0");
         set_window_text(signing_key_edit_, L"");
     }
@@ -2623,9 +2820,15 @@ private:
             }
             prefix = L"Self-extractor: ";
         } else if (volume_size_edit_ != nullptr && !window_text(volume_size_edit_).empty()) {
-            fs::path root = output;
-            if (lstrcmpiW(root.extension().c_str(), L".axar") == 0) root.replace_extension();
-            output = fs::path(root.wstring() + L".part001.axar");
+            if (selected_archive_format() == ArchiveFormat::zip) {
+                output.replace_extension(L".z01");
+            } else {
+                fs::path root = output;
+                if (lstrcmpiW(root.extension().c_str(), L".axar") == 0) {
+                    root.replace_extension();
+                }
+                output = fs::path(root.wstring() + L".part001.axar");
+            }
             prefix = L"First volume: ";
         } else if (!output.empty() &&
                    (output.extension().empty() || is_known_archive_extension(output))) {
@@ -2816,22 +3019,13 @@ private:
 
     void close_dialog() {
         save_named_window_placement(layout_name(), window_);
-        restore_dialog_owner(owner_, owner_was_enabled_);
+        HWND owner = owner_;
+        const bool owner_was_enabled = owner_was_enabled_;
         owner_was_enabled_ = false;
         if (window_ != nullptr && IsWindow(window_)) {
             DestroyWindow(window_);
         }
-    }
-
-    void show_advanced_features() {
-        ArchiveFeatureOptions archive_features;
-        ExtractFeatureOptions extract_features = extract_options.features;
-        if (show_archive_feature_options_dialog(
-                window_, ArchiveFeatureDialogContext::extract,
-                archive_features, extract_features,
-                extract_options.feature_availability)) {
-            extract_options.features = std::move(extract_features);
-        }
+        restore_dialog_owner(owner, owner_was_enabled);
     }
 
     bool checkbox_checked(int id) const {
@@ -3226,8 +3420,16 @@ private:
             case WM_GETMINMAXINFO:
                 if (mode_ == DialogMode::create_archive || mode_ == DialogMode::settings) {
                     auto* limits = reinterpret_cast<MINMAXINFO*>(lparam);
-                    int minimum_width = scale(mode_ == DialogMode::settings ? 840 : 650);
-                    int minimum_height = scale(mode_ == DialogMode::settings ? 700 : 520);
+                    const DWORD style = static_cast<DWORD>(
+                        GetWindowLongPtrW(window_, GWL_STYLE));
+                    const DWORD ex_style = static_cast<DWORD>(
+                        GetWindowLongPtrW(window_, GWL_EXSTYLE));
+                    const SIZE minimum = dialog_window_size_for_client(
+                        mode_ == DialogMode::settings ? 1000 : 650,
+                        mode_ == DialogMode::settings ? 720 : 520,
+                        style, ex_style, dpi_);
+                    int minimum_width = minimum.cx;
+                    int minimum_height = minimum.cy;
                     MONITORINFO monitor{sizeof(monitor)};
                     if (GetMonitorInfoW(
                             MonitorFromWindow(window_, MONITOR_DEFAULTTONEAREST),
@@ -3250,6 +3452,7 @@ private:
                              suggested->right - suggested->left,
                              suggested->bottom - suggested->top,
                              SWP_NOZORDER | SWP_NOACTIVATE);
+                apply_axiom_window_icons(window_, instance_);
                 rebuild_font_for_dpi();
                 layout();
                 return 0;
@@ -3349,7 +3552,6 @@ private:
                     case kBrowseLogFolder:
                         if (browse_settings_path(id)) return 0;
                         break;
-                    case kAdvancedFeatures: show_advanced_features(); return 0;
                     case kBrowseSigningKey:
                         if (const auto key = browse_signing_key(window_)) {
                             set_window_text(signing_key_edit_, key->wstring());
@@ -3466,7 +3668,6 @@ private:
     HWND browse_ = nullptr;
     HWND format_label_ = nullptr;
     HWND format_combo_ = nullptr;
-    HWND advanced_features_ = nullptr;
     HWND update_mode_label_ = nullptr;
     HWND update_mode_combo_ = nullptr;
     HWND comment_label_ = nullptr;

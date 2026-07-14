@@ -98,6 +98,7 @@
     <ClCompile Include="src\gui\main_window_util.cpp" />
     <ClCompile Include="src\gui\main_window_views.cpp" />
     <ClCompile Include="src\gui\custom_menu.cpp" />
+    <ClCompile Include="src\gui\compression_estimate_dialog.cpp" />
     <ClCompile Include="src\gui\toolbar_icons.cpp" />
     <ClCompile Include="src\gui\archive_dialogs.cpp" />
     <ClCompile Include="src\gui\archive_feature_dialogs.cpp" />
@@ -118,6 +119,7 @@
     <ClInclude Include="src\gui\browser_model.hpp" />
     <ClInclude Include="src\gui\main_window_internal.hpp" />
     <ClInclude Include="src\gui\custom_menu.hpp" />
+    <ClInclude Include="src\gui\compression_estimate_dialog.hpp" />
     <ClInclude Include="src\gui\toolbar_icons.hpp" />
     <ClInclude Include="src\gui\toolbar_icon_masks.inc" />
     <ClInclude Include="src\gui\app.hpp" />

@@ -32,10 +32,33 @@ set(MINIZ_SOURCES
     src/third_party/miniz/miniz_tinfl.c
     src/third_party/miniz/miniz_zip.c)
 
+# minizip-ng's raw container/split-stream core. Axiom uses this narrow backend
+# to preserve completed ZIP entries while producing or joining standard split
+# sets; normal ZIP Deflate remains on the established miniz provider path.
+set(MINIZIP_NG_SOURCES
+    src/third_party/minizip-ng/mz_crypt.c
+    src/third_party/minizip-ng/mz_os.c
+    src/third_party/minizip-ng/mz_strm.c
+    src/third_party/minizip-ng/mz_strm_buf.c
+    src/third_party/minizip-ng/mz_strm_mem.c
+    src/third_party/minizip-ng/mz_strm_split.c
+    src/third_party/minizip-ng/mz_zip.c
+    src/third_party/minizip-ng/mz_zip_rw.c)
+if(WIN32)
+    list(APPEND MINIZIP_NG_SOURCES
+        src/third_party/minizip-ng/mz_os_win32.c
+        src/third_party/minizip-ng/mz_strm_os_win32.c)
+else()
+    list(APPEND MINIZIP_NG_SOURCES
+        src/third_party/minizip-ng/mz_os_posix.c
+        src/third_party/minizip-ng/mz_strm_os_posix.c)
+endif()
+
 add_library(axiom STATIC
     src/archive/container.cpp
     src/archive/container_formats.cpp
     src/archive/container_zip.cpp
+    src/archive/zip_split_backend.cpp
     src/archive/system_provider.cpp
     src/codec/block.cpp
     src/codec/fast_lz.cpp
@@ -44,6 +67,7 @@ add_library(axiom STATIC
     src/core/archive.cpp
     src/core/checksum.cpp
     src/core/checksum_clmul.cpp
+    src/core/compression_estimator.cpp
     src/core/cpu.cpp
     src/core/crypto.cpp
     src/core/file_meta.cpp
@@ -52,7 +76,11 @@ add_library(axiom STATIC
     src/entropy/range.cpp
     ${BLAKE3_SOURCES}
     ${MONOCYPHER_SOURCES}
-    ${MINIZ_SOURCES})
+    ${MINIZ_SOURCES}
+    ${MINIZIP_NG_SOURCES})
+
+set_source_files_properties(${MINIZIP_NG_SOURCES} PROPERTIES
+    COMPILE_DEFINITIONS "MZ_ZIP_NO_CRYPTO;_CRT_SECURE_NO_DEPRECATE;_CRT_NONSTDC_NO_DEPRECATE")
 
 target_include_directories(axiom
     PUBLIC include
@@ -62,12 +90,12 @@ target_compile_features(axiom PUBLIC cxx_std_20)
 
 if(MSVC)
     target_compile_options(axiom PRIVATE /W4 /permissive-)
-    set_source_files_properties(${BLAKE3_SOURCES} ${MONOCYPHER_SOURCES} ${MINIZ_SOURCES} PROPERTIES COMPILE_OPTIONS /w)
+    set_source_files_properties(${BLAKE3_SOURCES} ${MONOCYPHER_SOURCES} ${MINIZ_SOURCES} ${MINIZIP_NG_SOURCES} PROPERTIES COMPILE_OPTIONS /w)
     set_source_files_properties(src/third_party/blake3/blake3_avx2.c PROPERTIES COMPILE_OPTIONS "/w;/arch:AVX2")
     set_source_files_properties(src/third_party/blake3/blake3_avx512.c PROPERTIES COMPILE_OPTIONS "/w;/arch:AVX512")
 else()
     target_compile_options(axiom PRIVATE -Wall -Wextra -Wpedantic)
-    set_source_files_properties(${BLAKE3_SOURCES} ${MONOCYPHER_SOURCES} ${MINIZ_SOURCES} PROPERTIES COMPILE_OPTIONS -w)
+    set_source_files_properties(${BLAKE3_SOURCES} ${MONOCYPHER_SOURCES} ${MINIZ_SOURCES} ${MINIZIP_NG_SOURCES} PROPERTIES COMPILE_OPTIONS -w)
     if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|i686")
         set_source_files_properties(src/core/checksum_clmul.cpp PROPERTIES COMPILE_OPTIONS "-msse4.1;-mpclmul")
     endif()
@@ -106,6 +134,7 @@ if(WIN32)
         src/gui/main_window_util.cpp
         src/gui/main_window_views.cpp
         src/gui/custom_menu.cpp
+        src/gui/compression_estimate_dialog.cpp
         src/gui/toolbar_icons.cpp
         src/gui/archive_dialogs.cpp
         src/gui/archive_feature_dialogs.cpp
