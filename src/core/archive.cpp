@@ -5,6 +5,8 @@
 #include "codec/lz77.hpp"
 #include "codec/lz77_split.hpp"
 #include "core/checksum.hpp"
+#include "core/file_replace.hpp"
+#include "core/path_text.hpp"
 #include "entropy/huffman.hpp"
 
 #include <algorithm>
@@ -71,23 +73,28 @@ std::uint64_t read_u64(std::span<const std::uint8_t> input, std::size_t& cursor)
     return value;
 }
 
-ByteVector read_file(const std::filesystem::path& path) {
+ByteVector read_file(const std::filesystem::path& path,
+                     const std::function<void(std::uint64_t, std::uint64_t)>& progress = {}) {
     std::ifstream stream(path, std::ios::binary | std::ios::ate);
     if (!stream) {
-        throw std::runtime_error("failed to open input file: " + path.string());
+        throw std::runtime_error("failed to open input file: " + core::path_to_utf8(path));
     }
 
     const auto end = stream.tellg();
     if (end < std::streampos{0}) {
-        throw std::runtime_error("failed to determine input size: " + path.string());
+        throw std::runtime_error("failed to determine input size: " + core::path_to_utf8(path));
     }
     const auto size = static_cast<std::uintmax_t>(end);
     if (size > static_cast<std::uintmax_t>(std::numeric_limits<std::size_t>::max())) {
-        throw std::runtime_error("input file exceeds platform size limit: " + path.string());
+        throw std::runtime_error("input file exceeds platform size limit: " +
+                                 core::path_to_utf8(path));
     }
 
     ByteVector bytes(static_cast<std::size_t>(size));
     stream.seekg(0, std::ios::beg);
+    if (progress) {
+        progress(0, static_cast<std::uint64_t>(bytes.size()));
+    }
     if (!bytes.empty()) {
         // Bulk reads avoid the byte-at-a-time iterator path, which dominated the
         // fastest compression profiles before worker threads even started.
@@ -98,25 +105,68 @@ ByteVector read_file(const std::filesystem::path& path) {
             stream.read(reinterpret_cast<char*>(bytes.data() + offset),
                         static_cast<std::streamsize>(want));
             if (stream.gcount() != static_cast<std::streamsize>(want)) {
-                throw std::runtime_error("failed to read input file: " + path.string());
+                throw std::runtime_error("failed to read input file: " +
+                                         core::path_to_utf8(path));
             }
             offset += want;
+            if (progress) {
+                progress(static_cast<std::uint64_t>(offset),
+                         static_cast<std::uint64_t>(bytes.size()));
+            }
         }
     }
 
     return bytes;
 }
 
-void write_file(const std::filesystem::path& path, std::span<const std::uint8_t> bytes) {
-    std::ofstream stream(path, std::ios::binary);
-    if (!stream) {
-        throw std::runtime_error("failed to open output file: " + path.string());
+void write_file(const std::filesystem::path& path,
+                std::span<const std::uint8_t> bytes,
+                const std::function<void(std::uint64_t, std::uint64_t)>& progress = {}) {
+    // Write to a sibling temporary and rename into place so a mid-write failure
+    // (disk full, crash) never leaves a truncated file at the destination.
+    const std::filesystem::path temporary = core::unique_sibling_path(path, L"write");
+
+    {
+        std::ofstream stream(temporary, std::ios::binary | std::ios::trunc);
+        if (!stream) {
+            throw std::runtime_error("failed to open output file: " +
+                                     core::path_to_utf8(temporary));
+        }
+
+        constexpr std::size_t kWriteChunk = std::size_t{8} << 20;
+        std::size_t offset = 0;
+        if (progress) {
+            progress(0, static_cast<std::uint64_t>(bytes.size()));
+        }
+        while (offset < bytes.size()) {
+            const auto count = std::min(kWriteChunk, bytes.size() - offset);
+            stream.write(reinterpret_cast<const char*>(bytes.data() + offset),
+                         static_cast<std::streamsize>(count));
+            if (!stream) {
+                break;
+            }
+            offset += count;
+            if (progress) {
+                progress(static_cast<std::uint64_t>(offset),
+                         static_cast<std::uint64_t>(bytes.size()));
+            }
+        }
+        stream.flush();
+        if (!stream) {
+            stream.close();
+            std::error_code cleanup_error;
+            std::filesystem::remove(temporary, cleanup_error);
+            throw std::runtime_error("failed to write output file: " +
+                                     core::path_to_utf8(path));
+        }
     }
 
-    stream.write(reinterpret_cast<const char*>(bytes.data()),
-                 static_cast<std::streamsize>(bytes.size()));
-    if (!stream) {
-        throw std::runtime_error("failed to write output file: " + path.string());
+    try {
+        core::replace_file(temporary, path, "output file");
+    } catch (...) {
+        std::error_code cleanup_error;
+        std::filesystem::remove(temporary, cleanup_error);
+        throw;
     }
 }
 
@@ -220,6 +270,9 @@ ByteVector compress(std::span<const std::uint8_t> input,
     if (options.operation) {
         options.operation->checkpoint();
     }
+    if (options.encoded_bytes_progress) {
+        options.encoded_bytes_progress(0);
+    }
 
     ByteVector payload;
     auto codec = core::CodecId::store;
@@ -260,6 +313,9 @@ ByteVector compress(std::span<const std::uint8_t> input,
                 static_cast<std::uint64_t>(block_payload.size()),
                 block_crc,
             };
+            if (options.encoded_bytes_progress) {
+                options.encoded_bytes_progress(static_cast<std::uint64_t>(input.size()));
+            }
             return core::write_archive(block_payload, header);
         }
 
@@ -274,6 +330,9 @@ ByteVector compress(std::span<const std::uint8_t> input,
                     static_cast<std::uint64_t>(block_payload.size()),
                     block_crc,
                 };
+                if (options.encoded_bytes_progress) {
+                    options.encoded_bytes_progress(static_cast<std::uint64_t>(input.size()));
+                }
                 return core::write_archive(block_payload, header);
             }
 
@@ -284,6 +343,9 @@ ByteVector compress(std::span<const std::uint8_t> input,
                 static_cast<std::uint64_t>(payload.size()),
                 core::crc32(input),
             };
+            if (options.encoded_bytes_progress) {
+                options.encoded_bytes_progress(static_cast<std::uint64_t>(input.size()));
+            }
             return core::write_archive(payload, header);
         }
 
@@ -365,16 +427,35 @@ ByteVector compress(std::span<const std::uint8_t> input,
             if (options.operation) {
                 options.operation->checkpoint();
             }
+            // Serial candidates parse the whole input back to back; map the
+            // encoders' fine-grained scan fractions onto the input size so the
+            // bar keeps moving during single-block and single-worker encodes.
+            auto serial_options = options;
+            if (options.encoded_bytes_progress) {
+                serial_options.encode_progress =
+                    [report = options.encoded_bytes_progress,
+                     total = input.size()](double fraction) {
+                        report(static_cast<std::uint64_t>(
+                            static_cast<double>(total) *
+                            std::clamp(fraction, 0.0, 1.0)));
+                    };
+            }
             const bool run_optimal =
                 thorough && input.size() <= options.optimal_parse_limit;
-            auto greedy = codec::encode_lz77(input, options);
+            const double greedy_share =
+                !run_optimal ? 0.90 : options.optimal_two_pass ? 0.18 : 0.35;
+            auto greedy = codec::encode_lz77(
+                input, codec::scoped_progress_options(serial_options, 0.0, greedy_share));
+            const auto optimal_options =
+                codec::scoped_progress_options(serial_options, greedy_share, 0.90);
             if (run_optimal && !options.optimal_two_pass) {
                 if (options.operation) {
                     options.operation->checkpoint();
                 }
                 // Single-pass optimal measures its cost model from the greedy
                 // tokens, so they must outlive the parse (see compress_block).
-                auto optimal_tokens = codec::encode_lz77_optimal(input, options, &greedy);
+                auto optimal_tokens =
+                    codec::encode_lz77_optimal(input, optimal_options, &greedy);
                 consider_lz_payload(std::move(greedy));
                 consider_lz_payload(std::move(optimal_tokens));
             } else {
@@ -383,13 +464,14 @@ ByteVector compress(std::span<const std::uint8_t> input,
                     if (options.operation) {
                         options.operation->checkpoint();
                     }
-                    consider_lz_payload(codec::encode_lz77_optimal(input, options));
+                    consider_lz_payload(codec::encode_lz77_optimal(input, optimal_options));
                 }
             }
             // Max-effort mode also tries the binary-tree finder, whose large
             // effective window typically finds the most (and longest) matches.
             if (thorough && !options.use_tree_matcher) {
-                auto tree_options = options;
+                auto tree_options =
+                    codec::scoped_progress_options(serial_options, 0.90, 1.0);
                 tree_options.use_tree_matcher = true;
                 if (options.operation) {
                     options.operation->checkpoint();
@@ -416,6 +498,9 @@ ByteVector compress(std::span<const std::uint8_t> input,
     if (options.operation) {
         options.operation->checkpoint();
     }
+    if (options.encoded_bytes_progress) {
+        options.encoded_bytes_progress(static_cast<std::uint64_t>(input.size()));
+    }
     return core::write_archive(payload, header);
 }
 
@@ -432,6 +517,10 @@ ByteVector decompress(std::span<const std::uint8_t> archive,
     // original_size bytes, so this single check bounds peak memory.
     if (header.original_size > options.max_output_size) {
         throw FormatError("declared output size exceeds the allowed limit");
+    }
+
+    if (options.decoded_bytes_progress) {
+        options.decoded_bytes_progress(0, header.original_size);
     }
 
     const auto payload = core::archive_payload(archive, header);
@@ -459,6 +548,12 @@ ByteVector decompress(std::span<const std::uint8_t> archive,
             core::checked_size(header.original_size, "original size"),
             options.thread_count,
             options.operation,
+            [progress = options.decoded_bytes_progress,
+             total = header.original_size](std::uint64_t done) {
+                if (progress) {
+                    progress(done, total);
+                }
+            },
             &combined_crc);
         restored_crc = combined_crc;
     } else {
@@ -477,23 +572,71 @@ ByteVector decompress(std::span<const std::uint8_t> archive,
         throw FormatError("CRC check failed");
     }
 
+    if (options.decoded_bytes_progress) {
+        // Serial codecs cannot expose safe token-level progress yet, but still
+        // finish the same public progress range as parallel block streams.
+        options.decoded_bytes_progress(header.original_size, header.original_size);
+    }
+
     return restored;
 }
 
 void compress_file(const std::filesystem::path& input_path,
                    const std::filesystem::path& output_path,
                    const CompressionOptions& options) {
-    const auto input = core::read_file(input_path);
-    const auto archive = compress(input, options);
+    auto file_options = options;
+    const std::string input_name = core::path_to_utf8(input_path);
+    const auto operation = file_options.operation;
+    const auto input = core::read_file(
+        input_path, [operation, input_name](std::uint64_t done, std::uint64_t total) {
+            if (operation) {
+                operation->report({OperationStage::reading, done, total, 0, 1, input_name,
+                                   done, total});
+            }
+        });
+    if (file_options.operation && !file_options.encoded_bytes_progress) {
+        const auto progress_operation = file_options.operation;
+        const auto total = static_cast<std::uint64_t>(input.size());
+        file_options.encoded_bytes_progress = [progress_operation, input_name, total](std::uint64_t done) {
+            progress_operation->report({OperationStage::compressing, done, total, 0, 1, input_name,
+                                        done, total});
+        };
+    }
+    const auto archive = compress(input, file_options);
     core::write_file(output_path, archive);
 }
 
 void decompress_file(const std::filesystem::path& input_path,
                      const std::filesystem::path& output_path,
                      const DecompressionOptions& options) {
-    const auto archive = core::read_file(input_path);
-    const auto output = decompress(archive, options);
-    core::write_file(output_path, output);
+    auto file_options = options;
+    const std::string input_name = core::path_to_utf8(input_path);
+    if (file_options.operation && !file_options.decoded_bytes_progress) {
+        const auto operation = file_options.operation;
+        file_options.decoded_bytes_progress = [operation, input_name](std::uint64_t done,
+                                                                       std::uint64_t total) {
+            operation->report({OperationStage::extracting, done, total, 0, 1, input_name,
+                               done, total});
+        };
+    }
+    const auto operation = file_options.operation;
+    const auto archive = core::read_file(
+        input_path, [operation, input_name](std::uint64_t done, std::uint64_t total) {
+            if (operation) {
+                operation->report({OperationStage::reading, done, total, 0, 1, input_name,
+                                   done, total});
+            }
+        });
+    const auto output = decompress(archive, file_options);
+    const std::string output_name = core::path_to_utf8(output_path);
+    core::write_file(
+        output_path, output,
+        [operation, output_name](std::uint64_t done, std::uint64_t total) {
+            if (operation) {
+                operation->report({OperationStage::writing, done, total, 0, 1, output_name,
+                                   done, total});
+            }
+        });
 }
 
 }  // namespace axiom

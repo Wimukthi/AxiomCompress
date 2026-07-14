@@ -64,6 +64,13 @@ public:
 
     std::uint8_t read_bit() {
         if (cursor_ >= bytes_.size()) {
+            // The decoder legitimately reads up to one value-register width of
+            // implicit zero bits past the encoder's final flush. Anything more
+            // means the stream is truncated, so fail instead of synthesizing an
+            // unbounded run of zeros.
+            if (++overrun_ > 32) {
+                throw FormatError("truncated order-1 range stream");
+            }
             return 0;
         }
 
@@ -80,6 +87,7 @@ public:
 private:
     std::span<const std::uint8_t> bytes_;
     std::size_t cursor_ = 0;
+    std::uint32_t overrun_ = 0;
     std::uint8_t bit_index_ = 0;
 };
 

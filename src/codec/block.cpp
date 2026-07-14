@@ -171,21 +171,28 @@ BlockResult compress_block(std::span<const std::uint8_t> input,
         }
     };
 
+    // Phase plan for fine-grained progress: place the greedy parse and the
+    // optimal passes into rough shares of this block's wall time so the
+    // fraction rises continuously across a multi-second encode. The trailing
+    // ~5% covers the entropy bake-off; block completion reports the remainder.
     const bool run_optimal =
         options.enable_optimal_parser && input.size() <= options.optimal_parse_limit;
-    auto greedy = encode_lz77(input, options);
+    const double greedy_share =
+        !run_optimal ? 0.90 : options.optimal_two_pass ? 0.18 : 0.35;
+    auto greedy = encode_lz77(input, scoped_progress_options(options, 0.0, greedy_share));
+    const auto optimal_options = scoped_progress_options(options, greedy_share, 0.95);
     if (run_optimal && !options.optimal_two_pass) {
         // Single-pass optimal measures its cost model from the greedy tokens,
         // so they must outlive the parse; two-pass mode releases them first —
         // keeping the extra buffer live through the long DP measurably hurts
         // cache behaviour.
-        auto optimal_tokens = encode_lz77_optimal(input, options, &greedy);
+        auto optimal_tokens = encode_lz77_optimal(input, optimal_options, &greedy);
         consider_lz_payload(std::move(greedy));
         consider_lz_payload(std::move(optimal_tokens));
     } else {
         consider_lz_payload(std::move(greedy));
         if (run_optimal) {
-            consider_lz_payload(encode_lz77_optimal(input, options));
+            consider_lz_payload(encode_lz77_optimal(input, optimal_options));
         }
     }
 
@@ -352,10 +359,52 @@ ByteVector encode_parallel_blocks(std::span<const std::uint8_t> input,
         effective_compression_thread_count(options.thread_count, block_count);
     std::mutex exception_mutex;
     std::exception_ptr first_exception;
+    // Once any worker fails, the whole encode fails; let the other workers
+    // drain instead of finishing blocks whose results will be discarded.
+    std::atomic_bool failed = false;
 
-    auto worker = [&] {
+    // Fine-grained progress: each worker publishes an estimate of how far into
+    // its current block the encoder has scanned (via the encode_progress phase
+    // plan inside compress_block); the aggregate completed + in-flight sum is
+    // reported through encoded_bytes_progress. Slow optimal-parse blocks then
+    // advance the bar continuously instead of stalling until they complete.
+    // Reports are throttled here so hot parse loops never fan out one call per
+    // tick per worker; the consumer additionally treats values as a monotonic
+    // high-water mark, which absorbs the benign completed/in-flight race.
+    std::vector<std::atomic<std::uint64_t>> in_flight(
+        options.encoded_bytes_progress ? worker_count : 0);
+    std::atomic_uint64_t last_reported = 0;
+    const auto report_aggregate = [&](bool force) {
+        std::uint64_t total = encoded_bytes.load(std::memory_order_relaxed);
+        for (const auto& slot : in_flight) {
+            total += slot.load(std::memory_order_relaxed);
+        }
+        constexpr std::uint64_t kReportQuantum = 512u << 10;
+        auto previous = last_reported.load(std::memory_order_relaxed);
+        while (force || total >= previous + kReportQuantum) {
+            if (last_reported.compare_exchange_weak(previous, total,
+                                                    std::memory_order_relaxed)) {
+                options.encoded_bytes_progress(total);
+                return;
+            }
+        }
+    };
+
+    auto worker = [&](std::size_t worker_index) {
         try {
-            while (true) {
+            auto worker_options = options;
+            std::size_t current_length = 0;
+            if (options.encoded_bytes_progress) {
+                worker_options.encode_progress = [&, worker_index](double fraction) {
+                    const auto scanned = static_cast<std::uint64_t>(
+                        static_cast<double>(current_length) *
+                        std::clamp(fraction, 0.0, 1.0));
+                    in_flight[worker_index].store(scanned, std::memory_order_relaxed);
+                    report_aggregate(false);
+                };
+            }
+
+            while (!failed.load(std::memory_order_relaxed)) {
                 const auto block_index = next_block.fetch_add(1);
                 if (block_index >= block_count) {
                     return;
@@ -367,7 +416,8 @@ ByteVector encode_parallel_blocks(std::span<const std::uint8_t> input,
                 const auto start = block_index * block_size;
                 const auto length = std::min(block_size, input.size() - start);
                 const auto block_input = input.subspan(start, length);
-                results[block_index] = compress_block(block_input, options);
+                current_length = length;
+                results[block_index] = compress_block(block_input, worker_options);
                 if (crc32 != nullptr) {
                     // The archive header still stores the normal whole-input
                     // CRC. Computing block CRCs here lets large parallel
@@ -375,17 +425,16 @@ ByteVector encode_parallel_blocks(std::span<const std::uint8_t> input,
                     block_crcs[block_index] = core::crc32(block_input);
                 }
                 if (options.encoded_bytes_progress) {
-                    // Cumulative bytes whose blocks finished, regardless of
-                    // block order; the callback treats it as a high-water mark.
-                    const auto done =
-                        encoded_bytes.fetch_add(length, std::memory_order_relaxed) + length;
-                    options.encoded_bytes_progress(done);
+                    encoded_bytes.fetch_add(length, std::memory_order_relaxed);
+                    in_flight[worker_index].store(0, std::memory_order_relaxed);
+                    report_aggregate(true);
                 }
                 if (options.operation) {
                     options.operation->checkpoint();
                 }
             }
         } catch (...) {
+            failed.store(true, std::memory_order_relaxed);
             std::lock_guard lock(exception_mutex);
             if (!first_exception) {
                 first_exception = std::current_exception();
@@ -394,12 +443,12 @@ ByteVector encode_parallel_blocks(std::span<const std::uint8_t> input,
     };
 
     if (worker_count <= 1) {
-        worker();
+        worker(0);
     } else {
         std::vector<std::thread> workers;
         workers.reserve(worker_count);
         for (std::size_t i = 0; i < worker_count; ++i) {
-            workers.emplace_back(worker);
+            workers.emplace_back(worker, i);
         }
         for (auto& thread : workers) {
             thread.join();
@@ -429,6 +478,7 @@ ByteVector decode_parallel_blocks(std::span<const std::uint8_t> encoded,
                                   std::size_t output_size,
                                   std::size_t thread_count,
                                   const std::shared_ptr<OperationControl>& operation,
+                                  const std::function<void(std::uint64_t)>& decoded_bytes_progress,
                                   std::uint32_t* crc32) {
     if (operation) {
         operation->checkpoint();
@@ -442,13 +492,19 @@ ByteVector decode_parallel_blocks(std::span<const std::uint8_t> encoded,
     ByteVector output(output_size);
     std::vector<std::uint32_t> block_crcs(blocks.size());
     std::atomic_size_t next_block = 0;
+    std::atomic<std::uint64_t> decoded_bytes = 0;
+    std::mutex progress_mutex;
+    std::uint64_t reported_decoded_bytes = 0;
     const auto worker_count = effective_thread_count(thread_count, blocks.size());
     std::mutex exception_mutex;
     std::exception_ptr first_exception;
+    // A failed block makes the whole decode throw; stop handing out blocks so a
+    // corrupt archive fails fast instead of decoding the rest for nothing.
+    std::atomic_bool failed = false;
 
     auto worker = [&] {
         try {
-            while (true) {
+            while (!failed.load(std::memory_order_relaxed)) {
                 const auto block_index = next_block.fetch_add(1);
                 if (block_index >= blocks.size()) {
                     return;
@@ -467,11 +523,25 @@ ByteVector decode_parallel_blocks(std::span<const std::uint8_t> encoded,
                     .subspan(block.output_offset, block.original_size);
                 decompress_block_into(payload, block.codec, target);
                 block_crcs[block_index] = core::crc32(target);
+                if (decoded_bytes_progress) {
+                    const auto done = decoded_bytes.fetch_add(block.original_size,
+                                                               std::memory_order_relaxed) +
+                                      block.original_size;
+                    // Workers finish out of order. Serialize the small callback
+                    // section so consumers never see a later byte count followed
+                    // by an older one.
+                    std::lock_guard lock(progress_mutex);
+                    if (done > reported_decoded_bytes) {
+                        reported_decoded_bytes = done;
+                        decoded_bytes_progress(done);
+                    }
+                }
                 if (operation) {
                     operation->checkpoint();
                 }
             }
         } catch (...) {
+            failed.store(true, std::memory_order_relaxed);
             std::lock_guard lock(exception_mutex);
             if (!first_exception) {
                 first_exception = std::current_exception();

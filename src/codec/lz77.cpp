@@ -36,6 +36,32 @@ inline void prefetch_read(const void* address) {
 #endif
 }
 
+// Emits options.encode_progress ticks from a parse loop: call tick(position)
+// each iteration; the callback fires once per kStep of scanned input, so the
+// hot loop pays one compare. Fractions are of this pass's own work; callers
+// wrap the callback to place a pass inside a larger phase plan.
+class ParseProgressTicker {
+public:
+    ParseProgressTicker(const std::function<void(double)>& callback, std::size_t total)
+        : callback_(callback && total != 0 ? &callback : nullptr),
+          total_(total),
+          next_(kStep) {}
+
+    void tick(std::size_t position) {
+        if (callback_ != nullptr && position >= next_) {
+            next_ = position + kStep;
+            (*callback_)(static_cast<double>(position) / static_cast<double>(total_));
+        }
+    }
+
+private:
+    static constexpr std::size_t kStep = 256u << 10;
+
+    const std::function<void(double)>* callback_;
+    std::size_t total_;
+    std::size_t next_;
+};
+
 constexpr std::uint8_t kLiteralToken = 0;
 constexpr std::uint8_t kMatchToken = 1;
 // Repeat-offset matches reuse one of the last kRepCount distances. Rep i is
@@ -51,6 +77,24 @@ constexpr std::size_t kParserCandidateLimit = 64;
 struct Match {
     std::uint16_t length = 0;
     std::uint32_t distance = 0;
+};
+
+// The optimal parser asks the matcher for candidates at every input position.
+// A std::vector here used to mean millions of tiny constructions (and frequent
+// heap traffic once the candidate count grew) in a level-9 block. The maximum
+// is a codec invariant, so a compact fixed list is both faster and easier to
+// keep in the matcher hot path.
+struct MatchList {
+    std::array<Match, kParserCandidateLimit> values{};
+    std::size_t count = 0;
+
+    void clear() {
+        count = 0;
+    }
+
+    const Match& operator[](std::size_t index) const {
+        return values[index];
+    }
 };
 
 enum class ParseKind : std::uint8_t { literal, match, rep };
@@ -185,37 +229,54 @@ std::uint32_t distance_slot(std::size_t distance) {
 
 // Costs are kept in scaled bits so fractional entropy estimates survive integer
 // arithmetic. The crude model reproduces the original fixed weights; the measured
-// model is built from the actual symbol statistics of a first parse.
+// model is built from the actual byte streams of a first parse. The split codec
+// entropy-codes varint *bytes*, not abstract lengths, so retaining their symbol
+// identities gives the DP a much closer approximation of its final payload.
 constexpr std::uint64_t kCostScale = 16;
 
 struct ParseCosts {
     bool measured = false;
-    std::uint64_t literal = 0;   // scaled bits per literal byte
-    std::uint64_t command = 0;   // scaled bits per command token
-    std::uint64_t length = 0;    // scaled bits per match-length value
-    std::uint64_t slot = 0;      // scaled bits per distance slot
+    std::array<std::uint64_t, 256> literal{};
+    std::array<std::uint64_t, 256> command{};
+    std::array<std::uint64_t, 256> match_length{};
+    std::array<std::uint64_t, 64> slot{};
 };
 
-std::uint64_t cost_literal_model(const ParseCosts& model) {
-    return model.measured ? model.literal : static_cast<std::uint64_t>(literal_cost());
+std::uint64_t cost_literal_model(const ParseCosts& model, std::uint8_t literal) {
+    return model.measured ? model.literal[literal] : static_cast<std::uint64_t>(literal_cost());
+}
+
+std::uint64_t cost_varuint_model(const std::array<std::uint64_t, 256>& byte_costs,
+                                 std::size_t value) {
+    std::uint64_t cost = 0;
+    while (value >= 0x80) {
+        cost += byte_costs[(value & 0x7Fu) | 0x80u];
+        value >>= 7;
+    }
+    return cost + byte_costs[value];
 }
 
 std::uint64_t cost_match_model(const ParseCosts& model, std::size_t length, std::size_t distance) {
     if (!model.measured) {
         return match_cost(length, distance);
     }
-    return model.command + model.length + model.slot +
+    return model.command[kMatchToken] +
+           cost_varuint_model(model.match_length, length) +
+           model.slot[distance_slot(distance)] +
            static_cast<std::uint64_t>(distance_footer_bits(distance)) * kCostScale;
 }
 
-std::uint64_t cost_rep_model(const ParseCosts& model, std::size_t length) {
+std::uint64_t cost_rep_model(const ParseCosts& model,
+                             std::size_t length,
+                             std::size_t rep_index) {
     if (!model.measured) {
         return rep_cost(length);
     }
-    return model.command + model.length;
+    return model.command[kRepTokenBase + rep_index] +
+           cost_varuint_model(model.match_length, length);
 }
 
-void add_match_candidate(std::vector<Match>& matches,
+void add_match_candidate(MatchList& matches,
                          std::size_t length,
                          std::size_t distance,
                          std::size_t max_candidates) {
@@ -228,50 +289,63 @@ void add_match_candidate(std::vector<Match>& matches,
     const auto narrowed_distance = static_cast<std::uint32_t>(
         std::min<std::size_t>(distance, std::numeric_limits<std::uint32_t>::max()));
 
-    for (auto& match : matches) {
+    for (std::size_t i = 0; i < matches.count; ++i) {
+        auto& match = matches.values[i];
         if (match.distance == narrowed_distance) {
             match.length = std::max(match.length, narrowed_length);
             return;
         }
     }
 
-    if (matches.size() >= max_candidates) {
-        const auto& worst = matches.back();
+    if (matches.count >= max_candidates) {
+        const auto& worst = matches.values[matches.count - 1];
         if (narrowed_length < worst.length ||
             (narrowed_length == worst.length && narrowed_distance >= worst.distance)) {
             return;
         }
     }
 
-    matches.push_back(Match{narrowed_length, narrowed_distance});
-
-    std::sort(matches.begin(), matches.end(), [](const Match& left, const Match& right) {
+    auto is_better = [](const Match& left, const Match& right) {
         if (left.length != right.length) {
             return left.length > right.length;
         }
-
         return left.distance < right.distance;
-    });
+    };
 
-    if (matches.size() > max_candidates) {
-        matches.resize(max_candidates);
+    // Keep the list in the same order as the former vector + std::sort path,
+    // but insert in place because this list has at most 64 elements.
+    auto insert_at = matches.count;
+    if (matches.count < matches.values.size()) {
+        ++matches.count;
+    } else {
+        // max_candidates is clamped to kParserCandidateLimit by the caller.
+        // Reaching this branch means the new candidate displaced the worst.
+        insert_at = matches.count - 1;
+    }
+    matches.values[insert_at] = Match{narrowed_length, narrowed_distance};
+    while (insert_at > 0 && is_better(matches.values[insert_at], matches.values[insert_at - 1])) {
+        std::swap(matches.values[insert_at], matches.values[insert_at - 1]);
+        --insert_at;
+    }
+
+    if (matches.count > max_candidates) {
+        matches.count = max_candidates;
     }
 }
 
 template <typename Index>
-std::vector<Match> find_matches_at(std::span<const std::uint8_t> input,
-                                   const std::vector<Index>& hash_heads,
-                                   const std::vector<Index>& previous,
-                                   std::size_t position,
-                                   std::size_t window_size,
-                                   std::size_t max_match,
-                                   std::size_t max_chain_depth,
-                                   std::size_t max_candidates) {
+void find_matches_at(std::span<const std::uint8_t> input,
+                     const std::vector<Index>& hash_heads,
+                     const std::vector<Index>& previous,
+                     std::size_t position,
+                     std::size_t window_size,
+                     std::size_t max_match,
+                     std::size_t max_chain_depth,
+                     std::size_t max_candidates,
+                     MatchList& matches) {
     constexpr Index kNoPos = std::numeric_limits<Index>::max();
-    std::vector<Match> matches;
-    matches.reserve(std::min(max_candidates, kParserCandidateLimit));
     if (position + kMinMatch > input.size()) {
-        return matches;
+        return;
     }
 
     auto candidate = hash_heads[hash4(input, position)];
@@ -291,8 +365,8 @@ std::vector<Match> find_matches_at(std::span<const std::uint8_t> input,
             break;
         }
 
-        if (matches.size() >= max_candidates) {
-            const auto threshold = static_cast<std::size_t>(matches.back().length);
+        if (matches.count >= max_candidates) {
+            const auto threshold = static_cast<std::size_t>(matches.values[matches.count - 1].length);
             if (threshold > kMinMatch &&
                 input[candidate + threshold - 1] != input[position + threshold - 1]) {
                 candidate = next;
@@ -321,7 +395,6 @@ std::vector<Match> find_matches_at(std::span<const std::uint8_t> input,
         ++depth;
     }
 
-    return matches;
 }
 
 void add_length_choice(std::array<std::uint16_t, 16>& lengths,
@@ -463,7 +536,9 @@ ByteVector encode_lz77_impl(std::span<const std::uint8_t> input,
     std::size_t lookahead_length = 0;
     std::size_t lookahead_distance = 0;
 
+    ParseProgressTicker progress(options.encode_progress, input.size());
     while (position < input.size()) {
+        progress.tick(position);
         std::size_t best_length = 0;
         std::size_t best_distance = 0;
         if (have_lookahead) {
@@ -727,7 +802,9 @@ ByteVector encode_lz77_tree(std::span<const std::uint8_t> input,
         }
     };
 
+    ParseProgressTicker progress(options.encode_progress, n);
     while (position < n) {
+        progress.tick(position);
         std::size_t best_length = 0;
         std::size_t best_distance = 0;
         process(position, cyclic_pos, true, best_length, best_distance);
@@ -813,7 +890,7 @@ public:
     // Must be called for every position in increasing order (the tree needs
     // each position inserted). When `matches` is non-null the improving
     // candidates are recorded through add_match_candidate.
-    void advance(std::size_t p, std::vector<Match>* matches, std::size_t max_candidates) {
+    void advance(std::size_t p, MatchList* matches, std::size_t max_candidates) {
         const auto cyclic_pos = cyclic_pos_;
         if (++cyclic_pos_ == cyclic_size_) {
             cyclic_pos_ = 0;
@@ -959,7 +1036,10 @@ ByteVector optimal_parse_with_costs(std::span<const std::uint8_t> input,
         }
     };
 
+    MatchList matches;
+    ParseProgressTicker progress(options.encode_progress, input.size());
     for (std::size_t position = 0; position < input.size(); ++position) {
+        progress.tick(position);
         if (costs[position] == kInf) {
             // Unreachable position: the match finder still needs it indexed.
             if (use_tree) {
@@ -988,30 +1068,31 @@ ByteVector optimal_parse_with_costs(std::span<const std::uint8_t> input,
             reps_at[position] = state;
         }
 
-        const auto literal_next = costs[position] + cost_literal_model(model);
+        const auto literal_next = costs[position] + cost_literal_model(model, input[position]);
         if (literal_next < costs[position + 1]) {
             costs[position + 1] = literal_next;
             decisions[position + 1] = ParseDecision{1, 0, ParseKind::literal, 0};
         }
 
-        std::vector<Match> matches;
+        matches.clear();
         if (use_tree) {
-            matches.reserve(std::min(max_candidates, kParserCandidateLimit));
             tree->advance(position, &matches, max_candidates);
         } else {
-            matches = find_matches_at(input,
-                                      hash_heads,
-                                      previous,
-                                      position,
-                                      window_size,
-                                      max_match,
-                                      max_chain_depth,
-                                      max_candidates);
+            find_matches_at(input,
+                            hash_heads,
+                            previous,
+                            position,
+                            window_size,
+                            max_match,
+                            max_chain_depth,
+                            max_candidates,
+                            matches);
         }
 
         // The parser evaluates a bounded set of useful lengths instead of every
         // possible prefix. That keeps the pass linear enough for large blocks.
-        for (const auto& match : matches) {
+        for (std::size_t match_index = 0; match_index < matches.count; ++match_index) {
+            const auto& match = matches[match_index];
             std::size_t length_count = 0;
             const auto lengths = useful_lengths(match.length, length_count);
 
@@ -1049,7 +1130,8 @@ ByteVector optimal_parse_with_costs(std::span<const std::uint8_t> input,
             for (std::size_t k = 0; k < length_count; ++k) {
                 const auto length = static_cast<std::size_t>(lengths[k]);
                 const auto target = position + length;
-                const auto candidate_cost = costs[position] + cost_rep_model(model, length);
+                const auto candidate_cost =
+                    costs[position] + cost_rep_model(model, length, i);
 
                 if (candidate_cost < costs[target]) {
                     costs[target] = candidate_cost;
@@ -1110,34 +1192,43 @@ ByteVector optimal_parse_with_costs(std::span<const std::uint8_t> input,
     return output;
 }
 
-std::uint64_t scaled_entropy(const std::vector<std::uint64_t>& histogram, std::uint64_t total) {
+template <std::size_t Count>
+std::array<std::uint64_t, Count> scaled_symbol_costs(
+    const std::array<std::uint64_t, Count>& histogram,
+    std::uint64_t total,
+    std::uint64_t fallback) {
+    std::array<std::uint64_t, Count> costs{};
     if (total == 0) {
-        return 0;
+        costs.fill(fallback);
+        return costs;
     }
 
-    double bits = 0.0;
-    for (const auto count : histogram) {
-        if (count == 0) {
-            continue;
-        }
-        const auto probability = static_cast<double>(count) / static_cast<double>(total);
-        bits -= probability * std::log2(probability);
+    // A one-count prior keeps previously unseen symbols finite. The re-parse
+    // can legitimately create a new length or slot byte, and the final encoder
+    // will add it to its rANS table instead of treating it as impossible.
+    const auto denominator = static_cast<double>(total + Count);
+    for (std::size_t symbol = 0; symbol < Count; ++symbol) {
+        const auto probability = static_cast<double>(histogram[symbol] + 1) / denominator;
+        costs[symbol] = static_cast<std::uint64_t>(
+            -std::log2(probability) * static_cast<double>(kCostScale) + 0.5);
     }
-
-    return static_cast<std::uint64_t>(bits * static_cast<double>(kCostScale) + 0.5);
+    return costs;
 }
 
-// Estimate the per-symbol coded cost of each stream from a completed parse using
-// its order-0 entropy. This is what the entropy stage approaches, so re-parsing
-// with these costs aligns the parser's split decisions with reality.
+// Estimate the per-byte coded cost of every split stream from a completed parse.
+// This tracks the representation the entropy layer really sees: command bytes,
+// match-length varint bytes, and position slots. It is intentionally order-0;
+// the final entropy bake-off may select clustered order-1 rANS, but an exact
+// per-symbol estimate is still substantially more useful to the parser than a
+// single average cost for all literals or all lengths.
 ParseCosts measure_costs(std::span<const std::uint8_t> tokens) {
-    std::vector<std::uint64_t> literal_hist(256, 0);
-    std::vector<std::uint64_t> command_hist(256, 0);
-    std::vector<std::uint64_t> length_hist(1u << 16, 0);
-    std::vector<std::uint64_t> slot_hist(64, 0);
+    std::array<std::uint64_t, 256> literal_hist{};
+    std::array<std::uint64_t, 256> command_hist{};
+    std::array<std::uint64_t, 256> match_length_hist{};
+    std::array<std::uint64_t, 64> slot_hist{};
     std::uint64_t literal_total = 0;
     std::uint64_t command_total = 0;
-    std::uint64_t length_total = 0;
+    std::uint64_t match_length_total = 0;
     std::uint64_t slot_total = 0;
 
     std::size_t cursor = 0;
@@ -1154,29 +1245,32 @@ ParseCosts measure_costs(std::span<const std::uint8_t> tokens) {
             literal_total += length;
             cursor += length;
         } else if (token == kMatchToken) {
-            const auto length = static_cast<std::size_t>(read_varuint(tokens, cursor));
-            const auto distance = static_cast<std::size_t>(read_varuint(tokens, cursor));
-            if (length < length_hist.size()) {
-                ++length_hist[length];
+            const auto length_start = cursor;
+            (void)read_varuint(tokens, cursor);
+            for (std::size_t i = length_start; i < cursor; ++i) {
+                ++match_length_hist[tokens[i]];
+                ++match_length_total;
             }
-            ++length_total;
+            const auto distance = static_cast<std::size_t>(read_varuint(tokens, cursor));
             ++slot_hist[distance_slot(distance)];
             ++slot_total;
         } else {
-            const auto length = static_cast<std::size_t>(read_varuint(tokens, cursor));
-            if (length < length_hist.size()) {
-                ++length_hist[length];
+            const auto length_start = cursor;
+            (void)read_varuint(tokens, cursor);
+            for (std::size_t i = length_start; i < cursor; ++i) {
+                ++match_length_hist[tokens[i]];
+                ++match_length_total;
             }
-            ++length_total;
         }
     }
 
     ParseCosts model;
     model.measured = true;
-    model.literal = literal_total ? scaled_entropy(literal_hist, literal_total) : 8 * kCostScale;
-    model.command = command_total ? scaled_entropy(command_hist, command_total) : 2 * kCostScale;
-    model.length = length_total ? scaled_entropy(length_hist, length_total) : 6 * kCostScale;
-    model.slot = slot_total ? scaled_entropy(slot_hist, slot_total) : 5 * kCostScale;
+    model.literal = scaled_symbol_costs(literal_hist, literal_total, 8 * kCostScale);
+    model.command = scaled_symbol_costs(command_hist, command_total, 2 * kCostScale);
+    model.match_length =
+        scaled_symbol_costs(match_length_hist, match_length_total, 6 * kCostScale);
+    model.slot = scaled_symbol_costs(slot_hist, slot_total, 5 * kCostScale);
     return model;
 }
 
@@ -1200,24 +1294,34 @@ ByteVector encode_lz77_optimal(std::span<const std::uint8_t> input,
         if (greedy_tokens != nullptr) {
             return optimal_parse_with_costs(input, options, measure_costs(*greedy_tokens));
         }
-        const auto greedy = encode_lz77(input, options);
-        return optimal_parse_with_costs(input, options, measure_costs(greedy));
+        const auto greedy_options = scoped_progress_options(options, 0.0, 0.30);
+        const auto greedy = encode_lz77(input, greedy_options);
+        const auto parse_options = scoped_progress_options(options, 0.30, 1.0);
+        return optimal_parse_with_costs(input, parse_options, measure_costs(greedy));
     }
 
     // Parse once with crude weights, measure the real symbol statistics, then
-    // re-parse with entropy-aligned costs.
-    auto first = optimal_parse_with_costs(input, options, ParseCosts{});
+    // re-parse with entropy-aligned costs. The two DP passes split this call's
+    // progress budget; the trailing entropy bake-off is short by comparison.
+    const auto first_options = scoped_progress_options(options, 0.0, 0.47);
+    auto first = optimal_parse_with_costs(input, first_options, ParseCosts{});
     const auto measured = measure_costs(first);
-    auto second = optimal_parse_with_costs(input, options, measured);
+    const auto second_options = scoped_progress_options(options, 0.47, 0.94);
+    auto second = optimal_parse_with_costs(input, second_options, measured);
 
     // The measured parse is meant to win after entropy coding even when it has
     // more raw tokens, so compare the actual coded size rather than token count.
     auto coded_size = [fast = options.fast_entropy](const ByteVector& tokens) {
-        auto split = encode_lz77_split_streams(tokens, fast).size();
-        if (auto slots = encode_lz77_split_streams_slots(tokens, fast)) {
-            split = std::min(split, slots->size());
+        // Both layouts share commands, lengths, and literals. Building them
+        // independently re-runs the clustered literal rANS encoder merely to
+        // select between two already-compatible distance representations.
+        // The paired encoder emits byte-identical candidates while doing that
+        // common work once.
+        auto [split, slots] = encode_lz77_split_payloads(tokens, fast);
+        if (slots) {
+            return std::min(split.size(), slots->size());
         }
-        return split;
+        return split.size();
     };
 
     return coded_size(second) <= coded_size(first) ? std::move(second) : std::move(first);

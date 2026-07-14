@@ -4,6 +4,23 @@
 
 namespace axiom::codec {
 
+// Copy of `options` whose encode_progress reports into the [begin, end) share
+// of the parent's progress; a cheap way to compose multi-pass phase plans
+// (compress_block places the greedy/optimal/entropy phases, and the optimal
+// parser places its own passes, without either knowing about the other).
+inline CompressionOptions scoped_progress_options(const CompressionOptions& options,
+                                                  double begin,
+                                                  double end) {
+    auto scoped = options;
+    if (options.encode_progress) {
+        scoped.encode_progress = [parent = options.encode_progress, begin,
+                                  width = end - begin](double fraction) {
+            parent(begin + width * fraction);
+        };
+    }
+    return scoped;
+}
+
 ByteVector encode_lz77(std::span<const std::uint8_t> input,
                        const CompressionOptions& options);
 

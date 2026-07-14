@@ -8,9 +8,11 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -25,11 +27,13 @@ public:
 
 enum class OperationStage {
     scanning,
+    estimating,
     reading,
     compressing,
     writing,
     testing,
     extracting,
+    transferring,
     finalizing,
 };
 
@@ -40,6 +44,21 @@ struct OperationProgress {
     std::uint64_t completed_items = 0;
     std::uint64_t total_items = 0;
     std::string current_path;
+    // The current item is reported independently from the operation total so
+    // frontends can present an overall bar and an exact per-file bar together.
+    // A zero total means the current stage has no file-sized unit (for example,
+    // an archive solid block that contains several files).
+    std::uint64_t current_file_completed_bytes = 0;
+    std::uint64_t current_file_total_bytes = 0;
+    // Monotonically increasing telemetry sequence assigned by OperationControl.
+    // Producers leave this at zero; frontends use it to distinguish a fresh
+    // atomic snapshot from a heartbeat repaint.
+    std::uint64_t sequence = 0;
+};
+
+struct OperationWarning {
+    std::string path;
+    std::string message;
 };
 
 class OperationControl final {
@@ -47,24 +66,115 @@ public:
     using ProgressCallback = std::function<void(const OperationProgress&)>;
 
     void set_progress_callback(ProgressCallback callback) {
-        std::lock_guard lock(callback_mutex_);
-        progress_callback_ = std::move(callback);
+        const bool present = static_cast<bool>(callback);
+        auto value = callback
+            ? std::make_shared<ProgressCallback>(std::move(callback))
+            : std::shared_ptr<ProgressCallback>{};
+        progress_callback_.store(std::move(value), std::memory_order_release);
+        progress_callback_present_.store(present, std::memory_order_release);
     }
 
     void report(const OperationProgress& progress) const {
         checkpoint();
-
-        ProgressCallback callback;
-        {
-            std::lock_guard lock(callback_mutex_);
-            callback = progress_callback_;
+        constexpr std::uint64_t kPublishQuantum = 1u << 20;
+        const auto previous_stage = static_cast<OperationStage>(
+            progress_stage_.load(std::memory_order_relaxed));
+        const auto previous_bytes =
+            progress_completed_bytes_.load(std::memory_order_relaxed);
+        const auto previous_total = progress_total_bytes_.load(std::memory_order_relaxed);
+        const auto previous_items =
+            progress_completed_items_.load(std::memory_order_relaxed);
+        const auto previous_item_total = progress_total_items_.load(std::memory_order_relaxed);
+        const auto previous_file_bytes =
+            progress_file_completed_bytes_.load(std::memory_order_relaxed);
+        const auto previous_file_total =
+            progress_file_total_bytes_.load(std::memory_order_relaxed);
+        const bool first = progress_version_.load(std::memory_order_relaxed) == 0;
+        const bool boundary = first || progress.stage != previous_stage ||
+            progress.total_bytes != previous_total ||
+            progress.total_items != previous_item_total ||
+            progress.completed_items != previous_items ||
+            progress.current_file_total_bytes != previous_file_total ||
+            progress.completed_bytes < previous_bytes ||
+            progress.current_file_completed_bytes < previous_file_bytes ||
+            (progress.total_bytes > 0 &&
+             progress.completed_bytes >= progress.total_bytes) ||
+            (progress.current_file_total_bytes > 0 &&
+             progress.current_file_completed_bytes >= progress.current_file_total_bytes);
+        const bool byte_quantum = progress.completed_bytes >= previous_bytes + kPublishQuantum ||
+            progress.current_file_completed_bytes >= previous_file_bytes + kPublishQuantum;
+        if (!boundary && !byte_quantum) return;
+        while (progress_writer_.test_and_set(std::memory_order_acquire)) {
+            std::this_thread::yield();
         }
-        if (callback) {
-            callback(progress);
+        progress_version_.fetch_add(1, std::memory_order_acq_rel); // writer active
+        progress_stage_.store(static_cast<unsigned>(progress.stage),
+                              std::memory_order_relaxed);
+        progress_completed_bytes_.store(progress.completed_bytes,
+                                        std::memory_order_relaxed);
+        progress_total_bytes_.store(progress.total_bytes, std::memory_order_relaxed);
+        progress_completed_items_.store(progress.completed_items,
+                                        std::memory_order_relaxed);
+        progress_total_items_.store(progress.total_items, std::memory_order_relaxed);
+        progress_file_completed_bytes_.store(progress.current_file_completed_bytes,
+                                             std::memory_order_relaxed);
+        progress_file_total_bytes_.store(progress.current_file_total_bytes,
+                                         std::memory_order_relaxed);
+        if (progress_writer_path_ != progress.current_path) {
+            progress_writer_path_ = progress.current_path;
+            progress_path_.store(
+                std::make_shared<const std::string>(progress.current_path),
+                std::memory_order_relaxed);
+        }
+        const std::uint64_t version =
+            progress_version_.fetch_add(1, std::memory_order_release) + 1;
+        progress_writer_.clear(std::memory_order_release);
+
+        if (progress_callback_present_.load(std::memory_order_acquire)) {
+            auto callback = progress_callback_.load(std::memory_order_acquire);
+            if (!callback) return;
+            OperationProgress published = progress;
+            published.sequence = version / 2;
+            (*callback)(published);
+        }
+    }
+
+    // A coherent, non-blocking telemetry snapshot. The operation writer never
+    // waits for the UI; readers retry only if they race the few atomic stores
+    // that publish a new sample.
+    std::optional<OperationProgress> latest_progress() const {
+        for (;;) {
+            const std::uint64_t before = progress_version_.load(std::memory_order_acquire);
+            if (before == 0) return std::nullopt;
+            if ((before & 1u) != 0) continue;
+            OperationProgress result;
+            result.stage = static_cast<OperationStage>(
+                progress_stage_.load(std::memory_order_relaxed));
+            result.completed_bytes =
+                progress_completed_bytes_.load(std::memory_order_relaxed);
+            result.total_bytes = progress_total_bytes_.load(std::memory_order_relaxed);
+            result.completed_items =
+                progress_completed_items_.load(std::memory_order_relaxed);
+            result.total_items = progress_total_items_.load(std::memory_order_relaxed);
+            result.current_file_completed_bytes =
+                progress_file_completed_bytes_.load(std::memory_order_relaxed);
+            result.current_file_total_bytes =
+                progress_file_total_bytes_.load(std::memory_order_relaxed);
+            const auto path = progress_path_.load(std::memory_order_relaxed);
+            if (path) result.current_path = *path;
+            const std::uint64_t after = progress_version_.load(std::memory_order_acquire);
+            if (before == after && (after & 1u) == 0) {
+                result.sequence = after / 2;
+                return result;
+            }
         }
     }
 
     void checkpoint() const {
+        if (!paused_.load(std::memory_order_acquire)) {
+            if (cancelled_.load(std::memory_order_acquire)) throw OperationCancelled();
+            return;
+        }
         std::unique_lock lock(pause_mutex_);
         pause_cv_.wait(lock, [&] {
             return !paused_.load(std::memory_order_acquire) ||
@@ -95,13 +205,38 @@ public:
         return paused_.load(std::memory_order_acquire);
     }
 
+    void add_warning(OperationWarning warning) const {
+        std::lock_guard lock(warning_mutex_);
+        warnings_.push_back(std::move(warning));
+    }
+
+    std::vector<OperationWarning> warnings() const {
+        std::lock_guard lock(warning_mutex_);
+        return warnings_;
+    }
+
 private:
     std::atomic_bool cancelled_ = false;
     std::atomic_bool paused_ = false;
     mutable std::mutex pause_mutex_;
     mutable std::condition_variable pause_cv_;
-    mutable std::mutex callback_mutex_;
-    ProgressCallback progress_callback_;
+    mutable std::mutex warning_mutex_;
+    mutable std::vector<OperationWarning> warnings_;
+    mutable std::atomic<std::shared_ptr<ProgressCallback>> progress_callback_;
+    mutable std::atomic_bool progress_callback_present_{false};
+    mutable std::atomic_flag progress_writer_ = ATOMIC_FLAG_INIT;
+    mutable std::atomic_uint64_t progress_version_{0};
+    mutable std::atomic_uint progress_stage_{
+        static_cast<unsigned>(OperationStage::reading)};
+    mutable std::atomic_uint64_t progress_completed_bytes_{0};
+    mutable std::atomic_uint64_t progress_total_bytes_{0};
+    mutable std::atomic_uint64_t progress_completed_items_{0};
+    mutable std::atomic_uint64_t progress_total_items_{0};
+    mutable std::atomic_uint64_t progress_file_completed_bytes_{0};
+    mutable std::atomic_uint64_t progress_file_total_bytes_{0};
+    mutable std::atomic<std::shared_ptr<const std::string>> progress_path_{
+        std::make_shared<const std::string>()};
+    mutable std::string progress_writer_path_;
 };
 
 struct CompressionOptions {
@@ -151,6 +286,11 @@ struct CompressionOptions {
     // the time for most of the ratio. Level 8 uses single-pass, level 9 and
     // --optimal keep two passes.
     bool optimal_two_pass = true;
+    // New-archive frontends may continue past inputs that disappear or remain
+    // unreadable after retries. Each omission is recorded on OperationControl;
+    // update paths deliberately ignore this option to preserve old entries.
+    bool skip_unreadable_files = false;
+    unsigned input_open_retries = 4;
     std::shared_ptr<OperationControl> operation;
     // Within-compress progress: when set, the parallel block codec calls this
     // with the cumulative number of this compress() call's input bytes whose
@@ -158,8 +298,17 @@ struct CompressionOptions {
     // concurrently and out of order — the callback must be thread-safe and
     // cheap, and should treat the value as a monotonic high-water mark. The
     // archive writer uses it to report progress inside large solid blocks;
-    // serial (single-worker) encodes do not call it.
+    // serial (single-worker) encodes receive the start and completion updates.
     std::function<void(std::uint64_t)> encoded_bytes_progress;
+    // Internal fine-grained progress: the parse loops call this with the
+    // fraction (0..1) of the *current encode call's* work completed, every few
+    // hundred KiB of scanned input. Wrappers compose it: compress_block maps
+    // each phase (greedy parse, optimal passes, entropy) into its share of the
+    // block, and the parallel block codec aggregates per-worker fractions into
+    // encoded_bytes_progress. This is what keeps the progress bar moving inside
+    // multi-second optimal parses instead of stalling until a block completes.
+    // Cheap to leave unset; encoders check once per reporting quantum.
+    std::function<void(double)> encode_progress;
     // When non-empty, archive blocks are encrypted: a per-archive key is derived
     // from this password (Argon2id) and each solid block is sealed with
     // XChaCha20-Poly1305. Applies to the archive container, not single-stream
@@ -290,6 +439,11 @@ struct DecompressionOptions {
     std::size_t thread_count = 0;
     std::size_t io_buffer_size = 0;  // 0 = automatic.
     std::shared_ptr<OperationControl> operation;
+    // Within-decompress progress. The callback receives completed and total
+    // uncompressed bytes for this decompress() call. Parallel block decodes
+    // invoke it from worker threads, so implementations must be thread-safe
+    // and treat completed bytes as a monotonic high-water mark.
+    std::function<void(std::uint64_t, std::uint64_t)> decoded_bytes_progress;
     // Password for an encrypted archive (container blocks). Empty for plaintext
     // archives; required to read an encrypted one.
     std::string password{};
