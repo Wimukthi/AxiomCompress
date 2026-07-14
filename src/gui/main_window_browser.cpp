@@ -5,16 +5,24 @@
 
 namespace axiom::gui {
 
-ShellIconRef MainWindow::tree_icon_for_filesystem(const fs::path& path, bool drive) const {
-    return shell_icon_for_path(path, drive);
+ShellIconRef MainWindow::tree_icon_for_filesystem(const fs::path& path, bool drive,
+                                                   bool directory,
+                                                   bool prefer_generic_unique_icon) {
+    axiom::gui::BrowserItem item;
+    item.kind = drive ? axiom::gui::BrowserItemKind::drive
+                      : directory ? axiom::gui::BrowserItemKind::directory
+                                  : axiom::gui::BrowserItemKind::file;
+    item.filesystem_path = path;
+    item.name = path.filename().wstring();
+    return cached_shell_icon_for_item(item, prefer_generic_unique_icon);
 }
 
-ShellIconRef MainWindow::tree_icon_for_archive(const fs::path& path) const {
+ShellIconRef MainWindow::tree_icon_for_archive(const fs::path& path) {
     axiom::gui::BrowserItem item;
     item.kind = axiom::gui::BrowserItemKind::archive;
     item.filesystem_path = path;
     item.name = path.filename().wstring();
-    return shell_icon_for_item(item);
+    return cached_shell_icon_for_item(item);
 }
 
 DirectoryTreeItem* MainWindow::insert_tree_item(DirectoryTreeItem* parent,
@@ -56,6 +64,7 @@ bool MainWindow::filesystem_has_tree_children(const fs::path& path) const {
 
 void MainWindow::populate_tree_filesystem_children(DirectoryTreeItem& item, const fs::path& path) {
     std::vector<TreeChildCandidate> candidates;
+    bool has_files_to_probe = false;
     WIN32_FIND_DATAW data{};
     HANDLE find = FindFirstFileExW((path / L"*").c_str(), FindExInfoBasic, &data,
                                    FindExSearchNameMatch, nullptr,
@@ -65,7 +74,8 @@ void MainWindow::populate_tree_filesystem_children(DirectoryTreeItem& item, cons
         if (!tree_should_show_filesystem_item(data)) continue;
         const bool directory = (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
         const fs::path child_path = path / data.cFileName;
-        const bool archive = !directory && path_has_supported_archive_extension(child_path);
+        const bool archive = !directory && tree_archive_was_detected(child_path);
+        has_files_to_probe = has_files_to_probe || !directory;
         candidates.push_back({data.cFileName, child_path, directory, archive, false});
     } while (FindNextFileW(find, &data));
     FindClose(find);
@@ -75,6 +85,7 @@ void MainWindow::populate_tree_filesystem_children(DirectoryTreeItem& item, cons
         return _wcsicmp(left.name.c_str(), right.name.c_str()) < 0;
     });
 
+    const bool prefer_generic_unique_icons = candidates.size() >= 512;
     for (const auto& child : candidates) {
         DirectoryTreeNode node;
         node.kind = child.archive ? DirectoryTreeNodeKind::archive
@@ -85,9 +96,120 @@ void MainWindow::populate_tree_filesystem_children(DirectoryTreeItem& item, cons
         const bool has_children = child.archive || child.directory;
         insert_tree_item(&item, child.name, std::move(node),
                          child.archive ? tree_icon_for_archive(child.path)
-                                       : tree_icon_for_filesystem(child.path),
+                                       : tree_icon_for_filesystem(
+                                             child.path, false, child.directory,
+                                             prefer_generic_unique_icons),
                          has_children);
     }
+    if (has_files_to_probe) queue_tree_archive_probe(path);
+}
+
+bool MainWindow::tree_archive_was_detected(const fs::path& path) const {
+    return tree_detected_archive_paths_.contains(folded_path_key(path));
+}
+
+void MainWindow::queue_tree_archive_probe(const fs::path& directory) {
+    if (directory.empty()) return;
+    const std::wstring key = folded_path_key(directory);
+    if (tree_archive_probe_requested_directories_.contains(key)) {
+        return;
+    }
+    tree_archive_probe_requested_directories_.insert(key);
+    {
+        std::scoped_lock lock(tree_archive_probe_mutex_);
+        tree_archive_probe_queue_.push_back(directory);
+    }
+    if (!tree_archive_probe_thread_.joinable()) {
+        tree_archive_probe_thread_ = std::jthread(
+            [this](std::stop_token stop) { tree_archive_probe_loop(stop); });
+    }
+    tree_archive_probe_cv_.notify_one();
+}
+
+void MainWindow::tree_archive_probe_loop(std::stop_token stop) {
+    const bool background_mode =
+        SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN) != FALSE;
+    while (!stop.stop_requested()) {
+        fs::path directory;
+        {
+            std::unique_lock lock(tree_archive_probe_mutex_);
+            if (!tree_archive_probe_cv_.wait(
+                    lock, stop,
+                    [this] { return !tree_archive_probe_queue_.empty(); })) {
+                break;
+            }
+            directory = std::move(tree_archive_probe_queue_.front());
+            tree_archive_probe_queue_.pop_front();
+        }
+
+        std::vector<fs::path> detected;
+        detected.reserve(16);
+        const auto post_result = [&](bool completed) {
+            auto payload = std::make_unique<TreeArchiveProbeResult>();
+            payload->directory = directory;
+            payload->archives = std::move(detected);
+            payload->completed = completed;
+            detected.clear();
+            detected.reserve(16);
+            TreeArchiveProbeResult* raw = payload.release();
+            if (!PostMessageW(hwnd_, kTreeArchiveProbeMessage, 0,
+                              reinterpret_cast<LPARAM>(raw))) {
+                delete raw;
+            }
+        };
+
+        WIN32_FIND_DATAW data{};
+        HANDLE find = FindFirstFileExW((directory / L"*").c_str(), FindExInfoBasic,
+                                       &data, FindExSearchNameMatch, nullptr,
+                                       FIND_FIRST_EX_LARGE_FETCH);
+        if (find != INVALID_HANDLE_VALUE) {
+            do {
+                if (stop.stop_requested()) {
+                    break;
+                }
+                if (wcscmp(data.cFileName, L".") == 0 ||
+                    wcscmp(data.cFileName, L"..") == 0 ||
+                    (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+                    continue;
+                }
+                const fs::path candidate = directory / data.cFileName;
+                if (axiom::archive_provider_for_contents(candidate) != nullptr) {
+                    detected.push_back(candidate);
+                    if (detected.size() >= 16) post_result(false);
+                }
+            } while (FindNextFileW(find, &data));
+            FindClose(find);
+        }
+        if (!stop.stop_requested()) post_result(true);
+    }
+    if (background_mode) {
+        SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_END);
+    }
+}
+
+void MainWindow::on_tree_archive_probe(LPARAM lparam) {
+    std::unique_ptr<TreeArchiveProbeResult> result(
+        reinterpret_cast<TreeArchiveProbeResult*>(lparam));
+    if (!result) return;
+    bool changed = false;
+    for (const fs::path& archive : result->archives) {
+        tree_detected_archive_paths_.insert(folded_path_key(archive));
+        DirectoryTreeItem* item = tree_view_.find_filesystem_item(archive);
+        if (item == nullptr || item->node.kind == DirectoryTreeNodeKind::archive) continue;
+        if (item->node.kind != DirectoryTreeNodeKind::file) continue;
+        item->node.kind = DirectoryTreeNodeKind::archive;
+        item->node.archive_path = archive;
+        item->node.populated = false;
+        item->icon = tree_icon_for_archive(archive);
+        item->may_have_children = true;
+        item->populated = false;
+        changed = true;
+    }
+    if (result->completed) {
+        const std::wstring directory_key = folded_path_key(result->directory);
+        tree_archive_probe_requested_directories_.erase(directory_key);
+    }
+    if (changed) tree_view_.refresh();
 }
 
 void MainWindow::add_known_tree_folder(DirectoryTreeItem& parent, const wchar_t* label,
@@ -97,7 +219,7 @@ void MainWindow::add_known_tree_folder(DirectoryTreeItem& parent, const wchar_t*
         node.kind = DirectoryTreeNodeKind::filesystem;
         node.filesystem_path = *path;
         insert_tree_item(&parent, label, std::move(node),
-                         tree_icon_for_filesystem(*path),
+                         tree_icon_for_filesystem(*path, false, true),
                          filesystem_has_tree_children(*path));
     }
 }
@@ -129,7 +251,7 @@ void MainWindow::populate_tree_computer_children(DirectoryTreeItem& item) {
         node.kind = DirectoryTreeNodeKind::filesystem;
         node.filesystem_path = path;
         insert_tree_item(&item, std::move(label), std::move(node),
-                         tree_icon_for_filesystem(path, true), true);
+                         tree_icon_for_filesystem(path, true, true), true);
     }
 }
 
@@ -138,22 +260,21 @@ std::shared_ptr<const axiom::gui::ArchiveCatalog> MainWindow::tree_archive_catal
     if (archive_catalog_ && same_filesystem_path(archive_catalog_->path(), archive)) {
         return archive_catalog_;
     }
-    try {
-        std::string password;
-        if (!archive_password_path_.empty() &&
-            same_filesystem_path(archive_password_path_, archive)) {
-            password = archive_password_;
-        }
-        return axiom::gui::ArchiveCatalog::load(archive, password);
-    } catch (...) {
-        return {};
-    }
+    // Expanding a tree node is an input/paint path. Never load or parse an
+    // unopened archive here. Selecting the archive navigates through the
+    // browser worker; once that worker publishes its catalog, tree population
+    // is an in-memory index lookup.
+    return {};
 }
 
 void MainWindow::populate_tree_archive_children(DirectoryTreeItem& item, const fs::path& archive,
                                     const std::string& directory) {
     auto catalog = tree_archive_catalog(archive);
-    if (!catalog) return;
+    if (!catalog) {
+        item.populated = false;
+        item.node.populated = false;
+        return;
+    }
     const auto snapshot = catalog->list(axiom::gui::BrowserLocation::archive(archive, directory),
                                         std::stop_token{});
     std::vector<axiom::gui::BrowserItem> directories;
@@ -174,7 +295,7 @@ void MainWindow::populate_tree_archive_children(DirectoryTreeItem& item, const f
         // entries; probing every sibling directory here rescans the full catalog for
         // each child and can make the GUI look like it crashed while opening.
         insert_tree_item(&item, child.name, std::move(node),
-                         tree_icon_for_filesystem(L"folder"),
+                         tree_icon_for_filesystem(L"folder", false, true),
                          true);
     }
 }
@@ -196,9 +317,17 @@ void MainWindow::populate_tree_item(DirectoryTreeItem& item) {
         case DirectoryTreeNodeKind::file:
             break;
         case DirectoryTreeNodeKind::archive:
+            if (!tree_archive_catalog(node.archive_path)) {
+                tree_view_.end_update();
+                return;
+            }
             populate_tree_archive_children(item, node.archive_path, {});
             break;
         case DirectoryTreeNodeKind::archive_directory:
+            if (!tree_archive_catalog(node.archive_path)) {
+                tree_view_.end_update();
+                return;
+            }
             populate_tree_archive_children(item, node.archive_path, node.archive_directory);
             break;
         case DirectoryTreeNodeKind::dummy:
@@ -246,6 +375,14 @@ DirectoryTreeItem* MainWindow::ensure_filesystem_tree_path(const fs::path& path)
     if (current_path.empty()) current_path = path.root_name();
     if (current_path.empty()) return tree_computer_item_;
 
+    const DWORD root_attributes = GetFileAttributesW(current_path.c_str());
+    if (root_attributes == INVALID_FILE_ATTRIBUTES) {
+        // Never recreate a persisted drive/path that disappeared while Axiom
+        // was closed. Re-enumerating This PC also removes a stale drive node.
+        tree_view_.refresh_item(tree_computer_item_);
+        return tree_computer_item_;
+    }
+
     DirectoryTreeItem* current =
         find_tree_child_by_filesystem_path(*tree_computer_item_, current_path);
     if (current == nullptr) {
@@ -253,7 +390,7 @@ DirectoryTreeItem* MainWindow::ensure_filesystem_tree_path(const fs::path& path)
         node.kind = DirectoryTreeNodeKind::filesystem;
         node.filesystem_path = current_path;
         current = insert_tree_item(tree_computer_item_, current_path.wstring(), std::move(node),
-                                   tree_icon_for_filesystem(current_path, true), true);
+                                   tree_icon_for_filesystem(current_path, true, true), true);
     }
 
     fs::path relative = path.lexically_relative(current_path);
@@ -263,17 +400,23 @@ DirectoryTreeItem* MainWindow::ensure_filesystem_tree_path(const fs::path& path)
         populate_tree_item(*current);
         current->expanded = true;
         current_path /= part;
+        const DWORD attributes = GetFileAttributesW(current_path.c_str());
+        if (attributes == INVALID_FILE_ATTRIBUTES) {
+            // A history or persisted-tree path can become stale between runs.
+            // Refresh its nearest surviving parent and select that parent.
+            tree_view_.refresh_item(current);
+            return current;
+        }
         DirectoryTreeItem* child = find_tree_child_by_filesystem_path(*current, current_path);
         const bool final_component = same_filesystem_path(current_path, path);
         if (child == nullptr) {
             DirectoryTreeNode node;
-            const DWORD attributes = GetFileAttributesW(current_path.c_str());
-            const bool directory = attributes != INVALID_FILE_ATTRIBUTES &&
-                                   (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
-            const bool archive = !directory &&
-                (path_has_supported_archive_extension(current_path) ||
-                 (final_component &&
-                  axiom::archive_provider_for_path(current_path) != nullptr));
+            const bool directory = (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+            const bool archive = !directory && final_component &&
+                (tree_archive_was_detected(current_path) ||
+                 (archive_catalog_ &&
+                  same_filesystem_path(archive_catalog_->path(), current_path)) ||
+                 false);
             node.kind = archive ? DirectoryTreeNodeKind::archive
                                 : directory ? DirectoryTreeNodeKind::filesystem
                                             : DirectoryTreeNodeKind::file;
@@ -284,13 +427,17 @@ DirectoryTreeItem* MainWindow::ensure_filesystem_tree_path(const fs::path& path)
             child = insert_tree_item(current, part.wstring(), std::move(node),
                                      node.kind == DirectoryTreeNodeKind::archive
                                          ? tree_icon_for_archive(current_path)
-                                         : tree_icon_for_filesystem(current_path),
+                                          : tree_icon_for_filesystem(
+                                                current_path, false, directory),
                                      node.kind == DirectoryTreeNodeKind::archive ||
                                          (node.kind == DirectoryTreeNodeKind::filesystem &&
                                           filesystem_has_tree_children(current_path)));
         } else if (final_component &&
                    child->node.kind == DirectoryTreeNodeKind::file &&
-                   axiom::archive_provider_for_path(current_path) != nullptr) {
+                   (tree_archive_was_detected(current_path) ||
+                    (archive_catalog_ &&
+                     same_filesystem_path(archive_catalog_->path(), current_path)) ||
+                    false)) {
             child->node.kind = DirectoryTreeNodeKind::archive;
             child->node.archive_path = current_path;
             child->icon = tree_icon_for_archive(current_path);
@@ -331,7 +478,7 @@ DirectoryTreeItem* MainWindow::ensure_archive_tree_path(const fs::path& archive,
             node.archive_path = archive;
             node.archive_directory = current_directory;
             child = insert_tree_item(current, widen(part), std::move(node),
-                                     tree_icon_for_filesystem(L"folder"),
+                                     tree_icon_for_filesystem(L"folder", false, true),
                                      true);
         }
         current = child;
@@ -362,7 +509,8 @@ void MainWindow::rebuild_directory_tree() {
     DirectoryTreeNode root;
     root.kind = DirectoryTreeNodeKind::computer;
     tree_computer_item_ = insert_tree_item(nullptr, L"This PC", std::move(root),
-                                           tree_icon_for_filesystem(L"folder"), true);
+                                           tree_icon_for_filesystem(
+                                               L"folder", false, true), true);
     if (tree_computer_item_ != nullptr) {
         populate_tree_item(*tree_computer_item_);
         tree_computer_item_->expanded = true;
@@ -441,13 +589,10 @@ void MainWindow::add_status_item(BrowserStatusTotals& totals,
 }
 
 MainWindow::BrowserStatusTotals MainWindow::summarize_browser_status(const std::vector<int>* indices) const {
-    BrowserStatusTotals totals;
     if (indices == nullptr) {
-        for (const auto& item : browser_items_) {
-            add_status_item(totals, item);
-        }
-        return totals;
+        return browser_status_totals_;
     }
+    BrowserStatusTotals totals;
     for (const int index : *indices) {
         if (index >= 0 && index < static_cast<int>(browser_items_.size())) {
             add_status_item(totals, browser_items_[static_cast<std::size_t>(index)]);
@@ -493,8 +638,6 @@ std::wstring MainWindow::status_location_suffix() const {
         if (archive_catalog_ && same_filesystem_path(archive_catalog_->path(),
                                                      location.archive_path)) {
             suffix = widen(archive_catalog_->format_info().display_name);
-        } else if (const auto* provider = axiom::archive_provider_for_path(location.archive_path)) {
-            suffix = widen(provider->info().display_name);
         } else {
             suffix = L"Archive";
         }
@@ -749,14 +892,58 @@ void MainWindow::navigate_to(axiom::gui::BrowserLocation location, bool record_h
         secure_clear(pending_archive_password_);
     }
     HWND target = hwnd_;
+    const int load_sort_column = sort_column_;
+    const bool load_sort_ascending = sort_ascending_;
     browser_thread_ = std::jthread(
         [target, generation, location = std::move(location), catalog = std::move(catalog),
-         archive_password = std::move(archive_password)](
+         archive_password = std::move(archive_password), load_sort_column,
+         load_sort_ascending](
             std::stop_token stop) mutable {
             auto result = std::make_unique<axiom::gui::BrowserLoadResult>(
                 axiom::gui::load_browser_location(location, generation, std::move(catalog), stop,
                                                   archive_password));
             secure_clear(archive_password);
+            if (stop.stop_requested()) return;
+            const auto rank = [](const axiom::gui::BrowserItem& item) {
+                if (item.kind == axiom::gui::BrowserItemKind::parent) return 0;
+                if (item.kind == axiom::gui::BrowserItemKind::drive ||
+                    item.kind == axiom::gui::BrowserItemKind::directory) return 1;
+                return 2;
+            };
+            std::stable_sort(result->snapshot.items.begin(), result->snapshot.items.end(),
+                [&](const auto& left, const auto& right) {
+                    if (rank(left) != rank(right)) return rank(left) < rank(right);
+                    int comparison = 0;
+                    switch (load_sort_column) {
+                        case 1:
+                            comparison = left.size < right.size ? -1
+                                : (left.size > right.size ? 1 : 0);
+                            break;
+                        case 2: {
+                            const auto left_size = left.packed_size.value_or(0);
+                            const auto right_size = right.packed_size.value_or(0);
+                            comparison = left_size < right_size ? -1
+                                : (left_size > right_size ? 1 : 0);
+                            break;
+                        }
+                        case 3: comparison = _wcsicmp(left.type.c_str(), right.type.c_str()); break;
+                        case 4: comparison = _wcsicmp(left.modified.c_str(), right.modified.c_str()); break;
+                        case 5:
+                            comparison = left.crc32.value_or(0) < right.crc32.value_or(0) ? -1
+                                : (left.crc32.value_or(0) > right.crc32.value_or(0) ? 1 : 0);
+                            break;
+                        case 6:
+                            comparison = _wcsicmp(left.attributes.c_str(), right.attributes.c_str());
+                            break;
+                        default:
+                            comparison = _wcsicmp(left.name.c_str(), right.name.c_str());
+                            break;
+                    }
+                    if (comparison == 0) {
+                        comparison = _wcsicmp(left.name.c_str(), right.name.c_str());
+                    }
+                    return load_sort_ascending ? comparison < 0 : comparison > 0;
+                });
             if (stop.stop_requested()) return;
             auto* payload = result.release();
             if (!PostMessageW(target, kBrowserLoadedMessage, 0,
@@ -865,21 +1052,43 @@ void MainWindow::finish_browser_table_population() {
     update_browser_status_for_current_selection();
 }
 
-void MainWindow::begin_browser_table_population(std::optional<BrowserViewState> restore_state) {
+void MainWindow::begin_browser_table_population(std::optional<BrowserViewState> restore_state,
+                                                bool sort_items) {
     cancel_browser_table_population();
-    sort_browser_items_for_table();
+    if (sort_items) sort_browser_items_for_table();
     table_.set_sort_indicator(sort_column_, sort_ascending_);
-    table_.clear();
-    table_.reserve_rows(browser_items_.size());
     pending_table_restore_state_ = std::move(restore_state);
-    table_population_next_ = 0;
     table_population_generation_ = browser_generation_;
-    table_population_active_ = true;
-    if (browser_items_.empty() || append_browser_table_batch()) {
-        finish_browser_table_population();
-        return;
+    table_population_active_ = false;
+
+    constexpr std::size_t kGenericIconThreshold = 512;
+    const bool prefer_generic_unique_icons =
+        browser_items_.size() >= kGenericIconThreshold;
+    HIMAGELIST image_list = nullptr;
+    if (!browser_items_.empty()) {
+        image_list = cached_shell_icon_for_item(
+            browser_items_.front(), prefer_generic_unique_icons).image_list;
     }
-    SetTimer(hwnd_, kBrowserPopulateTimer, 1, nullptr);
+    table_.set_virtual_rows(
+        browser_items_.size(),
+        [this](std::size_t index) {
+            return index < browser_items_.size()
+                ? browser_row_for_item(browser_items_[index])
+                : std::vector<std::wstring>{};
+        },
+        [this, prefer_generic_unique_icons](std::size_t index) {
+            return index < browser_items_.size()
+                ? cached_shell_icon_for_item(
+                      browser_items_[index], prefer_generic_unique_icons).index
+                : -1;
+        },
+        [this](std::size_t index) -> std::wstring_view {
+            return index < browser_items_.size()
+                ? std::wstring_view(browser_items_[index].name)
+                : std::wstring_view{};
+        },
+        image_list);
+    finish_browser_table_population();
 }
 
 void MainWindow::on_browser_populate_timer() {
@@ -911,6 +1120,32 @@ void MainWindow::on_browser_loaded(LPARAM lparam) {
     if (!result || result->snapshot.generation != browser_generation_) return;
     const auto loaded_location = result->snapshot.location;
 
+    if (loaded_location.kind == axiom::gui::BrowserLocationKind::archive &&
+        result->archive_capabilities_available &&
+        result->archive_capabilities.encrypted &&
+        !result->archive_password_supplied) {
+        std::wstring entered;
+        if (axiom::gui::show_archive_password_dialog(hwnd_, entered)) {
+            std::string encoded = utf8(entered);
+            secure_clear(entered);
+            const bool cache_password = application_options_.cache_passwords &&
+                                        application_options_.password_prompt_mode == 0;
+            clear_archive_password();
+            if (cache_password) {
+                archive_password_path_ = loaded_location.archive_path;
+                archive_password_ = std::move(encoded);
+            } else {
+                pending_archive_password_ = std::move(encoded);
+            }
+            navigate_to(loaded_location, false);
+            return;
+        }
+    } else if (loaded_location.kind == axiom::gui::BrowserLocationKind::archive &&
+               result->archive_capabilities_available &&
+               !result->archive_capabilities.encrypted) {
+        clear_archive_password();
+    }
+
     if (result->archive_catalog) archive_catalog_ = std::move(result->archive_catalog);
     browser_items_ = std::move(result->snapshot.items);
     if (!application_options_.show_parent_entry) {
@@ -922,13 +1157,17 @@ void MainWindow::on_browser_loaded(LPARAM lparam) {
                    item.attributes.find(L'S') != std::wstring::npos;
         });
     }
+    browser_status_totals_ = {};
+    for (const auto& item : browser_items_) {
+        add_status_item(browser_status_totals_, item);
+    }
     std::optional<BrowserViewState> restore_state;
     if (pending_browser_view_state_) {
         restore_state = std::move(pending_browser_view_state_);
         pending_browser_view_state_.reset();
     }
     std::optional<BrowserViewState> tree_restore_state = restore_state;
-    begin_browser_table_population(std::move(restore_state));
+    begin_browser_table_population(std::move(restore_state), false);
     displayed_browser_location_ = loaded_location;
     if (!result->snapshot.error.empty()) {
         set_status(L"Cannot read location: " + result->snapshot.error);
@@ -938,11 +1177,37 @@ void MainWindow::on_browser_loaded(LPARAM lparam) {
                                      kDirectoryChangedMessage);
         }
     }
-    update_navigation_buttons();
-    sync_tree_to_location(loaded_location);
+    if (restore_persisted_tree_state_) {
+        DirectoryTreeViewState persisted_tree;
+        persisted_tree.expanded_keys = persisted_settings_.tree_expanded_nodes;
+        persisted_tree.selected_key = persisted_settings_.tree_selected_node;
+        persisted_tree.vertical_scroll = persisted_settings_.tree_scroll_position;
+        tree_view_.restore_state(persisted_tree);
+        restore_persisted_tree_state_ = false;
+    }
     if (tree_restore_state) {
+        // Restore the branch expansion/scroll state before selecting the current
+        // location.  Restoring it afterwards re-applies the selection captured
+        // for the previous view, leaving the tree focused on the old folder while
+        // the file pane has already navigated somewhere else.
         tree_view_.restore_state(tree_restore_state->tree);
     }
+    if (result->snapshot.error.empty() &&
+        loaded_location.kind == axiom::gui::BrowserLocationKind::filesystem) {
+        if (DirectoryTreeItem* current =
+                tree_view_.find_filesystem_item(loaded_location.filesystem_path)) {
+            // The file table reload is authoritative. Reconcile this populated
+            // branch too, preserving expansion/scroll state for surviving nodes.
+            const DirectoryTreeViewState state = tree_view_.capture_state();
+            tree_view_.refresh_item(current);
+            tree_view_.restore_state(state);
+        }
+    }
+    update_navigation_buttons();
+    // The file pane location is authoritative.  Besides keeping the highlight in
+    // lock-step with navigation, this expands and makes visible a directory that
+    // was not part of the saved tree state.
+    sync_tree_to_location(loaded_location);
 }
 
 void MainWindow::on_navigate_back() {

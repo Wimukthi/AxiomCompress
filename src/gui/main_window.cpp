@@ -28,6 +28,8 @@ bool MainWindow::create(HINSTANCE instance,
     startup_command_ = std::move(startup_command);
     persisted_settings_ = axiom::gui::load_gui_settings();
     application_options_ = persisted_settings_.application;
+    restore_persisted_tree_state_ =
+        initial_path.empty() && application_options_.startup_location_mode == 0;
     tree_pane_visible_ = persisted_settings_.tree_pane_visible;
     configure_dialog_appearance(application_options_);
     recent_addresses_ = persisted_settings_.recent_locations;
@@ -457,7 +459,7 @@ void MainWindow::layout_browser_panes(const RECT& client, int y, bool invalidate
     const RECT previous_splitter = tree_splitter_rect_;
     if (!tree_pane_visible_) {
         tree_splitter_rect_ = {};
-        if (tree_view_.hwnd() != nullptr) {
+        if (tree_view_.hwnd() != nullptr && IsWindowVisible(tree_view_.hwnd())) {
             ShowWindow(tree_view_.hwnd(), SW_HIDE);
         }
         MoveWindow(list_, margin, y, content_width, content_height, FALSE);
@@ -469,7 +471,7 @@ void MainWindow::layout_browser_panes(const RECT& client, int y, bool invalidate
         return;
     }
 
-    if (tree_view_.hwnd() != nullptr) {
+    if (tree_view_.hwnd() != nullptr && !IsWindowVisible(tree_view_.hwnd())) {
         ShowWindow(tree_view_.hwnd(), SW_SHOW);
     }
     if (tree_width_ <= 0) tree_width_ = scale(250);
@@ -508,17 +510,12 @@ void MainWindow::layout_browser_panes_for_current_size() {
     layout_browser_panes(client, browser_pane_top(), true);
 }
 
-void MainWindow::repaint_browser_panes_now() const {
+void MainWindow::invalidate_browser_panes() const {
     if (tree_pane_visible_ && tree_view_.hwnd() != nullptr) {
-        RedrawWindow(tree_view_.hwnd(), nullptr, nullptr,
-                     RDW_INVALIDATE | RDW_NOERASE | RDW_UPDATENOW);
+        InvalidateRect(tree_view_.hwnd(), nullptr, FALSE);
     }
     if (list_ != nullptr) {
-        RedrawWindow(list_, nullptr, nullptr,
-                     RDW_INVALIDATE | RDW_NOERASE | RDW_UPDATENOW);
-    }
-    if (hwnd_ != nullptr) {
-        UpdateWindow(hwnd_);
+        InvalidateRect(list_, nullptr, FALSE);
     }
 }
 
@@ -540,19 +537,38 @@ void MainWindow::layout() {
     const int menu_height = menu_bar_.preferred_height();
     menu_bar_.move(0, 0, width, menu_height);
 
+    struct ChildPlacement {
+        HWND window{};
+        int x{};
+        int y{};
+        int width{};
+        int height{};
+    };
+    std::vector<ChildPlacement> placements;
+    placements.reserve(toolbar_buttons_.size() + 8);
+
     int y = menu_height + margin;
     int x = margin;
+    auto queue = [&](HWND child, int left, int top, int child_width, int child_height) {
+        if (child != nullptr) {
+            placements.push_back({child, left, top, child_width, child_height});
+        }
+    };
     auto place = [&](HWND child, int logical_width) {
         const int width_px = scale(logical_width);
-        ShowWindow(child, SW_SHOW);
-        MoveWindow(child, x, y, width_px, button_height, TRUE);
+        queue(child, x, y, width_px, button_height);
         x += width_px + gap;
     };
 
-    for (const ToolbarButton& button : toolbar_buttons_) {
-        if (button.window != nullptr) ShowWindow(button.window, SW_HIDE);
-    }
     const auto toolbar_commands = visible_toolbar_commands();
+    for (const ToolbarButton& button : toolbar_buttons_) {
+        if (button.window == nullptr) continue;
+        if (std::find(toolbar_commands.begin(), toolbar_commands.end(), button.command) ==
+                toolbar_commands.end() &&
+            IsWindowVisible(button.window)) {
+            ShowWindow(button.window, SW_HIDE);
+        }
+    }
     if (!toolbar_commands.empty()) {
         for (UINT command : toolbar_commands) {
             HWND button = toolbar_button(command);
@@ -562,8 +578,7 @@ void MainWindow::layout() {
                 x = margin;
                 y += button_height + gap;
             }
-            ShowWindow(button, SW_SHOW);
-            MoveWindow(button, x, y, width_px, button_height, TRUE);
+            queue(button, x, y, width_px, button_height);
             x += width_px + gap;
         }
         y += button_height + gap;
@@ -577,18 +592,37 @@ void MainWindow::layout() {
     const int go_width = scale(48);
     const int address_x = x;
     const int address_width = std::max(scale(100), right - go_width - gap - address_x);
-    MoveWindow(address_edit_, address_x, y, address_width, scale(360), TRUE);
+    queue(address_edit_, address_x, y, address_width, scale(360));
     SendMessageW(address_edit_, CB_SETDROPPEDWIDTH,
                  static_cast<WPARAM>(address_width), 0);
-    ShowWindow(address_edit_, SW_SHOW);
-    MoveWindow(address_go_, right - go_width, y, go_width, button_height, TRUE);
-    ShowWindow(address_go_, SW_SHOW);
+    queue(address_go_, right - go_width, y, go_width, button_height);
     y += edit_height + gap;
 
     const int bottom_height = scale(28);
-    layout_browser_panes(client, y, false);
     const int bottom_y = client.bottom - bottom_height;
-    MoveWindow(status_, margin, bottom_y + scale(2), width - margin * 2, scale(20), TRUE);
+    queue(status_, margin, bottom_y + scale(2), width - margin * 2, scale(20));
+
+    bool positioned = false;
+    HDWP batch = BeginDeferWindowPos(static_cast<int>(placements.size()));
+    if (batch != nullptr) {
+        for (const auto& placement : placements) {
+            batch = DeferWindowPos(batch, placement.window, nullptr,
+                                   placement.x, placement.y,
+                                   placement.width, placement.height,
+                                   SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+            if (batch == nullptr) break;
+        }
+        if (batch != nullptr) positioned = EndDeferWindowPos(batch) != FALSE;
+    }
+    if (!positioned) {
+        for (const auto& placement : placements) {
+            SetWindowPos(placement.window, nullptr,
+                         placement.x, placement.y,
+                         placement.width, placement.height,
+                         SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        }
+    }
+    layout_browser_panes(client, y, false);
     InvalidateRect(hwnd_, nullptr, FALSE);
 }
 
@@ -614,7 +648,7 @@ void MainWindow::toggle_tree_pane() {
     }
     EnableWindow(tree_view_.hwnd(), !busy_ && tree_pane_visible_);
     layout();
-    repaint_browser_panes_now();
+    invalidate_browser_panes();
     save_current_settings();
 }
 
@@ -678,13 +712,11 @@ LRESULT MainWindow::handle_message(UINT message, WPARAM wparam, LPARAM lparam) {
             layout();
             return 0;
         }
-        case WM_ERASEBKGND: {
-            RECT rect{};
-            GetClientRect(hwnd_, &rect);
-            FillRect(reinterpret_cast<HDC>(wparam), &rect,
-                     window_brush_ != nullptr ? window_brush_ : GetSysColorBrush(COLOR_WINDOW));
+        // The shell and custom child controls paint every invalid region themselves.
+        // Erasing here duplicates the background pass and exposes a blank frame while
+        // interactive resizing or modal-window activation is in progress.
+        case WM_ERASEBKGND:
             return 1;
-        }
         case WM_PAINT:
             paint_shell();
             return 0;
@@ -716,8 +748,7 @@ LRESULT MainWindow::handle_message(UINT message, WPARAM wparam, LPARAM lparam) {
                 show_tree_context_menu({GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)});
                 return 0;
             }
-            if (reinterpret_cast<HWND>(wparam) == list_ ||
-                reinterpret_cast<HWND>(wparam) == hwnd_) {
+            if (reinterpret_cast<HWND>(wparam) == list_) {
                 show_browser_context_menu({GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)});
                 return 0;
             }
@@ -755,8 +786,10 @@ LRESULT MainWindow::handle_message(UINT message, WPARAM wparam, LPARAM lparam) {
                     std::clamp(requested_width, minimum_tree_width, maximum_tree_width);
                 if (next_tree_width != tree_width_) {
                     tree_width_ = next_tree_width;
-                    layout_browser_panes_for_current_size();
-                    repaint_browser_panes_now();
+                    if (!splitter_layout_pending_) {
+                        splitter_layout_pending_ =
+                            PostMessageW(hwnd_, kSplitterLayoutMessage, 0, 0) != FALSE;
+                    }
                 }
                 SetCursor(LoadCursorW(nullptr, IDC_SIZEWE));
                 return 0;
@@ -771,6 +804,14 @@ LRESULT MainWindow::handle_message(UINT message, WPARAM wparam, LPARAM lparam) {
             if (dragging_tree_splitter_) {
                 dragging_tree_splitter_ = false;
                 if (GetCapture() == hwnd_) ReleaseCapture();
+                // Apply a coalesced final frame before persisting so a quick
+                // drag-and-close sequence always records the user's last width.
+                if (splitter_layout_pending_) {
+                    splitter_layout_pending_ = false;
+                    layout_browser_panes_for_current_size();
+                    invalidate_browser_panes();
+                }
+                save_current_settings();
                 return 0;
             }
             break;
@@ -870,9 +911,6 @@ LRESULT MainWindow::handle_message(UINT message, WPARAM wparam, LPARAM lparam) {
         case kOperationDoneMessage:
             on_operation_done(lparam);
             return 0;
-        case kOperationProgressMessage:
-            on_operation_progress(lparam);
-            return 0;
         case axiom::gui::kUpdateCheckCompleteMessage:
             on_update_check_complete(lparam);
             return 0;
@@ -881,6 +919,15 @@ LRESULT MainWindow::handle_message(UINT message, WPARAM wparam, LPARAM lparam) {
             return 0;
         case kBrowserLoadedMessage:
             on_browser_loaded(lparam);
+            return 0;
+        case kTreeArchiveProbeMessage:
+            on_tree_archive_probe(lparam);
+            return 0;
+        case kSelectedArchiveCapabilitiesMessage:
+            on_selected_archive_capabilities(lparam);
+            return 0;
+        case kBackgroundUiTaskMessage:
+            on_background_ui_task(lparam);
             return 0;
         case kTableActivateMessage:
             on_table_activate();
@@ -900,6 +947,11 @@ LRESULT MainWindow::handle_message(UINT message, WPARAM wparam, LPARAM lparam) {
             return 0;
         case kTableBeginDragMessage:
             on_table_begin_drag();
+            return 0;
+        case kSplitterLayoutMessage:
+            splitter_layout_pending_ = false;
+            layout_browser_panes_for_current_size();
+            invalidate_browser_panes();
             return 0;
         case kDirectoryChangedMessage:
             // Coalesce bursts from file copies and archive creation into one reload.
@@ -926,6 +978,40 @@ LRESULT MainWindow::handle_message(UINT message, WPARAM wparam, LPARAM lparam) {
             directory_watcher_.stop();
             browser_thread_.request_stop();
             operation_runner_.cancel();
+            operation_runner_.finish();
+            for (auto& task : background_ui_tasks_) task.worker.request_stop();
+            for (auto& task : background_ui_tasks_) {
+                if (task.worker.joinable()) task.worker.join();
+            }
+            background_ui_tasks_.clear();
+            tree_archive_probe_thread_.request_stop();
+            selected_archive_capability_thread_.request_stop();
+            tree_archive_probe_cv_.notify_all();
+            if (tree_archive_probe_thread_.joinable()) {
+                tree_archive_probe_thread_.join();
+            }
+            if (selected_archive_capability_thread_.joinable()) {
+                selected_archive_capability_thread_.join();
+            }
+            {
+                MSG queued{};
+                while (PeekMessageW(&queued, hwnd_, kTreeArchiveProbeMessage,
+                                    kTreeArchiveProbeMessage, PM_REMOVE)) {
+                    delete reinterpret_cast<TreeArchiveProbeResult*>(queued.lParam);
+                }
+                while (PeekMessageW(&queued, hwnd_, kOperationDoneMessage,
+                                    kOperationDoneMessage, PM_REMOVE)) {
+                    delete reinterpret_cast<axiom::gui::OperationResult*>(queued.lParam);
+                }
+                while (PeekMessageW(&queued, hwnd_, kSelectedArchiveCapabilitiesMessage,
+                                    kSelectedArchiveCapabilitiesMessage, PM_REMOVE)) {
+                    delete reinterpret_cast<SelectedArchiveCapabilitiesResult*>(queued.lParam);
+                }
+                while (PeekMessageW(&queued, hwnd_, kBackgroundUiTaskMessage,
+                                    kBackgroundUiTaskMessage, PM_REMOVE)) {
+                    delete reinterpret_cast<BackgroundUiTaskResult*>(queued.lParam);
+                }
+            }
             PostQuitMessage(0);
             return 0;
     }
@@ -982,6 +1068,12 @@ int run_axiom_gui(HINSTANCE instance,
 
     if (startup_command.kind == AxiomGuiStartupCommand::Kind::add_to_archive) {
         const int result = run_quick_add_to_archive(instance, startup_command.paths);
+        OleUninitialize();
+        return result;
+    }
+    if (startup_command.kind == AxiomGuiStartupCommand::Kind::extract_archive &&
+        !startup_command.paths.empty()) {
+        const int result = run_quick_extract_archive(instance, startup_command.paths.front());
         OleUninitialize();
         return result;
     }

@@ -189,12 +189,19 @@ void MainWindow::update_dpi(UINT dpi) {
     if (dpi == 0) {
         dpi = USER_DEFAULT_SCREEN_DPI;
     }
+    const UINT previous_dpi = dpi_ == 0 ? USER_DEFAULT_SCREEN_DPI : dpi_;
+    // Keep the splitter width in logical pixels across monitor transitions.
+    // The pane layout applies the current window's real minimum/maximum bounds;
+    // using a fixed 420 px cap here discarded a user's saved wider position.
+    const int logical_tree_width = tree_width_ > 0
+        ? MulDiv(tree_width_, USER_DEFAULT_SCREEN_DPI, static_cast<int>(previous_dpi))
+        : 0;
     dpi_ = dpi;
     rebuild_font();
     menu_bar_.set_dpi(dpi_);
     table_.set_dpi(dpi_);
     tree_view_.set_dpi(dpi_);
-    tree_width_ = std::clamp(tree_width_, scale(180), scale(420));
+    tree_width_ = logical_tree_width > 0 ? scale(logical_tree_width) : 0;
     apply_fonts();
     apply_edit_margins();
 }

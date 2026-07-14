@@ -26,11 +26,51 @@ std::wstring directory_tree_node_key(const DirectoryTreeNode& node) {
     }
 }
 
+std::wstring directory_tree_item_key(const DirectoryTreeItem& item) {
+    std::vector<std::wstring> ancestry;
+    for (const DirectoryTreeItem* current = &item; current != nullptr;
+         current = current->parent) {
+        std::wstring key = directory_tree_node_key(current->node);
+        if (key.empty()) return {};
+        ancestry.push_back(std::move(key));
+    }
+
+    // The same filesystem path can appear through a known-folder shortcut and
+    // beneath its drive. Length framing makes the persisted ancestry unambiguous
+    // and prevents restoring one alias from expanding every copy of that path.
+    std::wstring result = L"tree-v2|";
+    for (auto iterator = ancestry.rbegin(); iterator != ancestry.rend(); ++iterator) {
+        result += std::to_wstring(iterator->size());
+        result.push_back(L':');
+        result += *iterator;
+    }
+    return result;
+}
+
 DirectoryTreeItem* find_tree_item_by_key(DirectoryTreeItem& item,
                                          const std::wstring& key) {
-    if (!key.empty() && directory_tree_node_key(item.node) == key) return &item;
+    if (!key.empty() && directory_tree_item_key(item) == key) return &item;
     for (auto& child : item.children) {
         if (DirectoryTreeItem* found = find_tree_item_by_key(*child, key)) {
+            return found;
+        }
+    }
+    return nullptr;
+}
+
+DirectoryTreeItem* find_tree_item_by_filesystem_path(
+    DirectoryTreeItem& item, const fs::path& path) {
+    const auto& node = item.node;
+    if ((node.kind == DirectoryTreeNodeKind::filesystem ||
+         node.kind == DirectoryTreeNodeKind::file ||
+         node.kind == DirectoryTreeNodeKind::archive) &&
+        CompareStringOrdinal(node.filesystem_path.c_str(), -1,
+                             path.c_str(), -1, TRUE) == CSTR_EQUAL) {
+        return &item;
+    }
+    for (auto& child : item.children) {
+        if (DirectoryTreeItem* found =
+                find_tree_item_by_filesystem_path(*child, path)) {
             return found;
         }
     }
@@ -111,6 +151,10 @@ void DarkTableView::set_options(TableViewOptions options) {
 
 void DarkTableView::clear() {
     rows_.clear();
+    virtual_row_count_ = 0;
+    virtual_row_provider_ = {};
+    virtual_icon_provider_ = {};
+    virtual_match_text_provider_ = {};
     icon_indices_.clear();
     selected_.clear();
     selected_row_ = -1;
@@ -137,6 +181,9 @@ void DarkTableView::reserve_rows(std::size_t count) {
 void DarkTableView::append_rows(std::vector<std::vector<std::wstring>> rows,
                  std::vector<int> icon_indices,
                  HIMAGELIST image_list) {
+    RECT client{};
+    GetClientRect(hwnd_, &client);
+    const ScrollbarVisibility previous_visibility = scrollbar_visibility(client);
     if (image_list_ == nullptr && image_list != nullptr) {
         image_list_ = image_list;
     }
@@ -155,13 +202,30 @@ void DarkTableView::append_rows(std::vector<std::vector<std::wstring>> rows,
     }
     selected_.resize(rows_.size(), false);
     clamp_scroll();
-    invalidate();
+    const ScrollbarVisibility next_visibility = scrollbar_visibility(client);
+    const bool visibility_changed =
+        previous_visibility.vertical != next_visibility.vertical ||
+        previous_visibility.horizontal != next_visibility.horizontal;
+    const std::int64_t previous_bottom =
+        static_cast<std::int64_t>(old_size) * row_height();
+    const std::int64_t visible_bottom =
+        static_cast<std::int64_t>(scroll_y_) + viewport_height(client);
+    if (old_size == 0 || visibility_changed || previous_bottom < visible_bottom) {
+        invalidate();
+    } else if (next_visibility.vertical) {
+        const RECT scrollbar = scrollbar_track_rect(client);
+        InvalidateRect(hwnd_, &scrollbar, FALSE);
+    }
 }
 
 void DarkTableView::set_rows(std::vector<std::vector<std::wstring>> rows,
               std::vector<int> icon_indices,
               HIMAGELIST image_list) {
     rows_ = std::move(rows);
+    virtual_row_count_ = 0;
+    virtual_row_provider_ = {};
+    virtual_icon_provider_ = {};
+    virtual_match_text_provider_ = {};
     icon_indices_ = std::move(icon_indices);
     if (icon_indices_.size() < rows_.size()) {
         icon_indices_.resize(rows_.size(), -1);
@@ -170,6 +234,37 @@ void DarkTableView::set_rows(std::vector<std::vector<std::wstring>> rows,
     }
     image_list_ = image_list;
     selected_.assign(rows_.size(), false);
+    selected_row_ = -1;
+    selection_anchor_ = -1;
+    if (GetCapture() == hwnd_) ReleaseCapture();
+    resizing_column_ = -1;
+    dragging_scrollbar_ = false;
+    dragging_horizontal_scrollbar_ = false;
+    drag_candidate_ = false;
+    drag_started_ = false;
+    collapse_selection_on_click_ = -1;
+    marquee_selecting_ = false;
+    marquee_base_selection_.clear();
+    typeahead_.clear();
+    scroll_y_ = 0;
+    scroll_x_ = 0;
+    clamp_scroll();
+    invalidate();
+}
+
+void DarkTableView::set_virtual_rows(std::size_t count,
+                                     RowProvider row_provider,
+                                     IconProvider icon_provider,
+                                     MatchTextProvider match_text_provider,
+                                     HIMAGELIST image_list) {
+    rows_.clear();
+    icon_indices_.clear();
+    virtual_row_count_ = count;
+    virtual_row_provider_ = std::move(row_provider);
+    virtual_icon_provider_ = std::move(icon_provider);
+    virtual_match_text_provider_ = std::move(match_text_provider);
+    image_list_ = image_list;
+    selected_.assign(count, false);
     selected_row_ = -1;
     selection_anchor_ = -1;
     if (GetCapture() == hwnd_) ReleaseCapture();
@@ -209,7 +304,7 @@ int DarkTableView::horizontal_scroll_position() const {
 }
 
 std::optional<RECT> DarkTableView::cell_rect(int row, int column) const {
-    if (hwnd_ == nullptr || row < 0 || row >= static_cast<int>(rows_.size()) ||
+    if (hwnd_ == nullptr || row < 0 || row >= static_cast<int>(row_count()) ||
         column < 0 || column >= static_cast<int>(columns_.size())) {
         return std::nullopt;
     }
@@ -255,14 +350,14 @@ void DarkTableView::set_selection_and_scroll(std::vector<int> selected_indices,
                                   int focused_index,
                               int horizontal_scroll,
                               int vertical_scroll) {
-    selected_.assign(rows_.size(), false);
+    selected_.assign(row_count(), false);
     int first_selected = -1;
     for (int index : selected_indices) {
-        if (index < 0 || index >= static_cast<int>(rows_.size())) continue;
+        if (index < 0 || index >= static_cast<int>(row_count())) continue;
         selected_[static_cast<std::size_t>(index)] = true;
         if (first_selected < 0) first_selected = index;
     }
-    if (focused_index < 0 || focused_index >= static_cast<int>(rows_.size()) ||
+    if (focused_index < 0 || focused_index >= static_cast<int>(row_count()) ||
         (focused_index >= 0 &&
          focused_index < static_cast<int>(selected_.size()) &&
          !selected_[static_cast<std::size_t>(focused_index)])) {
@@ -291,7 +386,7 @@ int DarkTableView::row_at_screen_point(POINT point) const {
     }
     const int y = point.y - header_height() + scroll_y_;
     const int row = row_height() > 0 ? y / row_height() : -1;
-    return row >= 0 && row < static_cast<int>(rows_.size()) ? row : -1;
+    return row >= 0 && row < static_cast<int>(row_count()) ? row : -1;
 }
 
 void DarkTableView::select_all() {
@@ -344,7 +439,13 @@ int DarkTableView::scrollbar_gap() const {
 }
 
 int DarkTableView::content_height() const {
-    return row_height() * static_cast<int>(rows_.size());
+    const std::uint64_t height = static_cast<std::uint64_t>(row_height()) * row_count();
+    return static_cast<int>(std::min<std::uint64_t>(height,
+        static_cast<std::uint64_t>(std::numeric_limits<int>::max())));
+}
+
+std::size_t DarkTableView::row_count() const {
+    return virtual_row_provider_ ? virtual_row_count_ : rows_.size();
 }
 
 int DarkTableView::requested_content_width() const {
@@ -587,7 +688,7 @@ void DarkTableView::notify_parent(UINT message) const {
 }
 
 void DarkTableView::select_row(int row, bool extend, bool toggle) {
-    if (row < 0 || row >= static_cast<int>(rows_.size())) {
+    if (row < 0 || row >= static_cast<int>(row_count())) {
         if (!extend && !toggle) std::fill(selected_.begin(), selected_.end(), false);
         selected_row_ = -1;
         selection_anchor_ = -1;
@@ -612,15 +713,18 @@ void DarkTableView::select_row(int row, bool extend, bool toggle) {
     invalidate();
 }
 
-std::wstring DarkTableView::row_match_text(int row) const {
-    if (row < 0 || row >= static_cast<int>(rows_.size())) return {};
+std::wstring_view DarkTableView::row_match_text(int row) const {
+    if (row < 0 || row >= static_cast<int>(row_count())) return {};
+    if (virtual_match_text_provider_) {
+        return virtual_match_text_provider_(static_cast<std::size_t>(row));
+    }
     const auto& row_values = rows_[static_cast<std::size_t>(row)];
     return row_values.empty() ? std::wstring{} : row_values.front();
 }
 
 int DarkTableView::find_typeahead_match(std::wstring_view needle, bool cycle) const {
-    if (needle.empty() || rows_.empty()) return -1;
-    const int count = static_cast<int>(rows_.size());
+    if (needle.empty() || row_count() == 0) return -1;
+    const int count = static_cast<int>(row_count());
     const int start = cycle && selected_row_ >= 0 ? selected_row_ + 1 : 0;
     auto scan = [&](auto predicate) {
         for (int pass = 0; pass < 2; ++pass) {
@@ -691,12 +795,23 @@ bool DarkTableView::handle_typeahead_char(wchar_t character) {
 
 bool DarkTableView::point_can_select_row(POINT point, int row, const RECT& client) const {
     if (options_.full_row_select) return true;
-    if (row < 0 || row >= static_cast<int>(rows_.size())) return false;
+    if (row < 0 || row >= static_cast<int>(row_count())) return false;
     const auto widths = column_widths(client);
     if (widths.empty()) return false;
     const int first_left = table_left(client) - scroll_x_;
     const int first_right = first_left + widths.front();
     return point.x >= first_left && point.x < first_right;
+}
+
+int DarkTableView::selectable_row_at_point(POINT point, const RECT& client) const {
+    if (point.y < header_height() || point.y >= rows_bottom(client) ||
+        point.x < table_left(client) || point.x >= table_right(client)) {
+        return -1;
+    }
+    const int y = point.y - header_height() + scroll_y_;
+    const int row = row_height() > 0 ? y / row_height() : -1;
+    if (row < 0 || row >= static_cast<int>(row_count())) return -1;
+    return point_can_select_row(point, row, client) ? row : -1;
 }
 
 void DarkTableView::begin_marquee_selection(POINT point, bool preserve_selection) {
@@ -733,7 +848,7 @@ void DarkTableView::update_marquee_selection(POINT point) {
     int first_selected = -1;
     int last_selected = -1;
     if (visible) {
-        for (int row = 0; row < static_cast<int>(rows_.size()); ++row) {
+        for (int row = 0; row < static_cast<int>(row_count()); ++row) {
             const int top = header_height() + row * row_height() - scroll_y_;
             const RECT row_rect{rows_area.left, top, rows_area.right, top + row_height()};
             RECT overlap{};
@@ -827,9 +942,24 @@ void DarkTableView::paint_content(HDC dc, const RECT& client) {
     IntersectClipRect(dc, rows_clip.left, rows_clip.top, rows_clip.right, rows_clip.bottom);
 
     const int row_h = row_height();
+    int row_icon_width = 0;
+    int row_icon_height = 0;
+    if (image_list_ != nullptr) {
+        ImageList_GetIconSize(image_list_, &row_icon_width, &row_icon_height);
+    }
     const int first_row = row_h > 0 ? scroll_y_ / row_h : 0;
     int y = rows_clip.top - (row_h > 0 ? scroll_y_ % row_h : 0);
-    for (int row = first_row; row < static_cast<int>(rows_.size()) && y < rows_clip.bottom; ++row) {
+    for (int row = first_row; row < static_cast<int>(row_count()) && y < rows_clip.bottom; ++row) {
+        std::vector<std::wstring> virtual_values;
+        if (virtual_row_provider_) {
+            virtual_values = virtual_row_provider_(static_cast<std::size_t>(row));
+        }
+        const auto& row_values = virtual_row_provider_
+            ? virtual_values
+            : rows_[static_cast<std::size_t>(row)];
+        const int icon_index = virtual_icon_provider_
+            ? virtual_icon_provider_(static_cast<std::size_t>(row))
+            : row < static_cast<int>(icon_indices_.size()) ? icon_indices_[row] : -1;
         RECT row_rect{rows_clip.left, y, rows_clip.right, y + row_h};
         const bool selected = row < static_cast<int>(selected_.size()) && selected_[row];
         fill_solid_rect(dc, row_rect, selected ? theme_.selection : theme_.edit);
@@ -839,19 +969,15 @@ void DarkTableView::paint_content(HDC dc, const RECT& client) {
             const int next_x = x + widths[col];
             if (next_x > rows_clip.left && x < rows_clip.right) {
                 RECT cell{x + scale(7), row_rect.top, next_x - scale(7), row_rect.bottom};
-                if (col == 0 && image_list_ != nullptr &&
-                    row < static_cast<int>(icon_indices_.size()) && icon_indices_[row] >= 0) {
-                    int icon_width = 0;
-                    int icon_height = 0;
-                    ImageList_GetIconSize(image_list_, &icon_width, &icon_height);
-                    const int icon_y = row_rect.top + std::max(0, (row_h - icon_height) / 2);
-                    ImageList_Draw(image_list_, icon_indices_[row], dc, cell.left, icon_y,
+                if (col == 0 && image_list_ != nullptr && icon_index >= 0) {
+                    const int icon_y = row_rect.top +
+                        std::max(0, (row_h - row_icon_height) / 2);
+                    ImageList_Draw(image_list_, icon_index, dc, cell.left, icon_y,
                                    ILD_TRANSPARENT);
-                    cell.left += icon_width + scale(5);
+                    cell.left += row_icon_width + scale(5);
                 }
                 const std::wstring empty;
-                const std::wstring& text =
-                    col < rows_[row].size() ? rows_[row][col] : empty;
+                const std::wstring& text = col < row_values.size() ? row_values[col] : empty;
                 SetTextColor(dc, selected ? theme_.selection_text : theme_.text);
                 DrawTextW(dc, text.c_str(), -1, &cell,
                           DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS |
@@ -937,8 +1063,15 @@ void DarkTableView::on_paint() {
     if (width > 0 && height > 0) {
         RECT buffer{0, 0, width, height};
         if (paint_buffer_.ensure(dc, width, height)) {
+            const int saved = SaveDC(paint_buffer_.dc());
+            IntersectClipRect(paint_buffer_.dc(), paint.rcPaint.left, paint.rcPaint.top,
+                              paint.rcPaint.right, paint.rcPaint.bottom);
             paint_content(paint_buffer_.dc(), buffer);
-            BitBlt(dc, 0, 0, width, height, paint_buffer_.dc(), 0, 0, SRCCOPY);
+            RestoreDC(paint_buffer_.dc(), saved);
+            BitBlt(dc, paint.rcPaint.left, paint.rcPaint.top,
+                   paint.rcPaint.right - paint.rcPaint.left,
+                   paint.rcPaint.bottom - paint.rcPaint.top,
+                   paint_buffer_.dc(), paint.rcPaint.left, paint.rcPaint.top, SRCCOPY);
         } else {
             paint_content(dc, buffer);
         }
@@ -1041,7 +1174,7 @@ LRESULT DarkTableView::handle_message(UINT message, WPARAM wparam, LPARAM lparam
             }
             const int y = point.y - header_height() + scroll_y_;
             const int row = row_height() > 0 ? y / row_height() : -1;
-            int valid_row = row >= 0 && row < static_cast<int>(rows_.size()) ? row : -1;
+            int valid_row = row >= 0 && row < static_cast<int>(row_count()) ? row : -1;
             if (valid_row >= 0 && !point_can_select_row(point, valid_row, client)) {
                 valid_row = -1;
             }
@@ -1072,7 +1205,7 @@ LRESULT DarkTableView::handle_message(UINT message, WPARAM wparam, LPARAM lparam
             }
             const int y = point.y - header_height() + scroll_y_;
             const int row = row_height() > 0 ? y / row_height() : -1;
-            if (row >= 0 && row < static_cast<int>(rows_.size()) &&
+            if (row >= 0 && row < static_cast<int>(row_count()) &&
                 !point_can_select_row(point, row, client)) {
                 return 0;
             }
@@ -1084,26 +1217,32 @@ LRESULT DarkTableView::handle_message(UINT message, WPARAM wparam, LPARAM lparam
             RECT client{};
             GetClientRect(hwnd_, &client);
             POINT point{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
-            if (point.y < header_height() || point.y >= rows_bottom(client) ||
-                point.x < table_left(client) || point.x >= table_right(client)) {
-                return 0;
-            }
-            const int y = point.y - header_height() + scroll_y_;
-            const int row = row_height() > 0 ? y / row_height() : -1;
-            if (row >= 0 && row < static_cast<int>(rows_.size()) &&
-                point_can_select_row(point, row, client) &&
-                !selected_[static_cast<std::size_t>(row)]) {
+            const int row = selectable_row_at_point(point, client);
+            if (row >= 0 && !selected_[static_cast<std::size_t>(row)]) {
                 select_row(row, false, false);
             }
-            break;
+            return 0;
         }
-        case WM_CONTEXTMENU:
+        case WM_CONTEXTMENU: {
             // Custom child windows do not get the standard list-view
             // context-menu forwarding, so preserve the originating HWND
             // and screen point explicitly for the application shell.
+            if (lparam != static_cast<LPARAM>(-1)) {
+                POINT screen{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
+                POINT client_point = screen;
+                ScreenToClient(hwnd_, &client_point);
+                RECT client{};
+                GetClientRect(hwnd_, &client);
+                const int row = selectable_row_at_point(client_point, client);
+                if (row < 0) return 0;
+                if (!selected_[static_cast<std::size_t>(row)]) {
+                    select_row(row, false, false);
+                }
+            }
             SendMessageW(GetParent(hwnd_), WM_CONTEXTMENU,
                          reinterpret_cast<WPARAM>(hwnd_), lparam);
             return 0;
+        }
         case WM_MOUSEMOVE:
             if (marquee_selecting_ && (wparam & MK_LBUTTON) != 0) {
                 update_marquee_selection(
@@ -1203,9 +1342,9 @@ LRESULT DarkTableView::handle_message(UINT message, WPARAM wparam, LPARAM lparam
             }
             break;
         case WM_KEYDOWN:
-            if (!rows_.empty()) {
+            if (row_count() != 0) {
                 if (wparam == VK_DOWN) {
-                    select_row(std::min(static_cast<int>(rows_.size()) - 1, selected_row_ + 1),
+                    select_row(std::min(static_cast<int>(row_count()) - 1, selected_row_ + 1),
                                (GetKeyState(VK_SHIFT) & 0x8000) != 0,
                                (GetKeyState(VK_SHIFT) & 0x8000) != 0 &&
                                    (GetKeyState(VK_CONTROL) & 0x8000) != 0);
@@ -1219,7 +1358,7 @@ LRESULT DarkTableView::handle_message(UINT message, WPARAM wparam, LPARAM lparam
                     return 0;
                 }
                 if (wparam == VK_HOME || wparam == VK_END) {
-                    select_row(wparam == VK_HOME ? 0 : static_cast<int>(rows_.size()) - 1,
+                    select_row(wparam == VK_HOME ? 0 : static_cast<int>(row_count()) - 1,
                                (GetKeyState(VK_SHIFT) & 0x8000) != 0,
                                (GetKeyState(VK_SHIFT) & 0x8000) != 0 &&
                                    (GetKeyState(VK_CONTROL) & 0x8000) != 0);
@@ -1399,6 +1538,7 @@ void DarkDirectoryTreeView::refresh() {
         refresh_pending_ = true;
         return;
     }
+    visible_items_dirty_ = true;
     rebuild_visible_items();
     clamp_scroll();
     invalidate();
@@ -1435,6 +1575,9 @@ void DarkDirectoryTreeView::refresh_item(DirectoryTreeItem* item) {
 void DarkDirectoryTreeView::ensure_visible(DirectoryTreeItem* item) {
     if (item == nullptr || hwnd_ == nullptr) return;
     expand_ancestors(item);
+    // Programmatic navigation can expand already-populated ancestors without
+    // going through refresh(); rebuild the flattened cache before locating it.
+    visible_items_dirty_ = true;
     rebuild_visible_items();
     RECT client{};
     GetClientRect(hwnd_, &client);
@@ -1451,16 +1594,27 @@ void DarkDirectoryTreeView::ensure_visible(DirectoryTreeItem* item) {
     clamp_scroll();
 }
 
+DirectoryTreeItem* DarkDirectoryTreeView::find_filesystem_item(const fs::path& path) {
+    if (path.empty()) return nullptr;
+    for (auto& root : roots_) {
+        if (DirectoryTreeItem* found =
+                find_tree_item_by_filesystem_path(*root, path)) {
+            return found;
+        }
+    }
+    return nullptr;
+}
+
 DirectoryTreeViewState DarkDirectoryTreeView::capture_state() const {
     DirectoryTreeViewState state;
     state.vertical_scroll = scroll_y_;
     if (selected_ != nullptr) {
-        state.selected_key = directory_tree_node_key(selected_->node);
+        state.selected_key = directory_tree_item_key(*selected_);
     }
 
     const auto visit = [&](const auto& self, const DirectoryTreeItem& item) -> void {
         if (item.expanded) {
-            const std::wstring key = directory_tree_node_key(item.node);
+            const std::wstring key = directory_tree_item_key(item);
             if (!key.empty()) state.expanded_keys.push_back(key);
         }
         for (const auto& child : item.children) {
@@ -1478,7 +1632,7 @@ void DarkDirectoryTreeView::restore_state(const DirectoryTreeViewState& state) {
                                                    state.expanded_keys.end());
     begin_update();
     const auto restore_item = [&](const auto& self, DirectoryTreeItem& item) -> void {
-        const std::wstring key = directory_tree_node_key(item.node);
+        const std::wstring key = directory_tree_item_key(item);
         item.expanded = item.may_have_children && !key.empty() &&
                         expanded_keys.find(key) != expanded_keys.end();
         if (item.expanded) {
@@ -1634,10 +1788,12 @@ void DarkDirectoryTreeView::flatten(DirectoryTreeItem& item, int depth) {
 }
 
 void DarkDirectoryTreeView::rebuild_visible_items() {
+    if (!visible_items_dirty_) return;
     visible_.clear();
     for (auto& root : roots_) {
         flatten(*root, 0);
     }
+    visible_items_dirty_ = false;
 }
 
 int DarkDirectoryTreeView::visible_index(const DirectoryTreeItem* item) const {
@@ -1687,6 +1843,10 @@ DirectoryTreeItem* DarkDirectoryTreeView::item_at_point(POINT point, int* depth,
         *row_rect = RECT{content.left, top, content.right, top + row_height()};
     }
     return visible_[static_cast<std::size_t>(row)].item;
+}
+
+DirectoryTreeItem* DarkDirectoryTreeView::selectable_item_at_point(POINT point) {
+    return item_at_point(point);
 }
 
 RECT DarkDirectoryTreeView::glyph_rect_for_row(const RECT& row, int depth) const {
@@ -1799,8 +1959,15 @@ void DarkDirectoryTreeView::on_paint() {
     if (width > 0 && height > 0) {
         RECT buffer{0, 0, width, height};
         if (paint_buffer_.ensure(dc, width, height)) {
+            const int saved = SaveDC(paint_buffer_.dc());
+            IntersectClipRect(paint_buffer_.dc(), paint.rcPaint.left, paint.rcPaint.top,
+                              paint.rcPaint.right, paint.rcPaint.bottom);
             paint_content(paint_buffer_.dc(), buffer);
-            BitBlt(dc, 0, 0, width, height, paint_buffer_.dc(), 0, 0, SRCCOPY);
+            RestoreDC(paint_buffer_.dc(), saved);
+            BitBlt(dc, paint.rcPaint.left, paint.rcPaint.top,
+                   paint.rcPaint.right - paint.rcPaint.left,
+                   paint.rcPaint.bottom - paint.rcPaint.top,
+                   paint_buffer_.dc(), paint.rcPaint.left, paint.rcPaint.top, SRCCOPY);
         } else {
             paint_content(dc, buffer);
         }
@@ -1960,7 +2127,7 @@ LRESULT DarkDirectoryTreeView::handle_message(UINT message, WPARAM wparam, LPARA
         case WM_RBUTTONDOWN: {
             SetFocus(hwnd_);
             POINT point{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
-            if (DirectoryTreeItem* item = item_at_point(point)) {
+            if (DirectoryTreeItem* item = selectable_item_at_point(point)) {
                 select_item(item, false);
             }
             return 0;
@@ -1970,9 +2137,11 @@ LRESULT DarkDirectoryTreeView::handle_message(UINT message, WPARAM wparam, LPARA
                 POINT screen{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
                 POINT client = screen;
                 ScreenToClient(hwnd_, &client);
-                if (DirectoryTreeItem* item = item_at_point(client)) {
-                    select_item(item, false);
-                }
+                DirectoryTreeItem* item = selectable_item_at_point(client);
+                if (item == nullptr) return 0;
+                select_item(item, false);
+            } else if (selected_item() == nullptr) {
+                return 0;
             }
             SendMessageW(GetParent(hwnd_), WM_CONTEXTMENU,
                          reinterpret_cast<WPARAM>(hwnd_), lparam);

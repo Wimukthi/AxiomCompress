@@ -8,6 +8,7 @@
 #include <optional>
 #include <stop_token>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace axiom::gui {
@@ -73,16 +74,21 @@ public:
 private:
     ArchiveCatalog(std::filesystem::path path, const axiom::ArchiveProvider& provider,
                    std::vector<ArchiveEntry> entries, ArchiveCapabilities capabilities);
+    void build_directory_index();
 
     std::filesystem::path path_;
     const axiom::ArchiveProvider* provider_ = nullptr;
     std::vector<ArchiveEntry> entries_;
     ArchiveCapabilities capabilities_;
+    std::unordered_map<std::string, std::vector<BrowserItem>> children_by_directory_;
 };
 
 struct BrowserLoadResult {
     BrowserSnapshot snapshot;
     std::shared_ptr<const ArchiveCatalog> archive_catalog;
+    ArchiveCapabilities archive_capabilities;
+    bool archive_capabilities_available = false;
+    bool archive_password_supplied = false;
 };
 
 BrowserLoadResult load_browser_location(

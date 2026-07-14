@@ -13,6 +13,7 @@
 #include "gui/benchmark_dialog.hpp"
 #include "gui/browser_model.hpp"
 #include "gui/custom_menu.hpp"
+#include "gui/compression_estimate_dialog.hpp"
 #include "gui/dialog_support.hpp"
 #include "gui/directory_watcher.hpp"
 #include "gui/drag_drop.hpp"
@@ -39,10 +40,12 @@
 #include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <condition_variable>
 #include <cstring>
 #include <cwctype>
 #include <cstdint>
 #include <cstdlib>
+#include <deque>
 #include <exception>
 #include <filesystem>
 #include <fstream>
@@ -73,7 +76,6 @@ namespace axiom::gui {
 
 namespace fs = std::filesystem;
 constexpr UINT kOperationDoneMessage = WM_APP + 1;
-constexpr UINT kOperationProgressMessage = WM_APP + 2;
 constexpr UINT kTableActivateMessage = WM_APP + 3;
 constexpr UINT kTableSelectionChangedMessage = WM_APP + 4;
 constexpr UINT kBrowserLoadedMessage = WM_APP + 5;
@@ -81,6 +83,10 @@ constexpr UINT kTableParentMessage = WM_APP + 6;
 constexpr UINT kTableSortMessage = WM_APP + 7;
 constexpr UINT kDirectoryChangedMessage = WM_APP + 8;
 constexpr UINT kTableBeginDragMessage = WM_APP + 9;
+constexpr UINT kSplitterLayoutMessage = WM_APP + 10;
+constexpr UINT kTreeArchiveProbeMessage = WM_APP + 11;
+constexpr UINT kSelectedArchiveCapabilitiesMessage = WM_APP + 12;
+constexpr UINT kBackgroundUiTaskMessage = WM_APP + 13;
 constexpr UINT_PTR kBrowserPopulateTimer = 42;
 constexpr UINT_PTR kDirectoryRefreshTimer = 41;
 #ifndef DWMWA_USE_IMMERSIVE_DARK_MODE
@@ -149,6 +155,21 @@ enum ControlId : int {
     kSignArchive = 1154,
     kCompressStream = 1155,
     kDecompressStream = 1156,
+};
+
+struct BackgroundUiTaskResult {
+    std::uint64_t id = 0;
+    std::function<void()> completion;
+};
+
+struct BackgroundUiTask {
+    std::uint64_t id = 0;
+    std::jthread worker;
+};
+
+struct PendingArchiveCommand {
+    UINT command = 0;
+    fs::path archive;
 };
 template <typename T>
 class ComPtr {
@@ -318,6 +339,13 @@ public:
                 CreateCompatibleBitmap(reference_dc, next_width, next_height);
             if (next_bitmap == nullptr) return false;
             if (bitmap_ != nullptr) {
+                HDC transfer_dc = CreateCompatibleDC(reference_dc);
+                if (transfer_dc != nullptr) {
+                    HGDIOBJ transfer_old = SelectObject(transfer_dc, next_bitmap);
+                    BitBlt(transfer_dc, 0, 0, width_, height_, dc_, 0, 0, SRCCOPY);
+                    SelectObject(transfer_dc, transfer_old);
+                    DeleteDC(transfer_dc);
+                }
                 SelectObject(dc_, old_bitmap_);
                 DeleteObject(bitmap_);
             }
@@ -369,6 +397,9 @@ struct TableViewOptions {
 class DarkTableView {
 
 public:
+    using RowProvider = std::function<std::vector<std::wstring>(std::size_t)>;
+    using IconProvider = std::function<int(std::size_t)>;
+    using MatchTextProvider = std::function<std::wstring_view(std::size_t)>;
     bool create(HWND parent, HINSTANCE instance, int id);
     HWND hwnd() const;
     void set_font(HFONT font);
@@ -388,6 +419,11 @@ public:
     void set_rows(std::vector<std::vector<std::wstring>> rows,
                   std::vector<int> icon_indices,
                   HIMAGELIST image_list);
+    void set_virtual_rows(std::size_t row_count,
+                          RowProvider row_provider,
+                          IconProvider icon_provider,
+                          MatchTextProvider match_text_provider,
+                          HIMAGELIST image_list);
     std::vector<int> selected_indices() const;
     int focused_index() const;
     int vertical_scroll_position() const;
@@ -411,6 +447,7 @@ private:
     int scrollbar_width() const;
     int scrollbar_gap() const;
     int content_height() const;
+    std::size_t row_count() const;
     int requested_content_width() const;
 
 
@@ -443,10 +480,11 @@ private:
     void scroll_horizontally_by(int pixels);
     void notify_parent(UINT message) const;
     void select_row(int row, bool extend, bool toggle);
-    std::wstring row_match_text(int row) const;
+    std::wstring_view row_match_text(int row) const;
     int find_typeahead_match(std::wstring_view needle, bool cycle) const;
     bool handle_typeahead_char(wchar_t character);
     bool point_can_select_row(POINT point, int row, const RECT& client) const;
+    int selectable_row_at_point(POINT point, const RECT& client) const;
     void begin_marquee_selection(POINT point, bool preserve_selection);
     void update_marquee_selection(POINT point);
     void end_marquee_selection();
@@ -484,6 +522,14 @@ private:
     std::vector<TableColumn> columns_;
 
     std::vector<std::vector<std::wstring>> rows_;
+
+    std::size_t virtual_row_count_ = 0;
+
+    RowProvider virtual_row_provider_;
+
+    IconProvider virtual_icon_provider_;
+
+    MatchTextProvider virtual_match_text_provider_;
 
     std::vector<bool> selected_;
 
@@ -586,6 +632,7 @@ public:
     void set_expanded(DirectoryTreeItem* item, bool expanded);
     void refresh_item(DirectoryTreeItem* item);
     void ensure_visible(DirectoryTreeItem* item);
+    DirectoryTreeItem* find_filesystem_item(const fs::path& path);
     DirectoryTreeViewState capture_state() const;
     void restore_state(const DirectoryTreeViewState& state);
 
@@ -621,6 +668,7 @@ private:
     void ensure_populated(DirectoryTreeItem& item);
     void toggle_item(DirectoryTreeItem& item);
     DirectoryTreeItem* item_at_point(POINT point, int* depth = nullptr, RECT* row_rect = nullptr);
+    DirectoryTreeItem* selectable_item_at_point(POINT point);
     RECT glyph_rect_for_row(const RECT& row, int depth) const;
     void draw_chevron(HDC dc, const RECT& rect, bool expanded, COLORREF color) const;
     void paint_content(HDC dc, const RECT& client);
@@ -658,6 +706,8 @@ private:
 
     bool refresh_pending_ = false;
 
+    bool visible_items_dirty_ = true;
+
     PopulateCallback populate_callback_;
 
     SelectCallback select_callback_;
@@ -677,6 +727,8 @@ struct FileSearchSourceItem {
     std::wstring type;
     std::wstring size;
     std::wstring modified;
+    std::wstring folded_name;
+    std::wstring folded_search_text;
 };
 struct FileSearchDialogResult {
     bool accepted = false;
@@ -706,6 +758,13 @@ private:
         kSearchButton = 30107,
         kGoToButton = 30108,
         kResultsTable = 30109,
+        kSearchDebounceTimer = 30110,
+        kSearchResultsMessage = WM_APP + 110,
+    };
+    struct SearchPayload {
+        std::uint64_t generation = 0;
+        std::vector<int> indices;
+        std::vector<std::vector<std::wstring>> rows;
     };
     static const wchar_t* class_name();
     static bool register_class(HINSTANCE instance);
@@ -723,11 +782,14 @@ private:
     static bool is_archive_kind(axiom::gui::BrowserItemKind kind);
     static bool is_file_kind(axiom::gui::BrowserItemKind kind);
     bool type_allowed(const FileSearchSourceItem& item) const;
-    bool text_matches(const FileSearchSourceItem& item, std::wstring_view query) const;
+    bool text_matches(const FileSearchSourceItem& item, std::wstring_view query,
+                      std::wstring_view folded_query) const;
     void run_search();
+    void apply_search_results(LPARAM payload);
     void accept_selected();
     void layout();
     void create_controls();
+    void rebuild_font_for_dpi();
     LRESULT control_color(WPARAM wparam, bool edit);
     LRESULT handle_message(UINT message, WPARAM wparam, LPARAM lparam);
     static LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam);
@@ -799,6 +861,10 @@ private:
 
     DarkTableView results_;
 
+    std::jthread search_thread_;
+
+    std::uint64_t search_generation_ = 0;
+
 };
 class MainWindow {
 
@@ -823,8 +889,10 @@ private:
     void rebuild_theme_brushes();
     void apply_theme_to_control(HWND control) const;
     void apply_theme();
-    ShellIconRef tree_icon_for_filesystem(const fs::path& path, bool drive = false) const;
-    ShellIconRef tree_icon_for_archive(const fs::path& path) const;
+    ShellIconRef tree_icon_for_filesystem(const fs::path& path, bool drive = false,
+                                          bool directory = false,
+                                          bool prefer_generic_unique_icon = false);
+    ShellIconRef tree_icon_for_archive(const fs::path& path);
     DirectoryTreeItem* insert_tree_item(DirectoryTreeItem* parent,
                                         std::wstring text,
                                         DirectoryTreeNode node,
@@ -841,7 +909,27 @@ private:
         bool archive = false;
         bool drive = false;
     };
+    struct TreeArchiveProbeResult {
+        fs::path directory;
+        std::vector<fs::path> archives;
+        bool completed = false;
+    };
+    struct SelectedArchiveCapabilitiesResult {
+        fs::path archive;
+        const axiom::ArchiveProvider* provider = nullptr;
+        axiom::gui::ArchiveCapabilities capabilities;
+    };
     void populate_tree_filesystem_children(DirectoryTreeItem& item, const fs::path& path);
+    bool tree_archive_was_detected(const fs::path& path) const;
+    void queue_tree_archive_probe(const fs::path& directory);
+    void tree_archive_probe_loop(std::stop_token stop);
+    void on_tree_archive_probe(LPARAM lparam);
+    void queue_selected_archive_capability_probe(const fs::path& archive) const;
+    void on_selected_archive_capabilities(LPARAM lparam);
+    void begin_background_ui_task(
+        std::wstring status,
+        std::function<std::function<void()>()> work);
+    void on_background_ui_task(LPARAM lparam);
     void add_known_tree_folder(DirectoryTreeItem& parent, const wchar_t* label,
                                REFKNOWNFOLDERID folder_id);
     void populate_tree_computer_children(DirectoryTreeItem& item);
@@ -901,7 +989,7 @@ private:
     int browser_pane_top() const;
     void layout_browser_panes(const RECT& client, int y, bool invalidate_splitter_only);
     void layout_browser_panes_for_current_size();
-    void repaint_browser_panes_now() const;
+    void invalidate_browser_panes() const;
     void layout();
     void set_status(const std::wstring& text);
     void set_busy(bool busy);
@@ -1027,7 +1115,8 @@ private:
     bool append_browser_table_batch();
     void cancel_browser_table_population();
     void finish_browser_table_population();
-    void begin_browser_table_population(std::optional<BrowserViewState> restore_state);
+    void begin_browser_table_population(std::optional<BrowserViewState> restore_state,
+                                        bool sort_items = true);
     void on_browser_populate_timer();
     void on_table_sort(int column);
     void on_browser_loaded(LPARAM lparam);
@@ -1098,7 +1187,6 @@ private:
     void on_verify_archive_signature();
     void on_extract();
     void on_test();
-    void on_operation_progress(LPARAM lparam);
     void on_operation_done(LPARAM lparam);
     LRESULT handle_message(UINT message, WPARAM wparam, LPARAM lparam);
     static LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam);
@@ -1199,6 +1287,8 @@ private:
 
     bool dragging_tree_splitter_ = false;
 
+    bool splitter_layout_pending_ = false;
+
     int tree_splitter_start_x_ = 0;
 
     int tree_width_start_ = 0;
@@ -1206,6 +1296,38 @@ private:
     DirectoryTreeItem* tree_computer_item_ = nullptr;
 
     bool syncing_tree_ = false;
+
+    std::jthread tree_archive_probe_thread_;
+
+    std::mutex tree_archive_probe_mutex_;
+
+    std::condition_variable_any tree_archive_probe_cv_;
+
+    std::deque<fs::path> tree_archive_probe_queue_;
+
+    std::unordered_set<std::wstring> tree_archive_probe_requested_directories_;
+
+    std::unordered_set<std::wstring> tree_detected_archive_paths_;
+
+    mutable std::jthread selected_archive_capability_thread_;
+
+    mutable bool selected_archive_capability_probe_running_ = false;
+
+    mutable fs::path selected_archive_capability_probe_path_;
+
+    mutable fs::path selected_archive_capability_cache_path_;
+
+    mutable axiom::gui::ArchiveCapabilities selected_archive_capability_cache_;
+
+    mutable const axiom::ArchiveProvider* selected_archive_provider_cache_ = nullptr;
+
+    std::optional<PendingArchiveCommand> pending_archive_command_;
+
+    std::vector<BackgroundUiTask> background_ui_tasks_;
+
+    std::uint64_t next_background_ui_task_id_ = 1;
+
+    bool restore_persisted_tree_state_ = false;
 
     std::vector<AddressEntry> address_entries_;
 
@@ -1221,6 +1343,8 @@ private:
     std::vector<std::optional<BrowserViewState>> browser_history_states_;
 
     std::vector<axiom::gui::BrowserItem> browser_items_;
+
+    BrowserStatusTotals browser_status_totals_;
 
     std::unordered_map<std::wstring, ShellIconRef> shell_icon_cache_;
 
@@ -1276,14 +1400,24 @@ private:
 
     fs::path pending_archive_path_;
 
+    axiom::ArchiveFormat pending_archive_format_ = axiom::ArchiveFormat::axar;
+
     axiom::gui::ArchiveFeatureOptions pending_archive_features_;
+
+    fs::path archive_dialog_metadata_path_;
+
+    axiom::ArchiveEncryptionMode archive_dialog_encryption_mode_ =
+        axiom::ArchiveEncryptionMode::none;
+
+    std::wstring archive_dialog_comment_;
+
+    std::string archive_dialog_password_;
+
+    bool archive_dialog_metadata_valid_ = false;
 
 };
 int run_quick_add_to_archive(HINSTANCE instance, const std::vector<std::wstring>& paths);
-std::optional<int> run_embedded_sfx(HINSTANCE instance, const std::wstring& requested_destination);
-
-
-int run_quick_add_to_archive(HINSTANCE instance, const std::vector<std::wstring>& paths);
+int run_quick_extract_archive(HINSTANCE instance, const std::wstring& path);
 std::optional<int> run_embedded_sfx(HINSTANCE instance, const std::wstring& requested_destination);
 
 }  // namespace axiom::gui

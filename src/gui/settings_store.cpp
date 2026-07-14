@@ -227,6 +227,10 @@ PersistedGuiSettings load_gui_settings() {
     settings.tree_width =
         read_clamped_int(key, L"TreeWidth", 0, 0, 2000);
     settings.tree_pane_visible = read_bool(key, L"TreePaneVisible", true);
+    settings.tree_expanded_nodes = read_string_list(key, L"TreeExpandedNodes");
+    settings.tree_selected_node = read_string(key, L"TreeSelectedNode");
+    settings.tree_scroll_position =
+        read_clamped_int(key, L"TreeScrollPosition", 0, 0, 100000000);
     settings.column_widths = read_int_list(key, L"ColumnWidths");
     settings.last_location = read_string(key, L"LastLocation");
     settings.last_archive_output_folder = read_string(key, L"LastArchiveOutputFolder");
@@ -368,6 +372,10 @@ void save_gui_settings(const PersistedGuiSettings& settings) {
     write_dword(key, L"TreeWidth",
                 static_cast<DWORD>(std::clamp(settings.tree_width, 0, 2000)));
     write_dword(key, L"TreePaneVisible", settings.tree_pane_visible ? 1 : 0);
+    write_string_list(key, L"TreeExpandedNodes", settings.tree_expanded_nodes);
+    write_string(key, L"TreeSelectedNode", settings.tree_selected_node);
+    write_dword(key, L"TreeScrollPosition",
+                static_cast<DWORD>(std::max(settings.tree_scroll_position, 0)));
     write_string(key, L"ColumnWidths", join_int_list(settings.column_widths));
     write_string(key, L"LastLocation", settings.last_location);
     write_string(key, L"LastArchiveOutputFolder", settings.last_archive_output_folder);

@@ -4,6 +4,13 @@
 
 namespace axiom::gui {
 
+namespace {
+constexpr DWORD kFileSearchStyle =
+    WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME |
+    WS_CLIPCHILDREN | WS_CLIPSIBLINGS;
+constexpr DWORD kFileSearchExStyle = WS_EX_WINDOWEDGE | WS_EX_CONTROLPARENT;
+}
+
 FileSearchDialog::FileSearchDialog(HINSTANCE instance,
                  ThemePalette theme,
                  UINT dpi,
@@ -21,20 +28,21 @@ FileSearchDialogResult FileSearchDialog::show(HWND owner) {
         return result_;
     }
 
-    const int width = scale(820);
-    const int height = scale(560);
+    const SIZE window_size = dialog_window_size_for_client(
+        820, 560, kFileSearchStyle, kFileSearchExStyle, dpi_);
+    const int width = window_size.cx;
+    const int height = window_size.cy;
     const POINT position = axiom::gui::centered_window_position(owner, width, height);
     hwnd_ = CreateWindowExW(
-        WS_EX_WINDOWEDGE | WS_EX_CONTROLPARENT,
+        kFileSearchExStyle,
         class_name(), L"Find files",
-        WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME |
-            WS_CLIPCHILDREN | WS_CLIPSIBLINGS,
+        kFileSearchStyle,
         position.x, position.y, width, height, owner, nullptr, instance_, this);
     if (hwnd_ == nullptr) return result_;
 
     axiom::gui::apply_axiom_window_icons(hwnd_, instance_);
     axiom::gui::restore_named_window_placement(hwnd_, owner, L"FileSearchDialog");
-    const bool owner_was_enabled = axiom::gui::disable_dialog_owner(owner);
+    const bool owner_was_enabled = axiom::gui::disable_dialog_owner(owner, hwnd_);
     ShowWindow(hwnd_, SW_SHOW);
     UpdateWindow(hwnd_);
 
@@ -160,32 +168,96 @@ bool FileSearchDialog::type_allowed(const FileSearchSourceItem& item) const {
     return false;
 }
 
-bool FileSearchDialog::text_matches(const FileSearchSourceItem& item, std::wstring_view query) const {
+bool FileSearchDialog::text_matches(const FileSearchSourceItem& item, std::wstring_view query,
+                                    std::wstring_view folded_query) const {
     if (query.empty()) return true;
-    const std::wstring haystack = search_path_checked_ && !item.location.empty()
-        ? item.location + L"\\" + item.name
-        : item.name;
 
     if (whole_name_checked_) {
         return match_case_checked_ ? item.name == query
-                          : folded_text(item.name) == folded_text(query);
+                                   : item.folded_name == folded_query;
     }
     if (match_case_checked_) {
+        const std::wstring haystack = search_path_checked_ && !item.location.empty()
+            ? item.location + L"\\" + item.name
+            : item.name;
         return haystack.find(query) != std::wstring::npos;
     }
-    return contains_folded(haystack, query);
+    const std::wstring_view haystack = search_path_checked_
+        ? std::wstring_view(item.folded_search_text)
+        : std::wstring_view(item.folded_name);
+    return haystack.find(folded_query) != std::wstring_view::npos;
 }
 
 void FileSearchDialog::run_search() {
-    results_.clear();
+    search_thread_.request_stop();
+    if (search_thread_.joinable()) search_thread_.join();
+    const std::uint64_t generation = ++search_generation_;
     result_indices_.clear();
+    results_.clear();
+    EnableWindow(go_to_button_, FALSE);
+    set_text(result_count_, L"Searching...");
     const std::wstring query = get_text(search_edit_);
-    for (const auto& item : source_) {
-        if (!type_allowed(item) || !text_matches(item, query)) continue;
-        result_indices_.push_back(item.browser_index);
-        results_.append_row({item.name, item.location, item.type, item.size,
-                             item.modified});
-    }
+    const std::wstring folded_query = folded_text(query);
+    const bool include_files = include_files_checked_;
+    const bool include_folders = include_folders_checked_;
+    const bool include_archives = include_archives_checked_;
+    const bool match_case = match_case_checked_;
+    const bool whole_name = whole_name_checked_;
+    const bool search_path = search_path_checked_;
+    const auto* source = &source_;
+    HWND target = hwnd_;
+    search_thread_ = std::jthread(
+        [source, target, generation, query, folded_query,
+         include_files, include_folders, include_archives,
+         match_case, whole_name, search_path](std::stop_token stop) {
+            auto payload = std::make_unique<SearchPayload>();
+            payload->generation = generation;
+            payload->indices.reserve(source->size());
+            payload->rows.reserve(source->size());
+            for (const auto& item : *source) {
+                if (stop.stop_requested()) return;
+                const bool folder = is_folder_kind(item.kind);
+                const bool archive = is_archive_kind(item.kind);
+                const bool file = is_file_kind(item.kind);
+                if ((folder && !include_folders) ||
+                    (archive && !include_archives) ||
+                    (file && !include_files) || (!folder && !archive && !file)) {
+                    continue;
+                }
+                bool matches = query.empty();
+                if (!matches && whole_name) {
+                    matches = match_case ? item.name == query
+                                         : item.folded_name == folded_query;
+                } else if (!matches && match_case) {
+                    const std::wstring haystack = search_path && !item.location.empty()
+                        ? item.location + L"\\" + item.name
+                        : item.name;
+                    matches = haystack.find(query) != std::wstring::npos;
+                } else if (!matches) {
+                    const std::wstring_view haystack = search_path
+                        ? std::wstring_view(item.folded_search_text)
+                        : std::wstring_view(item.folded_name);
+                    matches = haystack.find(folded_query) != std::wstring_view::npos;
+                }
+                if (!matches) continue;
+                payload->indices.push_back(item.browser_index);
+                payload->rows.push_back(
+                    {item.name, item.location, item.type, item.size, item.modified});
+            }
+            if (stop.stop_requested()) return;
+            SearchPayload* raw = payload.release();
+            if (!PostMessageW(target, kSearchResultsMessage, 0,
+                              reinterpret_cast<LPARAM>(raw))) {
+                delete raw;
+            }
+        });
+}
+
+void FileSearchDialog::apply_search_results(LPARAM value) {
+    std::unique_ptr<SearchPayload> payload(reinterpret_cast<SearchPayload*>(value));
+    if (!payload || payload->generation != search_generation_) return;
+    result_indices_ = std::move(payload->indices);
+    results_.set_rows(std::move(payload->rows), {}, nullptr);
     if (!result_indices_.empty()) {
         results_.select_index(0);
     }
@@ -324,6 +396,20 @@ void FileSearchDialog::create_controls() {
     SetFocus(search_edit_);
 }
 
+void FileSearchDialog::rebuild_font_for_dpi() {
+    HFONT replacement = axiom::gui::create_dialog_font(dpi_);
+    for (HWND control : controls()) {
+        if (control != nullptr) {
+            SendMessageW(control, WM_SETFONT,
+                         reinterpret_cast<WPARAM>(replacement), TRUE);
+        }
+    }
+    results_.set_font(replacement);
+    results_.set_dpi(dpi_);
+    axiom::gui::delete_dialog_font(font_);
+    font_ = replacement;
+}
+
 LRESULT FileSearchDialog::control_color(WPARAM wparam, bool edit) {
     HDC dc = reinterpret_cast<HDC>(wparam);
     SetTextColor(dc, theme_.text);
@@ -342,8 +428,22 @@ LRESULT FileSearchDialog::handle_message(UINT message, WPARAM wparam, LPARAM lpa
             return 0;
         case WM_GETMINMAXINFO: {
             auto* info = reinterpret_cast<MINMAXINFO*>(lparam);
-            info->ptMinTrackSize.x = scale(700);
-            info->ptMinTrackSize.y = scale(440);
+            const SIZE minimum = dialog_window_size_for_client(
+                700, 440, kFileSearchStyle, kFileSearchExStyle, dpi_);
+            info->ptMinTrackSize.x = minimum.cx;
+            info->ptMinTrackSize.y = minimum.cy;
+            return 0;
+        }
+        case WM_DPICHANGED: {
+            dpi_ = HIWORD(wparam);
+            const auto* suggested = reinterpret_cast<const RECT*>(lparam);
+            SetWindowPos(hwnd_, nullptr, suggested->left, suggested->top,
+                         suggested->right - suggested->left,
+                         suggested->bottom - suggested->top,
+                         SWP_NOZORDER | SWP_NOACTIVATE);
+            axiom::gui::apply_axiom_window_icons(hwnd_, instance_);
+            rebuild_font_for_dpi();
+            layout();
             return 0;
         }
         case WM_COMMAND: {
@@ -351,7 +451,10 @@ LRESULT FileSearchDialog::handle_message(UINT message, WPARAM wparam, LPARAM lpa
             const int notification = HIWORD(wparam);
             switch (id) {
                 case kSearchText:
-                    if (notification == EN_CHANGE) run_search();
+                    if (notification == EN_CHANGE) {
+                        KillTimer(hwnd_, kSearchDebounceTimer);
+                        SetTimer(hwnd_, kSearchDebounceTimer, 120, nullptr);
+                    }
                     return 0;
                 case kMatchCase:
                 case kWholeName:
@@ -363,6 +466,7 @@ LRESULT FileSearchDialog::handle_message(UINT message, WPARAM wparam, LPARAM lpa
                     return 0;
                 case kSearchButton:
                 case IDOK:
+                    KillTimer(hwnd_, kSearchDebounceTimer);
                     run_search();
                     return 0;
                 case kGoToButton:
@@ -376,8 +480,18 @@ LRESULT FileSearchDialog::handle_message(UINT message, WPARAM wparam, LPARAM lpa
             }
             break;
         }
+        case WM_TIMER:
+            if (wparam == kSearchDebounceTimer) {
+                KillTimer(hwnd_, kSearchDebounceTimer);
+                run_search();
+                return 0;
+            }
+            break;
         case kTableActivateMessage:
             accept_selected();
+            return 0;
+        case kSearchResultsMessage:
+            apply_search_results(lparam);
             return 0;
         case WM_CTLCOLORSTATIC:
         case WM_CTLCOLORBTN:
@@ -415,7 +529,15 @@ LRESULT FileSearchDialog::handle_message(UINT message, WPARAM wparam, LPARAM lpa
         case WM_CLOSE:
             DestroyWindow(hwnd_);
             return 0;
-        case WM_NCDESTROY:
+        case WM_NCDESTROY: {
+            KillTimer(hwnd_, kSearchDebounceTimer);
+            search_thread_.request_stop();
+            if (search_thread_.joinable()) search_thread_.join();
+            MSG queued{};
+            while (PeekMessageW(&queued, hwnd_, kSearchResultsMessage,
+                                kSearchResultsMessage, PM_REMOVE)) {
+                delete reinterpret_cast<SearchPayload*>(queued.lParam);
+            }
             axiom::gui::save_named_window_placement(L"FileSearchDialog", hwnd_);
             if (font_ != nullptr) axiom::gui::delete_dialog_font(font_);
             if (background_brush_ != nullptr) DeleteObject(background_brush_);
@@ -423,6 +545,7 @@ LRESULT FileSearchDialog::handle_message(UINT message, WPARAM wparam, LPARAM lpa
             SetWindowLongPtrW(hwnd_, GWLP_USERDATA, 0);
             hwnd_ = nullptr;
             return 0;
+        }
         default:
             break;
     }

@@ -1,5 +1,6 @@
 #define NOMINMAX
 #include "gui/browser_model.hpp"
+#include "core/windows_time.hpp"
 
 #include <windows.h>
 
@@ -8,6 +9,7 @@
 #include <cwctype>
 #include <optional>
 #include <string_view>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 
@@ -29,7 +31,9 @@ std::wstring widen(std::string_view text) {
 
 std::string normalize_archive_path(std::string path) {
     std::replace(path.begin(), path.end(), '\\', '/');
-    while (!path.empty() && path.front() == '/') path.erase(path.begin());
+    const auto first = path.find_first_not_of('/');
+    if (first == std::string::npos) return {};
+    if (first != 0) path.erase(0, first);
     while (!path.empty() && path.back() == '/') path.pop_back();
     return path;
 }
@@ -40,7 +44,24 @@ std::string archive_parent(std::string path) {
     return separator == std::string::npos ? std::string{} : path.substr(0, separator);
 }
 
-std::wstring file_time_text(const FILETIME& file_time) {
+std::wstring file_time_text(const FILETIME& file_time,
+                            core::LocalTimeConverter* converter = nullptr) {
+    if (converter != nullptr) {
+        ULARGE_INTEGER ticks{};
+        ticks.LowPart = file_time.dwLowDateTime;
+        ticks.HighPart = file_time.dwHighDateTime;
+        constexpr std::uint64_t epoch_ticks = 11644473600ull * 10000000ull;
+        if (ticks.QuadPart < epoch_ticks) return {};
+        SYSTEMTIME system{};
+        const auto seconds = static_cast<std::int64_t>(
+            (ticks.QuadPart - epoch_ticks) / 10000000ull);
+        if (!converter->unix_to_local(seconds, system)) return {};
+        wchar_t buffer[64]{};
+        swprintf_s(buffer, L"%04u-%02u-%02u %02u:%02u",
+                   system.wYear, system.wMonth, system.wDay,
+                   system.wHour, system.wMinute);
+        return buffer;
+    }
     FILETIME local{};
     SYSTEMTIME system{};
     if (!FileTimeToLocalFileTime(&file_time, &local) ||
@@ -54,8 +75,18 @@ std::wstring file_time_text(const FILETIME& file_time) {
     return buffer;
 }
 
-std::wstring unix_time_text(std::int64_t seconds) {
+std::wstring unix_time_text(std::int64_t seconds,
+                            core::LocalTimeConverter* converter = nullptr) {
     if (seconds <= 0) return {};
+    if (converter != nullptr) {
+        SYSTEMTIME system{};
+        if (!converter->unix_to_local(seconds, system)) return {};
+        wchar_t buffer[64]{};
+        swprintf_s(buffer, L"%04u-%02u-%02u %02u:%02u",
+                   system.wYear, system.wMonth, system.wDay,
+                   system.wHour, system.wMinute);
+        return buffer;
+    }
     constexpr std::uint64_t epoch_difference = 11644473600ull;
     const std::uint64_t ticks =
         (static_cast<std::uint64_t>(seconds) + epoch_difference) * 10000000ull;
@@ -214,6 +245,7 @@ BrowserSnapshot load_filesystem(const BrowserLocation& location, std::stop_token
     snapshot.items.push_back(parent_item());
     const fs::path pattern = location.filesystem_path / L"*";
     WIN32_FIND_DATAW data{};
+    core::LocalTimeConverter time_converter;
     HANDLE find = FindFirstFileExW(pattern.c_str(), FindExInfoBasic, &data,
                                    FindExSearchNameMatch, nullptr, FIND_FIRST_EX_LARGE_FETCH);
     if (find == INVALID_HANDLE_VALUE) {
@@ -241,13 +273,12 @@ BrowserSnapshot load_filesystem(const BrowserLocation& location, std::stop_token
                                               : extension_type(item.filesystem_path, false));
         item.size = directory ? 0
             : (static_cast<std::uint64_t>(data.nFileSizeHigh) << 32) | data.nFileSizeLow;
-        item.modified = file_time_text(data.ftLastWriteTime);
+        item.modified = file_time_text(data.ftLastWriteTime, &time_converter);
         item.attributes = attributes_text(data.dwFileAttributes);
         item.id = stable_id(item.filesystem_path.wstring());
         snapshot.items.push_back(std::move(item));
     } while (FindNextFileW(find, &data));
     FindClose(find);
-    std::sort(snapshot.items.begin(), snapshot.items.end(), item_less);
     return snapshot;
 }
 
@@ -301,6 +332,101 @@ ArchiveCatalog::ArchiveCatalog(fs::path path, const axiom::ArchiveProvider& prov
       provider_(&provider),
       entries_(std::move(entries)),
       capabilities_(capabilities) {
+    build_directory_index();
+}
+
+void ArchiveCatalog::build_directory_index() {
+    struct NodeLocation {
+        std::string parent;
+        std::size_t index = 0;
+    };
+
+    std::unordered_map<std::string, NodeLocation> locations;
+    locations.reserve(entries_.size() * 2u);
+    children_by_directory_.reserve(entries_.size() / 4u + 1u);
+
+    const std::wstring archive_identity = path_.wstring() + L"|";
+    core::LocalTimeConverter time_converter;
+    for (auto& entry : entries_) {
+        entry.path = normalize_archive_path(std::move(entry.path));
+        if (entry.path.empty()) continue;
+
+        std::string parent;
+        std::size_t component_start = 0;
+        while (component_start < entry.path.size()) {
+            const std::size_t separator = entry.path.find('/', component_start);
+            const bool final_component = separator == std::string::npos;
+            const std::size_t component_end = final_component ? entry.path.size() : separator;
+            if (component_end == component_start) {
+                component_start = separator + 1;
+                continue;
+            }
+            const std::string_view component(entry.path.data() + component_start,
+                                             component_end - component_start);
+            std::string child_path;
+            child_path.reserve(parent.size() + (parent.empty() ? 0u : 1u) + component.size());
+            if (!parent.empty()) {
+                child_path = parent;
+                child_path.push_back('/');
+            }
+            child_path.append(component);
+
+            auto location = locations.find(child_path);
+            if (location == locations.end()) {
+                BrowserItem item;
+                item.archive_path = child_path;
+                item.name = widen(component);
+                item.id = stable_id(archive_identity + widen(child_path));
+                item.kind = BrowserItemKind::directory;
+                item.type = L"File folder";
+                auto& children = children_by_directory_[parent];
+                const std::size_t index = children.size();
+                children.push_back(std::move(item));
+                location = locations.emplace(child_path, NodeLocation{parent, index}).first;
+            }
+
+            auto& item = children_by_directory_[location->second.parent][location->second.index];
+            if (!final_component) {
+                // A malformed archive can describe a path first as a file and later
+                // use it as a parent. Browsing must still expose the reachable tree.
+                item.kind = BrowserItemKind::directory;
+                item.type = L"File folder";
+                item.size = 0;
+                item.packed_size.reset();
+                item.crc32.reset();
+            } else if (entry.is_directory) {
+                item.kind = BrowserItemKind::directory;
+                item.type = L"File folder";
+                item.size = 0;
+                item.packed_size.reset();
+                item.crc32.reset();
+                item.modified = unix_time_text(entry.mtime, &time_converter);
+            } else {
+                item.kind = entry.is_symlink ? BrowserItemKind::symlink
+                    : entry.is_hardlink ? BrowserItemKind::hardlink
+                                        : BrowserItemKind::file;
+                item.type = entry.is_symlink ? L"Symbolic link"
+                    : entry.is_hardlink ? L"Hard link"
+                                        : extension_type(fs::path(item.name), false);
+                item.size = entry.size;
+                item.packed_size = entry.packed_size;
+                item.packed_size_estimated = entry.packed_size_estimated;
+                item.crc32 = entry.has_crc32
+                    ? std::optional<std::uint32_t>{entry.crc32}
+                    : std::nullopt;
+                item.modified = unix_time_text(entry.mtime, &time_converter);
+            }
+
+            parent = std::move(child_path);
+            if (final_component) break;
+            component_start = separator + 1;
+        }
+    }
+
+    for (auto& [directory, children] : children_by_directory_) {
+        (void)directory;
+        std::sort(children.begin(), children.end(), item_less);
+    }
 }
 
 std::shared_ptr<const ArchiveCatalog> ArchiveCatalog::load(const fs::path& path,
@@ -331,44 +457,14 @@ BrowserSnapshot ArchiveCatalog::list(const BrowserLocation& location, std::stop_
     snapshot.location = location;
     if (!location.archive_directory.empty()) snapshot.items.push_back(parent_item());
     const std::string directory = normalize_archive_path(location.archive_directory);
-    const std::string prefix = directory.empty() ? std::string{} : directory + '/';
-    std::unordered_set<std::string> seen;
-    for (const auto& entry : entries_) {
-        if (stop.stop_requested()) return snapshot;
-        const std::string path = normalize_archive_path(entry.path);
-        if (path.size() <= prefix.size() || path.compare(0, prefix.size(), prefix) != 0) continue;
-        const std::string remainder = path.substr(prefix.size());
-        const auto separator = remainder.find('/');
-        const std::string name = separator == std::string::npos
-            ? remainder
-            : remainder.substr(0, separator);
-        if (name.empty() || !seen.insert(name).second) continue;
-
-        BrowserItem item;
-        item.archive_path = prefix + name;
-        item.name = widen(name);
-        item.id = stable_id(path_.wstring() + L"|" + widen(item.archive_path));
-        if (separator != std::string::npos || entry.is_directory) {
-            item.kind = BrowserItemKind::directory;
-            item.type = L"File folder";
-        } else if (entry.is_symlink) {
-            item.kind = BrowserItemKind::symlink;
-            item.type = L"Symbolic link";
-        } else if (entry.is_hardlink) {
-            item.kind = BrowserItemKind::hardlink;
-            item.type = L"Hard link";
-        } else {
-            item.kind = BrowserItemKind::file;
-            item.type = extension_type(fs::path(item.name), false);
-            item.size = entry.size;
-            item.packed_size = entry.packed_size;
-            item.packed_size_estimated = entry.packed_size_estimated;
-            if (entry.has_crc32) item.crc32 = entry.crc32;
+    if (const auto found = children_by_directory_.find(directory);
+        found != children_by_directory_.end()) {
+        snapshot.items.reserve(snapshot.items.size() + found->second.size());
+        for (const auto& item : found->second) {
+            if (stop.stop_requested()) return snapshot;
+            snapshot.items.push_back(item);
         }
-        item.modified = unix_time_text(entry.mtime);
-        snapshot.items.push_back(std::move(item));
     }
-    std::sort(snapshot.items.begin(), snapshot.items.end(), item_less);
     return snapshot;
 }
 
@@ -385,6 +481,13 @@ BrowserLoadResult load_browser_location(
         } else if (location.kind == BrowserLocationKind::filesystem) {
             result.snapshot = load_filesystem(location, stop);
         } else {
+            result.archive_password_supplied = !archive_password.empty();
+            if (const auto* provider = axiom::archive_provider_for_path(
+                    location.archive_path)) {
+                result.archive_capabilities = provider->capabilities(
+                    location.archive_path, archive_password);
+                result.archive_capabilities_available = true;
+            }
             if (!archive_catalog || archive_catalog->path() != location.archive_path) {
                 archive_catalog = ArchiveCatalog::load(location.archive_path, archive_password);
             }
