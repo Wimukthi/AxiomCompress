@@ -1,6 +1,7 @@
 #include "axiom/archive.hpp"
 
 #include "archive/container_internal.hpp"
+#include "codec/transform.hpp"
 #include "archive/fuzz_support.hpp"
 #include "core/checksum.hpp"
 #include "core/cpu.hpp"
@@ -41,6 +42,47 @@
 
 namespace axiom {
 namespace {
+
+int compression_type_class(const ScanItem& item) {
+    if (item.is_directory || item.is_symlink) return 0;
+    const auto extension = lower_ascii(item.absolute.extension().wstring());
+    static constexpr std::array<std::wstring_view, 17> text{
+        L".txt", L".md", L".csv", L".tsv", L".json", L".xml", L".html",
+        L".htm", L".css", L".js", L".ts", L".cpp", L".c", L".hpp",
+        L".h", L".py", L".log"};
+    static constexpr std::array<std::wstring_view, 8> executable{
+        L".exe", L".dll", L".sys", L".ocx", L".cpl", L".scr", L".com", L".efi"};
+    static constexpr std::array<std::wstring_view, 4> raw_media{
+        L".wav", L".bmp", L".dib", L".tiff"};
+    static constexpr std::array<std::wstring_view, 24> compressed{
+        L".7z", L".zip", L".rar", L".gz", L".xz", L".bz2", L".zst",
+        L".jpg", L".jpeg", L".png", L".gif", L".webp", L".mp3", L".aac",
+        L".flac", L".mp4", L".mkv", L".avi", L".pdf", L".docx", L".xlsx",
+        L".pptx", L".epub", L".msi"};
+    const auto in = [&](const auto& values) {
+        return std::find(values.begin(), values.end(), extension) != values.end();
+    };
+    if (in(text)) return 1;
+    if (in(executable)) return 2;
+    if (in(raw_media)) return 3;
+    if (in(compressed)) return 5;
+    return 4;
+}
+
+std::vector<const ScanItem*> compression_order(const std::vector<ScanItem>& items) {
+    std::vector<const ScanItem*> ordered;
+    ordered.reserve(items.size());
+    for (const auto& item : items) ordered.push_back(&item);
+    std::stable_sort(ordered.begin(), ordered.end(), [](const auto* left, const auto* right) {
+        const auto left_class = compression_type_class(*left);
+        const auto right_class = compression_type_class(*right);
+        if (left_class != right_class) return left_class < right_class;
+        if (left_class == 0) return false;
+        return lower_ascii(left->absolute.extension().wstring()) <
+               lower_ascii(right->absolute.extension().wstring());
+    });
+    return ordered;
+}
 
 namespace fs = std::filesystem;
 
@@ -1475,6 +1517,7 @@ void compress_items_into(std::ofstream& out, std::uint64_t& written,
                          bool allow_unreadable_skips,
                          const core::CryptoKey* key = nullptr) {
     ByteVector buffer;
+    std::vector<CompressionTransformRange> buffer_transform_ranges;
     std::uint64_t current_block = blocks.size();
     std::vector<char> io_buffer(effective_io_buffer_size(options.io_buffer_size));
 
@@ -1511,6 +1554,7 @@ void compress_items_into(std::ofstream& out, std::uint64_t& written,
     struct PendingBlock {
         std::uint64_t index = 0;
         ByteVector data;
+        std::vector<CompressionTransformRange> transform_ranges;
         std::string path;
     };
     struct CompletedBlock {
@@ -1558,6 +1602,7 @@ void compress_items_into(std::ofstream& out, std::uint64_t& written,
                          completed_items, total_items, block.path);
         auto block_options = options;
         block_options.thread_count = inner_thread_count;
+        block_options.transform_ranges = std::move(block.transform_ranges);
         auto block_done = std::make_shared<std::atomic<std::uint64_t>>(0);
         block_options.encoded_bytes_progress =
             [&, block_done, path = block.path](std::uint64_t done) {
@@ -1701,11 +1746,13 @@ void compress_items_into(std::ofstream& out, std::uint64_t& written,
             if (inflight_blocks < max_inflight_blocks) {
                 const auto index = current_block++;
                 pending.push_back(PendingBlock{index, std::move(buffer),
-                                               std::move(current_path)});
+                                                std::move(buffer_transform_ranges),
+                                                std::move(current_path)});
                 ++inflight_blocks;
                 lock.unlock();
                 pipeline_cv.notify_one();
                 buffer = ByteVector{};
+                buffer_transform_ranges = {};
                 return;
             }
 
@@ -1718,10 +1765,24 @@ void compress_items_into(std::ofstream& out, std::uint64_t& written,
         }
     };
 
-    for (const auto& item : items) {
+    const auto ordered_items = compression_order(items);
+    std::optional<int> previous_file_class;
+    for (const auto* item_pointer : ordered_items) {
+        const auto& item = *item_pointer;
         operation_checkpoint(operation);
         if (item.archive_path.size() > std::numeric_limits<std::uint16_t>::max()) {
             throw std::runtime_error("path too long to archive: " + item.archive_path);
+        }
+
+        if (!item.is_directory && !item.is_symlink) {
+            const int current_class = compression_type_class(item);
+            const auto minimum_group = std::max<std::size_t>(
+                1, std::min<std::size_t>(std::size_t{1} << 20, block_size / 4));
+            if (previous_file_class && *previous_file_class != current_class &&
+                buffer.size() >= minimum_group) {
+                flush_block(item.archive_path);
+            }
+            previous_file_class = current_class;
         }
 
         EntryRec entry;
@@ -1797,6 +1858,8 @@ void compress_items_into(std::ofstream& out, std::uint64_t& written,
         auto crc = core::crc32_init();
         core::Blake3 hasher;
         std::uint64_t total = 0;
+        codec::TransformHint transform_hint;
+        bool transform_classified = false;
         std::error_code size_error;
         std::uint64_t file_total = fs::file_size(item.absolute, size_error);
         if (size_error) {
@@ -1814,8 +1877,36 @@ void compress_items_into(std::ofstream& out, std::uint64_t& written,
             const std::span<const std::uint8_t> bytes(
                 reinterpret_cast<const std::uint8_t*>(io_buffer.data()),
                 static_cast<std::size_t>(got));
+            if (!transform_classified) {
+                transform_classified = true;
+                if (options.enable_file_filters) {
+                    transform_hint = codec::detect_transform_hint(bytes);
+                }
+            }
             crc = core::crc32_update(crc, bytes);
             hasher.update(bytes);
+            if (transform_hint.transform != CompressionTransform::none) {
+                CompressionTransformRange range{
+                    transform_hint.transform,
+                    static_cast<std::uint64_t>(buffer.size()),
+                    static_cast<std::uint64_t>(bytes.size()),
+                    total,
+                    transform_hint.parameter,
+                };
+                if (!buffer_transform_ranges.empty()) {
+                    auto& previous = buffer_transform_ranges.back();
+                    if (previous.transform == range.transform &&
+                        previous.parameter == range.parameter &&
+                        previous.offset + previous.size == range.offset &&
+                        previous.source_offset + previous.size == range.source_offset) {
+                        previous.size += range.size;
+                    } else {
+                        buffer_transform_ranges.push_back(range);
+                    }
+                } else {
+                    buffer_transform_ranges.push_back(range);
+                }
+            }
             total += static_cast<std::uint64_t>(got);
             // completed_bytes intentionally does not advance here: bytes are
             // counted when their block finishes compressing (see flush_block),

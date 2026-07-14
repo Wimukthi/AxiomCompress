@@ -705,6 +705,7 @@ ByteVector encode_lz77_tree(std::span<const std::uint8_t> input,
 
     const auto max_match = std::max<std::size_t>(kMinMatch, options.max_match);
     const auto depth_cutoff = std::max<std::size_t>(1, options.max_chain_depth);
+    const auto nice_length = std::max<std::size_t>(kMinMatch, options.nice_length);
 
     // cyclic_pos == p % cyclic_size for the position currently being processed.
     // process() is called for strictly increasing, contiguous positions, so the
@@ -782,6 +783,55 @@ ByteVector encode_lz77_tree(std::span<const std::uint8_t> input,
         }
     };
 
+    // Search without inserting. Level 7 uses this for a one-byte lazy lookahead:
+    // the next real process() call still owns insertion, so the cyclic tree stays
+    // identical whether the current match is taken or deferred.
+    auto find_best = [&](std::size_t p, std::size_t& best_len,
+                         std::size_t& best_dist) {
+        best_len = 0;
+        best_dist = 0;
+        if (p + kMinMatch > n) {
+            return;
+        }
+
+        auto node = head[hash4(input, p)];
+        std::size_t len_smaller = 0;
+        std::size_t len_larger = 0;
+        const auto limit = std::min(max_match, n - p);
+        std::size_t cycles = depth_cutoff;
+        while (node != kNoPos) {
+            const std::size_t np = node;
+            const std::size_t delta = p - np;
+            if (delta >= cyclic_size || cycles-- == 0) {
+                return;
+            }
+
+            const auto p_slot = p % cyclic_size;
+            const auto node_slot =
+                p_slot >= delta ? p_slot - delta : p_slot + cyclic_size - delta;
+            prefetch_read(&son[2 * node_slot]);
+
+            std::size_t len = std::min(len_smaller, len_larger);
+            len += common_prefix(input.data() + np + len, input.data() + p + len,
+                                 limit - len);
+            if (len > best_len) {
+                best_len = len;
+                best_dist = delta;
+            }
+            if (len == limit) {
+                return;
+            }
+
+            if (input[np + len] < input[p + len]) {
+                node = son[2 * node_slot + 1];
+                len_smaller = len;
+            } else {
+                node = son[2 * node_slot];
+                len_larger = len;
+            }
+        }
+    };
+
     std::size_t position = 0;
     std::size_t literal_start = 0;
     std::size_t cyclic_pos = 0;
@@ -823,7 +873,36 @@ ByteVector encode_lz77_tree(std::span<const std::uint8_t> input,
         }
 
         const bool take_rep = best_rep_length >= kMinMatch && best_rep_length >= best_length;
-        const bool take_match = !take_rep && best_length >= kMinMatch;
+        bool take_match = !take_rep && best_length >= kMinMatch;
+
+        if (take_match && options.lazy_matching && best_length < nice_length &&
+            position + 1 < n) {
+            std::size_t next_length = 0;
+            std::size_t next_distance = 0;
+            find_best(position + 1, next_length, next_distance);
+
+            bool defer = false;
+            if (next_length >= kMinMatch) {
+                const auto take_now = static_cast<std::uint64_t>(
+                    match_cost(best_length, best_distance));
+                const auto deferred = static_cast<std::uint64_t>(literal_cost()) +
+                                      match_cost(next_length, next_distance);
+                defer = deferred * best_length < take_now * (1 + next_length);
+            }
+            if (!defer && position + kMinMatch + 1 <= n) {
+                const auto rep_limit = std::min(max_match, n - (position + 1));
+                for (std::size_t i = 0; i < kRepCount; ++i) {
+                    if (match_length_at(input, position + 1, reps[i], rep_limit) >=
+                        best_length) {
+                        defer = true;
+                        break;
+                    }
+                }
+            }
+            if (defer) {
+                take_match = false;
+            }
+        }
 
         if (take_rep) {
             write_literal_run(output, input, literal_start, position - literal_start);

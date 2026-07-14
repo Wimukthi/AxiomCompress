@@ -76,6 +76,7 @@
     <ClInclude Include="src\codec\incompressible.hpp" />
     <ClInclude Include="src\codec\lz77.hpp" />
     <ClInclude Include="src\codec\lz77_split.hpp" />
+    <ClInclude Include="src\codec\transform.hpp" />
     <ClInclude Include="src\codec\match_copy.hpp" />
     <ClInclude Include="src\codec\varint.hpp" />
     <ClInclude Include="src\core\archive.hpp" />
@@ -122,6 +123,7 @@
     <ClCompile Include="src\codec\fast_lz.cpp" />
     <ClCompile Include="src\codec\lz77.cpp" />
     <ClCompile Include="src\codec\lz77_split.cpp" />
+    <ClCompile Include="src\codec\transform.cpp" />
     <ClCompile Include="src\core\archive.cpp" />
     <ClCompile Include="src\core\checksum.cpp" />
     <ClCompile Include="src\core\checksum_clmul.cpp" />

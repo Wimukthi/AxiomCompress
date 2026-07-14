@@ -18,6 +18,8 @@ struct ArchiveHeader {
     std::uint64_t original_size = 0;
     std::uint64_t payload_size = 0;
     std::uint32_t crc32 = 0;
+    std::vector<CompressionTransformRange> transform_ranges;
+    std::size_t payload_offset = 32;
 };
 
 ByteVector write_archive(std::span<const std::uint8_t> payload,

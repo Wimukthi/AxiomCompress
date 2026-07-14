@@ -74,9 +74,44 @@ than `block_size` spans several blocks.
 Each block's bytes are compressed with `axiom::compress`, producing a
 self-contained `.axc` payload (with its own header and CRC-32 — this is the
 per-block integrity check). Blocks are written back-to-back after the header. The
-`.axc` stream is its own versioned format (currently version `4`) and is described
+`.axc` stream is its own versioned format (currently version `5`) and is described
 in [ARCHITECTURE.md](ARCHITECTURE.md); the container does not interpret a block's
 internals beyond its declared size and checksum.
+
+Before building solid blocks, current writers group regular files by broad type
+and then by extension. This writer policy improves cross-file matching without
+changing AXAR directory semantics. Directories and links retain their scan order.
+
+#### Embedded AXC version 5 header and transforms
+
+Version 5 keeps the original fixed AXC fields and adds a bounded transform
+metadata area before the codec payload:
+
+| field | type | notes |
+|---|---|---|
+| magic | u8[8] | `"AXIOMC1\0"` |
+| version | u16 | `5` |
+| codec | u8 | inner store/LZ/parallel codec identifier |
+| flags | u8 | bit `0x01` means transform metadata is present |
+| original_size | u64 | restored byte count |
+| payload_size | u64 | inner codec payload only |
+| crc32 | u32 | CRC-32 of the original bytes after inverse transforms |
+| transform_metadata_size | u32 | bytes before the codec payload |
+| transform_metadata | u8[] | transform ranges, empty when flags are zero |
+| payload | u8[] | bytes consumed by the selected inner codec |
+
+Transform metadata begins with a vint range count. Each range stores a transform
+id (`1` = x86/x64 relative branch conversion, `2` = byte delta), one parameter
+byte (the delta stride, or zero for x86), followed by vint `offset`, `size`, and
+logical `source_offset`. Ranges are ordered, non-overlapping, and bounded by
+`original_size`. Independent source offsets let files and file fragments reset a
+filter safely when several inputs share a solid block or one file spans blocks.
+
+Writers content-check PE, PCM WAV, and uncompressed BMP inputs and run a small
+trial encode before enabling a candidate. Unsupported, overlapping, out-of-range,
+or implausibly numerous ranges are rejected before decode allocation. Version 5
+readers continue to accept canonical version 4 streams, whose payload begins at
+the old 32-byte fixed header.
 
 ### Central directory (at `directory_offset`)
 
@@ -303,11 +338,11 @@ declared size. The decoder defends against this before allocating:
 
 ## Compatibility policy
 
-The format is **pre-release and free to change**, so writers and readers are
-deliberately strict: a reader accepts **only the exact current version** it was
-built for (`.axar` container = `4`, embedded `.axc` stream = `4`) and rejects
-anything else with a clear error. There is **no backward or forward compatibility
-yet** — an archive must be produced and read by the same build generation.
+The format is **pre-release and free to change**. The AXAR container remains
+strictly version `4`. New embedded AXC streams are version `5`; current readers
+also accept legacy AXC version `4`, while older readers reject version `5`.
+Unknown AXAR versions, AXC versions, required flags, codecs, transforms, and
+transform parameters are rejected with a clear error.
 
 The `version` field and the reserved `flags` bitfield exist so that, once the
 format stabilizes, an incompatible structural change can bump `version` while

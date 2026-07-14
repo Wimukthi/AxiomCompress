@@ -51,6 +51,9 @@
     <ClInclude Include="src\codec\lz77_split.hpp">
       <Filter>Codec</Filter>
     </ClInclude>
+    <ClInclude Include="src\codec\transform.hpp">
+      <Filter>Codec</Filter>
+    </ClInclude>
     <ClInclude Include="src\codec\match_copy.hpp">
       <Filter>Codec</Filter>
     </ClInclude>
@@ -144,6 +147,9 @@
       <Filter>Codec</Filter>
     </ClCompile>
     <ClCompile Include="src\codec\lz77_split.cpp">
+      <Filter>Codec</Filter>
+    </ClCompile>
+    <ClCompile Include="src\codec\transform.cpp">
       <Filter>Codec</Filter>
     </ClCompile>
     <ClCompile Include="src\core\archive.cpp">

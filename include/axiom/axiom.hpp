@@ -239,6 +239,23 @@ private:
     mutable std::string progress_writer_path_;
 };
 
+enum class CompressionTransform : std::uint8_t {
+    none = 0,
+    x86_branch = 1,
+    delta = 2,
+};
+
+// A reversible pre-compression transform applied to one byte range. Archive
+// solid blocks can contain several files, so ranges carry their own logical
+// source position and reset independently at file and block boundaries.
+struct CompressionTransformRange {
+    CompressionTransform transform = CompressionTransform::none;
+    std::uint64_t offset = 0;
+    std::uint64_t size = 0;
+    std::uint64_t source_offset = 0;
+    std::uint8_t parameter = 0;  // Delta byte stride; zero for x86 branch filtering.
+};
+
 struct CompressionOptions {
     std::size_t window_size = 1u << 20;
     std::size_t max_match = 273;
@@ -291,6 +308,11 @@ struct CompressionOptions {
     // update paths deliberately ignore this option to preserve old entries.
     bool skip_unreadable_files = false;
     unsigned input_open_retries = 4;
+    // File-aware reversible filters are selected only when a fast trial predicts
+    // a net win. Archive writers populate ranges from individual file content;
+    // direct compress() calls auto-detect a supported whole-input transform.
+    bool enable_file_filters = true;
+    std::vector<CompressionTransformRange> transform_ranges;
     std::shared_ptr<OperationControl> operation;
     // Within-compress progress: when set, the parallel block codec calls this
     // with the cumulative number of this compress() call's input bytes whose
@@ -386,6 +408,7 @@ inline void apply_compression_level(CompressionOptions& options, int level) {
             options.max_chain_depth = 128;
             options.block_size = 8u << 20;
             options.window_size = 8u << 20;
+            options.lazy_matching = true;
             options.fast_entropy = false;
             break;
         case 8:
@@ -396,6 +419,7 @@ inline void apply_compression_level(CompressionOptions& options, int level) {
             options.max_chain_depth = 128;
             options.block_size = 32u << 20;
             options.window_size = 32u << 20;
+            options.lazy_matching = false;
             options.fast_entropy = false;
             options.enable_optimal_parser = true;
             options.optimal_two_pass = false;
@@ -405,15 +429,13 @@ inline void apply_compression_level(CompressionOptions& options, int level) {
         case 9:
             // Maximum preset keeps the deepest tree search and uses larger
             // blocks than level 8 so cross-block repetition can improve ratio.
-            // It is also the only preset that turns on the optimal parser:
-            // levels 7 and 8 land within a fraction of a percent of each other
-            // on mixed corpora, so the DP parse is what makes 9 the genuine
-            // max-ratio point (multi-block inputs run it per block on all
-            // workers).
+            // Its second DP pass is what makes it the genuine max-ratio point;
+            // multi-block inputs run the parse per block on all workers.
             options.use_tree_matcher = true;
             options.max_chain_depth = 512;
             options.block_size = 64u << 20;
             options.window_size = 64u << 20;
+            options.lazy_matching = false;
             options.fast_entropy = false;
             options.enable_optimal_parser = true;
             break;

@@ -64,6 +64,7 @@ add_library(axiom STATIC
     src/codec/fast_lz.cpp
     src/codec/lz77.cpp
     src/codec/lz77_split.cpp
+    src/codec/transform.cpp
     src/core/archive.cpp
     src/core/checksum.cpp
     src/core/checksum_clmul.cpp

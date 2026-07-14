@@ -4,6 +4,7 @@
 #include "codec/incompressible.hpp"
 #include "codec/lz77.hpp"
 #include "codec/lz77_split.hpp"
+#include "codec/transform.hpp"
 #include "core/checksum.hpp"
 #include "core/file_replace.hpp"
 #include "core/path_text.hpp"
@@ -29,8 +30,11 @@ namespace core {
 namespace {
 
 constexpr std::array<std::uint8_t, 8> kMagic = {'A', 'X', 'I', 'O', 'M', 'C', '1', '\0'};
-constexpr std::uint16_t kVersion = 4;
-constexpr std::size_t kHeaderSize = 32;
+constexpr std::uint16_t kLegacyVersion = 4;
+constexpr std::uint16_t kVersion = 5;
+constexpr std::size_t kLegacyHeaderSize = 32;
+constexpr std::size_t kHeaderSize = 36;
+constexpr std::uint8_t kFlagTransforms = 1u << 0;
 
 void write_u16(ByteVector& output, std::uint16_t value) {
     output.push_back(static_cast<std::uint8_t>(value));
@@ -193,23 +197,30 @@ std::size_t lz_payload_limit(std::uint64_t original_size) {
 
 ByteVector write_archive(std::span<const std::uint8_t> payload,
                          const ArchiveHeader& header) {
+    const auto transform_metadata = codec::serialize_transform_ranges(
+        header.transform_ranges);
+    if (transform_metadata.size() > std::numeric_limits<std::uint32_t>::max()) {
+        throw std::runtime_error("transform metadata exceeds format limit");
+    }
     ByteVector output;
-    output.reserve(kHeaderSize + payload.size());
+    output.reserve(kHeaderSize + transform_metadata.size() + payload.size());
 
     output.insert(output.end(), kMagic.begin(), kMagic.end());
     write_u16(output, kVersion);
     output.push_back(static_cast<std::uint8_t>(header.codec));
-    output.push_back(0);
+    output.push_back(header.transform_ranges.empty() ? 0 : kFlagTransforms);
     write_u64(output, header.original_size);
     write_u64(output, header.payload_size);
     write_u32(output, header.crc32);
+    write_u32(output, static_cast<std::uint32_t>(transform_metadata.size()));
+    output.insert(output.end(), transform_metadata.begin(), transform_metadata.end());
     output.insert(output.end(), payload.begin(), payload.end());
 
     return output;
 }
 
 ArchiveHeader read_archive_header(std::span<const std::uint8_t> archive) {
-    if (archive.size() < kHeaderSize) {
+    if (archive.size() < kLegacyHeaderSize) {
         throw FormatError("archive is smaller than the fixed header");
     }
 
@@ -219,12 +230,12 @@ ArchiveHeader read_archive_header(std::span<const std::uint8_t> archive) {
 
     std::size_t cursor = kMagic.size();
     const auto version = read_u16(archive, cursor);
-    if (version != kVersion) {
+    if (version != kLegacyVersion && version != kVersion) {
         throw FormatError("unsupported archive version");
     }
 
     const auto codec_byte = archive[cursor++];
-    ++cursor;  // reserved flags byte
+    const auto flags = archive[cursor++];
 
     ArchiveHeader header;
     if (codec_byte == static_cast<std::uint8_t>(CodecId::store)) {
@@ -247,11 +258,39 @@ ArchiveHeader read_archive_header(std::span<const std::uint8_t> archive) {
     header.payload_size = read_u64(archive, cursor);
     header.crc32 = read_u32(archive, cursor);
 
-    if (header.payload_size > archive.size() - kHeaderSize) {
+    if (version == kLegacyVersion) {
+        header.payload_offset = kLegacyHeaderSize;
+    } else {
+        if (archive.size() < kHeaderSize) {
+            throw FormatError("version 5 archive is smaller than the fixed header");
+        }
+        if ((flags & ~kFlagTransforms) != 0) {
+            throw FormatError("unsupported archive flags");
+        }
+        const auto metadata_size = static_cast<std::size_t>(read_u32(archive, cursor));
+        if (metadata_size > archive.size() - kHeaderSize) {
+            throw FormatError("transform metadata exceeds archive size");
+        }
+        const bool has_transforms = (flags & kFlagTransforms) != 0;
+        if (has_transforms != (metadata_size != 0)) {
+            throw FormatError("transform flag does not match metadata");
+        }
+        if (has_transforms) {
+            const auto metadata = archive.subspan(kHeaderSize, metadata_size);
+            header.transform_ranges =
+                codec::deserialize_transform_ranges(metadata, header.original_size);
+            if (header.transform_ranges.empty()) {
+                throw FormatError("transform metadata contains no usable ranges");
+            }
+        }
+        header.payload_offset = kHeaderSize + metadata_size;
+    }
+
+    if (header.payload_size > archive.size() - header.payload_offset) {
         throw FormatError("payload size exceeds archive size");
     }
 
-    if (archive.size() != kHeaderSize + header.payload_size) {
+    if (archive.size() != header.payload_offset + header.payload_size) {
         throw FormatError("archive has trailing bytes after payload");
     }
 
@@ -260,7 +299,8 @@ ArchiveHeader read_archive_header(std::span<const std::uint8_t> archive) {
 
 std::span<const std::uint8_t> archive_payload(std::span<const std::uint8_t> archive,
                                               const ArchiveHeader& header) {
-    return archive.subspan(kHeaderSize, static_cast<std::size_t>(header.payload_size));
+    return archive.subspan(header.payload_offset,
+                           static_cast<std::size_t>(header.payload_size));
 }
 
 }  // namespace core
@@ -273,6 +313,53 @@ ByteVector compress(std::span<const std::uint8_t> input,
     if (options.encoded_bytes_progress) {
         options.encoded_bytes_progress(0);
     }
+
+    const auto original_input = input;
+    ByteVector transformed_input;
+    std::vector<CompressionTransformRange> active_transforms;
+    if (options.enable_file_filters && !options.force_store && !input.empty()) {
+        std::vector<CompressionTransformRange> requested = options.transform_ranges;
+        if (requested.empty()) {
+            const auto hint = codec::detect_transform_hint(input);
+            if (hint.transform != CompressionTransform::none) {
+                requested.push_back({hint.transform, 0,
+                                     static_cast<std::uint64_t>(input.size()), 0,
+                                     hint.parameter});
+            }
+        }
+        active_transforms = codec::normalize_transform_ranges(requested, input.size());
+        if (!active_transforms.empty()) {
+            transformed_input = codec::apply_transform_ranges(input, active_transforms);
+            if (codec::transformed_sample_is_smaller(input, transformed_input,
+                                                     active_transforms, options)) {
+                input = transformed_input;
+            } else {
+                active_transforms.clear();
+                transformed_input.clear();
+            }
+        }
+    }
+
+    auto finish_archive = [&](ByteVector result_payload, core::CodecId result_codec,
+                              std::optional<std::uint32_t> encoded_crc = std::nullopt) {
+        if (result_codec == core::CodecId::store && !active_transforms.empty()) {
+            // A stored transformed stream can only add metadata and work. Preserve
+            // the original bytes and omit the transform envelope in this case.
+            result_payload.assign(original_input.begin(), original_input.end());
+            active_transforms.clear();
+        }
+        const auto crc = active_transforms.empty() && encoded_crc
+            ? *encoded_crc
+            : core::crc32(original_input);
+        const core::ArchiveHeader header{
+            result_codec,
+            static_cast<std::uint64_t>(original_input.size()),
+            static_cast<std::uint64_t>(result_payload.size()),
+            crc,
+            active_transforms,
+        };
+        return core::write_archive(result_payload, header);
+    };
 
     ByteVector payload;
     auto codec = core::CodecId::store;
@@ -307,16 +394,11 @@ ByteVector compress(std::span<const std::uint8_t> input,
             std::uint32_t block_crc = 0;
             const auto block_payload =
                 codec::encode_parallel_blocks(input, parallel_options, &block_crc);
-            const core::ArchiveHeader header{
-                core::CodecId::parallel_blocks,
-                static_cast<std::uint64_t>(input.size()),
-                static_cast<std::uint64_t>(block_payload.size()),
-                block_crc,
-            };
             if (options.encoded_bytes_progress) {
                 options.encoded_bytes_progress(static_cast<std::uint64_t>(input.size()));
             }
-            return core::write_archive(block_payload, header);
+            return finish_archive(std::move(block_payload),
+                                  core::CodecId::parallel_blocks, block_crc);
         }
 
         if (options.use_fast_lz) {
@@ -324,29 +406,18 @@ ByteVector compress(std::span<const std::uint8_t> input,
             auto block_payload =
                 codec::encode_parallel_blocks(input, parallel_options, &block_crc);
             if (block_payload.size() < input.size()) {
-                const core::ArchiveHeader header{
-                    core::CodecId::parallel_blocks,
-                    static_cast<std::uint64_t>(input.size()),
-                    static_cast<std::uint64_t>(block_payload.size()),
-                    block_crc,
-                };
                 if (options.encoded_bytes_progress) {
                     options.encoded_bytes_progress(static_cast<std::uint64_t>(input.size()));
                 }
-                return core::write_archive(block_payload, header);
+                return finish_archive(std::move(block_payload),
+                                      core::CodecId::parallel_blocks, block_crc);
             }
 
-            payload.assign(input.begin(), input.end());
-            const core::ArchiveHeader header{
-                core::CodecId::store,
-                static_cast<std::uint64_t>(input.size()),
-                static_cast<std::uint64_t>(payload.size()),
-                core::crc32(input),
-            };
+            payload.assign(original_input.begin(), original_input.end());
             if (options.encoded_bytes_progress) {
                 options.encoded_bytes_progress(static_cast<std::uint64_t>(input.size()));
             }
-            return core::write_archive(payload, header);
+            return finish_archive(std::move(payload), core::CodecId::store);
         }
 
         const auto evaluate_parallel_candidate = block_count > 1 && workers > 1;
@@ -488,20 +559,13 @@ ByteVector compress(std::span<const std::uint8_t> input,
         }
     }
 
-    const core::ArchiveHeader header{
-        codec,
-        static_cast<std::uint64_t>(input.size()),
-        static_cast<std::uint64_t>(payload.size()),
-        payload_crc ? *payload_crc : core::crc32(input),
-    };
-
     if (options.operation) {
         options.operation->checkpoint();
     }
     if (options.encoded_bytes_progress) {
         options.encoded_bytes_progress(static_cast<std::uint64_t>(input.size()));
     }
-    return core::write_archive(payload, header);
+    return finish_archive(std::move(payload), codec, payload_crc);
 }
 
 ByteVector decompress(std::span<const std::uint8_t> archive,
@@ -562,6 +626,13 @@ ByteVector decompress(std::span<const std::uint8_t> archive,
 
     if (restored.size() != header.original_size) {
         throw FormatError("restored size does not match archive header");
+    }
+
+    if (!header.transform_ranges.empty()) {
+        codec::inverse_transform_ranges(restored, header.transform_ranges);
+        // Parallel block CRCs cover the filtered representation. The public AXC
+        // CRC always authenticates the caller's original bytes after inversion.
+        restored_crc.reset();
     }
 
     if (options.operation) {

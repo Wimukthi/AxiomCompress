@@ -84,7 +84,7 @@ void print_usage() {
         "  --threads N        --block-size SIZE   --parallel\n"
         "  --chain-depth N    --nice N            (match-finder speed/ratio)\n"
         "  --lazy / --no-lazy  --fast-entropy     (override level knobs)\n"
-        "  --fast-lz                              (byte-token fast profile)\n"
+        "  --fast-lz          --no-filters        (byte-token profile / disable file filters)\n"
         "  --window SIZE                          (match window; bounds --bt memory)\n"
         "  --recovery N                           add 1..100% Reed-Solomon recovery data\n"
         "  --bt                                   (binary-tree match finder)\n"
@@ -585,6 +585,8 @@ bool take_compression_flags(std::vector<std::string>& args, axiom::CompressionOp
             options.use_fast_lz = true;
             options.use_tree_matcher = false;
             options.enable_optimal_parser = false;
+        } else if (arg == "--no-filters") {
+            options.enable_file_filters = false;
         } else if (arg == "--threads") {
             options.thread_count = parse_size(next("--threads"));
         } else if (arg == "-p" || arg == "--password") {

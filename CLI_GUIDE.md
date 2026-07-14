@@ -373,15 +373,15 @@ axiomc a --max maximum-ratio.axar Data
 | 2-3 | Shallow hash-chain search, price-aware lazy | Fast backups |
 | 4-5 | Balanced hash-chain search, price-aware lazy | General use |
 | 6 | Deep hash-chain search | Better ratio without tree memory |
-| 7 | Binary tree (greedy), 8 MiB window | Long-range redundancy (inputs with repeats beyond the 1 MiB chain window) |
+| 7 | Binary tree + cost-aware lazy lookahead, 8 MiB window | Long-range redundancy without optimal-parse cost |
 | 8 | Binary tree + single-pass optimal parse, 32 MiB window | Very high ratio at moderate time |
 | 9 | Binary tree + two-pass optimal parse, 64 MiB window | Maximum preset |
 
 Levels 8 and 9 run the dynamic-programming optimal parser (candidates come from
 the binary tree); on generic data they compress substantially smaller than
-levels 6-7. Level 7's greedy long-range search only pays off when the input
-actually contains redundancy beyond the hash-chain levels' 1 MiB window — on
-ordinary mixed data level 6 often matches it at half the time.
+levels 6-7. Level 7 uses a cheaper one-byte, token-cost-aware lookahead on the
+tree matcher. It can defer an expensive match for a better match or repeat
+offset at the next position without paying for a full DP parse.
 
 Explicit tuning options override the level regardless of argument order.
 
@@ -423,6 +423,25 @@ for repeatable benchmarks or deliberate memory/ratio tuning.
 ```powershell
 axiomc a --block-size 32M archive.axar Data
 ```
+
+### File-aware filters: automatic, `--no-filters` to disable
+
+AXAR creation groups similar file types before filling solid blocks. PE x86/x64
+executables can use a reversible relative-branch filter, while PCM WAV and
+uncompressed BMP data can use a reversible delta filter. Detection checks file
+content rather than trusting the extension, and a fast trial keeps the transform
+only when it predicts a net reduction after metadata.
+
+Filters are enabled by default for AXAR and single-stream AXC compression. Use
+`--no-filters` for an unfiltered comparison or compatibility benchmark:
+
+```powershell
+axiomc c --level 9 --no-filters app.exe app-unfiltered.axc
+axiomc a --level 9 --no-filters archive.axar Data
+```
+
+New filtered streams use AXC version 5. The reader remains compatible with AXC
+version 4, but older Axiom builds do not understand version-5 streams.
 
 ### Dictionary size: `--window SIZE`
 

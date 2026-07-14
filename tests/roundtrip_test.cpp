@@ -4,6 +4,7 @@
 #include "codec/fast_lz.hpp"
 #include "codec/lz77.hpp"
 #include "codec/lz77_split.hpp"
+#include "codec/transform.hpp"
 #include "core/checksum.hpp"
 #include "core/cpu.hpp"
 #include "core/hash.hpp"
@@ -179,9 +180,17 @@ void test_compression_level_presets() {
     AXIOM_CHECK(stronger_chain.max_chain_depth == 256);
     AXIOM_CHECK(stronger_chain.nice_length == 192);
 
+    axiom::CompressionOptions lazy_tree;
+    lazy_tree.lazy_matching = false;
+    axiom::apply_compression_level(lazy_tree, 7);
+    AXIOM_CHECK(lazy_tree.use_tree_matcher);
+    AXIOM_CHECK(lazy_tree.lazy_matching);
+    AXIOM_CHECK(!lazy_tree.enable_optimal_parser);
+
     axiom::CompressionOptions wide_tree;
     axiom::apply_compression_level(wide_tree, 8);
     AXIOM_CHECK(wide_tree.use_tree_matcher);
+    AXIOM_CHECK(!wide_tree.lazy_matching);
     AXIOM_CHECK(wide_tree.max_chain_depth == 128);
     AXIOM_CHECK(wide_tree.block_size == (32u << 20));
     AXIOM_CHECK(wide_tree.window_size == (32u << 20));
@@ -480,6 +489,208 @@ void test_write_le32(std::vector<std::uint8_t>& bytes, std::size_t offset,
     bytes[offset + 1] = static_cast<std::uint8_t>(value >> 8);
     bytes[offset + 2] = static_cast<std::uint8_t>(value >> 16);
     bytes[offset + 3] = static_cast<std::uint8_t>(value >> 24);
+}
+
+std::vector<std::uint8_t> synthetic_x64_image() {
+    std::vector<std::uint8_t> image(768u << 10, 0x90);
+    image[0] = 'M';
+    image[1] = 'Z';
+    test_write_le32(image, 0x3c, 0x80);
+    image[0x80] = 'P';
+    image[0x81] = 'E';
+    image[0x82] = 0;
+    image[0x83] = 0;
+    test_write_le16(image, 0x84, 0x8664);
+    constexpr std::uint32_t target = 0x00402000;
+    for (std::size_t pos = 512; pos + 16 <= image.size(); pos += 16) {
+        image[pos] = 0xe8;
+        test_write_le32(image, pos + 1,
+                        target - static_cast<std::uint32_t>(pos + 5));
+        image[pos + 5] = 0x48;
+        image[pos + 6] = 0x8b;
+        image[pos + 7] = 0xc1;
+    }
+    return image;
+}
+
+std::vector<std::uint8_t> synthetic_pcm_wave() {
+    constexpr std::size_t frames = 128u << 10;
+    std::vector<std::uint8_t> wave(44 + frames * 4, 0);
+    wave[0] = 'R'; wave[1] = 'I'; wave[2] = 'F'; wave[3] = 'F';
+    test_write_le32(wave, 4, static_cast<std::uint32_t>(wave.size() - 8));
+    wave[8] = 'W'; wave[9] = 'A'; wave[10] = 'V'; wave[11] = 'E';
+    wave[12] = 'f'; wave[13] = 'm'; wave[14] = 't'; wave[15] = ' ';
+    test_write_le32(wave, 16, 16);
+    test_write_le16(wave, 20, 1);       // PCM
+    test_write_le16(wave, 22, 2);       // stereo
+    test_write_le32(wave, 24, 48000);
+    test_write_le32(wave, 28, 48000 * 4);
+    test_write_le16(wave, 32, 4);       // interleaved frame stride
+    test_write_le16(wave, 34, 16);
+    wave[36] = 'd'; wave[37] = 'a'; wave[38] = 't'; wave[39] = 'a';
+    test_write_le32(wave, 40, static_cast<std::uint32_t>(frames * 4));
+    for (std::size_t frame = 0; frame < frames; ++frame) {
+        test_write_le16(wave, 44 + frame * 4,
+                        static_cast<std::uint16_t>(frame * 3));
+        test_write_le16(wave, 46 + frame * 4,
+                        static_cast<std::uint16_t>(frame * 5));
+    }
+    return wave;
+}
+
+void test_reversible_transforms_and_v5() {
+    auto source = synthetic_x64_image();
+    AXIOM_CHECK(axiom::codec::detect_transform_hint(source).transform ==
+                axiom::CompressionTransform::x86_branch);
+    std::vector<axiom::CompressionTransformRange> ranges{
+        {axiom::CompressionTransform::x86_branch, 512,
+         static_cast<std::uint64_t>(source.size() - 512), 512, 0},
+    };
+    const auto normalized = axiom::codec::normalize_transform_ranges(ranges, source.size());
+    const auto metadata = axiom::codec::serialize_transform_ranges(normalized);
+    const auto decoded_ranges =
+        axiom::codec::deserialize_transform_ranges(metadata, source.size());
+    AXIOM_CHECK(decoded_ranges.size() == 1);
+    auto transformed = axiom::codec::apply_transform_ranges(source, decoded_ranges);
+    AXIOM_CHECK(transformed != source);
+    axiom::codec::inverse_transform_ranges(transformed, decoded_ranges);
+    AXIOM_CHECK(transformed == source);
+
+    std::vector<std::uint8_t> delta_source(32u << 10);
+    for (std::size_t i = 0; i < delta_source.size(); ++i) {
+        delta_source[i] = static_cast<std::uint8_t>((i / 4 + (i % 4) * 17) & 0xff);
+    }
+    const std::vector<axiom::CompressionTransformRange> delta_ranges{
+        {axiom::CompressionTransform::delta, 0,
+         static_cast<std::uint64_t>(delta_source.size()), 0, 4},
+    };
+    auto delta = axiom::codec::apply_transform_ranges(delta_source, delta_ranges);
+    AXIOM_CHECK(delta != delta_source);
+    axiom::codec::inverse_transform_ranges(delta, delta_ranges);
+    AXIOM_CHECK(delta == delta_source);
+
+    axiom::CompressionOptions options;
+    options.thread_count = 1;
+    options.block_size = 1u << 20;
+    const auto filtered = axiom::compress(source, options);
+    options.enable_file_filters = false;
+    const auto plain = axiom::compress(source, options);
+    AXIOM_CHECK(test_read_le16(filtered, 8) == 5);
+    AXIOM_CHECK((filtered[11] & 1u) != 0);
+    AXIOM_CHECK(test_read_le32(filtered, 32) != 0);
+    AXIOM_CHECK(filtered.size() < plain.size());
+    AXIOM_CHECK(axiom::decompress(filtered) == source);
+
+    // A useful transformed file can occupy only a small middle range of a large
+    // solid block. The trial must sample that range instead of missing it while
+    // sampling unrelated bytes from the block.
+    std::vector<std::uint8_t> sparse_block(8u << 20);
+    std::uint32_t noise = 0x12345678u;
+    for (auto& byte : sparse_block) {
+        noise = noise * 1664525u + 1013904223u;
+        byte = static_cast<std::uint8_t>(noise >> 24);
+    }
+    constexpr std::size_t sparse_offset = (3u << 20) + (256u << 10);
+    std::copy(source.begin(), source.end(), sparse_block.begin() + sparse_offset);
+    axiom::CompressionOptions sparse_options;
+    sparse_options.thread_count = 1;
+    sparse_options.transform_ranges = {{
+        axiom::CompressionTransform::x86_branch,
+        sparse_offset,
+        static_cast<std::uint64_t>(source.size()),
+        0,
+        0,
+    }};
+    const auto sparse_filtered = axiom::compress(sparse_block, sparse_options);
+    AXIOM_CHECK((sparse_filtered[11] & 1u) != 0);
+    AXIOM_CHECK(axiom::decompress(sparse_filtered) == sparse_block);
+
+    const auto wave = synthetic_pcm_wave();
+    axiom::CompressionOptions wave_options;
+    wave_options.thread_count = 1;
+    const auto filtered_wave = axiom::compress(wave, wave_options);
+    wave_options.enable_file_filters = false;
+    const auto plain_wave = axiom::compress(wave, wave_options);
+    AXIOM_CHECK((filtered_wave[11] & 1u) != 0);
+    AXIOM_CHECK(filtered_wave.size() < plain_wave.size());
+    AXIOM_CHECK(axiom::decompress(filtered_wave) == wave);
+
+    auto bad_flag = filtered;
+    bad_flag[11] = 0;
+    expect_throws([&] { (void)axiom::decompress(bad_flag); });
+    auto bad_size = filtered;
+    test_write_le32(bad_size, 32, 0xffffffffu);
+    expect_throws([&] { (void)axiom::decompress(bad_size); });
+    auto bad_transform = filtered;
+    bad_transform[37] = 0xff;  // metadata starts with count, then transform id
+    expect_throws([&] { (void)axiom::decompress(bad_transform); });
+
+    // Version 4 used the same 32-byte fixed header without the v5 metadata-size
+    // field. New decoders continue to accept a canonical legacy stream.
+    auto legacy = plain;
+    AXIOM_CHECK(legacy[11] == 0 && test_read_le32(legacy, 32) == 0);
+    legacy.erase(legacy.begin() + 32, legacy.begin() + 36);
+    test_write_le16(legacy, 8, 4);
+    AXIOM_CHECK(axiom::decompress(legacy) == source);
+
+    const std::vector<axiom::CompressionTransformRange> overlapping{
+        {axiom::CompressionTransform::delta, 0, 8192, 0, 1},
+        {axiom::CompressionTransform::delta, 4096, 8192, 0, 1},
+    };
+    expect_throws([&] {
+        (void)axiom::codec::normalize_transform_ranges(overlapping, 16384);
+    });
+}
+
+void test_filtered_axar_roundtrip() {
+    const auto root = make_temp_dir();
+    const auto executable_one = root / "one.exe";
+    const auto executable_two = root / "two.dll";
+    const auto text_path = root / "notes.txt";
+    auto second_image = synthetic_x64_image();
+    second_image[0x100] ^= 0x5a;
+    write_all(executable_one, synthetic_x64_image());
+    write_all(executable_two, second_image);
+    write_all(text_path, bytes_from_string(std::string(96u << 10, 'T')));
+
+    axiom::CompressionOptions options;
+    options.thread_count = 1;
+    options.block_size = 4u << 20;
+    options.auto_block_size_for_threads = false;
+    const auto filtered_archive = root / "filtered.axar";
+    const auto plain_archive = root / "plain.axar";
+    axiom::create_archive({executable_one, text_path, executable_two},
+                          filtered_archive, options);
+    options.enable_file_filters = false;
+    axiom::create_archive({executable_one, text_path, executable_two},
+                          plain_archive, options);
+    AXIOM_CHECK(fs::file_size(filtered_archive) < fs::file_size(plain_archive));
+    axiom::test_archive(filtered_archive);
+
+    axiom::CompressionEstimateOptions estimate_options;
+    estimate_options.compression = options;
+    estimate_options.compression.enable_file_filters = true;
+    estimate_options.sample_budget = 1u << 20;
+    estimate_options.sample_chunk_size = 256u << 10;
+    estimate_options.time_budget = std::chrono::seconds(10);
+    const auto filtered_estimate =
+        axiom::estimate_compression({executable_one}, estimate_options);
+    estimate_options.compression.enable_file_filters = false;
+    const auto plain_estimate =
+        axiom::estimate_compression({executable_one}, estimate_options);
+    AXIOM_CHECK(filtered_estimate.estimated_archive_bytes <
+                plain_estimate.estimated_archive_bytes);
+
+    const auto destination = root / "out";
+    axiom::ExtractOptions extraction;
+    extraction.overwrite = axiom::ExtractOptions::Overwrite::overwrite;
+    axiom::extract_archive(filtered_archive, destination, extraction);
+    AXIOM_CHECK(read_all(destination / "one.exe") == read_all(executable_one));
+    AXIOM_CHECK(read_all(destination / "two.dll") == read_all(executable_two));
+    AXIOM_CHECK(read_all(destination / "notes.txt") == read_all(text_path));
+
+    std::error_code ec;
+    fs::remove_all(root, ec);
 }
 
 void test_archive_roundtrip() {
@@ -2998,6 +3209,8 @@ int main() {
     AXIOM_CHECK(failed);
 
     test_compression_level_presets();
+    test_reversible_transforms_and_v5();
+    test_filtered_axar_roundtrip();
     test_crc32();
     test_blake3();
     test_reed_solomon();

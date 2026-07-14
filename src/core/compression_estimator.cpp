@@ -1,4 +1,5 @@
 #include "axiom/archive.hpp"
+#include "codec/transform.hpp"
 
 #include "core/path_text.hpp"
 #include "third_party/miniz/miniz.h"
@@ -470,6 +471,8 @@ CompressionEstimateResult estimate_compression(
         if (operation) operation->checkpoint();
     };
     probe_options.encoded_bytes_progress = {};
+    std::vector<codec::TransformHint> transform_hints(files.size());
+    std::vector<bool> transform_hint_known(files.size(), false);
 
     for (std::size_t index = 0; index < regions.size(); ++index) {
         if (operation) operation->checkpoint();
@@ -491,9 +494,34 @@ CompressionEstimateResult estimate_compression(
             continue;
         }
         const auto codec_started = std::chrono::steady_clock::now();
+        auto region_options = probe_options;
+        region_options.transform_ranges.clear();
+        if (options.format == ArchiveFormat::axar &&
+            region_options.enable_file_filters &&
+            !transform_hint_known[region.file_index]) {
+            transform_hint_known[region.file_index] = true;
+            const SampleRegion prefix_region{
+                region.file_index, 0,
+                static_cast<std::size_t>(std::min<std::uint64_t>(
+                    files[region.file_index].size, std::size_t{64} << 10))};
+            ByteVector prefix;
+            if (read_sample_region(files[region.file_index], prefix_region,
+                                   options.compression.input_open_retries,
+                                   prefix, operation)) {
+                transform_hints[region.file_index] =
+                    codec::detect_transform_hint(prefix);
+            }
+        }
+        const auto hint = transform_hints[region.file_index];
+        if (options.format == ArchiveFormat::axar &&
+            hint.transform != CompressionTransform::none) {
+            region_options.transform_ranges.push_back({
+                hint.transform, 0, static_cast<std::uint64_t>(probe.size()),
+                region.offset, hint.parameter});
+        }
         const std::uint64_t packed = options.format == ArchiveFormat::zip
-            ? compress_zip_probe(probe, probe_options)
-            : static_cast<std::uint64_t>(compress(probe, probe_options).size());
+            ? compress_zip_probe(probe, region_options)
+            : static_cast<std::uint64_t>(compress(probe, region_options).size());
         codec_seconds += std::chrono::duration<double>(
             std::chrono::steady_clock::now() - codec_started).count();
         packed_sample_bytes = saturated_add(packed_sample_bytes, packed);
