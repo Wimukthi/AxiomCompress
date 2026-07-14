@@ -182,7 +182,7 @@ bool MainWindow::can_execute_shortcut_command(UINT command) const {
         case kEditRecoveryRecord:
             return !busy_ && has_archive && capabilities.recovery_records && archive_editable;
         case kSplitArchive:
-            return !busy_ && has_archive && capabilities.multi_volume;
+            return !busy_ && has_archive && capabilities.can_create_volumes;
         case kSignArchive:
             return !busy_ && has_archive && capabilities.authenticity && archive_editable;
         case kVerifyArchiveSignature:
@@ -334,7 +334,7 @@ std::vector<axiom::gui::CustomMenuItem> MainWindow::menu_items(UINT menu_id) con
                 {kRepackArchive, L"&Repack archive...", shortcut(kRepackArchive),
                   !busy_ && has_archive && archive_editable},
                 {kSplitArchive, L"S&plit archive...", shortcut(kSplitArchive),
-                 !busy_ && has_archive && capabilities.multi_volume},
+                 !busy_ && has_archive && capabilities.can_create_volumes},
                 {kJoinArchive, L"&Join archive volumes...", shortcut(kJoinArchive), !busy_},
                 {0, L"", L"", false, true},
                 {kView, L"&View", shortcut(kView), has_selection},
@@ -451,7 +451,7 @@ void MainWindow::show_tree_context_menu(POINT point) {
     } else if (node.kind == DirectoryTreeNodeKind::archive_directory) {
         archive_path = node.archive_path;
     } else if (node.kind == DirectoryTreeNodeKind::file &&
-               axiom::archive_provider_for_path(node.filesystem_path) != nullptr) {
+               tree_archive_was_detected(node.filesystem_path)) {
         archive_path = node.filesystem_path;
     }
     const bool is_archive = archive_path.has_value();
@@ -464,12 +464,18 @@ void MainWindow::show_tree_context_menu(POINT point) {
 
     axiom::gui::ArchiveCapabilities capabilities{};
     if (archive_path) {
-        if (const auto* provider = axiom::archive_provider_for_path(*archive_path)) {
-            try {
-                capabilities = provider->capabilities(*archive_path);
-            } catch (...) {
-                capabilities = {};
-            }
+        // Context-menu construction is a paint/input path. Parsing an archive
+        // here made large 7z/RAR menus visibly freeze. Use the async cache (or
+        // its conservative format fallback) just like the main toolbar.
+        const auto active = active_archive_path();
+        if (active && same_filesystem_path(*active, *archive_path)) {
+            capabilities = active_archive_capabilities();
+        } else {
+            queue_selected_archive_capability_probe(*archive_path);
+            capabilities.list = true;
+            capabilities.extract = true;
+            capabilities.test = true;
+            capabilities.selective_extract = true;
         }
     }
     std::vector<axiom::gui::CustomMenuItem> items{
@@ -663,92 +669,106 @@ void MainWindow::on_info() {
         }
         details.push_back({L"Archive path", archive->wstring()});
         const auto* provider = active_archive_provider();
-        const auto capabilities = active_archive_capabilities();
-        std::wstring archive_comment;
-        std::string metadata_password;
+        const auto cached_capabilities = active_archive_capabilities();
         if (provider != nullptr) {
             details.push_back({L"Format", widen(provider->info().display_name)});
         }
-        std::error_code archive_size_error;
-        const auto archive_file_size = fs::file_size(*archive, archive_size_error);
-        if (!archive_size_error) {
-            details.push_back({L"Packed total", format_size(archive_file_size)});
+        std::string metadata_password;
+        if (cached_capabilities.encrypted) {
+            auto password = password_for_archive_edit(*archive);
+            if (!password) return;
+            metadata_password = std::move(*password);
         }
-        if (provider != nullptr && provider->info().native) {
-            try {
-                const auto encryption = axiom::archive_encryption_mode(*archive);
-                if (encryption == axiom::ArchiveEncryptionMode::data_and_directory) {
-                    auto password = password_for_archive_edit(*archive);
-                    if (!password) return;
-                    metadata_password = std::move(*password);
+        const fs::path path = *archive;
+        const bool native = provider != nullptr && provider->info().native;
+        const auto catalog = archive_catalog_ &&
+                same_filesystem_path(archive_catalog_->path(), path)
+            ? archive_catalog_ : std::shared_ptr<const axiom::gui::ArchiveCatalog>{};
+        begin_background_ui_task(
+            L"Reading archive information...",
+            [this, path, provider, native, cached_capabilities,
+             details = std::move(details), catalog,
+             password = std::move(metadata_password)]() mutable {
+                auto capabilities = cached_capabilities;
+                std::wstring comment;
+                std::error_code size_error;
+                const auto file_size = fs::file_size(path, size_error);
+                if (!size_error) details.push_back({L"Packed total", format_size(file_size)});
+                try {
+                    if (provider != nullptr) {
+                        capabilities = provider->capabilities(path, password);
+                    }
+                    if (native) {
+                        const auto encryption = axiom::archive_encryption_mode(path);
+                        details.push_back({L"Encryption",
+                            encryption != axiom::ArchiveEncryptionMode::none
+                                ? L"File data encrypted" : L"None"});
+                        details.push_back({L"State",
+                            axiom::archive_is_locked(path, password)
+                                ? L"Locked (read-only)" : L"Editable"});
+                        comment = widen(axiom::archive_comment(path, password));
+                    } else {
+                        const bool can_write = capabilities.create || capabilities.update ||
+                            capabilities.delete_entries || capabilities.move_entries;
+                        details.push_back({L"Provider mode", can_write ? L"Read/write" : L"Read-only"});
+                        details.push_back({L"Full extraction", capabilities.extract ? L"Supported" : L"Not supported"});
+                        details.push_back({L"Selective extraction", capabilities.selective_extract ? L"Supported" : L"Not supported"});
+                        details.push_back({L"Integrity test", capabilities.test ? L"Supported" : L"Not supported"});
+                    }
+                    std::vector<axiom::ArchiveEntry> loaded_entries;
+                    const std::vector<axiom::ArchiveEntry>* entries = nullptr;
+                    if (catalog) {
+                        entries = &catalog->entries();
+                    } else if (provider != nullptr && capabilities.list) {
+                        loaded_entries = provider->list(path, password);
+                        entries = &loaded_entries;
+                    }
+                    if (entries) {
+                        const auto totals = summarize_archive_entries(*entries);
+                        details.push_back({L"Unpacked total", format_size(totals.unpacked)});
+                        if (!size_error) details.push_back({L"Overall ratio", format_ratio(file_size, totals.unpacked)});
+                        if (totals.has_packed) details.push_back({
+                            totals.packed_estimated ? L"Packed data (estimated)" : L"Packed data",
+                            format_packed_size(totals.packed, totals.packed_estimated)});
+                    }
+                } catch (...) {
+                    secure_clear(password);
+                    throw;
                 }
-                details.push_back({
-                    L"Encryption",
-                    encryption != axiom::ArchiveEncryptionMode::none
-                        ? L"File data encrypted"
-                        : L"None"
-                });
-                details.push_back({
-                    L"State",
-                    axiom::archive_is_locked(*archive, metadata_password)
-                        ? L"Locked (read-only)"
-                        : L"Editable"
-                });
-                archive_comment = widen(axiom::archive_comment(
-                    *archive, metadata_password));
-            } catch (...) {
-                secure_clear(metadata_password);
-                details.push_back({L"State", L"Could not read archive metadata"});
-            }
-        } else {
-            const bool can_write = capabilities.create || capabilities.update ||
-                                   capabilities.delete_entries ||
-                                   capabilities.move_entries;
-            details.push_back({L"Provider mode", can_write ? L"Read/write" : L"Read-only"});
-            details.push_back({L"Full extraction", capabilities.extract ? L"Supported" : L"Not supported"});
-            details.push_back({L"Selective extraction",
-                               capabilities.selective_extract ? L"Supported" : L"Not supported"});
-            details.push_back({L"Integrity test", capabilities.test ? L"Supported" : L"Not supported"});
-        }
-        std::vector<axiom::ArchiveEntry> loaded_entries;
-        const std::vector<axiom::ArchiveEntry>* entries = nullptr;
-        if (archive_catalog_ && same_filesystem_path(archive_catalog_->path(), *archive)) {
-            entries = &archive_catalog_->entries();
-        } else if (provider != nullptr && capabilities.list) {
-            try {
-                loaded_entries = provider->list(*archive, metadata_password);
-                entries = &loaded_entries;
-            } catch (...) {
-                entries = nullptr;
-            }
-        }
-        if (entries != nullptr) {
-            const auto totals = summarize_archive_entries(*entries);
-            details.push_back({L"Unpacked total", format_size(totals.unpacked)});
-            if (!archive_size_error) {
-                details.push_back({
-                    L"Overall ratio",
-                    format_ratio(archive_file_size, totals.unpacked)
-                });
-            }
-            if (totals.has_packed) {
-                details.push_back({
-                    totals.packed_estimated ? L"Packed data (estimated)" : L"Packed data",
-                    format_packed_size(totals.packed, totals.packed_estimated)
-                });
-            }
-        }
-        secure_clear(metadata_password);
-        axiom::gui::show_archive_information_dialog(
-            hwnd_, *archive, details, capabilities, std::move(archive_comment));
+                secure_clear(password);
+                return [this, path, details = std::move(details), capabilities,
+                        comment = std::move(comment)]() mutable {
+                    set_status(L"Archive information loaded.");
+                    axiom::gui::show_archive_information_dialog(
+                        hwnd_, path, details, capabilities, std::move(comment));
+                };
+            });
         return;
     }
-    std::wstring message = L"Location: " + history_.current().display_name() + L"\n\n";
-    message += indices.empty()
-        ? quote_count(browser_items_.size(), L"item", L"items")
-        : quote_count(indices.size(), L"selected item", L"selected items");
-    if (bytes != 0) message += L"\nSize: " + format_size(bytes);
-    show_app_message(message, axiom::gui::MessageDialogIcon::information, L"Information");
+    auto inputs = selected_filesystem_paths();
+    if (inputs.empty() &&
+        history_.current().kind == axiom::gui::BrowserLocationKind::filesystem) {
+        inputs.push_back(history_.current().filesystem_path);
+    }
+    if (inputs.empty()) {
+        show_app_message(L"Select a file or folder to estimate its compression.",
+                         axiom::gui::MessageDialogIcon::information, L"Information");
+        return;
+    }
+
+    axiom::CompressionEstimateOptions estimate_options;
+    estimate_options.format = axiom::ArchiveFormat::axar;
+    estimate_options.compression = compression_options();
+    // This is an adaptive ceiling, not a fixed cost. Higher codec levels use a
+    // smaller cap because each representative probe takes longer to encode.
+    estimate_options.sample_budget = selected_level() >= 8 ? 24u << 20
+        : selected_level() >= 6 ? 48u << 20 : 64u << 20;
+    estimate_options.sample_chunk_size = 512u << 10;
+    estimate_options.time_budget = std::chrono::seconds(5);
+
+    axiom::gui::show_filesystem_information_dialog(
+        hwnd_, std::move(inputs), std::move(estimate_options), selected_level());
+    set_status(L"Information closed.");
 }
 
 void MainWindow::on_about() {
@@ -900,6 +920,11 @@ void MainWindow::on_find_files() {
         } else {
             source_item.location = history_.current().display_name();
         }
+        source_item.folded_name = folded_text(source_item.name);
+        source_item.folded_search_text = folded_text(
+            source_item.location.empty()
+                ? source_item.name
+                : source_item.location + L"\\" + source_item.name);
         source.push_back(std::move(source_item));
     }
 
@@ -1252,7 +1277,7 @@ void MainWindow::apply_shell_integration() const {
 }
 
 bool MainWindow::maybe_execute_sfx_archive(const fs::path& path) {
-    if (!axiom::is_axiom_sfx_archive(path)) return false;
+    // The caller has already identified the SFX on an archive-analysis worker.
     const int choice = show_app_message(
         L"This is an Axiom self-extracting archive.\n\n"
         L"Choose Yes to run the self-extractor, or No to open the embedded archive "
@@ -1277,56 +1302,77 @@ bool MainWindow::maybe_execute_sfx_archive(const fs::path& path) {
 }
 
 bool MainWindow::open_archive_path(const fs::path& path) {
-    if (const auto joined = joined_archive_path_for_volume(path)) {
-        try {
-            const auto info = axiom::archive_volume_set_info(path);
-            std::wstring prompt =
-                L"This is one volume of a split Axiom archive. Reconstruct and open the "
-                L"complete archive?\n\n" + joined->wstring() + L"\n\n" +
-                std::to_wstring(info.data_volumes) + L" data volume(s), " +
-                std::to_wstring(info.recovery_volumes) + L" recovery volume(s)";
-            std::error_code exists_error;
-            if (fs::exists(*joined, exists_error)) {
-                prompt += L"\n\nThe existing complete archive will be replaced.";
+    if (path.empty()) return false;
+    const auto joined = joined_archive_path_for_volume(path);
+    begin_background_ui_task(L"Inspecting archive...", [this, path, joined] {
+        struct OpenProbe {
+            const axiom::ArchiveProvider* provider = nullptr;
+            bool sfx = false;
+            bool volume = false;
+            bool volume_data_complete = false;
+            fs::path open_path;
+            axiom::ArchiveVolumeSetInfo volume_info;
+        } probe{nullptr, false, false, false, path, {}};
+        if (joined) {
+            try {
+                probe.volume_info = axiom::archive_volume_set_info(path);
+                probe.volume = true;
+                probe.volume_data_complete =
+                    axiom::archive_volume_data_set_complete(path);
+                if (probe.volume_data_complete) {
+                    probe.open_path = axiom::archive_volume_primary_path(path);
+                    probe.provider = axiom::archive_provider_for_path(probe.open_path);
+                }
+            } catch (const axiom::FormatError&) {
+                // A normal file may contain .part/.rev in its name.
             }
-            if (show_app_message(prompt, axiom::gui::MessageDialogIcon::question,
-                                 L"Open split archive",
-                                 axiom::gui::MessageDialogButtons::yes_no,
-                                 IDYES) != IDYES) {
-                return true;
-            }
-            operation_archive_output_ = *joined;
-            operation_open_after_ = *joined;
-            const fs::path volume = path;
-            const fs::path output = *joined;
-            start_operation(
-                L"Joining archive volumes...", L"Archive volumes joined successfully.",
-                [volume, output](const std::shared_ptr<axiom::OperationControl>& operation) {
-                    axiom::join_archive_volumes(volume, output, operation);
-                });
-            return true;
-        } catch (const axiom::FormatError&) {
-            // A normal file can contain `.part` or `.rev` in its name. Only a
-            // validated Axiom volume is intercepted here.
-        } catch (const std::exception& error) {
-            show_app_message(widen(error.what()), axiom::gui::MessageDialogIcon::error,
-                             L"Open split archive");
-            return true;
         }
-    }
-    if (!axiom::gui::is_supported_archive(path)) return false;
-    if (maybe_execute_sfx_archive(path)) return true;
-    remember_archive_path(path);
-    navigate_to(axiom::gui::BrowserLocation::archive(path));
+        if (!probe.volume) {
+            probe.provider = axiom::archive_provider_for_path(path);
+            if (probe.provider != nullptr) probe.sfx = axiom::is_axiom_sfx_archive(path);
+        }
+        return [this, path, joined, probe] {
+            if (probe.volume && joined && !probe.volume_data_complete) {
+                std::wstring prompt =
+                    L"One or more data volumes are missing or incomplete. Reconstruct and "
+                    L"open the archive using the available recovery volumes?\n\n" +
+                    joined->wstring() + L"\n\n" +
+                    std::to_wstring(probe.volume_info.data_volumes) + L" data volume(s), " +
+                    std::to_wstring(probe.volume_info.recovery_volumes) + L" recovery volume(s)";
+                std::error_code exists_error;
+                if (fs::exists(*joined, exists_error)) {
+                    prompt += L"\n\nThe existing complete archive will be replaced.";
+                }
+                if (show_app_message(prompt, axiom::gui::MessageDialogIcon::question,
+                                     L"Open split archive",
+                                     axiom::gui::MessageDialogButtons::yes_no,
+                                     IDYES) != IDYES) return;
+                operation_archive_output_ = *joined;
+                operation_open_after_ = *joined;
+                start_operation(
+                    L"Joining archive volumes...", L"Archive volumes joined successfully.",
+                    [volume = path, output = *joined](
+                        const std::shared_ptr<axiom::OperationControl>& operation) {
+                        axiom::join_archive_volumes(volume, output, operation);
+                    });
+                return;
+            }
+            if (probe.provider == nullptr) {
+                show_app_message(L"The selected file is not a supported archive or Axiom volume.",
+                                 axiom::gui::MessageDialogIcon::warning, L"Open archive");
+                return;
+            }
+            if (probe.sfx && maybe_execute_sfx_archive(probe.open_path)) return;
+            remember_archive_path(probe.open_path);
+            navigate_to(axiom::gui::BrowserLocation::archive(probe.open_path));
+        };
+    });
     return true;
 }
 
 void MainWindow::on_open_archive() {
     auto path = pick_open_archive(hwnd_);
-    if (path && !open_archive_path(*path)) {
-        show_app_message(L"The selected file is not a supported archive or Axiom volume.",
-                         axiom::gui::MessageDialogIcon::warning, L"Open archive");
-    }
+    if (path) open_archive_path(*path);
 }
 
 void MainWindow::on_drop_files(HDROP drop) {
@@ -1358,6 +1404,14 @@ void MainWindow::save_current_settings() {
                                                       : dpi_))
                         : 0;
     persisted_settings_.tree_pane_visible = tree_pane_visible_;
+    DirectoryTreeViewState tree_state = tree_view_.capture_state();
+    constexpr std::size_t kMaximumPersistedTreeNodes = 256;
+    if (tree_state.expanded_keys.size() > kMaximumPersistedTreeNodes) {
+        tree_state.expanded_keys.resize(kMaximumPersistedTreeNodes);
+    }
+    persisted_settings_.tree_expanded_nodes = std::move(tree_state.expanded_keys);
+    persisted_settings_.tree_selected_node = std::move(tree_state.selected_key);
+    persisted_settings_.tree_scroll_position = std::max(tree_state.vertical_scroll, 0);
     persisted_settings_.column_widths = table_.logical_column_widths();
     persisted_settings_.recent_locations = recent_addresses_;
     persisted_settings_.recent_archives = recent_archives_;

@@ -12,6 +12,11 @@ namespace {
 
 constexpr wchar_t kCommandInputDialogClass[] = L"AxiomCommandInputDialog";
 constexpr int kCommandInputBase = 5200;
+constexpr DWORD kCommandInputDialogStyle =
+    WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_CLIPCHILDREN | WS_CLIPSIBLINGS |
+    WS_THICKFRAME;
+constexpr DWORD kCommandInputDialogExStyle =
+    WS_EX_WINDOWEDGE | WS_EX_CONTROLPARENT;
 
 struct CommandInputField {
     std::wstring label;
@@ -188,14 +193,18 @@ LRESULT CALLBACK command_input_dialog_proc(HWND hwnd, UINT message,
                          suggested->right - suggested->left,
                          suggested->bottom - suggested->top,
                          SWP_NOZORDER | SWP_NOACTIVATE);
+            apply_axiom_window_icons(hwnd, state->instance);
             rebuild_command_input_fonts(state);
             layout_command_input_dialog(state);
             return 0;
         }
         case WM_GETMINMAXINFO: {
             auto* info = reinterpret_cast<MINMAXINFO*>(lparam);
-            info->ptMinTrackSize.x = scale_for_dialog_dpi(520, state->dpi);
-            info->ptMinTrackSize.y = scale_for_dialog_dpi(260, state->dpi);
+            const SIZE minimum = dialog_window_size_for_client(
+                520, 260, kCommandInputDialogStyle,
+                kCommandInputDialogExStyle, state->dpi);
+            info->ptMinTrackSize.x = minimum.cx;
+            info->ptMinTrackSize.y = minimum.cy;
             return 0;
         }
         case WM_COMMAND:
@@ -298,15 +307,16 @@ bool show_command_input_dialog(HWND owner,
         return false;
     }
 
-    const int width = scale_for_dialog_dpi(560, dpi);
-    const int height = scale_for_dialog_dpi(
-        210 + static_cast<int>(fields.size()) * 42, dpi);
+    const SIZE window_size = dialog_window_size_for_client(
+        560, 210 + static_cast<int>(fields.size()) * 42,
+        kCommandInputDialogStyle, kCommandInputDialogExStyle, dpi);
+    const int width = window_size.cx;
+    const int height = window_size.cy;
     const POINT position = centered_window_position(owner, width, height);
     HWND dialog = CreateWindowExW(
-        WS_EX_WINDOWEDGE | WS_EX_CONTROLPARENT, kCommandInputDialogClass,
+        kCommandInputDialogExStyle, kCommandInputDialogClass,
         state.title.c_str(),
-        WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_CLIPCHILDREN | WS_CLIPSIBLINGS |
-            WS_THICKFRAME,
+        kCommandInputDialogStyle,
         position.x, position.y, width, height, owner, nullptr, instance, &state);
     if (dialog == nullptr) {
         show_message_dialog(owner, instance, dpi, state.dark, state.title,
@@ -315,7 +325,7 @@ bool show_command_input_dialog(HWND owner,
     }
     apply_axiom_window_icons(dialog, instance);
     restore_named_window_placement(dialog, owner, state.placement_name);
-    const bool owner_was_enabled = disable_dialog_owner(owner);
+    const bool owner_was_enabled = disable_dialog_owner(owner, dialog);
     ShowWindow(dialog, SW_SHOW);
     UpdateWindow(dialog);
     MSG message{};
@@ -656,16 +666,6 @@ std::string MainWindow::archive_drop_directory(POINT screen_point) const {
 }
 
 std::optional<std::string> MainWindow::password_for_archive_edit(const fs::path& archive) {
-    try {
-        const auto* provider = axiom::archive_provider_for_path(archive);
-        if (provider == nullptr || !provider->capabilities(archive).encrypted) {
-            return std::string{};
-        }
-    } catch (const std::exception& error) {
-        show_app_message(widen(error.what()), axiom::gui::MessageDialogIcon::error,
-                         L"Open archive");
-        return std::nullopt;
-    }
     const bool cache_password =
         application_options_.cache_passwords &&
         application_options_.password_prompt_mode == 0;
@@ -673,6 +673,15 @@ std::optional<std::string> MainWindow::password_for_archive_edit(const fs::path&
         same_filesystem_path(archive_password_path_, archive)) {
         return archive_password_;
     }
+    // Capability discovery is deliberately never performed here: this helper
+    // runs from UI commands and archive probing may parse hundreds of MiB.
+    // Open archives already carry authoritative capabilities in their catalog;
+    // selected unopened archives use the asynchronous selection cache.
+    const auto active = active_archive_path();
+    const bool encrypted = active && same_filesystem_path(*active, archive)
+        ? active_archive_capabilities().encrypted
+        : false;
+    if (!encrypted) return std::string{};
     std::wstring password;
     if (!axiom::gui::show_archive_password_dialog(hwnd_, password)) return std::nullopt;
     std::string encoded = utf8(password);
@@ -693,7 +702,6 @@ void MainWindow::clear_archive_password() {
 }
 
 bool MainWindow::prepare_archive_password(const axiom::gui::BrowserLocation& location) {
-    secure_clear(pending_archive_password_);
     if (location.kind != axiom::gui::BrowserLocationKind::archive) {
         clear_archive_password();
         return true;
@@ -705,38 +713,8 @@ bool MainWindow::prepare_archive_password(const axiom::gui::BrowserLocation& loc
         same_filesystem_path(archive_password_path_, location.archive_path)) {
         return true;
     }
-
-    bool encrypted = false;
-    try {
-        const auto* provider = axiom::archive_provider_for_path(location.archive_path);
-        if (provider == nullptr) {
-            show_app_message(L"This archive format is not supported.",
-                             axiom::gui::MessageDialogIcon::warning, L"Open archive");
-            return false;
-        }
-        encrypted = provider->capabilities(location.archive_path).encrypted;
-    } catch (const std::exception& error) {
-        show_app_message(widen(error.what()), axiom::gui::MessageDialogIcon::error,
-                         L"Open archive");
-        return false;
-    }
-    if (!encrypted) {
-        clear_archive_password();
-        return true;
-    }
-
-    std::wstring entered;
-    if (!axiom::gui::show_archive_password_dialog(hwnd_, entered)) return false;
-    std::string encoded = utf8(entered);
-    secure_clear(entered);
-    if (cache_password) {
-        clear_archive_password();
-        archive_password_path_ = location.archive_path;
-        archive_password_ = encoded;
-    } else {
-        clear_archive_password();
-        pending_archive_password_ = std::move(encoded);
-    }
+    // Encryption probing happens in load_browser_location() on its worker.
+    // on_browser_loaded() prompts and retries only after that probe completes.
     return true;
 }
 
@@ -928,10 +906,10 @@ DWORD MainWindow::perform_file_drop(IDataObject* object, POINT point, DWORD, DWO
 StagedArchiveEntries MainWindow::extract_archive_entries_to_staging(
     const fs::path& archive, const std::vector<std::string>& entries,
     const std::string& password, bool for_drag, bool sensitive) {
-    const auto* provider = axiom::archive_provider_for_path(archive);
-    if (provider == nullptr || !provider->capabilities(archive, password).selective_extract) {
-        throw std::runtime_error("this archive format does not support selective extraction");
-    }
+    const auto active = active_archive_path();
+    const auto* provider = active && same_filesystem_path(*active, archive)
+        ? active_archive_provider() : nullptr;
+    if (provider == nullptr) throw std::runtime_error("unsupported archive format");
     const fs::path staging = create_drag_staging_directory(sensitive);
     const HANDLE completed = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     if (completed == nullptr) throw std::runtime_error("could not start temporary extraction");
@@ -953,17 +931,15 @@ StagedArchiveEntries MainWindow::extract_archive_entries_to_staging(
         set_busy(false);
         throw std::runtime_error("could not create temporary extraction progress window");
     }
-    control->set_progress_callback([target = hwnd_](const axiom::OperationProgress& progress) {
-        auto* copy = new axiom::OperationProgress(progress);
-        if (!PostMessageW(target, kOperationProgressMessage, 0,
-                          reinterpret_cast<LPARAM>(copy))) {
-            delete copy;
-        }
-    });
+    operation_window_.set_progress_source(control);
 
     const std::size_t io_buffer_size = configured_io_buffer_size(application_options_);
     std::jthread worker([&, control, io_buffer_size] {
         try {
+            if (!provider->capabilities(archive, password).selective_extract) {
+                throw std::runtime_error(
+                    "this archive format does not support selective extraction");
+            }
             axiom::ExtractOptions options;
             options.overwrite = axiom::ExtractOptions::Overwrite::overwrite;
             options.password = password;
@@ -1077,17 +1053,31 @@ void MainWindow::on_table_begin_drag() {
     }
     if (virtual_items.empty()) return;
 
+    std::uint64_t transfer_total_bytes = 0;
+    std::uint64_t transfer_total_files = 0;
+    for (const auto& item : virtual_items) {
+        if (item.is_directory) continue;
+        transfer_total_bytes = item.size >
+                std::numeric_limits<std::uint64_t>::max() - transfer_total_bytes
+            ? std::numeric_limits<std::uint64_t>::max()
+            : transfer_total_bytes + item.size;
+        ++transfer_total_files;
+    }
+
     auto password = password_for_archive_edit(archive);
     if (!password) return;
 
     std::wstring drag_error;
+    auto transfer_control = std::make_shared<axiom::OperationControl>();
+    bool transfer_started = false;
     axiom::gui::FileDragSource source;
     source.archive_payload = {archive, entries};
     source.virtual_files = virtual_items;
     source.preferred_effect = DROPEFFECT_COPY;
+    source.transfer_operation = transfer_control;
     source.error_message = &drag_error;
     source.virtual_file_paths =
-        [this, archive, entries,
+        [this, archive, entries, transfer_control, &transfer_started,
          materialized_archive_paths = std::move(materialized_archive_paths),
          password = std::move(*password)]() mutable {
         try {
@@ -1099,6 +1089,22 @@ void MainWindow::on_table_begin_drag() {
             for (const auto& path : materialized_archive_paths) {
                 paths.push_back(staged.directory / fs::path(widen(path)));
             }
+            set_busy(true);
+            set_status(L"Transferring dropped archive entries...");
+            if (!operation_window_.create(
+                    hwnd_, instance_, L"Transferring dropped files...", {},
+                    make_operation_window_theme(theme_),
+                    [transfer_control](bool paused) {
+                        transfer_control->set_paused(paused);
+                    },
+                    [transfer_control] { transfer_control->request_cancel(); },
+                    false)) {
+                set_busy(false);
+                throw std::runtime_error(
+                    "could not create the drag transfer progress window");
+            }
+            operation_window_.set_progress_source(transfer_control);
+            transfer_started = true;
             return paths;
         } catch (...) {
             secure_clear(password);
@@ -1108,6 +1114,23 @@ void MainWindow::on_table_begin_drag() {
     DWORD effect = DROPEFFECT_NONE;
     axiom::gui::do_file_drag(std::move(source),
                              DROPEFFECT_COPY | DROPEFFECT_MOVE, effect);
+    if (transfer_started) {
+        if (effect != DROPEFFECT_NONE) {
+            axiom::OperationProgress completed;
+            completed.stage = axiom::OperationStage::transferring;
+            completed.completed_bytes = transfer_total_bytes;
+            completed.total_bytes = transfer_total_bytes;
+            completed.completed_items = transfer_total_files;
+            completed.total_items = transfer_total_files;
+            transfer_control->report(completed);
+        }
+        operation_window_.close();
+        set_busy(false);
+        operation_paused_ = false;
+        set_status(effect == DROPEFFECT_NONE
+                       ? L"Drag and drop transfer cancelled."
+                       : L"Drag and drop transfer completed.");
+    }
     if (!drag_error.empty()) {
         show_app_message(drag_error, axiom::gui::MessageDialogIcon::error,
                          L"Drag from archive");
@@ -1132,15 +1155,169 @@ axiom::gui::ArchiveCapabilities MainWindow::active_archive_capabilities() const 
         return archive_catalog_->capabilities();
     }
     if (archive) {
-        if (const auto* provider = axiom::archive_provider_for_path(*archive)) {
-            try {
-                return provider->capabilities(*archive);
-            } catch (...) {
-                return {};
-            }
+        if (!selected_archive_capability_cache_path_.empty() &&
+            same_filesystem_path(selected_archive_capability_cache_path_, *archive)) {
+            return selected_archive_capability_cache_;
         }
+        queue_selected_archive_capability_probe(*archive);
+
+        // Selection, hover, shortcut translation, and toolbar painting all
+        // query this method. Provider resolution itself sniffs file content,
+        // so even that must stay in the worker above.
+        axiom::gui::ArchiveCapabilities fallback;
+        fallback.list = true;
+        fallback.extract = true;
+        fallback.test = true;
+        fallback.selective_extract = true;
+        fallback.packed_sizes = true;
+        fallback.metadata = true;
+        std::wstring extension = archive->extension().wstring();
+        std::transform(extension.begin(), extension.end(), extension.begin(), towlower);
+        if (extension == L".axar") {
+                fallback.create = true;
+                fallback.update = true;
+                fallback.delete_entries = true;
+                fallback.move_entries = true;
+                fallback.encryption = true;
+                fallback.recovery_records = true;
+                fallback.can_create_volumes = true;
+                fallback.comments = true;
+                fallback.lock = true;
+                fallback.authenticity = true;
+                fallback.sfx = true;
+        } else if (extension == L".zip") {
+                fallback.create = true;
+                fallback.update = true;
+                fallback.delete_entries = true;
+                fallback.move_entries = true;
+                fallback.encryption = true;
+                fallback.can_create_volumes = true;
+                fallback.sfx = true;
+        }
+        return fallback;
     }
     return {};
+}
+
+void MainWindow::queue_selected_archive_capability_probe(const fs::path& archive) const {
+    if (selected_archive_capability_probe_running_ || archive.empty() || hwnd_ == nullptr) {
+        return;
+    }
+    selected_archive_capability_probe_running_ = true;
+    selected_archive_capability_probe_path_ = archive;
+    const HWND target = hwnd_;
+    selected_archive_capability_thread_ = std::jthread(
+        [target, archive](std::stop_token stop) {
+            auto result = std::make_unique<SelectedArchiveCapabilitiesResult>();
+            result->archive = archive;
+            if (!stop.stop_requested()) {
+                try {
+                    if (const auto* provider = axiom::archive_provider_for_path(archive)) {
+                        result->provider = provider;
+                        result->capabilities = provider->capabilities(archive);
+                    }
+                } catch (...) {
+                    result->capabilities = {};
+                }
+            }
+            if (stop.stop_requested()) return;
+            auto* payload = result.release();
+            if (!PostMessageW(target, kSelectedArchiveCapabilitiesMessage, 0,
+                              reinterpret_cast<LPARAM>(payload))) {
+                delete payload;
+            }
+        });
+}
+
+void MainWindow::on_selected_archive_capabilities(LPARAM lparam) {
+    std::unique_ptr<SelectedArchiveCapabilitiesResult> result(
+        reinterpret_cast<SelectedArchiveCapabilitiesResult*>(lparam));
+    if (selected_archive_capability_thread_.joinable()) {
+        selected_archive_capability_thread_.join();
+    }
+    selected_archive_capability_probe_running_ = false;
+    selected_archive_capability_probe_path_.clear();
+    if (!result) return;
+
+    const auto selected = active_archive_path();
+    if (selected && same_filesystem_path(*selected, result->archive)) {
+        selected_archive_capability_cache_path_ = result->archive;
+        selected_archive_provider_cache_ = result->provider;
+        selected_archive_capability_cache_ = result->capabilities;
+        update_toolbar_button_states();
+        if (pending_archive_command_ &&
+            same_filesystem_path(pending_archive_command_->archive, result->archive)) {
+            const UINT command = pending_archive_command_->command;
+            pending_archive_command_.reset();
+            if (result->provider != nullptr) {
+                PostMessageW(hwnd_, WM_COMMAND, MAKEWPARAM(command, 0), 0);
+            } else {
+                show_app_message(L"This file is not a supported archive.",
+                                 axiom::gui::MessageDialogIcon::warning,
+                                 L"Open archive");
+            }
+        } else if (pending_archive_command_) {
+            pending_archive_command_.reset();
+        }
+        return;
+    }
+    if (pending_archive_command_ &&
+        same_filesystem_path(pending_archive_command_->archive, result->archive)) {
+        // The selection moved while this probe was running. Never replay the
+        // requested command against the next archive selected by the user.
+        pending_archive_command_.reset();
+    }
+    if (selected) queue_selected_archive_capability_probe(*selected);
+}
+
+void MainWindow::begin_background_ui_task(
+    std::wstring status,
+    std::function<std::function<void()>()> work) {
+    set_status(std::move(status));
+    const std::uint64_t id = next_background_ui_task_id_++;
+    const HWND target = hwnd_;
+    MainWindow* const owner = this;
+    std::jthread worker([id, target, owner, work = std::move(work)](
+                            std::stop_token stop) mutable {
+        auto result = std::make_unique<BackgroundUiTaskResult>();
+        result->id = id;
+        try {
+            result->completion = work();
+        } catch (const std::exception& error) {
+            const std::wstring message = widen(error.what());
+            result->completion = [owner, message] {
+                owner->show_app_message(message, axiom::gui::MessageDialogIcon::error,
+                                        L"Archive analysis");
+            };
+        } catch (...) {
+            result->completion = [owner] {
+                owner->show_app_message(L"Archive analysis failed.",
+                                        axiom::gui::MessageDialogIcon::error,
+                                        L"Archive analysis");
+            };
+        }
+        if (stop.stop_requested()) return;
+        auto* payload = result.release();
+        if (!PostMessageW(target, kBackgroundUiTaskMessage, 0,
+                          reinterpret_cast<LPARAM>(payload))) {
+            delete payload;
+        }
+    });
+    background_ui_tasks_.push_back(BackgroundUiTask{id, std::move(worker)});
+}
+
+void MainWindow::on_background_ui_task(LPARAM lparam) {
+    std::unique_ptr<BackgroundUiTaskResult> result(
+        reinterpret_cast<BackgroundUiTaskResult*>(lparam));
+    if (!result) return;
+    const auto task = std::find_if(
+        background_ui_tasks_.begin(), background_ui_tasks_.end(),
+        [id = result->id](const BackgroundUiTask& item) { return item.id == id; });
+    if (task != background_ui_tasks_.end()) {
+        if (task->worker.joinable()) task->worker.join();
+        background_ui_tasks_.erase(task);
+    }
+    if (result && result->completion) result->completion();
 }
 
 const axiom::ArchiveProvider* MainWindow::active_archive_provider() const {
@@ -1149,7 +1326,12 @@ const axiom::ArchiveProvider* MainWindow::active_archive_provider() const {
     if (archive_catalog_ && same_filesystem_path(archive_catalog_->path(), *archive)) {
         return &archive_catalog_->provider();
     }
-    return axiom::archive_provider_for_path(*archive);
+    if (!selected_archive_capability_cache_path_.empty() &&
+        same_filesystem_path(selected_archive_capability_cache_path_, *archive)) {
+        return selected_archive_provider_cache_;
+    }
+    queue_selected_archive_capability_probe(*archive);
+    return nullptr;
 }
 
 axiom::gui::ArchiveFeatureAvailability MainWindow::implemented_feature_availability() {
@@ -1183,7 +1365,7 @@ axiom::gui::ArchiveFeatureAvailability MainWindow::feature_availability_from_cap
     availability.encryption = capabilities.encryption || capabilities.encrypted;
     availability.header_encryption = capabilities.encryption;
     availability.kdf_presets = false;
-    availability.volumes = capabilities.multi_volume;
+    availability.volumes = capabilities.can_create_volumes;
     availability.recovery = capabilities.recovery_records;
     availability.authenticity = capabilities.authenticity;
     availability.sfx = capabilities.sfx;
@@ -1213,6 +1395,38 @@ void MainWindow::create_archive_from_paths(
     std::optional<fs::path> target_archive,
     axiom::gui::ArchiveUpdateMode update_mode) {
     if (paths.empty()) return;
+
+    if (target_archive) {
+        const auto active = active_archive_path();
+        const auto* target_provider = active &&
+                same_filesystem_path(*active, *target_archive)
+            ? active_archive_provider() : nullptr;
+        if (target_provider != nullptr && target_provider->info().native &&
+            (!archive_dialog_metadata_valid_ || archive_dialog_metadata_path_.empty() ||
+             !same_filesystem_path(archive_dialog_metadata_path_, *target_archive))) {
+            auto password = password_for_archive_edit(*target_archive);
+            if (!password) return;
+            const fs::path path = *target_archive;
+            begin_background_ui_task(
+                L"Reading archive settings...",
+                [this, path, paths = std::move(paths), update_mode,
+                 password = std::move(*password)]() mutable {
+                    const auto mode = axiom::archive_encryption_mode(path);
+                    std::wstring comment = widen(axiom::archive_comment(path, password));
+                    return [this, path, paths = std::move(paths), update_mode, mode,
+                            comment = std::move(comment),
+                            password = std::move(password)]() mutable {
+                        archive_dialog_metadata_path_ = path;
+                        archive_dialog_encryption_mode_ = mode;
+                        archive_dialog_comment_ = std::move(comment);
+                        archive_dialog_password_ = std::move(password);
+                        archive_dialog_metadata_valid_ = true;
+                        create_archive_from_paths(std::move(paths), path, update_mode);
+                    };
+                });
+            return;
+        }
+    }
 
     axiom::gui::CreateArchiveDialogOptions dialog_options;
     dialog_options.level = application_options_.default_level;
@@ -1262,23 +1476,29 @@ void MainWindow::create_archive_from_paths(
     }
     default_archive = avoid_archive_input_collision(std::move(default_archive), paths);
     dialog_options.archive_path = target_archive.value_or(default_archive);
-    dialog_options.archive_format =
-        axiom::archive_provider_for_path(dialog_options.archive_path)
-            ? axiom::archive_provider_for_path(dialog_options.archive_path)->info().format
-            : axiom::ArchiveFormat::axar;
+    dialog_options.archive_format = dialog_options.archive_path.extension() == L".zip"
+        ? axiom::ArchiveFormat::zip : axiom::ArchiveFormat::axar;
     dialog_options.fixed_archive_format = target_archive.has_value();
     if (target_archive) {
-        const auto* target_provider = axiom::archive_provider_for_path(*target_archive);
+        const auto active = active_archive_path();
+        const auto* target_provider = active &&
+                same_filesystem_path(*active, *target_archive)
+            ? active_archive_provider() : nullptr;
         if (target_provider != nullptr && !target_provider->info().native) {
             dialog_options.archive_format = target_provider->info().format;
+            dialog_options.feature_availability =
+                feature_availability_from_capabilities(active_archive_capabilities());
             dialog_options.features.create_sfx = false;
             dialog_options.features.sign_archive = false;
             dialog_options.features.create_recovery_volumes = false;
             dialog_options.features.recovery_percent = 0;
-            dialog_options.features.volume_size.clear();
+            if (target_provider->info().format != axiom::ArchiveFormat::zip) {
+                dialog_options.features.volume_size.clear();
+            }
         } else {
-            try {
-                const auto mode = axiom::archive_encryption_mode(*target_archive);
+            if (archive_dialog_metadata_valid_ &&
+                same_filesystem_path(archive_dialog_metadata_path_, *target_archive)) {
+                const auto mode = archive_dialog_encryption_mode_;
                 if (mode == axiom::ArchiveEncryptionMode::data_and_directory) {
                     show_app_message(
                         L"Editing archives with encrypted file names is not supported yet.",
@@ -1293,17 +1513,14 @@ void MainWindow::create_archive_from_paths(
                     dialog_options.feature_availability.encryption = false;
                 }
                 if (mode == axiom::ArchiveEncryptionMode::data_only) {
-                    auto password = password_for_archive_edit(*target_archive);
-                    if (!password) return;
                     dialog_options.features.encrypt_data = true;
-                    dialog_options.features.password = widen(*password);
-                    secure_clear(*password);
+                    dialog_options.features.password = widen(archive_dialog_password_);
                 }
-                dialog_options.features.comment = widen(axiom::archive_comment(
-                    *target_archive, dialog_options.features.encrypt_data
-                        ? utf8(dialog_options.features.password) : std::string{}));
-            } catch (...) {
-                // The operation itself will report a precise archive error if necessary.
+                dialog_options.features.comment = archive_dialog_comment_;
+                secure_clear(archive_dialog_password_);
+                archive_dialog_comment_.clear();
+                archive_dialog_metadata_path_.clear();
+                archive_dialog_metadata_valid_ = false;
             }
         }
     }
@@ -1316,6 +1533,7 @@ void MainWindow::create_archive_from_paths(
     selected_word_size_ = dialog_options.word_size;
     selected_solid_block_size_ = dialog_options.solid_block_size;
     pending_archive_path_ = std::move(dialog_options.archive_path);
+    pending_archive_format_ = dialog_options.archive_format;
     if (pending_archive_path_.has_parent_path()) {
         persisted_settings_.last_archive_output_folder =
             pending_archive_path_.parent_path().wstring();
@@ -1407,7 +1625,7 @@ void MainWindow::on_delete_from_archive() {
         return;
     }
     if (!active_archive_is_editable()) return;
-    const auto* provider = axiom::archive_provider_for_path(*archive);
+    const auto* provider = active_archive_provider();
     if (provider == nullptr || !active_archive_capabilities().delete_entries) {
         show_app_message(L"This archive format does not support deleting entries.",
                          axiom::gui::MessageDialogIcon::information);
@@ -1476,25 +1694,29 @@ void MainWindow::on_edit_archive_comment() {
     const auto archive = active_archive_path();
     if (!archive) return;
     if (!active_archive_is_editable()) return;
-    std::wstring comment;
-    try {
-        comment = widen(axiom::archive_comment(*archive));
-    } catch (const std::exception& error) {
-        show_app_message(widen(error.what()), axiom::gui::MessageDialogIcon::error,
-                         L"Archive comment");
-        return;
-    }
-    if (!axiom::gui::show_archive_comment_dialog(hwnd_, comment)) return;
-    const auto options = compression_options();
-    const std::string encoded_comment = utf8(comment);
-    operation_archive_output_ = *archive;
-    start_operation(
-        L"Updating archive comment...", L"Archive comment updated.",
-        [archive = *archive, encoded_comment, options](
-            std::shared_ptr<axiom::OperationControl> operation) mutable {
-            auto run_options = options;
-            run_options.operation = std::move(operation);
-            axiom::set_archive_comment(archive, encoded_comment, run_options);
+    auto password = password_for_archive_edit(*archive);
+    if (!password) return;
+    const auto path = *archive;
+    begin_background_ui_task(
+        L"Reading archive comment...",
+        [this, path, password = std::move(*password)]() mutable {
+            std::wstring comment = widen(axiom::archive_comment(path, password));
+            secure_clear(password);
+            return [this, path, comment = std::move(comment)]() mutable {
+                set_status(L"Archive comment loaded.");
+                if (!axiom::gui::show_archive_comment_dialog(hwnd_, comment)) return;
+                const auto options = compression_options();
+                const std::string encoded_comment = utf8(comment);
+                operation_archive_output_ = path;
+                start_operation(
+                    L"Updating archive comment...", L"Archive comment updated.",
+                    [path, encoded_comment, options](
+                        std::shared_ptr<axiom::OperationControl> operation) mutable {
+                        auto run_options = options;
+                        run_options.operation = std::move(operation);
+                        axiom::set_archive_comment(path, encoded_comment, run_options);
+                    });
+            };
         });
 }
 
@@ -1567,35 +1789,31 @@ void MainWindow::on_delete_selected() {
 void MainWindow::on_repair_archive() {
     const auto archive = active_archive_path();
     if (!archive || busy_) return;
-    axiom::ArchiveRecoveryInfo info;
-    try {
-        info = axiom::archive_recovery_info(*archive);
-    } catch (const std::exception& error) {
-        show_app_message(widen(error.what()), axiom::gui::MessageDialogIcon::error,
-                         L"Repair archive");
-        return;
-    }
-    if (!info.present) {
-        show_app_message(L"This archive does not contain a recovery record.",
-                         axiom::gui::MessageDialogIcon::information,
-                         L"Repair archive");
-        return;
-    }
-    if (show_app_message(
-            L"Check every recovery shard and reconstruct damaged archive data?\n\n"
-            L"The archive is replaced atomically only after reconstruction succeeds.",
-            axiom::gui::MessageDialogIcon::question, L"Repair archive",
-            axiom::gui::MessageDialogButtons::yes_no, IDYES) != IDYES) {
-        return;
-    }
-    operation_archive_output_ = *archive;
-    start_operation(
-        L"Repairing archive...", L"Archive recovery data was verified and rebuilt.",
-        [archive = *archive](std::shared_ptr<axiom::OperationControl> operation) {
-            if (!axiom::repair_archive(archive, operation)) {
-                throw std::runtime_error("archive has no recovery record");
+    const auto path = *archive;
+    begin_background_ui_task(L"Reading recovery metadata...", [this, path] {
+        const auto info = axiom::archive_recovery_info(path);
+        return [this, path, info] {
+            if (!info.present) {
+                show_app_message(L"This archive does not contain a recovery record.",
+                                 axiom::gui::MessageDialogIcon::information,
+                                 L"Repair archive");
+                return;
             }
-        });
+            if (show_app_message(
+                    L"Check every recovery shard and reconstruct damaged archive data?\n\n"
+                    L"The archive is replaced atomically only after reconstruction succeeds.",
+                    axiom::gui::MessageDialogIcon::question, L"Repair archive",
+                    axiom::gui::MessageDialogButtons::yes_no, IDYES) != IDYES) return;
+            operation_archive_output_ = path;
+            start_operation(
+                L"Repairing archive...", L"Archive recovery data was verified and rebuilt.",
+                [path](std::shared_ptr<axiom::OperationControl> operation) {
+                    if (!axiom::repair_archive(path, operation)) {
+                        throw std::runtime_error("archive has no recovery record");
+                    }
+                });
+        };
+    });
 }
 
 void MainWindow::on_edit_recovery_record() {
@@ -1610,57 +1828,49 @@ void MainWindow::on_edit_recovery_record() {
         return;
     }
 
-    axiom::ArchiveRecoveryInfo info;
-    try {
-        info = axiom::archive_recovery_info(*archive);
-    } catch (const std::exception& error) {
-        show_app_message(widen(error.what()), axiom::gui::MessageDialogIcon::error,
-                         L"Recovery record");
-        return;
-    }
-
-    std::wstring heading = info.present
-        ? L"Current recovery record: " + std::to_wstring(info.percent) + L"% (" +
-              std::to_wstring(info.data_shards) + L" data + " +
-              std::to_wstring(info.parity_shards) + L" parity shards, protects " +
-              format_size(info.protected_size) + L").\n\nEnter 1..100 to rebuild, or 0 to remove."
-        : L"This archive has no recovery record.\n\nEnter 1..100 to create one; 0 leaves it disabled.";
-    std::vector<CommandInputField> fields{
-        {L"Recovery percent", info.present ? std::to_wstring(info.percent) : L"0"}
-    };
-    if (!show_command_input_dialog(hwnd_, instance_, L"Recovery record",
-                                   std::move(heading), fields,
-                                   L"Dialog.RecoveryRecord")) {
-        return;
-    }
-    const auto percent = parse_unsigned_field(fields[0].value, 100);
-    if (!percent) {
-        show_app_message(L"Enter a recovery percentage from 0 to 100.",
-                         axiom::gui::MessageDialogIcon::warning,
-                         L"Recovery record");
-        return;
-    }
-    if (*percent == 0 && !info.present) {
-        set_status(L"Archive has no recovery record.");
-        return;
-    }
-    if (*percent == 0 &&
-        show_app_message(L"Remove the recovery record from this archive?",
-                         axiom::gui::MessageDialogIcon::warning,
-                         L"Recovery record",
-                         axiom::gui::MessageDialogButtons::yes_no,
-                         IDNO) != IDYES) {
-        return;
-    }
-
-    operation_archive_output_ = *archive;
-    start_operation(
-        *percent == 0 ? L"Removing recovery record..." : L"Updating recovery record...",
-        *percent == 0 ? L"Recovery record removed." : L"Recovery record updated.",
-        [archive = *archive, percent = *percent](
-            std::shared_ptr<axiom::OperationControl> operation) {
-            axiom::set_archive_recovery(archive, percent, operation);
-        });
+    const auto path = *archive;
+    begin_background_ui_task(L"Reading recovery metadata...", [this, path] {
+        const auto info = axiom::archive_recovery_info(path);
+        return [this, path, info] {
+            std::wstring heading = info.present
+                ? L"Current recovery record: " + std::to_wstring(info.percent) + L"% (" +
+                      std::to_wstring(info.data_shards) + L" data + " +
+                      std::to_wstring(info.parity_shards) + L" parity shards, protects " +
+                      format_size(info.protected_size) +
+                      L").\n\nEnter 1..100 to rebuild, or 0 to remove."
+                : L"This archive has no recovery record.\n\nEnter 1..100 to create one; 0 leaves it disabled.";
+            std::vector<CommandInputField> fields{{
+                L"Recovery percent", info.present ? std::to_wstring(info.percent) : L"0"}};
+            if (!show_command_input_dialog(hwnd_, instance_, L"Recovery record",
+                                           std::move(heading), fields,
+                                           L"Dialog.RecoveryRecord")) return;
+            const auto percent = parse_unsigned_field(fields[0].value, 100);
+            if (!percent) {
+                show_app_message(L"Enter a recovery percentage from 0 to 100.",
+                                 axiom::gui::MessageDialogIcon::warning,
+                                 L"Recovery record");
+                return;
+            }
+            if (*percent == 0 && !info.present) {
+                set_status(L"Archive has no recovery record.");
+                return;
+            }
+            if (*percent == 0 &&
+                show_app_message(L"Remove the recovery record from this archive?",
+                                 axiom::gui::MessageDialogIcon::warning,
+                                 L"Recovery record",
+                                 axiom::gui::MessageDialogButtons::yes_no,
+                                 IDNO) != IDYES) return;
+            operation_archive_output_ = path;
+            start_operation(
+                *percent == 0 ? L"Removing recovery record..." : L"Updating recovery record...",
+                *percent == 0 ? L"Recovery record removed." : L"Recovery record updated.",
+                [path, percent = *percent](
+                    std::shared_ptr<axiom::OperationControl> operation) {
+                    axiom::set_archive_recovery(path, percent, operation);
+                });
+        };
+    });
 }
 
 void MainWindow::on_split_archive() {
@@ -1673,16 +1883,20 @@ void MainWindow::on_split_archive() {
         return;
     }
     if (busy_) return;
-    const auto* provider = axiom::archive_provider_for_path(archive);
+    const auto active = active_archive_path();
+    const bool is_active = active && same_filesystem_path(*active, archive);
+    const auto* provider = is_active
+        ? active_archive_provider() : axiom::archive_provider_for_path(archive);
     if (provider == nullptr) {
         show_app_message(L"Choose a supported archive first.",
                          axiom::gui::MessageDialogIcon::information,
                          L"Split archive");
         return;
     }
-    const auto capabilities = provider->capabilities(archive);
-    if (!capabilities.multi_volume) {
-        show_app_message(L"This archive format does not support Axiom split volumes.",
+    const auto capabilities = is_active
+        ? active_archive_capabilities() : provider->capabilities(archive);
+    if (!capabilities.can_create_volumes) {
+        show_app_message(L"This archive format does not support split-volume creation.",
                          axiom::gui::MessageDialogIcon::information,
                          L"Split archive");
         return;
@@ -1693,19 +1907,26 @@ void MainWindow::on_split_archive() {
         ? L"700M"
         : application_options_.default_volume_size +
               kUnitSuffixes[std::clamp(application_options_.default_volume_unit, 0, 3)];
-    std::vector<CommandInputField> fields{
-        {L"Volume size", std::move(default_volume)},
-        {L"Recovery volumes", application_options_.default_recovery_volumes ? L"1" : L"0"},
-    };
+    const bool zip = provider->info().format == axiom::ArchiveFormat::zip;
+    std::vector<CommandInputField> fields{{L"Volume size", std::move(default_volume)}};
+    if (!zip) {
+        fields.push_back({L"Recovery volumes",
+                          application_options_.default_recovery_volumes ? L"1" : L"0"});
+    }
     if (!show_command_input_dialog(
             hwnd_, instance_, L"Split archive",
-            L"Create numbered archive volumes beside the source archive.\n\n"
-            L"Use K, M, G, or T suffixes for volume size. Recovery volumes are optional.",
+            zip
+                ? L"Create a standard .z01, .z02, ..., .zip set beside the source archive.\n\n"
+                  L"Use K, M, G, or T suffixes for volume size. Split ZIP sets are read-only."
+                : L"Create numbered Axiom volumes beside the source archive.\n\n"
+                  L"Use K, M, G, or T suffixes for volume size. Recovery volumes are optional.",
             fields, L"Dialog.SplitArchive")) {
         return;
     }
     const auto volume_size = parse_size_setting(fields[0].value);
-    const auto recovery_count = parse_unsigned_field(fields[1].value, 100000);
+    const auto recovery_count = zip
+        ? std::optional<unsigned>{0}
+        : parse_unsigned_field(fields[1].value, 100000);
     if (!volume_size || *volume_size == 0 || !recovery_count) {
         show_app_message(L"Enter a positive volume size and a recovery volume count from 0 to 100000.",
                          axiom::gui::MessageDialogIcon::warning,
@@ -1714,10 +1935,16 @@ void MainWindow::on_split_archive() {
     }
     operation_archive_output_ = archive;
     start_operation(
-        L"Splitting archive...", L"Archive volumes were created beside the source archive.",
-        [archive, volume_size = *volume_size, recovery_count = *recovery_count](
+        L"Splitting archive...",
+        zip ? L"Standard ZIP volumes were created beside the source archive."
+            : L"Axiom archive volumes were created beside the source archive.",
+        [archive, zip, volume_size = *volume_size, recovery_count = *recovery_count](
             std::shared_ptr<axiom::OperationControl> operation) {
-            axiom::create_archive_volumes(archive, volume_size, recovery_count, operation);
+            if (zip) {
+                axiom::create_zip_volumes(archive, volume_size, operation);
+            } else {
+                axiom::create_archive_volumes(archive, volume_size, recovery_count, operation);
+            }
         });
 }
 
@@ -1989,7 +2216,7 @@ void MainWindow::start_operation(std::wstring running,
     directory_watcher_.stop();
     append_log(L"Starting operation: " + running);
     apply_operation_priority();
-    if (!operation_runner_.start(hwnd_, kOperationDoneMessage, kOperationProgressMessage,
+    if (!operation_runner_.start(hwnd_, kOperationDoneMessage,
                                  std::move(running), std::move(success), std::move(work))) {
         restore_operation_priority();
         append_log(L"Could not start operation: another operation is already running.");
@@ -1997,6 +2224,8 @@ void MainWindow::start_operation(std::wstring running,
         set_busy(false);
         set_status(L"Another operation is already running.");
         on_navigate_refresh();
+    } else {
+        operation_window_.set_progress_source(operation_runner_.control());
     }
 }
 
@@ -2036,15 +2265,19 @@ void MainWindow::on_compress() {
                          axiom::gui::MessageDialogIcon::information);
         return;
     }
-    const auto* archive_provider = axiom::archive_provider_for_path(archive);
-    if (archive_provider == nullptr) {
+    const auto output_format = pending_archive_format_;
+    if (output_format != axiom::ArchiveFormat::axar &&
+        output_format != axiom::ArchiveFormat::zip) {
         show_app_message(L"Choose a supported archive format (.axar or .zip).",
                          axiom::gui::MessageDialogIcon::warning,
                          L"Archive format");
         return;
     }
-    const auto provider_capabilities = archive_provider->capabilities(archive);
-    if (!provider_capabilities.create &&
+    // Creation/update support is a provider property, not an archive query.
+    // Do not parse an existing target on the UI thread merely to enable OK.
+    const bool provider_can_write = output_format == axiom::ArchiveFormat::axar ||
+                                    output_format == axiom::ArchiveFormat::zip;
+    if (!provider_can_write &&
         pending_archive_features_.update_mode == axiom::gui::ArchiveUpdateMode::create_new) {
         show_app_message(
             L"This format is read-only in Axiom. Create .axar or .zip archives instead.",
@@ -2052,7 +2285,7 @@ void MainWindow::on_compress() {
             L"Archive format");
         return;
     }
-    if (!provider_capabilities.update &&
+    if (!provider_can_write &&
         pending_archive_features_.update_mode != axiom::gui::ArchiveUpdateMode::create_new) {
         show_app_message(L"This archive format is read-only and cannot be updated.",
                          axiom::gui::MessageDialogIcon::warning,
@@ -2063,6 +2296,8 @@ void MainWindow::on_compress() {
     const auto inputs = inputs_;
     auto options = compression_options();
     const auto mode = pending_archive_features_.update_mode;
+    options.skip_unreadable_files =
+        mode == axiom::gui::ArchiveUpdateMode::create_new;
     options.encrypt_header = pending_archive_features_.encrypt_names;
     options.recovery_percent = static_cast<unsigned>(
         std::clamp(pending_archive_features_.recovery_percent, 0, 100));
@@ -2093,8 +2328,8 @@ void MainWindow::on_compress() {
     const bool lock_after = pending_archive_features_.lock_archive;
     const bool sign_after = pending_archive_features_.sign_archive;
     const bool create_sfx_after = pending_archive_features_.create_sfx;
-    const bool native_archive = archive_provider->info().native;
-    const bool zip_archive = archive_provider->info().format == axiom::ArchiveFormat::zip;
+    const bool native_archive = output_format == axiom::ArchiveFormat::axar;
+    const bool zip_archive = output_format == axiom::ArchiveFormat::zip;
     if (!native_archive &&
         ((!zip_archive && pending_archive_features_.encrypt_data) ||
          pending_archive_features_.encrypt_names ||
@@ -2102,14 +2337,14 @@ void MainWindow::on_compress() {
          pending_archive_features_.lock_archive ||
          pending_archive_features_.repack_after_update ||
          pending_archive_features_.recovery_percent != 0 ||
-         !pending_archive_features_.volume_size.empty() ||
+         (!zip_archive && !pending_archive_features_.volume_size.empty()) ||
          pending_archive_features_.create_recovery_volumes ||
          pending_archive_features_.sign_archive ||
-         pending_archive_features_.create_sfx)) {
+         (!zip_archive && pending_archive_features_.create_sfx))) {
         show_app_message(
             L"The selected archive format does not support one or more Axiom-only "
-            L"options. ZIP supports file-data encryption only; choose Axiom archive "
-            L"format for encrypted names, Recovery, SFX/signing, comment, or lock options.",
+            L"options. ZIP supports data encryption, split volumes, and SFX; choose Axiom "
+            L"format for encrypted names, recovery, signing, comments, or locking.",
             axiom::gui::MessageDialogIcon::warning,
             L"Archive format");
         return;
@@ -2253,8 +2488,11 @@ void MainWindow::on_compress() {
                                         "could not remove the unsplit archive", archive,
                                         remove_error);
                                 }
+                            } else if (provider->info().format ==
+                                           axiom::ArchiveFormat::zip && split_after) {
+                                axiom::create_zip_volumes(archive, volume_size, operation);
                             }
-                            if (provider->info().native && create_sfx_after) {
+                            if (create_sfx_after) {
                                 axiom::create_sfx_archive(archive, sfx_stub, sfx_output,
                                                           operation,
                                                           options.io_buffer_size);
@@ -2313,21 +2551,25 @@ void MainWindow::on_verify_archive_signature() {
     const auto archive = active_archive_path();
     if (!archive) return;
     std::string password;
-    try {
-        if (axiom::archive_is_encrypted(*archive)) {
-            std::wstring entered;
-            if (!axiom::gui::show_archive_password_dialog(hwnd_, entered)) return;
-            password = utf8(entered);
-            secure_clear(entered);
-        }
-        const auto info = axiom::verify_archive_signature(*archive, password);
-        if (!info.present) {
-            show_app_message(L"This archive is not signed.",
-                             axiom::gui::MessageDialogIcon::information,
-                             L"Verify signature");
-            return;
-        }
-        const bool trusted = signature_key_is_trusted(info);
+    if (active_archive_capabilities().encrypted) {
+        std::wstring entered;
+        if (!axiom::gui::show_archive_password_dialog(hwnd_, entered)) return;
+        password = utf8(entered);
+        secure_clear(entered);
+    }
+    const auto path = *archive;
+    begin_background_ui_task(L"Verifying archive signature...",
+        [this, path, password = std::move(password)]() mutable {
+        const auto info = axiom::verify_archive_signature(path, password);
+        secure_clear(password);
+        return [this, info] {
+            if (!info.present) {
+                show_app_message(L"This archive is not signed.",
+                                 axiom::gui::MessageDialogIcon::information,
+                                 L"Verify signature");
+                return;
+            }
+            const bool trusted = signature_key_is_trusted(info);
         std::wstringstream fingerprint;
         fingerprint << std::hex << std::setfill(L'0');
         for (std::size_t index = 0; index < 8; ++index) {
@@ -2344,10 +2586,8 @@ void MainWindow::on_verify_archive_signature() {
             info.valid && trusted ? axiom::gui::MessageDialogIcon::information
                                   : axiom::gui::MessageDialogIcon::error,
             L"Verify signature");
-    } catch (const std::exception& error) {
-        show_app_message(widen(error.what()), axiom::gui::MessageDialogIcon::error,
-                         L"Verify signature");
-    }
+        };
+    });
 }
 
 void MainWindow::on_extract() {
@@ -2359,8 +2599,9 @@ void MainWindow::on_extract() {
     }
     const auto* provider = active_archive_provider();
     if (provider == nullptr) {
-        show_app_message(L"This archive format is not supported.",
-                         axiom::gui::MessageDialogIcon::warning, L"Extract archive");
+        pending_archive_command_ = PendingArchiveCommand{kExtract, *archive};
+        queue_selected_archive_capability_probe(*archive);
+        set_status(L"Analyzing archive before extraction...");
         return;
     }
     axiom::gui::ExtractArchiveDialogOptions dialog_options;
@@ -2377,16 +2618,10 @@ void MainWindow::on_extract() {
         dialog_options.destination = archive->parent_path() / archive->stem();
     }
     auto capabilities = active_archive_capabilities();
-    if (!capabilities.list && !capabilities.extract && !capabilities.test) {
-        try {
-            capabilities = provider->capabilities(*archive);
-        } catch (const std::exception& error) {
-            show_app_message(widen(error.what()), axiom::gui::MessageDialogIcon::error,
-                             L"Open archive");
-            return;
-        }
-    }
-    if (!capabilities.extract) {
+    // Encrypted providers commonly advertise extraction only after a password
+    // is supplied. Do not reject them before the password dialog has had a
+    // chance to unlock the dynamic capability set.
+    if (!capabilities.extract && !capabilities.encrypted) {
         show_app_message(L"This archive format does not support extraction.",
                          axiom::gui::MessageDialogIcon::information,
                          L"Extract archive");
@@ -2487,32 +2722,21 @@ void MainWindow::on_test() {
     }
     const auto* provider = active_archive_provider();
     if (provider == nullptr) {
-        show_app_message(L"This archive format is not supported.",
-                         axiom::gui::MessageDialogIcon::warning, L"Test archive");
+        pending_archive_command_ = PendingArchiveCommand{kTest, *archive};
+        queue_selected_archive_capability_probe(*archive);
+        set_status(L"Analyzing archive before integrity test...");
         return;
     }
 
     axiom::DecompressionOptions options;
     options.thread_count = application_options_.default_thread_count;
     options.io_buffer_size = configured_io_buffer_size(application_options_);
-    try {
-        const auto capabilities = provider->capabilities(*archive);
-        if (!capabilities.test) {
-            show_app_message(L"This archive format does not support integrity testing.",
-                             axiom::gui::MessageDialogIcon::information,
-                             L"Test archive");
-            return;
-        }
-        if (capabilities.encrypted) {
-            std::wstring password;
-            if (!axiom::gui::show_archive_password_dialog(hwnd_, password)) return;
-            options.password = utf8(password);
-            secure_clear(password);
-        }
-    } catch (const std::exception& error) {
-        show_app_message(widen(error.what()), axiom::gui::MessageDialogIcon::error,
-                         L"Open archive");
-        return;
+    const auto known_capabilities = active_archive_capabilities();
+    if (known_capabilities.encrypted) {
+        std::wstring password;
+        if (!axiom::gui::show_archive_password_dialog(hwnd_, password)) return;
+        options.password = utf8(password);
+        secure_clear(password);
     }
     operation_archive_output_ = *archive;
     start_operation(L"Testing archive...",
@@ -2533,27 +2757,6 @@ void MainWindow::on_test() {
                             provider->test(archive, run_options);
                         }
                     });
-}
-
-void MainWindow::on_operation_progress(LPARAM lparam) {
-    std::unique_ptr<axiom::OperationProgress> progress(
-        reinterpret_cast<axiom::OperationProgress*>(lparam));
-    if (!progress) {
-        return;
-    }
-
-    // Keep only the newest worker update already waiting in the UI queue.
-    // Every payload is heap-owned, so replacing the unique_ptr also releases
-    // each stale update without changing the worker's progress cadence.
-    MSG queued{};
-    while (PeekMessageW(&queued, hwnd_, kOperationProgressMessage,
-                        kOperationProgressMessage, PM_REMOVE)) {
-        progress.reset(reinterpret_cast<axiom::OperationProgress*>(queued.lParam));
-    }
-    if (!busy_) {
-        return;
-    }
-    operation_window_.set_progress(*progress);
 }
 
 void MainWindow::on_operation_done(LPARAM lparam) {
@@ -2582,9 +2785,12 @@ void MainWindow::on_operation_done(LPARAM lparam) {
     }
     show_app_message(
         result->message,
-        result->ok ? axiom::gui::MessageDialogIcon::information
-                   : axiom::gui::MessageDialogIcon::error,
-        result->ok ? L"Axiom" : L"Axiom error");
+        result->ok && result->has_warnings
+            ? axiom::gui::MessageDialogIcon::warning
+            : result->ok ? axiom::gui::MessageDialogIcon::information
+                         : axiom::gui::MessageDialogIcon::error,
+        result->ok && result->has_warnings
+            ? L"Axiom warning" : result->ok ? L"Axiom" : L"Axiom error");
 }
 
 }  // namespace axiom::gui
