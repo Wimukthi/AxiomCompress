@@ -117,7 +117,8 @@ providers are:
   archives. New encrypted ZIPs use WinZip AES-256 file-data encryption.
   Existing encrypted ZIPs can be listed, tested, and extracted with a password,
   but are not edited in place yet. Existing unchanged plaintext entries are
-  preserved by cloning them into an atomically rewritten ZIP.
+  preserved by cloning them into an atomically rewritten ZIP. AXAR and ZIP can
+  both be packaged behind the native self-extractor stub.
 - `system-readonly`: a Windows-only read-only provider. It uses Axiom's bundled
   7-Zip console backend for 7z, RAR/RAR5, ISO, and CAB, and Windows `tar.exe`
   for TAR-family archives. It never advertises create, update, delete, or move.
@@ -166,6 +167,13 @@ for AES-256 encrypted ZIP creation. Future work is mainly richer metadata,
 comments, editable encrypted ZIPs, and possibly swapping the Deflate backend if
 profiling justifies it.
 
+A privately namespaced minizip-ng 4.2.2 container/split-stream core creates and
+directly reads standard `.z01`, `.z02`, ..., `.zip` sets. Axiom raw-copies completed
+entries, preserving Deflate data, metadata, CRCs, and WinZip AES ciphertext. Its
+vendored split writer carries a documented local-header boundary fix verified
+against bundled 7-Zip. Split sets are browse/test/extract only after creation;
+editing requires recreating the set.
+
 The detailed format support roadmap lives in
 [`docs/FORMAT_SUPPORT.md`](docs/FORMAT_SUPPORT.md).
 
@@ -174,7 +182,7 @@ The detailed format support roadmap lives in
 Archive-level services include:
 
 - signatures over exact stored block bytes and canonical directory semantics;
-- SFX output by appending an intact archive plus a fixed trailer to the native GUI
+- SFX output by appending an intact AXAR or ZIP archive plus a fixed trailer to the native GUI
   stub;
 - POSIX mode/uid/gid metadata through a skippable entry TLV;
 - recovery records backed by the portable Reed-Solomon core;
@@ -184,6 +192,11 @@ Recovery protects the archive through the end of the central directory and can
 repair damaged shards atomically. Volume joining validates the reconstructed
 archive with BLAKE3 before installing it. Long recovery and volume operations
 honor `OperationControl`.
+
+Complete AXAR data-volume sets are exposed through a segmented random-access
+source, so list/test/extract operate on the numbered files without creating a
+joined archive. The provider marks this logical archive read-only. Missing data
+parts retain the existing Reed-Solomon join/reconstruction path.
 
 ### GUI drag/drop boundary
 
@@ -330,6 +343,52 @@ Any new feature must keep decompression deterministic and bounded:
 - Reject malformed distances, sizes, and checksums.
 
 ## Threading
+
+### GUI responsiveness and progress telemetry
+
+The Win32 thread owns windows, menus, dialogs, input routing, and presentation
+only. Archive identification, provider capability probes, catalog loading,
+comments, recovery metadata, signature verification, SFX/split-volume
+inspection, and all archive operations run on workers. Results return as owned,
+typed messages; closing the main window invalidates the shared lifetime token and
+drains any already-queued payloads.
+
+`OperationControl` is also the single source of progress truth. Producers publish
+a coherent snapshot containing stage bytes, item counts, current path, and
+per-file bytes. Numeric fields use a sequence-guarded atomic snapshot and paths
+are replaced atomically only when they change. Reports are coalesced at 1 MiB
+unless a stage, item, total, file, or completion boundary changes, so telemetry
+cannot become an inner-loop throughput bottleneck.
+
+Progress stays continuous even inside multi-second encodes: the parse loops
+(greedy chains, tree matcher, and both optimal-parser passes) tick a fractional
+`encode_progress` hook every 256 KiB of scanned input, `compress_block` maps
+each pass into a rough share of its block's wall time, the parallel block codec
+sums per-worker in-flight fractions into the byte-progress channel, and the
+archive writer sums per-solid-block contributions across its concurrent jobs
+(never a shared high-water mark, which would collapse concurrent blocks into
+block-sized jumps). Measured on a level-9 Silesia archive: the worst gap
+between progress advances is ~0.6 s and steps stay under 2 MB, where a whole
+solid block previously arrived at once.
+
+GUI progress windows and the interactive CLI poll this snapshot; operation
+threads never paint, format status text, query HWNDs, inspect a growing output
+file, or enqueue progress messages. The GUI samples at its own cadence, computes
+rate and ETA from a rolling phase-local window, and repaints a liveness heartbeat
+even when an external backend is between measurable checkpoints. Bundled 7-Zip
+operations request and parse its native percentage stream for accurate progress.
+Pause and cancellation retain their cooperative `OperationControl` checkpoints;
+the unpaused checkpoint path is an atomic fast path.
+
+Archive drag-out has two explicit telemetry phases. The provider first extracts
+selected entries into Axiom's private staging directory. After the drop is
+accepted, the OLE `CFSTR_FILECONTENTS` streams are wrapped by a read-only
+counting `IStream`; this reports bytes actually consumed by the shell, the
+current relative path, and completed-file counts while Explorer writes the drop
+destination. The wrapper does not rescan or recopy data and publishes at 1 MiB
+or file boundaries. Transfer cancellation is checked on every stream read;
+pause is intentionally unavailable for this phase because an OLE stream call
+may be dispatched on the source STA and blocking it would also block Resume UI.
 
 `thread_count == 0` means "use the machine": compression workers default to the
 **physical core count** (hyperthread siblings measured flat-to-negative on the

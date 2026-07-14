@@ -557,6 +557,9 @@ axiomc t restored.axar
 Any surviving data or recovery volume may identify the set. Joining checks each
 payload CRC and the BLAKE3 digest of the complete reconstructed archive.
 
+When every data volume is present, ordinary read commands can use any numbered
+volume directly without first running `join`; the set is exposed read-only.
+
 ## Signing and verification
 
 Generate a key pair:
@@ -631,7 +634,7 @@ axiomc sfx release.axar release-setup.exe "D:\Axiom\Axiom.exe"
 ```
 
 The output is one standalone Windows executable. It contains the native Axiom GUI
-stub, the intact `.axar` payload, and an Axiom SFX trailer; the source archive is
+stub, the intact `.axar` or `.zip` payload, and an Axiom SFX trailer; the source archive is
 not referenced when the resulting `.exe` runs. Use the GUI and CLI executables
 from the same build.
 

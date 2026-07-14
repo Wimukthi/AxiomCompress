@@ -38,7 +38,7 @@ Most users need one of these paths:
 - Optional encrypted filenames/directories.
 - Recovery records, repair, split volumes, and `.rev` recovery volumes.
 - Monocypher EdDSA archive signatures.
-- Native Windows SFX output as a single merged `.exe`.
+- Native Windows SFX output for AXAR and ZIP as a single merged `.exe`.
 - Cooperative progress, pause, resume, and cancel through shared worker-thread
   operation control.
 - Coverage-guided fuzz targets and Release-mode round-trip tests.
@@ -151,9 +151,11 @@ directory. AXAR populates Packed with a proportional estimate because solid
 blocks can contain data from several files; estimated values are marked with
 `≈`. New encrypted ZIPs use WinZip AES-256 file-data encryption. ZIP file names
 remain visible, and existing encrypted ZIPs are read/test/extract only for now.
-AXAR-only features such as archive comments, locking, recovery records, split
-volumes, signatures, SFX packaging, encrypted names, and Axiom metadata remain
-disabled when ZIP is selected.
+AXAR-only features such as archive comments, locking, recovery records and recovery
+volumes, signatures, encrypted names, and Axiom metadata remain disabled
+when ZIP is selected. ZIP can create and open standard `.z01`, `.z02`, ..., `.zip`
+split sets; split sets are read-only and must be recreated to change their entries.
+SFX packaging works for both AXAR and ZIP and emits only the merged executable.
 
 On Windows, Axiom also exposes read-only archive providers for common formats.
 ISO browsing uses Axiom's native ISO9660/Joliet directory reader so large images
@@ -177,7 +179,8 @@ The GUI supports:
 - Edit archive comments.
 - Lock archives.
 - Repair damaged archives when recovery data is available.
-- Open numbered split volumes and reconstruct the complete archive.
+- Open complete numbered split-volume sets directly; reconstruct only when data
+  parts are missing or damaged.
 - Sign and verify archives.
 - Create native SFX executables.
 
@@ -478,6 +481,8 @@ Vendored third-party components keep their license notices under
 third-party components include:
 
 - miniz 3.1.1 for ZIP read/write support, under the MIT license.
+- minizip-ng 4.2.2 container/split-stream core, privately namespaced for
+  standard split-ZIP support, under the zlib license.
 - 7-Zip console backend for read-only 7z/RAR/ISO/CAB support, under LGPL/BSD
   terms with the upstream unRAR restriction for some RAR code.
 - Monocypher for cryptographic primitives, under the BSD 2-Clause license.

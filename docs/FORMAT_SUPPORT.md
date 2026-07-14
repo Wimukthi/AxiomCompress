@@ -8,8 +8,8 @@ commands that are safe for that format.
 
 | Format | Browse | Extract | Test | Create | Add/update/sync | Delete | Move/rename | Packed sizes | Notes |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---|
-| AXAR | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Estimated | Native format with encryption, recovery records, split volumes, comments, locking, signatures, metadata, links, and SFX packaging. |
-| ZIP | Yes | Yes | Yes | Yes | Yes, plaintext only | Yes, plaintext only | Yes, plaintext only | Yes | Stored/Deflate ZIP archives. New encrypted ZIPs use WinZip AES-256 file-data encryption. ZIP edits are atomic rewrites. |
+| AXAR | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Estimated | Native format with encryption, recovery records, directly readable read-only split volumes, comments, locking, signatures, metadata, links, and SFX packaging. |
+| ZIP | Yes | Yes | Yes | Yes | Yes, plaintext only | Yes, plaintext only | Yes, plaintext only | Yes | Stored/Deflate ZIP archives, WinZip AES-256 creation, SFX, and standard split volumes. ZIP edits are atomic rewrites. Split sets are read-only. |
 | 7z | Windows | Windows | Windows | No | No | No | No | Yes | Read-only bundled 7-Zip backend. Encrypted 7z archives prompt for a password. |
 | RAR/RAR5 | Windows | Windows | Windows | No | No | No | No | Yes | Read-only bundled 7-Zip backend. RAR creation is intentionally unsupported. |
 | TAR family | Windows | Windows | Windows | No | No | No | No | No | Covers `.tar`, `.tar.gz`, `.tgz`, `.tar.xz`, `.txz`, `.tar.bz2`, `.tbz2`, `.tar.zst`, and `.tzst` when supported by Windows `tar.exe`. |
@@ -20,10 +20,12 @@ ZIP stores exact compressed sizes per central-directory entry. AXAR uses solid
 blocks, so per-file Packed values are proportional estimates and the GUI marks
 them with `≈`. ZIP can create AES-256 encrypted archives and can read/test/extract
 encrypted stored/Deflate entries when a password is supplied. Existing encrypted
-ZIPs are not updated, deleted from, or renamed in place yet. ZIP intentionally
-does not expose AXAR-only services: archive comments, locking, recovery records,
-split volumes, signatures, SFX packaging, encrypted names, and Axiom metadata
-remain disabled when ZIP is selected.
+ZIPs are not updated, deleted from, or renamed in place yet. Standard `.z01`,
+`.z02`, ..., `.zip` sets can be created, browsed, tested, and extracted, including
+AES-256 entries, but are not edited in place. ZIP intentionally does not expose
+AXAR-only services: archive comments, locking, recovery records/recovery volumes,
+signatures, encrypted names, and Axiom metadata. SFX packaging is supported for
+single-file ZIP archives.
 
 The Windows system provider is intentionally read-only. It uses a bundled 7-Zip
 console backend for 7z, RAR/RAR5, ISO, and CAB, and Windows `tar.exe` for TAR

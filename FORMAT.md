@@ -262,6 +262,11 @@ validates set identity and payload CRCs, reconstructs unavailable shards when
 enough members survive, truncates to `archive_size`, verifies `archive_digest`,
 and installs the output atomically. A set is limited to 255 total volumes.
 
+When every data volume is present, readers concatenate those payload ranges as a
+logical random-access archive and can list, test, or extract it directly. This
+does not create a temporary joined file and the set remains read-only. Joining is
+required for modification and for recovery from missing or corrupt data parts.
+
 ### Footer (24 bytes, at end of file)
 
 | field          | type  | notes                       |
@@ -364,8 +369,10 @@ What the format and the current implementation do and do not handle:
   digest covers exact header/preamble/block bytes and canonical directory semantics.
   `test` rejects an invalid signature and any edit removes the stale signature.
   This primitive is not wire-compatible with standard SHA-512 Ed25519.
-- **SFX packaging:** an intact `.axar` is appended to `Axiom.exe`, followed by
-  `"AXIOMSFX"` and a u64 archive length. The stub verifies and extracts the payload.
+- **SFX packaging:** an intact `.axar` or `.zip` is appended to `Axiom.exe`, followed
+  by `"AXIOMSFX"` and a u64 payload length. The stub identifies the embedded provider,
+  verifies where supported, and extracts the payload. This wrapper does not change
+  either archive format.
 - **Recovery records:** optional Reed-Solomon parity protects the archive through
   the end of its central directory and supports atomic repair.
 - **Split/recovery volumes:** exact archive bytes can be divided into checked data
