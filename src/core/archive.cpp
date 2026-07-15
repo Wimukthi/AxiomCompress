@@ -8,6 +8,7 @@
 #include "core/checksum.hpp"
 #include "core/file_replace.hpp"
 #include "core/path_text.hpp"
+#include "core/task_executor.hpp"
 #include "entropy/huffman.hpp"
 
 #include <algorithm>
@@ -31,7 +32,9 @@ namespace {
 
 constexpr std::array<std::uint8_t, 8> kMagic = {'A', 'X', 'I', 'O', 'M', 'C', '1', '\0'};
 constexpr std::uint16_t kLegacyVersion = 4;
-constexpr std::uint16_t kVersion = 5;
+constexpr std::uint16_t kTransformVersion = 5;
+constexpr std::uint16_t kSequenceVersion = 6;
+constexpr std::uint16_t kVersion = 7;
 constexpr std::size_t kLegacyHeaderSize = 32;
 constexpr std::size_t kHeaderSize = 36;
 constexpr std::uint8_t kFlagTransforms = 1u << 0;
@@ -230,7 +233,8 @@ ArchiveHeader read_archive_header(std::span<const std::uint8_t> archive) {
 
     std::size_t cursor = kMagic.size();
     const auto version = read_u16(archive, cursor);
-    if (version != kLegacyVersion && version != kVersion) {
+    if (version != kLegacyVersion && version != kTransformVersion &&
+        version != kSequenceVersion && version != kVersion) {
         throw FormatError("unsupported archive version");
     }
 
@@ -238,6 +242,7 @@ ArchiveHeader read_archive_header(std::span<const std::uint8_t> archive) {
     const auto flags = archive[cursor++];
 
     ArchiveHeader header;
+    header.format_version = version;
     if (codec_byte == static_cast<std::uint8_t>(CodecId::store)) {
         header.codec = CodecId::store;
     } else if (codec_byte == static_cast<std::uint8_t>(CodecId::greedy_lz77)) {
@@ -250,6 +255,9 @@ ArchiveHeader read_archive_header(std::span<const std::uint8_t> archive) {
         header.codec = CodecId::greedy_lz77_split;
     } else if (codec_byte == static_cast<std::uint8_t>(CodecId::greedy_lz77_split_slots)) {
         header.codec = CodecId::greedy_lz77_split_slots;
+    } else if (codec_byte == static_cast<std::uint8_t>(CodecId::lz77_sequences) &&
+               version >= kSequenceVersion) {
+        header.codec = CodecId::lz77_sequences;
     } else {
         throw FormatError("unsupported codec id");
     }
@@ -262,7 +270,7 @@ ArchiveHeader read_archive_header(std::span<const std::uint8_t> archive) {
         header.payload_offset = kLegacyHeaderSize;
     } else {
         if (archive.size() < kHeaderSize) {
-            throw FormatError("version 5 archive is smaller than the fixed header");
+            throw FormatError("archive is smaller than the extended fixed header");
         }
         if ((flags & ~kFlagTransforms) != 0) {
             throw FormatError("unsupported archive flags");
@@ -320,12 +328,7 @@ ByteVector compress(std::span<const std::uint8_t> input,
     if (options.enable_file_filters && !options.force_store && !input.empty()) {
         std::vector<CompressionTransformRange> requested = options.transform_ranges;
         if (requested.empty()) {
-            const auto hint = codec::detect_transform_hint(input);
-            if (hint.transform != CompressionTransform::none) {
-                requested.push_back({hint.transform, 0,
-                                     static_cast<std::uint64_t>(input.size()), 0,
-                                     hint.parameter});
-            }
+            requested = codec::detect_transform_ranges(input);
         }
         active_transforms = codec::normalize_transform_ranges(requested, input.size());
         if (!active_transforms.empty()) {
@@ -342,10 +345,14 @@ ByteVector compress(std::span<const std::uint8_t> input,
 
     auto finish_archive = [&](ByteVector result_payload, core::CodecId result_codec,
                               std::optional<std::uint32_t> encoded_crc = std::nullopt) {
-        if (result_codec == core::CodecId::store && !active_transforms.empty()) {
-            // A stored transformed stream can only add metadata and work. Preserve
-            // the original bytes and omit the transform envelope in this case.
-            result_payload.assign(original_input.begin(), original_input.end());
+        if (result_codec == core::CodecId::store) {
+            // Store is tracked as a size-only candidate during the bake-off.
+            // Materialize it only if every compressed candidate lost, avoiding
+            // an eager full-input copy on the normal compressed path.
+            if (result_payload.empty() && !original_input.empty()) {
+                result_payload.assign(original_input.begin(), original_input.end());
+            }
+            // A stored transformed stream can only add metadata and work.
             active_transforms.clear();
         }
         const auto crc = active_transforms.empty() && encoded_crc
@@ -363,12 +370,11 @@ ByteVector compress(std::span<const std::uint8_t> input,
 
     ByteVector payload;
     auto codec = core::CodecId::store;
+    std::size_t best_size = input.size();
     std::optional<std::uint32_t> payload_crc;
 
     if (options.force_store) {
-        payload.assign(input.begin(), input.end());
     } else if (!options.force_parallel_blocks && codec::likely_incompressible(input)) {
-        payload.assign(input.begin(), input.end());
     } else {
         auto parallel_options = options;
         parallel_options.block_size = codec::effective_parallel_block_size(input.size(), options);
@@ -413,7 +419,6 @@ ByteVector compress(std::span<const std::uint8_t> input,
                                       core::CodecId::parallel_blocks, block_crc);
             }
 
-            payload.assign(original_input.begin(), original_input.end());
             if (options.encoded_bytes_progress) {
                 options.encoded_bytes_progress(static_cast<std::uint64_t>(input.size()));
             }
@@ -435,14 +440,15 @@ ByteVector compress(std::span<const std::uint8_t> input,
                                 input.size() <= options.optimal_parse_limit));
         std::future<ByteVector> block_future;
         if (evaluate_parallel_candidate && thorough) {
-            block_future = std::async(std::launch::async, [&input, parallel_options] {
+            auto encode_blocks = [&input, parallel_options] {
                 return codec::encode_parallel_blocks(input, parallel_options);
-            });
+            };
+            block_future = options.task_executor
+                ? options.task_executor->submit(std::move(encode_blocks))
+                : std::async(std::launch::async, std::move(encode_blocks));
         }
 
-        payload.assign(input.begin(), input.end());
-
-        auto consider_lz_payload = [&](ByteVector lz_payload) {
+        auto consider_lz_payload = [&](ByteVector lz_payload, bool try_sequence) {
             if (options.operation) {
                 options.operation->checkpoint();
             }
@@ -455,27 +461,65 @@ ByteVector compress(std::span<const std::uint8_t> input,
             if (!options.fast_entropy) {
                 entropy_payload = entropy::encode_huffman(lz_payload);
             }
-            auto [split_payload, slot_payload] =
-                codec::encode_lz77_split_payloads(lz_payload, options.fast_entropy);
+            std::optional<ByteVector> split_payload;
+            std::optional<ByteVector> slot_payload;
+            std::optional<ByteVector> sequence_payload;
+            if (try_sequence && options.fast_entropy) {
+                auto candidates = codec::encode_lz77_payload_candidates(
+                    input, lz_payload, options.fast_entropy,
+                    options.task_executor.get());
+                split_payload = std::move(candidates.split);
+                slot_payload = std::move(candidates.slots);
+                sequence_payload = std::move(candidates.sequence);
+            } else {
+                auto legacy =
+                    codec::encode_lz77_split_payloads(lz_payload, options.fast_entropy,
+                                                      options.task_executor.get());
+                split_payload = std::move(legacy.first);
+                slot_payload = std::move(legacy.second);
+                if (try_sequence) {
+                    auto useful_size = std::min(best_size, lz_payload.size());
+                    if (entropy_payload) {
+                        useful_size = std::min(useful_size, entropy_payload->size());
+                    }
+                    useful_size = std::min(useful_size, split_payload->size());
+                    if (slot_payload) {
+                        useful_size = std::min(useful_size, slot_payload->size());
+                    }
+                    sequence_payload = codec::encode_lz77_sequence_streams(
+                        input, lz_payload, options.fast_entropy, useful_size,
+                        options.task_executor.get());
+                }
+            }
 
-            if (lz_payload.size() < payload.size()) {
+            if (lz_payload.size() < best_size) {
+                best_size = lz_payload.size();
                 codec = core::CodecId::greedy_lz77;
                 payload = std::move(lz_payload);
             }
 
-            if (entropy_payload && entropy_payload->size() < payload.size()) {
+            if (entropy_payload && entropy_payload->size() < best_size) {
+                best_size = entropy_payload->size();
                 codec = core::CodecId::greedy_lz77_huffman;
                 payload = std::move(*entropy_payload);
             }
 
-            if (split_payload.size() < payload.size()) {
+            if (split_payload && split_payload->size() < best_size) {
+                best_size = split_payload->size();
                 codec = core::CodecId::greedy_lz77_split;
-                payload = std::move(split_payload);
+                payload = std::move(*split_payload);
             }
 
-            if (slot_payload && slot_payload->size() < payload.size()) {
+            if (slot_payload && slot_payload->size() < best_size) {
+                best_size = slot_payload->size();
                 codec = core::CodecId::greedy_lz77_split_slots;
                 payload = std::move(*slot_payload);
+            }
+
+            if (sequence_payload && sequence_payload->size() < best_size) {
+                best_size = sequence_payload->size();
+                codec = core::CodecId::lz77_sequences;
+                payload = std::move(*sequence_payload);
             }
         };
 
@@ -489,7 +533,8 @@ ByteVector compress(std::span<const std::uint8_t> input,
             std::uint32_t block_crc = 0;
             auto block_payload =
                 codec::encode_parallel_blocks(input, parallel_options, &block_crc);
-            if (block_payload.size() < payload.size()) {
+            if (block_payload.size() < best_size) {
+                best_size = block_payload.size();
                 codec = core::CodecId::parallel_blocks;
                 payload = std::move(block_payload);
                 payload_crc = block_crc;
@@ -527,15 +572,16 @@ ByteVector compress(std::span<const std::uint8_t> input,
                 // tokens, so they must outlive the parse (see compress_block).
                 auto optimal_tokens =
                     codec::encode_lz77_optimal(input, optimal_options, &greedy);
-                consider_lz_payload(std::move(greedy));
-                consider_lz_payload(std::move(optimal_tokens));
+                consider_lz_payload(std::move(greedy), /*try_sequence=*/false);
+                consider_lz_payload(std::move(optimal_tokens), /*try_sequence=*/true);
             } else {
-                consider_lz_payload(std::move(greedy));
+                consider_lz_payload(std::move(greedy), /*try_sequence=*/!run_optimal);
                 if (run_optimal) {
                     if (options.operation) {
                         options.operation->checkpoint();
                     }
-                    consider_lz_payload(codec::encode_lz77_optimal(input, optimal_options));
+                    consider_lz_payload(codec::encode_lz77_optimal(input, optimal_options),
+                                        /*try_sequence=*/true);
                 }
             }
             // Max-effort mode also tries the binary-tree finder, whose large
@@ -547,11 +593,13 @@ ByteVector compress(std::span<const std::uint8_t> input,
                 if (options.operation) {
                     options.operation->checkpoint();
                 }
-                consider_lz_payload(codec::encode_lz77(input, tree_options));
+                consider_lz_payload(codec::encode_lz77(input, tree_options),
+                                    /*try_sequence=*/true);
             }
             if (evaluate_parallel_candidate) {
                 auto block_payload = block_future.get();
-                if (block_payload.size() < payload.size()) {
+                if (block_payload.size() < best_size) {
+                    best_size = block_payload.size();
                     codec = core::CodecId::parallel_blocks;
                     payload = std::move(block_payload);
                 }
@@ -605,6 +653,9 @@ ByteVector decompress(std::span<const std::uint8_t> archive,
     } else if (header.codec == core::CodecId::greedy_lz77_split_slots) {
         restored = codec::decode_lz77_split_streams_slots(
             payload, core::checked_size(header.original_size, "original size"));
+    } else if (header.codec == core::CodecId::lz77_sequences) {
+        restored = codec::decode_lz77_sequence_streams(
+            payload, core::checked_size(header.original_size, "original size"));
     } else if (header.codec == core::CodecId::parallel_blocks) {
         std::uint32_t combined_crc = 0;
         restored = codec::decode_parallel_blocks(
@@ -618,7 +669,9 @@ ByteVector decompress(std::span<const std::uint8_t> archive,
                     progress(done, total);
                 }
             },
-            &combined_crc);
+            &combined_crc,
+            header.format_version >= core::kSequenceVersion,
+            header.format_version >= core::kVersion);
         restored_crc = combined_crc;
     } else {
         throw FormatError("unsupported codec id");

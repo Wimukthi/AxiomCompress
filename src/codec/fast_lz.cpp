@@ -10,6 +10,13 @@
 #include <limits>
 #include <vector>
 
+#if defined(_M_X64) || defined(__x86_64__)
+#include <emmintrin.h>
+#define AXIOM_HAS_SSE2 1
+#else
+#define AXIOM_HAS_SSE2 0
+#endif
+
 namespace axiom::codec {
 namespace {
 
@@ -37,14 +44,48 @@ std::uint32_t load_u32_le(const std::uint8_t* p) {
            (static_cast<std::uint32_t>(p[3]) << 24);
 }
 
+std::size_t hash_value(std::uint32_t value) {
+    return (value * 2654435761u) >> (32 - kHashBits);
+}
+
 std::size_t hash4(const std::uint8_t* p) {
-    return (load_u32_le(p) * 2654435761u) >> (32 - kHashBits);
+    return hash_value(load_u32_le(p));
 }
 
 std::size_t common_prefix(const std::uint8_t* left,
                           const std::uint8_t* right,
                           std::size_t limit) {
     std::size_t matched = 0;
+    if (matched + 8 <= limit) {
+        std::uint64_t a = 0;
+        std::uint64_t b = 0;
+        std::memcpy(&a, left + matched, sizeof(a));
+        std::memcpy(&b, right + matched, sizeof(b));
+        const auto diff = a ^ b;
+        if (diff != 0) {
+            if constexpr (std::endian::native == std::endian::little) {
+                return std::countr_zero(diff) / 8;
+            } else {
+                return std::countl_zero(diff) / 8;
+            }
+        }
+        matched += 8;
+    }
+#if AXIOM_HAS_SSE2
+    // Keep short probes scalar; widen only after the first eight bytes match.
+    while (matched + 16 <= limit) {
+        const auto a = _mm_loadu_si128(
+            reinterpret_cast<const __m128i*>(left + matched));
+        const auto b = _mm_loadu_si128(
+            reinterpret_cast<const __m128i*>(right + matched));
+        const auto equal = static_cast<std::uint32_t>(
+            _mm_movemask_epi8(_mm_cmpeq_epi8(a, b)));
+        if (equal != 0xFFFFu) {
+            return matched + std::countr_zero((~equal) & 0xFFFFu);
+        }
+        matched += 16;
+    }
+#endif
     while (matched + 8 <= limit) {
         std::uint64_t a = 0;
         std::uint64_t b = 0;
@@ -331,7 +372,8 @@ ByteVector encode_fast_lz(std::span<const std::uint8_t> input,
     std::size_t literal_start = 0;
     std::size_t pos = 0;
     while (pos + kMinMatch <= input.size()) {
-        const auto& row = table[hash4(input.data() + pos)];
+        const auto current = load_u32_le(input.data() + pos);
+        const auto& row = table[hash_value(current)];
         std::size_t best_length = 0;
         std::size_t best_distance = 0;
 
@@ -339,15 +381,14 @@ ByteVector encode_fast_lz(std::span<const std::uint8_t> input,
             if (candidate32 == kInvalidPos) {
                 continue;
             }
+            // Rows contain only positions remembered by earlier iterations;
+            // the invalid sentinel was handled above.
             const auto candidate = static_cast<std::size_t>(candidate32);
-            if (candidate >= pos) {
-                continue;
-            }
             const auto distance = pos - candidate;
             if (distance > max_distance) {
                 continue;
             }
-            if (load_u32_le(input.data() + candidate) != load_u32_le(input.data() + pos)) {
+            if (load_u32_le(input.data() + candidate) != current) {
                 continue;
             }
 
@@ -407,7 +448,8 @@ ByteVector encode_fast_lz77(std::span<const std::uint8_t> input,
     std::size_t pos = 0;
     std::array<std::size_t, kRepCount> reps{1, 2, 3, 4};
     while (pos + kMinMatch <= input.size()) {
-        const auto& row = table[hash4(input.data() + pos)];
+        const auto current = load_u32_le(input.data() + pos);
+        const auto& row = table[hash_value(current)];
         std::size_t best_length = 0;
         std::size_t best_distance = 0;
 
@@ -416,14 +458,11 @@ ByteVector encode_fast_lz77(std::span<const std::uint8_t> input,
                 continue;
             }
             const auto candidate = static_cast<std::size_t>(candidate32);
-            if (candidate >= pos) {
-                continue;
-            }
             const auto distance = pos - candidate;
             if (distance > max_distance) {
                 continue;
             }
-            if (load_u32_le(input.data() + candidate) != load_u32_le(input.data() + pos)) {
+            if (load_u32_le(input.data() + candidate) != current) {
                 continue;
             }
 
@@ -446,8 +485,7 @@ ByteVector encode_fast_lz77(std::span<const std::uint8_t> input,
             if (distance == 0 || distance > pos) {
                 continue;
             }
-            if (load_u32_le(input.data() + pos - distance) !=
-                load_u32_le(input.data() + pos)) {
+            if (load_u32_le(input.data() + pos - distance) != current) {
                 continue;
             }
             const auto length = common_prefix(input.data() + pos - distance,
@@ -596,7 +634,8 @@ FastLz77SplitPayloads encode_fast_lz77_split_payloads(
     std::size_t pos = 0;
     std::array<std::size_t, kRepCount> reps{1, 2, 3, 4};
     while (pos + kMinMatch <= input.size()) {
-        const auto& row = table[hash4(input.data() + pos)];
+        const auto current = load_u32_le(input.data() + pos);
+        const auto& row = table[hash_value(current)];
         std::size_t best_length = 0;
         std::size_t best_distance = 0;
 
@@ -605,14 +644,11 @@ FastLz77SplitPayloads encode_fast_lz77_split_payloads(
                 continue;
             }
             const auto candidate = static_cast<std::size_t>(candidate32);
-            if (candidate >= pos) {
-                continue;
-            }
             const auto distance = pos - candidate;
             if (distance > max_distance) {
                 continue;
             }
-            if (load_u32_le(input.data() + candidate) != load_u32_le(input.data() + pos)) {
+            if (load_u32_le(input.data() + candidate) != current) {
                 continue;
             }
 
@@ -635,8 +671,7 @@ FastLz77SplitPayloads encode_fast_lz77_split_payloads(
             if (distance == 0 || distance > pos) {
                 continue;
             }
-            if (load_u32_le(input.data() + pos - distance) !=
-                load_u32_le(input.data() + pos)) {
+            if (load_u32_le(input.data() + pos - distance) != current) {
                 continue;
             }
             const auto length = common_prefix(input.data() + pos - distance,

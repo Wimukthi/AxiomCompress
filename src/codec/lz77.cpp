@@ -18,6 +18,13 @@
 #include <intrin.h>
 #endif
 
+#if defined(_M_X64) || defined(__x86_64__)
+#include <emmintrin.h>
+#define AXIOM_HAS_SSE2 1
+#else
+#define AXIOM_HAS_SSE2 0
+#endif
+
 namespace axiom::codec {
 namespace {
 
@@ -106,13 +113,7 @@ struct ParseDecision {
     std::uint8_t rep_index = 0;       // only meaningful for a rep match
 };
 
-std::size_t hash4(std::span<const std::uint8_t> input, std::size_t position) {
-    const auto value =
-        static_cast<std::uint32_t>(input[position]) |
-        (static_cast<std::uint32_t>(input[position + 1]) << 8) |
-        (static_cast<std::uint32_t>(input[position + 2]) << 16) |
-        (static_cast<std::uint32_t>(input[position + 3]) << 24);
-
+std::size_t hash4_value(std::uint32_t value) {
     return (value * 2654435761u) >> (32 - kHashBits);
 }
 
@@ -122,13 +123,46 @@ std::uint32_t load_u32_le(const std::uint8_t* data) {
     return value;
 }
 
-// Length of the common prefix of two byte runs, capped at `limit`. Compares eight
-// bytes per step (the first mismatching byte is located with a single
-// count-trailing-zeros) instead of one byte at a time. Both pointers read the
-// original input buffer, so overlapping match sources (distance < 8) compare
-// exactly as a byte-serial loop would.
+std::size_t hash4(std::span<const std::uint8_t> input, std::size_t position) {
+    return hash4_value(load_u32_le(input.data() + position));
+}
+
+// Length of the common prefix of two byte runs, capped at `limit`. The first
+// eight bytes use a cheap scalar probe; longer matches switch to 16-byte SSE2
+// comparisons on x64. Both pointers read the original input buffer, so
+// overlapping match sources compare exactly as a byte-serial loop would.
 std::size_t common_prefix(const std::uint8_t* a, const std::uint8_t* b, std::size_t limit) {
     std::size_t i = 0;
+    // Most probes diverge in their first eight bytes, where the scalar XOR +
+    // trailing-zero path is cheaper than setting up SIMD.
+    if (i + 8 <= limit) {
+        std::uint64_t x = 0;
+        std::uint64_t y = 0;
+        std::memcpy(&x, a + i, 8);
+        std::memcpy(&y, b + i, 8);
+        const std::uint64_t diff = x ^ y;
+        if (diff != 0) {
+            const auto bit = std::endian::native == std::endian::little
+                                 ? std::countr_zero(diff)
+                                 : std::countl_zero(diff);
+            return static_cast<std::size_t>(bit) >> 3;
+        }
+        i += 8;
+    }
+#if AXIOM_HAS_SSE2
+    // Once eight bytes already matched, long runs are common enough that two
+    // cache-line-friendly 16-byte comparisons amortize the SIMD mask cost.
+    while (i + 16 <= limit) {
+        const auto left = _mm_loadu_si128(reinterpret_cast<const __m128i*>(a + i));
+        const auto right = _mm_loadu_si128(reinterpret_cast<const __m128i*>(b + i));
+        const auto equal = static_cast<std::uint32_t>(
+            _mm_movemask_epi8(_mm_cmpeq_epi8(left, right)));
+        if (equal != 0xFFFFu) {
+            return i + std::countr_zero((~equal) & 0xFFFFu);
+        }
+        i += 16;
+    }
+#endif
     while (i + 8 <= limit) {
         std::uint64_t x = 0;
         std::uint64_t y = 0;
@@ -348,7 +382,8 @@ void find_matches_at(std::span<const std::uint8_t> input,
         return;
     }
 
-    auto candidate = hash_heads[hash4(input, position)];
+    const auto current = load_u32_le(input.data() + position);
+    auto candidate = hash_heads[hash4_value(current)];
     const auto limit = std::min(max_match, input.size() - position);
     std::size_t depth = 0;
 
@@ -375,7 +410,7 @@ void find_matches_at(std::span<const std::uint8_t> input,
             }
         }
 
-        if (load_u32_le(input.data() + candidate) != load_u32_le(input.data() + position)) {
+        if (load_u32_le(input.data() + candidate) != current) {
             candidate = next;
             ++depth;
             continue;
@@ -478,7 +513,8 @@ ByteVector encode_lz77_impl(std::span<const std::uint8_t> input,
             return;
         }
 
-        auto candidate = hash_heads[hash4(input, pos)];
+        const auto current = load_u32_le(input.data() + pos);
+        auto candidate = hash_heads[hash4_value(current)];
         const auto limit = std::min(max_match, input.size() - pos);
         const auto nice = std::min(nice_length, limit);
         std::size_t depth = 0;
@@ -502,7 +538,7 @@ ByteVector encode_lz77_impl(std::span<const std::uint8_t> input,
 
             if (best_length < limit &&
                 input[candidate + best_length] == input[pos + best_length] &&
-                load_u32_le(input.data() + candidate) == load_u32_le(input.data() + pos)) {
+                load_u32_le(input.data() + candidate) == current) {
                 const std::size_t length =
                     common_prefix(input.data() + candidate, input.data() + pos, limit);
 

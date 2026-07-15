@@ -7,12 +7,14 @@
 #include "codec/varint.hpp"
 #include "core/checksum.hpp"
 #include "core/cpu.hpp"
+#include "core/task_executor.hpp"
 #include "entropy/huffman.hpp"
 
 #include <algorithm>
 #include <atomic>
 #include <cstddef>
 #include <exception>
+#include <future>
 #include <limits>
 #include <mutex>
 #include <optional>
@@ -29,6 +31,8 @@ enum class BlockCodec : std::uint8_t {
     greedy_lz77_split = 3,
     greedy_lz77_split_slots = 4,
     fast_lz = 5,
+    lz77_sequences = 6,
+    lz77_context_split = 7,
 };
 
 struct BlockResult {
@@ -43,6 +47,12 @@ struct EncodedBlock {
     std::size_t output_offset = 0;
     std::size_t payload_offset = 0;
     std::size_t payload_size = 0;
+};
+
+struct LegacyPayloads {
+    ByteVector split;
+    std::optional<ByteVector> slots;
+    std::optional<ByteVector> context_split;
 };
 
 BlockCodec read_block_codec(std::uint8_t value) {
@@ -64,6 +74,12 @@ BlockCodec read_block_codec(std::uint8_t value) {
     if (value == static_cast<std::uint8_t>(BlockCodec::fast_lz)) {
         return BlockCodec::fast_lz;
     }
+    if (value == static_cast<std::uint8_t>(BlockCodec::lz77_sequences)) {
+        return BlockCodec::lz77_sequences;
+    }
+    if (value == static_cast<std::uint8_t>(BlockCodec::lz77_context_split)) {
+        return BlockCodec::lz77_context_split;
+    }
 
     throw FormatError("unsupported block codec");
 }
@@ -79,7 +95,8 @@ std::size_t lz_payload_limit(std::size_t original_size) {
 }
 
 BlockResult compress_block(std::span<const std::uint8_t> input,
-                           const CompressionOptions& options) {
+                           const CompressionOptions& options,
+                           core::TaskExecutor* executor) {
     BlockResult best;
     best.codec = BlockCodec::store;
     best.original_size = input.size();
@@ -103,7 +120,7 @@ BlockResult compress_block(std::span<const std::uint8_t> input,
         // only if that candidate can actually win.
         auto fast_payloads = encode_fast_lz77_split_payloads(input, options);
         auto [split_payload, slot_payload] =
-            encode_lz77_split_payloads(fast_payloads.streams, /*fast=*/true);
+            encode_lz77_split_payloads(fast_payloads.streams, /*fast=*/true, executor);
         if (split_payload.size() < best_size) {
             best_size = split_payload.size();
             best.codec = BlockCodec::greedy_lz77_split;
@@ -139,35 +156,146 @@ BlockResult compress_block(std::span<const std::uint8_t> input,
         return finish_best();
     }
 
-    auto consider_lz_payload = [&](ByteVector lz_payload) {
+    auto consider_lz_payload = [&](ByteVector lz_payload, bool try_sequence) {
+        // Record a raw winner without copying its full token buffer. Most real
+        // blocks replace it with an entropy-coded candidate below; move it into
+        // the result only if it is still the winner after that bake-off.
+        bool raw_payload_pending = false;
         if (lz_payload.size() < best_size) {
             best_size = lz_payload.size();
             best.codec = BlockCodec::greedy_lz77;
-            best.payload = lz_payload;
+            raw_payload_pending = true;
         }
 
-        // The whole-stream Huffman candidate almost never beats split streams on
-        // real data; in fast mode skip it rather than pay a full Huffman pass.
-        if (!options.fast_entropy) {
-            if (auto entropy_payload = entropy::encode_huffman(lz_payload);
-                entropy_payload && entropy_payload->size() < best_size) {
-                best_size = entropy_payload->size();
-                best.codec = BlockCodec::greedy_lz77_huffman;
-                best.payload = std::move(*entropy_payload);
+        auto accept_encoded_payload = [&](BlockCodec codec, ByteVector payload) {
+            if (payload.size() < best_size) {
+                best_size = payload.size();
+                best.codec = codec;
+                best.payload = std::move(payload);
+                raw_payload_pending = false;
+            }
+        };
+
+        std::optional<ByteVector> entropy_payload;
+        std::optional<ByteVector> split_payload;
+        std::optional<ByteVector> slot_payload;
+        std::optional<ByteVector> sequence_payload;
+        std::optional<ByteVector> context_split_payload;
+        // Fast-entropy presets already accept estimate-driven selection, so they
+        // share analysis and prune a provably inferior legacy bake-off. Thorough
+        // presets retain independent candidates to keep their exhaustive policy.
+        if (try_sequence && options.fast_entropy) {
+            auto candidates =
+                encode_lz77_payload_candidates(input, lz_payload, options.fast_entropy,
+                                               executor);
+            split_payload = std::move(candidates.split);
+            slot_payload = std::move(candidates.slots);
+            sequence_payload = std::move(candidates.sequence);
+        } else if (executor != nullptr && !options.fast_entropy &&
+                   lz_payload.size() >= (std::size_t{256} << 10)) {
+            // Huffman, legacy split layouts, and the v6 sequence layout only
+            // read the token stream. Run those independent trials through the
+            // encode-wide executor; deterministic selection still happens in
+            // the original order below.
+            auto huffman_task = executor->submit([&lz_payload] {
+                return entropy::encode_huffman(lz_payload);
+            });
+            auto legacy_task = executor->submit([&input, &lz_payload, &options,
+                                                  try_sequence, executor] {
+                auto pair = encode_lz77_split_payloads(lz_payload, options.fast_entropy,
+                                                       executor);
+                LegacyPayloads result{std::move(pair.first), std::move(pair.second),
+                                      std::nullopt};
+                if (try_sequence && result.slots) {
+                    result.context_split = encode_lz77_context_split_streams(
+                        input, lz_payload, *result.slots, executor);
+                }
+                return result;
+            });
+
+            std::optional<std::future<std::optional<ByteVector>>> sequence_task;
+            if (try_sequence) {
+                const auto useful_size = std::min(best_size, lz_payload.size());
+                sequence_task.emplace(executor->submit(
+                    [&input, &lz_payload, &options, useful_size, executor] {
+                        return encode_lz77_sequence_streams(
+                            input, lz_payload, options.fast_entropy, useful_size, executor);
+                    }));
+            }
+
+            std::exception_ptr task_error;
+            std::optional<LegacyPayloads> legacy;
+            auto collect = [&](auto& task, auto& destination) {
+                try {
+                    destination = executor->wait(task);
+                } catch (...) {
+                    if (!task_error) {
+                        task_error = std::current_exception();
+                    }
+                }
+            };
+            // Drain every sibling before references captured by those tasks go
+            // out of scope, even if allocation or a coder fails in one trial.
+            collect(huffman_task, entropy_payload);
+            collect(legacy_task, legacy);
+            if (sequence_task) {
+                collect(*sequence_task, sequence_payload);
+            }
+            if (task_error) {
+                std::rethrow_exception(task_error);
+            }
+            if (legacy) {
+                split_payload = std::move(legacy->split);
+                slot_payload = std::move(legacy->slots);
+                context_split_payload = std::move(legacy->context_split);
+            }
+        } else {
+            // The whole-stream Huffman candidate almost never beats split
+            // streams, but thorough presets keep the exhaustive comparison.
+            if (!options.fast_entropy) {
+                entropy_payload = entropy::encode_huffman(lz_payload);
+            }
+            auto legacy =
+                encode_lz77_split_payloads(lz_payload, options.fast_entropy, executor);
+            split_payload = std::move(legacy.first);
+            slot_payload = std::move(legacy.second);
+            if (try_sequence) {
+                // Candidate policy must not depend on whether an executor is
+                // present. The parallel path starts this trial before legacy
+                // split sizes are known, so use the same stable upper bound in
+                // serial mode; thread count then cannot change archive bytes.
+                const auto useful_size = std::min(best_size, lz_payload.size());
+                sequence_payload =
+                    encode_lz77_sequence_streams(input, lz_payload, options.fast_entropy,
+                                                 useful_size, executor);
+                if (slot_payload) {
+                    context_split_payload = encode_lz77_context_split_streams(
+                        input, lz_payload, *slot_payload, executor);
+                }
             }
         }
-
-        auto [split_payload, slot_payload] =
-            encode_lz77_split_payloads(lz_payload, options.fast_entropy);
-        if (split_payload.size() < best_size) {
-            best_size = split_payload.size();
-            best.codec = BlockCodec::greedy_lz77_split;
-            best.payload = std::move(split_payload);
+        if (entropy_payload && entropy_payload->size() < best_size) {
+            accept_encoded_payload(BlockCodec::greedy_lz77_huffman,
+                                   std::move(*entropy_payload));
+        }
+        if (split_payload && split_payload->size() < best_size) {
+            accept_encoded_payload(BlockCodec::greedy_lz77_split,
+                                   std::move(*split_payload));
         }
         if (slot_payload && slot_payload->size() < best_size) {
-            best_size = slot_payload->size();
-            best.codec = BlockCodec::greedy_lz77_split_slots;
-            best.payload = std::move(*slot_payload);
+            accept_encoded_payload(BlockCodec::greedy_lz77_split_slots,
+                                   std::move(*slot_payload));
+        }
+        if (sequence_payload && sequence_payload->size() < best_size) {
+            accept_encoded_payload(BlockCodec::lz77_sequences,
+                                   std::move(*sequence_payload));
+        }
+        if (context_split_payload && context_split_payload->size() < best_size) {
+            accept_encoded_payload(BlockCodec::lz77_context_split,
+                                   std::move(*context_split_payload));
+        }
+        if (raw_payload_pending) {
+            best.payload = std::move(lz_payload);
         }
     };
 
@@ -187,12 +315,13 @@ BlockResult compress_block(std::span<const std::uint8_t> input,
         // keeping the extra buffer live through the long DP measurably hurts
         // cache behaviour.
         auto optimal_tokens = encode_lz77_optimal(input, optimal_options, &greedy);
-        consider_lz_payload(std::move(greedy));
-        consider_lz_payload(std::move(optimal_tokens));
+        consider_lz_payload(std::move(greedy), /*try_sequence=*/false);
+        consider_lz_payload(std::move(optimal_tokens), /*try_sequence=*/true);
     } else {
-        consider_lz_payload(std::move(greedy));
+        consider_lz_payload(std::move(greedy), /*try_sequence=*/!run_optimal);
         if (run_optimal) {
-            consider_lz_payload(encode_lz77_optimal(input, optimal_options));
+            consider_lz_payload(encode_lz77_optimal(input, optimal_options),
+                                /*try_sequence=*/true);
         }
     }
 
@@ -234,6 +363,16 @@ void decompress_block_into(std::span<const std::uint8_t> payload,
 
     if (codec == BlockCodec::fast_lz) {
         decode_fast_lz_into(payload, output);
+        return;
+    }
+
+    if (codec == BlockCodec::lz77_sequences) {
+        decode_lz77_sequence_streams_into(payload, output);
+        return;
+    }
+
+    if (codec == BlockCodec::lz77_context_split) {
+        decode_lz77_context_split_streams_into(payload, output);
         return;
     }
 
@@ -355,8 +494,18 @@ ByteVector encode_parallel_blocks(std::span<const std::uint8_t> input,
     std::vector<std::uint32_t> block_crcs(crc32 != nullptr ? block_count : 0);
     std::atomic_size_t next_block = 0;
     std::atomic_uint64_t encoded_bytes = 0;
+    // The total executor budget is independent of the number of logical
+    // blocks. A single ratio-friendly block can still fan out entropy work to
+    // every requested worker, while block workers remain capped by block count.
+    constexpr std::size_t kMinimumNestedTaskInput = std::size_t{256} << 10;
+    const auto executor_thread_count = block_count == 0 ||
+                                               (block_count == 1 &&
+                                                input.size() < kMinimumNestedTaskInput)
+        ? std::size_t{1}
+        : effective_compression_thread_count(
+              options.thread_count, std::numeric_limits<std::size_t>::max());
     const auto worker_count =
-        effective_compression_thread_count(options.thread_count, block_count);
+        effective_thread_count(executor_thread_count, block_count);
     std::mutex exception_mutex;
     std::exception_ptr first_exception;
     // Once any worker fails, the whole encode fails; let the other workers
@@ -390,7 +539,7 @@ ByteVector encode_parallel_blocks(std::span<const std::uint8_t> input,
         }
     };
 
-    auto worker = [&](std::size_t worker_index) {
+    auto worker = [&](std::size_t worker_index, core::TaskExecutor* executor) {
         try {
             auto worker_options = options;
             std::size_t current_length = 0;
@@ -417,7 +566,7 @@ ByteVector encode_parallel_blocks(std::span<const std::uint8_t> input,
                 const auto length = std::min(block_size, input.size() - start);
                 const auto block_input = input.subspan(start, length);
                 current_length = length;
-                results[block_index] = compress_block(block_input, worker_options);
+                results[block_index] = compress_block(block_input, worker_options, executor);
                 if (crc32 != nullptr) {
                     // The archive header still stores the normal whole-input
                     // CRC. Computing block CRCs here lets large parallel
@@ -442,17 +591,31 @@ ByteVector encode_parallel_blocks(std::span<const std::uint8_t> input,
         }
     };
 
-    if (worker_count <= 1) {
-        worker(0);
+    auto run_workers = [&](core::TaskExecutor& executor) {
+        std::vector<std::future<void>> workers;
+        workers.reserve(worker_count > 0 ? worker_count - 1 : 0);
+        for (std::size_t i = 1; i < worker_count; ++i) {
+            workers.push_back(executor.submit([&, i] { worker(i, &executor); }));
+        }
+        // The submitting thread is part of a local executor's budget. With an
+        // archive-scoped executor it is an outer solid-block worker already
+        // accounted for by that operation's global budget.
+        worker(0, &executor);
+        for (auto& task : workers) {
+            executor.wait(task);
+        }
+    };
+
+    if (executor_thread_count <= 1) {
+        worker(0, nullptr);
+    } else if (options.task_executor) {
+        run_workers(*options.task_executor);
     } else {
-        std::vector<std::thread> workers;
-        workers.reserve(worker_count);
-        for (std::size_t i = 0; i < worker_count; ++i) {
-            workers.emplace_back(worker, i);
-        }
-        for (auto& thread : workers) {
-            thread.join();
-        }
+        // One cooperative executor owns every worker for this encode. Block
+        // tasks can later fan out into smaller codec tasks without spawning a
+        // nested pool; a waiting worker helps drain the same queue.
+        core::TaskExecutor executor(executor_thread_count);
+        run_workers(executor);
     }
     if (first_exception) {
         std::rethrow_exception(first_exception);
@@ -479,7 +642,9 @@ ByteVector decode_parallel_blocks(std::span<const std::uint8_t> encoded,
                                   std::size_t thread_count,
                                   const std::shared_ptr<OperationControl>& operation,
                                   const std::function<void(std::uint64_t)>& decoded_bytes_progress,
-                                  std::uint32_t* crc32) {
+                                  std::uint32_t* crc32,
+                                  bool allow_sequence_codec,
+                                  bool allow_context_split_codec) {
     if (operation) {
         operation->checkpoint();
     }
@@ -487,6 +652,18 @@ ByteVector decode_parallel_blocks(std::span<const std::uint8_t> encoded,
     const auto blocks = read_block_table(encoded, cursor, output_size);
     if (cursor != encoded.size()) {
         throw FormatError("trailing bytes after block payloads");
+    }
+    if (!allow_sequence_codec &&
+        std::any_of(blocks.begin(), blocks.end(), [](const auto& block) {
+            return block.codec == BlockCodec::lz77_sequences;
+        })) {
+        throw FormatError("sequence block codec requires AXC version 6");
+    }
+    if (!allow_context_split_codec &&
+        std::any_of(blocks.begin(), blocks.end(), [](const auto& block) {
+            return block.codec == BlockCodec::lz77_context_split;
+        })) {
+        throw FormatError("context-split block codec requires AXC version 7");
     }
 
     ByteVector output(output_size);

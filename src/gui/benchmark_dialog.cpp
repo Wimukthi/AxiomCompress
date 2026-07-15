@@ -9,7 +9,6 @@
 #include "gui/update_checker.hpp"
 
 #include <commctrl.h>
-#include <knownfolders.h>
 #include <shlobj.h>
 #include <shobjidl.h>
 
@@ -23,6 +22,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -144,7 +144,6 @@ struct BenchmarkLiveState {
     int current_pass = 0;
     bool input_ready = false;
     bool verified = false;
-    bool workspace_cleaned = false;
     std::wstring status;
     axiom::OperationProgress progress;
     CpuTimeSample phase_start;
@@ -514,7 +513,8 @@ std::uint64_t effective_solid_block_size(const axiom::CompressionOptions& option
 }
 
 std::uint64_t estimate_memory_usage(const axiom::CompressionOptions& options,
-                                    std::size_t threads) {
+                                    std::size_t threads,
+                                    std::uint64_t corpus_bytes) {
     const std::uint64_t solid_block = effective_solid_block_size(options, threads);
     const std::uint64_t internal_block =
         threads > 1 ? std::max<std::uint64_t>(1ull << 20,
@@ -522,7 +522,7 @@ std::uint64_t estimate_memory_usage(const axiom::CompressionOptions& options,
                     : solid_block;
     std::uint64_t estimate = solid_block * 2;  // input block plus encoded candidates.
     estimate += static_cast<std::uint64_t>(threads) * (2ull << 20);
-    estimate += 64ull << 20;  // entropy tables, directory data, and archive buffers.
+    estimate += 64ull << 20;  // entropy tables and archive metadata.
     if (options.use_tree_matcher) {
         const std::uint64_t tree_window =
             std::min<std::uint64_t>(static_cast<std::uint64_t>(options.window_size),
@@ -531,7 +531,12 @@ std::uint64_t estimate_memory_usage(const axiom::CompressionOptions& options,
     } else {
         estimate += static_cast<std::uint64_t>(threads) * (1ull << 20);
     }
-    return estimate;
+    // The benchmark deliberately retains the source, encoded stream, and
+    // restored stream together so no timed pass touches the filesystem.
+    const auto retained = corpus_bytes > UINT64_MAX / 3
+        ? UINT64_MAX
+        : corpus_bytes * 3;
+    return estimate > UINT64_MAX - retained ? UINT64_MAX : estimate + retained;
 }
 
 std::wstring stage_text(axiom::OperationStage stage) {
@@ -698,11 +703,11 @@ std::wstring render_benchmark_report(const BenchmarkLiveState& state) {
         out << L"  Archive: " << format_bytes(state.archive_bytes)
             << L" | Ratio: " << ratio_text(state.original_bytes, state.archive_bytes)
             << L" | Verify: " << (state.verified ? L"Passed" : L"...")
-            << L" | Workspace: " << (state.workspace_cleaned ? L"cleaned" : L"temporary")
+            << L" | Storage: memory"
             << L"\r\n";
     } else {
         out << L"  Archive: ... | Verify: " << (state.verified ? L"Passed" : L"...")
-            << L" | Workspace: " << (state.workspace_cleaned ? L"cleaned" : L"temporary")
+            << L" | Storage: memory"
             << L"\r\n";
     }
 
@@ -733,139 +738,216 @@ std::wstring render_benchmark_report(const BenchmarkLiveState& state) {
     return out.str();
 }
 
-fs::path local_benchmark_root() {
-    PWSTR local_app_data = nullptr;
-    if (FAILED(SHGetKnownFolderPath(FOLDERID_LocalAppData, KF_FLAG_CREATE, nullptr,
-                                    &local_app_data)) ||
-        local_app_data == nullptr) {
-        return fs::temp_directory_path() / L"AxiomCompress" / L"Benchmark";
+std::size_t checked_corpus_size(std::uint64_t bytes) {
+    if (bytes > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) {
+        throw std::runtime_error("benchmark corpus is too large for this process");
     }
-    fs::path root(local_app_data);
-    CoTaskMemFree(local_app_data);
-    return root / L"AxiomCompress" / L"Benchmark";
+    return static_cast<std::size_t>(bytes);
 }
 
-void write_text_bytes(const fs::path& path, std::uint64_t bytes,
-                      const std::shared_ptr<axiom::OperationControl>& operation) {
+void report_memory_preparation(const std::shared_ptr<axiom::OperationControl>& operation,
+                               std::uint64_t completed, std::uint64_t total,
+                               std::string current) {
+    operation->report({axiom::OperationStage::reading, completed, total, 0, 0,
+                       std::move(current)});
+}
+
+void fill_text_bytes(axiom::ByteVector& corpus, std::size_t offset, std::size_t bytes,
+                     const std::shared_ptr<axiom::OperationControl>& operation) {
     static constexpr std::string_view line =
         "Axiom benchmark text corpus: repeated log lines, paths, numbers, and messages. "
         "The purpose is compressible structure with realistic small variations.\r\n";
-    std::ofstream output(path, std::ios::binary | std::ios::trunc);
-    if (!output) throw std::runtime_error("cannot create benchmark input");
-    std::uint64_t written = 0;
+    std::size_t written = 0;
+    std::size_t next_report = 1u << 20;
     while (written < bytes) {
         operation->checkpoint();
-        const std::uint64_t remaining = bytes - written;
-        const std::size_t count = static_cast<std::size_t>(
-            std::min<std::uint64_t>(remaining, line.size()));
-        output.write(line.data(), static_cast<std::streamsize>(count));
-        if (!output) throw std::runtime_error("cannot write benchmark input");
+        const std::size_t count = std::min(bytes - written, line.size());
+        std::memcpy(corpus.data() + offset + written, line.data(), count);
         written += count;
-        if ((written & ((1ull << 20) - 1)) == 0 || written == bytes) {
-            operation->report({axiom::OperationStage::writing, written, bytes, 0, 0,
-                               axiom::core::path_to_utf8(path)});
+        if (written >= next_report || written == bytes) {
+            report_memory_preparation(operation, offset + written, corpus.size(),
+                                      "Generated memory corpus");
+            next_report = written + (1u << 20);
         }
     }
 }
 
-void write_binary_bytes(const fs::path& path, std::uint64_t bytes,
-                        const std::shared_ptr<axiom::OperationControl>& operation) {
-    std::ofstream output(path, std::ios::binary | std::ios::trunc);
-    if (!output) throw std::runtime_error("cannot create benchmark input");
-    std::array<char, 64 * 1024> buffer{};
+void fill_binary_bytes(axiom::ByteVector& corpus, std::size_t offset, std::size_t bytes,
+                       const std::shared_ptr<axiom::OperationControl>& operation) {
     std::uint32_t state = 0xA71015u;
-    std::uint64_t written = 0;
-    std::uint64_t next_report = 1ull << 20;
+    std::size_t written = 0;
+    std::size_t next_report = 1u << 20;
     while (written < bytes) {
         operation->checkpoint();
-        for (char& value : buffer) {
+        const std::size_t count = std::min<std::size_t>(bytes - written, 64u << 10);
+        for (std::size_t index = 0; index < count; ++index) {
             state = state * 1664525u + 1013904223u;
-            value = static_cast<char>((state >> 24) & 0xff);
+            corpus[offset + written + index] = static_cast<std::uint8_t>(state >> 24);
         }
-        const std::size_t count = static_cast<std::size_t>(
-            std::min<std::uint64_t>(bytes - written, buffer.size()));
-        output.write(buffer.data(), static_cast<std::streamsize>(count));
-        if (!output) throw std::runtime_error("cannot write benchmark input");
         written += count;
         if (written >= next_report || written == bytes) {
-            operation->report({axiom::OperationStage::writing, written, bytes, 0, 0,
-                               axiom::core::path_to_utf8(path)});
-            next_report = written + (1ull << 20);
+            report_memory_preparation(operation, offset + written, corpus.size(),
+                                      "Generated memory corpus");
+            next_report = written + (1u << 20);
         }
     }
 }
 
-void write_repeated_binary_bytes(const fs::path& path, std::uint64_t bytes,
-                                 const std::shared_ptr<axiom::OperationControl>& operation) {
-    std::ofstream output(path, std::ios::binary | std::ios::trunc);
-    if (!output) throw std::runtime_error("cannot create benchmark input");
-    std::array<char, 64 * 1024> pattern{};
+void fill_repeated_binary_bytes(
+    axiom::ByteVector& corpus, std::size_t offset, std::size_t bytes,
+    const std::shared_ptr<axiom::OperationControl>& operation) {
+    std::array<std::uint8_t, 64 * 1024> pattern{};
     for (std::size_t index = 0; index < pattern.size(); ++index) {
-        pattern[index] = static_cast<char>((index * 37u + (index >> 3)) & 0xff);
+        pattern[index] = static_cast<std::uint8_t>((index * 37u + (index >> 3)) & 0xff);
     }
-    std::uint64_t written = 0;
-    std::uint64_t next_report = 1ull << 20;
+    std::size_t written = 0;
+    std::size_t next_report = 1u << 20;
     while (written < bytes) {
         operation->checkpoint();
-        const std::size_t count = static_cast<std::size_t>(
-            std::min<std::uint64_t>(bytes - written, pattern.size()));
-        output.write(pattern.data(), static_cast<std::streamsize>(count));
-        if (!output) throw std::runtime_error("cannot write benchmark input");
+        const std::size_t count = std::min(bytes - written, pattern.size());
+        std::memcpy(corpus.data() + offset + written, pattern.data(), count);
         written += count;
         if (written >= next_report || written == bytes) {
-            operation->report({axiom::OperationStage::writing, written, bytes, 0, 0,
-                               axiom::core::path_to_utf8(path)});
-            next_report = written + (1ull << 20);
+            report_memory_preparation(operation, offset + written, corpus.size(),
+                                      "Generated memory corpus");
+            next_report = written + (1u << 20);
         }
     }
 }
 
-std::uint64_t generate_corpus(const fs::path& input_root, const BenchmarkParams& params,
-                              const std::shared_ptr<axiom::OperationControl>& operation) {
-    fs::create_directories(input_root);
+axiom::ByteVector generate_corpus(
+    const BenchmarkParams& params,
+    const std::shared_ptr<axiom::OperationControl>& operation) {
+    axiom::ByteVector corpus(checked_corpus_size(params.bytes));
     switch (params.corpus) {
         case CorpusKind::text:
-            write_text_bytes(input_root / L"text-log-corpus.txt", params.bytes, operation);
-            return params.bytes;
+            fill_text_bytes(corpus, 0, corpus.size(), operation);
+            break;
         case CorpusKind::binary:
-            write_binary_bytes(input_root / L"random.bin", params.bytes, operation);
-            return params.bytes;
+            fill_binary_bytes(corpus, 0, corpus.size(), operation);
+            break;
         case CorpusKind::mixed: {
-            fs::create_directories(input_root / L"docs");
-            fs::create_directories(input_root / L"bin");
-            const std::uint64_t text = params.bytes * 45 / 100;
-            const std::uint64_t random = params.bytes * 35 / 100;
-            const std::uint64_t repeated = params.bytes - text - random;
-            write_text_bytes(input_root / L"docs" / L"activity.log", text, operation);
-            write_binary_bytes(input_root / L"bin" / L"payload.dat", random, operation);
-            write_repeated_binary_bytes(input_root / L"bin" / L"records.bin", repeated, operation);
-            return params.bytes;
+            const std::size_t text = corpus.size() * 45 / 100;
+            const std::size_t random = corpus.size() * 35 / 100;
+            const std::size_t repeated = corpus.size() - text - random;
+            fill_text_bytes(corpus, 0, text, operation);
+            fill_binary_bytes(corpus, text, random, operation);
+            fill_repeated_binary_bytes(corpus, text + random, repeated, operation);
+            break;
         }
     }
-    return params.bytes;
+    return corpus;
 }
 
-std::uint64_t measure_input_bytes(const fs::path& input,
-                                  const std::shared_ptr<axiom::OperationControl>& operation) {
-    std::error_code ec;
-    if (fs::is_regular_file(input, ec)) {
-        return fs::file_size(input, ec);
+void append_u64(axiom::ByteVector& output, std::uint64_t value) {
+    for (unsigned shift = 0; shift != 64; shift += 8) {
+        output.push_back(static_cast<std::uint8_t>(value >> shift));
     }
-    if (!fs::is_directory(input, ec)) {
+}
+
+void append_file_bytes(axiom::ByteVector& output, const fs::path& path,
+                       std::uint64_t size, std::uint64_t& completed,
+                       std::uint64_t total,
+                       const std::shared_ptr<axiom::OperationControl>& operation) {
+    const std::size_t start = output.size();
+    const std::size_t count = checked_corpus_size(size);
+    if (count > output.max_size() - start) {
+        throw std::runtime_error("custom benchmark corpus is too large");
+    }
+    output.resize(start + count);
+    std::ifstream input(path, std::ios::binary);
+    if (!input) throw std::runtime_error("cannot read custom benchmark input");
+    std::size_t read = 0;
+    while (read < count) {
+        operation->checkpoint();
+        const std::size_t chunk = std::min<std::size_t>(count - read, 8u << 20);
+        input.read(reinterpret_cast<char*>(output.data() + start + read),
+                   static_cast<std::streamsize>(chunk));
+        if (input.gcount() != static_cast<std::streamsize>(chunk)) {
+            throw std::runtime_error("custom benchmark input changed while being read");
+        }
+        read += chunk;
+        completed += chunk;
+        report_memory_preparation(operation, completed, total,
+                                  axiom::core::path_to_utf8(path));
+    }
+}
+
+axiom::ByteVector load_custom_corpus(
+    const fs::path& input_path,
+    const std::shared_ptr<axiom::OperationControl>& operation) {
+    std::error_code ec;
+    if (fs::is_regular_file(input_path, ec)) {
+        const std::uint64_t size = fs::file_size(input_path, ec);
+        if (ec) throw std::runtime_error("cannot measure custom benchmark input");
+        axiom::ByteVector corpus;
+        corpus.reserve(checked_corpus_size(size));
+        std::uint64_t completed = 0;
+        append_file_bytes(corpus, input_path, size, completed, size, operation);
+        return corpus;
+    }
+    if (!fs::is_directory(input_path, ec)) {
         throw std::runtime_error("custom benchmark input is not a file or folder");
     }
-    std::uint64_t total = 0;
-    for (const auto& entry : fs::recursive_directory_iterator(input, ec)) {
+
+    struct MemoryFile {
+        fs::path path;
+        std::string relative_path;
+        std::uint64_t size = 0;
+    };
+    std::vector<MemoryFile> files;
+    std::uint64_t content_bytes = 0;
+    fs::recursive_directory_iterator iterator(input_path, ec);
+    const fs::recursive_directory_iterator end;
+    if (ec) throw std::runtime_error("cannot scan custom benchmark input");
+    for (; iterator != end; iterator.increment(ec)) {
         operation->checkpoint();
         if (ec) throw std::runtime_error("cannot scan custom benchmark input");
-        if (!entry.is_regular_file(ec)) continue;
-        total += entry.file_size(ec);
+        const auto& entry = *iterator;
+        const bool regular = entry.is_regular_file(ec);
+        if (ec) throw std::runtime_error("cannot inspect custom benchmark input");
+        if (!regular) continue;
+        const std::uint64_t size = entry.file_size(ec);
         if (ec) throw std::runtime_error("cannot measure custom benchmark input");
+        if (content_bytes > UINT64_MAX - size) {
+            throw std::runtime_error("custom benchmark corpus is too large");
+        }
+        content_bytes += size;
+        auto relative = axiom::core::path_to_utf8(entry.path().lexically_relative(input_path));
+        std::replace(relative.begin(), relative.end(), '\\', '/');
+        files.push_back({entry.path(), std::move(relative), size});
     }
-    if (total == 0) {
+    if (ec) throw std::runtime_error("cannot scan custom benchmark input");
+    if (files.empty()) {
         throw std::runtime_error("custom benchmark folder contains no regular files");
     }
-    return total;
+    std::sort(files.begin(), files.end(), [](const MemoryFile& left, const MemoryFile& right) {
+        return left.relative_path < right.relative_path;
+    });
+
+    static constexpr std::string_view magic = "AXIOM-BENCH-FOLDER\0";
+    std::uint64_t stream_bytes = magic.size() + sizeof(std::uint64_t);
+    for (const auto& file : files) {
+        const std::uint64_t metadata = sizeof(std::uint64_t) * 2 + file.relative_path.size();
+        if (stream_bytes > UINT64_MAX - metadata ||
+            stream_bytes + metadata > UINT64_MAX - file.size) {
+            throw std::runtime_error("custom benchmark corpus is too large");
+        }
+        stream_bytes += metadata + file.size;
+    }
+    axiom::ByteVector corpus;
+    corpus.reserve(checked_corpus_size(stream_bytes));
+    corpus.insert(corpus.end(), magic.begin(), magic.end());
+    append_u64(corpus, files.size());
+    std::uint64_t completed = 0;
+    report_memory_preparation(operation, 0, content_bytes, "Loading custom folder into memory");
+    for (const auto& file : files) {
+        append_u64(corpus, file.relative_path.size());
+        corpus.insert(corpus.end(), file.relative_path.begin(), file.relative_path.end());
+        append_u64(corpus, file.size);
+        append_file_bytes(corpus, file.path, file.size, completed, content_bytes, operation);
+    }
+    return corpus;
 }
 
 void post_text(HWND hwnd, const std::wstring& text) {
@@ -882,7 +964,6 @@ void benchmark_worker(HWND hwnd, BenchmarkParams params,
                       std::shared_ptr<axiom::OperationControl> operation,
                       std::shared_ptr<BenchmarkLiveState> live) {
     const auto started = std::chrono::steady_clock::now();
-    fs::path workspace;
     {
         std::lock_guard lock(live->mutex);
         live->params = params;
@@ -891,7 +972,8 @@ void benchmark_worker(HWND hwnd, BenchmarkParams params,
         live->compression.thread_count = params.threads;
         const std::size_t threads =
             selected_thread_count(params.threads, live->system.hardware_threads);
-        live->estimated_memory = estimate_memory_usage(live->compression, threads);
+        live->estimated_memory = estimate_memory_usage(
+            live->compression, threads, params.bytes);
         live->started = started;
         live->phase_start = sample_cpu_time();
         live->status = L"Starting benchmark...";
@@ -920,76 +1002,78 @@ void benchmark_worker(HWND hwnd, BenchmarkParams params,
     };
 
     try {
-        workspace = local_benchmark_root() /
-                    (L"run-" + std::to_wstring(GetCurrentProcessId()) + L"-" +
-                     std::to_wstring(GetTickCount64()));
-        const fs::path input = workspace / L"input";
-        const fs::path archive = workspace / L"bench.axar";
-        const fs::path extract = workspace / L"extract";
-        fs::create_directories(workspace);
-
         begin_phase(BenchmarkPhase::preparing, 0,
-                    params.custom_input ? L"Scanning input..." : L"Preparing corpus...");
-        const std::uint64_t original_bytes = params.custom_input
-            ? measure_input_bytes(*params.custom_input, operation)
-            : generate_corpus(input, params, operation);
-        const std::vector<fs::path> benchmark_inputs{
-            params.custom_input ? *params.custom_input : input};
+                    params.custom_input ? L"Loading input into memory..."
+                                        : L"Preparing memory corpus...");
+        // Preparation is intentionally outside every timed pass. The source
+        // remains immutable and resident until all passes have verified.
+        const axiom::ByteVector corpus = params.custom_input
+            ? load_custom_corpus(*params.custom_input, operation)
+            : generate_corpus(params, operation);
+        const std::uint64_t original_bytes = corpus.size();
         {
             std::lock_guard lock(live->mutex);
             live->original_bytes = original_bytes;
             live->input_ready = true;
-            live->status = L"Input ready.";
+            const std::size_t threads = selected_thread_count(
+                params.threads, live->system.hardware_threads);
+            live->estimated_memory = estimate_memory_usage(
+                live->compression, threads, original_bytes);
+            live->status = L"Memory corpus ready.";
         }
         publish();
 
         for (int pass = 1; pass <= params.passes; ++pass) {
             operation->checkpoint();
-            fs::remove(archive);
-            fs::remove_all(extract);
             axiom::CompressionOptions compression;
             axiom::apply_compression_level(compression, params.level);
             compression.thread_count = params.threads;
             compression.operation = operation;
+            compression.encoded_bytes_progress = [operation, original_bytes](std::uint64_t done) {
+                operation->report({axiom::OperationStage::compressing, done,
+                                   original_bytes, 0, 0, "In-memory stream"});
+            };
             const CpuTimeSample compress_start = sample_cpu_time();
             begin_phase(BenchmarkPhase::compressing, pass,
                         L"Compressing pass " + std::to_wstring(pass) + L"...",
                         compress_start);
-            axiom::create_archive(benchmark_inputs, archive, compression);
+            axiom::ByteVector archive = axiom::compress(corpus, compression);
             const double compress_seconds = elapsed_wall_seconds(compress_start);
             const double compress_cpu_seconds = elapsed_cpu_seconds(compress_start);
-            const std::uint64_t archive_bytes = fs::file_size(archive);
+            const std::uint64_t archive_bytes = archive.size();
             {
                 std::lock_guard lock(live->mutex);
                 live->archive_bytes = archive_bytes;
-                live->status = L"Testing archive...";
+                live->status = L"Compressed stream ready in memory.";
             }
 
-            axiom::DecompressionOptions test_options;
-            test_options.thread_count = params.threads;
-            test_options.operation = operation;
-            begin_phase(BenchmarkPhase::testing, pass,
-                        L"Testing archive pass " + std::to_wstring(pass) + L"...");
-            axiom::test_archive(archive, test_options);
-            {
-                std::lock_guard lock(live->mutex);
-                live->verified = true;
-            }
-
-            axiom::ExtractOptions extract_options;
-            extract_options.thread_count = params.threads;
-            extract_options.operation = operation;
-            extract_options.overwrite = axiom::ExtractOptions::Overwrite::overwrite;
+            axiom::DecompressionOptions decompression;
+            decompression.thread_count = params.threads;
+            decompression.operation = operation;
+            decompression.max_output_size = corpus.size();
+            decompression.decoded_bytes_progress =
+                [operation](std::uint64_t done, std::uint64_t total) {
+                    operation->report({axiom::OperationStage::extracting, done, total,
+                                       0, 0, "In-memory stream"});
+                };
             const CpuTimeSample extract_start = sample_cpu_time();
             begin_phase(BenchmarkPhase::decompressing, pass,
                         L"Decompressing pass " + std::to_wstring(pass) + L"...",
                         extract_start);
-            axiom::extract_archive(archive, extract, extract_options);
+            axiom::ByteVector restored = axiom::decompress(archive, decompression);
             const double extract_seconds = elapsed_wall_seconds(extract_start);
             const double extract_cpu_seconds = elapsed_cpu_seconds(extract_start);
 
+            begin_phase(BenchmarkPhase::testing, pass,
+                        L"Verifying pass " + std::to_wstring(pass) + L" in memory...");
+            operation->checkpoint();
+            if (restored != corpus) {
+                throw std::runtime_error("in-memory round-trip verification failed");
+            }
+
             {
                 std::lock_guard lock(live->mutex);
+                live->verified = true;
                 live->passes.push_back(PassMetrics{
                     pass,
                     original_bytes,
@@ -1007,13 +1091,11 @@ void benchmark_worker(HWND hwnd, BenchmarkParams params,
             publish();
         }
 
-        fs::remove_all(workspace);
         {
             std::lock_guard lock(live->mutex);
             live->phase = BenchmarkPhase::finished;
             live->current_pass = 0;
             live->progress = {};
-            live->workspace_cleaned = true;
             live->status = L"Finished.";
         }
         std::wstring final_text;
@@ -1023,33 +1105,23 @@ void benchmark_worker(HWND hwnd, BenchmarkParams params,
         }
         post_done(hwnd, true, final_text);
     } catch (const axiom::OperationCancelled&) {
-        if (!workspace.empty()) {
-            std::error_code ignored;
-            fs::remove_all(workspace, ignored);
-        }
         std::wstring final_text;
         {
             std::lock_guard lock(live->mutex);
             live->phase = BenchmarkPhase::finished;
             live->current_pass = 0;
             live->progress = {};
-            live->workspace_cleaned = true;
             live->status = L"Benchmark cancelled.";
             final_text = render_benchmark_report(*live);
         }
         post_done(hwnd, false, final_text);
     } catch (const std::exception& ex) {
-        if (!workspace.empty()) {
-            std::error_code ignored;
-            fs::remove_all(workspace, ignored);
-        }
         std::wstring final_text;
         {
             std::lock_guard lock(live->mutex);
             live->phase = BenchmarkPhase::finished;
             live->current_pass = 0;
             live->progress = {};
-            live->workspace_cleaned = true;
             live->status = L"Benchmark failed: " +
                 std::wstring(ex.what(), ex.what() + std::strlen(ex.what()));
             final_text = render_benchmark_report(*live);

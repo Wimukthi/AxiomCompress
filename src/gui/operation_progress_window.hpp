@@ -4,11 +4,13 @@
 
 #include <windows.h>
 
+#include <array>
 #include <chrono>
 #include <filesystem>
 #include <functional>
 #include <deque>
 #include <string>
+#include <utility>
 
 namespace axiom::gui {
 
@@ -55,6 +57,26 @@ public:
     [[nodiscard]] HWND hwnd() const { return hwnd_; }
 
 private:
+    enum class TelemetryField : std::size_t {
+        stage,
+        current_path,
+        output_path,
+        overall_percent,
+        overall_completed,
+        overall_total,
+        items_completed,
+        items_total,
+        speed,
+        file_percent,
+        file_completed,
+        file_total,
+        eta,
+        elapsed,
+        checkpoint_age,
+        activity,
+        count,
+    };
+
     static LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam);
     LRESULT handle_message(UINT message, WPARAM wparam, LPARAM lparam);
 
@@ -63,6 +85,12 @@ private:
     void rebuild_font();
     void apply_theme();
     void layout();
+    void update_telemetry_fields();
+    void set_field_text(TelemetryField field, std::wstring text);
+    [[nodiscard]] HWND field(TelemetryField field) const;
+    [[nodiscard]] bool muted_field(HWND control) const;
+    [[nodiscard]] std::pair<std::uint64_t, std::uint64_t>
+        displayed_file_progress() const;
     void invalidate_progress_area();
     void paint();
     bool ensure_back_buffer(HDC reference, int width, int height);
@@ -76,8 +104,11 @@ private:
     HWND hwnd_{};
     HWND pause_button_{};
     HWND cancel_button_{};
+    std::array<HWND, static_cast<std::size_t>(TelemetryField::count)> telemetry_fields_{};
+    std::array<std::wstring, static_cast<std::size_t>(TelemetryField::count)> telemetry_text_{};
     HINSTANCE instance_{};
     HFONT font_{};
+    HBRUSH background_brush_{};
     HDC back_buffer_dc_{};
     HBITMAP back_buffer_bitmap_{};
     HGDIOBJ back_buffer_old_bitmap_{};
@@ -96,6 +127,7 @@ private:
     double current_rate_{};
     bool has_progress_{false};
     bool progress_dirty_{false};
+    bool telemetry_dirty_{false};
     bool paused_{false};
     bool cancelling_{false};
     bool pause_available_{true};

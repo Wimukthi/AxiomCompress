@@ -366,6 +366,48 @@ constexpr std::uint32_t kRansTotal = 1u << kRansTotalBits;
 constexpr std::uint32_t kRansLow = 1u << 23;  // a multiple of kRansTotal
 constexpr std::size_t kRansLanes = 4;
 
+// Precomputed reciprocal form of the rANS encoder update. The old hot loop
+// divided twice per symbol; this is the same state transition expressed with
+// one 64-bit multiply and shifts. The representation is independent of the
+// rANS precision, so order-0 and clustered order-1 tables share it.
+struct RansEncoderSymbol {
+    std::uint32_t x_max = 0;
+    std::uint32_t reciprocal = 0;
+    std::uint32_t bias = 0;
+    std::uint16_t complement = 0;
+    std::uint8_t reciprocal_shift = 0;
+};
+
+RansEncoderSymbol make_rans_encoder_symbol(std::uint32_t start,
+                                           std::uint32_t frequency,
+                                           std::uint32_t scale_bits) {
+    const auto total = std::uint32_t{1} << scale_bits;
+    RansEncoderSymbol symbol;
+    symbol.x_max = ((kRansLow >> scale_bits) << 8) * frequency;
+    symbol.complement = static_cast<std::uint16_t>(total - frequency);
+
+    if (frequency < 2) {
+        symbol.reciprocal = std::numeric_limits<std::uint32_t>::max();
+        symbol.bias = start + total - 1;
+        return symbol;
+    }
+
+    const auto shift = static_cast<std::uint32_t>(std::bit_width(frequency - 1));
+    symbol.reciprocal = static_cast<std::uint32_t>(
+        (((std::uint64_t{1} << (shift + 31)) + frequency - 1) / frequency));
+    symbol.bias = start;
+    symbol.reciprocal_shift = static_cast<std::uint8_t>(shift - 1);
+    return symbol;
+}
+
+std::uint32_t rans_encode_advance(std::uint32_t state,
+                                  const RansEncoderSymbol& symbol) {
+    const auto quotient = static_cast<std::uint32_t>(
+        (static_cast<std::uint64_t>(state) * symbol.reciprocal) >> 32) >>
+        symbol.reciprocal_shift;
+    return state + symbol.bias + quotient * symbol.complement;
+}
+
 std::array<std::uint32_t, kSymbolCount> rans_normalize(
     const std::array<std::uint64_t, kSymbolCount>& counts,
     std::uint64_t count_total,
@@ -512,8 +554,13 @@ std::optional<ByteVector> encode_rans(
     const auto frequencies = rans_normalize(counts, input.size(), kRansTotal);
 
     std::array<std::uint32_t, kSymbolCount + 1> cumulative{};
+    std::array<RansEncoderSymbol, kSymbolCount> encoder_symbols{};
     for (std::size_t symbol = 0; symbol < kSymbolCount; ++symbol) {
         cumulative[symbol + 1] = cumulative[symbol] + frequencies[symbol];
+        if (frequencies[symbol] != 0) {
+            encoder_symbols[symbol] = make_rans_encoder_symbol(
+                cumulative[symbol], frequencies[symbol], kRansTotalBits);
+        }
     }
 
     ByteVector output;
@@ -534,14 +581,13 @@ std::optional<ByteVector> encode_rans(
 
     for (std::size_t i = input.size(); i-- > 0;) {
         const auto symbol = input[i];
-        const auto frequency = frequencies[symbol];
-        const auto x_max = ((kRansLow >> kRansTotalBits) << 8) * frequency;
+        const auto& encoder_symbol = encoder_symbols[symbol];
         auto& state = states[i & (kRansLanes - 1)];
-        while (state >= x_max) {
+        while (state >= encoder_symbol.x_max) {
             scratch[--head] = static_cast<std::uint8_t>(state & 0xFFu);
             state >>= 8;
         }
-        state = ((state / frequency) << kRansTotalBits) + (state % frequency) + cumulative[symbol];
+        state = rans_encode_advance(state, encoder_symbol);
     }
 
     head -= kRansLanes * 4;
@@ -758,6 +804,7 @@ std::optional<ByteVector> encode_rans_order1(std::span<const std::uint8_t> input
     // Normalize each cluster to the shared power-of-two total.
     std::vector<std::uint32_t> frequencies(cluster_count * kSymbolCount);
     std::vector<std::uint32_t> cumulative(cluster_count * (kSymbolCount + 1), 0);
+    std::vector<RansEncoderSymbol> encoder_symbols(cluster_count * kSymbolCount);
     for (std::size_t j = 0; j < cluster_count; ++j) {
         std::array<std::uint64_t, kSymbolCount> counts{};
         std::uint64_t total = 0;
@@ -771,6 +818,10 @@ std::optional<ByteVector> encode_rans_order1(std::span<const std::uint8_t> input
         for (std::size_t s = 0; s < kSymbolCount; ++s) {
             freq[s] = table[s];
             cumul[s + 1] = cumul[s] + table[s];
+            if (table[s] != 0) {
+                encoder_symbols[j * kSymbolCount + s] =
+                    make_rans_encoder_symbol(cumul[s], table[s], kRansO1TotalBits);
+            }
         }
     }
 
@@ -797,15 +848,13 @@ std::optional<ByteVector> encode_rans_order1(std::span<const std::uint8_t> input
         const auto context = i == 0 ? std::uint8_t{0} : input[i - 1];
         const auto cluster = cluster_map[context];
         const auto symbol = input[i];
-        const auto frequency = frequencies[cluster * kSymbolCount + symbol];
-        const auto x_max = ((kRansLow >> kRansO1TotalBits) << 8) * frequency;
+        const auto& encoder_symbol = encoder_symbols[cluster * kSymbolCount + symbol];
         auto& state = states[i & (kRansLanes - 1)];
-        while (state >= x_max) {
+        while (state >= encoder_symbol.x_max) {
             scratch[--head] = static_cast<std::uint8_t>(state & 0xFFu);
             state >>= 8;
         }
-        state = ((state / frequency) << kRansO1TotalBits) + (state % frequency) +
-                cumulative[cluster * (kSymbolCount + 1) + symbol];
+        state = rans_encode_advance(state, encoder_symbol);
     }
 
     head -= kRansLanes * 4;

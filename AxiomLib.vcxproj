@@ -89,6 +89,7 @@
     <ClInclude Include="src\core\path_text.hpp" />
     <ClInclude Include="src\core\file_replace.hpp" />
     <ClInclude Include="src\core\reed_solomon.hpp" />
+    <ClInclude Include="src\core\task_executor.hpp" />
     <ClInclude Include="src\core\windows_time.hpp" />
     <ClInclude Include="src\entropy\huffman.hpp" />
     <ClInclude Include="src\entropy\range.hpp" />

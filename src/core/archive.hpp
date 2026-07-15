@@ -11,6 +11,7 @@ enum class CodecId : std::uint8_t {
     parallel_blocks = 3,
     greedy_lz77_split = 4,
     greedy_lz77_split_slots = 5,
+    lz77_sequences = 6,
 };
 
 struct ArchiveHeader {
@@ -20,6 +21,7 @@ struct ArchiveHeader {
     std::uint32_t crc32 = 0;
     std::vector<CompressionTransformRange> transform_ranges;
     std::size_t payload_offset = 32;
+    std::uint16_t format_version = 0;
 };
 
 ByteVector write_archive(std::span<const std::uint8_t> payload,

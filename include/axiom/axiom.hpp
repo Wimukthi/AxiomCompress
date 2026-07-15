@@ -20,6 +20,10 @@ namespace axiom {
 
 using ByteVector = std::vector<std::uint8_t>;
 
+namespace core {
+class TaskExecutor;
+}
+
 class OperationCancelled final : public std::runtime_error {
 public:
     OperationCancelled() : std::runtime_error("operation cancelled") {}
@@ -50,6 +54,11 @@ struct OperationProgress {
     // an archive solid block that contains several files).
     std::uint64_t current_file_completed_bytes = 0;
     std::uint64_t current_file_total_bytes = 0;
+    // Source-byte counter used only for throughput sampling. Archive creation
+    // can advance this while assembling its first solid block even though no
+    // bytes are complete yet, avoiding a false 0 B/s during small-file reads.
+    // A zero value asks frontends to fall back to completed_bytes.
+    std::uint64_t throughput_bytes = 0;
     // Monotonically increasing telemetry sequence assigned by OperationControl.
     // Producers leave this at zero; frontends use it to distinguish a fresh
     // atomic snapshot from a heartbeat repaint.
@@ -89,6 +98,8 @@ public:
             progress_file_completed_bytes_.load(std::memory_order_relaxed);
         const auto previous_file_total =
             progress_file_total_bytes_.load(std::memory_order_relaxed);
+        const auto previous_throughput_bytes =
+            progress_throughput_bytes_.load(std::memory_order_relaxed);
         const bool first = progress_version_.load(std::memory_order_relaxed) == 0;
         const bool boundary = first || progress.stage != previous_stage ||
             progress.total_bytes != previous_total ||
@@ -97,12 +108,14 @@ public:
             progress.current_file_total_bytes != previous_file_total ||
             progress.completed_bytes < previous_bytes ||
             progress.current_file_completed_bytes < previous_file_bytes ||
+            progress.throughput_bytes < previous_throughput_bytes ||
             (progress.total_bytes > 0 &&
              progress.completed_bytes >= progress.total_bytes) ||
             (progress.current_file_total_bytes > 0 &&
              progress.current_file_completed_bytes >= progress.current_file_total_bytes);
         const bool byte_quantum = progress.completed_bytes >= previous_bytes + kPublishQuantum ||
-            progress.current_file_completed_bytes >= previous_file_bytes + kPublishQuantum;
+            progress.current_file_completed_bytes >= previous_file_bytes + kPublishQuantum ||
+            progress.throughput_bytes >= previous_throughput_bytes + kPublishQuantum;
         if (!boundary && !byte_quantum) return;
         while (progress_writer_.test_and_set(std::memory_order_acquire)) {
             std::this_thread::yield();
@@ -119,6 +132,8 @@ public:
         progress_file_completed_bytes_.store(progress.current_file_completed_bytes,
                                              std::memory_order_relaxed);
         progress_file_total_bytes_.store(progress.current_file_total_bytes,
+                                         std::memory_order_relaxed);
+        progress_throughput_bytes_.store(progress.throughput_bytes,
                                          std::memory_order_relaxed);
         if (progress_writer_path_ != progress.current_path) {
             progress_writer_path_ = progress.current_path;
@@ -160,6 +175,8 @@ public:
                 progress_file_completed_bytes_.load(std::memory_order_relaxed);
             result.current_file_total_bytes =
                 progress_file_total_bytes_.load(std::memory_order_relaxed);
+            result.throughput_bytes =
+                progress_throughput_bytes_.load(std::memory_order_relaxed);
             const auto path = progress_path_.load(std::memory_order_relaxed);
             if (path) result.current_path = *path;
             const std::uint64_t after = progress_version_.load(std::memory_order_acquire);
@@ -234,6 +251,7 @@ private:
     mutable std::atomic_uint64_t progress_total_items_{0};
     mutable std::atomic_uint64_t progress_file_completed_bytes_{0};
     mutable std::atomic_uint64_t progress_file_total_bytes_{0};
+    mutable std::atomic_uint64_t progress_throughput_bytes_{0};
     mutable std::atomic<std::shared_ptr<const std::string>> progress_path_{
         std::make_shared<const std::string>()};
     mutable std::string progress_writer_path_;
@@ -243,6 +261,7 @@ enum class CompressionTransform : std::uint8_t {
     none = 0,
     x86_branch = 1,
     delta = 2,
+    word16_predict = 3,
 };
 
 // A reversible pre-compression transform applied to one byte range. Archive
@@ -300,8 +319,8 @@ struct CompressionOptions {
     // Two-pass optimal parsing re-parses with costs measured from the first DP
     // pass and keeps the smaller coded result; single-pass (false) measures
     // costs from the cheap greedy parse and runs the DP once — roughly half
-    // the time for most of the ratio. Level 8 uses single-pass, level 9 and
-    // --optimal keep two passes.
+    // the time for most of the ratio. Levels 8-9 use the measured-cost single
+    // pass; callers enabling --optimal on another preset retain two passes.
     bool optimal_two_pass = true;
     // New-archive frontends may continue past inputs that disappear or remain
     // unreadable after retries. Each omission is recorded on OperationControl;
@@ -314,6 +333,10 @@ struct CompressionOptions {
     bool enable_file_filters = true;
     std::vector<CompressionTransformRange> transform_ranges;
     std::shared_ptr<OperationControl> operation;
+    // Internal operation-scoped executor. Archive writers populate this so
+    // every solid block and nested codec task shares one global CPU budget;
+    // ordinary callers leave it empty and compress() creates a local executor.
+    std::shared_ptr<core::TaskExecutor> task_executor;
     // Within-compress progress: when set, the parallel block codec calls this
     // with the cumulative number of this compress() call's input bytes whose
     // blocks have finished encoding. Invoked from worker threads, possibly
@@ -427,17 +450,19 @@ inline void apply_compression_level(CompressionOptions& options, int level) {
             options.max_parser_candidates = 6;
             break;
         case 9:
-            // Maximum preset keeps the deepest tree search and uses larger
-            // blocks than level 8 so cross-block repetition can improve ratio.
-            // Its second DP pass is what makes it the genuine max-ratio point;
-            // multi-block inputs run the parse per block on all workers.
+            // Maximum preset keeps the deepest tree search, extends matches to
+            // 4 KiB, and uses larger blocks than level 8. A measured-cost single
+            // DP pass proved both smaller and faster once v7 numeric transforms
+            // exposed longer runs; multi-block inputs still parse in parallel.
             options.use_tree_matcher = true;
             options.max_chain_depth = 512;
+            options.max_match = 4096;
             options.block_size = 64u << 20;
             options.window_size = 64u << 20;
             options.lazy_matching = false;
             options.fast_entropy = false;
             options.enable_optimal_parser = true;
+            options.optimal_two_pass = false;
             break;
     }
 }

@@ -5,7 +5,10 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
+#include <cstring>
 #include <limits>
+#include <optional>
 
 namespace axiom::codec {
 namespace {
@@ -14,6 +17,7 @@ constexpr std::size_t kMinTransformSize = 4096;
 constexpr std::size_t kSampleWindow = std::size_t{256} << 10;
 constexpr std::size_t kMaxSampleWindows = 4;
 constexpr std::uint8_t kMaxDeltaStride = 64;
+constexpr std::size_t kTarBlockSize = 512;
 
 std::uint16_t read_le16(std::span<const std::uint8_t> bytes, std::size_t offset) {
     return static_cast<std::uint16_t>(bytes[offset]) |
@@ -32,6 +36,11 @@ void write_le32(std::span<std::uint8_t> bytes, std::size_t offset, std::uint32_t
     for (unsigned shift = 0; shift < 32; shift += 8) {
         bytes[offset++] = static_cast<std::uint8_t>(value >> shift);
     }
+}
+
+void write_le16(std::span<std::uint8_t> bytes, std::size_t offset, std::uint16_t value) {
+    bytes[offset] = static_cast<std::uint8_t>(value);
+    bytes[offset + 1] = static_cast<std::uint8_t>(value >> 8);
 }
 
 bool has_bytes(std::span<const std::uint8_t> bytes, std::size_t offset, std::size_t count) {
@@ -124,6 +133,75 @@ void delta_filter(std::span<std::uint8_t> bytes, std::uint8_t stride, bool encod
     }
 }
 
+std::uint16_t zigzag16(std::uint16_t value) {
+    const auto signed_value = static_cast<std::int16_t>(value);
+    const auto widened = static_cast<std::int32_t>(signed_value);
+    return static_cast<std::uint16_t>(
+        (static_cast<std::uint32_t>(widened) << 1) ^
+        static_cast<std::uint32_t>(widened >> 15));
+}
+
+std::uint16_t unzigzag16(std::uint16_t value) {
+    const auto decoded = static_cast<std::uint16_t>(
+        (value >> 1) ^ static_cast<std::uint16_t>(0u - (value & 1u)));
+    return decoded;
+}
+
+void word16_predict_filter(std::span<std::uint8_t> bytes,
+                           std::uint8_t parameter,
+                           bool encode) {
+    const auto word_count = bytes.size() / 2;
+    if (word_count == 0) {
+        return;
+    }
+    const std::size_t row_width = parameter == 0 ? 0 : std::size_t{1} << parameter;
+    std::vector<std::uint16_t> words(word_count);
+
+    if (encode) {
+        for (std::size_t i = 0; i < word_count; ++i) {
+            words[i] = read_le16(bytes, i * 2);
+        }
+        if (row_width == 0) {
+            for (std::size_t i = word_count; i-- > 1;) {
+                words[i] = static_cast<std::uint16_t>(words[i] - words[i - 1]);
+            }
+        } else if (word_count > row_width + 1) {
+            for (std::size_t i = word_count; i-- > row_width + 1;) {
+                const auto prediction = static_cast<std::uint16_t>(
+                    words[i - 1] + words[i - row_width] - words[i - row_width - 1]);
+                words[i] = static_cast<std::uint16_t>(words[i] - prediction);
+            }
+        }
+        for (std::size_t i = 0; i < word_count; ++i) {
+            const auto residual = zigzag16(words[i]);
+            bytes[i] = static_cast<std::uint8_t>(residual);
+            bytes[word_count + i] = static_cast<std::uint8_t>(residual >> 8);
+        }
+        return;
+    }
+
+    for (std::size_t i = 0; i < word_count; ++i) {
+        const auto packed = static_cast<std::uint16_t>(
+            static_cast<std::uint16_t>(bytes[i]) |
+            static_cast<std::uint16_t>(bytes[word_count + i]) << 8);
+        words[i] = unzigzag16(packed);
+    }
+    if (row_width == 0) {
+        for (std::size_t i = 1; i < word_count; ++i) {
+            words[i] = static_cast<std::uint16_t>(words[i] + words[i - 1]);
+        }
+    } else if (word_count > row_width + 1) {
+        for (std::size_t i = row_width + 1; i < word_count; ++i) {
+            const auto prediction = static_cast<std::uint16_t>(
+                words[i - 1] + words[i - row_width] - words[i - row_width - 1]);
+            words[i] = static_cast<std::uint16_t>(words[i] + prediction);
+        }
+    }
+    for (std::size_t i = 0; i < word_count; ++i) {
+        write_le16(bytes, i * 2, words[i]);
+    }
+}
+
 void transform_one(ByteVector& bytes, const CompressionTransformRange& range,
                    bool encode) {
     const auto offset = static_cast<std::size_t>(range.offset);
@@ -133,6 +211,8 @@ void transform_one(ByteVector& bytes, const CompressionTransformRange& range,
         x86_filter(part, range.source_offset, encode);
     } else if (range.transform == CompressionTransform::delta) {
         delta_filter(part, range.parameter, encode);
+    } else if (range.transform == CompressionTransform::word16_predict) {
+        word16_predict_filter(part, range.parameter, encode);
     }
 }
 
@@ -151,6 +231,118 @@ ByteVector sampled_bytes(std::span<const std::uint8_t> input) {
     return sample;
 }
 
+double histogram_entropy(const std::array<std::uint64_t, 256>& histogram,
+                         std::uint64_t total) {
+    if (total == 0) {
+        return 8.0;
+    }
+    double entropy = 0.0;
+    for (const auto count : histogram) {
+        if (count == 0) {
+            continue;
+        }
+        const auto probability = static_cast<double>(count) /
+                                 static_cast<double>(total);
+        entropy -= probability * std::log2(probability);
+    }
+    return entropy;
+}
+
+TransformHint detect_word16_predictor(std::span<const std::uint8_t> input) {
+    constexpr std::size_t kMinimumWords = std::size_t{128} << 10;
+    constexpr std::size_t kMaximumSamples = std::size_t{1} << 20;
+    constexpr std::array<std::uint8_t, 6> kParameters{0, 7, 8, 9, 10, 11};
+    const auto word_count = input.size() / 2;
+    if (word_count < kMinimumWords) {
+        return {};
+    }
+
+    double best_entropy = 8.0;
+    double best_raw_entropy = 0.0;
+    std::uint8_t best_parameter = 0;
+    for (const auto parameter : kParameters) {
+        const auto row_width = parameter == 0 ? 0 : std::size_t{1} << parameter;
+        const auto first = row_width == 0 ? std::size_t{1} : row_width + 1;
+        if (first >= word_count) {
+            continue;
+        }
+        const auto available = word_count - first;
+        const auto step = std::max<std::size_t>(1, available / kMaximumSamples);
+        std::array<std::uint64_t, 256> raw_histogram{};
+        std::array<std::uint64_t, 256> residual_histogram{};
+        std::uint64_t sampled_bytes = 0;
+        for (std::size_t i = first; i < word_count; i += step) {
+            const auto current = read_le16(input, i * 2);
+            const auto prediction = row_width == 0
+                ? read_le16(input, (i - 1) * 2)
+                : static_cast<std::uint16_t>(
+                      read_le16(input, (i - 1) * 2) +
+                      read_le16(input, (i - row_width) * 2) -
+                      read_le16(input, (i - row_width - 1) * 2));
+            const auto residual = zigzag16(
+                static_cast<std::uint16_t>(current - prediction));
+            ++raw_histogram[static_cast<std::uint8_t>(current)];
+            ++raw_histogram[static_cast<std::uint8_t>(current >> 8)];
+            ++residual_histogram[static_cast<std::uint8_t>(residual)];
+            ++residual_histogram[static_cast<std::uint8_t>(residual >> 8)];
+            sampled_bytes += 2;
+        }
+        const auto raw_entropy = histogram_entropy(raw_histogram, sampled_bytes);
+        const auto residual_entropy = histogram_entropy(residual_histogram, sampled_bytes);
+        if (residual_entropy < best_entropy) {
+            best_entropy = residual_entropy;
+            best_raw_entropy = raw_entropy;
+            best_parameter = parameter;
+        }
+    }
+
+    // A broad transform changes match structure as well as entropy. Require a
+    // large symbol-level win so ordinary text, executables, and databases never
+    // enter this specialized numeric path on sampling noise alone.
+    if (best_entropy + 0.50 < best_raw_entropy) {
+        return {CompressionTransform::word16_predict, best_parameter};
+    }
+    return {};
+}
+
+std::optional<std::uint64_t> parse_tar_octal(std::span<const std::uint8_t> field) {
+    std::uint64_t value = 0;
+    bool saw_digit = false;
+    for (const auto byte : field) {
+        if (byte == 0 || byte == ' ') {
+            if (saw_digit) {
+                break;
+            }
+            continue;
+        }
+        if (byte < '0' || byte > '7') {
+            return std::nullopt;
+        }
+        saw_digit = true;
+        if (value > (std::numeric_limits<std::uint64_t>::max() >> 3)) {
+            return std::nullopt;
+        }
+        value = (value << 3) | static_cast<std::uint64_t>(byte - '0');
+    }
+    return saw_digit ? std::optional<std::uint64_t>(value) : std::nullopt;
+}
+
+bool valid_tar_header(std::span<const std::uint8_t> header) {
+    if (header.size() != kTarBlockSize ||
+        std::memcmp(header.data() + 257, "ustar", 5) != 0) {
+        return false;
+    }
+    const auto stored = parse_tar_octal(header.subspan(148, 8));
+    if (!stored) {
+        return false;
+    }
+    std::uint64_t sum = 0;
+    for (std::size_t i = 0; i < header.size(); ++i) {
+        sum += i >= 148 && i < 156 ? static_cast<std::uint8_t>(' ') : header[i];
+    }
+    return sum == *stored;
+}
+
 }  // namespace
 
 TransformHint detect_transform_hint(std::span<const std::uint8_t> prefix) {
@@ -161,6 +353,72 @@ TransformHint detect_transform_hint(std::span<const std::uint8_t> prefix) {
         return wave;
     }
     return detect_bmp(prefix);
+}
+
+std::vector<CompressionTransformRange> detect_transform_ranges(
+    std::span<const std::uint8_t> input) {
+    if (const auto hint = detect_transform_hint(input);
+        hint.transform != CompressionTransform::none) {
+        return {{hint.transform, 0, static_cast<std::uint64_t>(input.size()), 0,
+                 hint.parameter}};
+    }
+
+    std::vector<CompressionTransformRange> tar_ranges;
+    std::size_t cursor = 0;
+    bool saw_tar_member = false;
+    while (cursor + kTarBlockSize <= input.size()) {
+        const auto header = input.subspan(cursor, kTarBlockSize);
+        if (std::all_of(header.begin(), header.end(), [](std::uint8_t byte) {
+                return byte == 0;
+            })) {
+            break;
+        }
+        if (!valid_tar_header(header)) {
+            tar_ranges.clear();
+            saw_tar_member = false;
+            break;
+        }
+        const auto encoded_size = parse_tar_octal(header.subspan(124, 12));
+        if (!encoded_size || *encoded_size > std::numeric_limits<std::size_t>::max()) {
+            tar_ranges.clear();
+            saw_tar_member = false;
+            break;
+        }
+        const auto member_size = static_cast<std::size_t>(*encoded_size);
+        const auto content_offset = cursor + kTarBlockSize;
+        if (member_size > input.size() - content_offset) {
+            tar_ranges.clear();
+            saw_tar_member = false;
+            break;
+        }
+        saw_tar_member = true;
+        const auto type = header[156];
+        if ((type == 0 || type == '0') && member_size >= kMinTransformSize) {
+            const auto member = input.subspan(content_offset, member_size);
+            auto hint = detect_transform_hint(member);
+            if (hint.transform == CompressionTransform::none) {
+                hint = detect_word16_predictor(member);
+            }
+            if (hint.transform != CompressionTransform::none) {
+                tar_ranges.push_back({hint.transform,
+                                      static_cast<std::uint64_t>(content_offset),
+                                      static_cast<std::uint64_t>(member_size), 0,
+                                      hint.parameter});
+            }
+        }
+        const auto padded_size = (member_size + kTarBlockSize - 1) &
+                                 ~(kTarBlockSize - 1);
+        if (padded_size > input.size() - content_offset) {
+            tar_ranges.clear();
+            saw_tar_member = false;
+            break;
+        }
+        cursor = content_offset + padded_size;
+    }
+    if (saw_tar_member) {
+        return tar_ranges;
+    }
+    return {};
 }
 
 std::vector<CompressionTransformRange> normalize_transform_ranges(
@@ -179,6 +437,11 @@ std::vector<CompressionTransformRange> normalize_transform_ranges(
         } else if (range.transform == CompressionTransform::delta) {
             if (range.parameter == 0 || range.parameter > kMaxDeltaStride) {
                 throw FormatError("invalid delta transform stride");
+            }
+        } else if (range.transform == CompressionTransform::word16_predict) {
+            if (range.parameter != 0 &&
+                (range.parameter < 7 || range.parameter > 15)) {
+                throw FormatError("invalid word16 predictor parameter");
             }
         } else {
             throw FormatError("unknown compression transform");

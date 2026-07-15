@@ -1444,6 +1444,7 @@ struct ZipFileReadContext {
     std::uint64_t completed_items = 0;
     std::uint64_t total_items = 0;
     std::uint64_t reported_until = 0;
+    std::uint64_t current_file_total = 0;
     std::string current_path;
     bool cancelled = false;
     bool failed = false;
@@ -1468,7 +1469,8 @@ size_t zip_file_read_callback(void* opaque, mz_uint64 file_ofs, void* buffer, si
             report_operation(context->operation, OperationStage::compressing,
                              *context->completed_bytes, context->total_bytes,
                              context->completed_items, context->total_items,
-                             context->current_path);
+                             context->current_path, end_offset,
+                             context->current_file_total);
         }
         return read;
     } catch (const OperationCancelled&) {
@@ -1557,6 +1559,7 @@ void add_zip_scan_item(ZipWriter& writer, const ScanItem& item,
     context.total_items = total_items;
     context.current_path = item.archive_path;
     const auto size = static_cast<mz_uint64>(fs::file_size(item.absolute));
+    context.current_file_total = size;
     if (!mz_zip_writer_add_read_buf_callback(
             &writer.zip(), archive_path.c_str(), &zip_file_read_callback,
             &context, size, &modified, nullptr, 0,
@@ -1569,8 +1572,8 @@ void add_zip_scan_item(ZipWriter& writer, const ScanItem& item,
     }
     ++completed_items;
     report_operation(options.operation, OperationStage::compressing,
-                     completed_bytes, total_bytes, completed_items, total_items,
-                     item.archive_path);
+                      completed_bytes, total_bytes, completed_items, total_items,
+                      item.archive_path, size, size);
 }
 
 template <typename KeepExisting>

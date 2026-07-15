@@ -84,6 +84,9 @@
     <ClInclude Include="src\core\reed_solomon.hpp">
       <Filter>Core</Filter>
     </ClInclude>
+    <ClInclude Include="src\core\task_executor.hpp">
+      <Filter>Core</Filter>
+    </ClInclude>
     <ClInclude Include="src\core\windows_time.hpp">
       <Filter>Core</Filter>
     </ClInclude>

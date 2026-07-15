@@ -14,6 +14,12 @@ struct TransformHint {
 
 TransformHint detect_transform_hint(std::span<const std::uint8_t> prefix);
 
+// Detects whole-input filters and, for a valid POSIX tar stream, filters on
+// individual regular-file payloads. The latter preserves tar headers while
+// allowing scientific/image members to use their native numeric predictor.
+std::vector<CompressionTransformRange> detect_transform_ranges(
+    std::span<const std::uint8_t> input);
+
 std::vector<CompressionTransformRange> normalize_transform_ranges(
     std::span<const CompressionTransformRange> ranges,
     std::size_t input_size);

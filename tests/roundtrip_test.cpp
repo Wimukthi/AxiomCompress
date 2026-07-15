@@ -10,6 +10,7 @@
 #include "core/hash.hpp"
 #include "core/file_replace.hpp"
 #include "core/reed_solomon.hpp"
+#include "core/task_executor.hpp"
 #include "entropy/huffman.hpp"
 #include "entropy/range.hpp"
 #include "third_party/miniz/miniz.h"
@@ -27,12 +28,14 @@
 #endif
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstring>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <iostream>
 #include <iterator>
 #include <memory>
@@ -135,6 +138,56 @@ void expect_slot_split_stream_roundtrip(const std::vector<std::uint8_t>& input) 
     AXIOM_CHECK(restored == input);
 }
 
+void expect_nested_task_executor() {
+    axiom::core::TaskExecutor executor(8);
+    std::atomic_size_t completed = 0;
+    auto parent = executor.submit([&] {
+        std::vector<std::future<std::size_t>> children;
+        children.reserve(256);
+        for (std::size_t i = 0; i < 256; ++i) {
+            children.push_back(executor.submit([&, i] {
+                completed.fetch_add(1, std::memory_order_relaxed);
+                return i;
+            }));
+        }
+        std::size_t sum = 0;
+        for (auto& child : children) {
+            sum += executor.wait(child);
+        }
+        return sum;
+    });
+
+    AXIOM_CHECK(executor.wait(parent) == (255u * 256u) / 2u);
+    AXIOM_CHECK(completed.load(std::memory_order_relaxed) == 256);
+}
+
+void expect_sequence_stream_roundtrip(const std::vector<std::uint8_t>& input) {
+    const auto lz77 = axiom::codec::encode_lz77(input, {});
+    const auto sequences =
+        axiom::codec::encode_lz77_sequence_streams(input, lz77, /*fast=*/false);
+    AXIOM_CHECK(sequences.has_value());
+    AXIOM_CHECK(axiom::codec::decode_lz77_sequence_streams(*sequences, input.size()) == input);
+    AXIOM_CHECK(!axiom::codec::encode_lz77_sequence_streams(
+        input, lz77, /*fast=*/false, /*maximum_useful_size=*/0));
+
+    const auto candidates =
+        axiom::codec::encode_lz77_payload_candidates(input, lz77, /*fast=*/false);
+    AXIOM_CHECK(candidates.sequence || candidates.split || candidates.slots);
+    if (candidates.sequence) {
+        AXIOM_CHECK(*candidates.sequence == *sequences);
+        AXIOM_CHECK(axiom::codec::decode_lz77_sequence_streams(
+                        *candidates.sequence, input.size()) == input);
+    }
+    if (candidates.split) {
+        AXIOM_CHECK(axiom::codec::decode_lz77_split_streams(
+                        *candidates.split, input.size()) == input);
+    }
+    if (candidates.slots) {
+        AXIOM_CHECK(axiom::codec::decode_lz77_split_streams_slots(
+                        *candidates.slots, input.size()) == input);
+    }
+}
+
 // The fast entropy chooser must produce archives that decode identically; only
 // the encoder's coder selection differs from the full bake-off.
 void expect_fast_entropy_roundtrip(const std::vector<std::uint8_t>& input) {
@@ -203,8 +256,10 @@ void test_compression_level_presets() {
     AXIOM_CHECK(maximum.use_tree_matcher);
     AXIOM_CHECK(!maximum.use_fast_lz);
     AXIOM_CHECK(maximum.max_chain_depth == 512);
+    AXIOM_CHECK(maximum.max_match == 4096);
     AXIOM_CHECK(maximum.block_size == (64u << 20));
     AXIOM_CHECK(maximum.window_size == (64u << 20));
+    AXIOM_CHECK(!maximum.optimal_two_pass);
     AXIOM_CHECK(maximum.auto_block_size_for_threads);
 }
 void expect_tree_lz77_roundtrip(const std::vector<std::uint8_t>& input) {
@@ -454,6 +509,18 @@ void expect_throws(Fn&& fn) {
     AXIOM_CHECK(threw);
 }
 
+void test_sequence_stream_truncation() {
+    const auto input = bytes_from_string(
+        "sequence stream truncation should never synthesize missing entropy bytes");
+    const auto lz77 = axiom::codec::encode_lz77(input, {});
+    auto encoded = axiom::codec::encode_lz77_sequence_streams(input, lz77, false);
+    AXIOM_CHECK(encoded.has_value() && !encoded->empty());
+    encoded->pop_back();
+    expect_throws([&] {
+        (void)axiom::codec::decode_lz77_sequence_streams(*encoded, input.size());
+    });
+}
+
 std::size_t find_bytes(const std::vector<std::uint8_t>& haystack, const std::string& needle) {
     const auto* first = reinterpret_cast<const std::uint8_t*>(needle.data());
     auto it = std::search(haystack.begin(), haystack.end(), first, first + needle.size());
@@ -538,7 +605,7 @@ std::vector<std::uint8_t> synthetic_pcm_wave() {
     return wave;
 }
 
-void test_reversible_transforms_and_v5() {
+void test_reversible_transforms_and_v7() {
     auto source = synthetic_x64_image();
     AXIOM_CHECK(axiom::codec::detect_transform_hint(source).transform ==
                 axiom::CompressionTransform::x86_branch);
@@ -569,13 +636,65 @@ void test_reversible_transforms_and_v5() {
     axiom::codec::inverse_transform_ranges(delta, delta_ranges);
     AXIOM_CHECK(delta == delta_source);
 
+    // A smooth 512-sample-wide 16-bit field should select the v7 numeric
+    // predictor without relying on its file name. The transform combines a 2D
+    // predictor, signed-residual zigzag, and byte-plane shuffling.
+    constexpr std::size_t numeric_width = 512;
+    constexpr std::size_t numeric_height = 512;
+    std::vector<std::uint8_t> numeric(numeric_width * numeric_height * 2);
+    for (std::size_t y = 0; y < numeric_height; ++y) {
+        for (std::size_t x = 0; x < numeric_width; ++x) {
+            test_write_le16(numeric, (y * numeric_width + x) * 2,
+                            static_cast<std::uint16_t>(y * 17 + x * 11 +
+                                                       ((x ^ y) & 3)));
+        }
+    }
+    const std::vector<axiom::CompressionTransformRange> numeric_ranges{{
+        axiom::CompressionTransform::word16_predict, 0,
+        static_cast<std::uint64_t>(numeric.size()), 0, 9}};
+    auto predicted = axiom::codec::apply_transform_ranges(numeric, numeric_ranges);
+    AXIOM_CHECK(predicted != numeric);
+    axiom::codec::inverse_transform_ranges(predicted, numeric_ranges);
+    AXIOM_CHECK(predicted == numeric);
+
+    // The direct-stream detector also looks through validated POSIX tar headers
+    // so a benchmark tar receives the same per-file filters as an AXAR input.
+    constexpr std::size_t tar_block = 512;
+    const auto padded_numeric = (numeric.size() + tar_block - 1) & ~(tar_block - 1);
+    std::vector<std::uint8_t> tar(tar_block + padded_numeric + tar_block * 2, 0);
+    std::copy_n("image.raw", 9, tar.begin());
+    auto write_octal = [&](std::size_t offset, std::size_t width, std::uint64_t value) {
+        std::fill_n(tar.begin() + static_cast<std::ptrdiff_t>(offset), width, '0');
+        tar[offset + width - 1] = 0;
+        for (std::size_t i = offset + width - 1; i-- > offset && value != 0;) {
+            tar[i] = static_cast<std::uint8_t>('0' + (value & 7u));
+            value >>= 3;
+        }
+    };
+    write_octal(124, 12, numeric.size());
+    std::fill_n(tar.begin() + 148, 8, ' ');
+    tar[156] = '0';
+    std::copy_n("ustar", 5, tar.begin() + 257);
+    std::uint64_t tar_checksum = 0;
+    for (std::size_t i = 0; i < tar_block; ++i) {
+        tar_checksum += tar[i];
+    }
+    write_octal(148, 8, tar_checksum);
+    std::copy(numeric.begin(), numeric.end(), tar.begin() + tar_block);
+    const auto tar_ranges = axiom::codec::detect_transform_ranges(tar);
+    AXIOM_CHECK(tar_ranges.size() == 1);
+    AXIOM_CHECK(tar_ranges[0].transform ==
+                axiom::CompressionTransform::word16_predict);
+    AXIOM_CHECK(tar_ranges[0].offset == tar_block);
+    AXIOM_CHECK(tar_ranges[0].size == numeric.size());
+
     axiom::CompressionOptions options;
     options.thread_count = 1;
     options.block_size = 1u << 20;
     const auto filtered = axiom::compress(source, options);
     options.enable_file_filters = false;
     const auto plain = axiom::compress(source, options);
-    AXIOM_CHECK(test_read_le16(filtered, 8) == 5);
+    AXIOM_CHECK(test_read_le16(filtered, 8) == 7);
     AXIOM_CHECK((filtered[11] & 1u) != 0);
     AXIOM_CHECK(test_read_le32(filtered, 32) != 0);
     AXIOM_CHECK(filtered.size() < plain.size());
@@ -632,6 +751,14 @@ void test_reversible_transforms_and_v5() {
     legacy.erase(legacy.begin() + 32, legacy.begin() + 36);
     test_write_le16(legacy, 8, 4);
     AXIOM_CHECK(axiom::decompress(legacy) == source);
+
+    // Version 5 has the same extended header as v6/v7. Keep accepting its
+    // original codec set while reserving newer block codecs for later streams.
+    axiom::CompressionOptions store_options;
+    store_options.force_store = true;
+    auto previous = axiom::compress(source, store_options);
+    test_write_le16(previous, 8, 5);
+    AXIOM_CHECK(axiom::decompress(previous) == source);
 
     const std::vector<axiom::CompressionTransformRange> overlapping{
         {axiom::CompressionTransform::delta, 0, 8192, 0, 1},
@@ -2556,6 +2683,9 @@ void test_archive_operation_control() {
     std::uint64_t max_completed = 0;
     std::uint64_t reported_total = 0;
     bool saw_final = false;
+    std::atomic_uint64_t max_compression_file_bytes = 0;
+    std::atomic_bool saw_compression_file_path = false;
+    std::atomic_bool saw_staging_throughput = false;
     control->set_progress_callback([&](const axiom::OperationProgress& progress) {
         max_completed = std::max(max_completed, progress.completed_bytes);
         if (progress.total_bytes > 0) {
@@ -2564,6 +2694,22 @@ void test_archive_operation_control() {
         if (progress.stage == axiom::OperationStage::finalizing &&
             progress.completed_bytes == progress.total_bytes) {
             saw_final = true;
+        }
+        if (progress.stage == axiom::OperationStage::compressing &&
+            progress.current_file_total_bytes == payload.size()) {
+            auto previous = max_compression_file_bytes.load(std::memory_order_relaxed);
+            while (progress.current_file_completed_bytes > previous &&
+                   !max_compression_file_bytes.compare_exchange_weak(
+                       previous, progress.current_file_completed_bytes,
+                       std::memory_order_relaxed)) {
+            }
+            if (progress.current_path.ends_with("payload.bin")) {
+                saw_compression_file_path.store(true, std::memory_order_relaxed);
+            }
+        }
+        if (progress.stage == axiom::OperationStage::reading &&
+            progress.completed_bytes == 0 && progress.throughput_bytes > 0) {
+            saw_staging_throughput.store(true, std::memory_order_relaxed);
         }
     });
 
@@ -2575,6 +2721,9 @@ void test_archive_operation_control() {
     AXIOM_CHECK(reported_total == payload.size());
     AXIOM_CHECK(max_completed == payload.size());
     AXIOM_CHECK(saw_final);
+    AXIOM_CHECK(max_compression_file_bytes.load(std::memory_order_relaxed) == payload.size());
+    AXIOM_CHECK(saw_compression_file_path.load(std::memory_order_relaxed));
+    AXIOM_CHECK(saw_staging_throughput.load(std::memory_order_relaxed));
     const auto final_snapshot = control->latest_progress();
     AXIOM_CHECK(final_snapshot.has_value());
     AXIOM_CHECK(final_snapshot->sequence > 0);
@@ -2590,7 +2739,7 @@ void test_archive_operation_control() {
         for (std::uint64_t value = 1; value <= 10000; ++value) {
             telemetry->report(axiom::OperationProgress{
                 axiom::OperationStage::compressing, value, 10000,
-                value, 10000, std::to_string(value), value, 10000});
+                value, 10000, std::to_string(value), value, 10000, value});
         }
         writer_done.store(true, std::memory_order_release);
     });
@@ -2599,6 +2748,7 @@ void test_archive_operation_control() {
         if (!snapshot) continue;
         if (snapshot->completed_bytes != snapshot->completed_items ||
             snapshot->completed_bytes != snapshot->current_file_completed_bytes ||
+            snapshot->completed_bytes != snapshot->throughput_bytes ||
             snapshot->current_path != std::to_string(snapshot->completed_bytes)) {
             incoherent.store(true, std::memory_order_release);
             break;
@@ -3118,7 +3268,9 @@ int main() {
     expect_tree_lz77_windowed_roundtrip(bytes_from_string(repeated), 1024);
     expect_tree_lz77_windowed_roundtrip(bytes_from_string(repeated), 4099);  // non-power-of-two
     expect_split_stream_roundtrip(bytes_from_string(repeated));
+    expect_sequence_stream_roundtrip(bytes_from_string(repeated));
     expect_parallel_block_roundtrip(bytes_from_string(repeated));
+    expect_nested_task_executor();
     expect_fast_lz_roundtrip(bytes_from_string(repeated));
 
     std::vector<std::uint8_t> binary;
@@ -3134,6 +3286,7 @@ int main() {
     expect_tree_lz77_roundtrip(binary);
     expect_split_stream_roundtrip(binary);
     expect_slot_split_stream_roundtrip(binary);
+    expect_sequence_stream_roundtrip(binary);
     expect_fast_lz_roundtrip(binary);
 
     // Interleave several recurring substrings so the parser sees a handful of
@@ -3148,6 +3301,7 @@ int main() {
     expect_roundtrip(bytes_from_string(rep_heavy));
     expect_split_stream_roundtrip(bytes_from_string(rep_heavy));
     expect_slot_split_stream_roundtrip(bytes_from_string(rep_heavy));
+    expect_sequence_stream_roundtrip(bytes_from_string(rep_heavy));
     expect_fast_lz_roundtrip(bytes_from_string(rep_heavy));
     expect_optimal_lz77_roundtrip(bytes_from_string(rep_heavy));
     expect_tree_lz77_roundtrip(bytes_from_string(rep_heavy));
@@ -3209,7 +3363,7 @@ int main() {
     AXIOM_CHECK(failed);
 
     test_compression_level_presets();
-    test_reversible_transforms_and_v5();
+    test_reversible_transforms_and_v7();
     test_filtered_axar_roundtrip();
     test_crc32();
     test_blake3();
@@ -3250,6 +3404,7 @@ int main() {
     test_extract_link_safety();
     test_decompress_bomb();
     test_split_stream_size_bomb();
+    test_sequence_stream_truncation();
     fuzz_decompress(20000);
     fuzz_archive(1500);
 
