@@ -5,10 +5,10 @@ line. Its main archive format is `.axar`; the lower-level single-stream format i
 `.axc`.
 
 The current goal is competitive modern solid compression with a simple, bounded
-decoder. Axiom is measured across LZ4, zstd, Deflate, bzip2, and LZMA2 rather
-than treating any one format as the sole target. On the Silesia corpus the
-maximum preset sits between zstd's mid/high-ratio profiles and bzip2/LZMA2 in
-ratio, while retaining much faster decode than bzip2 and LZMA2 (see the
+decoder. Axiom is measured across LZ4, zstd, Deflate, bzip2, LZMA2, and WinRAR
+RAR5 rather than treating any one format as the sole target. On the Silesia
+corpus the maximum preset sits between zstd's high-ratio profiles and LZMA2,
+while retaining much faster decode than WinRAR, bzip2, and LZMA2 (see the
 performance section below). Beyond the codec, the project has a complete
 archive container, a native Win32 GUI, a scriptable CLI,
 integrity checks, encryption, recovery data, split volumes, signing, and SFX
@@ -252,7 +252,10 @@ future options are disabled instead of being stored as silent no-ops.
 
 `Tools > Benchmark...` opens a 7-Zip-style benchmark window for measuring Axiom
 compression and extraction throughput. It can use generated corpora or a custom
-input folder/file.
+input folder/file. Generated data is created directly in RAM; custom input is
+preloaded once before timing. Every compression, decompression, and byte-for-byte
+verification pass then runs entirely in memory, so storage throughput and
+temporary-file cleanup do not contaminate the codec result.
 
 ## CLI quick start
 
@@ -311,11 +314,23 @@ One level chooses the speed/ratio tradeoff:
 | 6 | Deeper hash chain | Better ratio without tree memory |
 | 7 | Binary tree + cost-aware lazy lookahead, 8 MiB window | Long-range redundancy without optimal-parse cost |
 | 8 | Binary tree + single-pass optimal parse, 32 MiB window | Very high ratio at moderate time |
-| 9 / `--max` | Binary tree + two-pass optimal parse, 64 MiB window | Maximum preset |
+| 9 / `--max` | Deep binary tree + measured-cost optimal parse, 64 MiB window, 4 KiB matches | Maximum preset |
 
 The default is level 5. Levels 8 and 9 run the dynamic-programming optimal
 parser with candidates drawn from the binary tree; on generic data they
 compress substantially smaller than 6-7.
+
+Levels 2-9 also trial the AXC v6 sequence representation: logarithmic length
+codes, recent-distance slots, previous-byte literal lanes, and an optional
+rep0-XOR literal residual. AXC v7 adds a hybrid that keeps the older split
+command/length/distance representation while applying those stronger literal
+lanes. Each block keeps whichever complete representation is smallest.
+
+Across the twelve individual Silesia files, compared with commit `4e014ec7`, the
+current level 2 improves aggregate ratio by 2.57% with a 2.67% compression
+throughput cost; level 5 improves ratio by 0.81% with a 2.29% throughput cost.
+These totals use two complete, SHA-256-verified passes and sum elapsed time across
+the corpus rather than averaging unstable per-file percentages.
 
 Advanced flags can override the preset:
 
@@ -352,9 +367,11 @@ python bench/bench_codecs.py --axiom out/Release/axiomc.exe --input path/to/corp
 python bench/bench_codecs.py --axiom out/Release/axiomc.exe --input path/to/corpus --quick
 ```
 
-The harness auto-detects available LZ4, zstd, and 7-Zip executables and accepts
-explicit `--lz4`, `--zstd`, and `--sevenzip` paths. Every reported row is
-decompressed and compared byte-for-byte with the shared input stream.
+The harness auto-detects available LZ4, zstd, 7-Zip, and WinRAR executables and
+accepts explicit `--lz4`, `--zstd`, `--sevenzip`, and `--winrar` paths. Every
+reported row is decompressed and compared byte-for-byte with the shared input
+stream. Verified rows are checkpointed to `--output` as they finish, so a late
+external-tool failure does not discard earlier measurements.
 
 `--threads 0` is the default and means all detected hardware threads. Supplying
 `--block-size` is useful for controlled experiments, but it disables the default
@@ -392,43 +409,56 @@ profile sweeps and repeatable tuning workflow details, see
 
 Measured on the **Silesia corpus** (the twelve files packed into one 211.9 MB
 uncompressed tar, so every codec sees identical input), AMD Ryzen 9 5950X
-(16C/32T), NVMe, warm cache, Release build. Compression is best-of-2, decode
+(16C/32T), NVMe, warm cache, Release build. Compression is best-of-2 and decode
 best-of-3; every row is round-trip verified. Reference tools: zstd 1.5.7
-(`-T0`), LZ4 1.10.0, and 7-Zip 26.02 (`-mmt=on`) for LZMA2, bzip2, and gzip.
+(`-T0`), LZ4 1.10.0, 7-Zip 26.02 (`-mmt=on`) for LZMA2, bzip2, and gzip, and
+WinRAR 7.23 RAR5 (`-m3` and `-m5 -md128m`).
 Axiom runs with default `--threads 0`. These are direct codec comparisons on
-one tar stream; the separate AXAR filter tests exercise per-file transforms.
+one tar stream; Axiom's results include the default validated-tar member
+transforms, just as normal `axiomc c --level N` invocations do.
+
+![Silesia compression ratio by codec](docs/images/silesia-compression-ratio.svg)
+
+![Silesia compression ratio versus compression throughput](docs/images/silesia-speed-ratio.svg)
+
+The SVGs are generated directly from the table below with `python tools/generate_readme_charts.py`.
+The exact verified measurements are retained in
+[`bench/results/silesia-0.3.0.0.csv`](bench/results/silesia-0.3.0.0.csv).
 
 | Codec / level | Compressed | Ratio | Compress | Decompress |
 |---|---:|---:|---:|---:|
-| LZ4 -1 | 100.9 MB | 2.10x | 0.42 s | 0.42 s |
-| LZ4 -9 (HC) | 78.0 MB | 2.72x | 0.64 s | 0.45 s |
-| zstd -1 | 73.3 MB | 2.89x | 0.08 s | 0.15 s |
-| **Axiom -1** | 69.6 MB | 3.05x | 0.50 s | 0.18 s |
-| zstd -3 | 66.2 MB | 3.20x | 0.13 s | 0.17 s |
-| gzip Deflate -9 | 64.7 MB | 3.28x | 92.44 s | 0.82 s |
-| **Axiom -2** | 63.8 MB | 3.32x | 1.27 s | 0.18 s |
-| **Axiom -3** | 63.0 MB | 3.36x | 1.50 s | 0.18 s |
-| **Axiom -4** | 60.9 MB | 3.48x | 1.91 s | 0.18 s |
-| **Axiom -5** (default) | 60.5 MB | 3.51x | 2.43 s | 0.19 s |
-| **Axiom -6** | 60.2 MB | 3.52x | 3.19 s | 0.19 s |
-| zstd -9 | 59.2 MB | 3.58x | 0.56 s | 0.16 s |
-| **Axiom -7** | 58.7 MB | 3.61x | 5.57 s | 0.19 s |
-| **Axiom -8** | 56.2 MB | 3.77x | 15.30 s | 0.20 s |
-| **Axiom -9** | 55.4 MB | 3.83x | 28.94 s | 0.20 s |
-| bzip2 -9 | 54.2 MB | 3.91x | 7.53 s | 2.18 s |
-| zstd -19 | 52.8 MB | 4.01x | 19.41 s | 0.18 s |
-| zstd -22 --ultra | 52.3 MB | 4.05x | 96.02 s | 0.20 s |
-| LZMA2 -mx5 | 49.6 MB | 4.27x | 19.81 s | 0.82 s |
-| LZMA2 -mx9 | 48.7 MB | 4.35x | 40.03 s | 1.26 s |
+| LZ4 -1 | 100.9 MB | 2.10x | 0.09 s | 0.09 s |
+| LZ4 -9 (HC) | 78.0 MB | 2.72x | 0.38 s | 0.09 s |
+| zstd -1 | 73.3 MB | 2.89x | 0.06 s | 0.15 s |
+| zstd -3 | 66.2 MB | 3.20x | 0.12 s | 0.16 s |
+| **Axiom -1** | 65.6 MB | 3.23x | 0.75 s | 0.22 s |
+| gzip Deflate -9 | 64.7 MB | 3.28x | 89.26 s | 0.81 s |
+| **Axiom -2** | 59.4 MB | 3.57x | 1.48 s | 0.22 s |
+| zstd -9 | 59.2 MB | 3.58x | 0.53 s | 0.16 s |
+| **Axiom -3** | 58.7 MB | 3.61x | 1.67 s | 0.22 s |
+| **Axiom -4** | 57.5 MB | 3.69x | 2.19 s | 0.23 s |
+| **Axiom -5** (default) | 57.1 MB | 3.71x | 2.64 s | 0.22 s |
+| **Axiom -6** | 56.9 MB | 3.73x | 3.42 s | 0.23 s |
+| **Axiom -7** | 55.5 MB | 3.82x | 5.20 s | 0.23 s |
+| WinRAR -m3 | 54.2 MB | 3.91x | 2.18 s | 0.51 s |
+| bzip2 -9 | 54.2 MB | 3.91x | 7.39 s | 2.27 s |
+| WinRAR -m5 128M | 53.2 MB | 3.99x | 3.57 s | 0.50 s |
+| **Axiom -8** | 53.0 MB | 4.00x | 15.18 s | 0.23 s |
+| zstd -19 | 52.8 MB | 4.01x | 16.64 s | 0.17 s |
+| **Axiom -9** | 52.5 MB | 4.03x | 20.56 s | 0.25 s |
+| zstd -22 --ultra | 52.3 MB | 4.05x | 94.89 s | 0.20 s |
+| LZMA2 -mx5 | 49.6 MB | 4.27x | 17.75 s | 0.81 s |
+| LZMA2 -mx9 | 48.7 MB | 4.35x | 40.27 s | 1.26 s |
 
 Reading the table: Axiom's fast presets trade zstd's throughput for a smaller
-result, while levels 4–7 fill the ratio gap between zstd -3 and zstd -9. The
-maximum preset is 4.8% larger and slower to encode than zstd -19 on this run,
-but decodes at essentially the same speed. LZMA2 -mx9 is 12% smaller than Axiom
--9 and encodes more slowly, while Axiom decodes about six times faster. bzip2
-also beats Axiom -9 on ratio and encode time here, but decodes roughly eleven
-times slower. These cross-codec tradeoffs—not one 7-Zip row—define the active
-ratio, speed, and decoder-complexity work.
+result, while levels 2–7 cover the range between zstd -3 and WinRAR normal.
+Axiom -9 is 0.6% smaller than zstd -19 while encoding about 24% more slowly;
+zstd -22 is only 0.5% smaller than Axiom -9 but takes 4.6 times as long to
+encode. WinRAR best is 1.2% larger than Axiom -9 and encodes 5.8 times faster,
+while Axiom decodes about twice as fast. LZMA2 -mx9 is 7.2% smaller than Axiom
+-9, but Axiom encodes about twice as fast and decodes about five times as fast.
+These cross-codec tradeoffs define the active ratio, speed, and decoder-complexity
+work rather than treating any single comparison as the target.
 
 On `enwik8` (100 MB English Wikipedia text, default `--threads 0`):
 

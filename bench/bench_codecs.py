@@ -176,10 +176,13 @@ def sevenzip_profiles(executable, quick):
             return ([executable, "a", "-bd", "-bso0", "-bsp0", "-y",
                      *arguments, archive, source.name], source.parent)
 
-        def decompress(archive, output, source_name=None):
+        def decompress(archive, output, source_name=None, extension=extension):
             output.mkdir()
+            # Raw bzip2 streams do not preserve the input filename. 7-Zip
+            # restores them using the archive stem, unlike gzip and 7z.
+            restored_name = archive.stem if extension == ".bz2" else source_name
             return ([executable, "e", "-bd", "-bso0", "-bsp0", "-y",
-                     f"-o{output}", archive], None, output / source_name)
+                     f"-o{output}", archive], None, output / restored_name)
 
         result.append({
             "label": label,
@@ -188,6 +191,34 @@ def sevenzip_profiles(executable, quick):
             "compress": compress,
             "decompress": decompress,
             "sevenzip": True,
+        })
+    return result
+
+
+def winrar_profiles(executable, quick):
+    if not executable:
+        return []
+    levels = [("winrar-m3", ["-ma5", "-m3"])]
+    if not quick:
+        levels.append(("winrar-m5-128m", ["-ma5", "-m5", "-md128m"]))
+    result = []
+    for label, arguments in levels:
+        def compress(source, archive, arguments=arguments):
+            return ([executable, "a", "-idq", "-o+", *arguments,
+                     archive, source.name], source.parent)
+
+        def decompress(archive, output, source_name=None):
+            output.mkdir()
+            return ([executable, "x", "-idq", "-o+", archive,
+                     str(output) + os.sep], None, output / source_name)
+
+        result.append({
+            "label": label,
+            "tool": "WinRAR",
+            "extension": ".rar",
+            "compress": compress,
+            "decompress": decompress,
+            "directory_extract": True,
         })
     return result
 
@@ -208,7 +239,7 @@ def benchmark_profile(profile, corpus, temp, compress_repeats, decompress_repeat
     for repeat in range(decompress_repeats):
         output = temp / f"{profile['label']}-restore-{repeat}"
         remove_output(output)
-        if profile.get("sevenzip"):
+        if profile.get("sevenzip") or profile.get("directory_extract"):
             command, cwd, restored = profile["decompress"](
                 archive, output, source_name=corpus.name
             )
@@ -240,9 +271,19 @@ def benchmark_profile(profile, corpus, temp, compress_repeats, decompress_repeat
     }
 
 
+def write_csv(path, rows):
+    fields = list(rows[0].keys())
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as file:
+        writer = csv.DictWriter(file, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description="Benchmark Axiom against available LZ4, zstd, and 7-Zip codecs."
+        description=("Benchmark Axiom against available LZ4, zstd, 7-Zip, "
+                     "and WinRAR codecs.")
     )
     parser.add_argument("--axiom", required=True, help="Path to axiomc executable.")
     parser.add_argument("--input", required=True, help="Input file or directory.")
@@ -254,6 +295,7 @@ def main():
     parser.add_argument("--zstd", help="Path to zstd; otherwise auto-detected.")
     parser.add_argument("--lz4", help="Path to lz4; otherwise auto-detected.")
     parser.add_argument("--sevenzip", help="Path to 7z; otherwise auto-detected.")
+    parser.add_argument("--winrar", help="Path to Rar.exe; otherwise auto-detected.")
     parser.add_argument("--quick", action="store_true", help="Run a reduced profile set.")
     args = parser.parse_args()
 
@@ -274,8 +316,13 @@ def main():
         Path(r"C:\Program Files\7-Zip\7z.exe"),
         Path(r"C:\Program Files (x86)\7-Zip\7z.exe"),
     ])
+    winrar = find_executable(args.winrar, "WINRAR", "rar", [
+        Path(r"C:\Program Files\WinRAR\Rar.exe"),
+        Path(r"C:\Program Files (x86)\WinRAR\Rar.exe"),
+    ])
 
-    for name, executable in (("LZ4", lz4), ("zstd", zstd), ("7-Zip", sevenzip)):
+    for name, executable in (("LZ4", lz4), ("zstd", zstd),
+                             ("7-Zip", sevenzip), ("WinRAR", winrar)):
         if not executable:
             print(f"Skipping {name}: executable not found", file=sys.stderr)
 
@@ -287,22 +334,19 @@ def main():
         profiles += lz4_profiles(lz4, args.quick)
         profiles += zstd_profiles(zstd, args.quick)
         profiles += sevenzip_profiles(sevenzip, args.quick)
+        profiles += winrar_profiles(winrar, args.quick)
         rows = []
         for profile in profiles:
             print(f"Benchmarking {profile['label']}...", file=sys.stderr)
             rows.append(benchmark_profile(
                 profile, corpus, temp, args.compress_repeats, args.decompress_repeats
             ))
+            if args.output:
+                # Preserve every verified row so a late external-tool failure
+                # does not discard several minutes of valid benchmark data.
+                write_csv(Path(args.output), rows)
 
     fields = list(rows[0].keys())
-    if args.output:
-        output = Path(args.output)
-        output.parent.mkdir(parents=True, exist_ok=True)
-        with output.open("w", newline="", encoding="utf-8") as file:
-            writer = csv.DictWriter(file, fieldnames=fields)
-            writer.writeheader()
-            writer.writerows(rows)
-
     writer = csv.DictWriter(sys.stdout, fieldnames=fields, lineterminator="\n")
     writer.writeheader()
     writer.writerows(rows)

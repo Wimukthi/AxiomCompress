@@ -74,7 +74,7 @@ than `block_size` spans several blocks.
 Each block's bytes are compressed with `axiom::compress`, producing a
 self-contained `.axc` payload (with its own header and CRC-32 — this is the
 per-block integrity check). Blocks are written back-to-back after the header. The
-`.axc` stream is its own versioned format (currently version `5`) and is described
+`.axc` stream is its own versioned format (currently version `7`) and is described
 in [ARCHITECTURE.md](ARCHITECTURE.md); the container does not interpret a block's
 internals beyond its declared size and checksum.
 
@@ -82,15 +82,15 @@ Before building solid blocks, current writers group regular files by broad type
 and then by extension. This writer policy improves cross-file matching without
 changing AXAR directory semantics. Directories and links retain their scan order.
 
-#### Embedded AXC version 5 header and transforms
+#### Embedded AXC version 5/6/7 header and transforms
 
-Version 5 keeps the original fixed AXC fields and adds a bounded transform
+Versions 5 through 7 keep the original fixed AXC fields and add a bounded transform
 metadata area before the codec payload:
 
 | field | type | notes |
 |---|---|---|
 | magic | u8[8] | `"AXIOMC1\0"` |
-| version | u16 | `5` |
+| version | u16 | `5`, `6`, or `7` |
 | codec | u8 | inner store/LZ/parallel codec identifier |
 | flags | u8 | bit `0x01` means transform metadata is present |
 | original_size | u64 | restored byte count |
@@ -101,17 +101,38 @@ metadata area before the codec payload:
 | payload | u8[] | bytes consumed by the selected inner codec |
 
 Transform metadata begins with a vint range count. Each range stores a transform
-id (`1` = x86/x64 relative branch conversion, `2` = byte delta), one parameter
-byte (the delta stride, or zero for x86), followed by vint `offset`, `size`, and
-logical `source_offset`. Ranges are ordered, non-overlapping, and bounded by
+id (`1` = x86/x64 relative branch conversion, `2` = byte delta, `3` = 16-bit
+numeric prediction + zigzag + byte-plane shuffle), one parameter byte (the delta
+stride, zero for x86, or the numeric predictor's row-width exponent), followed
+by vint `offset`, `size`, and logical `source_offset`. Ranges are ordered,
+non-overlapping, and bounded by
 `original_size`. Independent source offsets let files and file fragments reset a
 filter safely when several inputs share a solid block or one file spans blocks.
 
 Writers content-check PE, PCM WAV, and uncompressed BMP inputs and run a small
 trial encode before enabling a candidate. Unsupported, overlapping, out-of-range,
-or implausibly numerous ranges are rejected before decode allocation. Version 5
+or implausibly numerous ranges are rejected before decode allocation. Current
 readers continue to accept canonical version 4 streams, whose payload begins at
 the old 32-byte fixed header.
+
+Version 6 adds codec id `6`, a sequence-oriented LZ77 payload. It stores the
+sequence count and final literal count, followed by entropy-coded literal-length,
+match-length, and offset-code streams. Values `0..15` are direct; larger lengths
+use a logarithmic code plus packed low bits. Offset codes `0..3` select an MTF
+recent-distance entry, while higher codes select a distance slot plus packed low
+bits. Literals are split into eight lanes using the high three bits of the
+previous output byte. The writer chooses between raw literals and literals XORed
+with the current most-recent-match prediction. Counts, packed-bit padding, lane
+consumption, match references, and trailing bytes are all validated exactly.
+
+Version 7 adds parallel-block codec id `7`, a hybrid split/context payload. Its
+first five streams retain the legacy command, literal-length, match-length,
+distance-slot, and distance-footer representation. A literal-mode byte and eight
+previous-byte context lanes replace the flat literal stream; the lanes hold
+either raw literals or literals XORed with the current rep0 prediction. Version 7
+also introduces transform id `3`. Writers entropy-screen 16-bit numeric ranges,
+validate tar member boundaries when discovering nested ranges, and retain the
+transform only after a fast trial predicts a net archive-size win.
 
 ### Central directory (at `directory_offset`)
 
@@ -339,8 +360,8 @@ declared size. The decoder defends against this before allocating:
 ## Compatibility policy
 
 The format is **pre-release and free to change**. The AXAR container remains
-strictly version `4`. New embedded AXC streams are version `5`; current readers
-also accept legacy AXC version `4`, while older readers reject version `5`.
+strictly version `4`. New embedded AXC streams are version `7`; current readers
+also accept AXC versions `4`, `5`, and `6`, while older readers reject version `7`.
 Unknown AXAR versions, AXC versions, required flags, codecs, transforms, and
 transform parameters are rejected with a clear error.
 

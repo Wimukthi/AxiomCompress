@@ -54,21 +54,33 @@ round-trip. The README's performance section is measured this way.
 ## Cross-codec suite
 
 Use the codec-neutral harness for the published comparison. It runs Axiom levels
-1–9 and any available LZ4, zstd, Deflate, bzip2, and LZMA2 profiles against the
-same byte stream:
+1–9 and any available LZ4, zstd, Deflate, bzip2, LZMA2, and WinRAR RAR5
+profiles against the same byte stream:
 
 ```powershell
 python .\bench\bench_codecs.py `
   --axiom .\out\Release\axiomc.exe `
   --input D:\tests\axiom-perf\silesia.tar `
+  --winrar "C:\Program Files\WinRAR\Rar.exe" `
   --output D:\tests\axiom-perf\results\silesia-codecs.csv
 ```
 
 The harness auto-detects tools on `PATH` and common Windows install locations.
-Use `--lz4`, `--zstd`, or `--sevenzip` for explicit executable paths. Missing
+Use `--lz4`, `--zstd`, `--sevenzip`, or `--winrar` for explicit executable paths. Missing
 reference tools are reported and skipped; Axiom is always required. The default
 protocol is best-of-two compression and best-of-three decompression, with every
 restore compared byte-for-byte. `--quick` selects a short smoke-test profile.
+WinRAR profiles use RAR5 normal (`-m3`) and best with a fixed 128 MiB dictionary
+(`-m5 -md128m`). The CSV is rewritten after every verified row so completed
+measurements survive a later external-tool failure.
+
+The published July 2026 snapshot used WinRAR 7.23, 7-Zip 26.02, zstd 1.5.7,
+and LZ4 1.10.0 on a Ryzen 9 5950X. Axiom level 9 measured 4.03x in 20.56 s;
+WinRAR best measured 3.99x in 3.57 s. See the README graphs for the complete
+22-profile ratio/throughput comparison.
+The exact published rows are versioned in
+`bench/results/silesia-0.3.0.0.csv`; keep this artifact aligned with the README
+table whenever the snapshot is refreshed.
 
 If you only need a smoke test, let the script create deterministic sample files:
 

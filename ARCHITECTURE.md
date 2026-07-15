@@ -57,9 +57,10 @@ The codec currently implements:
   levels 8–9 use the optimal parser instead.
 - A bounded **optimal (DP) parser** whose candidates come from the binary tree
   (LZMA-style `GetMatches`: the descent yields several distinct lengths, each
-  at its nearest distance). Level 9 runs it two-pass (re-parse with measured
-  entropy costs); level 8 runs it single-pass with the cost model measured from
-  the greedy parse, for most of the ratio at roughly half the time.
+  at its nearest distance). Levels 8 and 9 use one measured-cost pass seeded by
+  the greedy parse; level 9 searches deeper, uses a 64 MiB window, and permits
+  4 KiB matches. The older two-pass shape remains available to explicit
+  `--optimal` configurations.
 - Repeat-offset (rep0–rep3) matches and split LZ77 streams, with an optional
   position-slot distance representation.
 - Entropy via byte-level canonical Huffman, a **4-lane interleaved order-0
@@ -213,17 +214,45 @@ The archive header stores:
 
 - Magic and version.
 - Codec identifier.
-- Version-5 transform-present flags and a bounded transform-range section.
+- Version-5/6/7 transform-present flags and a bounded transform-range section.
 - Original size.
 - Payload size.
 - CRC-32 of the uncompressed data.
 
 The current transform layer supports independently reset x86/x64 relative-branch
-conversion and byte-delta ranges. PE, PCM WAV, and uncompressed BMP signatures
-provide candidate hints; a fast trial encode enables the filter only when it is
-expected to beat the unfiltered representation. AXAR passes one range per file or
-file fragment so mixed solid blocks remain reversible, while the final AXC CRC
-continues to authenticate the original bytes.
+conversion, byte-delta ranges, and a 16-bit numeric transform that combines a
+left/2D predictor, signed-residual zigzag, and byte-plane shuffling. PE, PCM WAV,
+and uncompressed BMP signatures provide candidate hints. Direct AXC compression
+also validates POSIX tar headers and entropy-screens individual regular-file
+members for the numeric transform, so tar benchmarks retain file boundaries.
+A fast trial encode enables the resulting ranges only when they beat the
+unfiltered representation. The final AXC CRC always authenticates original bytes.
+
+AXC version 6 can represent LZ77 output as separate sequence-code, packed-extra,
+and literal-context streams. Recent-distance codes avoid repeatedly storing common
+offsets, while previous-byte literal lanes and an optional rep0-XOR residual mode
+improve entropy modeling without serial adaptive decoding. The encoder retains the
+older split layouts as candidates and writes v6 only when it is smaller. Both
+order-0 and clustered order-1 rANS encoders use precomputed reciprocal symbols in
+their hot loops instead of per-symbol integer division.
+
+AXC version 7 adds a hybrid block codec: commands, literal lengths, match lengths,
+distance slots, and footer bits retain the best legacy split representation,
+while literals use the v6 previous-byte lanes and optional rep0-XOR residual.
+This avoids making stronger literal modeling contingent on the sequence code
+layout; each block still selects the smallest complete candidate.
+
+Fast-entropy presets share one token-analysis pass between the legacy and v6
+layouts. A sampled conditional-entropy estimate skips the legacy entropy bake-off
+only when the completed v6 payload already beats that estimate; thorough presets
+retain their exhaustive independent candidates. Small blocks build both literal
+residual modes in one cache-hot pass, while larger blocks retain compact run
+metadata and materialize only the selected mode to bound peak memory.
+
+The inverse gate is conservative as well: before entropy-coding a sequence
+candidate, its stream estimate is compared with the best exact legacy size. A
+candidate that cannot plausibly win is rejected after analysis, avoiding the
+costliest redundant work without changing the selected archive representation.
 
 Future block headers should add:
 
@@ -257,8 +286,8 @@ higher-effort ratio tools for levels that explicitly trade speed away.
 A single `--level 1..9` knob selects the speed/ratio operating point (default 5).
 Levels 1–6 drive the hash-chain matcher, raising chain depth and turning on lazy
 matching and the full entropy bake-off as the level rises; level 7 switches to
-a cost-aware lazy binary tree, and levels 8–9 use growing tree windows plus the
-optimal parser (single-pass at 8, two-pass at 9). Individual flags (`--chain-depth`,
+a cost-aware lazy binary tree, and levels 8–9 use growing tree windows plus a
+measured-cost single-pass optimal parser. Individual flags (`--chain-depth`,
 `--nice`, `--lazy`/`--no-lazy`, `--fast-entropy`, `--bt`, `--window`,
 `--optimal…`) override the preset, so a level is just a starting point. The
 decoder is identical at every level.
@@ -317,12 +346,12 @@ same work.
 
 Two effort shapes exist:
 
-- **Two-pass** (level 9, `--optimal`): parse with fixed weights, measure the
-  output streams, re-parse with measured entropy costs, keep whichever fully
-  encoded result is smaller.
-- **Single-pass** (level 8): measure the cost model from the greedy parse the
-  block encoder already computed, then run the DP once — most of the two-pass
-  ratio at roughly half the time.
+- **Single-pass** (levels 8–9): measure the cost model from the greedy parse the
+  block encoder already computed, then run the DP once. Level 9 raises the tree
+  depth, window, block, and maximum-match limits.
+- **Two-pass** (explicit `--optimal` on presets that do not override it): parse
+  with fixed weights, measure the output streams, re-parse with measured entropy
+  costs, and keep whichever fully encoded result is smaller.
 
 Use `--optimal-depth` and `--optimal-candidates` only when benchmarking or
 deliberately trading runtime for ratio (deeper descents keep helping slightly).
@@ -337,10 +366,18 @@ downloads enwik8 on first run, sweeps Axiom's match finders and window sizes,
 and verifies every row by round-trip before reporting a ratio.
 
 The cross-codec harness (`bench/bench_codecs.py`) compares Axiom levels against
-available LZ4, zstd, Deflate, bzip2, and LZMA2 profiles. For folders it builds a
-deterministic byte stream of relative paths and file bytes, then feeds that same
-stream to every codec. Each reported row is restored and compared byte-for-byte,
-keeping multi-file container differences out of codec measurements.
+available LZ4, zstd, Deflate, bzip2, LZMA2, and WinRAR RAR5 profiles. For folders
+it builds a deterministic byte stream of relative paths and file bytes, then
+feeds that same stream to every codec. Each reported row is restored and compared
+byte-for-byte, keeping multi-file container differences out of codec measurements.
+
+The native GUI benchmark follows the same codec-focused rule without creating a
+temporary workspace. Generated corpora are filled directly into a resident byte
+vector. A custom file is preloaded once; custom folders become a deterministic,
+sorted stream of relative UTF-8 paths, lengths, and file contents. Timed passes
+call the in-memory AXC `compress()` and `decompress()` APIs, retain source,
+archive, and restored buffers in RAM, and compare the result byte-for-byte after
+each pass. Disk reads during custom-input preparation are never part of timing.
 
 ## Decoder Rule
 
@@ -365,11 +402,14 @@ typed messages; closing the main window invalidates the shared lifetime token an
 drains any already-queued payloads.
 
 `OperationControl` is also the single source of progress truth. Producers publish
-a coherent snapshot containing stage bytes, item counts, current path, and
-per-file bytes. Numeric fields use a sequence-guarded atomic snapshot and paths
-are replaced atomically only when they change. Reports are coalesced at 1 MiB
-unless a stage, item, total, file, or completion boundary changes, so telemetry
-cannot become an inner-loop throughput bottleneck.
+a coherent snapshot containing stage bytes, item counts, current path, per-file
+bytes, and a dedicated throughput counter. Archive creation advances the latter
+while reading small files into its first solid block, then switches it to codec
+progress, so speed never falsely remains at zero while useful work is advancing.
+Numeric fields use a sequence-guarded atomic snapshot and paths are replaced
+atomically only when they change. Reports are coalesced at 1 MiB unless a stage,
+item, total, file, or completion boundary changes, so telemetry cannot become an
+inner-loop throughput bottleneck.
 
 Progress stays continuous even inside multi-second encodes: the parse loops
 (greedy chains, tree matcher, and both optimal-parser passes) tick a fractional
@@ -405,9 +445,12 @@ may be dispatched on the source STA and blocking it would also block Resume UI.
 **physical core count** (hyperthread siblings measured flat-to-negative on the
 codec's memory-bound hot loops), while decode uses all logical processors.
 Explicit thread counts are honored as given. The codec caps the actual worker
-count to the number of useful work items so small inputs do not create idle
-threads, while large inputs split enough independent blocks to keep the requested
-workers busy.
+count for long-running block jobs to the block count. A shared cooperative
+work-stealing executor retains the full budget for larger inputs, though, so a
+block job can submit independent Huffman, sequence-layout, split-layout, and
+per-substream entropy trials without creating nested thread pools. Waiting
+workers execute or steal queued tasks. Tiny single-block inputs stay serial to
+avoid paying thread startup cost.
 
 There are two block-sizing layers:
 
@@ -422,6 +465,14 @@ then shrinks the internal block size as needed, down to 1 MiB minimum useful
 work, so one large solid block can still feed many compression workers. Supplying
 an explicit `--block-size` disables this automatic sizing for repeatable tuning
 runs.
+
+This removes the old one-block/one-thread ceiling for entropy work without
+changing block boundaries or candidate selection. Greedy and optimal match
+discovery inside one block is still ordered: its mutable hash/tree index and
+repeat-offset state depend on earlier positions. Consequently, more threads
+help a single large block only during its independent candidate and entropy
+phases; full scaling on levels 8-9 still requires a ratio-equivalent immutable
+suffix index rather than substituting the weaker hash-chain candidate source.
 
 Parallel blocks are independent by design: each block picks store, raw LZ77,
 Huffman-coded LZ77, the level-1 `fast_lz` format, or split-stream LZ77 whose

@@ -375,7 +375,7 @@ axiomc a --max maximum-ratio.axar Data
 | 6 | Deep hash-chain search | Better ratio without tree memory |
 | 7 | Binary tree + cost-aware lazy lookahead, 8 MiB window | Long-range redundancy without optimal-parse cost |
 | 8 | Binary tree + single-pass optimal parse, 32 MiB window | Very high ratio at moderate time |
-| 9 | Binary tree + two-pass optimal parse, 64 MiB window | Maximum preset |
+| 9 | Deep binary tree + measured-cost optimal parse, 64 MiB window, 4 KiB matches | Maximum preset |
 
 Levels 8 and 9 run the dynamic-programming optimal parser (candidates come from
 the binary tree); on generic data they compress substantially smaller than
@@ -400,8 +400,11 @@ These options apply to commands that create or recompress data: `add`, `update`,
 cores (hyperthread siblings measurably contend rather than help on the codec's
 memory-bound hot loops), while decompression, testing, and extraction use all
 logical processors. An explicit `N` is honored as given in both directions.
-Axiom caps the actual worker count to useful work items, so a small archive
-will not create one busy thread per CPU just to sit idle.
+Axiom caps long-running block jobs to the number of blocks. Larger single-block
+inputs can still use spare workers for independent candidate layouts and entropy
+substreams through the shared work-stealing executor; tiny inputs stay serial.
+Match discovery within one block remains ordered, so levels 8-9 scale best when
+the input contains several ratio-friendly blocks.
 
 ```powershell
 axiomc a --threads 8 archive.axar Data
@@ -428,9 +431,12 @@ axiomc a --block-size 32M archive.axar Data
 
 AXAR creation groups similar file types before filling solid blocks. PE x86/x64
 executables can use a reversible relative-branch filter, while PCM WAV and
-uncompressed BMP data can use a reversible delta filter. Detection checks file
-content rather than trusting the extension, and a fast trial keeps the transform
-only when it predicts a net reduction after metadata.
+uncompressed BMP data can use a reversible delta filter. Direct AXC compression
+also validates POSIX tar headers and can filter regular-file members in place;
+smooth 16-bit numeric members may use a predictor, signed-residual zigzag, and
+byte-plane shuffle. Detection checks content rather than trusting extensions,
+and a fast trial keeps transforms only when they predict a net reduction after
+metadata.
 
 Filters are enabled by default for AXAR and single-stream AXC compression. Use
 `--no-filters` for an unfiltered comparison or compatibility benchmark:
@@ -440,8 +446,9 @@ axiomc c --level 9 --no-filters app.exe app-unfiltered.axc
 axiomc a --level 9 --no-filters archive.axar Data
 ```
 
-New filtered streams use AXC version 5. The reader remains compatible with AXC
-version 4, but older Axiom builds do not understand version-5 streams.
+New streams use AXC version 7. The reader remains compatible with AXC versions
+4, 5, and 6, but older Axiom builds do not understand version-7 hybrid block
+payloads or numeric transforms.
 
 ### Dictionary size: `--window SIZE`
 
