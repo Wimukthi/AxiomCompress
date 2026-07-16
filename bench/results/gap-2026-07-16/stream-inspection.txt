@@ -1,0 +1,89 @@
+silesia-axiom9.axc
+  version 7, codec parallel-blocks, original 211948032, payload 52459548, header+transform 70 (transform metadata 34)
+
+  10 block(s):
+    context-split  x6   original    127168816 -> payload     40320328
+    split-slots    x4   original     84779216 -> payload     12139131
+
+  stream                          raw        coded  bits/raw   share  coders
+  distance_footer            16594181     16503861     7.956  31.46%  ransx4,storex6
+  match_lengths              11698049      6207295     4.245  11.83%  rans-o1x10
+  distance_slots              9704947      6190779     5.103  11.80%  rans-o1x10
+  literal_lane_0              4710433      4108719     6.978   7.83%  ransx6
+  literal_lane_1              3444728      3180525     7.386   6.06%  ransx6
+  literals                    3521931      2896321     6.579   5.52%  rans-o1x4
+  literal_lane_2              2617728      2463809     7.530   4.70%  ransx5,storex1
+  commands                   16209810      2284584     1.128   4.36%  rans-o1x10
+  literal_lane_3              2145434      2002633     7.468   3.82%  ransx6
+  literal_lane_5              1631173      1583473     7.766   3.02%  ransx6
+  literal_lane_7              1387211      1326086     7.647   2.53%  ransx5,storex1
+  literal_lengths             4623847      1302951     2.254   2.48%  ransx3,rans-o1x7
+  literal_lane_4              1339574      1302488     7.779   2.48%  ransx6
+  literal_lane_6              1136133      1105205     7.782   2.11%  ransx6
+  literal_mode                      0            6     0.000   0.00%  rawx3,rep0-xorx3
+  TOTAL                                   52458735
+  block/stream framing overhead: 813 bytes
+
+mozilla-axiom9.axc
+  version 7, codec parallel-blocks, original 51220480, payload 16085190, header+transform 36 (transform metadata 0)
+
+  10 block(s):
+    context-split  x10  original     51220480 -> payload     16085108
+
+  stream                          raw        coded  bits/raw   share  coders
+  distance_footer             3234636      3132170     7.747  19.47%  ransx9,storex1
+  literal_lane_0              2017698      1827242     7.245  11.36%  ransx10
+  match_lengths               3721205      1739214     3.739  10.81%  rans-o1x10
+  distance_slots              2299413      1488707     5.179   9.26%  ransx1,rans-o1x9
+  literal_lane_1              1201667      1127221     7.504   7.01%  ransx10
+  literal_lane_2              1158289      1108358     7.655   6.89%  ransx10
+  commands                    6026506      1053429     1.398   6.55%  rans-o1x10
+  literal_lane_5              1078475      1025784     7.609   6.38%  ransx10
+  literal_lane_7               893974       861983     7.714   5.36%  ransx10
+  literal_lane_3               836262       797871     7.633   4.96%  ransx10
+  literal_lane_4               701229       674211     7.692   4.19%  ransx10
+  literal_lane_6               667681       643511     7.710   4.00%  ransx10
+  literal_lengths             2319387       604487     2.085   3.76%  ransx1,rans-o1x9
+  literal_mode                      0           10     0.000   0.00%  rep0-xorx10
+  TOTAL                                   16084198
+  block/stream framing overhead: 992 bytes
+
+mr-tar-axiom9-t1.axc
+  version 7, codec split-slots, original 9973760, payload 2226684, header+transform 46 (transform metadata 10)
+
+  1 block(s):
+    split-slots    x1   original      9973760 -> payload      2226684
+
+  stream                          raw        coded  bits/raw   share  coders
+  distance_footer             1046914      1046649     7.998  47.01%  ransx1
+  literals                     802393       601219     5.994  27.00%  rans-o1x1
+  distance_slots               532406       290425     4.364  13.04%  rans-o1x1
+  match_lengths                545023       144826     2.126   6.50%  rans-o1x1
+  literal_lengths              221680        77029     2.780   3.46%  ransx1
+  commands                     755626        66494     0.704   2.99%  rans-o1x1
+  TOTAL                                    2226642
+  block/stream framing overhead: 42 bytes
+
+sao-axiom9.axc
+  version 7, codec parallel-blocks, original 7251944, payload 5013491, header+transform 36 (transform metadata 0)
+
+  2 block(s):
+    context-split  x2   original      7251944 -> payload      5013472
+
+  stream                          raw        coded  bits/raw   share  coders
+  distance_footer              955485       941668     7.884  18.78%  ransx2
+  literal_lane_1               530859       530859     8.000  10.59%  storex2
+  literal_lane_2               521936       521936     8.000  10.41%  storex2
+  literal_lane_5               487341       487177     7.997   9.72%  ransx1,storex1
+  literal_lane_0               520872       415370     6.380   8.29%  ransx2
+  literal_lane_7               413649       383160     7.410   7.64%  ransx2
+  literal_lane_6               365997       362336     7.920   7.23%  ransx2
+  literal_lane_4               355909       355896     8.000   7.10%  ransx1,storex1
+  literal_lane_3               352720       352720     8.000   7.04%  storex2
+  distance_slots               551240       321224     4.662   6.41%  ransx2
+  match_lengths                559863       161478     2.307   3.22%  rans-o1x2
+  literal_lengths              302817        99260     2.622   1.98%  rans-o1x2
+  commands                     862679        80204     0.744   1.60%  rans-o1x2
+  literal_mode                      0            2     0.000   0.00%  rawx2
+  TOTAL                                    5013290
+  block/stream framing overhead: 201 bytes

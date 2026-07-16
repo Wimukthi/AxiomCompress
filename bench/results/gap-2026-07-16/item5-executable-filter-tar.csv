@@ -1,0 +1,4 @@
+candidate,input_bytes,archive_bytes,delta_bytes,seconds,status
+item3-baseline,211948032,51511761,0,17.407,retained
+elf-x86-nested,211948032,51511761,0,22.383,landed-neutral
+alpha-branch-prototype,211948032,53909939,2398178,21.495,rejected-removed

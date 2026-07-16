@@ -4,6 +4,7 @@
 #include "codec/incompressible.hpp"
 #include "codec/lz77.hpp"
 #include "codec/lz77_split.hpp"
+#include "codec/transform.hpp"
 #include "codec/varint.hpp"
 #include "core/checksum.hpp"
 #include "core/cpu.hpp"
@@ -33,6 +34,8 @@ enum class BlockCodec : std::uint8_t {
     fast_lz = 5,
     lz77_sequences = 6,
     lz77_context_split = 7,
+    lz77_contextual_slots = 8,
+    lz77_contextual_slots_context_split = 9,
 };
 
 struct BlockResult {
@@ -49,10 +52,99 @@ struct EncodedBlock {
     std::size_t payload_size = 0;
 };
 
+struct BlockRange {
+    std::size_t offset = 0;
+    std::size_t length = 0;
+};
+
+std::vector<BlockRange> uniform_block_plan(std::size_t input_size,
+                                           std::size_t block_size) {
+    std::vector<BlockRange> blocks;
+    const auto count = input_size == 0 ? 0 : (input_size + block_size - 1) / block_size;
+    blocks.reserve(count);
+    for (std::size_t offset = 0; offset < input_size; offset += block_size) {
+        blocks.push_back({offset, std::min(block_size, input_size - offset)});
+    }
+    return blocks;
+}
+
+std::vector<BlockRange> adaptive_block_plan(
+    std::span<const std::uint8_t> input,
+    const CompressionOptions& options,
+    std::size_t uniform_block_size) {
+    if (!options.content_adaptive_blocks) {
+        return uniform_block_plan(input.size(), uniform_block_size);
+    }
+
+    const auto members = detect_tar_members(input);
+    if (members.empty()) {
+        return uniform_block_plan(input.size(), uniform_block_size);
+    }
+
+    constexpr std::size_t kMinimumAdaptiveBlock = std::size_t{4} << 20;
+    constexpr std::size_t kTarAlignment = 512;
+    const auto maximum_block = std::max<std::size_t>(
+        kMinimumAdaptiveBlock, (uniform_block_size * 3) / 4);
+    const auto aligned_maximum = std::max(
+        kTarAlignment, maximum_block & ~(kTarAlignment - 1));
+
+    std::vector<BlockRange> blocks;
+    blocks.reserve(members.size());
+    std::optional<std::size_t> pending_start;
+    std::size_t pending_end = 0;
+    const auto flush_pending = [&] {
+        if (pending_start) {
+            blocks.push_back({*pending_start, pending_end - *pending_start});
+            pending_start.reset();
+        }
+    };
+
+    for (const auto& member : members) {
+        const auto member_size = member.end_offset - member.header_offset;
+        if (member_size < kMinimumAdaptiveBlock) {
+            if (!pending_start) {
+                pending_start = member.header_offset;
+            }
+            pending_end = member.end_offset;
+            if (pending_end - *pending_start >= kMinimumAdaptiveBlock) {
+                flush_pending();
+            }
+            continue;
+        }
+
+        flush_pending();
+        auto offset = member.header_offset;
+        auto remaining = member_size;
+        while (remaining > aligned_maximum) {
+            blocks.push_back({offset, aligned_maximum});
+            offset += aligned_maximum;
+            remaining -= aligned_maximum;
+        }
+        if (remaining != 0) {
+            blocks.push_back({offset, remaining});
+        }
+    }
+    flush_pending();
+
+    const auto covered = blocks.empty() ? 0 : blocks.back().offset + blocks.back().length;
+    if (covered < input.size()) {
+        // Tar end markers are tiny and contain no useful match history. Keeping
+        // them with the final member avoids a pathological sub-kilobyte block.
+        if (!blocks.empty() && blocks.back().offset + blocks.back().length == covered) {
+            blocks.back().length += input.size() - covered;
+        } else {
+            blocks.push_back({covered, input.size() - covered});
+        }
+    }
+    return blocks;
+}
+
 struct LegacyPayloads {
     ByteVector split;
     std::optional<ByteVector> slots;
+    std::optional<ByteVector> contextual_slots;
     std::optional<ByteVector> context_split;
+    std::optional<ByteVector> contextual_context_split;
 };
 
 BlockCodec read_block_codec(std::uint8_t value) {
@@ -79,6 +171,13 @@ BlockCodec read_block_codec(std::uint8_t value) {
     }
     if (value == static_cast<std::uint8_t>(BlockCodec::lz77_context_split)) {
         return BlockCodec::lz77_context_split;
+    }
+    if (value == static_cast<std::uint8_t>(BlockCodec::lz77_contextual_slots)) {
+        return BlockCodec::lz77_contextual_slots;
+    }
+    if (value == static_cast<std::uint8_t>(
+                     BlockCodec::lz77_contextual_slots_context_split)) {
+        return BlockCodec::lz77_contextual_slots_context_split;
     }
 
     throw FormatError("unsupported block codec");
@@ -119,8 +218,11 @@ BlockResult compress_block(std::span<const std::uint8_t> input,
         // only estimates the raw LZ77 candidate size; raw bytes are materialized
         // only if that candidate can actually win.
         auto fast_payloads = encode_fast_lz77_split_payloads(input, options);
-        auto [split_payload, slot_payload] =
+        auto payloads =
             encode_lz77_split_payloads(fast_payloads.streams, /*fast=*/true, executor);
+        auto split_payload = std::move(payloads.split);
+        auto slot_payload = std::move(payloads.slots);
+        auto contextual_slot_payload = std::move(payloads.contextual_slots);
         if (split_payload.size() < best_size) {
             best_size = split_payload.size();
             best.codec = BlockCodec::greedy_lz77_split;
@@ -130,6 +232,11 @@ BlockResult compress_block(std::span<const std::uint8_t> input,
             best_size = slot_payload->size();
             best.codec = BlockCodec::greedy_lz77_split_slots;
             best.payload = std::move(*slot_payload);
+        }
+        if (contextual_slot_payload && contextual_slot_payload->size() < best_size) {
+            best_size = contextual_slot_payload->size();
+            best.codec = BlockCodec::lz77_contextual_slots;
+            best.payload = std::move(*contextual_slot_payload);
         }
         if (fast_payloads.lz77_size < input.size() &&
             fast_payloads.lz77_size <= best_size) {
@@ -179,8 +286,10 @@ BlockResult compress_block(std::span<const std::uint8_t> input,
         std::optional<ByteVector> entropy_payload;
         std::optional<ByteVector> split_payload;
         std::optional<ByteVector> slot_payload;
+        std::optional<ByteVector> contextual_slot_payload;
         std::optional<ByteVector> sequence_payload;
         std::optional<ByteVector> context_split_payload;
+        std::optional<ByteVector> contextual_context_split_payload;
         // Fast-entropy presets already accept estimate-driven selection, so they
         // share analysis and prune a provably inferior legacy bake-off. Thorough
         // presets retain independent candidates to keep their exhaustive policy.
@@ -190,6 +299,7 @@ BlockResult compress_block(std::span<const std::uint8_t> input,
                                                executor);
             split_payload = std::move(candidates.split);
             slot_payload = std::move(candidates.slots);
+            contextual_slot_payload = std::move(candidates.contextual_slots);
             sequence_payload = std::move(candidates.sequence);
         } else if (executor != nullptr && !options.fast_entropy &&
                    lz_payload.size() >= (std::size_t{256} << 10)) {
@@ -204,11 +314,18 @@ BlockResult compress_block(std::span<const std::uint8_t> input,
                                                   try_sequence, executor] {
                 auto pair = encode_lz77_split_payloads(lz_payload, options.fast_entropy,
                                                        executor);
-                LegacyPayloads result{std::move(pair.first), std::move(pair.second),
+                LegacyPayloads result{std::move(pair.split), std::move(pair.slots),
+                                      std::move(pair.contextual_slots), std::nullopt,
                                       std::nullopt};
                 if (try_sequence && result.slots) {
-                    result.context_split = encode_lz77_context_split_streams(
-                        input, lz_payload, *result.slots, executor);
+                    const auto contextual = result.contextual_slots
+                        ? std::span<const std::uint8_t>(*result.contextual_slots)
+                        : std::span<const std::uint8_t>{};
+                    auto context_split = encode_lz77_context_split_streams(
+                        input, lz_payload, *result.slots, contextual, executor);
+                    result.context_split = std::move(context_split.slots);
+                    result.contextual_context_split =
+                        std::move(context_split.contextual_slots);
                 }
                 return result;
             });
@@ -247,7 +364,10 @@ BlockResult compress_block(std::span<const std::uint8_t> input,
             if (legacy) {
                 split_payload = std::move(legacy->split);
                 slot_payload = std::move(legacy->slots);
+                contextual_slot_payload = std::move(legacy->contextual_slots);
                 context_split_payload = std::move(legacy->context_split);
+                contextual_context_split_payload =
+                    std::move(legacy->contextual_context_split);
             }
         } else {
             // The whole-stream Huffman candidate almost never beats split
@@ -257,8 +377,9 @@ BlockResult compress_block(std::span<const std::uint8_t> input,
             }
             auto legacy =
                 encode_lz77_split_payloads(lz_payload, options.fast_entropy, executor);
-            split_payload = std::move(legacy.first);
-            slot_payload = std::move(legacy.second);
+            split_payload = std::move(legacy.split);
+            slot_payload = std::move(legacy.slots);
+            contextual_slot_payload = std::move(legacy.contextual_slots);
             if (try_sequence) {
                 // Candidate policy must not depend on whether an executor is
                 // present. The parallel path starts this trial before legacy
@@ -269,8 +390,14 @@ BlockResult compress_block(std::span<const std::uint8_t> input,
                     encode_lz77_sequence_streams(input, lz_payload, options.fast_entropy,
                                                  useful_size, executor);
                 if (slot_payload) {
-                    context_split_payload = encode_lz77_context_split_streams(
-                        input, lz_payload, *slot_payload, executor);
+                    const auto contextual = contextual_slot_payload
+                        ? std::span<const std::uint8_t>(*contextual_slot_payload)
+                        : std::span<const std::uint8_t>{};
+                    auto context_split = encode_lz77_context_split_streams(
+                        input, lz_payload, *slot_payload, contextual, executor);
+                    context_split_payload = std::move(context_split.slots);
+                    contextual_context_split_payload =
+                        std::move(context_split.contextual_slots);
                 }
             }
         }
@@ -286,6 +413,10 @@ BlockResult compress_block(std::span<const std::uint8_t> input,
             accept_encoded_payload(BlockCodec::greedy_lz77_split_slots,
                                    std::move(*slot_payload));
         }
+        if (contextual_slot_payload && contextual_slot_payload->size() < best_size) {
+            accept_encoded_payload(BlockCodec::lz77_contextual_slots,
+                                   std::move(*contextual_slot_payload));
+        }
         if (sequence_payload && sequence_payload->size() < best_size) {
             accept_encoded_payload(BlockCodec::lz77_sequences,
                                    std::move(*sequence_payload));
@@ -293,6 +424,12 @@ BlockResult compress_block(std::span<const std::uint8_t> input,
         if (context_split_payload && context_split_payload->size() < best_size) {
             accept_encoded_payload(BlockCodec::lz77_context_split,
                                    std::move(*context_split_payload));
+        }
+        if (contextual_context_split_payload &&
+            contextual_context_split_payload->size() < best_size) {
+            accept_encoded_payload(
+                BlockCodec::lz77_contextual_slots_context_split,
+                std::move(*contextual_context_split_payload));
         }
         if (raw_payload_pending) {
             best.payload = std::move(lz_payload);
@@ -373,6 +510,16 @@ void decompress_block_into(std::span<const std::uint8_t> payload,
 
     if (codec == BlockCodec::lz77_context_split) {
         decode_lz77_context_split_streams_into(payload, output);
+        return;
+    }
+
+    if (codec == BlockCodec::lz77_contextual_slots) {
+        decode_lz77_contextual_slot_streams_into(payload, output);
+        return;
+    }
+
+    if (codec == BlockCodec::lz77_contextual_slots_context_split) {
+        decode_lz77_contextual_slot_context_split_streams_into(payload, output);
         return;
     }
 
@@ -488,7 +635,8 @@ ByteVector encode_parallel_blocks(std::span<const std::uint8_t> input,
         options.operation->checkpoint();
     }
     const auto block_size = effective_parallel_block_size(input.size(), options);
-    const auto block_count = (input.size() + block_size - 1) / block_size;
+    const auto block_plan = adaptive_block_plan(input, options, block_size);
+    const auto block_count = block_plan.size();
 
     std::vector<BlockResult> results(block_count);
     std::vector<std::uint32_t> block_crcs(crc32 != nullptr ? block_count : 0);
@@ -562,8 +710,8 @@ ByteVector encode_parallel_blocks(std::span<const std::uint8_t> input,
                 if (options.operation) {
                     options.operation->checkpoint();
                 }
-                const auto start = block_index * block_size;
-                const auto length = std::min(block_size, input.size() - start);
+                const auto start = block_plan[block_index].offset;
+                const auto length = block_plan[block_index].length;
                 const auto block_input = input.subspan(start, length);
                 current_length = length;
                 results[block_index] = compress_block(block_input, worker_options, executor);
@@ -644,7 +792,8 @@ ByteVector decode_parallel_blocks(std::span<const std::uint8_t> encoded,
                                   const std::function<void(std::uint64_t)>& decoded_bytes_progress,
                                   std::uint32_t* crc32,
                                   bool allow_sequence_codec,
-                                  bool allow_context_split_codec) {
+                                  bool allow_context_split_codec,
+                                  bool allow_contextual_footer_codec) {
     if (operation) {
         operation->checkpoint();
     }
@@ -664,6 +813,14 @@ ByteVector decode_parallel_blocks(std::span<const std::uint8_t> encoded,
             return block.codec == BlockCodec::lz77_context_split;
         })) {
         throw FormatError("context-split block codec requires AXC version 7");
+    }
+    if (!allow_contextual_footer_codec &&
+        std::any_of(blocks.begin(), blocks.end(), [](const auto& block) {
+            return block.codec == BlockCodec::lz77_contextual_slots ||
+                   block.codec ==
+                       BlockCodec::lz77_contextual_slots_context_split;
+        })) {
+        throw FormatError("contextual footer block codec requires AXC version 8");
     }
 
     ByteVector output(output_size);

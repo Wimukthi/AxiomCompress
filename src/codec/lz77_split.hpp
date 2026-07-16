@@ -32,7 +32,19 @@ struct Lz77SplitStreams {
 struct Lz77PayloadCandidates {
     std::optional<ByteVector> split;
     std::optional<ByteVector> slots;
+    std::optional<ByteVector> contextual_slots;
     std::optional<ByteVector> sequence;
+};
+
+struct Lz77SplitPayloads {
+    ByteVector split;
+    std::optional<ByteVector> slots;
+    std::optional<ByteVector> contextual_slots;
+};
+
+struct Lz77ContextSplitPayloads {
+    std::optional<ByteVector> slots;
+    std::optional<ByteVector> contextual_slots;
 };
 
 // When `fast` is set, each substream's entropy coder is chosen from a cheap
@@ -64,13 +76,22 @@ void decode_lz77_split_streams_slots_into(std::span<const std::uint8_t> encoded,
 // streams, but partition literals by the preceding decoded byte and optionally
 // XOR them with the current rep0 prediction. This lets the stronger literal
 // model compete without forcing the v6 sequence representation for matches.
-std::optional<ByteVector> encode_lz77_context_split_streams(
+Lz77ContextSplitPayloads encode_lz77_context_split_streams(
     std::span<const std::uint8_t> input,
     std::span<const std::uint8_t> lz77_payload,
     std::span<const std::uint8_t> slot_payload,
+    std::span<const std::uint8_t> contextual_slot_payload = {},
     core::TaskExecutor* executor = nullptr);
 
 void decode_lz77_context_split_streams_into(
+    std::span<const std::uint8_t> encoded,
+    std::span<std::uint8_t> output);
+
+void decode_lz77_contextual_slot_streams_into(
+    std::span<const std::uint8_t> encoded,
+    std::span<std::uint8_t> output);
+
+void decode_lz77_contextual_slot_context_split_streams_into(
     std::span<const std::uint8_t> encoded,
     std::span<std::uint8_t> output);
 
@@ -106,12 +127,12 @@ void decode_lz77_sequence_streams_into(std::span<const std::uint8_t> encoded,
 // literal stream, whose order-1 coding is the most expensive). The second value
 // is nullopt when a distance does not fit the slot scheme. Byte-for-byte
 // identical to calling the two encoders separately, but roughly half the work.
-std::pair<ByteVector, std::optional<ByteVector>> encode_lz77_split_payloads(
+Lz77SplitPayloads encode_lz77_split_payloads(
     std::span<const std::uint8_t> lz77_payload,
     bool fast = false,
     core::TaskExecutor* executor = nullptr);
 
-std::pair<ByteVector, std::optional<ByteVector>> encode_lz77_split_payloads(
+Lz77SplitPayloads encode_lz77_split_payloads(
     const Lz77SplitStreams& streams,
     bool fast = false,
     core::TaskExecutor* executor = nullptr);

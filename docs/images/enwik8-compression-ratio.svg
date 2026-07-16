@@ -1,0 +1,90 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="768" viewBox="0 0 1000 768" role="img" aria-labelledby="title desc">
+  <title id="title">enwik8 compression ratio by codec</title>
+  <desc id="desc">Horizontal bars compare compression ratios. Higher values are better; Axiom results are orange.</desc>
+  <style>
+    :root{--bg:#fff;--fg:#172033;--muted:#667085;--grid:#d9dee8;--axiom:#e26d2f;--zstd:#238b74;--lz4:#3973c6;--lzma2:#a54d9d;--winrar:#c43b4d;--other:#7b8798}
+    @media(prefers-color-scheme:dark){:root{--bg:#0d1117;--fg:#e6edf3;--muted:#9ba7b4;--grid:#30363d;--axiom:#ff934f;--zstd:#4fc3a1;--lz4:#73a7ef;--lzma2:#d88ad0;--winrar:#ff667a;--other:#a6b0bd}}
+    .bg{fill:var(--bg)}.fg{fill:var(--fg)}.muted{fill:var(--muted)}.grid{stroke:var(--grid);stroke-width:1}.axis{stroke:var(--muted);stroke-width:1.2}
+    text{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;font-size:13px}.title{font-size:20px;font-weight:500}.subtitle{font-size:12px}.value{font-weight:500}
+    .axiom{fill:var(--axiom)}.zstd{fill:var(--zstd)}.lz4{fill:var(--lz4)}.lzma2{fill:var(--lzma2)}.winrar{fill:var(--winrar)}.other{fill:var(--other)}.best{stroke:var(--fg);stroke-width:2}
+  </style>
+  <rect class="bg" width="1000" height="768"/>
+  <text class="title fg" x="24" y="32">enwik8 compression ratio</text>
+  <text class="subtitle muted" x="24" y="54">100 MB English Wikipedia text &#183; higher is better</text>
+  <line class="grid" x1="180.0" y1="68" x2="180.0" y2="720"/>
+  <text class="muted" x="180.0" y="750" text-anchor="middle">0&#215;</text>
+  <line class="grid" x1="343.6" y1="68" x2="343.6" y2="720"/>
+  <text class="muted" x="343.6" y="750" text-anchor="middle">1&#215;</text>
+  <line class="grid" x1="507.1" y1="68" x2="507.1" y2="720"/>
+  <text class="muted" x="507.1" y="750" text-anchor="middle">2&#215;</text>
+  <line class="grid" x1="670.7" y1="68" x2="670.7" y2="720"/>
+  <text class="muted" x="670.7" y="750" text-anchor="middle">3&#215;</text>
+  <line class="grid" x1="834.2" y1="68" x2="834.2" y2="720"/>
+  <text class="muted" x="834.2" y="750" text-anchor="middle">4&#215;</text>
+  <text class="fg" x="168" y="98" text-anchor="end">LZMA2 -mx9</text>
+  <rect class="lzma2" x="180" y="85" width="659.5" height="19" rx="3"><title>LZMA2 -mx9: 4.03x, 24.8 MB</title></rect>
+  <text class="value fg" x="847.5" y="99">4.03&#215;</text>
+  <text class="fg" x="168" y="127" text-anchor="end">zstd -22 --ultra</text>
+  <rect class="zstd" x="180" y="114" width="647.2" height="19" rx="3"><title>zstd -22 --ultra: 3.96x, 25.3 MB</title></rect>
+  <text class="value fg" x="835.2" y="128">3.96&#215;</text>
+  <text class="fg" x="168" y="156" text-anchor="end">LZMA2 -mx5</text>
+  <rect class="lzma2" x="180" y="143" width="643.9" height="19" rx="3"><title>LZMA2 -mx5: 3.94x, 25.4 MB</title></rect>
+  <text class="value fg" x="831.9" y="157">3.94&#215;</text>
+  <text class="fg" x="168" y="185" text-anchor="end">WinRAR -m5 128M</text>
+  <rect class="winrar" x="180" y="172" width="607.5" height="19" rx="3"><title>WinRAR -m5 128M: 3.71x, 26.9 MB</title></rect>
+  <text class="value fg" x="795.5" y="186">3.71&#215;</text>
+  <text class="fg" x="168" y="214" text-anchor="end">zstd -19</text>
+  <rect class="zstd" x="180" y="201" width="607.0" height="19" rx="3"><title>zstd -19: 3.71x, 26.9 MB</title></rect>
+  <text class="value fg" x="795.0" y="215">3.71&#215;</text>
+  <text class="fg" x="168" y="243" text-anchor="end" font-weight="500">Axiom -9</text>
+  <rect class="axiom best" x="180" y="230" width="574.3" height="19" rx="3"><title>Axiom -9: 3.51x, 28.5 MB</title></rect>
+  <text class="value fg" x="762.3" y="244">3.51&#215;</text>
+  <text class="fg" x="168" y="272" text-anchor="end">WinRAR -m3</text>
+  <rect class="winrar" x="180" y="259" width="570.9" height="19" rx="3"><title>WinRAR -m3: 3.49x, 28.6 MB</title></rect>
+  <text class="value fg" x="758.9" y="273">3.49&#215;</text>
+  <text class="fg" x="168" y="301" text-anchor="end">Axiom -8</text>
+  <rect class="axiom" x="180" y="288" width="569.1" height="19" rx="3"><title>Axiom -8: 3.48x, 28.7 MB</title></rect>
+  <text class="value fg" x="757.1" y="302">3.48&#215;</text>
+  <text class="fg" x="168" y="330" text-anchor="end">bzip2 -9</text>
+  <rect class="other" x="180" y="317" width="563.9" height="19" rx="3"><title>bzip2 -9: 3.45x, 29.0 MB</title></rect>
+  <text class="value fg" x="751.9" y="331">3.45&#215;</text>
+  <text class="fg" x="168" y="359" text-anchor="end">Axiom -7</text>
+  <rect class="axiom" x="180" y="346" width="532.0" height="19" rx="3"><title>Axiom -7: 3.25x, 30.7 MB</title></rect>
+  <text class="value fg" x="720.0" y="360">3.25&#215;</text>
+  <text class="fg" x="168" y="388" text-anchor="end">zstd -9</text>
+  <rect class="zstd" x="180" y="375" width="525.4" height="19" rx="3"><title>zstd -9: 3.21x, 31.1 MB</title></rect>
+  <text class="value fg" x="713.4" y="389">3.21&#215;</text>
+  <text class="fg" x="168" y="417" text-anchor="end">Axiom -6</text>
+  <rect class="axiom" x="180" y="404" width="515.9" height="19" rx="3"><title>Axiom -6: 3.15x, 31.7 MB</title></rect>
+  <text class="value fg" x="703.9" y="418">3.15&#215;</text>
+  <text class="fg" x="168" y="446" text-anchor="end">Axiom -5</text>
+  <rect class="axiom" x="180" y="433" width="513.6" height="19" rx="3"><title>Axiom -5: 3.14x, 31.8 MB</title></rect>
+  <text class="value fg" x="701.6" y="447">3.14&#215;</text>
+  <text class="fg" x="168" y="475" text-anchor="end">Axiom -4</text>
+  <rect class="axiom" x="180" y="462" width="510.1" height="19" rx="3"><title>Axiom -4: 3.12x, 32.1 MB</title></rect>
+  <text class="value fg" x="698.1" y="476">3.12&#215;</text>
+  <text class="fg" x="168" y="504" text-anchor="end">Axiom -3</text>
+  <rect class="axiom" x="180" y="491" width="505.1" height="19" rx="3"><title>Axiom -3: 3.09x, 32.4 MB</title></rect>
+  <text class="value fg" x="693.1" y="505">3.09&#215;</text>
+  <text class="fg" x="168" y="533" text-anchor="end">Axiom -2</text>
+  <rect class="axiom" x="180" y="520" width="498.3" height="19" rx="3"><title>Axiom -2: 3.05x, 32.8 MB</title></rect>
+  <text class="value fg" x="686.3" y="534">3.05&#215;</text>
+  <text class="fg" x="168" y="562" text-anchor="end">gzip Deflate -9</text>
+  <rect class="other" x="180" y="549" width="465.9" height="19" rx="3"><title>gzip Deflate -9: 2.85x, 35.1 MB</title></rect>
+  <text class="value fg" x="653.9" y="563">2.85&#215;</text>
+  <text class="fg" x="168" y="591" text-anchor="end">zstd -3</text>
+  <rect class="zstd" x="180" y="578" width="461.4" height="19" rx="3"><title>zstd -3: 2.82x, 35.4 MB</title></rect>
+  <text class="value fg" x="649.4" y="592">2.82&#215;</text>
+  <text class="fg" x="168" y="620" text-anchor="end">Axiom -1</text>
+  <rect class="axiom" x="180" y="607" width="438.4" height="19" rx="3"><title>Axiom -1: 2.68x, 37.3 MB</title></rect>
+  <text class="value fg" x="626.4" y="621">2.68&#215;</text>
+  <text class="fg" x="168" y="649" text-anchor="end">zstd -1</text>
+  <rect class="zstd" x="180" y="636" width="402.1" height="19" rx="3"><title>zstd -1: 2.46x, 40.7 MB</title></rect>
+  <text class="value fg" x="590.1" y="650">2.46&#215;</text>
+  <text class="fg" x="168" y="678" text-anchor="end">LZ4 -9 (HC)</text>
+  <rect class="lz4" x="180" y="665" width="386.9" height="19" rx="3"><title>LZ4 -9 (HC): 2.37x, 42.3 MB</title></rect>
+  <text class="value fg" x="574.9" y="679">2.37&#215;</text>
+  <text class="fg" x="168" y="707" text-anchor="end">LZ4 -1</text>
+  <rect class="lz4" x="180" y="694" width="285.5" height="19" rx="3"><title>LZ4 -1: 1.75x, 57.3 MB</title></rect>
+  <text class="value fg" x="473.5" y="708">1.75&#215;</text>
+</svg>

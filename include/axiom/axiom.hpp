@@ -296,6 +296,10 @@ struct CompressionOptions {
     // This flag lets the parallel block codec reduce an oversized preset block
     // size so there is enough independent work to keep the selected workers busy.
     bool auto_block_size_for_threads = true;
+    // Maximum-ratio auto geometry may align variable codec blocks with validated
+    // container/member boundaries. Explicit block-size callers keep uniform
+    // blocks, and the decoder already accepts arbitrary per-block lengths.
+    bool content_adaptive_blocks = false;
     // Lazy matching: before committing a normal match at p, check p+1; if a strictly
     // longer match starts there, emit a literal and take the better match next. Lets
     // a shallow chain reach close to a deep chain's ratio. (Rep matches stay eager.)
@@ -387,6 +391,7 @@ inline void apply_compression_level(CompressionOptions& options, int level) {
     options.optimal_chain_depth = 32;
     options.max_parser_candidates = 8;
     options.auto_block_size_for_threads = true;
+    options.content_adaptive_blocks = false;
 
     switch (level) {
         case 1:
@@ -463,6 +468,7 @@ inline void apply_compression_level(CompressionOptions& options, int level) {
             options.fast_entropy = false;
             options.enable_optimal_parser = true;
             options.optimal_two_pass = false;
+            options.content_adaptive_blocks = true;
             break;
     }
 }

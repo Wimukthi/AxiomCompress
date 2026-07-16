@@ -214,19 +214,22 @@ The archive header stores:
 
 - Magic and version.
 - Codec identifier.
-- Version-5/6/7 transform-present flags and a bounded transform-range section.
+- Version-5-and-later transform-present flags and a bounded transform-range section.
 - Original size.
 - Payload size.
 - CRC-32 of the uncompressed data.
 
 The current transform layer supports independently reset x86/x64 relative-branch
 conversion, byte-delta ranges, and a 16-bit numeric transform that combines a
-left/2D predictor, signed-residual zigzag, and byte-plane shuffling. PE, PCM WAV,
-and uncompressed BMP signatures provide candidate hints. Direct AXC compression
-also validates POSIX tar headers and entropy-screens individual regular-file
-members for the numeric transform, so tar benchmarks retain file boundaries.
-A fast trial encode enables the resulting ranges only when they beat the
-unfiltered representation. The final AXC CRC always authenticates original bytes.
+left/2D predictor, signed-residual zigzag, and byte-plane shuffling. PE, x86 ELF,
+PCM WAV, and uncompressed BMP signatures provide candidate hints. Direct AXC
+compression also validates POSIX tar headers, inspects x86 ELF payloads inside
+one nested tar, and entropy-screens both raw inputs and individual tar members
+for the numeric transform. A fast trial encode enables the resulting ranges only
+when they beat the unfiltered representation. AXAR supplies per-file ranges and
+disables block-wide auto-detection when none of its files qualify, preventing a
+predictor from crossing solid-block file boundaries. The final AXC CRC always
+authenticates original bytes.
 
 AXC version 6 can represent LZ77 output as separate sequence-code, packed-extra,
 and literal-context streams. Recent-distance codes avoid repeatedly storing common
@@ -241,6 +244,33 @@ distance slots, and footer bits retain the best legacy split representation,
 while literals use the v6 previous-byte lanes and optional rep0-XOR residual.
 This avoids making stronger literal modeling contingent on the sequence code
 layout; each block still selects the smallest complete candidate.
+
+AXC version 8 adds static slot-context coding for distance footers. Short
+footers are coded completely; longer distances keep their high bits packed and
+code the low four alignment bits with four-lane rANS tables selected by the
+distance slot. The decoder derives the context sequence from the already
+decoded slots, so it remains bounded and search-free. Both flat-literal and
+context-split block forms compete against their v7 raw-footer equivalents, and
+the v8 representation is emitted only when the complete payload is strictly
+smaller. Version 8 also adds a static match-byte literal mode: the first literal
+after a match is XORed with its rep0 byte and placed in one of eight lanes chosen
+by that byte, while ordinary literals remain in the previous-byte lanes. Its
+complete sixteen-lane suffix competes with the prior eight-lane representation.
+A full-previous-byte mode can instead map each of the 256 preceding-byte values
+to at most 16 encoder-chosen clusters, with one static literal stream per
+cluster. Decoding is one map lookup and one bounded stream read per literal; it
+does not learn or search. The complete cluster map, stream tables, payloads, and
+framing must be strictly smaller than every prior literal suffix before this
+mode is emitted. Earlier version-8 representations and versions 4 through 7
+remain decodable.
+
+Level-9 automatic block planning recognizes validated POSIX ustar members and
+uses their boundaries as static match-window and entropy-table reset points.
+Large members are split below the normal thread-derived block budget and small
+adjacent members are coalesced, preserving parallel throughput. The parallel
+block table has always carried each block's original length, so these variable
+boundaries require no new decoder representation; explicit block sizes remain
+uniform.
 
 Fast-entropy presets share one token-analysis pass between the legacy and v6
 layouts. A sampled conditional-entropy estimate skips the legacy entropy bake-off

@@ -421,50 +421,73 @@ transforms, just as normal `axiomc c --level N` invocations do.
 
 ![Silesia compression ratio versus compression throughput](docs/images/silesia-speed-ratio.svg)
 
-The SVGs are generated directly from the table below with `python tools/generate_readme_charts.py`.
-The exact verified measurements are retained in
-[`bench/results/silesia-0.3.0.0.csv`](bench/results/silesia-0.3.0.0.csv).
+The SVGs are generated from the versioned CSV snapshots with
+`python tools/generate_readme_charts.py`. The exact verified measurements are
+retained in
+[`bench/results/silesia-0.4.0.0.csv`](bench/results/silesia-0.4.0.0.csv).
 
 | Codec / level | Compressed | Ratio | Compress | Decompress |
 |---|---:|---:|---:|---:|
-| LZ4 -1 | 100.9 MB | 2.10x | 0.09 s | 0.09 s |
-| LZ4 -9 (HC) | 78.0 MB | 2.72x | 0.38 s | 0.09 s |
-| zstd -1 | 73.3 MB | 2.89x | 0.06 s | 0.15 s |
-| zstd -3 | 66.2 MB | 3.20x | 0.12 s | 0.16 s |
-| **Axiom -1** | 65.6 MB | 3.23x | 0.75 s | 0.22 s |
-| gzip Deflate -9 | 64.7 MB | 3.28x | 89.26 s | 0.81 s |
-| **Axiom -2** | 59.4 MB | 3.57x | 1.48 s | 0.22 s |
-| zstd -9 | 59.2 MB | 3.58x | 0.53 s | 0.16 s |
-| **Axiom -3** | 58.7 MB | 3.61x | 1.67 s | 0.22 s |
-| **Axiom -4** | 57.5 MB | 3.69x | 2.19 s | 0.23 s |
-| **Axiom -5** (default) | 57.1 MB | 3.71x | 2.64 s | 0.22 s |
-| **Axiom -6** | 56.9 MB | 3.73x | 3.42 s | 0.23 s |
-| **Axiom -7** | 55.5 MB | 3.82x | 5.20 s | 0.23 s |
-| WinRAR -m3 | 54.2 MB | 3.91x | 2.18 s | 0.51 s |
-| bzip2 -9 | 54.2 MB | 3.91x | 7.39 s | 2.27 s |
-| WinRAR -m5 128M | 53.2 MB | 3.99x | 3.57 s | 0.50 s |
-| **Axiom -8** | 53.0 MB | 4.00x | 15.18 s | 0.23 s |
-| zstd -19 | 52.8 MB | 4.01x | 16.64 s | 0.17 s |
-| **Axiom -9** | 52.5 MB | 4.03x | 20.56 s | 0.25 s |
-| zstd -22 --ultra | 52.3 MB | 4.05x | 94.89 s | 0.20 s |
-| LZMA2 -mx5 | 49.6 MB | 4.27x | 17.75 s | 0.81 s |
-| LZMA2 -mx9 | 48.7 MB | 4.35x | 40.27 s | 1.26 s |
+| LZ4 -1 | 100.9 MB | 2.10x | 0.10 s | 0.10 s |
+| LZ4 -9 (HC) | 78.0 MB | 2.72x | 0.42 s | 0.10 s |
+| zstd -1 | 73.3 MB | 2.89x | 0.08 s | 0.15 s |
+| zstd -3 | 66.2 MB | 3.20x | 0.13 s | 0.17 s |
+| **Axiom -1** | 64.9 MB | 3.27x | 0.81 s | 0.23 s |
+| gzip Deflate -9 | 64.7 MB | 3.28x | 91.35 s | 0.81 s |
+| zstd -9 | 59.2 MB | 3.58x | 0.57 s | 0.16 s |
+| **Axiom -2** | 59.1 MB | 3.59x | 1.80 s | 0.24 s |
+| **Axiom -3** | 58.4 MB | 3.63x | 2.06 s | 0.24 s |
+| **Axiom -4** | 56.8 MB | 3.73x | 2.73 s | 0.24 s |
+| **Axiom -5** (default) | 56.5 MB | 3.75x | 3.17 s | 0.24 s |
+| **Axiom -6** | 56.2 MB | 3.77x | 4.24 s | 0.24 s |
+| **Axiom -7** | 54.9 MB | 3.86x | 6.31 s | 0.24 s |
+| WinRAR -m3 | 54.2 MB | 3.91x | 2.20 s | 0.51 s |
+| bzip2 -9 | 54.2 MB | 3.91x | 7.50 s | 2.17 s |
+| WinRAR -m5 128M | 53.2 MB | 3.99x | 3.54 s | 0.50 s |
+| zstd -19 | 52.8 MB | 4.01x | 20.38 s | 0.18 s |
+| **Axiom -8** | 52.4 MB | 4.04x | 14.38 s | 0.26 s |
+| zstd -22 --ultra | 52.3 MB | 4.05x | 98.93 s | 0.19 s |
+| **Axiom -9** | 51.4 MB | 4.12x | 21.31 s | 0.24 s |
+| LZMA2 -mx5 | 49.6 MB | 4.27x | 19.84 s | 0.81 s |
+| LZMA2 -mx9 | 48.7 MB | 4.35x | 40.03 s | 1.26 s |
 
 Reading the table: Axiom's fast presets trade zstd's throughput for a smaller
 result, while levels 2–7 cover the range between zstd -3 and WinRAR normal.
-Axiom -9 is 0.6% smaller than zstd -19 while encoding about 24% more slowly;
-zstd -22 is only 0.5% smaller than Axiom -9 but takes 4.6 times as long to
-encode. WinRAR best is 1.2% larger than Axiom -9 and encodes 5.8 times faster,
-while Axiom decodes about twice as fast. LZMA2 -mx9 is 7.2% smaller than Axiom
--9, but Axiom encodes about twice as fast and decodes about five times as fast.
+Axiom -9 is 2.8% smaller than zstd -19 at similar compression time, and 1.7%
+smaller than zstd -22 while encoding 4.6 times faster. WinRAR best is 3.3%
+larger and encodes 6.0 times faster, while Axiom decodes 2.1 times faster.
+LZMA2 -mx9 is 5.5% smaller than Axiom -9, but Axiom encodes 1.9 times faster
+and decodes 5.3 times faster.
 These cross-codec tradeoffs define the active ratio, speed, and decoder-complexity
 work rather than treating any single comparison as the target.
 
-On `enwik8` (100 MB English Wikipedia text, default `--threads 0`):
+The same 22-profile protocol was also run on `enwik8` (100 MB English Wikipedia
+text, default `--threads 0`):
 
-| Level | 1 | 3 | 5 default | 6 | 7 | 8 | 9 |
-|---|---|---|---|---|---|---|---|
-| Ratio | 2.68x | 3.03x | 3.11x | 3.13x | 3.23x | 3.43x | 3.46x |
+![enwik8 compression ratio by codec](docs/images/enwik8-compression-ratio.svg)
+
+![enwik8 compression ratio versus compression throughput](docs/images/enwik8-speed-ratio.svg)
+
+Exact measurements are retained in
+[`bench/results/enwik8-0.4.0.0.csv`](bench/results/enwik8-0.4.0.0.csv).
+
+| Axiom level | Compressed | Ratio | Compress | Decompress |
+|---|---:|---:|---:|---:|
+| 1 | 37.3 MB | 2.68x | 0.35 s | 0.11 s |
+| 2 | 32.8 MB | 3.05x | 0.91 s | 0.10 s |
+| 3 | 32.4 MB | 3.09x | 1.18 s | 0.10 s |
+| 4 | 32.1 MB | 3.12x | 2.04 s | 0.10 s |
+| 5 (default) | 31.8 MB | 3.14x | 2.54 s | 0.10 s |
+| 6 | 31.7 MB | 3.15x | 3.42 s | 0.10 s |
+| 7 | 30.7 MB | 3.25x | 2.96 s | 0.11 s |
+| 8 | 28.7 MB | 3.48x | 6.82 s | 0.10 s |
+| 9 | 28.5 MB | 3.51x | 7.05 s | 0.10 s |
+
+The separate full-window diagnostic reaches 3.57x but only 1.9 MB/s, so it is
+not promoted to a preset; its complete level/window sweep is retained in
+[`bench/results/enwik8-level-window-0.4.0.0.csv`](bench/results/enwik8-level-window-0.4.0.0.csv).
+On enwik8, Axiom -9 encodes 5.8 times faster and
+decodes 6.5 times faster than LZMA2 -mx9, while LZMA2 remains 12.9% smaller.
 
 Throughput depends on CPU, memory bandwidth, storage, corpus shape, and Release
 build settings; re-run `tools\bench_enwik8.ps1` or the method in

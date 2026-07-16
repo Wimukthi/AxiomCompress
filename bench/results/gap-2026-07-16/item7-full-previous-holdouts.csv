@@ -1,0 +1,5 @@
+corpus,input_bytes,previous_bytes,full_previous_bytes,saved_bytes,previous_seconds,full_previous_seconds
+silesia.tar,211948032,51511761,51386561,125200,21.940,22.028
+axiom-source.tar,6615040,1630558,1630139,419,3.369,3.181
+autoruns.tar,3074560,774053,774053,0,1.363,1.404
+arduino-1.0.5.tar,270883328,68567248,68486329,80919,17.676,17.754

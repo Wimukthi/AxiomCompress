@@ -74,13 +74,34 @@ WinRAR profiles use RAR5 normal (`-m3`) and best with a fixed 128 MiB dictionary
 (`-m5 -md128m`). The CSV is rewritten after every verified row so completed
 measurements survive a later external-tool failure.
 
-The published July 2026 snapshot used WinRAR 7.23, 7-Zip 26.02, zstd 1.5.7,
-and LZ4 1.10.0 on a Ryzen 9 5950X. Axiom level 9 measured 4.03x in 20.56 s;
-WinRAR best measured 3.99x in 3.57 s. See the README graphs for the complete
-22-profile ratio/throughput comparison.
+The published 0.4.0.0 snapshot used WinRAR 7.23, 7-Zip 26.02, zstd 1.5.7,
+and LZ4 1.10.0 on a Ryzen 9 5950X. On Silesia, Axiom level 9 measured
+4.12x in 21.31 s; WinRAR best measured 3.99x in 3.54 s. On enwik8, Axiom
+level 9 measured 3.51x in 7.05 s and WinRAR best measured 3.71x in 2.35 s.
+See the README graphs for both complete 22-profile ratio/throughput
+comparisons.
+
 The exact published rows are versioned in
-`bench/results/silesia-0.3.0.0.csv`; keep this artifact aligned with the README
-table whenever the snapshot is refreshed.
+`bench/results/silesia-0.4.0.0.csv` and
+`bench/results/enwik8-0.4.0.0.csv`. Keep these artifacts aligned with the
+README tables whenever the snapshot is refreshed. The chart generator reads
+the verified CSVs directly and rejects missing, unknown, or unverified rows:
+
+```powershell
+python .\tools\generate_readme_charts.py
+```
+
+The dedicated `tools\bench_enwik8.ps1` sweep additionally validates every
+Axiom level and binary-tree windows from 1 MiB through the full 128 MiB input.
+The 0.4.0.0 full-window diagnostic reached 3.57x at 1.9 MB/s; the normal
+level-9 preset reached 3.51x at 13.5 MB/s, so the full-window row remains a
+diagnostic rather than a default. Exact diagnostic rows are retained in
+`bench/results/enwik8-level-window-0.4.0.0.csv`.
+
+For the ongoing LZMA2 ratio-gap work, see
+[`GAP_ANALYSIS_LZMA2.md`](GAP_ANALYSIS_LZMA2.md): per-member deltas, stream
+accounting (`bench/axc_inspect.py`), the measured plan, and how to re-run the
+sweep (`bench/gap_analysis.py`).
 
 If you only need a smoke test, let the script create deterministic sample files:
 

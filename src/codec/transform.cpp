@@ -67,6 +67,23 @@ TransformHint detect_pe(std::span<const std::uint8_t> prefix) {
     return {};
 }
 
+TransformHint detect_elf(std::span<const std::uint8_t> prefix) {
+    if (!matches(prefix, 0, {0x7f, 'E', 'L', 'F'}) ||
+        !has_bytes(prefix, 0, 20) ||
+        (prefix[4] != 1 && prefix[4] != 2) || prefix[6] != 1) {
+        return {};
+    }
+    // Both supported x86 ELF machines are little-endian architectures.
+    if (prefix[5] != 1) {
+        return {};
+    }
+    const auto machine = read_le16(prefix, 18);
+    if (machine == 3 || machine == 62) {
+        return {CompressionTransform::x86_branch, 0};
+    }
+    return {};
+}
+
 TransformHint detect_wave(std::span<const std::uint8_t> prefix) {
     if (!matches(prefix, 0, {'R', 'I', 'F', 'F'}) ||
         !matches(prefix, 8, {'W', 'A', 'V', 'E'})) {
@@ -349,10 +366,50 @@ TransformHint detect_transform_hint(std::span<const std::uint8_t> prefix) {
     if (const auto pe = detect_pe(prefix); pe.transform != CompressionTransform::none) {
         return pe;
     }
+    if (const auto elf = detect_elf(prefix);
+        elf.transform != CompressionTransform::none) {
+        return elf;
+    }
     if (const auto wave = detect_wave(prefix); wave.transform != CompressionTransform::none) {
         return wave;
     }
     return detect_bmp(prefix);
+}
+
+std::vector<TarMemberSpan> detect_tar_members(
+    std::span<const std::uint8_t> input) {
+    std::vector<TarMemberSpan> members;
+    std::size_t cursor = 0;
+    while (cursor + kTarBlockSize <= input.size()) {
+        const auto header = input.subspan(cursor, kTarBlockSize);
+        if (std::all_of(header.begin(), header.end(), [](std::uint8_t byte) {
+                return byte == 0;
+            })) {
+            break;
+        }
+        if (!valid_tar_header(header)) {
+            return {};
+        }
+        const auto encoded_size = parse_tar_octal(header.subspan(124, 12));
+        if (!encoded_size || *encoded_size > std::numeric_limits<std::size_t>::max()) {
+            return {};
+        }
+        const auto member_size = static_cast<std::size_t>(*encoded_size);
+        const auto content_offset = cursor + kTarBlockSize;
+        if (member_size > input.size() - content_offset) {
+            return {};
+        }
+        const auto padded_size = (member_size + kTarBlockSize - 1) &
+                                 ~(kTarBlockSize - 1);
+        if (padded_size > input.size() - content_offset) {
+            return {};
+        }
+        const auto end_offset = content_offset + padded_size;
+        members.push_back({cursor, content_offset, member_size, end_offset,
+                           header[156]});
+        cursor = end_offset;
+    }
+    return members;
 }
 
 std::vector<CompressionTransformRange> detect_transform_ranges(
@@ -362,61 +419,54 @@ std::vector<CompressionTransformRange> detect_transform_ranges(
         return {{hint.transform, 0, static_cast<std::uint64_t>(input.size()), 0,
                  hint.parameter}};
     }
-
+    const auto members = detect_tar_members(input);
     std::vector<CompressionTransformRange> tar_ranges;
-    std::size_t cursor = 0;
-    bool saw_tar_member = false;
-    while (cursor + kTarBlockSize <= input.size()) {
-        const auto header = input.subspan(cursor, kTarBlockSize);
-        if (std::all_of(header.begin(), header.end(), [](std::uint8_t byte) {
-                return byte == 0;
-            })) {
-            break;
-        }
-        if (!valid_tar_header(header)) {
-            tar_ranges.clear();
-            saw_tar_member = false;
-            break;
-        }
-        const auto encoded_size = parse_tar_octal(header.subspan(124, 12));
-        if (!encoded_size || *encoded_size > std::numeric_limits<std::size_t>::max()) {
-            tar_ranges.clear();
-            saw_tar_member = false;
-            break;
-        }
-        const auto member_size = static_cast<std::size_t>(*encoded_size);
-        const auto content_offset = cursor + kTarBlockSize;
-        if (member_size > input.size() - content_offset) {
-            tar_ranges.clear();
-            saw_tar_member = false;
-            break;
-        }
-        saw_tar_member = true;
-        const auto type = header[156];
-        if ((type == 0 || type == '0') && member_size >= kMinTransformSize) {
-            const auto member = input.subspan(content_offset, member_size);
+    for (const auto& span : members) {
+        if ((span.type == 0 || span.type == '0') &&
+            span.content_size >= kMinTransformSize) {
+            const auto member = input.subspan(span.content_offset, span.content_size);
             auto hint = detect_transform_hint(member);
             if (hint.transform == CompressionTransform::none) {
                 hint = detect_word16_predictor(member);
             }
             if (hint.transform != CompressionTransform::none) {
                 tar_ranges.push_back({hint.transform,
-                                      static_cast<std::uint64_t>(content_offset),
-                                      static_cast<std::uint64_t>(member_size), 0,
+                                      static_cast<std::uint64_t>(span.content_offset),
+                                      static_cast<std::uint64_t>(span.content_size), 0,
                                       hint.parameter});
+                continue;
+            }
+
+            // Some benchmark and source-distribution members are tars themselves.
+            // Descend exactly one level and reuse the existing static x86 filter for
+            // validated ELF payloads; decoder behavior and metadata stay unchanged.
+            for (const auto& nested_span : detect_tar_members(member)) {
+                if ((nested_span.type != 0 && nested_span.type != '0') ||
+                    nested_span.content_size < kMinTransformSize) {
+                    continue;
+                }
+                const auto nested_member = member.subspan(
+                    nested_span.content_offset, nested_span.content_size);
+                const auto nested_hint = detect_transform_hint(nested_member);
+                if (nested_hint.transform != CompressionTransform::x86_branch) {
+                    continue;
+                }
+                tar_ranges.push_back({
+                    nested_hint.transform,
+                    static_cast<std::uint64_t>(span.content_offset) +
+                        static_cast<std::uint64_t>(nested_span.content_offset),
+                    static_cast<std::uint64_t>(nested_span.content_size), 0,
+                    nested_hint.parameter});
             }
         }
-        const auto padded_size = (member_size + kTarBlockSize - 1) &
-                                 ~(kTarBlockSize - 1);
-        if (padded_size > input.size() - content_offset) {
-            tar_ranges.clear();
-            saw_tar_member = false;
-            break;
-        }
-        cursor = content_offset + padded_size;
     }
-    if (saw_tar_member) {
+    if (!members.empty()) {
         return tar_ranges;
+    }
+    if (const auto hint = detect_word16_predictor(input);
+        hint.transform != CompressionTransform::none) {
+        return {{hint.transform, 0, static_cast<std::uint64_t>(input.size()), 0,
+                 hint.parameter}};
     }
     return {};
 }
@@ -531,7 +581,15 @@ std::vector<CompressionTransformRange> deserialize_transform_ranges(
     std::span<const std::uint8_t> metadata, std::uint64_t original_size) {
     std::size_t cursor = 0;
     const auto count = read_varuint(metadata, cursor);
+    if (original_size > std::numeric_limits<std::size_t>::max()) {
+        throw FormatError("transform output size exceeds platform limit");
+    }
+    // Every serialized range needs two fixed bytes and three one-byte varints.
+    // Reject an impossible count before reserve() so corrupt metadata cannot turn
+    // an otherwise tiny archive into a multi-gigabyte allocation request.
+    constexpr std::size_t kMinSerializedRangeSize = 5;
     if (count > (original_size / kMinTransformSize) + 1 ||
+        count > (metadata.size() - cursor) / kMinSerializedRangeSize ||
         count > std::numeric_limits<std::size_t>::max()) {
         throw FormatError("implausible transform range count");
     }
@@ -548,9 +606,6 @@ std::vector<CompressionTransformRange> deserialize_transform_ranges(
         ranges.push_back(range);
     }
     if (cursor != metadata.size()) throw FormatError("trailing transform metadata");
-    if (original_size > std::numeric_limits<std::size_t>::max()) {
-        throw FormatError("transform output size exceeds platform limit");
-    }
     return normalize_transform_ranges(ranges, static_cast<std::size_t>(original_size));
 }
 

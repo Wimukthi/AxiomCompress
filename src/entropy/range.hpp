@@ -28,6 +28,21 @@ std::optional<ByteVector> encode_rans(
 ByteVector decode_rans(std::span<const std::uint8_t> encoded,
                        std::size_t max_output_size);
 
+// Static contextual rANS for cases where the decoder already knows one small
+// context id per symbol (for example, an LZ distance slot). Only the used
+// context tables are transmitted; decoding remains a four-lane table lookup.
+std::optional<ByteVector> encode_rans_contextual(
+    std::span<const std::uint8_t> input,
+    std::span<const std::uint8_t> contexts,
+    std::size_t context_count,
+    std::size_t symbol_count);
+
+ByteVector decode_rans_contextual(
+    std::span<const std::uint8_t> encoded,
+    std::span<const std::uint8_t> contexts,
+    std::size_t context_count,
+    std::size_t symbol_count);
+
 // Static order-1 rANS: previous-byte contexts are clustered into a small set
 // of transmitted frequency tables (plus a 256-entry context map), keeping the
 // interleaved table-lookup decode of the order-0 coder while capturing most of

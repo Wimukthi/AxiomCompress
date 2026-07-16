@@ -662,6 +662,208 @@ ByteVector decode_rans(std::span<const std::uint8_t> encoded, std::size_t max_ou
     return output;
 }
 
+std::optional<ByteVector> encode_rans_contextual(
+    std::span<const std::uint8_t> input,
+    std::span<const std::uint8_t> contexts,
+    std::size_t context_count,
+    std::size_t symbol_count) {
+    if (input.empty() || input.size() != contexts.size() || context_count == 0 ||
+        context_count > kSymbolCount || symbol_count == 0 ||
+        symbol_count > kSymbolCount) {
+        return std::nullopt;
+    }
+
+    constexpr std::uint32_t kContextTotalBits = 12;
+    constexpr std::uint32_t kContextTotal = 1u << kContextTotalBits;
+    using Counts = std::array<std::uint64_t, kSymbolCount>;
+    using Frequencies = std::array<std::uint32_t, kSymbolCount>;
+    using Cumulative = std::array<std::uint32_t, kSymbolCount + 1>;
+    std::vector<Counts> counts(context_count);
+    std::vector<std::uint64_t> context_totals(context_count);
+    for (std::size_t i = 0; i < input.size(); ++i) {
+        const auto context = static_cast<std::size_t>(contexts[i]);
+        const auto symbol = static_cast<std::size_t>(input[i]);
+        if (context >= context_count || symbol >= symbol_count) {
+            return std::nullopt;
+        }
+        ++counts[context][symbol];
+        ++context_totals[context];
+    }
+
+    std::vector<Frequencies> frequencies(context_count);
+    std::vector<Cumulative> cumulative(context_count);
+    std::vector<std::array<RansEncoderSymbol, kSymbolCount>> encoder_symbols(
+        context_count);
+    std::size_t used_contexts = 0;
+    for (std::size_t context = 0; context < context_count; ++context) {
+        if (context_totals[context] == 0) {
+            continue;
+        }
+        ++used_contexts;
+        frequencies[context] =
+            rans_normalize(counts[context], context_totals[context], kContextTotal);
+        for (std::size_t symbol = 0; symbol < kSymbolCount; ++symbol) {
+            cumulative[context][symbol + 1] =
+                cumulative[context][symbol] + frequencies[context][symbol];
+            if (frequencies[context][symbol] != 0) {
+                encoder_symbols[context][symbol] = make_rans_encoder_symbol(
+                    cumulative[context][symbol], frequencies[context][symbol],
+                    kContextTotalBits);
+            }
+        }
+    }
+
+    ByteVector output;
+    codec::write_varuint(output, input.size());
+    codec::write_varuint(output, used_contexts);
+    for (std::size_t context = 0; context < context_count; ++context) {
+        if (context_totals[context] == 0) {
+            continue;
+        }
+        output.push_back(static_cast<std::uint8_t>(context));
+        rans_write_table(output, frequencies[context]);
+    }
+
+    static thread_local std::vector<std::uint8_t> scratch;
+    scratch.resize(input.size() * 2 + 64 + kRansLanes * 4);
+    std::size_t head = scratch.size();
+    std::array<std::uint32_t, kRansLanes> states{};
+    states.fill(kRansLow);
+
+    for (std::size_t i = input.size(); i-- > 0;) {
+        const auto context = static_cast<std::size_t>(contexts[i]);
+        const auto symbol = static_cast<std::size_t>(input[i]);
+        const auto& encoder_symbol = encoder_symbols[context][symbol];
+        auto& state = states[i & (kRansLanes - 1)];
+        while (state >= encoder_symbol.x_max) {
+            scratch[--head] = static_cast<std::uint8_t>(state & 0xFFu);
+            state >>= 8;
+        }
+        state = rans_encode_advance(state, encoder_symbol);
+    }
+
+    head -= kRansLanes * 4;
+    for (std::size_t lane = 0; lane < kRansLanes; ++lane) {
+        write_u32_le(scratch.data() + head + lane * 4, states[lane]);
+    }
+    output.insert(output.end(), scratch.begin() + static_cast<std::ptrdiff_t>(head),
+                  scratch.end());
+    return output;
+}
+
+ByteVector decode_rans_contextual(
+    std::span<const std::uint8_t> encoded,
+    std::span<const std::uint8_t> contexts,
+    std::size_t context_count,
+    std::size_t symbol_count) {
+    constexpr std::uint32_t kContextTotalBits = 12;
+    constexpr std::uint32_t kContextTotal = 1u << kContextTotalBits;
+    if (context_count == 0 || context_count > kSymbolCount || symbol_count == 0 ||
+        symbol_count > kSymbolCount) {
+        throw FormatError("invalid contextual rANS dimensions");
+    }
+
+    std::size_t cursor = 0;
+    const auto decoded_size =
+        static_cast<std::size_t>(codec::read_varuint(encoded, cursor));
+    if (decoded_size != contexts.size()) {
+        throw FormatError("contextual rANS context count mismatch");
+    }
+    if (decoded_size == 0) {
+        if (cursor != encoded.size()) {
+            throw FormatError("trailing bytes after contextual rANS stream");
+        }
+        return {};
+    }
+
+    const auto used_context_count =
+        static_cast<std::size_t>(codec::read_varuint(encoded, cursor));
+    if (used_context_count == 0 || used_context_count > context_count) {
+        throw FormatError("invalid contextual rANS table count");
+    }
+
+    using Frequencies = std::array<std::uint32_t, kSymbolCount>;
+    using Cumulative = std::array<std::uint32_t, kSymbolCount + 1>;
+    std::vector<Frequencies> frequencies(context_count);
+    std::vector<Cumulative> cumulative(context_count);
+    std::vector<bool> table_present(context_count);
+    for (std::size_t table = 0; table < used_context_count; ++table) {
+        if (cursor >= encoded.size()) {
+            throw FormatError("truncated contextual rANS context id");
+        }
+        const auto context = static_cast<std::size_t>(encoded[cursor++]);
+        if (context >= context_count || table_present[context]) {
+            throw FormatError("invalid contextual rANS context id");
+        }
+        frequencies[context] = rans_read_table(encoded, cursor, kContextTotal);
+        for (std::size_t symbol = symbol_count; symbol < kSymbolCount; ++symbol) {
+            if (frequencies[context][symbol] != 0) {
+                throw FormatError("contextual rANS symbol exceeds alphabet");
+            }
+        }
+        for (std::size_t symbol = 0; symbol < kSymbolCount; ++symbol) {
+            cumulative[context][symbol + 1] =
+                cumulative[context][symbol] + frequencies[context][symbol];
+        }
+        table_present[context] = true;
+    }
+
+    static thread_local std::vector<std::uint8_t> slot_to_symbol;
+    slot_to_symbol.resize(context_count * kContextTotal);
+    for (std::size_t context = 0; context < context_count; ++context) {
+        if (!table_present[context]) {
+            continue;
+        }
+        const auto base = context * kContextTotal;
+        for (std::size_t symbol = 0; symbol < symbol_count; ++symbol) {
+            for (std::uint32_t slot = cumulative[context][symbol];
+                 slot < cumulative[context][symbol + 1]; ++slot) {
+                slot_to_symbol[base + slot] = static_cast<std::uint8_t>(symbol);
+            }
+        }
+    }
+
+    std::array<std::uint32_t, kRansLanes> states{};
+    for (auto& state : states) {
+        state = read_u32_le(encoded, cursor);
+    }
+
+    ByteVector output(decoded_size);
+    auto decode_one = [&](std::size_t lane, std::size_t out_index) {
+        const auto context = static_cast<std::size_t>(contexts[out_index]);
+        if (context >= context_count || !table_present[context]) {
+            throw FormatError("contextual rANS stream uses a missing table");
+        }
+        auto& state = states[lane];
+        const auto slot = state & (kContextTotal - 1);
+        const auto symbol = slot_to_symbol[context * kContextTotal + slot];
+        output[out_index] = symbol;
+        state = frequencies[context][symbol] * (state >> kContextTotalBits) + slot -
+                cumulative[context][symbol];
+        while (state < kRansLow) {
+            if (cursor >= encoded.size()) {
+                throw FormatError("truncated contextual rANS stream");
+            }
+            state = (state << 8) | encoded[cursor++];
+        }
+    };
+
+    std::size_t i = 0;
+    for (; i + kRansLanes <= decoded_size; i += kRansLanes) {
+        decode_one(0, i + 0);
+        decode_one(1, i + 1);
+        decode_one(2, i + 2);
+        decode_one(3, i + 3);
+    }
+    for (; i < decoded_size; ++i) {
+        decode_one(i & (kRansLanes - 1), i);
+    }
+    if (cursor != encoded.size()) {
+        throw FormatError("trailing bytes after contextual rANS stream");
+    }
+    return output;
+}
+
 namespace {
 
 // Static order-1 rANS. The 256 previous-byte contexts are clustered into a

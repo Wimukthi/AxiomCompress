@@ -4,7 +4,7 @@
 # and window detail. Use bench/bench_codecs.py when comparing against external
 # codecs. Every row here is verified by decompressing and comparing a hash.
 #
-#   tools\bench_enwik8.ps1 [-Axiomc <path>] [-Scratch <dir>] [-Quick]
+#   tools\bench_enwik8.ps1 [-Axiomc <path>] [-Scratch <dir>] [-OutputCsv <path>] [-Quick]
 #
 # Corpus and scratch live under -Scratch, which defaults to a LOCAL path off any
 # cloud-synced tree: background sync of the repo otherwise contends for cores and
@@ -12,6 +12,7 @@
 param(
     [string]$Axiomc = "",
     [string]$Scratch = (Join-Path $env:LOCALAPPDATA "axiom-bench"),
+    [string]$OutputCsv = "",
     [switch]$Quick
 )
 
@@ -77,6 +78,15 @@ Axiom-Row "bt single w=8M"           @("--bt","--block-size","128M","--window","
 Axiom-Row "bt single w=32M"          @("--bt","--block-size","128M","--window","32M")
 if (-not $Quick) {
     Axiom-Row "bt single w=128M (full)" @("--bt","--block-size","128M","--window","128M")
+}
+
+if ($OutputCsv) {
+    $outputParent = Split-Path -Parent $OutputCsv
+    if ($outputParent) {
+        New-Item -ItemType Directory -Force $outputParent | Out-Null
+    }
+    $rows | Export-Csv -LiteralPath $OutputCsv -NoTypeInformation -Encoding utf8
+    Write-Host "`nVerified CSV: $OutputCsv"
 }
 
 Write-Host "`n--- markdown ---"

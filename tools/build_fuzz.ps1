@@ -35,10 +35,12 @@ $libSources = @(
     "src\archive\container_formats.cpp",
     "src\archive\container_zip.cpp",
     "src\archive\system_provider.cpp",
+    "src\archive\zip_split_backend.cpp",
     "src\codec\block.cpp",
     "src\codec\fast_lz.cpp",
     "src\codec\lz77.cpp",
     "src\codec\lz77_split.cpp",
+    "src\codec\transform.cpp",
     "src\core\archive.cpp",
     "src\core\checksum.cpp",
     "src\core\checksum_clmul.cpp",
@@ -55,6 +57,16 @@ $libSources = @(
     "src\third_party\miniz\miniz_tdef.c",
     "src\third_party\miniz\miniz_tinfl.c",
     "src\third_party\miniz\miniz_zip.c",
+    "src\third_party\minizip-ng\mz_crypt.c",
+    "src\third_party\minizip-ng\mz_os.c",
+    "src\third_party\minizip-ng\mz_os_win32.c",
+    "src\third_party\minizip-ng\mz_strm.c",
+    "src\third_party\minizip-ng\mz_strm_buf.c",
+    "src\third_party\minizip-ng\mz_strm_mem.c",
+    "src\third_party\minizip-ng\mz_strm_os_win32.c",
+    "src\third_party\minizip-ng\mz_strm_split.c",
+    "src\third_party\minizip-ng\mz_zip.c",
+    "src\third_party\minizip-ng\mz_zip_rw.c",
     "src\third_party\monocypher\monocypher.c"
 ) | ForEach-Object { "`"$Root\$_`"" }
 
@@ -66,7 +78,8 @@ $targets = if ($Target -eq "all") { @("fuzz_decompress", "fuzz_archive") } else 
 foreach ($t in $targets) {
     $objDir = Join-Path $outDir "$t-obj"
     New-Item -ItemType Directory -Force -Path $objDir | Out-Null
-    $flags = "/nologo /std:c++20 /O1 /Zi /EHsc /MD /fsanitize=fuzzer /fsanitize=address $blake3Defs"
+    $pdb = Join-Path $objDir "$t.pdb"
+    $flags = "/nologo /std:c++20 /O1 /Zi /FS /Fd:`"$pdb`" /EHsc /MD /fsanitize=fuzzer /fsanitize=address /DMZ_ZIP_NO_CRYPTO /D_CRT_SECURE_NO_DEPRECATE /D_CRT_NONSTDC_NO_DEPRECATE $blake3Defs"
     $includes = "/I `"$Root\include`" /I `"$Root\src`""
     $inputs = ($libSources -join ' ') + " `"$Root\fuzz\$t.cpp`""
     $cl = "cl $flags $includes $inputs /Fe:`"$outDir\$t.exe`" /Fo:`"$objDir\\`""

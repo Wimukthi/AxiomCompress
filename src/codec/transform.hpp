@@ -12,11 +12,25 @@ struct TransformHint {
     std::uint8_t parameter = 0;
 };
 
+struct TarMemberSpan {
+    std::size_t header_offset = 0;
+    std::size_t content_offset = 0;
+    std::size_t content_size = 0;
+    std::size_t end_offset = 0;
+    std::uint8_t type = 0;
+};
+
 TransformHint detect_transform_hint(std::span<const std::uint8_t> prefix);
+
+// Returns every validated member of a POSIX ustar stream. An empty result means
+// either non-tar input or an invalid/truncated stream.
+std::vector<TarMemberSpan> detect_tar_members(
+    std::span<const std::uint8_t> input);
 
 // Detects whole-input filters and, for a valid POSIX tar stream, filters on
 // individual regular-file payloads. The latter preserves tar headers while
-// allowing scientific/image members to use their native numeric predictor.
+// allowing scientific/image members to use their native numeric predictor and
+// x86 ELF payloads inside one nested tar to use the branch transform.
 std::vector<CompressionTransformRange> detect_transform_ranges(
     std::span<const std::uint8_t> input);
 

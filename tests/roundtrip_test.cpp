@@ -136,6 +136,102 @@ void expect_slot_split_stream_roundtrip(const std::vector<std::uint8_t>& input) 
 
     const auto restored = axiom::codec::decode_lz77_split_streams_slots(*slots, input.size());
     AXIOM_CHECK(restored == input);
+
+    const auto payloads = axiom::codec::encode_lz77_split_payloads(lz77);
+    if (payloads.contextual_slots) {
+        std::vector<std::uint8_t> contextual_restored(input.size());
+        axiom::codec::decode_lz77_contextual_slot_streams_into(
+            *payloads.contextual_slots, contextual_restored);
+        AXIOM_CHECK(contextual_restored == input);
+
+        const auto context_split = axiom::codec::encode_lz77_context_split_streams(
+            input, lz77, *payloads.slots, *payloads.contextual_slots);
+        AXIOM_CHECK(context_split.contextual_slots.has_value());
+        std::fill(contextual_restored.begin(), contextual_restored.end(), 0);
+        axiom::codec::decode_lz77_contextual_slot_context_split_streams_into(
+            *context_split.contextual_slots, contextual_restored);
+        AXIOM_CHECK(contextual_restored == input);
+    }
+}
+
+std::size_t skip_test_varuint(std::span<const std::uint8_t> encoded,
+                              std::size_t& cursor) {
+    std::size_t value = 0;
+    unsigned shift = 0;
+    while (cursor < encoded.size() && shift < sizeof(std::size_t) * 8) {
+        const auto byte = encoded[cursor++];
+        value |= static_cast<std::size_t>(byte & 0x7Fu) << shift;
+        if ((byte & 0x80u) == 0) {
+            return value;
+        }
+        shift += 7;
+    }
+    AXIOM_CHECK(false);
+    return 0;
+}
+
+std::size_t split_literal_mode_offset(std::span<const std::uint8_t> encoded) {
+    std::size_t cursor = 0;
+    for (unsigned stream = 0; stream < 5; ++stream) {
+        (void)skip_test_varuint(encoded, cursor);
+        AXIOM_CHECK(cursor < encoded.size());
+        ++cursor;  // Stream codec.
+        const auto payload_size = skip_test_varuint(encoded, cursor);
+        AXIOM_CHECK(payload_size <= encoded.size() - cursor);
+        cursor += payload_size;
+    }
+    AXIOM_CHECK(cursor < encoded.size());
+    return cursor;
+}
+
+void test_full_previous_literal_mode() {
+    // A seeded first-order source has near-uniform bytes globally but only four
+    // likely successors per previous byte. It exercises the encoder-selected
+    // context map without relying on a benchmark corpus fixture.
+    std::mt19937 rng(0xF011CAFEu);
+    std::vector<std::uint8_t> input(1u << 20);
+    std::uint8_t previous = 0x5Au;
+    for (auto& byte : input) {
+        const auto choice = static_cast<std::uint8_t>(rng() & 3u);
+        byte = static_cast<std::uint8_t>(previous * 13u + choice * 61u + 17u);
+        previous = byte;
+    }
+
+    const auto lz77 = axiom::codec::encode_lz77(input, {});
+    const auto legacy = axiom::codec::encode_lz77_split_payloads(lz77);
+    AXIOM_CHECK(legacy.slots.has_value());
+    AXIOM_CHECK(legacy.contextual_slots.has_value());
+    const auto encoded = axiom::codec::encode_lz77_context_split_streams(
+        input, lz77, *legacy.slots, *legacy.contextual_slots);
+    AXIOM_CHECK(encoded.slots.has_value());
+
+    const auto mode_offset = split_literal_mode_offset(*encoded.slots);
+    AXIOM_CHECK((*encoded.slots)[mode_offset] == 3u);
+    std::vector<std::uint8_t> restored(input.size());
+    axiom::codec::decode_lz77_context_split_streams_into(*encoded.slots, restored);
+    AXIOM_CHECK(restored == input);
+
+    auto expect_decode_rejected = [&](const std::vector<std::uint8_t>& payload) {
+        bool threw = false;
+        try {
+            axiom::codec::decode_lz77_context_split_streams_into(payload, restored);
+        } catch (const std::exception&) {
+            threw = true;
+        }
+        AXIOM_CHECK(threw);
+    };
+
+    auto invalid_cluster_count = *encoded.slots;
+    AXIOM_CHECK(mode_offset + 1 < invalid_cluster_count.size());
+    invalid_cluster_count[mode_offset + 1] = 0;
+    expect_decode_rejected(invalid_cluster_count);
+
+    auto invalid_context_map = *encoded.slots;
+    const auto cluster_count = invalid_context_map[mode_offset + 1];
+    AXIOM_CHECK(cluster_count > 0);
+    AXIOM_CHECK(mode_offset + 2 < invalid_context_map.size());
+    invalid_context_map[mode_offset + 2] = cluster_count;
+    expect_decode_rejected(invalid_context_map);
 }
 
 void expect_nested_task_executor() {
@@ -509,6 +605,28 @@ void expect_throws(Fn&& fn) {
     AXIOM_CHECK(threw);
 }
 
+void test_rans_contextual_edges() {
+    std::mt19937 rng(0xA81C0DEu);
+    for (const std::size_t len : {std::size_t{1}, std::size_t{3}, std::size_t{4},
+                                  std::size_t{17}, std::size_t{4097},
+                                  std::size_t{20000}}) {
+        std::vector<std::uint8_t> symbols(len);
+        std::vector<std::uint8_t> contexts(len);
+        for (std::size_t i = 0; i < len; ++i) {
+            contexts[i] = static_cast<std::uint8_t>((i * 13 + rng()) % 64);
+            // Give each slot a distinct skew while exercising the full nibble.
+            symbols[i] = static_cast<std::uint8_t>(
+                ((rng() & 7u) == 0 ? rng() : contexts[i]) & 0x0Fu);
+        }
+        const auto encoded = axiom::entropy::encode_rans_contextual(
+            symbols, contexts, /*context_count=*/64, /*symbol_count=*/16);
+        AXIOM_CHECK(encoded.has_value());
+        AXIOM_CHECK(axiom::entropy::decode_rans_contextual(
+                        *encoded, contexts, /*context_count=*/64,
+                        /*symbol_count=*/16) == symbols);
+    }
+}
+
 void test_sequence_stream_truncation() {
     const auto input = bytes_from_string(
         "sequence stream truncation should never synthesize missing entropy bytes");
@@ -580,6 +698,49 @@ std::vector<std::uint8_t> synthetic_x64_image() {
     return image;
 }
 
+std::vector<std::uint8_t> synthetic_x64_elf() {
+    auto image = synthetic_x64_image();
+    image.resize(128u << 10);
+    std::fill_n(image.begin(), 0x100, std::uint8_t{0});
+    image[0] = 0x7f;
+    image[1] = 'E';
+    image[2] = 'L';
+    image[3] = 'F';
+    image[4] = 2;  // ELFCLASS64
+    image[5] = 1;  // ELFDATA2LSB
+    image[6] = 1;  // EV_CURRENT
+    test_write_le16(image, 18, 62);  // EM_X86_64
+    return image;
+}
+
+std::vector<std::uint8_t> single_file_tar(
+    std::string_view name, std::span<const std::uint8_t> payload) {
+    constexpr std::size_t tar_block = 512;
+    const auto padded_size = (payload.size() + tar_block - 1) & ~(tar_block - 1);
+    std::vector<std::uint8_t> tar(tar_block + padded_size + tar_block * 2, 0);
+    std::copy_n(name.begin(), std::min<std::size_t>(name.size(), 100), tar.begin());
+    auto write_octal = [&](std::size_t offset, std::size_t width,
+                           std::uint64_t value) {
+        std::fill_n(tar.begin() + static_cast<std::ptrdiff_t>(offset), width, '0');
+        tar[offset + width - 1] = 0;
+        for (std::size_t i = offset + width - 1; i-- > offset && value != 0;) {
+            tar[i] = static_cast<std::uint8_t>('0' + (value & 7u));
+            value >>= 3;
+        }
+    };
+    write_octal(124, 12, payload.size());
+    std::fill_n(tar.begin() + 148, 8, ' ');
+    tar[156] = '0';
+    std::copy_n("ustar", 5, tar.begin() + 257);
+    std::uint64_t checksum = 0;
+    for (std::size_t i = 0; i < tar_block; ++i) {
+        checksum += tar[i];
+    }
+    write_octal(148, 8, checksum);
+    std::copy(payload.begin(), payload.end(), tar.begin() + tar_block);
+    return tar;
+}
+
 std::vector<std::uint8_t> synthetic_pcm_wave() {
     constexpr std::size_t frames = 128u << 10;
     std::vector<std::uint8_t> wave(44 + frames * 4, 0);
@@ -609,6 +770,13 @@ void test_reversible_transforms_and_v7() {
     auto source = synthetic_x64_image();
     AXIOM_CHECK(axiom::codec::detect_transform_hint(source).transform ==
                 axiom::CompressionTransform::x86_branch);
+    const auto elf = synthetic_x64_elf();
+    AXIOM_CHECK(axiom::codec::detect_transform_hint(elf).transform ==
+                axiom::CompressionTransform::x86_branch);
+    auto non_x86_elf = elf;
+    test_write_le16(non_x86_elf, 18, 183);  // EM_AARCH64
+    AXIOM_CHECK(axiom::codec::detect_transform_hint(non_x86_elf).transform ==
+                axiom::CompressionTransform::none);
     std::vector<axiom::CompressionTransformRange> ranges{
         {axiom::CompressionTransform::x86_branch, 512,
          static_cast<std::uint64_t>(source.size() - 512), 512, 0},
@@ -618,6 +786,17 @@ void test_reversible_transforms_and_v7() {
     const auto decoded_ranges =
         axiom::codec::deserialize_transform_ranges(metadata, source.size());
     AXIOM_CHECK(decoded_ranges.size() == 1);
+    bool rejected_impossible_count = false;
+    try {
+        // A fuzzed v8 header used this four-byte count with no possible range
+        // records. It must fail as format data before attempting reserve().
+        const std::vector<std::uint8_t> impossible_count{0xff, 0xff, 0xff, 0x47};
+        (void)axiom::codec::deserialize_transform_ranges(
+            impossible_count, std::numeric_limits<std::uint64_t>::max());
+    } catch (const axiom::FormatError&) {
+        rejected_impossible_count = true;
+    }
+    AXIOM_CHECK(rejected_impossible_count);
     auto transformed = axiom::codec::apply_transform_ranges(source, decoded_ranges);
     AXIOM_CHECK(transformed != source);
     axiom::codec::inverse_transform_ranges(transformed, decoded_ranges);
@@ -656,31 +835,18 @@ void test_reversible_transforms_and_v7() {
     AXIOM_CHECK(predicted != numeric);
     axiom::codec::inverse_transform_ranges(predicted, numeric_ranges);
     AXIOM_CHECK(predicted == numeric);
+    const auto raw_numeric_ranges =
+        axiom::codec::detect_transform_ranges(numeric);
+    AXIOM_CHECK(raw_numeric_ranges.size() == 1);
+    AXIOM_CHECK(raw_numeric_ranges[0].transform ==
+                axiom::CompressionTransform::word16_predict);
+    AXIOM_CHECK(raw_numeric_ranges[0].offset == 0);
+    AXIOM_CHECK(raw_numeric_ranges[0].size == numeric.size());
 
     // The direct-stream detector also looks through validated POSIX tar headers
     // so a benchmark tar receives the same per-file filters as an AXAR input.
     constexpr std::size_t tar_block = 512;
-    const auto padded_numeric = (numeric.size() + tar_block - 1) & ~(tar_block - 1);
-    std::vector<std::uint8_t> tar(tar_block + padded_numeric + tar_block * 2, 0);
-    std::copy_n("image.raw", 9, tar.begin());
-    auto write_octal = [&](std::size_t offset, std::size_t width, std::uint64_t value) {
-        std::fill_n(tar.begin() + static_cast<std::ptrdiff_t>(offset), width, '0');
-        tar[offset + width - 1] = 0;
-        for (std::size_t i = offset + width - 1; i-- > offset && value != 0;) {
-            tar[i] = static_cast<std::uint8_t>('0' + (value & 7u));
-            value >>= 3;
-        }
-    };
-    write_octal(124, 12, numeric.size());
-    std::fill_n(tar.begin() + 148, 8, ' ');
-    tar[156] = '0';
-    std::copy_n("ustar", 5, tar.begin() + 257);
-    std::uint64_t tar_checksum = 0;
-    for (std::size_t i = 0; i < tar_block; ++i) {
-        tar_checksum += tar[i];
-    }
-    write_octal(148, 8, tar_checksum);
-    std::copy(numeric.begin(), numeric.end(), tar.begin() + tar_block);
+    const auto tar = single_file_tar("image.raw", numeric);
     const auto tar_ranges = axiom::codec::detect_transform_ranges(tar);
     AXIOM_CHECK(tar_ranges.size() == 1);
     AXIOM_CHECK(tar_ranges[0].transform ==
@@ -688,13 +854,27 @@ void test_reversible_transforms_and_v7() {
     AXIOM_CHECK(tar_ranges[0].offset == tar_block);
     AXIOM_CHECK(tar_ranges[0].size == numeric.size());
 
+    const auto inner_tar = single_file_tar("libsample.so", elf);
+    const auto nested_tar = single_file_tar("mozilla.tar", inner_tar);
+    const auto nested_ranges = axiom::codec::detect_transform_ranges(nested_tar);
+    AXIOM_CHECK(nested_ranges.size() == 1);
+    AXIOM_CHECK(nested_ranges[0].transform ==
+                axiom::CompressionTransform::x86_branch);
+    AXIOM_CHECK(nested_ranges[0].offset == tar_block * 2);
+    AXIOM_CHECK(nested_ranges[0].size == elf.size());
+    auto nested_filtered =
+        axiom::codec::apply_transform_ranges(nested_tar, nested_ranges);
+    AXIOM_CHECK(nested_filtered != nested_tar);
+    axiom::codec::inverse_transform_ranges(nested_filtered, nested_ranges);
+    AXIOM_CHECK(nested_filtered == nested_tar);
+
     axiom::CompressionOptions options;
     options.thread_count = 1;
     options.block_size = 1u << 20;
     const auto filtered = axiom::compress(source, options);
     options.enable_file_filters = false;
     const auto plain = axiom::compress(source, options);
-    AXIOM_CHECK(test_read_le16(filtered, 8) == 7);
+    AXIOM_CHECK(test_read_le16(filtered, 8) == 8);
     AXIOM_CHECK((filtered[11] & 1u) != 0);
     AXIOM_CHECK(test_read_le32(filtered, 32) != 0);
     AXIOM_CHECK(filtered.size() < plain.size());
@@ -752,7 +932,7 @@ void test_reversible_transforms_and_v7() {
     test_write_le16(legacy, 8, 4);
     AXIOM_CHECK(axiom::decompress(legacy) == source);
 
-    // Version 5 has the same extended header as v6/v7. Keep accepting its
+    // Version 5 has the same extended header as v6/v7/v8. Keep accepting its
     // original codec set while reserving newer block codecs for later streams.
     axiom::CompressionOptions store_options;
     store_options.force_store = true;
@@ -3286,6 +3466,7 @@ int main() {
     expect_tree_lz77_roundtrip(binary);
     expect_split_stream_roundtrip(binary);
     expect_slot_split_stream_roundtrip(binary);
+    test_full_previous_literal_mode();
     expect_sequence_stream_roundtrip(binary);
     expect_fast_lz_roundtrip(binary);
 
@@ -3369,6 +3550,7 @@ int main() {
     test_blake3();
     test_reed_solomon();
     test_rans_edges();
+    test_rans_contextual_edges();
     test_archive_roundtrip();
     test_archive_provider_layer();
     test_zip_provider_layer();

@@ -1666,6 +1666,10 @@ void compress_items_into(std::ofstream& out, std::uint64_t& written,
         block_options.thread_count = inner_thread_count;
         block_options.task_executor = task_executor;
         block_options.transform_ranges = std::move(block.transform_ranges);
+        // AXAR classifies filters per source file while reading. An empty list
+        // means no file in this solid block qualified; do not let the core
+        // reinterpret it as permission to detect a transform across file edges.
+        block_options.enable_file_filters = !block_options.transform_ranges.empty();
         auto block_done = std::make_shared<std::atomic<std::uint64_t>>(0);
         block_options.encoded_bytes_progress =
             [&, block_done, path = block.path](std::uint64_t done) {

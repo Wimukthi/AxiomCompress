@@ -15,7 +15,8 @@ ByteVector decode_parallel_blocks(std::span<const std::uint8_t> encoded,
                                   const std::function<void(std::uint64_t)>& decoded_bytes_progress = {},
                                   std::uint32_t* crc32 = nullptr,
                                   bool allow_sequence_codec = true,
-                                  bool allow_context_split_codec = true);
+                                  bool allow_context_split_codec = true,
+                                  bool allow_contextual_footer_codec = true);
 
 std::size_t effective_parallel_block_size(std::size_t input_size,
                                           const CompressionOptions& options);

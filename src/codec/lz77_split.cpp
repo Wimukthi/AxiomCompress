@@ -166,7 +166,8 @@ void write_stream(ByteVector& output,
                   bool try_order1 = false,
                   bool fast = false,
                   bool prefer_rans = false,
-                  const Lz77SplitStreams::Histogram* histogram = nullptr) {
+                  const Lz77SplitStreams::Histogram* histogram = nullptr,
+                  bool screen_order1 = false) {
     write_varuint(output, raw.size());
 
     auto codec = StreamCodec::store;
@@ -232,7 +233,17 @@ void write_stream(ByteVector& output,
     // skip it there. The clustered static-table rANS replaced the adaptive
     // bit-serial coder: within a fraction of a percent on ratio, ~30x faster
     // to decode. It runs after plain rANS so it must strictly beat it.
-    if (try_order1) {
+    bool order1_is_plausible = try_order1;
+    if (order1_is_plausible && screen_order1 && raw.size() >= 4096) {
+        const auto order0 = histogram ? order0_bits_per_byte(*histogram, raw.size())
+                                      : order0_bits_per_byte(raw);
+        // New literal representations can have twice as many lanes. A sampled
+        // gate avoids paying for a full clustered model when its entropy is
+        // clearly behind order-0; the complete representation still has to win
+        // the outer byte-size bake-off.
+        order1_is_plausible = sampled_order1_bits_per_byte(raw) < order0 + 0.10;
+    }
+    if (order1_is_plausible) {
         (void)consider(StreamCodec::rans_order1, entropy::encode_rans_order1(raw));
     }
 
@@ -416,6 +427,9 @@ private:
 constexpr std::size_t kLiteralContextLanes = 8;
 constexpr std::uint8_t kSequenceLiteralRaw = 0;
 constexpr std::uint8_t kSequenceLiteralRepXor = 1;
+constexpr std::uint8_t kSequenceLiteralMatchByte = 2;
+constexpr std::uint8_t kSequenceLiteralFullPrevious = 3;
+constexpr std::size_t kFullPreviousMaxClusters = 16;
 constexpr std::uint8_t kSequenceCodesPlain = 0;
 constexpr std::uint8_t kDirectValueCodes = 16;
 constexpr std::uint8_t kMaximumValueCode = 43;  // direct 0..15, then 2^4..2^31
@@ -507,6 +521,7 @@ struct SequenceLiteralRun {
     std::size_t position = 0;
     std::size_t length = 0;
     std::size_t rep0 = 1;
+    bool has_match_context = false;
 };
 
 struct Lz77SequenceAnalysis {
@@ -518,9 +533,13 @@ struct Lz77SequenceAnalysis {
     BitPacker offset_extra;
     std::array<ByteVector, kLiteralContextLanes> raw_literals;
     std::array<ByteVector, kLiteralContextLanes> residual_literals;
+    std::array<ByteVector, kLiteralContextLanes> match_base_literals;
+    std::array<ByteVector, kLiteralContextLanes> match_literals;
     std::vector<SequenceLiteralRun> literal_runs;
     std::array<Lz77SplitStreams::Histogram, kLiteralContextLanes> raw_histograms{};
     std::array<Lz77SplitStreams::Histogram, kLiteralContextLanes> residual_histograms{};
+    std::array<Lz77SplitStreams::Histogram, kLiteralContextLanes> match_base_histograms{};
+    std::array<Lz77SplitStreams::Histogram, kLiteralContextLanes> match_histograms{};
     std::size_t sequence_count = 0;
     std::size_t trailing_literals = 0;
     bool literals_materialized = false;
@@ -589,9 +608,9 @@ Lz77PayloadAnalysis analyze_lz77_payload(std::span<const std::uint8_t> input,
                     analysis.sequence.reset();
                 } else {
                     auto& sequence = *analysis.sequence;
-                    if (!sequence.literals_materialized) {
-                        sequence.literal_runs.push_back({output_position, length, reps[0]});
-                    }
+                    const bool has_match_context = sequence.sequence_count != 0;
+                    sequence.literal_runs.push_back(
+                        {output_position, length, reps[0], has_match_context});
                     for (std::size_t i = 0; i < length; ++i) {
                         const auto position = output_position + i;
                         const auto literal = literals[i];
@@ -606,9 +625,23 @@ Lz77PayloadAnalysis analyze_lz77_payload(std::span<const std::uint8_t> input,
                                                    : std::uint8_t{0};
                         const auto residual = static_cast<std::uint8_t>(literal ^ predicted);
                         ++sequence.residual_histograms[lane][residual];
+                        const bool use_match_context =
+                            i == 0 && has_match_context && reps[0] <= position;
+                        const auto match_lane =
+                            static_cast<std::size_t>(predicted >> 5);
+                        if (use_match_context) {
+                            ++sequence.match_histograms[match_lane][residual];
+                        } else {
+                            ++sequence.match_base_histograms[lane][literal];
+                        }
                         if (sequence.literals_materialized) {
                             sequence.raw_literals[lane].push_back(literal);
                             sequence.residual_literals[lane].push_back(residual);
+                            if (use_match_context) {
+                                sequence.match_literals[match_lane].push_back(residual);
+                            } else {
+                                sequence.match_base_literals[lane].push_back(literal);
+                            }
                         }
                     }
                     if (analysis.sequence) {
@@ -726,6 +759,167 @@ std::size_t histogram_size(const Lz77SplitStreams::Histogram& histogram) {
     return static_cast<std::size_t>(total);
 }
 
+struct FullPreviousLiteralStreams {
+    std::array<std::uint8_t, 256> context_map{};
+    std::vector<ByteVector> streams;
+};
+
+std::optional<FullPreviousLiteralStreams> cluster_full_previous_literals(
+    std::span<const std::uint8_t> input,
+    std::span<const SequenceLiteralRun> runs,
+    std::size_t incumbent_size) {
+    constexpr std::size_t kMinimumLiterals = 4096;
+    static thread_local std::vector<std::uint32_t> joint;
+    joint.assign(256 * 256, 0);
+    std::array<std::uint64_t, 256> context_total{};
+    std::size_t literal_total = 0;
+    for (const auto& run : runs) {
+        for (std::size_t i = 0; i < run.length; ++i) {
+            const auto position = run.position + i;
+            const auto context = position == 0 ? std::uint8_t{0}
+                                               : input[position - 1];
+            const auto symbol = input[position];
+            ++joint[(static_cast<std::size_t>(context) << 8) | symbol];
+            ++context_total[context];
+            ++literal_total;
+        }
+    }
+    if (literal_total < kMinimumLiterals) {
+        return std::nullopt;
+    }
+
+    // The unclustered conditional entropy is an optimistic lower bound. If it
+    // cannot beat the already-serialized winner after the context map alone,
+    // no clustered representation can win, so skip all k-means/table work.
+    double conditional_bits = 0.0;
+    std::vector<std::size_t> occupied;
+    occupied.reserve(256);
+    for (std::size_t context = 0; context < 256; ++context) {
+        if (context_total[context] == 0) {
+            continue;
+        }
+        occupied.push_back(context);
+        const auto total = static_cast<double>(context_total[context]);
+        const auto* row = &joint[context << 8];
+        for (std::size_t symbol = 0; symbol < 256; ++symbol) {
+            if (row[symbol] != 0) {
+                const auto count = static_cast<double>(row[symbol]);
+                conditional_bits -= count * std::log2(count / total);
+            }
+        }
+    }
+    constexpr std::size_t kFixedFraming = 1 + 1 + 256;
+    const auto optimistic_size = kFixedFraming +
+        static_cast<std::size_t>(std::ceil(conditional_bits / 8.0));
+    if (optimistic_size >= incumbent_size || occupied.empty()) {
+        return std::nullopt;
+    }
+
+    auto cluster_count = std::min(kFullPreviousMaxClusters, occupied.size());
+    std::vector<std::size_t> seeds(occupied);
+    std::partial_sort(
+        seeds.begin(), seeds.begin() + static_cast<std::ptrdiff_t>(cluster_count),
+        seeds.end(), [&](std::size_t left, std::size_t right) {
+            return context_total[left] > context_total[right];
+        });
+    seeds.resize(cluster_count);
+
+    FullPreviousLiteralStreams result;
+    std::vector<std::uint64_t> cluster_hist(cluster_count * 256, 0);
+    for (std::size_t cluster = 0; cluster < cluster_count; ++cluster) {
+        const auto* row = &joint[seeds[cluster] << 8];
+        for (std::size_t symbol = 0; symbol < 256; ++symbol) {
+            cluster_hist[cluster * 256 + symbol] = row[symbol];
+        }
+    }
+
+    std::vector<double> costs(cluster_count * 256);
+    constexpr int kRefinePasses = 3;
+    for (int pass = 0; pass < kRefinePasses; ++pass) {
+        for (std::size_t cluster = 0; cluster < cluster_count; ++cluster) {
+            std::uint64_t total = 0;
+            for (std::size_t symbol = 0; symbol < 256; ++symbol) {
+                total += cluster_hist[cluster * 256 + symbol];
+            }
+            const auto denominator = static_cast<double>(total + 256);
+            for (std::size_t symbol = 0; symbol < 256; ++symbol) {
+                const auto probability =
+                    (cluster_hist[cluster * 256 + symbol] + 1) / denominator;
+                costs[cluster * 256 + symbol] = -std::log2(probability);
+            }
+        }
+
+        for (const auto context : occupied) {
+            const auto* row = &joint[context << 8];
+            std::size_t best_cluster = 0;
+            double best_bits = std::numeric_limits<double>::infinity();
+            for (std::size_t cluster = 0; cluster < cluster_count; ++cluster) {
+                double bits = 0.0;
+                const auto* cost = &costs[cluster * 256];
+                for (std::size_t symbol = 0; symbol < 256; ++symbol) {
+                    if (row[symbol] != 0) {
+                        bits += row[symbol] * cost[symbol];
+                    }
+                }
+                if (bits < best_bits) {
+                    best_bits = bits;
+                    best_cluster = cluster;
+                }
+            }
+            result.context_map[context] =
+                static_cast<std::uint8_t>(best_cluster);
+        }
+
+        std::fill(cluster_hist.begin(), cluster_hist.end(), 0);
+        for (const auto context : occupied) {
+            const auto* row = &joint[context << 8];
+            auto* histogram =
+                &cluster_hist[result.context_map[context] * 256];
+            for (std::size_t symbol = 0; symbol < 256; ++symbol) {
+                histogram[symbol] += row[symbol];
+            }
+        }
+    }
+
+    std::array<std::uint8_t, kFullPreviousMaxClusters> remap{};
+    std::size_t live_clusters = 0;
+    for (std::size_t cluster = 0; cluster < cluster_count; ++cluster) {
+        const auto total = std::accumulate(
+            cluster_hist.begin() + static_cast<std::ptrdiff_t>(cluster * 256),
+            cluster_hist.begin() + static_cast<std::ptrdiff_t>((cluster + 1) * 256),
+            std::uint64_t{0});
+        if (total == 0) {
+            continue;
+        }
+        if (live_clusters != cluster) {
+            std::copy_n(&cluster_hist[cluster * 256], 256,
+                        &cluster_hist[live_clusters * 256]);
+        }
+        remap[cluster] = static_cast<std::uint8_t>(live_clusters++);
+    }
+    for (const auto context : occupied) {
+        result.context_map[context] = remap[result.context_map[context]];
+    }
+    cluster_count = live_clusters;
+    result.streams.resize(cluster_count);
+    for (std::size_t cluster = 0; cluster < cluster_count; ++cluster) {
+        const auto total = std::accumulate(
+            cluster_hist.begin() + static_cast<std::ptrdiff_t>(cluster * 256),
+            cluster_hist.begin() + static_cast<std::ptrdiff_t>((cluster + 1) * 256),
+            std::uint64_t{0});
+        result.streams[cluster].reserve(static_cast<std::size_t>(total));
+    }
+    for (const auto& run : runs) {
+        for (std::size_t i = 0; i < run.length; ++i) {
+            const auto position = run.position + i;
+            const auto context = position == 0 ? std::uint8_t{0}
+                                               : input[position - 1];
+            result.streams[result.context_map[context]].push_back(input[position]);
+        }
+    }
+    return result;
+}
+
 void write_context_literal_streams(ByteVector& result,
                                    std::span<const std::uint8_t> input,
                                    Lz77SequenceAnalysis& analysis,
@@ -749,14 +943,33 @@ void write_context_literal_streams(ByteVector& result,
     const bool use_residual = residual_score < raw_score;
     const auto& selected_histograms = use_residual ? analysis.residual_histograms
                                                    : analysis.raw_histograms;
+    const auto match_score = estimate_literal_mode(analysis.match_base_histograms) +
+                             estimate_literal_mode(analysis.match_histograms);
+    // The estimate is deliberately permissive: it only avoids building a
+    // clearly losing second representation. Exact serialized bytes still make
+    // the final decision whenever match-byte is remotely competitive.
+    const auto selected_score = std::min(raw_score, residual_score);
+    const bool try_match = match_score < selected_score;
 
     std::array<ByteVector, kLiteralContextLanes> selected_literals;
+    std::array<ByteVector, kLiteralContextLanes> match_base_literals;
+    std::array<ByteVector, kLiteralContextLanes> match_literals;
     if (analysis.literals_materialized) {
         selected_literals = use_residual ? std::move(analysis.residual_literals)
                                          : std::move(analysis.raw_literals);
+        if (try_match) {
+            match_base_literals = std::move(analysis.match_base_literals);
+            match_literals = std::move(analysis.match_literals);
+        }
     } else {
         for (std::size_t lane = 0; lane < kLiteralContextLanes; ++lane) {
             selected_literals[lane].reserve(histogram_size(selected_histograms[lane]));
+            if (try_match) {
+                match_base_literals[lane].reserve(
+                    histogram_size(analysis.match_base_histograms[lane]));
+                match_literals[lane].reserve(
+                    histogram_size(analysis.match_histograms[lane]));
+            }
         }
         for (const auto& run : analysis.literal_runs) {
             for (std::size_t i = 0; i < run.length; ++i) {
@@ -772,32 +985,70 @@ void write_context_literal_streams(ByteVector& result,
                 } else {
                     selected_literals[lane].push_back(literal);
                 }
+
+                if (try_match) {
+                    const bool use_match_context =
+                        i == 0 && run.has_match_context && run.rep0 <= position;
+                    const auto predicted = use_match_context
+                                               ? input[position - run.rep0]
+                                               : std::uint8_t{0};
+                    if (use_match_context) {
+                        const auto match_lane =
+                            static_cast<std::size_t>(predicted >> 5);
+                        match_literals[match_lane].push_back(
+                            static_cast<std::uint8_t>(literal ^ predicted));
+                    } else {
+                        match_base_literals[lane].push_back(literal);
+                    }
+                }
             }
         }
     }
 
-    auto encode_lane = [&](std::size_t lane) {
+    auto encode_lane = [&](std::size_t candidate, std::size_t lane) {
         ByteVector encoded;
-        write_stream(encoded, selected_literals[lane], /*try_order1=*/false,
-                     /*fast=*/true, /*prefer_rans=*/true,
-                     &selected_histograms[lane]);
+        const ByteVector* literals = &selected_literals[lane];
+        const Lz77SplitStreams::Histogram* histogram = &selected_histograms[lane];
+        if (candidate == 1) {
+            literals = &match_base_literals[lane];
+            histogram = &analysis.match_base_histograms[lane];
+        } else if (candidate == 2) {
+            literals = &match_literals[lane];
+            histogram = &analysis.match_histograms[lane];
+        }
+        write_stream(encoded, *literals, /*try_order1=*/true,
+                     /*fast=*/false, /*prefer_rans=*/false,
+                     histogram, /*screen_order1=*/candidate != 0);
         return encoded;
     };
 
-    std::array<ByteVector, kLiteralContextLanes> encoded_lanes;
-    const auto literal_count = std::accumulate(
+    std::array<ByteVector, kLiteralContextLanes> encoded_selected_lanes;
+    std::array<ByteVector, kLiteralContextLanes> encoded_match_base_lanes;
+    std::array<ByteVector, kLiteralContextLanes> encoded_match_lanes;
+    const auto selected_literal_count = std::accumulate(
         selected_literals.begin(), selected_literals.end(), std::size_t{0},
         [](std::size_t total, const ByteVector& lane) { return total + lane.size(); });
     constexpr std::size_t kParallelLaneThreshold = std::size_t{256} << 10;
-    if (executor != nullptr && literal_count >= kParallelLaneThreshold) {
-        std::array<std::future<ByteVector>, kLiteralContextLanes> tasks;
-        for (std::size_t lane = 0; lane < kLiteralContextLanes; ++lane) {
-            tasks[lane] = executor->submit([&, lane] { return encode_lane(lane); });
+    if (executor != nullptr && selected_literal_count >= kParallelLaneThreshold) {
+        std::array<std::future<ByteVector>, kLiteralContextLanes * 3> tasks;
+        const auto task_count = try_match ? tasks.size() : kLiteralContextLanes;
+        for (std::size_t index = 0; index < task_count; ++index) {
+            tasks[index] = executor->submit([&, index] {
+                return encode_lane(index / kLiteralContextLanes,
+                                   index % kLiteralContextLanes);
+            });
         }
         std::exception_ptr task_error;
-        for (std::size_t lane = 0; lane < kLiteralContextLanes; ++lane) {
+        for (std::size_t index = 0; index < task_count; ++index) {
             try {
-                encoded_lanes[lane] = executor->wait(tasks[lane]);
+                auto* destination =
+                    &encoded_selected_lanes[index % kLiteralContextLanes];
+                if (index >= kLiteralContextLanes * 2) {
+                    destination = &encoded_match_lanes[index - kLiteralContextLanes * 2];
+                } else if (index >= kLiteralContextLanes) {
+                    destination = &encoded_match_base_lanes[index - kLiteralContextLanes];
+                }
+                *destination = executor->wait(tasks[index]);
             } catch (...) {
                 if (!task_error) {
                     task_error = std::current_exception();
@@ -809,14 +1060,91 @@ void write_context_literal_streams(ByteVector& result,
         }
     } else {
         for (std::size_t lane = 0; lane < kLiteralContextLanes; ++lane) {
-            encoded_lanes[lane] = encode_lane(lane);
+            encoded_selected_lanes[lane] = encode_lane(0, lane);
+            if (try_match) {
+                encoded_match_base_lanes[lane] = encode_lane(1, lane);
+                encoded_match_lanes[lane] = encode_lane(2, lane);
+            }
         }
     }
 
-    result.push_back(use_residual ? kSequenceLiteralRepXor : kSequenceLiteralRaw);
-    for (const auto& lane : encoded_lanes) {
-        result.insert(result.end(), lane.begin(), lane.end());
+    auto serialize_lanes = [](std::uint8_t mode, const auto& lanes) {
+        ByteVector encoded{mode};
+        for (const auto& lane : lanes) {
+            encoded.insert(encoded.end(), lane.begin(), lane.end());
+        }
+        return encoded;
+    };
+    auto selected = serialize_lanes(
+        use_residual ? kSequenceLiteralRepXor : kSequenceLiteralRaw,
+        encoded_selected_lanes);
+    ByteVector matched;
+    if (try_match) {
+        matched = serialize_lanes(kSequenceLiteralMatchByte,
+                                  encoded_match_base_lanes);
+        for (const auto& lane : encoded_match_lanes) {
+            matched.insert(matched.end(), lane.begin(), lane.end());
+        }
     }
+    // The new representation is format-visible only when its complete suffix,
+    // including all lane tables and framing, beats the previous winner.
+    const ByteVector* winner =
+        try_match && matched.size() < selected.size() ? &matched : &selected;
+
+    ByteVector full_previous;
+    if (auto clustered = cluster_full_previous_literals(
+            input, analysis.literal_runs, winner->size())) {
+        full_previous.push_back(kSequenceLiteralFullPrevious);
+        full_previous.push_back(
+            static_cast<std::uint8_t>(clustered->streams.size()));
+        full_previous.insert(full_previous.end(), clustered->context_map.begin(),
+                             clustered->context_map.end());
+
+        std::vector<ByteVector> encoded_clusters(clustered->streams.size());
+        auto encode_cluster = [&](std::size_t cluster) {
+            ByteVector encoded;
+            write_stream(encoded, clustered->streams[cluster],
+                         /*try_order1=*/false, /*fast=*/false,
+                         /*prefer_rans=*/true);
+            return encoded;
+        };
+        if (executor != nullptr && selected_literal_count >= kParallelLaneThreshold &&
+            clustered->streams.size() > 1) {
+            std::vector<std::future<ByteVector>> tasks(clustered->streams.size());
+            for (std::size_t cluster = 0; cluster < tasks.size(); ++cluster) {
+                tasks[cluster] = executor->submit([&, cluster] {
+                    return encode_cluster(cluster);
+                });
+            }
+            std::exception_ptr task_error;
+            for (std::size_t cluster = 0; cluster < tasks.size(); ++cluster) {
+                try {
+                    encoded_clusters[cluster] = executor->wait(tasks[cluster]);
+                } catch (...) {
+                    if (!task_error) {
+                        task_error = std::current_exception();
+                    }
+                }
+            }
+            if (task_error) {
+                std::rethrow_exception(task_error);
+            }
+        } else {
+            for (std::size_t cluster = 0; cluster < encoded_clusters.size(); ++cluster) {
+                encoded_clusters[cluster] = encode_cluster(cluster);
+            }
+        }
+        for (const auto& cluster : encoded_clusters) {
+            full_previous.insert(full_previous.end(), cluster.begin(), cluster.end());
+        }
+        if (full_previous.size() < winner->size()) {
+            winner = &full_previous;
+        }
+    }
+
+    // Every format-visible mode competes as a complete suffix, including its
+    // map, tables, streams, and framing.
+    result.insert(result.end(), winner->begin(), winner->end());
 }
 
 ByteVector encode_sequence_analysis(std::span<const std::uint8_t> input,
@@ -924,11 +1252,14 @@ double estimate_sequence_size(const Lz77SequenceAnalysis& sequence) {
 
     double raw_literals = 0.0;
     double residual_literals = 0.0;
+    double match_literals = 0.0;
     for (std::size_t lane = 0; lane < kLiteralContextLanes; ++lane) {
         raw_literals += estimate_histogram_stream(sequence.raw_histograms[lane]);
         residual_literals += estimate_histogram_stream(sequence.residual_histograms[lane]);
+        match_literals += estimate_histogram_stream(sequence.match_base_histograms[lane]);
+        match_literals += estimate_histogram_stream(sequence.match_histograms[lane]);
     }
-    return estimate + std::min(raw_literals, residual_literals);
+    return estimate + std::min({raw_literals, residual_literals, match_literals});
 }
 
 }  // namespace
@@ -981,20 +1312,72 @@ private:
     std::size_t out_ = 0;
 };
 
-std::size_t read_slot_distance(const ByteVector& distance_slots,
-                               std::size_t& distance_slot_cursor,
-                               BitUnpacker& extra) {
-    if (distance_slot_cursor >= distance_slots.size()) {
-        throw FormatError("distance slot stream underflow");
+class SlotDistanceReader {
+public:
+    explicit SlotDistanceReader(std::span<const std::uint8_t> packed_footer)
+        : packed_(packed_footer) {}
+
+    SlotDistanceReader(std::span<const std::uint8_t> packed_high,
+                       std::span<const std::uint8_t> contextual_low)
+        : packed_(packed_high), contextual_low_(contextual_low), contextual_(true) {}
+
+    std::size_t read(const ByteVector& distance_slots,
+                     std::size_t& distance_slot_cursor) {
+        if (distance_slot_cursor >= distance_slots.size()) {
+            throw FormatError("distance slot stream underflow");
+        }
+
+        const std::uint32_t slot = distance_slots[distance_slot_cursor++];
+        if (slot > 63) {
+            throw FormatError("invalid distance slot");
+        }
+        const auto footer_bits = slot_footer_bits(slot);
+        std::uint32_t footer_value = 0;
+        if (!contextual_) {
+            footer_value = packed_.get(footer_bits);
+        } else if (footer_bits != 0) {
+            if (contextual_cursor_ >= contextual_low_.size()) {
+                throw FormatError("contextual distance footer underflow");
+            }
+            const auto low = static_cast<std::uint32_t>(
+                contextual_low_[contextual_cursor_++]);
+            const auto low_bits = std::min<std::uint32_t>(footer_bits, 4);
+            if (low >= (std::uint32_t{1} << low_bits)) {
+                throw FormatError("contextual distance footer exceeds slot width");
+            }
+            footer_value = low;
+            if (footer_bits > 4) {
+                footer_value |= packed_.get(footer_bits - 4) << 4;
+            }
+        }
+        return static_cast<std::size_t>(slot_to_distance(slot, footer_value));
     }
 
-    const std::uint32_t slot = distance_slots[distance_slot_cursor++];
-    if (slot > 63) {
-        throw FormatError("invalid distance slot");
+    bool finish() const {
+        return packed_.finish() &&
+               (!contextual_ || contextual_cursor_ == contextual_low_.size());
     }
 
-    const auto footer_value = extra.get(slot_footer_bits(slot));
-    return static_cast<std::size_t>(slot_to_distance(slot, footer_value));
+private:
+    BitUnpacker packed_;
+    std::span<const std::uint8_t> contextual_low_;
+    std::size_t contextual_cursor_ = 0;
+    bool contextual_ = false;
+};
+
+ByteVector contextual_footer_contexts(const ByteVector& distance_slots) {
+    ByteVector contexts;
+    contexts.reserve(distance_slots.size());
+    for (const auto slot_byte : distance_slots) {
+        const auto slot = static_cast<std::uint32_t>(slot_byte);
+        if (slot > 63) {
+            throw FormatError("invalid distance slot");
+        }
+        if (slot_footer_bits(slot) != 0) {
+            contexts.push_back(slot_byte);
+        }
+    }
+    return contexts;
 }
 
 void reconstruct_from_streams_into(const ByteVector& commands,
@@ -1056,14 +1439,13 @@ void reconstruct_from_slot_streams_into(const ByteVector& commands,
                                         const ByteVector& literal_lengths,
                                         const ByteVector& match_lengths,
                                         const ByteVector& distance_slots,
-                                        const ByteVector& distance_extra,
+                                        SlotDistanceReader& distance_reader,
                                         const ByteVector& literals,
                                         std::span<std::uint8_t> output) {
     std::size_t literal_length_cursor = 0;
     std::size_t match_length_cursor = 0;
     std::size_t distance_slot_cursor = 0;
     std::size_t literal_cursor = 0;
-    BitUnpacker extra(distance_extra);
     StreamReconstructor reconstructor(output);
 
     std::array<std::size_t, kRepCount> reps{1, 2, 3, 4};
@@ -1076,7 +1458,8 @@ void reconstruct_from_slot_streams_into(const ByteVector& commands,
         } else if (command == kMatchToken) {
             const auto length = static_cast<std::size_t>(
                 read_varuint(match_lengths, match_length_cursor));
-            const auto distance = read_slot_distance(distance_slots, distance_slot_cursor, extra);
+            const auto distance =
+                distance_reader.read(distance_slots, distance_slot_cursor);
 
             reconstructor.copy_match(length, distance);
             reps = {distance, reps[0], reps[1], reps[2]};
@@ -1102,7 +1485,7 @@ void reconstruct_from_slot_streams_into(const ByteVector& commands,
         literal_length_cursor != literal_lengths.size() ||
         match_length_cursor != match_lengths.size() ||
         distance_slot_cursor != distance_slots.size() ||
-        literal_cursor != literals.size()) {
+        literal_cursor != literals.size() || !distance_reader.finish()) {
         throw FormatError("slot split streams did not consume exactly");
     }
 }
@@ -1170,7 +1553,7 @@ std::optional<ByteVector> encode_lz77_split_streams_slots(
     return output;
 }
 
-std::pair<ByteVector, std::optional<ByteVector>> encode_lz77_split_payloads(
+Lz77SplitPayloads encode_lz77_split_payloads(
     const Lz77SplitStreams& streams, bool fast, core::TaskExecutor* executor) {
     const auto* commands_hist = streams.has_histograms ? &streams.commands_hist : nullptr;
     const auto* literal_lengths_hist =
@@ -1187,6 +1570,12 @@ std::pair<ByteVector, std::optional<ByteVector>> encode_lz77_split_payloads(
     const bool has_distance_slots_hist = streams.has_histograms;
     BitPacker extra;
     extra.reserve(streams.distances.size());
+    BitPacker contextual_high;
+    contextual_high.reserve(streams.distances.size());
+    ByteVector contextual_symbols;
+    ByteVector contextual_slots;
+    contextual_symbols.reserve(streams.distances.size());
+    contextual_slots.reserve(streams.distances.size());
     bool slots_ok = true;
     std::size_t cursor = 0;
     while (cursor < streams.distances.size()) {
@@ -1204,6 +1593,16 @@ std::pair<ByteVector, std::optional<ByteVector>> encode_lz77_split_payloads(
             ++distance_slots_hist[slot];
         }
         extra.put(footer_value, footer_bits);
+        if (footer_bits != 0) {
+            contextual_slots.push_back(static_cast<std::uint8_t>(slot));
+            if (footer_bits <= 4) {
+                contextual_symbols.push_back(static_cast<std::uint8_t>(footer_value));
+            } else {
+                contextual_symbols.push_back(
+                    static_cast<std::uint8_t>(footer_value & 0x0Fu));
+                contextual_high.put(footer_value >> 4, footer_bits - 4);
+            }
+        }
     }
 
     auto encode_stream = [fast](std::span<const std::uint8_t> raw,
@@ -1216,8 +1615,10 @@ std::pair<ByteVector, std::optional<ByteVector>> encode_lz77_split_payloads(
     };
 
     ByteVector distance_extra;
+    ByteVector contextual_high_extra;
     if (slots_ok) {
         distance_extra = extra.finish();
+        contextual_high_extra = contextual_high.finish();
     }
 
     ByteVector commands_encoded;
@@ -1226,11 +1627,15 @@ std::pair<ByteVector, std::optional<ByteVector>> encode_lz77_split_payloads(
     ByteVector literals_encoded;
     ByteVector plain_distances;
     ByteVector slot_distances;
+    ByteVector distance_slots_encoded;
+    ByteVector distance_extra_encoded;
+    std::optional<ByteVector> contextual_slot_distances;
 
     const auto raw_size = streams.commands.size() + streams.literal_lengths.size() +
                           streams.match_lengths.size() + streams.literals.size() +
                           streams.distances.size() + distance_slots.size() +
-                          distance_extra.size();
+                          distance_extra.size() + contextual_high_extra.size() +
+                          contextual_symbols.size();
     constexpr std::size_t kParallelStreamThreshold = std::size_t{256} << 10;
     if (executor != nullptr && raw_size >= kParallelStreamThreshold) {
         // Each entropy stream is independent and concatenation below retains
@@ -1253,15 +1658,28 @@ std::pair<ByteVector, std::optional<ByteVector>> encode_lz77_split_payloads(
         auto plain_distances_task = executor->submit([&] {
             return encode_stream(streams.distances, false, false, distances_hist);
         });
-        std::optional<std::future<ByteVector>> slot_distances_task;
+        std::optional<std::future<ByteVector>> distance_slots_task;
+        std::optional<std::future<ByteVector>> distance_extra_task;
+        std::optional<std::future<std::optional<ByteVector>>> contextual_slots_task;
         if (slots_ok) {
-            slot_distances_task.emplace(executor->submit([&] {
-                auto encoded = encode_stream(
+            distance_slots_task.emplace(executor->submit([&] {
+                return encode_stream(
                     distance_slots, !fast, fast,
                     has_distance_slots_hist ? &distance_slots_hist : nullptr);
-                auto footer = encode_stream(distance_extra, false, false, nullptr);
-                encoded.insert(encoded.end(), footer.begin(), footer.end());
-                return encoded;
+            }));
+            distance_extra_task.emplace(executor->submit([&] {
+                return encode_stream(distance_extra, false, false, nullptr);
+            }));
+            contextual_slots_task.emplace(executor->submit([&] {
+                auto align = entropy::encode_rans_contextual(
+                    contextual_symbols, contextual_slots,
+                    /*context_count=*/64, /*symbol_count=*/16);
+                if (!align) {
+                    return std::optional<ByteVector>{};
+                }
+                auto encoded = encode_stream(contextual_high_extra, false, false, nullptr);
+                write_raw_blob(encoded, *align);
+                return std::optional<ByteVector>{std::move(encoded)};
             }));
         }
 
@@ -1282,8 +1700,14 @@ std::pair<ByteVector, std::optional<ByteVector>> encode_lz77_split_payloads(
         collect(match_lengths_task, match_lengths_encoded);
         collect(literals_task, literals_encoded);
         collect(plain_distances_task, plain_distances);
-        if (slot_distances_task) {
-            collect(*slot_distances_task, slot_distances);
+        if (distance_slots_task) {
+            collect(*distance_slots_task, distance_slots_encoded);
+        }
+        if (distance_extra_task) {
+            collect(*distance_extra_task, distance_extra_encoded);
+        }
+        if (contextual_slots_task) {
+            collect(*contextual_slots_task, contextual_slot_distances);
         }
         if (task_error) {
             std::rethrow_exception(task_error);
@@ -1297,12 +1721,39 @@ std::pair<ByteVector, std::optional<ByteVector>> encode_lz77_split_payloads(
         literals_encoded = encode_stream(streams.literals, true, fast, literals_hist);
         plain_distances = encode_stream(streams.distances, false, false, distances_hist);
         if (slots_ok) {
-            slot_distances = encode_stream(
+            distance_slots_encoded = encode_stream(
                 distance_slots, !fast, fast,
                 has_distance_slots_hist ? &distance_slots_hist : nullptr);
-            auto footer = encode_stream(distance_extra, false, false, nullptr);
-            slot_distances.insert(slot_distances.end(), footer.begin(), footer.end());
+            distance_extra_encoded =
+                encode_stream(distance_extra, false, false, nullptr);
+            if (auto align = entropy::encode_rans_contextual(
+                    contextual_symbols, contextual_slots,
+                    /*context_count=*/64, /*symbol_count=*/16)) {
+                ByteVector contextual =
+                    encode_stream(contextual_high_extra, false, false, nullptr);
+                write_raw_blob(contextual, *align);
+                contextual_slot_distances = std::move(contextual);
+            }
         }
+    }
+
+    if (slots_ok) {
+        slot_distances.reserve(distance_slots_encoded.size() +
+                               distance_extra_encoded.size());
+        slot_distances.insert(slot_distances.end(), distance_slots_encoded.begin(),
+                              distance_slots_encoded.end());
+        slot_distances.insert(slot_distances.end(), distance_extra_encoded.begin(),
+                              distance_extra_encoded.end());
+    }
+    if (contextual_slot_distances) {
+        ByteVector framed;
+        framed.reserve(distance_slots_encoded.size() +
+                       contextual_slot_distances->size());
+        framed.insert(framed.end(), distance_slots_encoded.begin(),
+                      distance_slots_encoded.end());
+        framed.insert(framed.end(), contextual_slot_distances->begin(),
+                      contextual_slot_distances->end());
+        contextual_slot_distances = std::move(framed);
     }
 
     // Encode the streams the two layouts share exactly once. The sequence
@@ -1337,50 +1788,75 @@ std::pair<ByteVector, std::optional<ByteVector>> encode_lz77_split_payloads(
         slots = concat(shared, slot_distances, literals_encoded);
     }
 
-    return {std::move(plain), std::move(slots)};
+    std::optional<ByteVector> contextual_slots_payload;
+    if (contextual_slot_distances) {
+        contextual_slots_payload =
+            concat(shared, *contextual_slot_distances, literals_encoded);
+    }
+
+    return {std::move(plain), std::move(slots),
+            std::move(contextual_slots_payload)};
 }
 
-std::pair<ByteVector, std::optional<ByteVector>> encode_lz77_split_payloads(
+Lz77SplitPayloads encode_lz77_split_payloads(
     std::span<const std::uint8_t> lz77_payload,
     bool fast,
     core::TaskExecutor* executor) {
     return encode_lz77_split_payloads(split_lz77_payload(lz77_payload), fast, executor);
 }
 
-std::optional<ByteVector> encode_lz77_context_split_streams(
+Lz77ContextSplitPayloads encode_lz77_context_split_streams(
     std::span<const std::uint8_t> input,
     std::span<const std::uint8_t> lz77_payload,
     std::span<const std::uint8_t> slot_payload,
+    std::span<const std::uint8_t> contextual_slot_payload,
     core::TaskExecutor* executor) {
     auto analysis = analyze_lz77_payload(input, lz77_payload, /*build_sequence=*/true,
                                          /*build_split=*/false);
     if (!analysis.sequence) {
-        return std::nullopt;
+        return {};
     }
     if (slot_payload.empty()) {
-        return std::nullopt;
+        return {};
     }
-    ByteVector result(slot_payload.begin(), slot_payload.end());
 
-    // The slot layout's first five streams are commands, literal lengths,
-    // match lengths, distance slots, and distance footer bits. Retain that
-    // prefix and replace only its final flat literal stream with context lanes.
-    std::size_t cursor = 0;
-    for (unsigned stream = 0; stream < 5; ++stream) {
-        (void)read_varuint(result, cursor);
-        if (cursor >= result.size()) {
-            throw FormatError("truncated generated split stream");
+    ByteVector literal_suffix;
+    write_context_literal_streams(literal_suffix, input, *analysis.sequence, executor);
+
+    auto replace_literals = [&](std::span<const std::uint8_t> payload,
+                                bool contextual_footer) -> std::optional<ByteVector> {
+        if (payload.empty()) {
+            return std::nullopt;
         }
-        ++cursor;  // StreamCodec
-        const auto payload_size = static_cast<std::size_t>(read_varuint(result, cursor));
-        if (payload_size > result.size() - cursor) {
-            throw FormatError("generated split stream exceeds payload");
+        ByteVector result(payload.begin(), payload.end());
+        std::size_t cursor = 0;
+        // Both layouts begin with commands, literal lengths, match lengths,
+        // slots, and one packed-footer stream. The v8 layout then carries its
+        // contextual low-nibble payload as a bounded raw blob.
+        for (unsigned stream = 0; stream < 5; ++stream) {
+            (void)read_varuint(result, cursor);
+            if (cursor >= result.size()) {
+                throw FormatError("truncated generated split stream");
+            }
+            ++cursor;
+            const auto payload_size =
+                static_cast<std::size_t>(read_varuint(result, cursor));
+            if (payload_size > result.size() - cursor) {
+                throw FormatError("generated split stream exceeds payload");
+            }
+            cursor += payload_size;
         }
-        cursor += payload_size;
-    }
-    result.resize(cursor);
-    write_context_literal_streams(result, input, *analysis.sequence, executor);
-    return result;
+        if (contextual_footer) {
+            (void)read_raw_blob(result, cursor, result.size());
+        }
+        result.resize(cursor);
+        result.insert(result.end(), literal_suffix.begin(), literal_suffix.end());
+        return result;
+    };
+
+    return {replace_literals(slot_payload, /*contextual_footer=*/false),
+            replace_literals(contextual_slot_payload,
+                             /*contextual_footer=*/true)};
 }
 
 std::optional<ByteVector> encode_lz77_sequence_streams(
@@ -1424,12 +1900,15 @@ Lz77PayloadCandidates encode_lz77_payload_candidates(
     }
     std::optional<ByteVector> split;
     std::optional<ByteVector> slots;
+    std::optional<ByteVector> contextual_slots;
     if (!sequence || static_cast<double>(sequence->size()) > estimated_legacy_size) {
         auto legacy = encode_lz77_split_payloads(analysis.split, fast, executor);
-        split = std::move(legacy.first);
-        slots = std::move(legacy.second);
+        split = std::move(legacy.split);
+        slots = std::move(legacy.slots);
+        contextual_slots = std::move(legacy.contextual_slots);
     }
-    return {std::move(split), std::move(slots), std::move(sequence)};
+    return {std::move(split), std::move(slots),
+            std::move(contextual_slots), std::move(sequence)};
 }
 
 void decode_lz77_sequence_streams_into(std::span<const std::uint8_t> encoded,
@@ -1459,19 +1938,72 @@ void decode_lz77_sequence_streams_into(std::span<const std::uint8_t> encoded,
     }
     const auto literal_mode = encoded[cursor++];
     if (literal_mode != kSequenceLiteralRaw &&
-        literal_mode != kSequenceLiteralRepXor) {
+        literal_mode != kSequenceLiteralRepXor &&
+        literal_mode != kSequenceLiteralMatchByte &&
+        literal_mode != kSequenceLiteralFullPrevious) {
         throw FormatError("unknown sequence literal mode");
     }
 
     std::array<ByteVector, kLiteralContextLanes> literal_lanes;
+    std::array<ByteVector, kLiteralContextLanes> match_literal_lanes;
     std::array<std::size_t, kLiteralContextLanes> literal_cursors{};
+    std::array<std::size_t, kLiteralContextLanes> match_literal_cursors{};
+    std::array<std::uint8_t, 256> full_context_map{};
+    std::array<ByteVector, kFullPreviousMaxClusters> full_context_lanes;
+    std::array<const std::uint8_t*, kFullPreviousMaxClusters> full_context_readers{};
+    std::array<const std::uint8_t*, kFullPreviousMaxClusters> full_context_ends{};
+    std::size_t full_context_cluster_count = 0;
     std::size_t literal_total = 0;
-    for (auto& lane : literal_lanes) {
-        lane = read_stream(encoded, cursor, output.size());
-        if (lane.size() > output.size() - literal_total) {
-            throw FormatError("sequence literals exceed declared output size");
+    if (literal_mode == kSequenceLiteralFullPrevious) {
+        if (cursor >= encoded.size()) {
+            throw FormatError("truncated full-context literal cluster count");
         }
-        literal_total += lane.size();
+        full_context_cluster_count =
+            static_cast<std::size_t>(encoded[cursor++]);
+        if (full_context_cluster_count == 0 ||
+            full_context_cluster_count > kFullPreviousMaxClusters) {
+            throw FormatError("invalid full-context literal cluster count");
+        }
+        if (encoded.size() - cursor < full_context_map.size()) {
+            throw FormatError("truncated full-context literal map");
+        }
+        for (auto& cluster : full_context_map) {
+            cluster = encoded[cursor++];
+            if (cluster >= full_context_cluster_count) {
+                throw FormatError("full-context literal maps to missing cluster");
+            }
+        }
+        for (std::size_t cluster = 0; cluster < full_context_cluster_count;
+             ++cluster) {
+            auto& lane = full_context_lanes[cluster];
+            lane = read_stream(encoded, cursor, output.size());
+            if (lane.size() > output.size() - literal_total) {
+                throw FormatError("sequence literals exceed declared output size");
+            }
+            literal_total += lane.size();
+            full_context_readers[cluster] = lane.data();
+            full_context_ends[cluster] = lane.empty()
+                ? lane.data()
+                : lane.data() + lane.size();
+        }
+    } else {
+        for (auto& lane : literal_lanes) {
+            lane = read_stream(encoded, cursor, output.size());
+            if (lane.size() > output.size() - literal_total) {
+                throw FormatError("sequence literals exceed declared output size");
+            }
+            literal_total += lane.size();
+        }
+        if (literal_mode == kSequenceLiteralMatchByte) {
+            for (auto& lane : match_literal_lanes) {
+                lane = read_stream(encoded, cursor, output.size());
+                if (lane.size() > output.size() - literal_total) {
+                    throw FormatError(
+                        "sequence match literals exceed declared output size");
+                }
+                literal_total += lane.size();
+            }
+        }
     }
     if (cursor != encoded.size()) {
         throw FormatError("trailing bytes after sequence streams");
@@ -1484,17 +2016,43 @@ void decode_lz77_sequence_streams_into(std::span<const std::uint8_t> encoded,
     std::size_t out = 0;
     std::size_t literals_used = 0;
 
-    auto copy_literals = [&](std::size_t length) {
+    auto copy_literals = [&](std::size_t length, bool has_match_context) {
         if (length > output.size() - out) {
             throw FormatError("sequence literal run exceeds declared output size");
         }
+        if (literal_mode == kSequenceLiteralFullPrevious) {
+            for (std::size_t i = 0; i < length; ++i) {
+                const auto context = out == 0 ? std::uint8_t{0}
+                                              : output[out - 1];
+                const auto cluster = full_context_map[context];
+                auto& reader = full_context_readers[cluster];
+                if (reader == full_context_ends[cluster]) {
+                    throw FormatError("sequence full-context literal underflow");
+                }
+                output[out++] = *reader++;
+            }
+            literals_used += length;
+            return;
+        }
         for (std::size_t i = 0; i < length; ++i) {
-            const auto lane = literal_context_lane(output, out);
-            if (literal_cursors[lane] >= literal_lanes[lane].size()) {
+            const bool use_match_context =
+                literal_mode == kSequenceLiteralMatchByte && i == 0 &&
+                has_match_context && reps[0] <= out;
+            const auto predicted = use_match_context
+                                       ? output[out - reps[0]]
+                                       : std::uint8_t{0};
+            const auto lane = use_match_context
+                                  ? static_cast<std::size_t>(predicted >> 5)
+                                  : literal_context_lane(output, out);
+            auto& lanes = use_match_context ? match_literal_lanes : literal_lanes;
+            auto& cursors = use_match_context ? match_literal_cursors : literal_cursors;
+            if (cursors[lane] >= lanes[lane].size()) {
                 throw FormatError("sequence literal lane underflow");
             }
-            auto literal = literal_lanes[lane][literal_cursors[lane]++];
-            if (literal_mode == kSequenceLiteralRepXor && reps[0] <= out) {
+            auto literal = lanes[lane][cursors[lane]++];
+            if (use_match_context) {
+                literal = static_cast<std::uint8_t>(literal ^ predicted);
+            } else if (literal_mode == kSequenceLiteralRepXor && reps[0] <= out) {
                 literal = static_cast<std::uint8_t>(literal ^ output[out - reps[0]]);
             }
             output[out++] = literal;
@@ -1505,7 +2063,7 @@ void decode_lz77_sequence_streams_into(std::span<const std::uint8_t> encoded,
     for (std::size_t i = 0; i < sequence_count; ++i) {
         const auto literal_length = static_cast<std::size_t>(
             decode_value_code(literal_length_codes[i], literal_length_bits));
-        copy_literals(literal_length);
+        copy_literals(literal_length, i != 0);
 
         const auto match_base = decode_value_code(match_length_codes[i], match_length_bits);
         if (match_base > std::numeric_limits<std::uint32_t>::max() - kMinMatch) {
@@ -1536,15 +2094,26 @@ void decode_lz77_sequence_streams_into(std::span<const std::uint8_t> encoded,
                       "sequence match exceeds declared output size");
     }
 
-    copy_literals(trailing_literals);
+    copy_literals(trailing_literals, sequence_count != 0);
     if (out != output.size() || literals_used != literal_total ||
         !literal_length_bits.finish() || !match_length_bits.finish() ||
         !offset_bits.finish()) {
         throw FormatError("sequence streams did not consume exactly");
     }
-    for (std::size_t lane = 0; lane < kLiteralContextLanes; ++lane) {
-        if (literal_cursors[lane] != literal_lanes[lane].size()) {
-            throw FormatError("sequence literal lanes did not consume exactly");
+    if (literal_mode == kSequenceLiteralFullPrevious) {
+        for (std::size_t cluster = 0; cluster < full_context_cluster_count;
+             ++cluster) {
+            if (full_context_readers[cluster] != full_context_ends[cluster]) {
+                throw FormatError(
+                    "sequence full-context literals did not consume exactly");
+            }
+        }
+    } else {
+        for (std::size_t lane = 0; lane < kLiteralContextLanes; ++lane) {
+            if (literal_cursors[lane] != literal_lanes[lane].size() ||
+                match_literal_cursors[lane] != match_literal_lanes[lane].size()) {
+                throw FormatError("sequence literal lanes did not consume exactly");
+            }
         }
     }
 }
@@ -1556,35 +2125,98 @@ ByteVector decode_lz77_sequence_streams(std::span<const std::uint8_t> encoded,
     return output;
 }
 
-void decode_lz77_context_split_streams_into(
+void decode_lz77_context_split_streams_impl(
     std::span<const std::uint8_t> encoded,
-    std::span<std::uint8_t> output) {
+    std::span<std::uint8_t> output,
+    bool contextual_footer) {
     std::size_t cursor = 0;
     const auto stream_limit = decoded_stream_limit(output.size());
     const auto commands = read_stream(encoded, cursor, stream_limit);
     const auto literal_lengths = read_stream(encoded, cursor, stream_limit);
     const auto match_lengths = read_stream(encoded, cursor, stream_limit);
     const auto distance_slots = read_stream(encoded, cursor, stream_limit);
-    const auto distance_extra = read_stream(encoded, cursor, stream_limit);
+    const auto distance_packed = read_stream(encoded, cursor, stream_limit);
+
+    ByteVector contextual_low;
+    if (contextual_footer) {
+        const auto contextual_payload = read_raw_blob(encoded, cursor, stream_limit);
+        const auto contexts = contextual_footer_contexts(distance_slots);
+        contextual_low = entropy::decode_rans_contextual(
+            contextual_payload, contexts,
+            /*context_count=*/64, /*symbol_count=*/16);
+    }
 
     if (cursor >= encoded.size()) {
         throw FormatError("truncated context-split literal mode");
     }
     const auto literal_mode = encoded[cursor++];
     if (literal_mode != kSequenceLiteralRaw &&
-        literal_mode != kSequenceLiteralRepXor) {
+        literal_mode != kSequenceLiteralRepXor &&
+        literal_mode != kSequenceLiteralMatchByte &&
+        literal_mode != kSequenceLiteralFullPrevious) {
         throw FormatError("unknown context-split literal mode");
     }
 
     std::array<ByteVector, kLiteralContextLanes> literal_lanes;
+    std::array<ByteVector, kLiteralContextLanes> match_literal_lanes;
     std::array<std::size_t, kLiteralContextLanes> literal_cursors{};
+    std::array<std::size_t, kLiteralContextLanes> match_literal_cursors{};
+    std::array<std::uint8_t, 256> full_context_map{};
+    std::array<ByteVector, kFullPreviousMaxClusters> full_context_lanes;
+    std::array<const std::uint8_t*, kFullPreviousMaxClusters> full_context_readers{};
+    std::array<const std::uint8_t*, kFullPreviousMaxClusters> full_context_ends{};
+    std::size_t full_context_cluster_count = 0;
     std::size_t literal_total = 0;
-    for (auto& lane : literal_lanes) {
-        lane = read_stream(encoded, cursor, output.size());
-        if (lane.size() > output.size() - literal_total) {
-            throw FormatError("context-split literals exceed declared output size");
+    if (literal_mode == kSequenceLiteralFullPrevious) {
+        if (cursor >= encoded.size()) {
+            throw FormatError("truncated full-context literal cluster count");
         }
-        literal_total += lane.size();
+        full_context_cluster_count =
+            static_cast<std::size_t>(encoded[cursor++]);
+        if (full_context_cluster_count == 0 ||
+            full_context_cluster_count > kFullPreviousMaxClusters) {
+            throw FormatError("invalid full-context literal cluster count");
+        }
+        if (encoded.size() - cursor < full_context_map.size()) {
+            throw FormatError("truncated full-context literal map");
+        }
+        for (auto& cluster : full_context_map) {
+            cluster = encoded[cursor++];
+            if (cluster >= full_context_cluster_count) {
+                throw FormatError("full-context literal maps to missing cluster");
+            }
+        }
+        for (std::size_t cluster = 0; cluster < full_context_cluster_count;
+             ++cluster) {
+            auto& lane = full_context_lanes[cluster];
+            lane = read_stream(encoded, cursor, output.size());
+            if (lane.size() > output.size() - literal_total) {
+                throw FormatError("context-split literals exceed declared output size");
+            }
+            literal_total += lane.size();
+            full_context_readers[cluster] = lane.data();
+            full_context_ends[cluster] = lane.empty()
+                ? lane.data()
+                : lane.data() + lane.size();
+        }
+    } else {
+        for (auto& lane : literal_lanes) {
+            lane = read_stream(encoded, cursor, output.size());
+            if (lane.size() > output.size() - literal_total) {
+                throw FormatError("context-split literals exceed declared output size");
+            }
+            literal_total += lane.size();
+        }
+        if (literal_mode == kSequenceLiteralMatchByte) {
+            for (auto& lane : match_literal_lanes) {
+                lane = read_stream(encoded, cursor, output.size());
+                if (lane.size() > output.size() - literal_total) {
+                    throw FormatError(
+                        "context-split match literals exceed declared output size");
+                }
+                literal_total += lane.size();
+            }
+        }
     }
     if (cursor != encoded.size()) {
         throw FormatError("trailing bytes after context-split streams");
@@ -1595,20 +2227,53 @@ void decode_lz77_context_split_streams_into(
     std::size_t distance_slot_cursor = 0;
     std::size_t literals_used = 0;
     std::size_t out = 0;
-    BitUnpacker extra(distance_extra);
+    std::optional<SlotDistanceReader> distance_reader;
+    if (contextual_footer) {
+        distance_reader.emplace(distance_packed, contextual_low);
+    } else {
+        distance_reader.emplace(distance_packed);
+    }
     std::array<std::size_t, kRepCount> reps{1, 2, 3, 4};
+    bool has_match_context = false;
 
     auto copy_literals = [&](std::size_t length) {
         if (length > output.size() - out) {
             throw FormatError("context-split literal exceeds declared output size");
         }
+        if (literal_mode == kSequenceLiteralFullPrevious) {
+            for (std::size_t i = 0; i < length; ++i) {
+                const auto context = out == 0 ? std::uint8_t{0}
+                                              : output[out - 1];
+                const auto cluster = full_context_map[context];
+                auto& reader = full_context_readers[cluster];
+                if (reader == full_context_ends[cluster]) {
+                    throw FormatError(
+                        "context-split full-context literal underflow");
+                }
+                output[out++] = *reader++;
+            }
+            literals_used += length;
+            return;
+        }
         for (std::size_t i = 0; i < length; ++i) {
-            const auto lane = literal_context_lane(output, out);
-            if (literal_cursors[lane] >= literal_lanes[lane].size()) {
+            const bool use_match_context =
+                literal_mode == kSequenceLiteralMatchByte && i == 0 &&
+                has_match_context && reps[0] <= out;
+            const auto predicted = use_match_context
+                                       ? output[out - reps[0]]
+                                       : std::uint8_t{0};
+            const auto lane = use_match_context
+                                  ? static_cast<std::size_t>(predicted >> 5)
+                                  : literal_context_lane(output, out);
+            auto& lanes = use_match_context ? match_literal_lanes : literal_lanes;
+            auto& cursors = use_match_context ? match_literal_cursors : literal_cursors;
+            if (cursors[lane] >= lanes[lane].size()) {
                 throw FormatError("context-split literal lane underflow");
             }
-            auto literal = literal_lanes[lane][literal_cursors[lane]++];
-            if (literal_mode == kSequenceLiteralRepXor && reps[0] <= out) {
+            auto literal = lanes[lane][cursors[lane]++];
+            if (use_match_context) {
+                literal = static_cast<std::uint8_t>(literal ^ predicted);
+            } else if (literal_mode == kSequenceLiteralRepXor && reps[0] <= out) {
                 literal = static_cast<std::uint8_t>(literal ^ output[out - reps[0]]);
             }
             output[out++] = literal;
@@ -1621,15 +2286,19 @@ void decode_lz77_context_split_streams_into(
             const auto length = static_cast<std::size_t>(
                 read_varuint(literal_lengths, literal_length_cursor));
             copy_literals(length);
+            if (length != 0) {
+                has_match_context = false;
+            }
         } else if (command == kMatchToken) {
             const auto length = static_cast<std::size_t>(
                 read_varuint(match_lengths, match_length_cursor));
             const auto distance =
-                read_slot_distance(distance_slots, distance_slot_cursor, extra);
+                distance_reader->read(distance_slots, distance_slot_cursor);
             copy_lz_match(output, out, distance, length,
                           "invalid context-split match reference",
                           "context-split match exceeds declared output size");
             reps = {distance, reps[0], reps[1], reps[2]};
+            has_match_context = true;
         } else if (command >= kRepTokenBase &&
                    command < kRepTokenBase + kRepCount) {
             const auto index = static_cast<std::size_t>(command - kRepTokenBase);
@@ -1644,6 +2313,7 @@ void decode_lz77_context_split_streams_into(
                 reps[j] = reps[j - 1];
             }
             reps[0] = chosen;
+            has_match_context = true;
         } else {
             throw FormatError("unknown context-split command");
         }
@@ -1652,14 +2322,41 @@ void decode_lz77_context_split_streams_into(
     if (out != output.size() || literals_used != literal_total ||
         literal_length_cursor != literal_lengths.size() ||
         match_length_cursor != match_lengths.size() ||
-        distance_slot_cursor != distance_slots.size() || !extra.finish()) {
+        distance_slot_cursor != distance_slots.size() ||
+        !distance_reader->finish()) {
         throw FormatError("context-split streams did not consume exactly");
     }
-    for (std::size_t lane = 0; lane < kLiteralContextLanes; ++lane) {
-        if (literal_cursors[lane] != literal_lanes[lane].size()) {
-            throw FormatError("context-split literal lanes did not consume exactly");
+    if (literal_mode == kSequenceLiteralFullPrevious) {
+        for (std::size_t cluster = 0; cluster < full_context_cluster_count;
+             ++cluster) {
+            if (full_context_readers[cluster] != full_context_ends[cluster]) {
+                throw FormatError(
+                    "context-split full-context literals did not consume exactly");
+            }
+        }
+    } else {
+        for (std::size_t lane = 0; lane < kLiteralContextLanes; ++lane) {
+            if (literal_cursors[lane] != literal_lanes[lane].size() ||
+                match_literal_cursors[lane] != match_literal_lanes[lane].size()) {
+                throw FormatError(
+                    "context-split literal lanes did not consume exactly");
+            }
         }
     }
+}
+
+void decode_lz77_context_split_streams_into(
+    std::span<const std::uint8_t> encoded,
+    std::span<std::uint8_t> output) {
+    decode_lz77_context_split_streams_impl(
+        encoded, output, /*contextual_footer=*/false);
+}
+
+void decode_lz77_contextual_slot_context_split_streams_into(
+    std::span<const std::uint8_t> encoded,
+    std::span<std::uint8_t> output) {
+    decode_lz77_context_split_streams_impl(
+        encoded, output, /*contextual_footer=*/true);
 }
 
 void decode_lz77_split_streams_slots_into(std::span<const std::uint8_t> encoded,
@@ -1677,8 +2374,34 @@ void decode_lz77_split_streams_slots_into(std::span<const std::uint8_t> encoded,
         throw FormatError("trailing bytes after slot split streams");
     }
 
+    SlotDistanceReader distance_reader(distance_extra);
     reconstruct_from_slot_streams_into(commands, literal_lengths, match_lengths,
-                                       distance_slots, distance_extra, literals, output);
+                                       distance_slots, distance_reader, literals, output);
+}
+
+void decode_lz77_contextual_slot_streams_into(
+    std::span<const std::uint8_t> encoded,
+    std::span<std::uint8_t> output) {
+    std::size_t cursor = 0;
+    const auto stream_limit = decoded_stream_limit(output.size());
+    const auto commands = read_stream(encoded, cursor, stream_limit);
+    const auto literal_lengths = read_stream(encoded, cursor, stream_limit);
+    const auto match_lengths = read_stream(encoded, cursor, stream_limit);
+    const auto distance_slots = read_stream(encoded, cursor, stream_limit);
+    const auto distance_high = read_stream(encoded, cursor, stream_limit);
+    const auto contextual_payload = read_raw_blob(encoded, cursor, stream_limit);
+    const auto literals = read_stream(encoded, cursor, stream_limit);
+    if (cursor != encoded.size()) {
+        throw FormatError("trailing bytes after contextual slot streams");
+    }
+
+    const auto contexts = contextual_footer_contexts(distance_slots);
+    const auto contextual_low = entropy::decode_rans_contextual(
+        contextual_payload, contexts,
+        /*context_count=*/64, /*symbol_count=*/16);
+    SlotDistanceReader distance_reader(distance_high, contextual_low);
+    reconstruct_from_slot_streams_into(commands, literal_lengths, match_lengths,
+                                       distance_slots, distance_reader, literals, output);
 }
 
 ByteVector decode_lz77_split_streams_slots(std::span<const std::uint8_t> encoded,

@@ -1432,11 +1432,15 @@ ByteVector encode_lz77_optimal(std::span<const std::uint8_t> input,
         // select between two already-compatible distance representations.
         // The paired encoder emits byte-identical candidates while doing that
         // common work once.
-        auto [split, slots] = encode_lz77_split_payloads(tokens, fast);
-        if (slots) {
-            return std::min(split.size(), slots->size());
+        auto payloads = encode_lz77_split_payloads(tokens, fast);
+        auto best = payloads.split.size();
+        if (payloads.slots) {
+            best = std::min(best, payloads.slots->size());
         }
-        return split.size();
+        if (payloads.contextual_slots) {
+            best = std::min(best, payloads.contextual_slots->size());
+        }
+        return best;
     };
 
     return coded_size(second) <= coded_size(first) ? std::move(second) : std::move(first);

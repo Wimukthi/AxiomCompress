@@ -34,7 +34,8 @@ constexpr std::array<std::uint8_t, 8> kMagic = {'A', 'X', 'I', 'O', 'M', 'C', '1
 constexpr std::uint16_t kLegacyVersion = 4;
 constexpr std::uint16_t kTransformVersion = 5;
 constexpr std::uint16_t kSequenceVersion = 6;
-constexpr std::uint16_t kVersion = 7;
+constexpr std::uint16_t kContextSplitVersion = 7;
+constexpr std::uint16_t kVersion = 8;
 constexpr std::size_t kLegacyHeaderSize = 32;
 constexpr std::size_t kHeaderSize = 36;
 constexpr std::uint8_t kFlagTransforms = 1u << 0;
@@ -234,7 +235,8 @@ ArchiveHeader read_archive_header(std::span<const std::uint8_t> archive) {
     std::size_t cursor = kMagic.size();
     const auto version = read_u16(archive, cursor);
     if (version != kLegacyVersion && version != kTransformVersion &&
-        version != kSequenceVersion && version != kVersion) {
+        version != kSequenceVersion && version != kContextSplitVersion &&
+        version != kVersion) {
         throw FormatError("unsupported archive version");
     }
 
@@ -258,6 +260,9 @@ ArchiveHeader read_archive_header(std::span<const std::uint8_t> archive) {
     } else if (codec_byte == static_cast<std::uint8_t>(CodecId::lz77_sequences) &&
                version >= kSequenceVersion) {
         header.codec = CodecId::lz77_sequences;
+    } else if (codec_byte == static_cast<std::uint8_t>(CodecId::lz77_contextual_slots) &&
+               version >= kVersion) {
+        header.codec = CodecId::lz77_contextual_slots;
     } else {
         throw FormatError("unsupported codec id");
     }
@@ -377,6 +382,8 @@ ByteVector compress(std::span<const std::uint8_t> input,
     } else if (!options.force_parallel_blocks && codec::likely_incompressible(input)) {
     } else {
         auto parallel_options = options;
+        parallel_options.content_adaptive_blocks =
+            options.content_adaptive_blocks && options.auto_block_size_for_threads;
         parallel_options.block_size = codec::effective_parallel_block_size(input.size(), options);
         if (options.enable_optimal_parser) {
             // With the optimal parser on, per-block match windows dominate the
@@ -463,6 +470,7 @@ ByteVector compress(std::span<const std::uint8_t> input,
             }
             std::optional<ByteVector> split_payload;
             std::optional<ByteVector> slot_payload;
+            std::optional<ByteVector> contextual_slot_payload;
             std::optional<ByteVector> sequence_payload;
             if (try_sequence && options.fast_entropy) {
                 auto candidates = codec::encode_lz77_payload_candidates(
@@ -470,13 +478,15 @@ ByteVector compress(std::span<const std::uint8_t> input,
                     options.task_executor.get());
                 split_payload = std::move(candidates.split);
                 slot_payload = std::move(candidates.slots);
+                contextual_slot_payload = std::move(candidates.contextual_slots);
                 sequence_payload = std::move(candidates.sequence);
             } else {
                 auto legacy =
                     codec::encode_lz77_split_payloads(lz_payload, options.fast_entropy,
                                                       options.task_executor.get());
-                split_payload = std::move(legacy.first);
-                slot_payload = std::move(legacy.second);
+                split_payload = std::move(legacy.split);
+                slot_payload = std::move(legacy.slots);
+                contextual_slot_payload = std::move(legacy.contextual_slots);
                 if (try_sequence) {
                     auto useful_size = std::min(best_size, lz_payload.size());
                     if (entropy_payload) {
@@ -485,6 +495,10 @@ ByteVector compress(std::span<const std::uint8_t> input,
                     useful_size = std::min(useful_size, split_payload->size());
                     if (slot_payload) {
                         useful_size = std::min(useful_size, slot_payload->size());
+                    }
+                    if (contextual_slot_payload) {
+                        useful_size =
+                            std::min(useful_size, contextual_slot_payload->size());
                     }
                     sequence_payload = codec::encode_lz77_sequence_streams(
                         input, lz_payload, options.fast_entropy, useful_size,
@@ -514,6 +528,13 @@ ByteVector compress(std::span<const std::uint8_t> input,
                 best_size = slot_payload->size();
                 codec = core::CodecId::greedy_lz77_split_slots;
                 payload = std::move(*slot_payload);
+            }
+
+            if (contextual_slot_payload &&
+                contextual_slot_payload->size() < best_size) {
+                best_size = contextual_slot_payload->size();
+                codec = core::CodecId::lz77_contextual_slots;
+                payload = std::move(*contextual_slot_payload);
             }
 
             if (sequence_payload && sequence_payload->size() < best_size) {
@@ -656,6 +677,9 @@ ByteVector decompress(std::span<const std::uint8_t> archive,
     } else if (header.codec == core::CodecId::lz77_sequences) {
         restored = codec::decode_lz77_sequence_streams(
             payload, core::checked_size(header.original_size, "original size"));
+    } else if (header.codec == core::CodecId::lz77_contextual_slots) {
+        restored.resize(core::checked_size(header.original_size, "original size"));
+        codec::decode_lz77_contextual_slot_streams_into(payload, restored);
     } else if (header.codec == core::CodecId::parallel_blocks) {
         std::uint32_t combined_crc = 0;
         restored = codec::decode_parallel_blocks(
@@ -671,6 +695,7 @@ ByteVector decompress(std::span<const std::uint8_t> archive,
             },
             &combined_crc,
             header.format_version >= core::kSequenceVersion,
+            header.format_version >= core::kContextSplitVersion,
             header.format_version >= core::kVersion);
         restored_crc = combined_crc;
     } else {
