@@ -14,6 +14,14 @@ archive container, a native Win32 GUI, a scriptable CLI,
 integrity checks, encryption, recovery data, split volumes, signing, and SFX
 packaging.
 
+## Screenshots
+
+[![Axiom's native Windows archive browser in dark mode](docs/images/axiom-gui.png)](docs/images/axiom-gui.png)
+
+| Add to archive | Interactive command line |
+|---|---|
+| [![Axiom's Add to archive dialog](docs/images/axiom-add-to-archive.png)](docs/images/axiom-add-to-archive.png) | [![The interactive Axiom command shell](docs/images/axiom-cli.png)](docs/images/axiom-cli.png) |
+
 ## Start here
 
 Most users need one of these paths:
