@@ -6,7 +6,7 @@ line. Its main archive format is `.axar`; the lower-level single-stream format i
 
 The current goal is competitive modern solid compression with a simple, bounded
 decoder. Axiom is measured across LZ4, zstd, Deflate, bzip2, LZMA2, and WinRAR
-RAR5 rather than treating any one format as the sole target. On the Silesia
+RAR5. On the Silesia
 corpus the maximum preset sits between zstd's high-ratio profiles and LZMA2,
 while retaining much faster decode than WinRAR, bzip2, and LZMA2 (see the
 performance section below). Beyond the codec, the project has a complete
