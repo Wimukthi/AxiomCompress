@@ -1,5 +1,6 @@
 #include "axiom/archive.hpp"
 #include "axiom/axiom.hpp"
+#include "archive/container_internal.hpp"
 #include "codec/block.hpp"
 #include "codec/fast_lz.hpp"
 #include "codec/lz77.hpp"
@@ -2937,6 +2938,35 @@ void test_archive_operation_control() {
     writer.join();
     AXIOM_CHECK(!incoherent.load(std::memory_order_acquire));
 
+    // Exercise concurrent callback replacement so the portable pointer lock
+    // retains the lifetime guarantees previously supplied by atomic<shared_ptr>.
+    auto replaceable_callback = std::make_shared<axiom::OperationControl>();
+    std::atomic_uint64_t callback_calls = 0;
+    std::jthread callback_setter([&] {
+        for (std::uint64_t value = 0; value < 5000; ++value) {
+            replaceable_callback->set_progress_callback(
+                [&](const axiom::OperationProgress&) {
+                    callback_calls.fetch_add(1, std::memory_order_relaxed);
+                });
+            if ((value & 1u) != 0) {
+                replaceable_callback->set_progress_callback({});
+            }
+        }
+    });
+    for (std::uint64_t value = 1; value <= 5000; ++value) {
+        replaceable_callback->report({
+            axiom::OperationStage::compressing, value, 5000,
+            value, 5000, std::to_string(value), value, 5000, value});
+    }
+    callback_setter.join();
+    replaceable_callback->set_progress_callback(
+        [&](const axiom::OperationProgress&) {
+            callback_calls.fetch_add(1, std::memory_order_relaxed);
+        });
+    replaceable_callback->report({axiom::OperationStage::finalizing,
+                                  5000, 5000, 5000, 5000});
+    AXIOM_CHECK(callback_calls.load(std::memory_order_relaxed) > 0);
+
     const auto cancelled_archive = root / "cancelled.axar";
     auto cancelled = std::make_shared<axiom::OperationControl>();
     cancelled->request_cancel();
@@ -2947,6 +2977,18 @@ void test_archive_operation_control() {
 
     std::error_code ec;
     fs::remove_all(root, ec);
+}
+
+void test_archive_timestamp_conversion() {
+    // Archive timestamps remain whole Unix seconds, but conversion between the
+    // filesystem and system clocks must work without chrono::clock_cast.
+    for (const std::int64_t seconds : {
+             std::int64_t{-1}, std::int64_t{0}, std::int64_t{1},
+             std::int64_t{1609459200}, std::int64_t{4102444800}}) {
+        const auto restored = axiom::to_unix_seconds(
+            axiom::from_unix_seconds(seconds));
+        AXIOM_CHECK(std::llabs(restored - seconds) <= 1);
+    }
 }
 
 void test_compression_estimator() {
@@ -3576,6 +3618,7 @@ int main() {
     test_archive_authenticity_and_sfx();
     test_archive_encryption();
     test_archive_encrypted_directory();
+    test_archive_timestamp_conversion();
     test_archive_operation_control();
     test_compression_estimator();
 #if defined(_WIN32)

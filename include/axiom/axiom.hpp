@@ -79,7 +79,10 @@ public:
         auto value = callback
             ? std::make_shared<ProgressCallback>(std::move(callback))
             : std::shared_ptr<ProgressCallback>{};
-        progress_callback_.store(std::move(value), std::memory_order_release);
+        {
+            std::lock_guard lock(progress_callback_mutex_);
+            progress_callback_ = std::move(value);
+        }
         progress_callback_present_.store(present, std::memory_order_release);
     }
 
@@ -137,16 +140,20 @@ public:
                                          std::memory_order_relaxed);
         if (progress_writer_path_ != progress.current_path) {
             progress_writer_path_ = progress.current_path;
-            progress_path_.store(
-                std::make_shared<const std::string>(progress.current_path),
-                std::memory_order_relaxed);
+            std::lock_guard lock(progress_path_mutex_);
+            progress_path_ =
+                std::make_shared<const std::string>(progress.current_path);
         }
         const std::uint64_t version =
             progress_version_.fetch_add(1, std::memory_order_release) + 1;
         progress_writer_.clear(std::memory_order_release);
 
         if (progress_callback_present_.load(std::memory_order_acquire)) {
-            auto callback = progress_callback_.load(std::memory_order_acquire);
+            std::shared_ptr<ProgressCallback> callback;
+            {
+                std::lock_guard lock(progress_callback_mutex_);
+                callback = progress_callback_;
+            }
             if (!callback) return;
             OperationProgress published = progress;
             published.sequence = version / 2;
@@ -177,7 +184,11 @@ public:
                 progress_file_total_bytes_.load(std::memory_order_relaxed);
             result.throughput_bytes =
                 progress_throughput_bytes_.load(std::memory_order_relaxed);
-            const auto path = progress_path_.load(std::memory_order_relaxed);
+            std::shared_ptr<const std::string> path;
+            {
+                std::lock_guard lock(progress_path_mutex_);
+                path = progress_path_;
+            }
             if (path) result.current_path = *path;
             const std::uint64_t after = progress_version_.load(std::memory_order_acquire);
             if (before == after && (after & 1u) == 0) {
@@ -239,7 +250,10 @@ private:
     mutable std::condition_variable pause_cv_;
     mutable std::mutex warning_mutex_;
     mutable std::vector<OperationWarning> warnings_;
-    mutable std::atomic<std::shared_ptr<ProgressCallback>> progress_callback_;
+    // Narrow pointer locks keep callback replacement and path snapshots
+    // portable to Apple libc++ versions without atomic<shared_ptr>.
+    mutable std::mutex progress_callback_mutex_;
+    mutable std::shared_ptr<ProgressCallback> progress_callback_;
     mutable std::atomic_bool progress_callback_present_{false};
     mutable std::atomic_flag progress_writer_ = ATOMIC_FLAG_INIT;
     mutable std::atomic_uint64_t progress_version_{0};
@@ -252,7 +266,8 @@ private:
     mutable std::atomic_uint64_t progress_file_completed_bytes_{0};
     mutable std::atomic_uint64_t progress_file_total_bytes_{0};
     mutable std::atomic_uint64_t progress_throughput_bytes_{0};
-    mutable std::atomic<std::shared_ptr<const std::string>> progress_path_{
+    mutable std::mutex progress_path_mutex_;
+    mutable std::shared_ptr<const std::string> progress_path_{
         std::make_shared<const std::string>()};
     mutable std::string progress_writer_path_;
 };

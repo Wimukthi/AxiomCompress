@@ -278,15 +278,44 @@ private:
 
 }  // namespace
 
+namespace {
+
+template <typename Clock, typename Duration>
+auto file_time_to_system(std::chrono::time_point<Clock, Duration> stamp) {
+    if constexpr (requires { Clock::to_sys(stamp); }) {
+        return Clock::to_sys(stamp);
+    } else {
+        // Older standard libraries expose neither file_clock::to_sys nor
+        // clock_cast. Preserve the clock offset at the instant of conversion.
+        return std::chrono::system_clock::now() +
+            std::chrono::duration_cast<std::chrono::system_clock::duration>(
+                stamp - Clock::now());
+    }
+}
+
+template <typename Clock, typename Duration>
+auto system_time_to_file(
+    std::chrono::time_point<std::chrono::system_clock, Duration> stamp) {
+    if constexpr (requires { Clock::from_sys(stamp); }) {
+        return Clock::from_sys(stamp);
+    } else {
+        return Clock::now() +
+            std::chrono::duration_cast<typename Clock::duration>(
+                stamp - std::chrono::system_clock::now());
+    }
+}
+
+}  // namespace
+
 // Shared with the other archive TUs via container_internal.hpp.
 std::int64_t to_unix_seconds(fs::file_time_type stamp) {
-    const auto system = std::chrono::clock_cast<std::chrono::system_clock>(stamp);
+    const auto system = file_time_to_system(stamp);
     return std::chrono::duration_cast<std::chrono::seconds>(system.time_since_epoch()).count();
 }
 
 fs::file_time_type from_unix_seconds(std::int64_t seconds) {
     const std::chrono::system_clock::time_point system{std::chrono::seconds{seconds}};
-    return std::chrono::clock_cast<fs::file_time_type::clock>(system);
+    return system_time_to_file<fs::file_time_type::clock>(system);
 }
 
 // ---- path safety -----------------------------------------------------------
