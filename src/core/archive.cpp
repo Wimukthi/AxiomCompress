@@ -35,7 +35,8 @@ constexpr std::uint16_t kLegacyVersion = 4;
 constexpr std::uint16_t kTransformVersion = 5;
 constexpr std::uint16_t kSequenceVersion = 6;
 constexpr std::uint16_t kContextSplitVersion = 7;
-constexpr std::uint16_t kVersion = 8;
+constexpr std::uint16_t kContextualFooterVersion = 8;
+constexpr std::uint16_t kVersion = 9;
 constexpr std::size_t kLegacyHeaderSize = 32;
 constexpr std::size_t kHeaderSize = 36;
 constexpr std::uint8_t kFlagTransforms = 1u << 0;
@@ -236,7 +237,7 @@ ArchiveHeader read_archive_header(std::span<const std::uint8_t> archive) {
     const auto version = read_u16(archive, cursor);
     if (version != kLegacyVersion && version != kTransformVersion &&
         version != kSequenceVersion && version != kContextSplitVersion &&
-        version != kVersion) {
+        version != kContextualFooterVersion && version != kVersion) {
         throw FormatError("unsupported archive version");
     }
 
@@ -261,7 +262,7 @@ ArchiveHeader read_archive_header(std::span<const std::uint8_t> archive) {
                version >= kSequenceVersion) {
         header.codec = CodecId::lz77_sequences;
     } else if (codec_byte == static_cast<std::uint8_t>(CodecId::lz77_contextual_slots) &&
-               version >= kVersion) {
+               version >= kContextualFooterVersion) {
         header.codec = CodecId::lz77_contextual_slots;
     } else {
         throw FormatError("unsupported codec id");
@@ -455,6 +456,8 @@ ByteVector compress(std::span<const std::uint8_t> input,
                 : std::async(std::launch::async, std::move(encode_blocks));
         }
 
+        core::TaskExecutor* candidate_executor = options.task_executor.get();
+
         auto consider_lz_payload = [&](ByteVector lz_payload, bool try_sequence) {
             if (options.operation) {
                 options.operation->checkpoint();
@@ -475,7 +478,7 @@ ByteVector compress(std::span<const std::uint8_t> input,
             if (try_sequence && options.fast_entropy) {
                 auto candidates = codec::encode_lz77_payload_candidates(
                     input, lz_payload, options.fast_entropy,
-                    options.task_executor.get());
+                    candidate_executor);
                 split_payload = std::move(candidates.split);
                 slot_payload = std::move(candidates.slots);
                 contextual_slot_payload = std::move(candidates.contextual_slots);
@@ -483,7 +486,7 @@ ByteVector compress(std::span<const std::uint8_t> input,
             } else {
                 auto legacy =
                     codec::encode_lz77_split_payloads(lz_payload, options.fast_entropy,
-                                                      options.task_executor.get());
+                                                      candidate_executor);
                 split_payload = std::move(legacy.split);
                 slot_payload = std::move(legacy.slots);
                 contextual_slot_payload = std::move(legacy.contextual_slots);
@@ -502,7 +505,7 @@ ByteVector compress(std::span<const std::uint8_t> input,
                     }
                     sequence_payload = codec::encode_lz77_sequence_streams(
                         input, lz_payload, options.fast_entropy, useful_size,
-                        options.task_executor.get());
+                        candidate_executor);
                 }
             }
 
@@ -563,6 +566,23 @@ ByteVector compress(std::span<const std::uint8_t> input,
         } else {
             if (options.operation) {
                 options.operation->checkpoint();
+            }
+            // Ordinary compress() calls carry no operation executor, which
+            // used to leave the whole-input entropy bake-off (and any nested
+            // codec stage such as the swarm parse) on one core. Scope one
+            // executor to the serial analysis so those stages share the
+            // machine budget; explicit --threads 1 stays fully serial, and
+            // dual-candidate runs keep their existing thread usage.
+            std::optional<core::TaskExecutor> serial_executor;
+            if (candidate_executor == nullptr && !evaluate_parallel_candidate) {
+                const auto serial_workers =
+                    codec::effective_compression_thread_count(
+                        options.thread_count,
+                        std::numeric_limits<std::size_t>::max());
+                if (serial_workers > 1) {
+                    serial_executor.emplace(serial_workers);
+                    candidate_executor = &*serial_executor;
+                }
             }
             // Serial candidates parse the whole input back to back; map the
             // encoders' fine-grained scan fractions onto the input size so the
@@ -696,6 +716,7 @@ ByteVector decompress(std::span<const std::uint8_t> archive,
             &combined_crc,
             header.format_version >= core::kSequenceVersion,
             header.format_version >= core::kContextSplitVersion,
+            header.format_version >= core::kContextualFooterVersion,
             header.format_version >= core::kVersion);
         restored_crc = combined_crc;
     } else {

@@ -74,7 +74,7 @@ than `block_size` spans several blocks.
 Each block's bytes are compressed with `axiom::compress`, producing a
 self-contained `.axc` payload (with its own header and CRC-32 — this is the
 per-block integrity check). Blocks are written back-to-back after the header. The
-`.axc` stream is its own versioned format (currently version `7`) and is described
+`.axc` stream is its own versioned format (currently version `9`) and is described
 in [ARCHITECTURE.md](ARCHITECTURE.md); the container does not interpret a block's
 internals beyond its declared size and checksum.
 
@@ -82,15 +82,15 @@ Before building solid blocks, current writers group regular files by broad type
 and then by extension. This writer policy improves cross-file matching without
 changing AXAR directory semantics. Directories and links retain their scan order.
 
-#### Embedded AXC version 5/6/7 header and transforms
+#### Embedded AXC version 5/6/7/8/9 header and transforms
 
-Versions 5 through 7 keep the original fixed AXC fields and add a bounded transform
+Versions 5 through 9 keep the original fixed AXC fields and add a bounded transform
 metadata area before the codec payload:
 
 | field | type | notes |
 |---|---|---|
 | magic | u8[8] | `"AXIOMC1\0"` |
-| version | u16 | `5`, `6`, or `7` |
+| version | u16 | `5`, `6`, `7`, `8`, or `9` |
 | codec | u8 | inner store/LZ/parallel codec identifier |
 | flags | u8 | bit `0x01` means transform metadata is present |
 | original_size | u64 | restored byte count |
@@ -133,6 +133,19 @@ either raw literals or literals XORed with the current rep0 prediction. Version 
 also introduces transform id `3`. Writers entropy-screen 16-bit numeric ranges,
 validate tar member boundaries when discovering nested ranges, and retain the
 transform only after a fast trial predicts a net archive-size win.
+
+Version 8 adds contextual coding for the low distance-footer bits and static
+match-byte/full-previous literal modes. Version 9 adds parallel-block codec id
+`10`, the parser-checkpoint context-split representation. A zero-output command
+contains four descriptor bytes: values `0..3` copy a distance from the decoder's
+current four-entry recent-distance table, while value `4` reads one explicit
+distance from the normal distance-slot stream. The four selected values replace
+the table atomically. Checkpoint distances must be nonzero and no greater than
+the output position; descriptor, stream-consumption, and footer padding checks
+remain exact. Matches retain the full block window but may not cross the static
+encoder-selected checkpoint boundaries. The complete version-9 payload,
+including every reset descriptor, competes against all older block candidates
+and is emitted only when strictly smaller.
 
 ### Central directory (at `directory_offset`)
 
@@ -360,8 +373,8 @@ declared size. The decoder defends against this before allocating:
 ## Compatibility policy
 
 The format is **pre-release and free to change**. The AXAR container remains
-strictly version `4`. New embedded AXC streams are version `7`; current readers
-also accept AXC versions `4`, `5`, and `6`, while older readers reject version `7`.
+strictly version `4`. New embedded AXC streams are version `9`; current readers
+also accept AXC versions `4` through `8`, while older readers reject version `9`.
 Unknown AXAR versions, AXC versions, required flags, codecs, transforms, and
 transform parameters are rejected with a clear error.
 

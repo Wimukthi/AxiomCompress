@@ -31,6 +31,15 @@ ByteVector encode_lz77_optimal(std::span<const std::uint8_t> input,
                                const CompressionOptions& options,
                                const ByteVector* greedy_tokens = nullptr);
 
+// Independent fixed-grain optimal parses whose encoder-selected recent-distance
+// states are carried by format-visible checkpoint tokens. Returns nullopt when
+// the input/executor cannot benefit; callers must still compare the complete
+// encoded representation against the ordinary global parse.
+std::optional<ByteVector> encode_lz77_optimal_checkpointed(
+    std::span<const std::uint8_t> input,
+    const CompressionOptions& options,
+    const ByteVector& greedy_tokens);
+
 ByteVector decode_lz77(std::span<const std::uint8_t> encoded,
                        std::size_t output_size);
 

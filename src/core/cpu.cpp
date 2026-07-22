@@ -102,8 +102,19 @@ const CpuFeatures& cpu_features() {
 
 namespace {
 
+std::size_t detect_logical_processors() {
+#if defined(_WIN32)
+    const auto count = GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
+    if (count != 0) {
+        return static_cast<std::size_t>(count);
+    }
+#endif
+    const auto fallback =
+        static_cast<std::size_t>(std::thread::hardware_concurrency());
+    return fallback != 0 ? fallback : 1;
+}
+
 std::size_t detect_physical_cores() {
-    const auto logical = static_cast<std::size_t>(std::thread::hardware_concurrency());
 #if defined(_WIN32)
     DWORD length = 0;
     GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &length);
@@ -130,10 +141,47 @@ std::size_t detect_physical_cores() {
         }
     }
 #endif
-    return logical != 0 ? logical : 1;
+    return logical_processor_count();
 }
 
 }  // namespace
+
+std::size_t logical_processor_count() {
+    static const std::size_t processors = detect_logical_processors();
+    return processors;
+}
+
+void bind_current_thread_to_processor_group(std::size_t worker_index) {
+#if defined(_WIN32)
+    const auto group_count = GetActiveProcessorGroupCount();
+    if (group_count <= 1) {
+        return;
+    }
+
+    auto slot = worker_index % logical_processor_count();
+    for (WORD group = 0; group < group_count; ++group) {
+        const auto active = GetActiveProcessorCount(group);
+        if (active == 0) {
+            continue;
+        }
+        if (slot >= active) {
+            slot -= active;
+            continue;
+        }
+
+        constexpr auto kAffinityBits = sizeof(KAFFINITY) * 8;
+        GROUP_AFFINITY affinity{};
+        affinity.Group = group;
+        affinity.Mask = active >= kAffinityBits
+            ? ~KAFFINITY{0}
+            : (KAFFINITY{1} << active) - 1;
+        (void)SetThreadGroupAffinity(GetCurrentThread(), &affinity, nullptr);
+        return;
+    }
+#else
+    (void)worker_index;
+#endif
+}
 
 std::size_t physical_core_count() {
     static const std::size_t cores = detect_physical_cores();

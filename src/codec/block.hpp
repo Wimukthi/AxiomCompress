@@ -16,18 +16,18 @@ ByteVector decode_parallel_blocks(std::span<const std::uint8_t> encoded,
                                   std::uint32_t* crc32 = nullptr,
                                   bool allow_sequence_codec = true,
                                   bool allow_context_split_codec = true,
-                                  bool allow_contextual_footer_codec = true);
+                                  bool allow_contextual_footer_codec = true,
+                                  bool allow_checkpoint_codec = true);
 
 std::size_t effective_parallel_block_size(std::size_t input_size,
                                           const CompressionOptions& options);
 
 std::size_t effective_thread_count(std::size_t requested_threads, std::size_t work_items);
 
-// Worker count for compression: like effective_thread_count, but an
-// unspecified request (0) maps to the physical core count instead of the
-// logical processor count. Compression is memory-bound enough that SMT
-// siblings add contention, not throughput (measured flat-to-negative
-// scaling past the physical core count). Decode keeps the logical count.
+// Worker budget for compression. Automatic mode exposes every logical
+// processor to the shared executor; ratio-oriented block planning is computed
+// separately, so SMT helpers can run nested parser/entropy tasks without
+// forcing smaller block boundaries.
 std::size_t effective_compression_thread_count(std::size_t requested_threads,
                                                std::size_t work_items);
 

@@ -265,6 +265,14 @@ preloaded once before timing. Every compression, decompression, and byte-for-byt
 verification pass then runs entirely in memory, so storage throughput and
 temporary-file cleanup do not contaminate the codec result.
 
+The default versioned synthetic corpus uses deterministic literals and
+log-distributed backward matches to exercise the match finder across the active
+window, rather than timing a trivially repeated string. Automatic sizing fits
+the selected level and available memory, while each measured phase repeats long
+enough to reduce timer noise. Continuous mode runs until **Stop**, retaining
+bounded recent-pass details plus lifetime throughput, rolling variation, and a
+stability indicator.
+
 ## CLI quick start
 
 Use `axiomc.exe` for scripts and automation:

@@ -36,6 +36,7 @@ enum class BlockCodec : std::uint8_t {
     lz77_context_split = 7,
     lz77_contextual_slots = 8,
     lz77_contextual_slots_context_split = 9,
+    lz77_checkpoint_context_split = 10,
 };
 
 struct BlockResult {
@@ -179,6 +180,10 @@ BlockCodec read_block_codec(std::uint8_t value) {
                      BlockCodec::lz77_contextual_slots_context_split)) {
         return BlockCodec::lz77_contextual_slots_context_split;
     }
+    if (value == static_cast<std::uint8_t>(
+                     BlockCodec::lz77_checkpoint_context_split)) {
+        return BlockCodec::lz77_checkpoint_context_split;
+    }
 
     throw FormatError("unsupported block codec");
 }
@@ -212,7 +217,7 @@ BlockResult compress_block(std::span<const std::uint8_t> input,
         return finish_best();
     }
 
-    if (options.use_fast_lz) {
+    if (options.use_fast_lz && !options.swarm_parse) {
         // The fast path's primary codec is LZ77 sequences entropy-coded with the
         // split-stream rANS backend. The parser fills split streams directly and
         // only estimates the raw LZ77 candidate size; raw bytes are materialized
@@ -451,9 +456,53 @@ BlockResult compress_block(std::span<const std::uint8_t> input,
         // so they must outlive the parse; two-pass mode releases them first —
         // keeping the extra buffer live through the long DP measurably hurts
         // cache behaviour.
-        auto optimal_tokens = encode_lz77_optimal(input, optimal_options, &greedy);
+        std::optional<std::future<std::optional<ByteVector>>> checkpoint_task;
+        auto checkpoint_options = optimal_options;
+        checkpoint_options.encode_progress = {};
+        if (options.swarm_parse && executor != nullptr &&
+            executor->worker_count() > 1) {
+            // Preserve the exact global DP as the ratio incumbent, but run the
+            // independent checkpoint DP beside it. SMT helpers then have useful
+            // work while this block worker advances the ordered path.
+            checkpoint_task.emplace(executor->submit(
+                [input, checkpoint_options, &greedy] {
+                    return encode_lz77_optimal_checkpointed(
+                        input, checkpoint_options, greedy);
+                }));
+        }
+
+        std::optional<ByteVector> optimal_tokens;
+        std::optional<ByteVector> checkpoint_tokens;
+        std::exception_ptr parse_error;
+        try {
+            optimal_tokens =
+                encode_lz77_optimal(input, optimal_options, &greedy);
+        } catch (...) {
+            parse_error = std::current_exception();
+        }
+        if (checkpoint_task) {
+            try {
+                checkpoint_tokens = executor->wait(*checkpoint_task);
+            } catch (...) {
+                if (!parse_error) {
+                    parse_error = std::current_exception();
+                }
+            }
+        }
+        if (parse_error) {
+            std::rethrow_exception(parse_error);
+        }
         consider_lz_payload(std::move(greedy), /*try_sequence=*/false);
-        consider_lz_payload(std::move(optimal_tokens), /*try_sequence=*/true);
+        consider_lz_payload(std::move(*optimal_tokens), /*try_sequence=*/true);
+        if (checkpoint_tokens) {
+            auto payload = encode_lz77_checkpoint_context_streams(
+                input, *checkpoint_tokens, executor);
+            if (payload && payload->size() < best_size) {
+                best_size = payload->size();
+                best.codec = BlockCodec::lz77_checkpoint_context_split;
+                best.payload = std::move(*payload);
+            }
+        }
     } else {
         consider_lz_payload(std::move(greedy), /*try_sequence=*/!run_optimal);
         if (run_optimal) {
@@ -523,6 +572,11 @@ void decompress_block_into(std::span<const std::uint8_t> payload,
         return;
     }
 
+    if (codec == BlockCodec::lz77_checkpoint_context_split) {
+        decode_lz77_checkpoint_context_streams_into(payload, output);
+        return;
+    }
+
     throw FormatError("unsupported block codec");
 }
 
@@ -582,7 +636,7 @@ std::size_t effective_thread_count(std::size_t requested_threads, std::size_t wo
 
     auto threads = requested_threads;
     if (threads == 0) {
-        threads = std::thread::hardware_concurrency();
+        threads = core::logical_processor_count();
     }
     if (threads == 0) {
         threads = 1;
@@ -593,9 +647,7 @@ std::size_t effective_thread_count(std::size_t requested_threads, std::size_t wo
 
 std::size_t effective_compression_thread_count(std::size_t requested_threads,
                                                std::size_t work_items) {
-    return effective_thread_count(
-        requested_threads == 0 ? core::physical_core_count() : requested_threads,
-        work_items);
+    return effective_thread_count(requested_threads, work_items);
 }
 
 std::size_t effective_parallel_block_size(std::size_t input_size,
@@ -793,7 +845,8 @@ ByteVector decode_parallel_blocks(std::span<const std::uint8_t> encoded,
                                   std::uint32_t* crc32,
                                   bool allow_sequence_codec,
                                   bool allow_context_split_codec,
-                                  bool allow_contextual_footer_codec) {
+                                  bool allow_contextual_footer_codec,
+                                  bool allow_checkpoint_codec) {
     if (operation) {
         operation->checkpoint();
     }
@@ -821,6 +874,12 @@ ByteVector decode_parallel_blocks(std::span<const std::uint8_t> encoded,
                        BlockCodec::lz77_contextual_slots_context_split;
         })) {
         throw FormatError("contextual footer block codec requires AXC version 8");
+    }
+    if (!allow_checkpoint_codec &&
+        std::any_of(blocks.begin(), blocks.end(), [](const auto& block) {
+            return block.codec == BlockCodec::lz77_checkpoint_context_split;
+        })) {
+        throw FormatError("parser-checkpoint block codec requires AXC version 9");
     }
 
     ByteVector output(output_size);

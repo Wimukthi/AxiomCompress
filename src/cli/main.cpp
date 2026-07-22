@@ -86,6 +86,8 @@ void print_usage() {
         "  --lazy / --no-lazy  --fast-entropy     (override level knobs)\n"
         "  --fast-lz          --no-filters        (byte-token profile / disable file filters)\n"
         "  --window SIZE                          (match window; bounds --bt memory)\n"
+        "  --swarm                                (levels 1-6, 8-9: cores cooperate\n"
+        "                                          inside large blocks; level 7 ignores it)\n"
         "  --recovery N                           add 1..100% Reed-Solomon recovery data\n"
         "  --bt                                   (binary-tree match finder)\n"
         "  --optimal          --optimal-depth N   --optimal-candidates N\n"
@@ -609,6 +611,8 @@ bool take_compression_flags(std::vector<std::string>& args, axiom::CompressionOp
             options.window_size = parse_size(next("--window"));
         } else if (arg == "--bt") {
             options.use_tree_matcher = true;
+        } else if (arg == "--swarm") {
+            options.swarm_parse = true;
         } else if (arg == "--parallel") {
             options.force_parallel_blocks = true;
         } else if (arg == "--optimal") {

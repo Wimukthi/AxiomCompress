@@ -153,8 +153,8 @@ public:
 
     mz_zip_archive& zip() { return zip_; }
     const mz_zip_archive& zip() const { return zip_; }
-    const fs::path& path() const { return path_; }
     std::uint64_t size() const { return size_; }
+    const fs::path& path() const { return path_; }
     bool is_split() const { return split_reader_ != nullptr; }
     const std::vector<SplitZipEntryInfo>& split_entries() const {
         if (!split_reader_) throw std::logic_error("ZIP is not split");
@@ -231,6 +231,7 @@ public:
 
     mz_zip_archive& zip() { return zip_; }
     const mz_zip_archive& zip() const { return zip_; }
+    std::uint64_t size() const { return size_; }
 
     void finalize() {
         if (!mz_zip_writer_finalize_archive(&zip_)) {
@@ -252,10 +253,15 @@ private:
         }
         self->stream_.write(static_cast<const char*>(buffer),
                             static_cast<std::streamsize>(count));
+        if (self->stream_) {
+            self->size_ = std::max<std::uint64_t>(
+                self->size_, static_cast<std::uint64_t>(file_ofs) + count);
+        }
         return self->stream_ ? count : 0;
     }
 
     std::ofstream stream_;
+    std::uint64_t size_ = 0;
     mz_zip_archive zip_{};
     bool open_ = false;
 };
@@ -1438,6 +1444,7 @@ void validate_zip_items(const std::vector<ScanItem>& items,
 
 struct ZipFileReadContext {
     std::ifstream input;
+    ZipWriter* writer = nullptr;
     std::shared_ptr<OperationControl> operation;
     std::uint64_t* completed_bytes = nullptr;
     std::uint64_t total_bytes = 0;
@@ -1470,7 +1477,10 @@ size_t zip_file_read_callback(void* opaque, mz_uint64 file_ofs, void* buffer, si
                              *context->completed_bytes, context->total_bytes,
                              context->completed_items, context->total_items,
                              context->current_path, end_offset,
-                             context->current_file_total);
+                             context->current_file_total,
+                             *context->completed_bytes,
+                             context->writer != nullptr ? context->writer->size() : 0,
+                             *context->completed_bytes);
         }
         return read;
     } catch (const OperationCancelled&) {
@@ -1530,7 +1540,8 @@ void add_zip_scan_item(ZipWriter& writer, const ScanItem& item,
         ++completed_items;
         report_operation(options.operation, OperationStage::compressing,
                          completed_bytes, total_bytes, completed_items, total_items,
-                         item.archive_path);
+                         item.archive_path, 0, 0, completed_bytes,
+                         writer.size(), completed_bytes);
         return;
     }
     if (item.is_symlink) {
@@ -1553,6 +1564,7 @@ void add_zip_scan_item(ZipWriter& writer, const ScanItem& item,
         return;
     }
     context.operation = options.operation;
+    context.writer = &writer;
     context.completed_bytes = &completed_bytes;
     context.total_bytes = total_bytes;
     context.completed_items = completed_items;
@@ -1573,7 +1585,8 @@ void add_zip_scan_item(ZipWriter& writer, const ScanItem& item,
     ++completed_items;
     report_operation(options.operation, OperationStage::compressing,
                       completed_bytes, total_bytes, completed_items, total_items,
-                      item.archive_path, size, size);
+                      item.archive_path, size, size, completed_bytes,
+                      writer.size(), completed_bytes);
 }
 
 template <typename KeepExisting>
@@ -1637,7 +1650,8 @@ void rebuild_zip_archive(const fs::path& archive_path,
                                   completed_items, total_items, false);
             }
             report_operation(options.operation, OperationStage::finalizing,
-                             completed_bytes, total_bytes, completed_items, total_items);
+                             completed_bytes, total_bytes, completed_items, total_items,
+                             {}, 0, 0, completed_bytes, writer.size(), completed_bytes);
             writer.finalize();
         }
     } else {
@@ -1654,7 +1668,8 @@ void rebuild_zip_archive(const fs::path& archive_path,
                                   options.skip_unreadable_files);
             }
             report_operation(options.operation, OperationStage::finalizing,
-                             completed_bytes, total_bytes, completed_items, total_items);
+                             completed_bytes, total_bytes, completed_items, total_items,
+                             {}, 0, 0, completed_bytes, writer.size(), completed_bytes);
             writer.finalize();
         }
     }
@@ -1663,7 +1678,9 @@ void rebuild_zip_archive(const fs::path& archive_path,
     replace_archive_file(temp_path, archive_path);
     temp_guard.dismiss();
     report_operation(options.operation, OperationStage::finalizing,
-                     total_bytes, total_bytes, total_items, total_items);
+                     total_bytes, total_bytes, total_items, total_items,
+                     {}, 0, 0, total_bytes, checked_file_size(archive_path),
+                     total_bytes);
 }
 
 std::string zip_writer_path(std::string path, bool is_directory) {

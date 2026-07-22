@@ -396,15 +396,16 @@ These options apply to commands that create or recompress data: `add`, `update`,
 
 ### Threads: `--threads N`
 
-`0` is the default and means "use the machine": compression uses all physical
-cores (hyperthread siblings measurably contend rather than help on the codec's
-memory-bound hot loops), while decompression, testing, and extraction use all
-logical processors. An explicit `N` is honored as given in both directions.
-Axiom caps long-running block jobs to the number of blocks. Larger single-block
-inputs can still use spare workers for independent candidate layouts and entropy
-substreams through the shared work-stealing executor; tiny inputs stay serial.
-Match discovery within one block remains ordered, so levels 8-9 scale best when
-the input contains several ratio-friendly blocks.
+`0` is the default and means "use the machine": compression, decompression,
+testing, and extraction expose all logical processors to their executor. For
+compression, automatic block sizing still targets physical cores; this keeps
+the ratio-friendly geometry stable while SMT siblings take nested parser and
+entropy tasks. An explicit `N` is honored as given. Axiom caps long-running
+outer block jobs to the number of blocks, but the shared work-stealing executor
+retains the full logical-worker budget. Tiny inputs stay serial. Match discovery
+within a level 8-9 block remains ordered, so Task Manager need not show 100%:
+on memory-bound phases, one busy thread per physical core can be the fastest
+schedule even though all logical workers are available.
 
 ```powershell
 axiomc a --threads 8 archive.axar Data
@@ -446,9 +447,9 @@ axiomc c --level 9 --no-filters app.exe app-unfiltered.axc
 axiomc a --level 9 --no-filters archive.axar Data
 ```
 
-New streams use AXC version 7. The reader remains compatible with AXC versions
-4, 5, and 6, but older Axiom builds do not understand version-7 hybrid block
-payloads or numeric transforms.
+New streams use AXC version 9. The reader remains compatible with AXC versions
+4 through 8, but older Axiom builds do not understand version-9 parser
+checkpoints when that block candidate wins.
 
 ### Dictionary size: `--window SIZE`
 
@@ -495,6 +496,7 @@ axiomc a --chain-depth 256 archive.axar Data
 | `--no-lazy` | Disable that extra match check |
 | `--fast-entropy` | Use cheaper entropy-coder selection |
 | `--parallel` | Force the independent parallel-block path |
+| `--swarm` | Levels 1-6 and 8-9: cooperate inside each block (see below) |
 
 The optimal parser has significant per-byte CPU and memory cost. Give it a
 bounded block size:
@@ -502,6 +504,56 @@ bounded block size:
 ```powershell
 axiomc a --level 7 --optimal --block-size 16M archive.axar Data
 ```
+
+### Threading model: `--swarm`
+
+Axiom's default threading model splits the input into independent blocks and
+compresses one per worker. This is the fastest general-purpose option, but the
+ratio eases slightly as more cores drive the automatic block size smaller, and a
+large `--block-size` chosen for ratio leaves most cores idle during the parse.
+
+At levels 2-6, `--swarm` parses each block cooperatively: segments are indexed
+and parsed in parallel against the full block window, then merged into one token
+stream. It is most useful with a large solid block, where it recovers the
+single-block ratio without the single-thread cost:
+
+```powershell
+axiomc a --level 6 --block-size 128M --window 128M --swarm archive.axar Data
+```
+
+Level 1 normally uses Axiom's fastest byte-token parser. Swarm intentionally
+replaces that parser with the cooperative hash-chain path: expect a better ratio
+but lower throughput, so this is a ratio-oriented override rather than a faster
+level 1.
+
+At levels 8-9, swarm parallelizes the preliminary binary-tree candidate. The
+global optimal parser remains intact, and the normal representation bake-off
+keeps a candidate only when it is smaller. The effect is consequently modest;
+supplemental prior-segment searches use the preset's bounded optimal-search
+depth. It does not turn the path-dependent optimal pass into independent
+segment DPs.
+
+Level 9 automatically separates exact global-tree discovery from path selection,
+independently of `--swarm`.
+The tree publishes fixed 256 KiB candidate tiles one task ahead while the DP
+consumes the current tile. These tasks use the shared work-stealing executor, so
+a consumer can produce its own next tile when other workers are occupied. Only
+the current and next tile are retained, and the result is byte-identical to the
+serial global-tree DP. Level 8 keeps the direct parser because its shallower tree
+does not amortize the pipeline framing.
+
+With `--swarm`, blocks of at least 4 MiB also trial AXC v9 parser checkpoints.
+Approximately 2 MiB token-aligned tiles receive static recent-distance seeds and
+run independent optimal DPs through the same work-stealing executor. Matches can
+still reference the full preceding block window. The encoder entropy-codes the
+concatenated stream globally and writes the checkpoint representation only when
+its complete payload is strictly smaller than the ordinary global-DP winner.
+Level 7's lazy tree parser is not safely segmentable and ignores `--swarm`.
+
+Swarm's levels 1-8 paths are encoder-only choices. Level 9 may write the AXC v9
+checkpoint block codec when it wins the exact bake-off; current readers retain
+compatibility with AXC versions 4 through 8. Fixed geometry keeps output
+independent of thread scheduling.
 
 ### Size syntax
 

@@ -28,6 +28,8 @@ constexpr std::uint8_t kLiteralToken = 0;
 constexpr std::uint8_t kMatchToken = 1;
 constexpr std::uint8_t kRepTokenBase = 2;
 constexpr std::size_t kRepCount = 4;
+constexpr std::uint8_t kCheckpointToken = kRepTokenBase + kRepCount;
+constexpr std::uint8_t kCheckpointExplicit = kRepCount;
 constexpr std::size_t kMinMatch = 4;
 
 enum class StreamCodec : std::uint8_t {
@@ -543,6 +545,7 @@ struct Lz77SequenceAnalysis {
     std::size_t sequence_count = 0;
     std::size_t trailing_literals = 0;
     bool literals_materialized = false;
+    bool has_checkpoints = false;
 };
 
 struct Lz77PayloadAnalysis {
@@ -575,8 +578,11 @@ Lz77PayloadAnalysis analyze_lz77_payload(std::span<const std::uint8_t> input,
     }
 
     std::array<std::size_t, kRepCount> reps{1, 2, 3, 4};
+    std::array<std::size_t, kRepCount> stream_reps{1, 2, 3, 4};
     std::size_t output_position = 0;
+    std::size_t decoded_position = 0;
     std::size_t pending_literals = 0;
+    bool has_match_context = false;
     std::size_t cursor = 0;
 
     while (cursor < lz77_payload.size()) {
@@ -602,13 +608,11 @@ Lz77PayloadAnalysis analyze_lz77_payload(std::span<const std::uint8_t> input,
             }
 
             if (analysis.sequence) {
-                if (pending_literals != 0 ||
-                    encoded_length > std::numeric_limits<std::uint32_t>::max() ||
+                if (encoded_length > std::numeric_limits<std::uint32_t>::max() ||
                     length > input.size() - output_position) {
                     analysis.sequence.reset();
                 } else {
                     auto& sequence = *analysis.sequence;
-                    const bool has_match_context = sequence.sequence_count != 0;
                     sequence.literal_runs.push_back(
                         {output_position, length, reps[0], has_match_context});
                     for (std::size_t i = 0; i < length; ++i) {
@@ -646,11 +650,60 @@ Lz77PayloadAnalysis analyze_lz77_payload(std::span<const std::uint8_t> input,
                     }
                     if (analysis.sequence) {
                         output_position += length;
-                        pending_literals = length;
+                        pending_literals += length;
+                        has_match_context = false;
                     }
                 }
             }
             cursor += length;
+            if (length > std::numeric_limits<std::size_t>::max() - decoded_position) {
+                throw FormatError("LZ77 payload output position overflows");
+            }
+            decoded_position += length;
+            continue;
+        }
+
+        if (token == kCheckpointToken) {
+            std::array<std::size_t, kRepCount> checkpoint_reps{};
+            const auto old_reps = stream_reps;
+            for (auto& distance : checkpoint_reps) {
+                if (build_split) {
+                    if (cursor >= lz77_payload.size()) {
+                        throw FormatError("truncated LZ77 parser checkpoint");
+                    }
+                    split.match_lengths.push_back(lz77_payload[cursor]);
+                }
+                if (cursor >= lz77_payload.size()) {
+                    throw FormatError("truncated LZ77 parser checkpoint");
+                }
+                const auto descriptor = lz77_payload[cursor++];
+                std::uint64_t encoded_distance = 0;
+                if (descriptor < kRepCount) {
+                    encoded_distance = old_reps[descriptor];
+                } else if (descriptor == kCheckpointExplicit) {
+                    const auto distance_start = cursor;
+                    encoded_distance = read_varuint(lz77_payload, cursor);
+                    if (build_split) {
+                        append_split_bytes(
+                            split.distances,
+                            lz77_payload.subspan(distance_start,
+                                                 cursor - distance_start));
+                    }
+                } else {
+                    throw FormatError("invalid LZ77 parser checkpoint descriptor");
+                }
+                if (encoded_distance == 0 || encoded_distance > decoded_position ||
+                    encoded_distance > std::numeric_limits<std::uint32_t>::max()) {
+                    throw FormatError("invalid LZ77 parser checkpoint distance");
+                }
+                distance = static_cast<std::size_t>(encoded_distance);
+            }
+            if (analysis.sequence) {
+                analysis.sequence->has_checkpoints = true;
+                reps = checkpoint_reps;
+                has_match_context = false;
+            }
+            stream_reps = checkpoint_reps;
             continue;
         }
 
@@ -674,6 +727,32 @@ Lz77PayloadAnalysis analyze_lz77_payload(std::span<const std::uint8_t> input,
                 append_split_bytes(split.distances,
                                    lz77_payload.subspan(distance_start, cursor - distance_start));
             }
+        }
+
+        const auto match_output_position = decoded_position;
+        if (encoded_match_length >
+            std::numeric_limits<std::size_t>::max() - decoded_position) {
+            throw FormatError("LZ77 payload output position overflows");
+        }
+        decoded_position += static_cast<std::size_t>(encoded_match_length);
+
+        if (token == kMatchToken) {
+            if (encoded_distance == 0 || encoded_distance > match_output_position ||
+                encoded_distance > std::numeric_limits<std::uint32_t>::max()) {
+                throw FormatError("invalid explicit LZ77 distance");
+            }
+            stream_reps = {static_cast<std::size_t>(encoded_distance),
+                           stream_reps[0], stream_reps[1], stream_reps[2]};
+        } else {
+            const auto index = static_cast<std::size_t>(token - kRepTokenBase);
+            if (stream_reps[index] > match_output_position) {
+                throw FormatError("invalid LZ77 repeat distance");
+            }
+            const auto chosen = stream_reps[index];
+            for (std::size_t i = index; i > 0; --i) {
+                stream_reps[i] = stream_reps[i - 1];
+            }
+            stream_reps[0] = chosen;
         }
 
         if (!analysis.sequence) {
@@ -726,6 +805,7 @@ Lz77PayloadAnalysis analyze_lz77_payload(std::span<const std::uint8_t> input,
                           static_cast<std::uint32_t>(match_length - kMinMatch));
         pending_literals = 0;
         output_position += match_length;
+        has_match_context = true;
         ++sequence.sequence_count;
     }
 
@@ -1859,6 +1939,39 @@ Lz77ContextSplitPayloads encode_lz77_context_split_streams(
                              /*contextual_footer=*/true)};
 }
 
+std::optional<ByteVector> encode_lz77_checkpoint_context_streams(
+    std::span<const std::uint8_t> input,
+    std::span<const std::uint8_t> lz77_payload,
+    core::TaskExecutor* executor) {
+    auto split = encode_lz77_split_payloads(
+        lz77_payload, /*fast=*/false, executor);
+    if (!split.slots) {
+        return std::nullopt;
+    }
+    const auto contextual = split.contextual_slots
+        ? std::span<const std::uint8_t>(*split.contextual_slots)
+        : std::span<const std::uint8_t>{};
+    auto payloads = encode_lz77_context_split_streams(
+        input, lz77_payload, *split.slots, contextual, executor);
+
+    std::optional<ByteVector> winner;
+    auto consider = [&](std::uint8_t mode, std::optional<ByteVector>& candidate) {
+        if (!candidate) {
+            return;
+        }
+        ByteVector framed;
+        framed.reserve(candidate->size() + 1);
+        framed.push_back(mode);
+        framed.insert(framed.end(), candidate->begin(), candidate->end());
+        if (!winner || framed.size() < winner->size()) {
+            winner = std::move(framed);
+        }
+    };
+    consider(0, payloads.slots);
+    consider(1, payloads.contextual_slots);
+    return winner;
+}
+
 std::optional<ByteVector> encode_lz77_sequence_streams(
     std::span<const std::uint8_t> input,
     std::span<const std::uint8_t> lz77_payload,
@@ -1868,7 +1981,7 @@ std::optional<ByteVector> encode_lz77_sequence_streams(
     (void)fast;
     auto analysis = analyze_lz77_payload(input, lz77_payload, /*build_sequence=*/true,
                                          /*build_split=*/false);
-    if (!analysis.sequence) {
+    if (!analysis.sequence || analysis.sequence->has_checkpoints) {
         return std::nullopt;
     }
     constexpr double kSequenceRejectionMargin = 1.02;
@@ -1889,7 +2002,7 @@ Lz77PayloadCandidates encode_lz77_payload_candidates(
                                          /*build_split=*/true);
     double estimated_legacy_size = 0.0;
     std::optional<ByteVector> sequence;
-    if (analysis.sequence) {
+    if (analysis.sequence && !analysis.sequence->has_checkpoints) {
         estimated_legacy_size =
             estimate_legacy_split_size(analysis.split, *analysis.sequence, fast);
         constexpr double kSequenceEstimateTolerance = 1.07;
@@ -2128,7 +2241,8 @@ ByteVector decode_lz77_sequence_streams(std::span<const std::uint8_t> encoded,
 void decode_lz77_context_split_streams_impl(
     std::span<const std::uint8_t> encoded,
     std::span<std::uint8_t> output,
-    bool contextual_footer) {
+    bool contextual_footer,
+    bool allow_checkpoints) {
     std::size_t cursor = 0;
     const auto stream_limit = decoded_stream_limit(output.size());
     const auto commands = read_stream(encoded, cursor, stream_limit);
@@ -2314,6 +2428,31 @@ void decode_lz77_context_split_streams_impl(
             }
             reps[0] = chosen;
             has_match_context = true;
+        } else if (command == kCheckpointToken && allow_checkpoints) {
+            if (out == 0) {
+                throw FormatError("parser checkpoint cannot precede output");
+            }
+            std::array<std::size_t, kRepCount> checkpoint_reps{};
+            const auto old_reps = reps;
+            for (auto& distance : checkpoint_reps) {
+                if (match_length_cursor >= match_lengths.size()) {
+                    throw FormatError("parser checkpoint descriptor underflow");
+                }
+                const auto descriptor = match_lengths[match_length_cursor++];
+                if (descriptor < kRepCount) {
+                    distance = old_reps[descriptor];
+                } else if (descriptor == kCheckpointExplicit) {
+                    distance = distance_reader->read(distance_slots,
+                                                     distance_slot_cursor);
+                } else {
+                    throw FormatError("invalid parser checkpoint descriptor");
+                }
+                if (distance == 0 || distance > out) {
+                    throw FormatError("invalid parser checkpoint distance");
+                }
+            }
+            reps = checkpoint_reps;
+            has_match_context = false;
         } else {
             throw FormatError("unknown context-split command");
         }
@@ -2349,14 +2488,28 @@ void decode_lz77_context_split_streams_into(
     std::span<const std::uint8_t> encoded,
     std::span<std::uint8_t> output) {
     decode_lz77_context_split_streams_impl(
-        encoded, output, /*contextual_footer=*/false);
+        encoded, output, /*contextual_footer=*/false,
+        /*allow_checkpoints=*/false);
 }
 
 void decode_lz77_contextual_slot_context_split_streams_into(
     std::span<const std::uint8_t> encoded,
     std::span<std::uint8_t> output) {
     decode_lz77_context_split_streams_impl(
-        encoded, output, /*contextual_footer=*/true);
+        encoded, output, /*contextual_footer=*/true,
+        /*allow_checkpoints=*/false);
+}
+
+void decode_lz77_checkpoint_context_streams_into(
+    std::span<const std::uint8_t> encoded,
+    std::span<std::uint8_t> output) {
+    if (encoded.empty() || encoded.front() > 1) {
+        throw FormatError("invalid parser-checkpoint footer mode");
+    }
+    decode_lz77_context_split_streams_impl(
+        encoded.subspan(1), output,
+        /*contextual_footer=*/encoded.front() != 0,
+        /*allow_checkpoints=*/true);
 }
 
 void decode_lz77_split_streams_slots_into(std::span<const std::uint8_t> encoded,

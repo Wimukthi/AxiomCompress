@@ -121,8 +121,12 @@ std::size_t effective_io_buffer_size(std::size_t requested) {
 }
 
 std::size_t selected_thread_count(std::size_t requested_threads) {
-    // Solid blocks feed compression workers, which default to physical cores
-    // (SMT siblings measured flat-to-negative for the codec), so size for that.
+    return requested_threads == 0 ? core::logical_processor_count() : requested_threads;
+}
+
+std::size_t selected_geometry_thread_count(std::size_t requested_threads) {
+    // Automatic geometry follows physical cores so SMT helpers do not create
+    // smaller match windows. Explicit requests continue to control both.
     return requested_threads == 0 ? core::physical_core_count() : requested_threads;
 }
 
@@ -132,7 +136,7 @@ std::size_t effective_solid_block_size(const CompressionOptions& options) {
         return block_size;
     }
 
-    const auto threads = selected_thread_count(options.thread_count);
+    const auto threads = selected_geometry_thread_count(options.thread_count);
     if (threads <= 1) {
         return block_size;
     }
@@ -748,7 +752,9 @@ void report_operation(const std::shared_ptr<OperationControl>& operation,
                       std::string current_path,
                       std::uint64_t current_file_completed_bytes,
                       std::uint64_t current_file_total_bytes,
-                      std::uint64_t throughput_bytes) {
+                      std::uint64_t throughput_bytes,
+                      std::uint64_t compressed_bytes,
+                      std::uint64_t compressed_source_bytes) {
     if (operation) {
         operation->report(OperationProgress{
             stage,
@@ -760,6 +766,8 @@ void report_operation(const std::shared_ptr<OperationControl>& operation,
             current_file_completed_bytes,
             current_file_total_bytes,
             throughput_bytes,
+            compressed_bytes,
+            compressed_source_bytes,
         });
     }
 }
@@ -1602,25 +1610,27 @@ void compress_items_into(std::ofstream& out, std::uint64_t& written,
     // a 64 MiB solid block into many 4 MiB match windows. Split the core budget
     // across a few independent solid-block jobs instead. Each job still emits a
     // normal self-contained .axc block; only scheduling and writer policy vary.
-    const auto thread_budget = selected_thread_count(options.thread_count);
+    const auto execution_budget = selected_thread_count(options.thread_count);
+    const auto geometry_budget =
+        selected_geometry_thread_count(options.thread_count);
     const bool use_outer_parallelism =
         options.enable_optimal_parser && block_size >= (std::size_t{4} << 20) &&
-        thread_budget >= 8;
+        geometry_budget >= 8;
     const auto outer_worker_count = use_outer_parallelism
         // Two outer jobs keep 8 MiB-or-larger inner windows on a 16-core
         // machine without multiplying the optimal parser's large working set
         // into a cache and memory-bandwidth bottleneck.
-        ? std::min<std::size_t>(2, thread_budget / 4)
+        ? std::min<std::size_t>(2, geometry_budget / 4)
         : std::size_t{1};
     const auto inner_thread_count = std::max<std::size_t>(
-        1, thread_budget / outer_worker_count);
+        1, geometry_budget / outer_worker_count);
     const auto max_inflight_blocks = outer_worker_count * 2;
     // Outer solid-block workers count toward the operation's CPU budget. Give
     // the shared executor only the remaining helper slots; every nested block,
     // candidate, and entropy task then uses this one pool instead of creating a
     // fresh pool for each solid block.
-    const auto helper_budget = thread_budget > outer_worker_count
-        ? thread_budget - outer_worker_count
+    const auto helper_budget = execution_budget > outer_worker_count
+        ? execution_budget - outer_worker_count
         : std::size_t{0};
     const auto task_executor = helper_budget != 0
         ? std::make_shared<core::TaskExecutor>(helper_budget + 1)
@@ -1655,11 +1665,19 @@ void compress_items_into(std::ofstream& out, std::uint64_t& written,
     // first tick swallow every earlier block's progress and reduce the bar to
     // solid-block-sized jumps.
     std::atomic<std::uint64_t> inflight_done{0};
+    // Actual archive bytes committed by the ordered writer, including the
+    // existing header/preamble, and the source bytes represented by those
+    // committed blocks. Codec workers must not publish speculative output.
+    std::atomic<std::uint64_t> compressed_bytes{written};
+    std::atomic<std::uint64_t> compressed_source_bytes{0};
 
     const auto throughput_progress = [&] {
         return codec_progress_started.load(std::memory_order_relaxed)
             ? reported_progress.load(std::memory_order_relaxed)
             : read_bytes.load(std::memory_order_relaxed);
+    };
+    const auto displayed_progress = [&] {
+        return reported_progress.load(std::memory_order_relaxed);
     };
 
     auto publish_progress = [&](const std::string& path) {
@@ -1668,19 +1686,20 @@ void compress_items_into(std::ofstream& out, std::uint64_t& written,
         // Max-clamp the displayed value: the completed/in-flight handoff below
         // is two atomics, so a racing reader could otherwise glimpse a dip.
         auto previous = reported_progress.load(std::memory_order_relaxed);
-        do {
-            if (total <= previous) {
-                return;
-            }
-        } while (!reported_progress.compare_exchange_weak(previous, total,
-                                                          std::memory_order_relaxed));
+        while (total > previous &&
+               !reported_progress.compare_exchange_weak(previous, total,
+                                                         std::memory_order_relaxed)) {
+        }
+        const auto displayed = std::max(total, previous);
         codec_progress_started.store(true, std::memory_order_relaxed);
-        const auto [file_completed, file_total] = single_file_progress(total);
-        report_operation(operation, OperationStage::compressing, total,
+        const auto [file_completed, file_total] = single_file_progress(displayed);
+        report_operation(operation, OperationStage::compressing, displayed,
                          total_bytes, completed_items, total_items,
                          path.empty() && single_file != nullptr
                              ? single_file->archive_path : path,
-                         file_completed, file_total, total);
+                         file_completed, file_total, displayed,
+                         compressed_bytes.load(std::memory_order_relaxed),
+                         compressed_source_bytes.load(std::memory_order_relaxed));
     };
 
     auto compress_block = [&](PendingBlock block) {
@@ -1690,7 +1709,9 @@ void compress_items_into(std::ofstream& out, std::uint64_t& written,
                          initial_progress, total_bytes, completed_items, total_items,
                          block.path.empty() && single_file != nullptr
                              ? single_file->archive_path : block.path,
-                         file_completed, file_total, throughput_progress());
+                         file_completed, file_total, throughput_progress(),
+                         compressed_bytes.load(std::memory_order_relaxed),
+                         compressed_source_bytes.load(std::memory_order_relaxed));
         auto block_options = options;
         block_options.thread_count = inner_thread_count;
         block_options.task_executor = task_executor;
@@ -1820,13 +1841,18 @@ void compress_items_into(std::ofstream& out, std::uint64_t& written,
                 throw std::runtime_error("failed while writing archive blocks");
             }
             written += block.payload.size();
+            compressed_bytes.store(written, std::memory_order_relaxed);
+            compressed_source_bytes.fetch_add(block.original_size,
+                                              std::memory_order_relaxed);
             const auto overall = completed_bytes.load(std::memory_order_relaxed);
             const auto [file_completed, file_total] = single_file_progress(overall);
             report_operation(operation, OperationStage::writing,
                              overall, total_bytes, completed_items, total_items,
                              block.path.empty() && single_file != nullptr
                                  ? single_file->archive_path : std::move(block.path),
-                             file_completed, file_total, throughput_progress());
+                             file_completed, file_total, throughput_progress(),
+                             compressed_bytes.load(std::memory_order_relaxed),
+                             compressed_source_bytes.load(std::memory_order_relaxed));
         }
     };
 
@@ -1895,7 +1921,7 @@ void compress_items_into(std::ofstream& out, std::uint64_t& written,
             entry.link_target = item.symlink_target;
             entries.push_back(std::move(entry));
             ++completed_items;
-            report_operation(operation, OperationStage::reading, completed_bytes, total_bytes,
+            report_operation(operation, OperationStage::reading, displayed_progress(), total_bytes,
                              completed_items, total_items, item.archive_path, 0, 0,
                              throughput_progress());
             continue;
@@ -1914,7 +1940,7 @@ void compress_items_into(std::ofstream& out, std::uint64_t& written,
             entry.type = kEntryDir;
             entries.push_back(std::move(entry));
             ++completed_items;
-            report_operation(operation, OperationStage::reading, completed_bytes, total_bytes,
+            report_operation(operation, OperationStage::reading, displayed_progress(), total_bytes,
                              completed_items, total_items, item.archive_path, 0, 0,
                              throughput_progress());
             continue;
@@ -1929,7 +1955,7 @@ void compress_items_into(std::ofstream& out, std::uint64_t& written,
             }
             report_skipped_input(item, operation);
             ++completed_items;
-            report_operation(operation, OperationStage::reading, completed_bytes,
+            report_operation(operation, OperationStage::reading, displayed_progress(),
                              total_bytes, completed_items, total_items,
                              item.archive_path, 0, 0, throughput_progress());
             continue;
@@ -1947,7 +1973,7 @@ void compress_items_into(std::ofstream& out, std::uint64_t& written,
                 entry.meta = {};
                 entries.push_back(std::move(entry));
                 ++completed_items;
-                report_operation(operation, OperationStage::reading, completed_bytes, total_bytes,
+                report_operation(operation, OperationStage::reading, displayed_progress(), total_bytes,
                                  completed_items, total_items, item.archive_path, 0, 0,
                                  throughput_progress());
                 continue;
@@ -1969,7 +1995,7 @@ void compress_items_into(std::ofstream& out, std::uint64_t& written,
         if (size_error) {
             file_total = 0;
         }
-        report_operation(operation, OperationStage::reading, completed_bytes, total_bytes,
+        report_operation(operation, OperationStage::reading, displayed_progress(), total_bytes,
                          completed_items, total_items, item.archive_path, 0, file_total,
                          throughput_progress());
         while (in) {
@@ -2020,7 +2046,7 @@ void compress_items_into(std::ofstream& out, std::uint64_t& written,
             // which is where the wall time actually goes.
             if (buffer.empty()) buffer_path = item.archive_path;
             buffer.insert(buffer.end(), bytes.begin(), bytes.end());
-            report_operation(operation, OperationStage::reading, completed_bytes, total_bytes,
+            report_operation(operation, OperationStage::reading, displayed_progress(), total_bytes,
                              completed_items, total_items, item.archive_path, total,
                              std::max(total, file_total), throughput_progress());
             if (buffer.size() >= block_size) {
@@ -2039,7 +2065,7 @@ void compress_items_into(std::ofstream& out, std::uint64_t& written,
         entry.ads = core::capture_ads(item.absolute);  // NTFS named streams (Win32 only)
         entries.push_back(std::move(entry));
         ++completed_items;
-        report_operation(operation, OperationStage::reading, completed_bytes, total_bytes,
+        report_operation(operation, OperationStage::reading, displayed_progress(), total_bytes,
                          completed_items, total_items, item.archive_path, total, total,
                          throughput_progress());
     }
@@ -2686,7 +2712,8 @@ void append_items_to_archive(const fs::path& archive_path, const std::vector<Sca
     }
 
     report_operation(operation, OperationStage::finalizing, completed_bytes, total_bytes,
-                     completed_items, total_items);
+                     completed_items, total_items, {}, 0, 0, completed_bytes,
+                     written, completed_bytes);
     write_directory_and_footer(out, written, blocks, entries, result_meta);
 
     std::error_code ec;
@@ -2705,8 +2732,14 @@ void append_items_to_archive(const fs::path& archive_path, const std::vector<Sca
         rewrite_recovery_service(archive_path, recovery_percent, operation,
                                  options.io_buffer_size);
     }
+    std::uint64_t logical_archive_bytes = 0;
+    for (const auto& entry : entries) {
+        if (entry.type == kEntryFile) logical_archive_bytes += entry.size;
+    }
     report_operation(operation, OperationStage::finalizing, total_bytes, total_bytes,
-                     total_items, total_items);
+                     total_items, total_items, {}, 0, 0, total_bytes,
+                     static_cast<std::uint64_t>(fs::file_size(archive_path)),
+                     logical_archive_bytes);
 }
 
 void rewrite_archive_directory(const fs::path& archive_path, ArchiveIndex index,
@@ -2857,7 +2890,8 @@ void create_archive(const std::vector<std::filesystem::path>& inputs,
                         options.skip_unreadable_files, key_ptr);
 
     report_operation(operation, OperationStage::finalizing, completed_bytes, total_bytes,
-                     completed_items, total_items);
+                     completed_items, total_items, {}, 0, 0, completed_bytes,
+                     written, completed_bytes);
     write_directory_and_footer(out, written, blocks, entries, meta,
                                encrypt_dir ? key_ptr : nullptr);
     core::secure_wipe(key);
@@ -2877,7 +2911,9 @@ void create_archive(const std::vector<std::filesystem::path>& inputs,
                                  options.io_buffer_size);
     }
     report_operation(operation, OperationStage::finalizing, total_bytes, total_bytes,
-                     total_items, total_items);
+                     total_items, total_items, {}, 0, 0, total_bytes,
+                     static_cast<std::uint64_t>(fs::file_size(archive_path)),
+                     total_bytes);
 }
 
 void add_to_archive(const std::vector<std::filesystem::path>& inputs,
@@ -4065,7 +4101,7 @@ void test_archive(const std::filesystem::path& archive_path,
     constexpr std::uint64_t kParallelTestDecodeLimit = std::uint64_t{512} << 20;
     auto decode_budget = options.thread_count;
     if (decode_budget == 0) {
-        decode_budget = std::thread::hardware_concurrency();
+        decode_budget = core::logical_processor_count();
     }
     if (decode_budget == 0) {
         decode_budget = 1;

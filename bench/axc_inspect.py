@@ -7,7 +7,7 @@ stream unit (raw symbol bytes vs coded bytes vs chosen stream coder). The
 aggregate table answers "where do the compressed bytes actually live" so
 modeling work can be aimed at the streams that dominate.
 
-Understands AXC versions 4 through 8 as written by current encoders:
+Understands AXC versions 4 through 9 as written by current encoders:
   header:      magic "AXIOMC1\\0", u16 version, u8 codec, u8 flags,
                u64 original, u64 payload, u32 crc, then (v5+ when flags&1)
                u32 transform metadata size + metadata bytes.
@@ -15,7 +15,8 @@ Understands AXC versions 4 through 8 as written by current encoders:
                4 split, 5 split+slots, 6 sequences, 7 contextual slots.
   block ids:   0 store, 1 raw LZ77, 2 Huffman, 3 split, 4 split+slots,
                5 fast_lz, 6 sequences, 7 context split,
-               8 contextual slots, 9 contextual slots + context split.
+               8 contextual slots, 9 contextual slots + context split,
+               10 parser checkpoints + context split.
   stream unit: varuint raw_size, u8 coder, varuint payload_size, payload.
   coders:      0 store, 1 huffman, 2 legacy order1, 3 rans, 4 rans_order1.
 """
@@ -37,6 +38,7 @@ BLOCK_NAMES = {
     0: "store", 1: "raw-lz77", 2: "huffman", 3: "split", 4: "split-slots",
     5: "fast-lz", 6: "sequences", 7: "context-split",
     8: "contextual-slots", 9: "contextual-slots-context-split",
+    10: "checkpoint-context-split",
 }
 STREAM_CODER_NAMES = {
     0: "store", 1: "huffman", 2: "order1-legacy", 3: "rans", 4: "rans-o1",
@@ -156,6 +158,14 @@ def walk_sequences(cursor, sink):
 
 def walk_block_payload(block_codec, payload, sink):
     cursor = Cursor(payload)
+    checkpoint_footer_mode = None
+    if block_codec == 10:
+        checkpoint_footer_mode = cursor.u8()
+        if checkpoint_footer_mode not in (0, 1):
+            raise ValueError(f"invalid checkpoint footer mode {checkpoint_footer_mode}")
+        sink.append({"stream": "checkpoint_footer_mode", "raw_bytes": 0,
+                     "coded_bytes": 1,
+                     "coder": "contextual" if checkpoint_footer_mode else "plain"})
     if block_codec == 3:
         walk_split(cursor, SPLIT_STREAMS, sink)
     elif block_codec == 4:
@@ -165,11 +175,12 @@ def walk_block_payload(block_codec, payload, sink):
     elif block_codec == 7:
         walk_split(cursor, SLOT_STREAMS[:-1], sink)
         walk_literal_lanes(cursor, sink)
-    elif block_codec in (8, 9):
+    elif block_codec in (8, 9, 10):
         for name in ["commands", "literal_lengths", "match_lengths",
                      "distance_slots", "distance_footer_high"]:
             read_stream_unit(cursor, name, sink)
-        read_contextual_rans_blob(cursor, "distance_footer_align", sink)
+        if block_codec in (8, 9) or checkpoint_footer_mode == 1:
+            read_contextual_rans_blob(cursor, "distance_footer_align", sink)
         if block_codec == 8:
             read_stream_unit(cursor, "literals", sink)
         else:

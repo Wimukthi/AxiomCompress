@@ -1,5 +1,7 @@
 #pragma once
 
+#include "core/cpu.hpp"
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -52,6 +54,17 @@ public:
         }
         current_executor_ = previous_executor_;
         current_worker_ = previous_worker_;
+    }
+
+    // The executor owning the calling thread (the constructing thread counts
+    // as worker zero), or nullptr outside any executor. Nested codec stages
+    // use this to join the operation's budget instead of spawning a pool.
+    static TaskExecutor* current() {
+        return current_executor_;
+    }
+
+    std::size_t worker_count() const noexcept {
+        return queues_.size();
     }
 
     template <typename Function>
@@ -174,6 +187,10 @@ private:
     }
 
     void worker_loop(std::size_t worker) {
+        // Windows otherwise keeps a thread inside its inherited processor
+        // group on large machines. Distribute helpers proportionally across
+        // all groups; single-group Intel/AMD systems take the no-op fast path.
+        bind_current_thread_to_processor_group(worker);
         current_executor_ = this;
         current_worker_ = worker;
         while (true) {

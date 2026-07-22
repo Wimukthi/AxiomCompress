@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -59,6 +60,11 @@ struct OperationProgress {
     // bytes are complete yet, avoiding a false 0 B/s during small-file reads.
     // A zero value asks frontends to fall back to completed_bytes.
     std::uint64_t throughput_bytes = 0;
+    // Archive output committed so far and the source bytes represented by it.
+    // These counters let frontends show a live compressed size and ratio
+    // without polling a partially written destination file.
+    std::uint64_t compressed_bytes = 0;
+    std::uint64_t compressed_source_bytes = 0;
     // Monotonically increasing telemetry sequence assigned by OperationControl.
     // Producers leave this at zero; frontends use it to distinguish a fresh
     // atomic snapshot from a heartbeat repaint.
@@ -89,6 +95,20 @@ public:
     void report(const OperationProgress& progress) const {
         checkpoint();
         constexpr std::uint64_t kPublishQuantum = 1u << 20;
+        const auto pipeline_stage = [](OperationStage stage) {
+            return stage == OperationStage::reading ||
+                   stage == OperationStage::compressing ||
+                   stage == OperationStage::writing;
+        };
+
+        // The archive reader, codec workers, and ordered writer report from
+        // different threads. Normalize only after acquiring the writer lock;
+        // otherwise a delayed report can overwrite a newer high-water mark.
+        while (progress_writer_.test_and_set(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+
+        OperationProgress published = progress;
         const auto previous_stage = static_cast<OperationStage>(
             progress_stage_.load(std::memory_order_relaxed));
         const auto previous_bytes =
@@ -103,46 +123,93 @@ public:
             progress_file_total_bytes_.load(std::memory_order_relaxed);
         const auto previous_throughput_bytes =
             progress_throughput_bytes_.load(std::memory_order_relaxed);
+        const auto previous_compressed_bytes =
+            progress_compressed_bytes_.load(std::memory_order_relaxed);
+        const auto previous_compressed_source_bytes =
+            progress_compressed_source_bytes_.load(std::memory_order_relaxed);
         const bool first = progress_version_.load(std::memory_order_relaxed) == 0;
-        const bool boundary = first || progress.stage != previous_stage ||
-            progress.total_bytes != previous_total ||
-            progress.total_items != previous_item_total ||
-            progress.completed_items != previous_items ||
-            progress.current_file_total_bytes != previous_file_total ||
-            progress.completed_bytes < previous_bytes ||
-            progress.current_file_completed_bytes < previous_file_bytes ||
-            progress.throughput_bytes < previous_throughput_bytes ||
-            (progress.total_bytes > 0 &&
-             progress.completed_bytes >= progress.total_bytes) ||
-            (progress.current_file_total_bytes > 0 &&
-             progress.current_file_completed_bytes >= progress.current_file_total_bytes);
-        const bool byte_quantum = progress.completed_bytes >= previous_bytes + kPublishQuantum ||
-            progress.current_file_completed_bytes >= previous_file_bytes + kPublishQuantum ||
-            progress.throughput_bytes >= previous_throughput_bytes + kPublishQuantum;
-        if (!boundary && !byte_quantum) return;
-        while (progress_writer_.test_and_set(std::memory_order_acquire)) {
-            std::this_thread::yield();
+
+        const bool same_totals = !first &&
+            published.total_bytes == previous_total &&
+            published.total_items == previous_item_total;
+        const bool monotonic_epoch = same_totals &&
+            (published.stage == previous_stage ||
+             (pipeline_stage(published.stage) && pipeline_stage(previous_stage)));
+        if (monotonic_epoch) {
+            published.completed_bytes =
+                std::max(published.completed_bytes, previous_bytes);
+            published.completed_items =
+                std::max(published.completed_items, previous_items);
+            published.throughput_bytes =
+                std::max(published.throughput_bytes, previous_throughput_bytes);
         }
+        // Output size describes the artifact produced by the operation, so it
+        // remains useful across compressing -> finalizing (and benchmark
+        // compressing -> extracting) stage changes with the same input totals.
+        if (same_totals) {
+            published.compressed_bytes =
+                std::max(published.compressed_bytes, previous_compressed_bytes);
+            published.compressed_source_bytes = std::max(
+                published.compressed_source_bytes,
+                previous_compressed_source_bytes);
+        }
+
+        const bool same_file = monotonic_epoch &&
+            published.current_path == progress_writer_path_ &&
+            published.current_file_total_bytes == previous_file_total;
+        if (same_file) {
+            published.current_file_completed_bytes = std::max(
+                published.current_file_completed_bytes, previous_file_bytes);
+        }
+
+        const bool boundary = first || published.stage != previous_stage ||
+            published.total_bytes != previous_total ||
+            published.total_items != previous_item_total ||
+            published.completed_items != previous_items ||
+            published.current_path != progress_writer_path_ ||
+            published.current_file_total_bytes != previous_file_total ||
+            (published.total_bytes > 0 &&
+             published.completed_bytes >= published.total_bytes) ||
+            (published.current_file_total_bytes > 0 &&
+             published.current_file_completed_bytes >=
+                 published.current_file_total_bytes);
+        const bool byte_quantum =
+            published.completed_bytes >= previous_bytes + kPublishQuantum ||
+            published.current_file_completed_bytes >=
+                previous_file_bytes + kPublishQuantum ||
+            published.throughput_bytes >=
+                previous_throughput_bytes + kPublishQuantum ||
+            published.compressed_bytes >=
+                previous_compressed_bytes + kPublishQuantum;
+        if (!boundary && !byte_quantum) {
+            progress_writer_.clear(std::memory_order_release);
+            return;
+        }
+
         progress_version_.fetch_add(1, std::memory_order_acq_rel); // writer active
-        progress_stage_.store(static_cast<unsigned>(progress.stage),
+        progress_stage_.store(static_cast<unsigned>(published.stage),
                               std::memory_order_relaxed);
-        progress_completed_bytes_.store(progress.completed_bytes,
+        progress_completed_bytes_.store(published.completed_bytes,
                                         std::memory_order_relaxed);
-        progress_total_bytes_.store(progress.total_bytes, std::memory_order_relaxed);
-        progress_completed_items_.store(progress.completed_items,
+        progress_total_bytes_.store(published.total_bytes, std::memory_order_relaxed);
+        progress_completed_items_.store(published.completed_items,
                                         std::memory_order_relaxed);
-        progress_total_items_.store(progress.total_items, std::memory_order_relaxed);
-        progress_file_completed_bytes_.store(progress.current_file_completed_bytes,
+        progress_total_items_.store(published.total_items, std::memory_order_relaxed);
+        progress_file_completed_bytes_.store(published.current_file_completed_bytes,
                                              std::memory_order_relaxed);
-        progress_file_total_bytes_.store(progress.current_file_total_bytes,
+        progress_file_total_bytes_.store(published.current_file_total_bytes,
                                          std::memory_order_relaxed);
-        progress_throughput_bytes_.store(progress.throughput_bytes,
+        progress_throughput_bytes_.store(published.throughput_bytes,
                                          std::memory_order_relaxed);
-        if (progress_writer_path_ != progress.current_path) {
-            progress_writer_path_ = progress.current_path;
+        progress_compressed_bytes_.store(published.compressed_bytes,
+                                         std::memory_order_relaxed);
+        progress_compressed_source_bytes_.store(
+            published.compressed_source_bytes, std::memory_order_relaxed);
+        if (progress_writer_path_ != published.current_path) {
+            progress_writer_path_ = published.current_path;
             std::lock_guard lock(progress_path_mutex_);
             progress_path_ =
-                std::make_shared<const std::string>(progress.current_path);
+                std::make_shared<const std::string>(published.current_path);
         }
         const std::uint64_t version =
             progress_version_.fetch_add(1, std::memory_order_release) + 1;
@@ -155,7 +222,6 @@ public:
                 callback = progress_callback_;
             }
             if (!callback) return;
-            OperationProgress published = progress;
             published.sequence = version / 2;
             (*callback)(published);
         }
@@ -184,6 +250,10 @@ public:
                 progress_file_total_bytes_.load(std::memory_order_relaxed);
             result.throughput_bytes =
                 progress_throughput_bytes_.load(std::memory_order_relaxed);
+            result.compressed_bytes =
+                progress_compressed_bytes_.load(std::memory_order_relaxed);
+            result.compressed_source_bytes =
+                progress_compressed_source_bytes_.load(std::memory_order_relaxed);
             std::shared_ptr<const std::string> path;
             {
                 std::lock_guard lock(progress_path_mutex_);
@@ -266,6 +336,8 @@ private:
     mutable std::atomic_uint64_t progress_file_completed_bytes_{0};
     mutable std::atomic_uint64_t progress_file_total_bytes_{0};
     mutable std::atomic_uint64_t progress_throughput_bytes_{0};
+    mutable std::atomic_uint64_t progress_compressed_bytes_{0};
+    mutable std::atomic_uint64_t progress_compressed_source_bytes_{0};
     mutable std::mutex progress_path_mutex_;
     mutable std::shared_ptr<const std::string> progress_path_{
         std::make_shared<const std::string>()};
@@ -315,6 +387,15 @@ struct CompressionOptions {
     // container/member boundaries. Explicit block-size callers keep uniform
     // blocks, and the decoder already accepts arbitrary per-block lengths.
     bool content_adaptive_blocks = false;
+    // Experimental: parse one block's segments concurrently against the full
+    // block window (immutable per-segment indexes; explicit distances, then a
+    // serial rep rewrite). Level 1 deliberately substitutes this ratio-oriented
+    // hash parser for its byte-token fast path. Levels 8-9 use it for the greedy
+    // tree candidate while retaining their global optimal parse; at optimal
+    // depth >= 32, exact tree discovery runs one bounded tile ahead of the DP.
+    // Level 7's lazy tree parser is not segmented. Token payload and decoder are
+    // unchanged; presets never enable the option.
+    bool swarm_parse = false;
     // Lazy matching: before committing a normal match at p, check p+1; if a strictly
     // longer match starts there, emit a literal and take the better match next. Lets
     // a shallow chain reach close to a deep chain's ratio. (Rep matches stay eager.)

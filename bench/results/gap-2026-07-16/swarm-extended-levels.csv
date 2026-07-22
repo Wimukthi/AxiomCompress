@@ -1,0 +1,16 @@
+level,mode,input_bytes,archive_bytes,ratio,compress_seconds,decode_seconds,sha256_roundtrip,disposition
+1,split,211948032,66248720,3.19928,1.145,0.684,true,baseline
+1,swarm,211948032,62308127,3.40161,3.715,0.326,true,retained_ratio_override
+8,split,211948032,52495767,4.03743,32.269,,true,baseline
+8,swarm_hybrid_segmented_dp,211948032,53401600,3.96895,40.761,,not_run,rejected_larger_and_slower
+8,swarm_greedy_global_dp_unbounded_prior,211948032,52487423,4.03807,34.374,0.356,true,superseded
+8,swarm_greedy_global_dp,211948032,52490464,4.03784,27.861,0.344,true,retained_opt_in
+9,split,211948032,51996245,4.07622,68.883,,true,baseline
+9,swarm_local_segmented_dp,211948032,55456758,3.82186,39.534,,true,rejected_larger
+9,swarm_greedy_global_dp_unbounded_prior,211948032,51992013,4.07655,71.801,0.468,true,superseded
+9,swarm_greedy_global_dp_pre_pipeline,211948032,51991188,4.07661,58.789,0.480,true,superseded
+9,swarm_exact_pipeline_long_producer_fast,211948032,51991188,4.07661,46.156,,true,rejected_unstable_scheduling
+9,swarm_exact_pipeline_long_producer_slow,211948032,51991188,4.07661,63.764,,true,rejected_unstable_scheduling
+9,swarm_exact_tiled_pipeline_run1,211948032,51991188,4.07661,44.285,,true,retained_opt_in
+9,swarm_exact_tiled_pipeline_run2,211948032,51991188,4.07661,46.264,0.471,true,retained_opt_in
+9,swarm_v9_checkpoint_bakeoff,211948032,51405457,4.12306,30.317,0.308,true,retained_one_block_strictly_smaller

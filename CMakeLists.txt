@@ -66,6 +66,7 @@ add_library(axiom STATIC
     src/codec/lz77_split.cpp
     src/codec/transform.cpp
     src/core/archive.cpp
+    src/core/benchmark_corpus.cpp
     src/core/checksum.cpp
     src/core/checksum_clmul.cpp
     src/core/compression_estimator.cpp
@@ -152,7 +153,7 @@ if(WIN32)
         src/gui/about_dialog.cpp
         src/gui/update_checker.cpp
         src/gui/axiom_gui.rc)
-    target_link_libraries(axiom_gui PRIVATE axiom Bcrypt Comctl32 Dwmapi Msimg32 Ole32 Shell32 Shlwapi Uxtheme Version Winhttp)
+    target_link_libraries(axiom_gui PRIVATE axiom Bcrypt Comctl32 Dwmapi Gdiplus Msimg32 Ole32 Shell32 Shlwapi Uxtheme Version Winhttp)
     target_include_directories(axiom_gui PRIVATE src)
     target_compile_definitions(axiom_gui PRIVATE UNICODE _UNICODE)
     set_target_properties(axiom_gui PROPERTIES OUTPUT_NAME "Axiom")

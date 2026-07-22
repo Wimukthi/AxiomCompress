@@ -139,7 +139,9 @@ void report_operation(const std::shared_ptr<OperationControl>& operation,
                       std::string current_path = {},
                       std::uint64_t current_file_completed_bytes = 0,
                       std::uint64_t current_file_total_bytes = 0,
-                      std::uint64_t throughput_bytes = 0);
+                      std::uint64_t throughput_bytes = 0,
+                      std::uint64_t compressed_bytes = 0,
+                      std::uint64_t compressed_source_bytes = 0);
 void operation_checkpoint(const std::shared_ptr<OperationControl>& operation);
 
 // ---- archive path safety -------------------------------------------------------

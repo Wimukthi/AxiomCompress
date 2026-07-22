@@ -83,6 +83,19 @@ Lz77ContextSplitPayloads encode_lz77_context_split_streams(
     std::span<const std::uint8_t> contextual_slot_payload = {},
     core::TaskExecutor* executor = nullptr);
 
+// AXC v9 parser-checkpoint representation. The leading mode byte selects the
+// ordinary or contextual distance-footer layout; the remaining payload keeps
+// global context-split entropy streams and embeds bounded rep-state resets in
+// the command/distance streams.
+std::optional<ByteVector> encode_lz77_checkpoint_context_streams(
+    std::span<const std::uint8_t> input,
+    std::span<const std::uint8_t> lz77_payload,
+    core::TaskExecutor* executor = nullptr);
+
+void decode_lz77_checkpoint_context_streams_into(
+    std::span<const std::uint8_t> encoded,
+    std::span<std::uint8_t> output);
+
 void decode_lz77_context_split_streams_into(
     std::span<const std::uint8_t> encoded,
     std::span<std::uint8_t> output);

@@ -264,6 +264,19 @@ framing must be strictly smaller than every prior literal suffix before this
 mode is emitted. Earlier version-8 representations and versions 4 through 7
 remain decodable.
 
+AXC version 9 adds a parser-checkpoint context-split block candidate for the
+level-9 swarm. Fixed approximately 2 MiB parser tiles retain the full block
+match window but end at token boundaries, so their optimal DPs are independent.
+The greedy parse supplies four static recent-distance seeds per boundary. Each
+seed either references one of the decoder's current four distances or carries
+an explicit slotted distance; a zero-output checkpoint command installs all four
+before the next tile. Candidate discovery remains encoder-side and tiles run as
+ordinary work-stealable tasks. Decode performs four bounded descriptor reads and
+table assignments—no search, learning, or data-dependent allocation. The global
+DP and every older entropy representation remain in the block bake-off; codec 10
+is written only when its complete payload is strictly smaller. AXC versions 4
+through 8 remain decodable.
+
 Level-9 automatic block planning recognizes validated POSIX ustar members and
 uses their boundaries as static match-window and entropy-table reset points.
 Large members are split below the normal thread-derived block budget and small
@@ -431,11 +444,23 @@ inspection, and all archive operations run on workers. Results return as owned,
 typed messages; closing the main window invalidates the shared lifetime token and
 drains any already-queued payloads.
 
+Editable Win32 controls declare their expected type or unit in the visible label
+and use a shared tooltip contract for ranges, examples, and side effects. Integer,
+byte-size, and hexadecimal controls also use shared character/paste filters, but
+submission validation remains authoritative: it checks full syntax, numeric
+ranges, processor limits, required existing paths, and HTTP/HTTPS URLs before any
+setting or operation is accepted. Text and path controls have explicit length
+limits so native control storage cannot become an accidental unbounded input.
+
 `OperationControl` is also the single source of progress truth. Producers publish
 a coherent snapshot containing stage bytes, item counts, current path, per-file
-bytes, and a dedicated throughput counter. Archive creation advances the latter
-while reading small files into its first solid block, then switches it to codec
+bytes, a dedicated throughput counter, and archive-output/source-byte counters
+for the live archive size and ratio. Archive creation advances throughput while
+reading small files into its first solid block, then switches it to codec
 progress, so speed never falsely remains at zero while useful work is advancing.
+Reading, compression, and ordered writing share one monotonic byte epoch: reports
+are normalized under the snapshot writer lock so a delayed producer cannot move
+the overall bar backwards, while a new path may still reset the per-file bar.
 Numeric fields use a sequence-guarded atomic snapshot and paths are replaced
 atomically only when they change. Reports are coalesced at 1 MiB unless a stage,
 item, total, file, or completion boundary changes, so telemetry cannot become an
@@ -455,7 +480,8 @@ solid block previously arrived at once.
 GUI progress windows and the interactive CLI poll this snapshot; operation
 threads never paint, format status text, query HWNDs, inspect a growing output
 file, or enqueue progress messages. The GUI samples at its own cadence, computes
-rate and ETA from a rolling phase-local window, and repaints a liveness heartbeat
+rate and ETA from a rolling phase-local window, displays compressed size and
+source-to-archive ratio as independent fields, and repaints a liveness heartbeat
 even when an external backend is between measurable checkpoints. Bundled 7-Zip
 operations request and parse its native percentage stream for accurate progress.
 Pause and cancellation retain their cooperative `OperationControl` checkpoints;
@@ -471,16 +497,16 @@ or file boundaries. Transfer cancellation is checked on every stream read;
 pause is intentionally unavailable for this phase because an OLE stream call
 may be dispatched on the source STA and blocking it would also block Resume UI.
 
-`thread_count == 0` means "use the machine": compression workers default to the
-**physical core count** (hyperthread siblings measured flat-to-negative on the
-codec's memory-bound hot loops), while decode uses all logical processors.
-Explicit thread counts are honored as given. The codec caps the actual worker
-count for long-running block jobs to the block count. A shared cooperative
-work-stealing executor retains the full budget for larger inputs, though, so a
-block job can submit independent Huffman, sequence-layout, split-layout, and
-per-substream entropy trials without creating nested thread pools. Waiting
-workers execute or steal queued tasks. Tiny single-block inputs stay serial to
-avoid paying thread startup cost.
+`thread_count == 0` means "use the machine": both compression and decode expose
+all logical processors to the shared executor. Compression block geometry is a
+separate decision and targets the physical-core count, so adding SMT helpers
+does not silently halve blocks and weaken ratio. Explicit thread counts are
+honored as given. The codec caps long-running outer block jobs to the block
+count, while spare workers can steal nested parser, candidate-layout, Huffman,
+split-layout, and entropy tasks. Tiny single-block inputs stay serial to avoid
+paying thread startup cost. The pool is sized with `size_t` and operating-system
+topology discovery rather than a fixed 32-thread mask, so the model applies to
+AMD SMT, Intel SMT/hybrid systems, and machines with more than 32 processors.
 
 There are two block-sizing layers:
 
@@ -497,12 +523,46 @@ an explicit `--block-size` disables this automatic sizing for repeatable tuning
 runs.
 
 This removes the old one-block/one-thread ceiling for entropy work without
-changing block boundaries or candidate selection. Greedy and optimal match
-discovery inside one block is still ordered: its mutable hash/tree index and
-repeat-offset state depend on earlier positions. Consequently, more threads
-help a single large block only during its independent candidate and entropy
-phases; full scaling on levels 8-9 still requires a ratio-equivalent immutable
-suffix index rather than substituting the weaker hash-chain candidate source.
+changing block boundaries or candidate selection. The opt-in swarm model also
+segments a greedy parse at fixed, thread-count-independent boundaries. It builds
+immutable per-segment indexes, searches completed earlier segments for
+full-window reach, emits explicit distances, and serially restores repeat-offset
+tokens. Levels 2-6 use the cooperative hash-chain path directly; level 1 can
+explicitly trade its byte-token fast path for that better-ratio parser. Levels
+8-9 use a local binary tree plus prior-segment hash indexes for their preliminary
+greedy candidate, but keep the global optimal DP intact. Level 7's path-dependent
+lazy tree parse is not segmented.
+
+At level 9, global tree discovery and path selection form an exact bounded
+pipeline automatically. The ordered tree publishes the same candidate sequence
+as the direct parser in fixed 256 KiB tiles while the DP consumes the preceding
+tile. Each tile is a separate task on the shared work-stealing executor; if all
+helpers are busy with other blocks, the waiting consumer cooperatively executes
+its own next tile.
+Only the current and next candidate reservoirs are live, bounding extra memory,
+and the resulting tokens are byte-identical across schedules and thread counts.
+Level 8 retains the direct parser because its depth-16 tree is too cheap to
+amortize tile materialization; custom optimal depths of at least 32 opt in.
+
+The level-9 DP also keeps only a `max_match + 1` ring of 64-bit frontier costs.
+Its full-input reconstruction state uses 32-bit distances and an explicitly
+8-byte decision record. These are encoder-memory changes only: the same costs,
+decisions, tokens, and archive bytes are selected. On enwik9 this reduced peak
+commit from 65.66 GiB to 39.55 GiB and improved compression from 130.79 s to
+117.85 s on a 16-core/32-thread Ryzen 9 5950X.
+
+The high-level DP remains ordered because its frontier and repeat-offset state
+depend on the chosen prior path. An attempted per-segment DP lost both ratio and
+throughput and was rejected. The exact pipeline overlaps the independent tree
+stage without pretending the DP itself is parallel; scaling that final stage
+further still requires a path-equivalent parallel formulation.
+
+The version-9 checkpoint candidate relaxes that last dependency without hiding
+it: each fixed tile receives encoder-chosen static rep state and forbids tokens
+from crossing its end, making the tile DPs independent and scalable through the
+shared executor. Global literal and distance entropy streams are retained after
+the tile tokens are concatenated. Because the ordinary global DP is still
+encoded and compared, checkpoint framing can never worsen a written block.
 
 Parallel blocks are independent by design: each block picks store, raw LZ77,
 Huffman-coded LZ77, the level-1 `fast_lz` format, or split-stream LZ77 whose

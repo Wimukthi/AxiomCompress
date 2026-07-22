@@ -3,6 +3,8 @@
 #include "codec/lz77_split.hpp"
 #include "codec/match_copy.hpp"
 #include "codec/varint.hpp"
+#include "core/cpu.hpp"
+#include "core/task_executor.hpp"
 
 #include <algorithm>
 #include <array>
@@ -10,7 +12,10 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <deque>
+#include <future>
 #include <limits>
+#include <numeric>
 #include <optional>
 #include <vector>
 
@@ -76,6 +81,12 @@ constexpr std::uint8_t kMatchToken = 1;
 // distance is stored, which is the whole point of the optimization.
 constexpr std::uint8_t kRepTokenBase = 2;
 constexpr std::size_t kRepCount = 4;
+// AXC v9 only: consumes no output and replaces the four recent distances with
+// encoder-chosen static values. Four descriptor bytes follow: 0..3 reuse one
+// of the decoder's current reps, while 4 carries an explicit distance varuint.
+// Descriptors and explicit values use the existing length/distance streams.
+constexpr std::uint8_t kCheckpointToken = kRepTokenBase + kRepCount;
+constexpr std::uint8_t kCheckpointExplicit = kRepCount;
 constexpr std::size_t kMinMatch = 4;
 constexpr std::size_t kHashBits = 20;
 constexpr std::size_t kHashSize = 1u << kHashBits;
@@ -107,11 +118,22 @@ struct MatchList {
 enum class ParseKind : std::uint8_t { literal, match, rep };
 
 struct ParseDecision {
-    std::uint16_t length = 0;
     std::uint32_t distance = 0;       // only meaningful for a normal match
+    std::uint16_t length = 0;
     ParseKind kind = ParseKind::literal;
     std::uint8_t rep_index = 0;       // only meaningful for a rep match
+
+    constexpr ParseDecision() = default;
+    constexpr ParseDecision(std::uint16_t length_value,
+                            std::uint32_t distance_value,
+                            ParseKind kind_value,
+                            std::uint8_t rep_index_value)
+        : distance(distance_value),
+          length(length_value),
+          kind(kind_value),
+          rep_index(rep_index_value) {}
 };
+static_assert(sizeof(ParseDecision) == 8);
 
 std::size_t hash4_value(std::uint32_t value) {
     return (value * 2654435761u) >> (32 - kHashBits);
@@ -702,6 +724,408 @@ ByteVector encode_lz77_impl(std::span<const std::uint8_t> input,
     return output;
 }
 
+// Experimental swarm parse: encode ONE logical block with the full-block match
+// window while parsing fixed segments concurrently. Phase 1 builds immutable
+// per-segment hash-chain indexes — insertion depends only on input bytes, never
+// on parse decisions, and the stored links equal exactly what sequential
+// insertion would have produced. Phase 2 parses every segment in parallel; a
+// query walks the segment's own incrementally revealed chain and then earlier
+// segments' completed chains, which visits the same candidates in the same
+// newest-to-oldest order under the same depth budget as the serial matcher.
+// Matches never extend past a segment boundary and the recent-distance list
+// restarts per segment, so phase 2 emits explicit distances only; the serial
+// phase 3 rewrites distance==rep matches into rep tokens under the true
+// decoder-visible state and merges adjacent literal runs. The result is a
+// standard token payload — the decoder is untouched — and it is deterministic
+// for a given input and segmentation regardless of worker timing.
+ByteVector finalize_swarm_tokens(std::span<const std::uint8_t> tokens) {
+    ByteVector output;
+    output.reserve(tokens.size());
+    std::array<std::size_t, kRepCount> reps{1, 2, 3, 4};
+    ByteVector pending_literals;
+    std::size_t cursor = 0;
+
+    const auto flush_literals = [&] {
+        if (!pending_literals.empty()) {
+            output.push_back(kLiteralToken);
+            write_varuint(output, pending_literals.size());
+            output.insert(output.end(), pending_literals.begin(), pending_literals.end());
+            pending_literals.clear();
+        }
+    };
+
+    while (cursor < tokens.size()) {
+        const auto command = tokens[cursor++];
+        if (command == kLiteralToken) {
+            const auto length = static_cast<std::size_t>(read_varuint(tokens, cursor));
+            if (length > tokens.size() - cursor) {
+                throw FormatError("swarm literal run exceeds token buffer");
+            }
+            pending_literals.insert(
+                pending_literals.end(),
+                tokens.begin() + static_cast<std::ptrdiff_t>(cursor),
+                tokens.begin() + static_cast<std::ptrdiff_t>(cursor + length));
+            cursor += length;
+        } else if (command == kMatchToken) {
+            flush_literals();
+            const auto length = read_varuint(tokens, cursor);
+            const auto distance = static_cast<std::size_t>(read_varuint(tokens, cursor));
+            std::size_t rep_index = kRepCount;
+            for (std::size_t i = 0; i < kRepCount; ++i) {
+                if (reps[i] == distance) {
+                    rep_index = i;
+                    break;
+                }
+            }
+            if (rep_index < kRepCount) {
+                output.push_back(static_cast<std::uint8_t>(kRepTokenBase + rep_index));
+                write_varuint(output, length);
+                const auto chosen = reps[rep_index];
+                for (std::size_t j = rep_index; j > 0; --j) {
+                    reps[j] = reps[j - 1];
+                }
+                reps[0] = chosen;
+            } else {
+                output.push_back(kMatchToken);
+                write_varuint(output, length);
+                write_varuint(output, distance);
+                reps = {distance, reps[0], reps[1], reps[2]};
+            }
+        } else {
+            // Phase 2 never emits rep commands; anything else is a logic error.
+            throw FormatError("unexpected command in swarm token stream");
+        }
+    }
+    flush_literals();
+    return output;
+}
+
+template <typename Index>
+ByteVector encode_lz77_swarm_impl(std::span<const std::uint8_t> input,
+                                  const CompressionOptions& options) {
+    constexpr Index kNoPos = std::numeric_limits<Index>::max();
+
+    // Segment size balances parallel grain against per-segment head-table
+    // memory (kHashSize indexes each); large blocks grow segments instead of
+    // accumulating tables.
+    constexpr std::size_t kMinSegment = std::size_t{2} << 20;
+    constexpr std::size_t kMaxSegments = 64;
+    const auto segment_size = std::max(
+        kMinSegment, (input.size() + kMaxSegments - 1) / kMaxSegments);
+    const auto segment_count =
+        input.size() == 0 ? std::size_t{0}
+                          : (input.size() + segment_size - 1) / segment_size;
+    if (segment_count <= 1) {
+        return encode_lz77_impl<Index>(input, options);
+    }
+
+    const auto window_size = std::max<std::size_t>(kMinMatch, options.window_size);
+    const auto max_match = std::max<std::size_t>(kMinMatch, options.max_match);
+    const auto max_chain_depth = std::max<std::size_t>(1, options.max_chain_depth);
+    const auto nice_length = std::max<std::size_t>(kMinMatch, options.nice_length);
+
+    const auto segment_begin = [segment_size](std::size_t segment) {
+        return segment * segment_size;
+    };
+    const auto segment_end_at = [segment_size, &input](std::size_t segment) {
+        return std::min(input.size(), segment * segment_size + segment_size);
+    };
+
+    // Phase 1 state. `previous` links each position to the prior same-hash
+    // position of the same segment; phase 2 treats it as read-only.
+    std::vector<Index> previous(input.size(), kNoPos);
+    std::vector<std::vector<Index>> segment_heads(segment_count);
+
+    const auto build_segment = [&](std::size_t segment) {
+        auto& heads = segment_heads[segment];
+        heads.assign(kHashSize, kNoPos);
+        const auto end = segment_end_at(segment);
+        for (auto position = segment_begin(segment); position < end; ++position) {
+            if (position + kMinMatch <= input.size()) {
+                const auto hash = hash4(input, position);
+                previous[position] = heads[hash];
+                heads[hash] = static_cast<Index>(position);
+            }
+        }
+    };
+
+    const auto parse_segment = [&](std::size_t segment) {
+        ByteVector output;
+        const auto start = segment_begin(segment);
+        const auto end = segment_end_at(segment);
+        output.reserve((end - start) / 8 + 64);
+
+        // Reveals the segment's own chain: heads advance as positions are
+        // scanned while the links themselves were precomputed in phase 1.
+        thread_local std::vector<Index> local_heads;
+        local_heads.assign(kHashSize, kNoPos);
+
+        const auto insert_position = [&](std::size_t position) {
+            if (position + kMinMatch <= input.size()) {
+                local_heads[hash4(input, position)] = static_cast<Index>(position);
+            }
+        };
+
+        const auto find_best = [&](std::size_t pos, std::size_t& out_length,
+                                   std::size_t& out_distance) {
+            out_length = 0;
+            out_distance = 0;
+            if (pos + kMinMatch > input.size()) {
+                return;
+            }
+
+            const auto current = load_u32_le(input.data() + pos);
+            const auto hash = hash4_value(current);
+            const auto limit = std::min(max_match, end - pos);
+            const auto nice = std::min(nice_length, limit);
+            std::size_t depth = 0;
+            std::size_t best_length = 0;
+            std::size_t best_distance = 0;
+
+            // Walk one chain newest-to-oldest. Returns false once the search
+            // should stop entirely: the window is exhausted (older segments are
+            // farther still) or a nice-length match was found.
+            const auto consider_chain = [&](Index candidate) {
+                while (candidate != kNoPos && depth < max_chain_depth) {
+                    const auto next = previous[candidate];
+                    if (candidate >= pos) {  // defensive: chains hold older positions
+                        candidate = next;
+                        ++depth;
+                        continue;
+                    }
+
+                    const auto distance = pos - candidate;
+                    if (distance > window_size) {
+                        return false;
+                    }
+
+                    if (best_length < limit &&
+                        input[candidate + best_length] == input[pos + best_length] &&
+                        load_u32_le(input.data() + candidate) == current) {
+                        const std::size_t length = common_prefix(
+                            input.data() + candidate, input.data() + pos, limit);
+                        if (length > best_length) {
+                            best_length = length;
+                            best_distance = distance;
+                            if (best_length >= nice) {
+                                return false;
+                            }
+                        }
+                    }
+
+                    candidate = next;
+                    ++depth;
+                }
+                return depth < max_chain_depth;
+            };
+
+            bool keep_searching = consider_chain(local_heads[hash]);
+            for (std::size_t prior = segment; keep_searching && prior > 0;) {
+                --prior;
+                const auto newest_position = segment_end_at(prior) - 1;
+                if (pos - newest_position > window_size) {
+                    break;
+                }
+                keep_searching = consider_chain(segment_heads[prior][hash]);
+            }
+
+            out_length = best_length;
+            out_distance = best_distance;
+        };
+
+        std::size_t position = start;
+        std::size_t literal_start = start;
+        std::array<std::size_t, kRepCount> reps{1, 2, 3, 4};
+        bool have_lookahead = false;
+        std::size_t lookahead_length = 0;
+        std::size_t lookahead_distance = 0;
+
+        while (position < end) {
+            std::size_t best_length = 0;
+            std::size_t best_distance = 0;
+            if (have_lookahead) {
+                best_length = lookahead_length;
+                best_distance = lookahead_distance;
+                have_lookahead = false;
+            } else {
+                find_best(position, best_length, best_distance);
+            }
+
+            insert_position(position);
+
+            std::size_t best_rep_length = 0;
+            std::size_t best_rep_index = 0;
+            if (position + kMinMatch <= input.size()) {
+                const auto limit = std::min(max_match, end - position);
+                for (std::size_t i = 0; i < kRepCount; ++i) {
+                    const auto length = match_length_at(input, position, reps[i], limit);
+                    if (length > best_rep_length) {
+                        best_rep_length = length;
+                        best_rep_index = i;
+                    }
+                }
+            }
+
+            const bool take_rep =
+                best_rep_length >= kMinMatch && best_rep_length >= best_length;
+            bool take_match = !take_rep && best_length >= kMinMatch;
+
+            if (take_match && options.lazy_matching && best_length < nice_length &&
+                position + 1 < end) {
+                std::size_t next_length = 0;
+                std::size_t next_distance = 0;
+                find_best(position + 1, next_length, next_distance);
+
+                bool defer = false;
+                if (next_length >= kMinMatch) {
+                    const auto take_now = static_cast<std::uint64_t>(
+                        match_cost(best_length, best_distance));
+                    const auto deferred = static_cast<std::uint64_t>(literal_cost()) +
+                                          match_cost(next_length, next_distance);
+                    defer = deferred * best_length < take_now * (1 + next_length);
+                }
+                if (!defer && position + kMinMatch + 1 <= input.size()) {
+                    const auto rep_look_limit =
+                        std::min(max_match, end - (position + 1));
+                    for (std::size_t i = 0; i < kRepCount; ++i) {
+                        const auto rep_length = match_length_at(
+                            input, position + 1, reps[i], rep_look_limit);
+                        if (rep_length >= best_length) {
+                            defer = true;
+                            break;
+                        }
+                    }
+                }
+
+                if (defer) {
+                    take_match = false;
+                    have_lookahead = true;
+                    lookahead_length = next_length;
+                    lookahead_distance = next_distance;
+                }
+            }
+
+            if (take_rep) {
+                write_literal_run(output, input, literal_start, position - literal_start);
+
+                // The segment-local recent-distance list may disagree with the
+                // decoder's, so the distance is stored explicitly; phase 3
+                // restores rep coding wherever the true stream state allows.
+                output.push_back(kMatchToken);
+                write_varuint(output, best_rep_length);
+                write_varuint(output, reps[best_rep_index]);
+
+                const auto chosen = reps[best_rep_index];
+                for (std::size_t j = best_rep_index; j > 0; --j) {
+                    reps[j] = reps[j - 1];
+                }
+                reps[0] = chosen;
+
+                for (std::size_t offset = 1; offset < best_rep_length; ++offset) {
+                    insert_position(position + offset);
+                }
+
+                position += best_rep_length;
+                literal_start = position;
+            } else if (take_match) {
+                write_literal_run(output, input, literal_start, position - literal_start);
+
+                output.push_back(kMatchToken);
+                write_varuint(output, best_length);
+                write_varuint(output, best_distance);
+
+                reps = {best_distance, reps[0], reps[1], reps[2]};
+
+                for (std::size_t offset = 1; offset < best_length; ++offset) {
+                    insert_position(position + offset);
+                }
+
+                position += best_length;
+                literal_start = position;
+            } else {
+                ++position;
+            }
+        }
+
+        write_literal_run(output, input, literal_start, end - literal_start);
+        return output;
+    };
+
+    std::vector<ByteVector> parsed(segment_count);
+    const auto run_phases = [&](core::TaskExecutor& executor) {
+        {
+            std::vector<std::future<void>> builds;
+            builds.reserve(segment_count);
+            for (std::size_t segment = 0; segment < segment_count; ++segment) {
+                builds.push_back(executor.submit([&, segment] {
+                    build_segment(segment);
+                }));
+            }
+            for (auto& task : builds) {
+                executor.wait(task);
+            }
+        }
+        {
+            std::vector<std::future<ByteVector>> parses;
+            parses.reserve(segment_count);
+            for (std::size_t segment = 0; segment < segment_count; ++segment) {
+                parses.push_back(executor.submit([&, segment] {
+                    return parse_segment(segment);
+                }));
+            }
+            for (std::size_t segment = 0; segment < segment_count; ++segment) {
+                parsed[segment] = executor.wait(parses[segment]);
+                if (options.encode_progress) {
+                    options.encode_progress(static_cast<double>(segment + 1) /
+                                            static_cast<double>(segment_count));
+                }
+            }
+        }
+    };
+
+    if (auto* ambient = core::TaskExecutor::current()) {
+        // Inside a block worker (or a scoped serial-analysis executor) the
+        // segment tasks join the operation's existing budget; cooperative
+        // waits keep the calling worker productive and no pool is nested.
+        run_phases(*ambient);
+    } else {
+        const auto requested_threads = options.thread_count == 0
+            ? core::physical_core_count()
+            : options.thread_count;
+        const auto worker_budget =
+            std::min<std::size_t>(std::max<std::size_t>(1, requested_threads),
+                                  segment_count);
+        if (worker_budget <= 1) {
+            for (std::size_t segment = 0; segment < segment_count; ++segment) {
+                build_segment(segment);
+            }
+            for (std::size_t segment = 0; segment < segment_count; ++segment) {
+                parsed[segment] = parse_segment(segment);
+                if (options.encode_progress) {
+                    options.encode_progress(static_cast<double>(segment + 1) /
+                                            static_cast<double>(segment_count));
+                }
+            }
+        } else {
+            core::TaskExecutor executor(worker_budget);
+            run_phases(executor);
+        }
+    }
+
+    std::size_t total = 0;
+    for (const auto& tokens : parsed) {
+        total += tokens.size();
+    }
+    ByteVector tokens;
+    tokens.reserve(total);
+    for (auto& part : parsed) {
+        tokens.insert(tokens.end(), part.begin(), part.end());
+        part.clear();
+        part.shrink_to_fit();
+    }
+    return finalize_swarm_tokens(tokens);
+}
+
 // Greedy parse driven by a binary search tree of suffixes (an LZMA-style bt4
 // finder over a *cyclic window*). The son array is sized to the window, not the
 // input: position q occupies cyclic slot q % cyclic_size, so slots are reused as
@@ -1087,12 +1511,349 @@ private:
     std::vector<Index> son_;
 };
 
+// Exact producer-consumer split for the global tree matcher and optimal DP.
+// The tree is inherently ordered, but it does not depend on DP decisions. A
+// worker therefore discovers the same candidates as the serial parser one tile
+// ahead while the calling worker consumes the current tile. Each tile is a
+// separate work-stealable task; a waiting consumer cooperatively executes it if
+// every helper is busy with another block. This bounded double buffer avoids a
+// per-position whole-block reservoir, and requesting candidates at formerly
+// unreachable positions cannot affect tree mutation.
+template <typename Index>
+class TreeCandidatePipeline {
+    struct Tile {
+        std::size_t start = 0;
+        std::vector<std::uint8_t> counts;
+        std::vector<Match> matches;
+    };
+
+public:
+    TreeCandidatePipeline(std::span<const std::uint8_t> input,
+                          std::size_t window_size,
+                          std::size_t max_match,
+                          std::size_t chain_depth,
+                          std::size_t max_candidates,
+                          core::TaskExecutor& executor)
+        : input_(input),
+          max_match_(max_match),
+          max_candidates_(max_candidates),
+          executor_(executor),
+          tree_(input, window_size, max_match, chain_depth) {
+        schedule_next();
+    }
+
+    TreeCandidatePipeline(const TreeCandidatePipeline&) = delete;
+    TreeCandidatePipeline& operator=(const TreeCandidatePipeline&) = delete;
+
+    ~TreeCandidatePipeline() {
+        if (next_tile_.valid()) {
+            try {
+                (void)executor_.wait(next_tile_);
+            } catch (...) {
+                // next() normally surfaces producer errors; suppress a second
+                // exception only when the parser is already unwinding.
+            }
+        }
+    }
+
+    std::span<const Match> next(std::size_t position) {
+        if (!current_ || current_offset_ == current_->counts.size()) {
+            if (!next_tile_.valid()) {
+                throw FormatError("tree candidate pipeline ended early");
+            }
+            current_.emplace(executor_.wait(next_tile_));
+            current_offset_ = 0;
+            current_match_ = 0;
+            schedule_next();
+        }
+
+        if (current_->start + current_offset_ != position) {
+            throw FormatError("tree candidate pipeline lost position order");
+        }
+        const auto count = static_cast<std::size_t>(
+            current_->counts[current_offset_++]);
+        if (current_match_ > current_->matches.size() ||
+            count > current_->matches.size() - current_match_) {
+            throw FormatError("tree candidate pipeline has invalid framing");
+        }
+        const auto result = std::span<const Match>(current_->matches)
+                                .subspan(current_match_, count);
+        current_match_ += count;
+        return result;
+    }
+
+    void finish() {
+        if (next_tile_.valid()) {
+            (void)executor_.wait(next_tile_);
+        }
+    }
+
+private:
+    Tile produce_tile(std::size_t start) {
+        const auto length = std::min(kTileSize, input_.size() - start);
+        Tile tile;
+        tile.start = start;
+        tile.counts.resize(length);
+        tile.matches.reserve(length * std::min<std::size_t>(2, max_candidates_));
+        for (std::size_t offset = 0; offset < length; ++offset) {
+            MatchList matches;
+            tree_.advance(start + offset, &matches, max_candidates_);
+            tile.counts[offset] = static_cast<std::uint8_t>(matches.count);
+            tile.matches.insert(tile.matches.end(), matches.values.begin(),
+                                matches.values.begin() +
+                                    static_cast<std::ptrdiff_t>(matches.count));
+        }
+        return tile;
+    }
+
+    void schedule_next() {
+        if (next_start_ >= input_.size()) {
+            next_tile_ = {};
+            return;
+        }
+        const auto start = next_start_;
+        next_start_ += std::min(kTileSize, input_.size() - next_start_);
+        next_tile_ = executor_.submit([this, start] {
+            return produce_tile(start);
+        });
+    }
+
+    static constexpr std::size_t kTileSize = std::size_t{256} << 10;
+
+    std::span<const std::uint8_t> input_;
+    std::size_t max_match_;
+    std::size_t max_candidates_;
+    core::TaskExecutor& executor_;
+    TreeMatchSource<Index> tree_;
+    std::future<Tile> next_tile_;
+    std::optional<Tile> current_;
+    std::size_t next_start_ = 0;
+    std::size_t current_offset_ = 0;
+    std::size_t current_match_ = 0;
+};
+
+// Tree-swarm greedy parse for levels 8-9. Each segment keeps the preset's
+// binary-tree matcher for nearby candidates and consults immutable hash-chain
+// snapshots from earlier segments for full-window reach. Segment-local rep
+// state is emitted as explicit distances; finalize_swarm_tokens restores the
+// true stream-wide rep state after the parallel phase.
+template <typename Index>
+ByteVector encode_lz77_tree_swarm_impl(std::span<const std::uint8_t> input,
+                                      const CompressionOptions& options) {
+    constexpr Index kNoPos = std::numeric_limits<Index>::max();
+    constexpr std::size_t kMinSegment = std::size_t{2} << 20;
+    constexpr std::size_t kMaxSegments = 64;
+
+    const auto segment_size = std::max(
+        kMinSegment, (input.size() + kMaxSegments - 1) / kMaxSegments);
+    const auto segment_count = input.empty()
+        ? std::size_t{0}
+        : (input.size() + segment_size - 1) / segment_size;
+    if (segment_count <= 1 || options.lazy_matching) {
+        return encode_lz77_tree<Index>(input, options);
+    }
+
+    const auto segment_begin = [segment_size](std::size_t segment) {
+        return segment * segment_size;
+    };
+    const auto segment_end = [segment_size, &input](std::size_t segment) {
+        return std::min(input.size(), (segment + 1) * segment_size);
+    };
+    const auto window_size = std::max<std::size_t>(kMinMatch, options.window_size);
+    const auto max_match = std::max<std::size_t>(kMinMatch, options.max_match);
+    const auto depth_limit = std::max<std::size_t>(1, options.max_chain_depth);
+    // The local tree retains the preset's full greedy depth. Cross-segment hash
+    // probes only seed the measured-cost DP, so its smaller candidate depth is
+    // the useful bound and avoids repeating hundreds of chain hops per byte.
+    const auto prior_depth_limit =
+        std::max<std::size_t>(1, options.optimal_chain_depth);
+
+    std::vector<Index> previous(input.size(), kNoPos);
+    std::vector<std::vector<Index>> segment_heads(segment_count);
+    const auto build_segment = [&](std::size_t segment) {
+        auto& heads = segment_heads[segment];
+        heads.assign(kHashSize, kNoPos);
+        for (auto position = segment_begin(segment);
+             position < segment_end(segment); ++position) {
+            if (position + kMinMatch <= input.size()) {
+                const auto hash = hash4(input, position);
+                previous[position] = heads[hash];
+                heads[hash] = static_cast<Index>(position);
+            }
+        }
+    };
+
+    const auto parse_segment = [&](std::size_t segment) {
+        const auto start = segment_begin(segment);
+        const auto end = segment_end(segment);
+        const auto local = input.subspan(start, end - start);
+        TreeMatchSource<Index> tree(local, std::min(window_size, local.size()),
+                                    max_match, depth_limit);
+        ByteVector output;
+        output.reserve(local.size() / 8 + 64);
+        std::array<std::size_t, kRepCount> reps{1, 2, 3, 4};
+        std::size_t position = start;
+        std::size_t literal_start = start;
+
+        const auto prior_matches = [&](std::size_t absolute, MatchList& matches) {
+            if (absolute + kMinMatch > end) return;
+            const auto current = load_u32_le(input.data() + absolute);
+            const auto hash = hash4_value(current);
+            const auto limit = std::min(max_match, end - absolute);
+            std::size_t depth = 0;
+            for (std::size_t prior = segment;
+                 prior > 0 && depth < prior_depth_limit;) {
+                --prior;
+                const auto newest = segment_end(prior) - 1;
+                if (absolute - newest > window_size) break;
+                auto candidate = segment_heads[prior][hash];
+                while (candidate != kNoPos && depth < prior_depth_limit) {
+                    const auto next = previous[candidate];
+                    const auto distance = absolute - static_cast<std::size_t>(candidate);
+                    if (distance > window_size) break;
+                    if (load_u32_le(input.data() + candidate) == current) {
+                        const auto length = common_prefix(
+                            input.data() + candidate, input.data() + absolute, limit);
+                        add_match_candidate(matches, length, distance, 1);
+                        if (length == limit) return;
+                    }
+                    candidate = next;
+                    ++depth;
+                }
+            }
+        };
+
+        while (position < end) {
+            MatchList matches;
+            tree.advance(position - start, &matches, 1);
+            prior_matches(position, matches);
+            const auto best_length = matches.count == 0
+                ? std::size_t{0} : static_cast<std::size_t>(matches[0].length);
+            const auto best_distance = matches.count == 0
+                ? std::size_t{0} : static_cast<std::size_t>(matches[0].distance);
+
+            std::size_t best_rep_length = 0;
+            std::size_t best_rep_index = 0;
+            const auto limit = std::min(max_match, end - position);
+            for (std::size_t i = 0; i < kRepCount; ++i) {
+                const auto length = match_length_at(input, position, reps[i], limit);
+                if (length > best_rep_length) {
+                    best_rep_length = length;
+                    best_rep_index = i;
+                }
+            }
+
+            const bool take_rep = best_rep_length >= kMinMatch &&
+                                  best_rep_length >= best_length;
+            const bool take_match = !take_rep && best_length >= kMinMatch;
+            const auto run = take_rep ? best_rep_length
+                           : take_match ? best_length : std::size_t{1};
+
+            if (take_rep || take_match) {
+                write_literal_run(output, input, literal_start,
+                                  position - literal_start);
+                const auto distance = take_rep ? reps[best_rep_index] : best_distance;
+                output.push_back(kMatchToken);
+                write_varuint(output, run);
+                write_varuint(output, distance);
+                if (take_rep) {
+                    const auto chosen = reps[best_rep_index];
+                    for (std::size_t i = best_rep_index; i > 0; --i) {
+                        reps[i] = reps[i - 1];
+                    }
+                    reps[0] = chosen;
+                } else {
+                    reps = {distance, reps[0], reps[1], reps[2]};
+                }
+                for (std::size_t offset = 1; offset < run; ++offset) {
+                    tree.advance(position - start + offset, nullptr, 0);
+                }
+                position += run;
+                literal_start = position;
+            } else {
+                ++position;
+            }
+        }
+        write_literal_run(output, input, literal_start, end - literal_start);
+        return output;
+    };
+
+    std::vector<ByteVector> parsed(segment_count);
+    const auto run = [&](core::TaskExecutor* executor) {
+        if (executor != nullptr) {
+            std::vector<std::future<void>> builds;
+            builds.reserve(segment_count);
+            for (std::size_t segment = 0; segment < segment_count; ++segment) {
+                builds.push_back(executor->submit([&, segment] { build_segment(segment); }));
+            }
+            for (auto& task : builds) executor->wait(task);
+
+            std::vector<std::future<ByteVector>> parses;
+            parses.reserve(segment_count);
+            for (std::size_t segment = 0; segment < segment_count; ++segment) {
+                parses.push_back(executor->submit([&, segment] {
+                    return parse_segment(segment);
+                }));
+            }
+            for (std::size_t segment = 0; segment < segment_count; ++segment) {
+                parsed[segment] = executor->wait(parses[segment]);
+                if (options.encode_progress) {
+                    options.encode_progress(static_cast<double>(segment + 1) /
+                                            static_cast<double>(segment_count));
+                }
+            }
+        } else {
+            for (std::size_t segment = 0; segment < segment_count; ++segment) {
+                build_segment(segment);
+            }
+            for (std::size_t segment = 0; segment < segment_count; ++segment) {
+                parsed[segment] = parse_segment(segment);
+            }
+        }
+    };
+
+    if (auto* ambient = core::TaskExecutor::current()) {
+        run(ambient);
+    } else {
+        const auto requested = options.thread_count == 0
+            ? core::physical_core_count() : options.thread_count;
+        const auto workers = std::min(std::max<std::size_t>(1, requested), segment_count);
+        if (workers > 1) {
+            core::TaskExecutor executor(workers);
+            run(&executor);
+        } else {
+            run(nullptr);
+        }
+    }
+
+    std::size_t total = 0;
+    for (const auto& part : parsed) total += part.size();
+    ByteVector tokens;
+    tokens.reserve(total);
+    for (auto& part : parsed) {
+        tokens.insert(tokens.end(), part.begin(), part.end());
+    }
+    return finalize_swarm_tokens(tokens);
+}
+
 ByteVector encode_lz77(std::span<const std::uint8_t> input,
                        const CompressionOptions& options) {
     // 32-bit indices suffice (and halve match-finder memory) until the input
     // reaches the point where a position would collide with the sentinel.
+    if (options.swarm_parse && options.use_tree_matcher &&
+        options.enable_optimal_parser &&
+        options.optimal_chain_depth < 32 &&
+        input.size() < std::numeric_limits<std::uint32_t>::max()) {
+        return encode_lz77_tree_swarm_impl<std::uint32_t>(input, options);
+    }
     if (options.use_tree_matcher && input.size() < std::numeric_limits<std::uint32_t>::max()) {
         return encode_lz77_tree<std::uint32_t>(input, options);
+    }
+    if (options.swarm_parse && !options.use_tree_matcher) {
+        if (input.size() < std::numeric_limits<std::uint32_t>::max()) {
+            return encode_lz77_swarm_impl<std::uint32_t>(input, options);
+        }
+        return encode_lz77_swarm_impl<std::size_t>(input, options);
     }
     if (input.size() < std::numeric_limits<std::uint32_t>::max()) {
         return encode_lz77_impl<std::uint32_t>(input, options);
@@ -1119,8 +1880,20 @@ ByteVector optimal_parse_with_costs(std::span<const std::uint8_t> input,
     // nearest distances, where a hash-chain walk mostly re-visits one length.
     const bool use_tree = options.use_tree_matcher;
     std::optional<TreeMatchSource<Index>> tree;
+    std::optional<TreeCandidatePipeline<Index>> candidate_pipeline;
     if (use_tree) {
-        tree.emplace(input, options.window_size, max_match, max_chain_depth);
+        auto* executor = core::TaskExecutor::current();
+        constexpr std::size_t kMinimumPipelineInput = std::size_t{512} << 10;
+        // At shallow level-8 depth the tile framing costs more than the tree/DP
+        // overlap saves. Level 9 (and custom depths >= 32) has enough discovery
+        // work to amortize the bounded pipeline.
+        if (max_chain_depth >= 32 && executor != nullptr &&
+            executor->worker_count() > 1 && input.size() >= kMinimumPipelineInput) {
+            candidate_pipeline.emplace(input, window_size, max_match,
+                                       max_chain_depth, max_candidates, *executor);
+        } else {
+            tree.emplace(input, window_size, max_match, max_chain_depth);
+        }
     }
 
     // Reused per worker thread across blocks (see encode_lz77_impl); the DP
@@ -1133,13 +1906,23 @@ ByteVector optimal_parse_with_costs(std::span<const std::uint8_t> input,
         hash_heads.assign(kHashSize, kNoPos);
         previous.assign(input.size(), kNoPos);
     }
-    costs.assign(input.size() + 1, kInf);
+    // No edge reaches farther than max_match, and a settled position's cost is
+    // never read again. Retain only that live frontier; decisions remain
+    // whole-input so path reconstruction is unchanged. At level 9 this turns
+    // another 8 bytes/input-byte allocation into a few KiB ring.
+    const auto max_transition = std::min(max_match, input.size());
+    costs.assign(max_transition + 1, kInf);
     decisions.assign(input.size() + 1, ParseDecision{});
     // The recent-distance list depends on the path taken, so each position keeps
     // the rep state of the lowest-cost path that reaches it. Because costs[pos]
     // is final once the loop reaches pos (every in-edge comes from an earlier
     // position), the recorded decision lets us settle reps_at[pos] deterministically.
-    static thread_local std::vector<std::array<std::size_t, kRepCount>> reps_at;
+    // Optimal parsing is bounded below 4 GiB (64 MiB in every preset), and
+    // ParseDecision already stores explicit distances as uint32_t. Keeping the
+    // four-state history equally narrow saves 16 bytes per input byte: one GiB
+    // for a 64 MiB level-9 block, without changing parser decisions or framing.
+    using RepState = std::array<Index, kRepCount>;
+    static thread_local std::vector<RepState> reps_at;
     reps_at.assign(input.size() + 1, {});
     costs[0] = 0;
 
@@ -1155,12 +1938,25 @@ ByteVector optimal_parse_with_costs(std::span<const std::uint8_t> input,
     ParseProgressTicker progress(options.encode_progress, input.size());
     for (std::size_t position = 0; position < input.size(); ++position) {
         progress.tick(position);
-        if (costs[position] == kInf) {
+        // This slot last represented position - 1. No earlier position can
+        // reach the newly exposed far edge, so clear it before relaxing edges
+        // from the current position.
+        if (position + max_transition <= input.size()) {
+            costs[(position + max_transition) % costs.size()] = kInf;
+        }
+        const auto current_cost = costs[position % costs.size()];
+        std::span<const Match> match_candidates;
+        if (candidate_pipeline) {
+            match_candidates = candidate_pipeline->next(position);
+        }
+        if (current_cost == kInf) {
             // Unreachable position: the match finder still needs it indexed.
-            if (use_tree) {
+            if (use_tree && !candidate_pipeline) {
                 tree->advance(position, nullptr, 0);
             } else {
-                insert_position(position);
+                if (!use_tree) {
+                    insert_position(position);
+                }
             }
             continue;
         }
@@ -1183,16 +1979,19 @@ ByteVector optimal_parse_with_costs(std::span<const std::uint8_t> input,
             reps_at[position] = state;
         }
 
-        const auto literal_next = costs[position] + cost_literal_model(model, input[position]);
-        if (literal_next < costs[position + 1]) {
-            costs[position + 1] = literal_next;
+        const auto literal_next = current_cost + cost_literal_model(model, input[position]);
+        auto& literal_target = costs[(position + 1) % costs.size()];
+        if (literal_next < literal_target) {
+            literal_target = literal_next;
             decisions[position + 1] = ParseDecision{1, 0, ParseKind::literal, 0};
         }
 
-        matches.clear();
-        if (use_tree) {
+        if (use_tree && !candidate_pipeline) {
+            matches.clear();
             tree->advance(position, &matches, max_candidates);
-        } else {
+            match_candidates = std::span<const Match>(matches.values.data(), matches.count);
+        } else if (!use_tree) {
+            matches.clear();
             find_matches_at(input,
                             hash_heads,
                             previous,
@@ -1202,12 +2001,12 @@ ByteVector optimal_parse_with_costs(std::span<const std::uint8_t> input,
                             max_chain_depth,
                             max_candidates,
                             matches);
+            match_candidates = std::span<const Match>(matches.values.data(), matches.count);
         }
 
         // The parser evaluates a bounded set of useful lengths instead of every
         // possible prefix. That keeps the pass linear enough for large blocks.
-        for (std::size_t match_index = 0; match_index < matches.count; ++match_index) {
-            const auto& match = matches[match_index];
+        for (const auto& match : match_candidates) {
             std::size_t length_count = 0;
             const auto lengths = useful_lengths(match.length, length_count);
 
@@ -1215,10 +2014,11 @@ ByteVector optimal_parse_with_costs(std::span<const std::uint8_t> input,
                 const auto length = static_cast<std::size_t>(lengths[i]);
                 const auto target = position + length;
                 const auto candidate_cost =
-                    costs[position] + cost_match_model(model, length, match.distance);
+                    current_cost + cost_match_model(model, length, match.distance);
 
-                if (candidate_cost < costs[target]) {
-                    costs[target] = candidate_cost;
+                auto& target_cost = costs[target % costs.size()];
+                if (candidate_cost < target_cost) {
+                    target_cost = candidate_cost;
                     decisions[target] = ParseDecision{
                         static_cast<std::uint16_t>(length),
                         match.distance,
@@ -1246,10 +2046,11 @@ ByteVector optimal_parse_with_costs(std::span<const std::uint8_t> input,
                 const auto length = static_cast<std::size_t>(lengths[k]);
                 const auto target = position + length;
                 const auto candidate_cost =
-                    costs[position] + cost_rep_model(model, length, i);
+                    current_cost + cost_rep_model(model, length, i);
 
-                if (candidate_cost < costs[target]) {
-                    costs[target] = candidate_cost;
+                auto& target_cost = costs[target % costs.size()];
+                if (candidate_cost < target_cost) {
+                    target_cost = candidate_cost;
                     decisions[target] = ParseDecision{
                         static_cast<std::uint16_t>(length),
                         0,
@@ -1263,6 +2064,10 @@ ByteVector optimal_parse_with_costs(std::span<const std::uint8_t> input,
         if (!use_tree) {
             insert_position(position);  // tree->advance already indexed it
         }
+    }
+
+    if (candidate_pipeline) {
+        candidate_pipeline->finish();
     }
 
     ByteVector output;
@@ -1387,6 +2192,398 @@ ParseCosts measure_costs(std::span<const std::uint8_t> tokens) {
         scaled_symbol_costs(match_length_hist, match_length_total, 6 * kCostScale);
     model.slot = scaled_symbol_costs(slot_hist, slot_total, 5 * kCostScale);
     return model;
+}
+
+struct CheckpointSeed {
+    std::size_t position = 0;
+    std::array<std::size_t, kRepCount> reps{1, 2, 3, 4};
+};
+
+struct CheckpointCandidateTile {
+    std::size_t begin = 0;
+    std::size_t end = 0;
+    std::vector<std::uint8_t> counts;
+    std::vector<Match> matches;
+};
+
+std::vector<CheckpointSeed> checkpoint_seeds_from_greedy(
+    std::span<const std::uint8_t> tokens,
+    std::size_t output_size,
+    std::size_t target_tile_size) {
+    std::vector<CheckpointSeed> seeds{{}};
+    std::array<std::size_t, kRepCount> reps{1, 2, 3, 4};
+    std::size_t cursor = 0;
+    std::size_t out = 0;
+    std::size_t next_target = target_tile_size;
+
+    while (cursor < tokens.size()) {
+        const auto command = tokens[cursor++];
+        if (command == kLiteralToken) {
+            const auto length = static_cast<std::size_t>(read_varuint(tokens, cursor));
+            if (length > tokens.size() - cursor || length > output_size - out) {
+                throw FormatError("invalid greedy literal while choosing checkpoints");
+            }
+            cursor += length;
+            out += length;
+        } else if (command == kMatchToken) {
+            const auto length = static_cast<std::size_t>(read_varuint(tokens, cursor));
+            const auto distance = static_cast<std::size_t>(read_varuint(tokens, cursor));
+            if (distance == 0 || distance > out || length > output_size - out) {
+                throw FormatError("invalid greedy match while choosing checkpoints");
+            }
+            reps = {distance, reps[0], reps[1], reps[2]};
+            out += length;
+        } else if (command >= kRepTokenBase &&
+                   command < kRepTokenBase + kRepCount) {
+            const auto index = static_cast<std::size_t>(command - kRepTokenBase);
+            const auto length = static_cast<std::size_t>(read_varuint(tokens, cursor));
+            if (reps[index] == 0 || reps[index] > out || length > output_size - out) {
+                throw FormatError("invalid greedy rep while choosing checkpoints");
+            }
+            const auto chosen = reps[index];
+            for (std::size_t i = index; i > 0; --i) {
+                reps[i] = reps[i - 1];
+            }
+            reps[0] = chosen;
+            out += length;
+        } else {
+            throw FormatError("unknown greedy token while choosing checkpoints");
+        }
+
+        // Boundaries are token ends, so no match can straddle a checkpoint.
+        if (out >= next_target && out < output_size) {
+            seeds.push_back({out, reps});
+            next_target = out + target_tile_size;
+        }
+    }
+    if (out != output_size) {
+        throw FormatError("greedy parse size does not match checkpoint input");
+    }
+    return seeds;
+}
+
+ByteVector parse_checkpoint_tile(std::span<const std::uint8_t> input,
+                                 const CompressionOptions& options,
+                                 const ParseCosts& model,
+                                 const CheckpointSeed& seed,
+                                 CheckpointCandidateTile candidates) {
+    constexpr std::uint64_t kInf = std::numeric_limits<std::uint64_t>::max() / 4;
+    const auto length = candidates.end - candidates.begin;
+    const auto max_match = std::max<std::size_t>(kMinMatch, options.max_match);
+
+    const auto max_transition = std::min(max_match, length);
+    std::vector<std::uint64_t> costs(max_transition + 1, kInf);
+    std::vector<ParseDecision> decisions(length + 1);
+    using RepState = std::array<std::uint32_t, kRepCount>;
+    std::vector<RepState> reps_at(length + 1);
+    costs[0] = 0;
+    std::transform(seed.reps.begin(), seed.reps.end(), reps_at[0].begin(),
+                   [](std::size_t distance) {
+                       return static_cast<std::uint32_t>(distance);
+                   });
+
+    std::size_t match_cursor = 0;
+    for (std::size_t local = 0; local < length; ++local) {
+        if (local + max_transition <= length) {
+            costs[(local + max_transition) % costs.size()] = kInf;
+        }
+        const auto current_cost = costs[local % costs.size()];
+        if (local != 0) {
+            const auto& decision = decisions[local];
+            if (decision.length == 0 || decision.length > local) {
+                throw FormatError("checkpoint parser reached an invalid state");
+            }
+            auto state = reps_at[local - decision.length];
+            if (decision.kind == ParseKind::match) {
+                state = {decision.distance, state[0], state[1], state[2]};
+            } else if (decision.kind == ParseKind::rep) {
+                const auto chosen = state[decision.rep_index];
+                for (std::size_t i = decision.rep_index; i > 0; --i) {
+                    state[i] = state[i - 1];
+                }
+                state[0] = chosen;
+            }
+            reps_at[local] = state;
+        }
+
+        const auto position = candidates.begin + local;
+        const auto literal_cost_value =
+            current_cost + cost_literal_model(model, input[position]);
+        auto& literal_target = costs[(local + 1) % costs.size()];
+        if (literal_cost_value < literal_target) {
+            literal_target = literal_cost_value;
+            decisions[local + 1] = {1, 0, ParseKind::literal, 0};
+        }
+
+        if (local >= candidates.counts.size()) {
+            throw FormatError("checkpoint candidate counts ended early");
+        }
+        const auto count = static_cast<std::size_t>(candidates.counts[local]);
+        if (match_cursor > candidates.matches.size() ||
+            count > candidates.matches.size() - match_cursor) {
+            throw FormatError("checkpoint candidate framing is invalid");
+        }
+        for (std::size_t index = 0; index < count; ++index) {
+            const auto& match = candidates.matches[match_cursor + index];
+            const auto capped_length = std::min<std::size_t>(match.length, length - local);
+            if (capped_length < kMinMatch) {
+                continue;
+            }
+            std::size_t useful_count = 0;
+            const auto useful = useful_lengths(capped_length, useful_count);
+            for (std::size_t i = 0; i < useful_count; ++i) {
+                const auto match_length = static_cast<std::size_t>(useful[i]);
+                const auto target = local + match_length;
+                const auto candidate_cost = current_cost +
+                    cost_match_model(model, match_length, match.distance);
+                auto& target_cost = costs[target % costs.size()];
+                if (candidate_cost < target_cost) {
+                    target_cost = candidate_cost;
+                    decisions[target] = {
+                        static_cast<std::uint16_t>(match_length), match.distance,
+                        ParseKind::match, 0};
+                }
+            }
+        }
+        match_cursor += count;
+
+        const auto& reps = reps_at[local];
+        const auto rep_limit = std::min(max_match, length - local);
+        for (std::size_t index = 0; index < kRepCount; ++index) {
+            const auto rep_length =
+                match_length_at(input, position, reps[index], rep_limit);
+            if (rep_length < kMinMatch) {
+                continue;
+            }
+            std::size_t useful_count = 0;
+            const auto useful = useful_lengths(rep_length, useful_count);
+            for (std::size_t i = 0; i < useful_count; ++i) {
+                const auto match_length = static_cast<std::size_t>(useful[i]);
+                const auto target = local + match_length;
+                const auto candidate_cost =
+                    current_cost + cost_rep_model(model, match_length, index);
+                auto& target_cost = costs[target % costs.size()];
+                if (candidate_cost < target_cost) {
+                    target_cost = candidate_cost;
+                    decisions[target] = {
+                        static_cast<std::uint16_t>(match_length), 0,
+                        ParseKind::rep, static_cast<std::uint8_t>(index)};
+                }
+            }
+        }
+    }
+    if (match_cursor != candidates.matches.size()) {
+        throw FormatError("checkpoint candidates were not consumed exactly");
+    }
+
+    std::vector<ParseDecision> path;
+    for (std::size_t local = length; local > 0;) {
+        const auto decision = decisions[local];
+        if (decision.length == 0 || decision.length > local) {
+            throw FormatError("checkpoint parser failed to reconstruct a path");
+        }
+        path.push_back(decision);
+        local -= decision.length;
+    }
+    std::reverse(path.begin(), path.end());
+
+    ByteVector output;
+    output.reserve(length / 4);
+    std::size_t position = candidates.begin;
+    std::size_t literal_start = position;
+    for (const auto& decision : path) {
+        if (decision.kind == ParseKind::literal) {
+            ++position;
+            continue;
+        }
+        write_literal_run(output, input, literal_start, position - literal_start);
+        if (decision.kind == ParseKind::rep) {
+            output.push_back(static_cast<std::uint8_t>(
+                kRepTokenBase + decision.rep_index));
+            write_varuint(output, decision.length);
+        } else {
+            output.push_back(kMatchToken);
+            write_varuint(output, decision.length);
+            write_varuint(output, decision.distance);
+        }
+        position += decision.length;
+        literal_start = position;
+    }
+    write_literal_run(output, input, literal_start, candidates.end - literal_start);
+    return output;
+}
+
+std::optional<ByteVector> encode_lz77_optimal_checkpointed(
+    std::span<const std::uint8_t> input,
+    const CompressionOptions& options,
+    const ByteVector& greedy_tokens) {
+    constexpr std::size_t kTileSize = std::size_t{2} << 20;
+    constexpr std::size_t kMinimumInput = kTileSize * 2;
+    if (!options.swarm_parse || !options.use_tree_matcher ||
+        !options.enable_optimal_parser || input.size() < kMinimumInput ||
+        input.size() > options.optimal_parse_limit ||
+        input.size() >= std::numeric_limits<std::uint32_t>::max()) {
+        return std::nullopt;
+    }
+    auto* executor = core::TaskExecutor::current();
+    if (executor == nullptr || executor->worker_count() <= 1) {
+        return std::nullopt;
+    }
+
+    const auto seeds =
+        checkpoint_seeds_from_greedy(greedy_tokens, input.size(), kTileSize);
+    if (seeds.size() <= 1) {
+        return std::nullopt;
+    }
+
+    const auto window_size = std::max<std::size_t>(kMinMatch, options.window_size);
+    const auto max_match = std::max<std::size_t>(kMinMatch, options.max_match);
+    const auto chain_depth = std::max<std::size_t>(1, options.optimal_chain_depth);
+    const auto max_candidates =
+        std::clamp<std::size_t>(options.max_parser_candidates, 1,
+                                kParserCandidateLimit);
+    const auto model = measure_costs(greedy_tokens);
+    TreeMatchSource<std::uint32_t> tree(
+        input, window_size, max_match, chain_depth);
+
+    struct PendingTile {
+        std::size_t index = 0;
+        std::future<ByteVector> future;
+    };
+    std::deque<PendingTile> pending;
+    std::vector<ByteVector> encoded_tiles(seeds.size());
+    // There is no fixed CPU ceiling: work in flight follows the executor size
+    // and is naturally bounded by the number of deterministic tiles in the
+    // block. Larger inputs and multiple blocks therefore scale beyond 32
+    // workers without changing archive bytes.
+    const auto max_in_flight = executor->worker_count();
+
+    const auto collect_front = [&] {
+        auto item = std::move(pending.front());
+        pending.pop_front();
+        encoded_tiles[item.index] = executor->wait(item.future);
+    };
+
+    ParseProgressTicker progress(options.encode_progress, input.size());
+    for (std::size_t tile_index = 0; tile_index < seeds.size(); ++tile_index) {
+        CheckpointCandidateTile tile;
+        tile.begin = seeds[tile_index].position;
+        tile.end = tile_index + 1 < seeds.size()
+            ? seeds[tile_index + 1].position
+            : input.size();
+        const auto tile_length = tile.end - tile.begin;
+        tile.counts.resize(tile_length);
+        tile.matches.reserve(tile_length * std::min<std::size_t>(2, max_candidates));
+        for (std::size_t position = tile.begin; position < tile.end; ++position) {
+            progress.tick(position);
+            MatchList matches;
+            tree.advance(position, &matches, max_candidates);
+            const auto local = position - tile.begin;
+            tile.counts[local] = static_cast<std::uint8_t>(matches.count);
+            tile.matches.insert(
+                tile.matches.end(), matches.values.begin(),
+                matches.values.begin() + static_cast<std::ptrdiff_t>(matches.count));
+        }
+
+        const auto seed = seeds[tile_index];
+        pending.push_back({
+            tile_index,
+            executor->submit([input, options, model, seed, tile = std::move(tile)]() mutable {
+                return parse_checkpoint_tile(input, options, model, seed,
+                                             std::move(tile));
+            })});
+        if (pending.size() >= max_in_flight) {
+            collect_front();
+        }
+    }
+    while (!pending.empty()) {
+        collect_front();
+    }
+
+    ByteVector output;
+    const auto token_bytes = std::accumulate(
+        encoded_tiles.begin(), encoded_tiles.end(), std::size_t{0},
+        [](std::size_t total, const ByteVector& tile) {
+            return total + tile.size();
+        });
+    output.reserve(token_bytes + (seeds.size() - 1) * 9);
+    std::array<std::size_t, kRepCount> decoder_reps{1, 2, 3, 4};
+    std::size_t decoded_position = 0;
+    const auto advance_state = [&](std::span<const std::uint8_t> tokens) {
+        std::size_t cursor = 0;
+        while (cursor < tokens.size()) {
+            const auto command = tokens[cursor++];
+            if (command == kLiteralToken) {
+                const auto length =
+                    static_cast<std::size_t>(read_varuint(tokens, cursor));
+                if (length > tokens.size() - cursor ||
+                    length > input.size() - decoded_position) {
+                    throw FormatError("invalid checkpoint tile literal");
+                }
+                cursor += length;
+                decoded_position += length;
+            } else if (command == kMatchToken) {
+                const auto length =
+                    static_cast<std::size_t>(read_varuint(tokens, cursor));
+                const auto distance =
+                    static_cast<std::size_t>(read_varuint(tokens, cursor));
+                if (distance == 0 || distance > decoded_position ||
+                    length > input.size() - decoded_position) {
+                    throw FormatError("invalid checkpoint tile match");
+                }
+                decoder_reps = {distance, decoder_reps[0], decoder_reps[1],
+                                decoder_reps[2]};
+                decoded_position += length;
+            } else if (command >= kRepTokenBase &&
+                       command < kRepTokenBase + kRepCount) {
+                const auto index =
+                    static_cast<std::size_t>(command - kRepTokenBase);
+                const auto length =
+                    static_cast<std::size_t>(read_varuint(tokens, cursor));
+                if (decoder_reps[index] > decoded_position ||
+                    length > input.size() - decoded_position) {
+                    throw FormatError("invalid checkpoint tile rep");
+                }
+                const auto chosen = decoder_reps[index];
+                for (std::size_t i = index; i > 0; --i) {
+                    decoder_reps[i] = decoder_reps[i - 1];
+                }
+                decoder_reps[0] = chosen;
+                decoded_position += length;
+            } else {
+                throw FormatError("unexpected token inside checkpoint tile");
+            }
+        }
+    };
+    for (std::size_t tile_index = 0; tile_index < encoded_tiles.size(); ++tile_index) {
+        if (tile_index != 0) {
+            output.push_back(kCheckpointToken);
+            const auto old_reps = decoder_reps;
+            for (const auto distance : seeds[tile_index].reps) {
+                std::size_t old_index = kRepCount;
+                for (std::size_t i = 0; i < kRepCount; ++i) {
+                    if (old_reps[i] == distance) {
+                        old_index = i;
+                        break;
+                    }
+                }
+                if (old_index < kRepCount) {
+                    output.push_back(static_cast<std::uint8_t>(old_index));
+                } else {
+                    output.push_back(kCheckpointExplicit);
+                    write_varuint(output, distance);
+                }
+            }
+            decoder_reps = seeds[tile_index].reps;
+        }
+        output.insert(output.end(), encoded_tiles[tile_index].begin(),
+                      encoded_tiles[tile_index].end());
+        advance_state(encoded_tiles[tile_index]);
+    }
+    if (decoded_position != input.size()) {
+        throw FormatError("checkpoint tiles do not cover the input exactly");
+    }
+    return output;
 }
 
 ByteVector encode_lz77_optimal(std::span<const std::uint8_t> input,

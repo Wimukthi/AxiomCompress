@@ -1,0 +1,11 @@
+configuration,threads,geometry,wall_seconds,cpu_seconds,avg_active_logical,task_manager_percent,peak_threads,peak_working_set_gib,peak_commit_gib,archive_bytes,ratio,disposition
+fixed_64m,16,64MiB,141.243,1880.562,13.31,41.6,19,55.39,65.55,226778869,4.40958,diagnostic_same_geometry
+fixed_64m,32,64MiB,139.635,1911.688,13.69,42.8,35,54.72,65.57,226778869,4.40958,rejected_no_scaling
+automatic_logical_geometry,32,about_31MiB,89.201,2202.453,24.69,77.2,35,54.82,65.69,233427563,4.28398,rejected_ratio_regression
+swarm_fixed_64m,16,64MiB,197.341,2916.812,14.78,46.2,,55.10,67.02,227579655,4.39407,rejected_slower_and_larger
+swarm_fixed_64m,32,64MiB,173.581,3258.234,18.77,58.7,,56.52,60.67,227579655,4.39407,rejected_slower_and_larger
+global_plus_checkpoint_concurrent,32,automatic,178.960,3939.297,22.01,68.8,35,56.33,85.98,227339187,4.39871,rejected_duplicate_full_parse
+checkpoint_only_2m,32,automatic,107.419,1839.844,17.13,53.5,35,18.29,19.29,227414458,4.39726,diagnostic_ratio_regression
+exact_pipeline_pre_compaction,32,physical_core_geometry,130.789,1971.031,15.08,47.1,35,55.63,65.66,227343036,4.39864,baseline
+exact_pipeline_compact_dp,32,physical_core_geometry,117.850,1841.312,15.64,48.9,35,38.88,39.55,227343036,4.39864,landed
+axar_auto_compact_dp,32,64MiB_solid_8MiB_inner,72.518,1184.594,16.34,51.1,36,9.74,9.96,246291964,4.06022,landed_gui_equivalent_integration

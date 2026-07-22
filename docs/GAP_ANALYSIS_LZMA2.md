@@ -274,6 +274,125 @@ round trip, and corrupt cluster counts/maps are rejected. Raw results are in
 
 The remaining tar gap is 1,777,887 bytes to mx5 and 2,701,150 bytes to mx9.
 
+### Swarm parse prototype validated: full-window ratio without serial encode
+
+An encoder-only experiment (behind `--swarm`, hash-chain levels, presets never
+enable it) tests decoupling parallelism from block geometry. One logical block
+is parsed as concurrent segments against the full block window:
+
+- **Phase 1** builds immutable per-segment hash-chain indexes in parallel.
+  Insertion depends only on input bytes, and the stored links equal exactly
+  what sequential insertion would produce.
+- **Phase 2** parses every segment concurrently. A candidate walk visits the
+  segment's own incrementally revealed chain, then earlier segments' completed
+  chains — the same candidates, in the same newest-to-oldest order, under the
+  same depth budget as the serial matcher. Matches stop at segment boundaries
+  and the recent-distance list restarts per segment, so only explicit
+  distances are emitted.
+- **Phase 3** serially rewrites distance==rep matches into rep tokens under
+  the true decoder-visible state and merges adjacent literal runs.
+
+The payload format and decoder are untouched, and output is deterministic for
+a given input regardless of worker timing. Controlled level-6 measurement on
+the two members that measurably want a full window (10-core machine,
+best-of-two, swarm output round-trip verified):
+
+| member | serial 1-thread (full window) | parallel default (split) | swarm (full window, all cores) |
+|---|---:|---:|---:|
+| webster | 9,796,783 in 71.5 s | 10,392,825 in 5.2 s | **9,796,807 in 20.7 s** |
+| nci | 1,965,352 in 9.9 s | 2,237,680 in 0.8 s | **1,965,390 in 3.6 s** |
+
+The seam cost is **24 and 38 bytes** — effectively zero — while recovering the
+full window ratio (−5.7% and −12.2% versus split blocks) at 2.7–3.5x the
+serial speed. The full Release test/safety/fuzz suite passes with the flag
+compiled in; default behavior is byte-identical since presets never set it.
+
+Two follow-up changes landed after that first measurement. `TaskExecutor`
+gained a `current()` accessor and the swarm joins the ambient executor when
+one exists, so block-path workers fan segment tasks into the shared budget
+instead of nesting pools. And the serial whole-input analysis now scopes one
+executor over its candidates (plain `compress()` calls previously ran the
+entire entropy bake-off on one core; explicit `--threads 1` and dual-candidate
+runs keep their old behavior). The full suite passes after both.
+
+Tar-level level-6 comparison on the same 10-core machine (single runs,
+swarm outputs round-trip verified):
+
+| configuration | bytes | seconds |
+|---|---:|---:|
+| default auto split (~21 MiB blocks) | 56,240,198 | 8.3 |
+| 64 MiB blocks (4 busy workers) | 55,966,155 | 94.6 |
+| **64 MiB blocks + swarm inside** | **55,966,074** | **47.4** |
+| one solid 256 MiB-window block + swarm | 57,433,908 | 80.8 |
+| one solid block, serial (ceiling) | 57,433,728 | 241.4 |
+
+Three conclusions:
+
+1. **At a fixed block geometry the swarm strictly dominates.** The 64 MiB
+   configuration keeps its exact archive (81 bytes smaller, in fact) while the
+   segment tasks raise worker occupancy from 4 to 10 — 2.0x faster. This is
+   the concrete form of "swarm beats split blocks": same ratio point, idle
+   workers converted to speed.
+2. **The serial-equivalence holds at scale.** One solid block parsed by the
+   swarm lands within 180 bytes of the serial ceiling (0.0003%) at 3.0x its
+   speed, consistent with the 24–38-byte member results.
+3. **A uniform giant window is confirmed anti-productive — for the third
+   independent time.** The solid 256 MiB-window run is 1.47 MB *worse* than
+   4x64 MiB blocks: one entropy-table set straddling mozilla, webster, and
+   x-ray loses far more than the extra window reach gains (cross-member
+   matching was already measured near-worthless). The shipping shape is
+   therefore **content-adaptive blocks (item 3) with the swarm inside each**
+   — window and tables sized to content, cores kept busy regardless of block
+   count, and ratio independent of the machine's core count.
+
+The opt-in has now been extended to levels 1, 8, and 9. Level 1 bypasses its
+byte-token fast path when swarm is explicitly requested and uses the cooperative
+hash parser. Levels 8-9 use a per-segment binary tree locally plus immutable
+prior-segment chain heads for full-window reach in the greedy candidate. Their
+global optimal DP remains unchanged: an attempted segmented DP was rejected
+because it was both larger and slower (level 8: 53,401,600 bytes in 40.8 s,
+versus 52,495,767 bytes in 32.3 s for split).
+
+Controlled Silesia tar results on the same 10-core machine (211,948,032-byte
+input, explicit preset block/window sizes, single runs except for the final
+level-9 two-run validation, all swarm outputs SHA-256 round-trip verified):
+
+| level | split | swarm | interpretation |
+|---|---:|---:|---|
+| 1 | 66,248,720 bytes / 1.15 s | **62,308,127 bytes** / 3.72 s | 5.95% smaller; ratio override, not a speed win |
+| 8 | 52,495,767 bytes / 32.27 s | **52,490,464 bytes** / **27.86 s** | 5,303 bytes smaller; 13.7% faster in this run |
+| 9 | 51,996,245 bytes / 68.88 s | **51,991,188 bytes** / **46.26 s** | 5,057 bytes smaller; 32.8% faster (slower of two final runs) |
+
+Raw rows, including the rejected segmented-DP trials, are in
+`swarm-extended-levels.csv`.
+
+The high-level result is intentionally conservative: swarm adds a parallel
+greedy representation, while the existing block bake-off and the unsegmented
+optimal candidate protect ratio. Supplemental prior-segment chain walks are
+bounded by the preset's optimal search depth (16 at level 8, 32 at level 9),
+rather than repeating the local tree's much larger 128/512 depth. That bound
+turned the initial 4-7% slowdown into the measured 14% throughput gain above.
+Level 9 then separates exact global-tree discovery from the path-dependent DP:
+the tree publishes fixed 256 KiB candidate tiles one task ahead, with only two
+tiles live, and the consumer cooperatively executes its next tile if other block
+workers occupy the executor. The final two runs were 44.29 and 46.26 s, another
+21-25% faster than the 58.79 s pre-pipeline swarm and byte-identical to it. The
+shallower level-8 tree retains the direct DP because three trials showed the tile
+framing cost about one second there. Levels 8-9 remain opt-in until
+broader-corpus measurements confirm the result.
+The next ratio-oriented swarm work is to re-tune the adaptive-geometry split
+threshold; geometry no longer needs to over-split large members merely to feed
+workers.
+
+It is exposed as an opt-in now. The CLI takes `--swarm` (documented in
+`CLI_GUIDE.md`), and the GUI Add-to-archive and Settings > Compression pages
+have a "Threading model" selector (Split blocks / Swarm) with an inline
+level-specific tradeoff note. It is enabled at levels 1–6 and 8–9; level 7 is
+disabled because its lazy tree parse is path-dependent. The
+choice persists via the `ThreadModel` setting and flows through
+`compression_options()` to `swarm_parse`. Presets still never set it, so
+default output is unchanged.
+
 Corpus layout used: the twelve Silesia members in `D:\Silesia`, and the tar
 built with `tar --force-local --format=ustar -b 1 -cf silesia.tar dickens
 mozilla mr nci ooffice osdb reymont samba sao webster x-ray xml` (from the
@@ -425,9 +544,10 @@ item-5 forecast was based on the incorrect ELF assumption, while item 4 lost
 its bake-off. The next ratio phase therefore has to attack the remaining
 mozilla literal-modeling gap directly rather than count those estimates again.
 
-Encoder memory (secondary): ~55 bytes/byte of parse state per in-flight
-level-9 block vs LZMA BT4's ~11.5; worth a diet during item 3 so big-window
-segments don't constrain thread count on 16–32 GB machines.
+Encoder memory (secondary): the July 18 DP compaction reduced the measured
+enwik9 peak from 65.66 GiB to 39.55 GiB. The tree and full-path rep history are
+still the dominant per-block state and remain candidates for a cache-local
+redesign.
 
 ## Reproducing / continuing on the workstation
 
@@ -448,6 +568,11 @@ py bench\axc_inspect.py path\to\archive.axc
 
 Next ratio phase:
 
+- Productionize the validated swarm parse: parallelize the serial-path entropy
+  bake-off, then measure a level 5/6 "solid" mode (full-window ratio at
+  mid throughput) and design the level 8–9 hybrid candidate source
+  (per-segment tree + prior-segment chains into the DP). This also equalizes
+  ratio across machine core counts.
 - First test position-mod-stride literal contexts for sao/osdb without physically
   shuffling records. Stride and clustered tables are encoder-chosen static
   metadata, so the decoder remains bounded; the complete representation still
@@ -458,3 +583,80 @@ Next ratio phase:
 - The full-window optimal-parse ceiling remains a diagnostic only: a 212 MB
   single block currently exceeds `optimal_parse_limit` (64 MiB), and raising it
   is unlikely to satisfy the no-throughput-regression constraint.
+
+## Level-9 DP checkpoints (2026-07-18)
+
+The remaining serial DP dependency was tested as a versioned, decoder-static
+representation rather than by weakening match discovery. Token-aligned parser
+tiles are approximately 2 MiB; each keeps the full block window, receives four
+greedy-selected recent-distance seeds, and runs an independent optimal DP on the
+shared executor. The concatenated tokens retain global context-split entropy
+streams. A checkpoint seed first references one of the decoder's current four
+distances when possible and transmits a slotted explicit distance only as a
+fallback. Decode is four bounded descriptor reads plus table assignments.
+
+The absolute-distance prototype lost every Silesia block by tens of bytes. Rep
+reuse removed enough framing that one 5,346,816-byte block won the exact complete
+payload bake-off (476,299 versus 476,477 bytes). On the current working tree and
+the exact 211,948,032-byte tar:
+
+| configuration | archive bytes | ratio | compression | result |
+|---|---:|---:|---:|---|
+| same run, all checkpoint candidates rejected | 51,405,635 | 4.12305x | 29.732 s | incumbent |
+| AXC v9 2 MiB checkpoints, strict per-block bake-off | **51,405,457** | **4.12306x** | 30.317 s | 178 bytes smaller |
+
+SHA-256 round-trip passed (0.308 s decode), the full
+codec/archive/safety/fuzz suite passed, and
+the checkpoint token stream was byte-identical with three and four executor
+workers. `axc_inspect.py` now recognizes block codec 10. This is deliberately a
+small first ratio win: the architectural result is that independent DPs can use
+all available executor workers without accepting the large ratio loss measured
+for hard segmented DP, while the ordinary global parse remains the fallback.
+
+## enwik9 thread scaling and bottleneck trace (2026-07-18)
+
+Machine: AMD Ryzen 9 5950X, 16 physical cores / 32 logical processors, 64 GiB
+RAM. Input: canonical 1,000,000,000-byte `D:\enwik9`. All rows use level 9;
+the complete raw matrix is
+`bench/results/enwik9-thread-scaling-2026-07-18.csv`.
+
+| configuration | time | active logical CPUs | peak commit | bytes | result |
+|---|---:|---:|---:|---:|---|
+| fixed 64 MiB, 16 workers | 141.243 s | 13.31 | 65.55 GiB | 226,778,869 | ratio reference |
+| fixed 64 MiB, 32 workers | 139.635 s | 13.69 | 65.57 GiB | 226,778,869 | SMT did not scale |
+| 32 automatic blocks | 89.201 s | 24.69 | 65.69 GiB | 233,427,563 | rejected: +6.65 MB |
+| exact tree/DP pipeline, pre-compaction | 130.789 s | 15.08 | 65.66 GiB | 227,343,036 | traced baseline |
+| exact pipeline + compact DP | **117.850 s** | **15.64** | **39.55 GiB** | **227,343,036** | landed |
+
+The isolated 64 MiB trace was decisive: direct parsing used one CPU for
+63.069 s; the exact two-stage tree/DP pipeline used 1.29 CPUs and took 58.133 s
+with identical 17,387,614-byte output. DP therefore supplies only about 29% of
+a second thread while ordered binary-tree discovery remains the long pole. With
+16 blocks already walking trees on all 16 physical cores, SMT siblings compete
+for cache and memory bandwidth; Task Manager showing about 49% does not mean the
+executor is capped at 16. It means only about one hardware thread per core is
+useful during the dominant phase.
+
+Automatic execution now exposes all logical processors, discovered across all
+Windows processor groups, while automatic block geometry remains based on
+physical cores. This preserves the incumbent ratio and lets nested work use SMT
+on AMD, Intel, and larger machines without a fixed 32-thread ceiling. The exact
+level-9 pipeline is automatic; the checkpoint representation remains an opt-in
+swarm candidate and still ships only when its complete payload is smaller.
+
+Three representation-neutral DP changes removed the measured memory bottleneck:
+
+- recent-distance state uses four 32-bit values rather than four `size_t`s;
+- `ParseDecision` is explicitly 8 bytes instead of 12 bytes with padding; and
+- only the live `max_match + 1` cost frontier is retained in a ring.
+
+Together they reduced peak commit by 26.11 GiB (39.8%) and improved wall time by
+12.939 s (9.9%), with identical archive bytes. Full Release tests and SHA-256
+round-trip passed. A GUI-equivalent AXAR integration run completed in 72.518 s,
+averaged 16.34 active logical CPUs, peaked at 36 process threads and 9.96 GiB
+commit, and passed `axiomc test`; its separate solid-block geometry is recorded
+in the CSV and is not ratio-comparable to the AXC row. The next throughput target
+is not more blind worker creation:
+it is a cache-local, full-history tree candidate source (segment-local tree plus
+immutable prior-segment indexes) that can feed independent checkpoint DPs. It
+must still win the existing complete-payload bake-off before becoming writable.

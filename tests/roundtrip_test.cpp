@@ -7,6 +7,7 @@
 #include "codec/lz77_split.hpp"
 #include "codec/transform.hpp"
 #include "core/checksum.hpp"
+#include "core/benchmark_corpus.hpp"
 #include "core/cpu.hpp"
 #include "core/hash.hpp"
 #include "core/file_replace.hpp"
@@ -148,7 +149,8 @@ void expect_slot_split_stream_roundtrip(const std::vector<std::uint8_t>& input) 
         const auto context_split = axiom::codec::encode_lz77_context_split_streams(
             input, lz77, *payloads.slots, *payloads.contextual_slots);
         AXIOM_CHECK(context_split.contextual_slots.has_value());
-        std::fill(contextual_restored.begin(), contextual_restored.end(), 0);
+        std::fill(contextual_restored.begin(), contextual_restored.end(),
+                  std::uint8_t{0});
         axiom::codec::decode_lz77_contextual_slot_context_split_streams_into(
             *context_split.contextual_slots, contextual_restored);
         AXIOM_CHECK(contextual_restored == input);
@@ -358,6 +360,15 @@ void test_compression_level_presets() {
     AXIOM_CHECK(maximum.window_size == (64u << 20));
     AXIOM_CHECK(!maximum.optimal_two_pass);
     AXIOM_CHECK(maximum.auto_block_size_for_threads);
+
+    const auto automatic_workers = axiom::codec::effective_thread_count(
+        0, std::numeric_limits<std::size_t>::max());
+    AXIOM_CHECK(axiom::core::logical_processor_count() >= 1);
+    AXIOM_CHECK(axiom::core::physical_core_count() <=
+                axiom::core::logical_processor_count());
+    AXIOM_CHECK(axiom::codec::effective_compression_thread_count(
+                    0, std::numeric_limits<std::size_t>::max()) ==
+                automatic_workers);
 }
 void expect_tree_lz77_roundtrip(const std::vector<std::uint8_t>& input) {
     axiom::CompressionOptions options;
@@ -398,6 +409,121 @@ void expect_optimal_lz77_roundtrip(const std::vector<std::uint8_t>& input) {
     const auto lz77 = axiom::codec::encode_lz77_optimal(input, options);
     const auto restored = axiom::codec::decode_lz77(lz77, input.size());
     AXIOM_CHECK(restored == input);
+}
+
+void test_swarm_extended_levels() {
+    // More than two fixed swarm segments, with recurring pages that exercise
+    // both local matches and lookups into completed earlier segments.
+    std::vector<std::uint8_t> page(64u << 10);
+    std::uint32_t state = 0xA710CAFEu;
+    for (std::size_t i = 0; i < page.size(); ++i) {
+        state = state * 1664525u + 1013904223u;
+        page[i] = static_cast<std::uint8_t>((state >> 24) ^ (i & 31u));
+    }
+    std::vector<std::uint8_t> input;
+    input.reserve(5u << 20);
+    while (input.size() < (5u << 20)) {
+        const auto count = std::min(page.size(), (5u << 20) - input.size());
+        input.insert(input.end(), page.begin(),
+                     page.begin() + static_cast<std::ptrdiff_t>(count));
+        input.back() ^= static_cast<std::uint8_t>(input.size() >> 16);
+    }
+
+    for (const int level : {1, 8, 9}) {
+        axiom::CompressionOptions one_thread;
+        axiom::apply_compression_level(one_thread, level);
+        one_thread.swarm_parse = true;
+        one_thread.thread_count = 1;
+        one_thread.window_size = input.size();
+
+        auto four_threads = one_thread;
+        four_threads.thread_count = 4;
+        const auto serial_schedule = axiom::codec::encode_lz77(input, one_thread);
+        const auto parallel_schedule = axiom::codec::encode_lz77(input, four_threads);
+        AXIOM_CHECK(parallel_schedule == serial_schedule);
+        AXIOM_CHECK(axiom::codec::decode_lz77(parallel_schedule, input.size()) == input);
+    }
+
+    // The high-level candidate pipeline must be exactly equivalent to the
+    // serial global tree, not merely round-trip compatible. Supplying the same
+    // greedy cost model isolates discovery/DP scheduling from model selection.
+    const std::vector<std::uint8_t> pipeline_input(
+        input.begin(), input.begin() + static_cast<std::ptrdiff_t>(768u << 10));
+    for (const int level : {9}) {
+        axiom::CompressionOptions serial;
+        axiom::apply_compression_level(serial, level);
+        serial.window_size = pipeline_input.size();
+        serial.thread_count = 4;
+        const auto greedy = axiom::codec::encode_lz77(pipeline_input, serial);
+        const auto expected =
+            axiom::codec::encode_lz77_optimal(pipeline_input, serial, &greedy);
+
+        axiom::core::TaskExecutor executor(4);
+        const auto pipelined =
+            axiom::codec::encode_lz77_optimal(pipeline_input, serial, &greedy);
+        AXIOM_CHECK(pipelined == expected);
+        AXIOM_CHECK(axiom::codec::decode_lz77(pipelined, pipeline_input.size()) ==
+                    pipeline_input);
+    }
+
+    // AXC v9 checkpoint tiles run independent DPs but retain global entropy
+    // coding and full-window matches. Their static rep seeds must produce the
+    // same bytes regardless of worker scheduling, and malformed framing is
+    // rejected before any stream decoding begins.
+    axiom::CompressionOptions checkpoint_options;
+    axiom::apply_compression_level(checkpoint_options, 9);
+    checkpoint_options.swarm_parse = true;
+    checkpoint_options.thread_count = 4;
+    checkpoint_options.window_size = input.size();
+    checkpoint_options.optimal_parse_limit = input.size();
+    const auto checkpoint_greedy =
+        axiom::codec::encode_lz77(input, checkpoint_options);
+    std::optional<std::vector<std::uint8_t>> first_checkpoint_tokens;
+    std::optional<std::vector<std::uint8_t>> first_checkpoint_payload;
+    {
+        axiom::core::TaskExecutor executor(4);
+        first_checkpoint_tokens = axiom::codec::encode_lz77_optimal_checkpointed(
+            input, checkpoint_options, checkpoint_greedy);
+        AXIOM_CHECK(first_checkpoint_tokens.has_value());
+        first_checkpoint_payload =
+            axiom::codec::encode_lz77_checkpoint_context_streams(
+                input, *first_checkpoint_tokens, &executor);
+    }
+    AXIOM_CHECK(first_checkpoint_payload.has_value());
+    std::vector<std::uint8_t> checkpoint_restored(input.size());
+    axiom::codec::decode_lz77_checkpoint_context_streams_into(
+        *first_checkpoint_payload, checkpoint_restored);
+    AXIOM_CHECK(checkpoint_restored == input);
+    {
+        axiom::core::TaskExecutor executor(3);
+        const auto second_tokens = axiom::codec::encode_lz77_optimal_checkpointed(
+            input, checkpoint_options, checkpoint_greedy);
+        AXIOM_CHECK(second_tokens == first_checkpoint_tokens);
+    }
+    auto bad_checkpoint_mode = *first_checkpoint_payload;
+    bad_checkpoint_mode[0] = 2;
+    bool rejected_bad_checkpoint = false;
+    try {
+        axiom::codec::decode_lz77_checkpoint_context_streams_into(
+            bad_checkpoint_mode, checkpoint_restored);
+    } catch (const axiom::FormatError&) {
+        rejected_bad_checkpoint = true;
+    }
+    AXIOM_CHECK(rejected_bad_checkpoint);
+
+    // Level 1 normally exits through the byte-token block path. Explicit swarm
+    // must instead reach the cooperative LZ77 path and still round-trip through
+    // the complete container/candidate bake-off.
+    axiom::CompressionOptions fast_swarm;
+    axiom::apply_compression_level(fast_swarm, 1);
+    fast_swarm.swarm_parse = true;
+    fast_swarm.thread_count = 4;
+    fast_swarm.block_size = input.size();
+    fast_swarm.window_size = input.size();
+    fast_swarm.auto_block_size_for_threads = false;
+    fast_swarm.enable_file_filters = false;
+    const auto archive = axiom::compress(input, fast_swarm);
+    AXIOM_CHECK(axiom::decompress(archive) == input);
 }
 
 // Reference one-byte-per-step reflected CRC-32, independent of the production
@@ -604,6 +730,40 @@ void expect_throws(Fn&& fn) {
         threw = true;
     }
     AXIOM_CHECK(threw);
+}
+
+void test_benchmark_corpus_generator() {
+    axiom::core::BenchmarkCorpusOptions options;
+    options.kind = axiom::core::BenchmarkCorpusKind::lz_synthetic;
+    options.size = 64u << 10;
+    options.window_size = 32u << 10;
+    options.segment_size = 16u << 10;
+    options.seed = axiom::core::kBenchmarkCorpusDefaultSeed;
+
+    std::size_t reported = 0;
+    const auto first = axiom::core::generate_benchmark_corpus(
+        options, [&](std::size_t completed) { reported = completed; });
+    const auto second = axiom::core::generate_benchmark_corpus(options);
+    AXIOM_CHECK(first == second);
+    AXIOM_CHECK(reported == options.size);
+    const std::array<std::uint8_t, 16> expected_prefix{
+        0xb5, 0xa4, 0xbd, 0x80, 0x37, 0x24, 0x7d, 0x9b,
+        0x87, 0x44, 0x38, 0x55, 0xc2, 0x45, 0xd6, 0x3f};
+    AXIOM_CHECK(std::equal(expected_prefix.begin(), expected_prefix.end(), first.begin()));
+
+    ++options.seed;
+    AXIOM_CHECK(axiom::core::generate_benchmark_corpus(options) != first);
+    options.kind = axiom::core::BenchmarkCorpusKind::structured_text;
+    const auto text = axiom::core::generate_benchmark_corpus(options);
+    AXIOM_CHECK(text != first);
+    AXIOM_CHECK(std::search(text.begin(), text.end(),
+                            std::begin("worker="), std::end("worker=") - 1) != text.end());
+    options.kind = axiom::core::BenchmarkCorpusKind::random;
+    const auto random = axiom::core::generate_benchmark_corpus(options);
+    AXIOM_CHECK(random != first);
+    // The default workload must continue to exercise actual match coding,
+    // rather than silently degrading into another incompressible byte stream.
+    AXIOM_CHECK(axiom::compress(first).size() < axiom::compress(random).size());
 }
 
 void test_rans_contextual_edges() {
@@ -875,7 +1035,7 @@ void test_reversible_transforms_and_v7() {
     const auto filtered = axiom::compress(source, options);
     options.enable_file_filters = false;
     const auto plain = axiom::compress(source, options);
-    AXIOM_CHECK(test_read_le16(filtered, 8) == 8);
+    AXIOM_CHECK(test_read_le16(filtered, 8) == 9);
     AXIOM_CHECK((filtered[11] & 1u) != 0);
     AXIOM_CHECK(test_read_le32(filtered, 32) != 0);
     AXIOM_CHECK(filtered.size() < plain.size());
@@ -933,12 +1093,14 @@ void test_reversible_transforms_and_v7() {
     test_write_le16(legacy, 8, 4);
     AXIOM_CHECK(axiom::decompress(legacy) == source);
 
-    // Version 5 has the same extended header as v6/v7/v8. Keep accepting its
+    // Version 5 has the same extended header as v6/v7/v8/v9. Keep accepting its
     // original codec set while reserving newer block codecs for later streams.
     axiom::CompressionOptions store_options;
     store_options.force_store = true;
     auto previous = axiom::compress(source, store_options);
     test_write_le16(previous, 8, 5);
+    AXIOM_CHECK(axiom::decompress(previous) == source);
+    test_write_le16(previous, 8, 8);
     AXIOM_CHECK(axiom::decompress(previous) == source);
 
     const std::vector<axiom::CompressionTransformRange> overlapping{
@@ -2865,9 +3027,15 @@ void test_archive_operation_control() {
     std::uint64_t reported_total = 0;
     bool saw_final = false;
     std::atomic_uint64_t max_compression_file_bytes = 0;
+    std::atomic_uint64_t max_compressed_bytes = 0;
+    std::atomic_uint64_t max_compressed_source_bytes = 0;
     std::atomic_bool saw_compression_file_path = false;
     std::atomic_bool saw_staging_throughput = false;
+    std::mutex progress_samples_mutex;
+    std::vector<axiom::OperationProgress> progress_samples;
     control->set_progress_callback([&](const axiom::OperationProgress& progress) {
+        std::lock_guard lock(progress_samples_mutex);
+        progress_samples.push_back(progress);
         max_completed = std::max(max_completed, progress.completed_bytes);
         if (progress.total_bytes > 0) {
             reported_total = progress.total_bytes;
@@ -2892,6 +3060,14 @@ void test_archive_operation_control() {
             progress.completed_bytes == 0 && progress.throughput_bytes > 0) {
             saw_staging_throughput.store(true, std::memory_order_relaxed);
         }
+        max_compressed_bytes.store(
+            std::max(max_compressed_bytes.load(std::memory_order_relaxed),
+                     progress.compressed_bytes),
+            std::memory_order_relaxed);
+        max_compressed_source_bytes.store(
+            std::max(max_compressed_source_bytes.load(std::memory_order_relaxed),
+                     progress.compressed_source_bytes),
+            std::memory_order_relaxed);
     });
 
     axiom::CompressionOptions options;
@@ -2905,10 +3081,31 @@ void test_archive_operation_control() {
     AXIOM_CHECK(max_compression_file_bytes.load(std::memory_order_relaxed) == payload.size());
     AXIOM_CHECK(saw_compression_file_path.load(std::memory_order_relaxed));
     AXIOM_CHECK(saw_staging_throughput.load(std::memory_order_relaxed));
+    AXIOM_CHECK(max_compressed_bytes.load(std::memory_order_relaxed) > 0);
+    AXIOM_CHECK(max_compressed_source_bytes.load(std::memory_order_relaxed) ==
+                payload.size());
+    {
+        std::lock_guard lock(progress_samples_mutex);
+        std::sort(progress_samples.begin(), progress_samples.end(),
+                  [](const auto& left, const auto& right) {
+                      return left.sequence < right.sequence;
+                  });
+        std::uint64_t previous = 0;
+        for (const auto& sample : progress_samples) {
+            if (sample.stage == axiom::OperationStage::reading ||
+                sample.stage == axiom::OperationStage::compressing ||
+                sample.stage == axiom::OperationStage::writing) {
+                AXIOM_CHECK(sample.completed_bytes >= previous);
+                previous = sample.completed_bytes;
+            }
+        }
+    }
     const auto final_snapshot = control->latest_progress();
     AXIOM_CHECK(final_snapshot.has_value());
     AXIOM_CHECK(final_snapshot->sequence > 0);
     AXIOM_CHECK(final_snapshot->completed_bytes == final_snapshot->total_bytes);
+    AXIOM_CHECK(final_snapshot->compressed_bytes == fs::file_size(archive));
+    AXIOM_CHECK(final_snapshot->compressed_source_bytes == payload.size());
 
     // A reader racing a writer must observe one whole telemetry sample, never
     // fields combined from two reports. This is the contract used by the GUI,
@@ -2966,6 +3163,35 @@ void test_archive_operation_control() {
     replaceable_callback->report({axiom::OperationStage::finalizing,
                                   5000, 5000, 5000, 5000});
     AXIOM_CHECK(callback_calls.load(std::memory_order_relaxed) > 0);
+
+    // Overlapping archive stages share one monotonic byte epoch. A delayed
+    // reader report must not overwrite a newer codec value, while a new file
+    // may reset only the per-file counter. A genuinely different phase still
+    // starts its own byte epoch for in-memory benchmark passes.
+    auto monotonic = std::make_shared<axiom::OperationControl>();
+    axiom::OperationProgress codec_sample{
+        axiom::OperationStage::compressing, 700, 1000, 1, 2,
+        "first.bin", 700, 1000, 700};
+    codec_sample.compressed_bytes = 200;
+    codec_sample.compressed_source_bytes = 700;
+    monotonic->report(codec_sample);
+    monotonic->report({axiom::OperationStage::reading, 100, 1000, 0, 2,
+                       "first.bin", 100, 1000, 100});
+    auto monotonic_snapshot = monotonic->latest_progress();
+    AXIOM_CHECK(monotonic_snapshot.has_value());
+    AXIOM_CHECK(monotonic_snapshot->completed_bytes == 700);
+    AXIOM_CHECK(monotonic_snapshot->compressed_bytes == 200);
+    monotonic->report({axiom::OperationStage::reading, 120, 1000, 1, 2,
+                       "second.bin", 0, 300, 120});
+    monotonic_snapshot = monotonic->latest_progress();
+    AXIOM_CHECK(monotonic_snapshot->completed_bytes == 700);
+    AXIOM_CHECK(monotonic_snapshot->current_path == "second.bin");
+    AXIOM_CHECK(monotonic_snapshot->current_file_completed_bytes == 0);
+    monotonic->report({axiom::OperationStage::extracting, 0, 1000, 0, 2,
+                       "roundtrip", 0, 1000, 0});
+    monotonic_snapshot = monotonic->latest_progress();
+    AXIOM_CHECK(monotonic_snapshot->completed_bytes == 0);
+    AXIOM_CHECK(monotonic_snapshot->compressed_bytes == 200);
 
     const auto cancelled_archive = root / "cancelled.axar";
     auto cancelled = std::make_shared<axiom::OperationControl>();
@@ -3586,9 +3812,11 @@ int main() {
     AXIOM_CHECK(failed);
 
     test_compression_level_presets();
+    test_swarm_extended_levels();
     test_reversible_transforms_and_v7();
     test_filtered_axar_roundtrip();
     test_crc32();
+    test_benchmark_corpus_generator();
     test_blake3();
     test_reed_solomon();
     test_rans_edges();
