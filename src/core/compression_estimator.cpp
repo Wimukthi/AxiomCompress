@@ -49,6 +49,10 @@ constexpr std::size_t kMinimumRepresentativeProbes = 16;
 constexpr double kHighConfidenceMargin = 0.025;
 constexpr double kMediumConfidenceMargin = 0.05;
 constexpr double kStableEstimateDelta = 0.01;
+// Each sampled AXC stream carries this fixed framing, while a real solid block
+// carries it only once. Container overhead below accounts for the real block,
+// so exclude the per-probe copy before projecting the payload ratio.
+constexpr std::uint64_t kAxcFixedHeaderBytes = 36;
 
 std::uint64_t saturated_add(std::uint64_t left, std::uint64_t right) {
     if (right > std::numeric_limits<std::uint64_t>::max() - left) {
@@ -345,6 +349,14 @@ std::uint64_t compress_zip_probe(std::span<const std::uint8_t> input,
     return length > 6 ? static_cast<std::uint64_t>(length - 6) : length;
 }
 
+std::uint64_t compress_axar_probe(std::span<const std::uint8_t> input,
+                                  const CompressionOptions& options) {
+    const auto encoded = compress(input, options);
+    return encoded.size() > kAxcFixedHeaderBytes
+        ? static_cast<std::uint64_t>(encoded.size()) - kAxcFixedHeaderBytes
+        : 0;
+}
+
 std::uint64_t estimate_container_overhead(const std::vector<EstimateFile>& files,
                                           std::uint64_t item_count,
                                           std::uint64_t source_bytes,
@@ -521,7 +533,7 @@ CompressionEstimateResult estimate_compression(
         }
         const std::uint64_t packed = options.format == ArchiveFormat::zip
             ? compress_zip_probe(probe, region_options)
-            : static_cast<std::uint64_t>(compress(probe, region_options).size());
+            : compress_axar_probe(probe, region_options);
         codec_seconds += std::chrono::duration<double>(
             std::chrono::steady_clock::now() - codec_started).count();
         packed_sample_bytes = saturated_add(packed_sample_bytes, packed);
