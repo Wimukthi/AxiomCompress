@@ -6,8 +6,10 @@
 #include <algorithm>
 #include <commctrl.h>
 #include <windowsx.h>
+#include <cwchar>
 #include <cwctype>
 #include <dwmapi.h>
+#include <gdiplus.h>
 #include <new>
 #include <string>
 #include <uxtheme.h>
@@ -18,6 +20,7 @@ namespace {
 constexpr DWORD kOlderImmersiveDarkMode = 19;
 constexpr UINT_PTR kDarkComboSubclass = 1;
 constexpr UINT_PTR kModalOwnerSubclass = 2;
+constexpr UINT_PTR kTypedInputSubclass = 3;
 constexpr const wchar_t* kSavedComboStyleProperty = L"AxiomSavedComboStyle";
 constexpr const wchar_t* kSavedComboExStyleProperty = L"AxiomSavedComboExStyle";
 constexpr const wchar_t* kDarkComboHotProperty = L"AxiomDarkComboHot";
@@ -26,6 +29,124 @@ constexpr const wchar_t* kWindowLayoutsRegistryPath =
     L"Software\\AxiomCompress\\GUI\\WindowLayouts";
 
 DialogAppearance g_dialog_appearance{};
+
+class GdiplusSession {
+public:
+    GdiplusSession() {
+        Gdiplus::GdiplusStartupInput input;
+        ready_ = Gdiplus::GdiplusStartup(&token_, &input, nullptr) == Gdiplus::Ok;
+    }
+
+    ~GdiplusSession() {
+        if (ready_) Gdiplus::GdiplusShutdown(token_);
+    }
+
+    bool ready() const { return ready_; }
+
+private:
+    ULONG_PTR token_ = 0;
+    bool ready_ = false;
+};
+
+bool gdiplus_ready() {
+    static GdiplusSession session;
+    return session.ready();
+}
+
+Gdiplus::Color gdiplus_color(COLORREF color) {
+    return Gdiplus::Color(255, GetRValue(color), GetGValue(color), GetBValue(color));
+}
+
+void draw_antialiased_checkmark(HDC dc, const RECT& box, UINT dpi, COLORREF color) {
+    if (!gdiplus_ready()) return;
+    Gdiplus::Graphics graphics(dc);
+    graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+    graphics.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
+    Gdiplus::Pen pen(gdiplus_color(color),
+                     static_cast<Gdiplus::REAL>(scale_for_dialog_dpi(2, dpi)));
+    pen.SetLineCap(Gdiplus::LineCapRound, Gdiplus::LineCapRound,
+                   Gdiplus::DashCapRound);
+    pen.SetLineJoin(Gdiplus::LineJoinRound);
+    Gdiplus::PointF points[] = {
+        {static_cast<Gdiplus::REAL>(box.left + scale_for_dialog_dpi(3, dpi)),
+         static_cast<Gdiplus::REAL>(box.top + scale_for_dialog_dpi(8, dpi))},
+        {static_cast<Gdiplus::REAL>(box.left + scale_for_dialog_dpi(7, dpi)),
+         static_cast<Gdiplus::REAL>(box.bottom - scale_for_dialog_dpi(3, dpi))},
+        {static_cast<Gdiplus::REAL>(box.right - scale_for_dialog_dpi(3, dpi)),
+         static_cast<Gdiplus::REAL>(box.top + scale_for_dialog_dpi(3, dpi))},
+    };
+    graphics.DrawLines(&pen, points, static_cast<INT>(std::size(points)));
+}
+
+void draw_selection_control_text(const DRAWITEMSTRUCT& draw, const RECT& glyph,
+                                 UINT dpi, const DialogColors& colors, bool enabled) {
+    wchar_t text[256]{};
+    GetWindowTextW(draw.hwndItem, text,
+                   static_cast<int>(sizeof(text) / sizeof(text[0])));
+    HFONT font = reinterpret_cast<HFONT>(SendMessageW(draw.hwndItem, WM_GETFONT, 0, 0));
+    HGDIOBJ old_font = font != nullptr ? SelectObject(draw.hDC, font) : nullptr;
+    SetBkMode(draw.hDC, TRANSPARENT);
+    SetTextColor(draw.hDC, enabled ? colors.text : colors.disabled_text);
+    RECT text_rect = draw.rcItem;
+    text_rect.left = glyph.right + scale_for_dialog_dpi(8, dpi);
+    DrawTextW(draw.hDC, text, -1, &text_rect,
+              DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    if (old_font != nullptr) SelectObject(draw.hDC, old_font);
+}
+
+bool input_character_allowed(DialogInputFilter filter, wchar_t character) {
+    if (character < L' ') return true;
+    switch (filter) {
+        case DialogInputFilter::unsigned_integer:
+            return character >= L'0' && character <= L'9';
+        case DialogInputFilter::byte_size:
+            return (character >= L'0' && character <= L'9') ||
+                   std::iswspace(character) ||
+                   wcschr(L"bBkKmMgGtTiIyYeEsS", character) != nullptr;
+        case DialogInputFilter::hexadecimal_color:
+            return character == L'#' || std::iswxdigit(character);
+    }
+    return false;
+}
+
+bool clipboard_matches_input_filter(HWND window, DialogInputFilter filter) {
+    if (!OpenClipboard(window)) return false;
+    const HANDLE handle = GetClipboardData(CF_UNICODETEXT);
+    const auto* text = handle == nullptr
+        ? nullptr : static_cast<const wchar_t*>(GlobalLock(handle));
+    bool valid = text != nullptr;
+    if (text != nullptr) {
+        for (const wchar_t* cursor = text; *cursor != L'\0'; ++cursor) {
+            if (!input_character_allowed(filter, *cursor)) {
+                valid = false;
+                break;
+            }
+        }
+        GlobalUnlock(handle);
+    }
+    CloseClipboard();
+    return valid;
+}
+
+LRESULT CALLBACK typed_input_subclass_proc(HWND window, UINT message,
+                                            WPARAM wparam, LPARAM lparam,
+                                            UINT_PTR, DWORD_PTR reference) {
+    const auto filter = static_cast<DialogInputFilter>(reference);
+    if (message == WM_CHAR &&
+        !input_character_allowed(filter, static_cast<wchar_t>(wparam))) {
+        MessageBeep(MB_ICONWARNING);
+        return 0;
+    }
+    if (message == WM_PASTE && !clipboard_matches_input_filter(window, filter)) {
+        MessageBeep(MB_ICONWARNING);
+        return 0;
+    }
+    if (message == WM_NCDESTROY) {
+        RemoveWindowSubclass(window, typed_input_subclass_proc,
+                             kTypedInputSubclass);
+    }
+    return DefSubclassProc(window, message, wparam, lparam);
+}
 
 struct ModalOwnerState {
     HWND owner = nullptr;
@@ -735,6 +856,85 @@ void set_dialog_control_font(HWND control, HFONT font) {
     }
 }
 
+HWND create_dialog_tooltip(HWND owner) {
+    if (owner == nullptr) return nullptr;
+    HWND tooltip = CreateWindowExW(
+        WS_EX_TOPMOST, TOOLTIPS_CLASSW, nullptr,
+        WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX | TTS_BALLOON,
+        CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
+        owner, nullptr, GetModuleHandleW(nullptr), nullptr);
+    if (tooltip != nullptr) {
+        SetWindowPos(tooltip, HWND_TOPMOST, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        SendMessageW(tooltip, TTM_SETMAXTIPWIDTH, 0, 420);
+        SendMessageW(tooltip, TTM_SETDELAYTIME, TTDT_AUTOPOP, 12000);
+    }
+    return tooltip;
+}
+
+void add_dialog_tooltip(HWND tooltip, HWND control, const wchar_t* text) {
+    if (tooltip == nullptr || control == nullptr || text == nullptr || *text == L'\0') {
+        return;
+    }
+    HWND registered[3]{};
+    std::size_t registered_count = 0;
+    const auto add_tool = [&](HWND target) {
+        if (target == nullptr || !IsWindow(target)) return;
+        for (std::size_t index = 0; index < registered_count; ++index) {
+            if (registered[index] == target) return;
+        }
+        registered[registered_count++] = target;
+        TOOLINFOW tool{};
+        // Axiom currently runs with the system comctl32 activation context.
+        // Its tooltip control rejects the newer TOOLINFO tail fields, so use
+        // the documented v1 size for compatibility with both v5 and v6.
+        tool.cbSize = TTTOOLINFOW_V1_SIZE;
+        tool.uFlags = TTF_IDISHWND | TTF_SUBCLASS;
+        // Composite controls such as drop-down-list combos route pointer input
+        // through child and popup windows. Keep one notification owner while
+        // subclassing each surface that can actually receive the mouse.
+        tool.hwnd = GetWindow(tooltip, GW_OWNER);
+        if (tool.hwnd == nullptr) tool.hwnd = GetParent(tooltip);
+        if (tool.hwnd == nullptr) tool.hwnd = GetParent(control);
+        tool.uId = reinterpret_cast<UINT_PTR>(target);
+        tool.lpszText = const_cast<wchar_t*>(text);
+        SendMessageW(tooltip, TTM_ADDTOOLW, 0, reinterpret_cast<LPARAM>(&tool));
+    };
+    add_tool(control);
+
+    wchar_t class_name[32]{};
+    GetClassNameW(control, class_name,
+                  static_cast<int>(sizeof(class_name) / sizeof(class_name[0])));
+    if (lstrcmpiW(class_name, L"ComboBox") == 0) {
+        COMBOBOXINFO info{sizeof(info)};
+        if (GetComboBoxInfo(control, &info)) {
+            // CBS_DROPDOWNLIST uses a STATIC item window, editable combos use
+            // an EDIT, and the expanded list is a separate popup window.
+            add_tool(info.hwndItem);
+            add_tool(info.hwndList);
+        }
+    }
+}
+
+void apply_dialog_input_filter(HWND control, DialogInputFilter filter,
+                               UINT maximum_characters) {
+    if (control == nullptr) return;
+    HWND edit = control;
+    wchar_t class_name[32]{};
+    GetClassNameW(control, class_name,
+                  static_cast<int>(sizeof(class_name) / sizeof(class_name[0])));
+    if (lstrcmpiW(class_name, L"ComboBox") == 0) {
+        COMBOBOXINFO info{sizeof(info)};
+        if (!GetComboBoxInfo(control, &info) || info.hwndItem == nullptr) return;
+        edit = info.hwndItem;
+    }
+    if (maximum_characters != 0) {
+        SendMessageW(edit, EM_SETLIMITTEXT, maximum_characters, 0);
+    }
+    SetWindowSubclass(edit, typed_input_subclass_proc, kTypedInputSubclass,
+                      static_cast<DWORD_PTR>(filter));
+}
+
 void draw_dialog_button(const DRAWITEMSTRUCT& draw, bool dark) {
     if (draw.CtlType != ODT_BUTTON || draw.hDC == nullptr || draw.hwndItem == nullptr) {
         return;
@@ -843,31 +1043,59 @@ void draw_dialog_checkbox(const DRAWITEMSTRUCT& draw, bool dark, bool checked) {
     DeleteObject(border);
 
     if (checked) {
-        HPEN pen = CreatePen(PS_SOLID, scale_for_dialog_dpi(2, dpi),
-                             enabled ? colors.focus_border : colors.disabled_text);
-        HGDIOBJ old_pen = SelectObject(draw.hDC, pen);
-        MoveToEx(draw.hDC, box.left + scale_for_dialog_dpi(3, dpi),
-                 box.top + scale_for_dialog_dpi(8, dpi), nullptr);
-        LineTo(draw.hDC, box.left + scale_for_dialog_dpi(7, dpi),
-               box.bottom - scale_for_dialog_dpi(3, dpi));
-        LineTo(draw.hDC, box.right - scale_for_dialog_dpi(3, dpi),
-               box.top + scale_for_dialog_dpi(3, dpi));
-        SelectObject(draw.hDC, old_pen);
-        DeleteObject(pen);
+        draw_antialiased_checkmark(
+            draw.hDC, box, dpi,
+            enabled ? colors.focus_border : colors.disabled_text);
     }
 
-    wchar_t text[256]{};
-    GetWindowTextW(draw.hwndItem, text,
-                   static_cast<int>(sizeof(text) / sizeof(text[0])));
-    HFONT font = reinterpret_cast<HFONT>(SendMessageW(draw.hwndItem, WM_GETFONT, 0, 0));
-    HGDIOBJ old_font = font != nullptr ? SelectObject(draw.hDC, font) : nullptr;
-    SetBkMode(draw.hDC, TRANSPARENT);
-    SetTextColor(draw.hDC, enabled ? colors.text : colors.disabled_text);
-    RECT text_rect = draw.rcItem;
-    text_rect.left = box.right + scale_for_dialog_dpi(8, dpi);
-    DrawTextW(draw.hDC, text, -1, &text_rect,
-              DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-    if (old_font != nullptr) SelectObject(draw.hDC, old_font);
+    draw_selection_control_text(draw, box, dpi, colors, enabled);
+}
+
+void draw_dialog_radio_button(const DRAWITEMSTRUCT& draw, bool dark, bool checked) {
+    if (draw.CtlType != ODT_BUTTON || draw.hDC == nullptr || draw.hwndItem == nullptr) {
+        return;
+    }
+    const DialogColors colors = dialog_colors(dark);
+    const bool enabled = (draw.itemState & ODS_DISABLED) == 0;
+    const bool focused = (draw.itemState & ODS_FOCUS) != 0;
+    HBRUSH background = CreateSolidBrush(colors.background);
+    FillRect(draw.hDC, &draw.rcItem, background);
+    DeleteObject(background);
+
+    const UINT dpi = GetDpiForWindow(draw.hwndItem);
+    const int diameter = scale_for_dialog_dpi(16, dpi);
+    RECT circle{
+        draw.rcItem.left + scale_for_dialog_dpi(2, dpi),
+        draw.rcItem.top + (draw.rcItem.bottom - draw.rcItem.top - diameter) / 2,
+        draw.rcItem.left + scale_for_dialog_dpi(2, dpi) + diameter,
+        draw.rcItem.top + (draw.rcItem.bottom - draw.rcItem.top + diameter) / 2,
+    };
+    if (gdiplus_ready()) {
+        Gdiplus::Graphics graphics(draw.hDC);
+        graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+        graphics.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
+        Gdiplus::SolidBrush fill(gdiplus_color(colors.control_background));
+        Gdiplus::Pen outline(gdiplus_color(focused ? colors.focus_border : colors.border),
+                             1.0f);
+        const Gdiplus::RectF bounds(
+            static_cast<Gdiplus::REAL>(circle.left) + 0.5f,
+            static_cast<Gdiplus::REAL>(circle.top) + 0.5f,
+            static_cast<Gdiplus::REAL>(diameter - 1),
+            static_cast<Gdiplus::REAL>(diameter - 1));
+        graphics.FillEllipse(&fill, bounds);
+        graphics.DrawEllipse(&outline, bounds);
+        if (checked) {
+            const int inset = scale_for_dialog_dpi(5, dpi);
+            Gdiplus::SolidBrush dot(gdiplus_color(
+                enabled ? colors.focus_border : colors.disabled_text));
+            graphics.FillEllipse(
+                &dot, static_cast<Gdiplus::REAL>(circle.left + inset),
+                static_cast<Gdiplus::REAL>(circle.top + inset),
+                static_cast<Gdiplus::REAL>(diameter - inset * 2),
+                static_cast<Gdiplus::REAL>(diameter - inset * 2));
+        }
+    }
+    draw_selection_control_text(draw, circle, dpi, colors, enabled);
 }
 
 void draw_dialog_combo_item(const DRAWITEMSTRUCT& draw, bool dark) {
@@ -953,8 +1181,15 @@ bool window_placement_is_visible(const WINDOWPLACEMENT& placement) {
 
 POINT centered_window_position(HWND owner, int width, int height) {
     const RECT work = owner_or_primary_work_area(owner);
-    int x = work.left + ((work.right - work.left) - width) / 2;
-    int y = work.top + ((work.bottom - work.top) - height) / 2;
+    RECT anchor = work;
+    HWND owner_root = owner != nullptr && IsWindow(owner)
+        ? GetAncestor(owner, GA_ROOTOWNER) : nullptr;
+    if (owner_root != nullptr && IsWindowVisible(owner_root)) {
+        RECT owner_rect{};
+        if (GetWindowRect(owner_root, &owner_rect)) anchor = owner_rect;
+    }
+    int x = anchor.left + ((anchor.right - anchor.left) - width) / 2;
+    int y = anchor.top + ((anchor.bottom - anchor.top) - height) / 2;
     x = std::clamp(x, static_cast<int>(work.left),
                    (std::max)(static_cast<int>(work.left),
                               static_cast<int>(work.right) - width));
@@ -968,7 +1203,8 @@ void restore_named_window_placement(HWND window, HWND owner, std::wstring_view n
     if (window == nullptr) return;
     WINDOWPLACEMENT placement{sizeof(placement)};
     UINT saved_dpi = 0;
-    if (read_window_placement(name, placement, saved_dpi) &&
+    if (!g_dialog_appearance.center_child_windows &&
+        read_window_placement(name, placement, saved_dpi) &&
         window_placement_is_visible(placement)) {
         if (placement.showCmd == SW_SHOWMINIMIZED) placement.showCmd = SW_SHOWNORMAL;
 
@@ -1004,7 +1240,8 @@ void restore_named_window_placement(HWND window, HWND owner, std::wstring_view n
 }
 
 void save_named_window_placement(std::wstring_view name, HWND window) {
-    if (window == nullptr || !IsWindow(window)) return;
+    if (g_dialog_appearance.center_child_windows ||
+        window == nullptr || !IsWindow(window)) return;
     WINDOWPLACEMENT placement{sizeof(placement)};
     if (!GetWindowPlacement(window, &placement)) return;
     if (placement.showCmd == SW_SHOWMINIMIZED) placement.showCmd = SW_SHOWNORMAL;

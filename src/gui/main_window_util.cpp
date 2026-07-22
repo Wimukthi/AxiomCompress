@@ -200,6 +200,8 @@ if (unit.empty() || unit == L"b" || unit == L"bytes") {
     multiplier = 1024ull * 1024ull;
 } else if (unit == L"g" || unit == L"gb" || unit == L"gib") {
     multiplier = 1024ull * 1024ull * 1024ull;
+} else if (unit == L"t" || unit == L"tb" || unit == L"tib") {
+    multiplier = 1024ull * 1024ull * 1024ull * 1024ull;
 } else {
     return std::nullopt;
 }

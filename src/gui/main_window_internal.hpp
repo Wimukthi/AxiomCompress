@@ -722,6 +722,10 @@ private:
 struct FileSearchSourceItem {
     int browser_index = -1;
     axiom::gui::BrowserItemKind kind = axiom::gui::BrowserItemKind::file;
+    axiom::gui::BrowserLocation target_location;
+    fs::path filesystem_path;
+    std::string archive_entry_path;
+    bool recurse_directory = false;
     std::wstring name;
     std::wstring location;
     std::wstring type;
@@ -733,6 +737,9 @@ struct FileSearchSourceItem {
 struct FileSearchDialogResult {
     bool accepted = false;
     int browser_index = -1;
+    axiom::gui::BrowserLocation target_location;
+    fs::path filesystem_path;
+    std::string archive_entry_path;
 };
 class FileSearchDialog {
 
@@ -740,7 +747,8 @@ public:
     FileSearchDialog(HINSTANCE instance,
                      ThemePalette theme,
                      UINT dpi,
-                     std::wstring scope,
+                     axiom::gui::BrowserLocation location,
+                     std::shared_ptr<const axiom::gui::ArchiveCatalog> archive_catalog,
                      std::vector<FileSearchSourceItem> source);
     FileSearchDialogResult show(HWND owner);
 
@@ -759,12 +767,22 @@ private:
         kGoToButton = 30108,
         kResultsTable = 30109,
         kSearchDebounceTimer = 30110,
+        kSearchArea = 30111,
+        kArchiveTypes = 30112,
+        kIncludeSubfolders = 30113,
+        kFindInArchives = 30114,
+        kSkipEncrypted = 30115,
         kSearchResultsMessage = WM_APP + 110,
+        kSearchProgressMessage = WM_APP + 111,
     };
     struct SearchPayload {
         std::uint64_t generation = 0;
-        std::vector<int> indices;
+        std::vector<FileSearchDialogResult> targets;
         std::vector<std::vector<std::wstring>> rows;
+        std::size_t scanned_items = 0;
+        std::size_t skipped_archives = 0;
+        std::size_t read_errors = 0;
+        bool result_limit_reached = false;
     };
     static const wchar_t* class_name();
     static bool register_class(HINSTANCE instance);
@@ -774,7 +792,7 @@ private:
                       DWORD style,
                       int id = 0,
                       DWORD ex_style = 0);
-    std::array<HWND, 14> controls() const;
+    std::array<HWND, 22> controls() const;
     bool checkbox_checked(int id) const;
     void set_checkbox(int id, bool checked);
     void toggle_checkbox(int id);
@@ -807,9 +825,13 @@ private:
 
     std::wstring scope_;
 
+    axiom::gui::BrowserLocation location_;
+
+    std::shared_ptr<const axiom::gui::ArchiveCatalog> archive_catalog_;
+
     std::vector<FileSearchSourceItem> source_;
 
-    std::vector<int> result_indices_;
+    std::vector<FileSearchDialogResult> result_targets_;
 
     FileSearchDialogResult result_;
 
@@ -818,6 +840,8 @@ private:
     HBRUSH background_brush_ = nullptr;
 
     HBRUSH edit_brush_ = nullptr;
+
+    HWND tooltip_ = nullptr;
 
     bool match_case_checked_ = false;
 
@@ -831,11 +855,31 @@ private:
 
     bool include_archives_checked_ = true;
 
+    bool include_subfolders_checked_ = true;
+
+    bool find_in_archives_checked_ = true;
+
+    bool skip_encrypted_checked_ = false;
+
+    bool search_started_ = false;
+
+    std::vector<std::wstring> search_area_labels_;
+
     HWND title_ = nullptr;
 
     HWND scope_label_ = nullptr;
 
     HWND query_label_ = nullptr;
+
+    HWND where_label_ = nullptr;
+
+    HWND search_area_label_ = nullptr;
+
+    HWND search_area_ = nullptr;
+
+    HWND archive_types_label_ = nullptr;
+
+    HWND archive_types_ = nullptr;
 
     HWND search_edit_ = nullptr;
 
@@ -850,6 +894,12 @@ private:
     HWND include_folders_ = nullptr;
 
     HWND include_archives_ = nullptr;
+
+    HWND include_subfolders_ = nullptr;
+
+    HWND find_in_archives_ = nullptr;
+
+    HWND skip_encrypted_ = nullptr;
 
     HWND result_count_ = nullptr;
 
@@ -1356,6 +1406,12 @@ private:
 
     std::optional<BrowserViewState> pending_table_restore_state_;
 
+    std::optional<axiom::gui::BrowserLocation> pending_find_location_;
+
+    fs::path pending_find_filesystem_path_;
+
+    std::string pending_find_archive_entry_path_;
+
     std::size_t table_population_next_ = 0;
 
     std::uint64_t table_population_generation_ = 0;
@@ -1397,6 +1453,8 @@ private:
     std::size_t selected_word_size_ = 0;
 
     std::size_t selected_solid_block_size_ = 0;
+
+    int selected_thread_model_ = 0;  // 0 = split blocks, 1 = swarm.
 
     fs::path pending_archive_path_;
 

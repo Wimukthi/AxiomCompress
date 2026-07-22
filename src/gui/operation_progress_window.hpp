@@ -67,6 +67,8 @@ private:
         items_completed,
         items_total,
         speed,
+        compressed_size,
+        compression_ratio,
         file_percent,
         file_completed,
         file_total,

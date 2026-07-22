@@ -1,5 +1,6 @@
 #define NOMINMAX
 #include "gui/archive_dialogs.hpp"
+#include "core/cpu.hpp"
 #include "gui/dialog_support.hpp"
 #include "gui/main_window_internal.hpp"
 #include "gui/message_dialog.hpp"
@@ -36,6 +37,10 @@ constexpr int kDictionarySize = 2012;
 constexpr int kWordSize = 2013;
 constexpr int kSolidBlockSize = 2014;
 constexpr int kArchiveFormat = 2015;
+constexpr int kThreadModel = 2016;
+constexpr int kCompressionProfile = 2017;
+constexpr int kSaveCompressionProfile = 2018;
+constexpr int kDeleteCompressionProfile = 2019;
 constexpr int kCreateTabs = 2099;
 constexpr int kCreateTabBase = 2100;
 constexpr int kUpdateMode = 2110;
@@ -67,6 +72,7 @@ constexpr int kBrowseStartupCustomPath = 2236;
 constexpr int kToolbarIconStyle = 2237;
 constexpr int kAccentColorMode = 2238;
 constexpr int kCustomAccentColor = 2239;
+constexpr int kCenterChildWindows = 2240;
 constexpr int kDefaultUpdateMode = 2250;
 constexpr int kDefaultVolumeSize = 2251;
 constexpr int kDefaultVolumeUnit = 2252;
@@ -162,6 +168,51 @@ constexpr std::array<const wchar_t*, 10> kSolidBlockNames{
 constexpr std::array<std::size_t, 10> kSolidBlockValues{
     0, 1u << 20, 4u << 20, 8u << 20, 16u << 20, 32u << 20,
     64u << 20, 128u << 20, 256u << 20, 512u << 20};
+constexpr std::array<const wchar_t*, 2> kThreadModelNames{
+    L"Split blocks (default)", L"Swarm (cores share each block)"};
+
+const std::array<CompressionProfile, 5>& built_in_compression_profiles() {
+    static const std::array<CompressionProfile, 5> profiles{{
+        // Repetitive UTF text and source benefit from long matches and the
+        // largest practical window. Swarm keeps the expensive level-9 parse
+        // scalable without splitting the 64 MiB context.
+        {L"Text, logs and source code (built-in)",
+         9, 0, 64u << 20, 273, 64u << 20, 1},
+        // Executable filtering is selected per file by the archive writer;
+        // level 8 gives the filtered byte stream a strong tree/DP parse without
+        // level 9's maximum search cost.
+        {L"Executables and libraries (built-in)",
+         8, 0, 32u << 20, 192, 32u << 20, 1},
+        // Tables, database pages, CSV and numeric arrays often repeat across
+        // distant records, so retain the large level-9 dictionary while using
+        // a shorter early-stop length for record-sized matches.
+        {L"Databases and structured data (built-in)",
+         9, 0, 64u << 20, 192, 64u << 20, 1},
+        // Most media payloads are already entropy-coded. Keep probes and blocks
+        // small so incompressible data is recognized and stored quickly.
+        {L"Photos, audio and video (built-in)",
+         1, 0, 64u << 10, 32, 1u << 20, 0},
+        // A moderate window and independent blocks are a safer default for a
+        // heterogeneous folder where no single content model dominates.
+        {L"Mixed files and folders (built-in)",
+         6, 0, 8u << 20, 192, 16u << 20, 0},
+    }};
+    return profiles;
+}
+
+bool profile_names_equal(std::wstring_view left, std::wstring_view right) {
+    return CompareStringOrdinal(left.data(), static_cast<int>(left.size()),
+                                right.data(), static_cast<int>(right.size()),
+                                TRUE) == CSTR_EQUAL;
+}
+
+bool is_built_in_profile_name(std::wstring_view name) {
+    return std::any_of(
+        built_in_compression_profiles().begin(), built_in_compression_profiles().end(),
+        [&](const CompressionProfile& profile) {
+            return profile_names_equal(profile.name, name);
+        });
+}
 constexpr std::array<const wchar_t*, 5> kCreateTabNames{
     L"Compression", L"General", L"Security", L"Recovery & volumes", L"SFX & signing"};
 constexpr std::array<const wchar_t*, 11> kSettingsTabNames{
@@ -436,6 +487,8 @@ std::optional<std::uint64_t> parse_size_text(std::wstring text) {
         multiplier = 1024ull * 1024ull;
     } else if (unit == L"g" || unit == L"gb" || unit == L"gib") {
         multiplier = 1024ull * 1024ull * 1024ull;
+    } else if (unit == L"t" || unit == L"tb" || unit == L"tib") {
+        multiplier = 1024ull * 1024ull * 1024ull * 1024ull;
     } else {
         return std::nullopt;
     }
@@ -967,7 +1020,7 @@ public:
             mode_ == DialogMode::create_archive
                 ? 840 : mode_ == DialogMode::settings ? 1040 : 540,
             mode_ == DialogMode::create_archive
-                ? 650 : mode_ == DialogMode::settings ? 760 : 290,
+                ? 690 : mode_ == DialogMode::settings ? 760 : 290,
             window_style, extended_style, dpi_);
         int width = initial_size.cx;
         int height = initial_size.cy;
@@ -994,6 +1047,15 @@ public:
         UpdateWindow(window_);
         MSG message{};
         while (IsWindow(window_) && GetMessageW(&message, nullptr, 0, 0) > 0) {
+            if (tooltip_ != nullptr && message.message >= WM_MOUSEFIRST &&
+                message.message <= WM_MOUSELAST &&
+                (message.hwnd == window_ || IsChild(window_, message.hwnd))) {
+                // Relay explicitly as well as using TTF_SUBCLASS. Editable
+                // combo children and owner-drawn settings controls do not
+                // consistently forward hover tracking through IsDialogMessage.
+                SendMessageW(tooltip_, TTM_RELAYEVENT, 0,
+                             reinterpret_cast<LPARAM>(&message));
+            }
             if (mode_ == DialogMode::settings &&
                 toolbar_list_.hwnd() != nullptr &&
                 message.message == WM_KEYDOWN &&
@@ -1089,7 +1151,8 @@ private:
         SendMessageW(combo, CB_SETITEMHEIGHT, static_cast<WPARAM>(-1), scale(24));
         SendMessageW(combo, CB_ADDSTRING, 0,
                      reinterpret_cast<LPARAM>(L"0 (all processors)"));
-        const unsigned int hardware_threads = std::max(1u, std::thread::hardware_concurrency());
+        const auto hardware_threads = static_cast<unsigned int>(
+            axiom::core::logical_processor_count());
         for (unsigned int i = 1; i <= hardware_threads; ++i) {
             const std::wstring value = std::to_wstring(i);
             SendMessageW(combo, CB_ADDSTRING, 0,
@@ -1159,7 +1222,8 @@ private:
         SendMessageW(combo, CB_SETITEMHEIGHT, static_cast<WPARAM>(-1), scale(24));
         SendMessageW(combo, CB_ADDSTRING, 0,
                      reinterpret_cast<LPARAM>(L"0 (all processors)"));
-        const unsigned hardware_threads = std::max(1u, std::thread::hardware_concurrency());
+        const auto hardware_threads = static_cast<unsigned>(
+            axiom::core::logical_processor_count());
         for (unsigned index = 1; index <= hardware_threads; ++index) {
             const std::wstring value = std::to_wstring(index);
             SendMessageW(combo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(value.c_str()));
@@ -1246,7 +1310,8 @@ private:
         SendMessageW(combo, CB_SETITEMHEIGHT, static_cast<WPARAM>(-1), scale(24));
         SendMessageW(combo, CB_ADDSTRING, 0,
                      reinterpret_cast<LPARAM>(L"0 (all processors)"));
-        const unsigned hardware_threads = std::max(1u, std::thread::hardware_concurrency());
+        const auto hardware_threads = static_cast<unsigned>(
+            axiom::core::logical_processor_count());
         for (unsigned index = 1; index <= hardware_threads; ++index) {
             const std::wstring value = std::to_wstring(index);
             SendMessageW(combo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(value.c_str()));
@@ -1466,7 +1531,7 @@ private:
         setting_combo(0, kThemeMode, kThemeModeNames, 180, 36, 260);
         setting_label(0, L"Accent color", 0, 84, 170);
         setting_combo(0, kAccentColorMode, kAccentColorNames, 180, 78, 260);
-        setting_label(0, L"Custom accent", 0, 126, 170);
+        setting_label(0, L"Custom accent (hex)", 0, 126, 170);
         setting_edit(0, kCustomAccentColor, 180, 120, 150);
         setting_label(0, L"Use #RRGGBB when Accent color is set to Custom.",
                       344, 126, 380, 32, true);
@@ -1474,18 +1539,20 @@ private:
         setting_combo(0, kToolbarIconStyle, kToolbarIconStyleNames, 180, 162, 260);
         setting_label(0, L"Startup location", 0, 210, 170);
         setting_combo(0, kStartupMode, kStartupLocationNames, 180, 204, 260);
-        setting_label(0, L"Custom startup path", 0, 252, 170);
+        setting_label(0, L"Startup folder path", 0, 252, 170);
         setting_edit(0, kStartupCustomPath, 180, 246, 470);
         setting_browse(0, kBrowseStartupCustomPath, 660, 246);
         setting_checkbox(0, kRestoreWindowPlacement,
-                         L"Restore previous window size and position", 180, 290);
-        setting_checkbox(0, kConfirmDelete, L"Confirm before deleting files", 180, 324);
+                         L"Restore main window size and position", 180, 290);
+        setting_checkbox(0, kCenterChildWindows,
+                         L"Center child windows on the main window", 180, 324);
+        setting_checkbox(0, kConfirmDelete, L"Confirm before deleting files", 180, 358);
         setting_checkbox(0, kConfirmOverwrite,
-                         L"Confirm before overwriting existing files", 180, 358);
-        setting_label(0, L"Recent locations", 0, 402, 170);
-        setting_edit(0, kRecentLocationCount, 180, 396, 95, ES_NUMBER | ES_AUTOHSCROLL);
+                         L"Confirm before overwriting existing files", 180, 392);
+        setting_label(0, L"Recent count (integer)", 0, 436, 170);
+        setting_edit(0, kRecentLocationCount, 180, 430, 95, ES_NUMBER | ES_AUTOHSCROLL);
         setting_label(0, L"0 disables recent path entries; 12 matches the current default.",
-                      288, 402, 430, 38, true);
+                      288, 436, 430, 38, true);
 
         setting_label(1, L"Default Add-to-archive options", 0, 0, 660);
         setting_label(1, L"Compression level", 0, 42, 170);
@@ -1496,43 +1563,46 @@ private:
         setting_combo(1, kWordSize, kWordSizeNames, 180, 120, 260);
         setting_label(1, L"Solid block size", 0, 168, 170);
         setting_combo(1, kSolidBlockSize, kSolidBlockNames, 180, 162, 260);
-        setting_label(1, L"CPU threads", 0, 210, 170);
-        setting_thread_combo(1, 180, 204, 190);
-        setting_label(1, L"Update mode", 0, 252, 170);
-        setting_combo(1, kDefaultUpdateMode, kUpdateModeNames, 180, 246, 330);
-        setting_label(1, L"Split volume size", 0, 294, 170);
-        setting_edit(1, kDefaultVolumeSize, 180, 288, 160);
-        setting_combo(1, kDefaultVolumeUnit, kVolumeUnitNames, 350, 288, 105);
-        setting_label(1, L"Recovery record", 0, 336, 170);
-        setting_edit(1, kDefaultRecoveryPercent, 180, 330, 80, ES_NUMBER | ES_AUTOHSCROLL);
-        setting_label(1, L"%", 268, 336, 24);
+        setting_label(1, L"Threading model", 0, 210, 170);
+        setting_combo(1, kThreadModel, kThreadModelNames, 180, 204, 260);
+        setting_label(1, L"CPU threads (integer)", 0, 252, 170);
+        setting_thread_combo(1, 180, 246, 190);
+        setting_label(1, L"Update mode", 0, 294, 170);
+        setting_combo(1, kDefaultUpdateMode, kUpdateModeNames, 180, 288, 330);
+        setting_label(1, L"Volume size (integer)", 0, 336, 170);
+        setting_edit(1, kDefaultVolumeSize, 180, 330, 160,
+                     ES_NUMBER | ES_AUTOHSCROLL);
+        setting_combo(1, kDefaultVolumeUnit, kVolumeUnitNames, 350, 330, 105);
+        setting_label(1, L"Recovery (integer 0-100)", 0, 378, 170);
+        setting_edit(1, kDefaultRecoveryPercent, 180, 372, 80, ES_NUMBER | ES_AUTOHSCROLL);
+        setting_label(1, L"%", 268, 378, 24);
         setting_checkbox(1, kDefaultRecoveryVolumes,
-                         L"Create recovery volumes when split volumes are enabled", 180, 372);
+                         L"Create recovery volumes when split volumes are enabled", 180, 414);
         setting_checkbox(1, kDefaultCreateSfx,
-                         L"Create self-extracting .exe by default", 180, 406);
+                         L"Create self-extracting .exe by default", 180, 448);
         setting_checkbox(1, kDefaultSignArchive,
-                         L"Sign archives by default", 180, 440);
-        setting_label(1, L"Signing key", 0, 482, 170);
-        setting_edit(1, kDefaultSigningKey, 180, 476, 470);
-        setting_browse(1, kBrowseDefaultSigningKey, 660, 476);
+                         L"Sign archives by default", 180, 482);
+        setting_label(1, L"Signing key file path", 0, 524, 170);
+        setting_edit(1, kDefaultSigningKey, 180, 518, 470);
+        setting_browse(1, kBrowseDefaultSigningKey, 660, 518);
 
         setting_label(2, L"Default folders", 0, 0, 660);
         setting_label(2, L"Archive output", 0, 42, 170);
         setting_combo(2, kArchiveOutputMode, kFolderPolicyNames, 180, 36, 260);
-        setting_label(2, L"Archive folder", 0, 84, 170);
+        setting_label(2, L"Archive folder path", 0, 84, 170);
         setting_edit(2, kArchiveOutputFolder, 180, 78, 470);
         setting_browse(2, kBrowseArchiveOutputFolder, 660, 78);
         setting_label(2, L"Extraction output", 0, 126, 170);
         setting_combo(2, kExtractDestinationMode, kFolderPolicyNames, 180, 120, 260);
-        setting_label(2, L"Extraction folder", 0, 168, 170);
+        setting_label(2, L"Extraction folder path", 0, 168, 170);
         setting_edit(2, kExtractDestinationFolder, 180, 162, 470);
         setting_browse(2, kBrowseExtractDestinationFolder, 660, 162);
         setting_label(2, L"Temporary files", 0, 210, 170);
         setting_combo(2, kTempFolderMode, kTempFolderModeNames, 180, 204, 300);
-        setting_label(2, L"Temporary folder", 0, 252, 170);
+        setting_label(2, L"Temporary folder path", 0, 252, 170);
         setting_edit(2, kTempFolder, 180, 246, 470);
         setting_browse(2, kBrowseTempFolder, 660, 246);
-        setting_label(2, L"Cleanup after days", 0, 294, 170);
+        setting_label(2, L"Cleanup days (integer)", 0, 294, 170);
         setting_edit(2, kTempCleanupDays, 180, 288, 80, ES_NUMBER | ES_AUTOHSCROLL);
         setting_label(2,
                       L"Last-used folders are remembered after successful dialog confirmation. "
@@ -1555,10 +1625,10 @@ private:
         setting_label(4, L"Viewing files from archives", 0, 0, 660);
         setting_label(4, L"Double-click action", 0, 42, 170);
         setting_combo(4, kFileOpenMode, kFileOpenModeNames, 180, 36, 280);
-        setting_label(4, L"External viewer", 0, 84, 170);
+        setting_label(4, L"Viewer executable path", 0, 84, 170);
         setting_edit(4, kExternalViewer, 180, 78, 470);
         setting_browse(4, kBrowseExternalViewer, 660, 78);
-        setting_label(4, L"External editor", 0, 126, 170);
+        setting_label(4, L"Editor executable path", 0, 126, 170);
         setting_edit(4, kExternalEditor, 180, 120, 470);
         setting_browse(4, kBrowseExternalEditor, 660, 120);
         setting_checkbox(4, kWarnExecutableOpen,
@@ -1579,7 +1649,7 @@ private:
                          L"Verify signed archives before extraction by default", 180, 114);
         setting_checkbox(5, kWipeEncryptedTempFiles,
                          L"Wipe temporary files extracted from encrypted archives", 180, 148);
-        setting_label(5, L"Trusted keys folder", 0, 198, 170);
+        setting_label(5, L"Trusted keys folder path", 0, 198, 170);
         setting_edit(5, kTrustedKeysFolder, 180, 192, 470);
         setting_browse(5, kBrowseTrustedKeysFolder, 660, 192);
         setting_label(5,
@@ -1611,7 +1681,7 @@ private:
                          L"Check for updates automatically on startup", 0, 42);
         setting_label(7, L"Release channel", 0, 92, 170);
         setting_combo(7, kUpdateChannel, kUpdateChannelNames, 180, 86, 260);
-        setting_label(7, L"Update feed URL", 0, 134, 170);
+        setting_label(7, L"Update URL (http/https)", 0, 134, 170);
         setting_edit(7, kUpdateUrl, 180, 128, 470);
         setting_label(7,
                       L"The existing update checker reads this URL directly. Leave it empty to "
@@ -1621,7 +1691,7 @@ private:
         setting_label(8, L"Keyboard shortcuts", 0, 0, 660);
         setting_label(8, L"Command", 0, 42, 170);
         setting_shortcut_command_combo(8, 180, 36, 470);
-        setting_label(8, L"Shortcut", 0, 92, 170);
+        setting_label(8, L"Shortcut (key chord)", 0, 92, 170);
         setting_edit(8, kShortcutValue, 180, 86, 190);
         setting_control(8, L"BUTTON", L"Assign", WS_TABSTOP | BS_OWNERDRAW,
                         kShortcutAssign, 386, 86, 86, 30);
@@ -1653,13 +1723,13 @@ private:
         setting_label(10, L"Worker priority", 0, 42, 170);
         setting_combo(10, kWorkerPriority, kWorkerPriorityNames, 180, 36, 240);
         setting_checkbox(10, kVerboseLogging, L"Enable verbose operation logging", 180, 80);
-        setting_label(10, L"Log folder", 0, 126, 170);
+        setting_label(10, L"Log folder path", 0, 126, 170);
         setting_edit(10, kLogFolder, 180, 120, 470);
         setting_browse(10, kBrowseLogFolder, 660, 120);
-        setting_label(10, L"I/O buffer", 0, 168, 170);
+        setting_label(10, L"I/O buffer (byte size)", 0, 168, 170);
         setting_combo(10, kIoBufferMode, kAutomaticCustomNames, 180, 162, 180);
         setting_edit(10, kIoBufferSize, 370, 162, 160);
-        setting_label(10, L"Memory limit", 0, 210, 170);
+        setting_label(10, L"Memory limit (byte size)", 0, 210, 170);
         setting_combo(10, kMemoryLimitMode, kAutomaticCustomNames, 180, 204, 180);
         setting_edit(10, kMemoryLimit, 370, 204, 160);
         setting_label(10,
@@ -1667,6 +1737,91 @@ private:
                       L"operations. Automatic I/O uses 1 MiB; custom values must be 64 KiB "
                       L"through 64 MiB.",
                       0, 264, 660, 72, true);
+
+        apply_dialog_input_filter(item(kCustomAccentColor),
+                                  DialogInputFilter::hexadecimal_color, 7);
+        apply_dialog_input_filter(item(kRecentLocationCount),
+                                  DialogInputFilter::unsigned_integer, 2);
+        apply_dialog_input_filter(item(kThreads),
+                                  DialogInputFilter::unsigned_integer, 5);
+        apply_dialog_input_filter(item(kDefaultVolumeSize),
+                                  DialogInputFilter::unsigned_integer, 20);
+        apply_dialog_input_filter(item(kDefaultRecoveryPercent),
+                                  DialogInputFilter::unsigned_integer, 3);
+        apply_dialog_input_filter(item(kTempCleanupDays),
+                                  DialogInputFilter::unsigned_integer, 3);
+        apply_dialog_input_filter(item(kIoBufferSize),
+                                  DialogInputFilter::byte_size, 24);
+        apply_dialog_input_filter(item(kMemoryLimit),
+                                  DialogInputFilter::byte_size, 24);
+
+        for (const int id : {kStartupCustomPath, kDefaultSigningKey,
+                             kArchiveOutputFolder, kExtractDestinationFolder,
+                             kTempFolder, kExternalViewer, kExternalEditor,
+                             kTrustedKeysFolder, kLogFolder}) {
+            SendMessageW(item(id), EM_SETLIMITTEXT, 32767, 0);
+        }
+        SendMessageW(item(kUpdateUrl), EM_SETLIMITTEXT, 2048, 0);
+        SendMessageW(item(kShortcutValue), EM_SETLIMITTEXT, 64, 0);
+
+        add_dialog_tooltip(tooltip_, item(kCustomAccentColor),
+                           L"Hexadecimal RGB color. Enter exactly #RRGGBB, for example #FFB93C.");
+        add_dialog_tooltip(tooltip_, item(kStartupCustomPath),
+                           L"Windows folder path used when Startup location is Custom.");
+        add_dialog_tooltip(tooltip_, item(kBrowseStartupCustomPath),
+                           L"Choose an existing startup folder.");
+        add_dialog_tooltip(tooltip_, item(kRecentLocationCount),
+                           L"Unsigned integer from 0 through 50. Zero disables recent locations.");
+        add_dialog_tooltip(tooltip_, item(kCenterChildWindows),
+                           L"When selected, dialogs open centered on the main Axiom window. Clear it to remember each dialog's last position.");
+        add_dialog_tooltip(tooltip_, item(kThreads),
+                           L"Unsigned integer from 0 through the available logical processor count. Zero uses all processors.");
+        add_dialog_tooltip(tooltip_, item(kDefaultVolumeSize),
+                           L"Positive integer. Select KiB, MiB, GiB, or TiB in the adjacent unit list; leave empty for one archive file.");
+        add_dialog_tooltip(tooltip_, item(kDefaultRecoveryPercent),
+                           L"Unsigned integer percentage from 0 through 100.");
+        add_dialog_tooltip(tooltip_, item(kDefaultSigningKey),
+                           L"Windows file path to an Axiom signing-key file.");
+        add_dialog_tooltip(tooltip_, item(kBrowseDefaultSigningKey),
+                           L"Choose an existing Axiom signing-key file.");
+        add_dialog_tooltip(tooltip_, item(kArchiveOutputFolder),
+                           L"Windows folder path for newly created archives when the custom-folder policy is selected.");
+        add_dialog_tooltip(tooltip_, item(kBrowseArchiveOutputFolder),
+                           L"Choose an existing custom archive-output folder.");
+        add_dialog_tooltip(tooltip_, item(kExtractDestinationFolder),
+                           L"Windows folder path for extracted files when the custom-folder policy is selected.");
+        add_dialog_tooltip(tooltip_, item(kBrowseExtractDestinationFolder),
+                           L"Choose an existing custom extraction folder.");
+        add_dialog_tooltip(tooltip_, item(kTempFolder),
+                           L"Windows folder path for Axiom temporary and staging files.");
+        add_dialog_tooltip(tooltip_, item(kBrowseTempFolder),
+                           L"Choose an existing custom temporary folder.");
+        add_dialog_tooltip(tooltip_, item(kTempCleanupDays),
+                           L"Unsigned integer from 0 through 365 days.");
+        add_dialog_tooltip(tooltip_, item(kExternalViewer),
+                           L"Windows file path to the executable used to view extracted files.");
+        add_dialog_tooltip(tooltip_, item(kBrowseExternalViewer),
+                           L"Choose an existing viewer executable file.");
+        add_dialog_tooltip(tooltip_, item(kExternalEditor),
+                           L"Windows file path to the executable used to edit extracted files.");
+        add_dialog_tooltip(tooltip_, item(kBrowseExternalEditor),
+                           L"Choose an existing editor executable file.");
+        add_dialog_tooltip(tooltip_, item(kTrustedKeysFolder),
+                           L"Windows folder path containing trusted Axiom public-key files.");
+        add_dialog_tooltip(tooltip_, item(kBrowseTrustedKeysFolder),
+                           L"Choose an existing trusted-keys folder.");
+        add_dialog_tooltip(tooltip_, item(kUpdateUrl),
+                           L"Absolute HTTP or HTTPS URL for the update feed. Leave empty to disable feed checks.");
+        add_dialog_tooltip(tooltip_, item(kShortcutValue),
+                           L"Key-chord text such as Ctrl+O, Alt+Left, F5, Delete, or None.");
+        add_dialog_tooltip(tooltip_, item(kLogFolder),
+                           L"Windows folder path for verbose operation logs.");
+        add_dialog_tooltip(tooltip_, item(kBrowseLogFolder),
+                           L"Choose an existing log folder.");
+        add_dialog_tooltip(tooltip_, item(kIoBufferSize),
+                           L"Positive byte size from 64 KiB through 64 MiB. Accepted suffixes: B, KiB, MiB, GiB, or TiB.");
+        add_dialog_tooltip(tooltip_, item(kMemoryLimit),
+                           L"Positive byte size. Accepted suffixes: B, KiB, MiB, GiB, or TiB.");
 
         accept_ = control(L"BUTTON", L"OK", WS_TABSTOP | BS_DEFPUSHBUTTON | BS_OWNERDRAW, kAccept);
         cancel_ = control(L"BUTTON", L"Cancel", WS_TABSTOP | BS_OWNERDRAW, kCancel);
@@ -1678,7 +1833,7 @@ private:
 
     void create_create_controls() {
         summary_ = label(L"");
-        path_label_ = label(L"Output");
+        path_label_ = label(L"Output file path");
         path_edit_ = control(L"EDIT", L"", WS_TABSTOP | ES_AUTOHSCROLL, kPathEdit);
         browse_ = control(L"BUTTON", L"Browse...", WS_TABSTOP | BS_OWNERDRAW, kBrowse);
         SendMessageW(path_edit_, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN,
@@ -1691,7 +1846,7 @@ private:
 
         update_mode_label_ = page_label(1, L"Update mode");
         update_mode_combo_ = page_combo(1, kUpdateMode, kUpdateModeNames);
-        comment_label_ = page_label(1, L"Archive comment");
+        comment_label_ = page_label(1, L"Archive comment (text)");
         comment_edit_ = page_edit(1, kArchiveComment,
                                   ES_MULTILINE | ES_AUTOVSCROLL | WS_VSCROLL | ES_WANTRETURN);
         lock_archive_ = page_checkbox(1, kLockArchive,
@@ -1704,6 +1859,20 @@ private:
             L"Windows attributes and timestamps, NTFS alternate data streams, supported links, "
             L"and POSIX mode and ownership are captured automatically.", true);
 
+        compression_profile_label_ = page_label(0, L"Compression profile");
+        compression_profile_combo_ = page_control(
+            0, L"COMBOBOX", L"", WS_TABSTOP | WS_VSCROLL | CBS_DROPDOWN |
+                CBS_AUTOHSCROLL | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS,
+            kCompressionProfile);
+        SendMessageW(compression_profile_combo_, CB_SETITEMHEIGHT, 0, scale(24));
+        SendMessageW(compression_profile_combo_, CB_SETITEMHEIGHT,
+                     static_cast<WPARAM>(-1), scale(24));
+        save_compression_profile_ = page_control(
+            0, L"BUTTON", L"Save", WS_TABSTOP | BS_OWNERDRAW,
+            kSaveCompressionProfile);
+        delete_compression_profile_ = page_control(
+            0, L"BUTTON", L"Delete", WS_TABSTOP | BS_OWNERDRAW,
+            kDeleteCompressionProfile);
         level_label_ = page_label(0, L"Compression level");
         level_combo_ = page_combo(0, kLevel, kLevelNames);
         dictionary_label_ = page_label(0, L"Dictionary size");
@@ -1712,8 +1881,10 @@ private:
         word_size_combo_ = page_combo(0, kWordSize, kWordSizeNames);
         solid_block_label_ = page_label(0, L"Solid block size");
         solid_block_combo_ = page_combo(0, kSolidBlockSize, kSolidBlockNames);
-        threads_label_ = page_label(0, L"Threads (0 = all)");
+        threads_label_ = page_label(0, L"Threads (integer; 0 = all)");
         threads_combo_ = page_thread_combo(0);
+        thread_model_label_ = page_label(0, L"Threading model");
+        thread_model_combo_ = page_combo(0, kThreadModel, kThreadModelNames);
         compression_info_ = page_label(
             0,
             L"Default values follow the selected compression level. Larger dictionaries and "
@@ -1722,9 +1893,9 @@ private:
         encrypt_data_ = page_checkbox(2, kEncryptData, L"Encrypt file data");
         encrypt_names_ = page_checkbox(2, kEncryptNames,
                                        L"Encrypt file names and archive directory");
-        password_label_ = page_label(2, L"Password");
+        password_label_ = page_label(2, L"Password (text)");
         password_edit_ = page_edit(2, kPassword, ES_PASSWORD | ES_AUTOHSCROLL);
-        confirm_password_label_ = page_label(2, L"Confirm password");
+        confirm_password_label_ = page_label(2, L"Confirm password (text)");
         confirm_password_edit_ = page_edit(
             2, kConfirmPassword, ES_PASSWORD | ES_AUTOHSCROLL);
         show_password_ = page_checkbox(2, kShowPassword, L"Show password");
@@ -1733,10 +1904,10 @@ private:
             L"Axiom uses Argon2id key derivation and XChaCha20-Poly1305. Passwords are never "
             L"saved in GUI settings and are cleared when this dialog closes.", true);
 
-        volume_size_label_ = page_label(3, L"Split volume size");
+        volume_size_label_ = page_label(3, L"Volume size (integer > 0)");
         volume_size_edit_ = page_edit(3, kVolumeSize, ES_NUMBER | ES_AUTOHSCROLL);
         volume_unit_combo_ = page_combo(3, kVolumeUnit, kVolumeUnitNames);
-        recovery_percent_label_ = page_label(3, L"Recovery record");
+        recovery_percent_label_ = page_label(3, L"Recovery (integer 0-100)");
         recovery_percent_edit_ = page_edit(3, kRecoveryPercent,
                                            ES_NUMBER | ES_AUTOHSCROLL);
         recovery_percent_suffix_ = page_label(3, L"% of archive data");
@@ -1750,7 +1921,7 @@ private:
 
         sign_archive_ = page_checkbox(4, kSignArchive,
                                       L"Sign the completed archive");
-        signing_key_label_ = page_label(4, L"Signing key");
+        signing_key_label_ = page_label(4, L"Signing key file path");
         signing_key_edit_ = page_edit(4, kSigningKey);
         browse_signing_key_ = page_control(4, L"BUTTON", L"Browse...",
                                            WS_TABSTOP | BS_OWNERDRAW, kBrowseSigningKey);
@@ -1763,6 +1934,52 @@ private:
 
         output_preview_ = control(L"STATIC", L"",
                                   SS_LEFT | SS_NOPREFIX | SS_PATHELLIPSIS, 0);
+        SendMessageW(path_edit_, EM_SETLIMITTEXT, 32767, 0);
+        SendMessageW(comment_edit_, EM_SETLIMITTEXT, 65535, 0);
+        SendMessageW(password_edit_, EM_SETLIMITTEXT, 1024, 0);
+        SendMessageW(confirm_password_edit_, EM_SETLIMITTEXT, 1024, 0);
+        SendMessageW(signing_key_edit_, EM_SETLIMITTEXT, 32767, 0);
+        apply_dialog_input_filter(threads_combo_,
+                                  DialogInputFilter::unsigned_integer, 5);
+        apply_dialog_input_filter(volume_size_edit_,
+                                  DialogInputFilter::unsigned_integer, 20);
+        apply_dialog_input_filter(recovery_percent_edit_,
+                                  DialogInputFilter::unsigned_integer, 3);
+        add_dialog_tooltip(tooltip_, path_edit_,
+                           L"Windows file path for the archive or self-extracting executable.");
+        add_dialog_tooltip(tooltip_, browse_,
+                           L"Choose the output archive or self-extracting executable file path.");
+        add_dialog_tooltip(tooltip_, format_combo_,
+                           L"Archive format selection. Available options determine which other fields are enabled.");
+        add_dialog_tooltip(
+            tooltip_, compression_profile_combo_,
+            L"Choose a built-in or saved compression profile. To create one, adjust the compression settings, type a profile name, and select Save.");
+        add_dialog_tooltip(tooltip_, save_compression_profile_,
+                           L"Save the current compression-tab settings under the typed profile name.");
+        add_dialog_tooltip(tooltip_, delete_compression_profile_,
+                           L"Delete the selected user profile. Built-in profiles cannot be deleted.");
+        add_dialog_tooltip(tooltip_, level_combo_,
+                           L"Compression level from 1 (fastest) through 9 (maximum ratio).");
+        add_dialog_tooltip(tooltip_, threads_combo_,
+                           L"Unsigned integer from 0 through the available logical processor count. Zero uses all processors.");
+        add_dialog_tooltip(tooltip_, comment_edit_,
+                           L"Unicode text stored as the archive comment.");
+        add_dialog_tooltip(tooltip_, password_edit_,
+                           L"Unicode password text. Passwords are never saved in GUI settings.");
+        add_dialog_tooltip(tooltip_, confirm_password_edit_,
+                           L"Repeat the password exactly; both text fields must match.");
+        add_dialog_tooltip(tooltip_, volume_size_edit_,
+                           L"Positive integer. Select KiB, MiB, GiB, or TiB beside it; leave empty to disable splitting.");
+        add_dialog_tooltip(tooltip_, volume_unit_combo_,
+                           L"Binary unit applied to the positive integer volume size.");
+        add_dialog_tooltip(tooltip_, recovery_percent_edit_,
+                           L"Unsigned integer percentage from 0 through 100.");
+        add_dialog_tooltip(tooltip_, signing_key_edit_,
+                           L"Windows file path to an Axiom signing-key file.");
+        add_dialog_tooltip(tooltip_, browse_signing_key_,
+                           L"Choose an existing Axiom signing-key file.");
+        add_dialog_tooltip(tooltip_, create_sfx_,
+                           L"Build one Windows .exe containing the selected archive format and extraction stub.");
         accept_ = control(L"BUTTON", L"OK", WS_TABSTOP | BS_DEFPUSHBUTTON | BS_OWNERDRAW, kAccept);
         cancel_ = control(L"BUTTON", L"Cancel", WS_TABSTOP | BS_OWNERDRAW, kCancel);
         load_create_values();
@@ -1774,6 +1991,7 @@ private:
     void create_controls() {
         palette_ = make_palette();
         set_dark_title(window_, palette_.dark);
+        tooltip_ = create_dialog_tooltip(window_);
         window_brush_ = CreateSolidBrush(palette_.window);
         edit_brush_ = CreateSolidBrush(palette_.edit);
         NONCLIENTMETRICSW metrics{sizeof(metrics)};
@@ -1795,7 +2013,9 @@ private:
 
         if (mode_ != DialogMode::settings) {
             summary_ = label(mode_ == DialogMode::create_archive ? L"Selected items" : L"Archive");
-            path_label_ = label(mode_ == DialogMode::create_archive ? L"Archive path" : L"Destination");
+            path_label_ = label(mode_ == DialogMode::create_archive
+                                    ? L"Archive file path"
+                                    : L"Destination folder path");
             path_edit_ = control(L"EDIT", L"", WS_TABSTOP | ES_AUTOHSCROLL, kPathEdit);
             browse_ = control(L"BUTTON", L"Browse...", WS_TABSTOP | BS_OWNERDRAW, kBrowse);
         }
@@ -1809,7 +2029,7 @@ private:
             solid_block_label_ = label(L"Solid block size");
             solid_block_combo_ = selection_combo(kSolidBlockSize, kSolidBlockNames);
         }
-        threads_label_ = label(L"Threads (0 = all)");
+        threads_label_ = label(L"Threads (integer; 0 = all)");
         threads_combo_ = thread_combo();
         if (mode_ == DialogMode::extract_archive) {
             overwrite_ = control(L"BUTTON", L"Overwrite existing files",
@@ -1826,6 +2046,23 @@ private:
         cancel_ = control(L"BUTTON", L"Cancel", WS_TABSTOP | BS_OWNERDRAW, kCancel);
         SendMessageW(path_edit_, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN,
                      MAKELPARAM(scale(6), scale(6)));
+        SendMessageW(path_edit_, EM_SETLIMITTEXT, 32767, 0);
+        apply_dialog_input_filter(threads_combo_,
+                                  DialogInputFilter::unsigned_integer, 5);
+        add_dialog_tooltip(tooltip_, path_edit_,
+                           mode_ == DialogMode::extract_archive
+                               ? L"Windows folder path that will receive the extracted items."
+                               : L"Windows file path for the new archive.");
+        add_dialog_tooltip(tooltip_, browse_,
+                           mode_ == DialogMode::extract_archive
+                               ? L"Choose an extraction destination folder."
+                               : L"Choose an output archive file path.");
+        add_dialog_tooltip(tooltip_, threads_combo_,
+                           L"Unsigned integer from 0 through the available logical processor count. Zero uses all processors.");
+        add_dialog_tooltip(tooltip_, overwrite_,
+                           L"Allow extracted files to replace existing files with the same path.");
+        add_dialog_tooltip(tooltip_, restore_time_,
+                           L"Restore each extracted item's stored last-modified timestamp.");
         load_values();
         layout();
     }
@@ -1853,7 +2090,7 @@ private:
         }
         level_ = std::clamp(level, 1, 9);
         SendMessageW(level_combo_, CB_SETCURSEL, static_cast<WPARAM>(level_ - 1), 0);
-        set_window_text(threads_combo_, std::to_wstring(threads));
+        set_thread_count(threads_combo_, threads);
         if (mode_ == DialogMode::create_archive) {
             SendMessageW(dictionary_combo_, CB_SETCURSEL,
                          value_index(kDictionaryValues, create_options.dictionary_size), 0);
@@ -1979,22 +2216,276 @@ private:
         update_shortcut_controls();
     }
 
-    int edit_int(int id, int fallback, int minimum, int maximum) const {
-        try {
-            const std::wstring text = window_text(item(id));
-            if (text.empty()) return fallback;
-            return std::clamp(std::stoi(text), minimum, maximum);
-        } catch (...) {
-            return fallback;
+    std::optional<int> edit_int(int id, int minimum, int maximum) const {
+        const std::wstring text = window_text(item(id));
+        if (text.empty()) return std::nullopt;
+        wchar_t* end = nullptr;
+        errno = 0;
+        const unsigned long value = std::wcstoul(text.c_str(), &end, 10);
+        if (errno == ERANGE || end == text.c_str() || *end != L'\0' ||
+            value > static_cast<unsigned long>(maximum) ||
+            value < static_cast<unsigned long>(minimum)) {
+            return std::nullopt;
         }
+        return static_cast<int>(value);
     }
 
-    std::size_t thread_count_from(HWND combo) const {
-        try {
-            return static_cast<std::size_t>(std::stoull(window_text(combo)));
-        } catch (...) {
-            return 0;
+    std::optional<std::size_t> thread_count_from(HWND combo) const {
+        if (combo == nullptr) return std::nullopt;
+        const LRESULT selection = SendMessageW(combo, CB_GETCURSEL, 0, 0);
+        const auto maximum = static_cast<unsigned long long>(
+            axiom::core::logical_processor_count());
+        // Every valid thread count has a list entry at the same index. Reading
+        // that index also handles the descriptive "0 (all processors)" row.
+        if (selection != CB_ERR && selection >= 0 &&
+            static_cast<unsigned long long>(selection) <= maximum) {
+            return static_cast<std::size_t>(selection);
         }
+        std::wstring text = window_text(combo);
+        if (text.empty()) {
+            COMBOBOXINFO info{sizeof(info)};
+            if (GetComboBoxInfo(combo, &info) && info.hwndItem != nullptr) {
+                text = window_text(info.hwndItem);
+            }
+        }
+        if (text.empty()) return std::nullopt;
+        wchar_t* end = nullptr;
+        errno = 0;
+        const unsigned long long value = _wcstoui64(text.c_str(), &end, 10);
+        if (errno == ERANGE || end == text.c_str() || *end != L'\0' ||
+            value > maximum) {
+            return std::nullopt;
+        }
+        return static_cast<std::size_t>(value);
+    }
+
+    void set_thread_count(HWND combo, std::size_t count) const {
+        if (combo == nullptr) return;
+        const std::size_t maximum = axiom::core::logical_processor_count();
+        const std::size_t normalized = std::min(count, maximum);
+        SendMessageW(combo, CB_SETCURSEL, static_cast<WPARAM>(normalized), 0);
+    }
+
+    std::optional<CompressionProfile> compression_profile_from_controls(
+        std::wstring name) const {
+        const auto threads = thread_count_from(threads_combo_);
+        if (!threads) return std::nullopt;
+        const LRESULT level = SendMessageW(level_combo_, CB_GETCURSEL, 0, 0);
+        return CompressionProfile{
+            std::move(name),
+            level == CB_ERR ? 5 : std::clamp(static_cast<int>(level) + 1, 1, 9),
+            *threads,
+            selected_combo_value(dictionary_combo_, kDictionaryValues),
+            selected_combo_value(word_size_combo_, kWordSizeValues),
+            selected_combo_value(solid_block_combo_, kSolidBlockValues),
+            static_cast<int>(std::clamp<LRESULT>(
+                SendMessageW(thread_model_combo_, CB_GETCURSEL, 0, 0), 0, 1)),
+        };
+    }
+
+    static bool compression_profile_settings_equal(const CompressionProfile& left,
+                                                   const CompressionProfile& right) {
+        return left.level == right.level &&
+               left.thread_count == right.thread_count &&
+               left.dictionary_size == right.dictionary_size &&
+               left.word_size == right.word_size &&
+               left.solid_block_size == right.solid_block_size &&
+               left.thread_model == right.thread_model;
+    }
+
+    void update_compression_profile_actions() {
+        if (delete_compression_profile_ == nullptr ||
+            compression_profile_combo_ == nullptr) return;
+        const std::wstring name = trim_color_text(window_text(compression_profile_combo_));
+        const bool custom = std::any_of(
+            create_options.compression_profiles.begin(),
+            create_options.compression_profiles.end(),
+            [&](const CompressionProfile& profile) {
+                return profile_names_equal(profile.name, name);
+            });
+        EnableWindow(delete_compression_profile_, custom);
+    }
+
+    void rebuild_compression_profile_combo(bool match_current_settings = false) {
+        if (compression_profile_combo_ == nullptr) return;
+        SendMessageW(compression_profile_combo_, CB_RESETCONTENT, 0, 0);
+        for (const CompressionProfile& profile : built_in_compression_profiles()) {
+            SendMessageW(compression_profile_combo_, CB_ADDSTRING, 0,
+                         reinterpret_cast<LPARAM>(profile.name.c_str()));
+        }
+        for (const CompressionProfile& profile : create_options.compression_profiles) {
+            SendMessageW(compression_profile_combo_, CB_ADDSTRING, 0,
+                         reinterpret_cast<LPARAM>(profile.name.c_str()));
+        }
+
+        LRESULT selection = CB_ERR;
+        if (match_current_settings) {
+            if (const auto current = compression_profile_from_controls(L""); current) {
+                std::size_t index = 0;
+                for (const CompressionProfile& profile : built_in_compression_profiles()) {
+                    if (compression_profile_settings_equal(*current, profile)) {
+                        selection = static_cast<LRESULT>(index);
+                        break;
+                    }
+                    ++index;
+                }
+                if (selection == CB_ERR) {
+                    for (const CompressionProfile& profile : create_options.compression_profiles) {
+                        if (compression_profile_settings_equal(*current, profile)) {
+                            selection = static_cast<LRESULT>(index);
+                            break;
+                        }
+                        ++index;
+                    }
+                }
+            }
+        }
+        SendMessageW(compression_profile_combo_, CB_SETCURSEL, selection, 0);
+        if (selection == CB_ERR) {
+            SetWindowTextW(compression_profile_combo_, L"Custom settings");
+        }
+        update_compression_profile_actions();
+    }
+
+    void mark_compression_profile_custom() {
+        if (applying_compression_profile_ || compression_profile_combo_ == nullptr) return;
+        SendMessageW(compression_profile_combo_, CB_SETCURSEL, static_cast<WPARAM>(-1), 0);
+        SetWindowTextW(compression_profile_combo_, L"Custom settings");
+        update_compression_profile_actions();
+    }
+
+    void apply_selected_compression_profile() {
+        const LRESULT selection = SendMessageW(
+            compression_profile_combo_, CB_GETCURSEL, 0, 0);
+        if (selection == CB_ERR) {
+            update_compression_profile_actions();
+            return;
+        }
+        const std::size_t built_in_count = built_in_compression_profiles().size();
+        const CompressionProfile* profile = nullptr;
+        if (static_cast<std::size_t>(selection) < built_in_count) {
+            profile = &built_in_compression_profiles()[static_cast<std::size_t>(selection)];
+        } else {
+            const std::size_t custom_index =
+                static_cast<std::size_t>(selection) - built_in_count;
+            if (custom_index < create_options.compression_profiles.size()) {
+                profile = &create_options.compression_profiles[custom_index];
+            }
+        }
+        if (profile == nullptr) return;
+
+        applying_compression_profile_ = true;
+        SendMessageW(level_combo_, CB_SETCURSEL,
+                     static_cast<WPARAM>(std::clamp(profile->level, 1, 9) - 1), 0);
+        set_thread_count(threads_combo_, profile->thread_count);
+        SendMessageW(dictionary_combo_, CB_SETCURSEL,
+                     value_index(kDictionaryValues, profile->dictionary_size), 0);
+        SendMessageW(word_size_combo_, CB_SETCURSEL,
+                     value_index(kWordSizeValues, profile->word_size), 0);
+        SendMessageW(solid_block_combo_, CB_SETCURSEL,
+                     value_index(kSolidBlockValues, profile->solid_block_size), 0);
+        const int thread_model = profile->level == 7
+            ? 0 : std::clamp(profile->thread_model, 0, 1);
+        SendMessageW(thread_model_combo_, CB_SETCURSEL,
+                     static_cast<WPARAM>(thread_model), 0);
+        applying_compression_profile_ = false;
+        update_create_dependencies();
+        update_compression_profile_actions();
+    }
+
+    void save_compression_profile() {
+        std::wstring name = trim_color_text(window_text(compression_profile_combo_));
+        const bool invalid_character = std::any_of(
+            name.begin(), name.end(), [](wchar_t character) {
+                return character < L' ' || character == L'\t';
+            });
+        if (name.empty() || name.size() > 64 || invalid_character ||
+            profile_names_equal(name, L"Custom settings")) {
+            show_message_dialog(
+                window_, instance_, dpi_, palette_.dark, L"Compression profiles",
+                L"Type a profile name from 1 through 64 characters in the Profile field, then select Save.",
+                MessageDialogIcon::warning);
+            SetFocus(compression_profile_combo_);
+            return;
+        }
+        if (is_built_in_profile_name(name)) {
+            show_message_dialog(
+                window_, instance_, dpi_, palette_.dark, L"Compression profiles",
+                L"Built-in profiles cannot be replaced. Type a different profile name.",
+                MessageDialogIcon::warning);
+            SetFocus(compression_profile_combo_);
+            return;
+        }
+        auto profile = compression_profile_from_controls(name);
+        if (!profile) {
+            show_message_dialog(
+                window_, instance_, dpi_, palette_.dark, L"Compression profiles",
+                L"The current thread count is invalid. Correct it before saving the profile.",
+                MessageDialogIcon::warning);
+            SetFocus(threads_combo_);
+            return;
+        }
+        auto existing = std::find_if(
+            create_options.compression_profiles.begin(),
+            create_options.compression_profiles.end(),
+            [&](const CompressionProfile& value) {
+                return profile_names_equal(value.name, name);
+            });
+        if (existing != create_options.compression_profiles.end()) {
+            if (show_message_dialog(
+                    window_, instance_, dpi_, palette_.dark,
+                    L"Replace compression profile",
+                    L"Replace the saved profile \"" + existing->name +
+                        L"\" with the current compression settings?",
+                    MessageDialogIcon::question, MessageDialogButtons::yes_no,
+                    IDNO) != IDYES) {
+                return;
+            }
+            *existing = *profile;
+        } else {
+            if (create_options.compression_profiles.size() >= 32) {
+                show_message_dialog(
+                    window_, instance_, dpi_, palette_.dark, L"Compression profiles",
+                    L"A maximum of 32 user compression profiles can be saved.",
+                    MessageDialogIcon::warning);
+                return;
+            }
+            create_options.compression_profiles.push_back(*profile);
+        }
+        create_options.compression_profiles_changed = true;
+        rebuild_compression_profile_combo(false);
+        const std::size_t index = built_in_compression_profiles().size() +
+            static_cast<std::size_t>(std::distance(
+                create_options.compression_profiles.begin(),
+                std::find_if(create_options.compression_profiles.begin(),
+                             create_options.compression_profiles.end(),
+                             [&](const CompressionProfile& value) {
+                                 return profile_names_equal(value.name, name);
+                             })));
+        SendMessageW(compression_profile_combo_, CB_SETCURSEL,
+                     static_cast<WPARAM>(index), 0);
+        update_compression_profile_actions();
+    }
+
+    void delete_compression_profile() {
+        const std::wstring name = trim_color_text(window_text(compression_profile_combo_));
+        const auto profile = std::find_if(
+            create_options.compression_profiles.begin(),
+            create_options.compression_profiles.end(),
+            [&](const CompressionProfile& value) {
+                return profile_names_equal(value.name, name);
+            });
+        if (profile == create_options.compression_profiles.end()) return;
+        if (show_message_dialog(
+                window_, instance_, dpi_, palette_.dark, L"Delete compression profile",
+                L"Delete the saved profile \"" + profile->name + L"\"?",
+                MessageDialogIcon::question, MessageDialogButtons::yes_no,
+                IDNO) != IDYES) {
+            return;
+        }
+        create_options.compression_profiles.erase(profile);
+        create_options.compression_profiles_changed = true;
+        rebuild_compression_profile_combo(false);
     }
 
     void load_settings_values() {
@@ -2024,8 +2515,9 @@ private:
         SendMessageW(item(kSolidBlockSize), CB_SETCURSEL,
                      value_index(kSolidBlockValues,
                                  application_options.default_solid_block_size), 0);
-        set_window_text(item(kThreads),
-                        std::to_wstring(application_options.default_thread_count));
+        set_selected_index(kThreadModel,
+                           std::clamp(application_options.default_thread_model, 0, 1));
+        set_thread_count(item(kThreads), application_options.default_thread_count);
         set_selected_index(kDefaultUpdateMode,
                            std::clamp(application_options.default_update_mode, 0, 4));
         set_window_text(item(kDefaultVolumeSize),
@@ -2088,6 +2580,99 @@ private:
 
     bool apply_settings_values() {
         if (!commit_shortcut_edit(true)) return false;
+        const auto reject_field = [&](int page, int id, const wchar_t* message) {
+            select_settings_page(page);
+            if (HWND control = item(id)) SetFocus(control);
+            show_message_dialog(window_, instance_, dpi_, palette_.dark,
+                                L"Axiom settings", message,
+                                MessageDialogIcon::warning);
+            return false;
+        };
+        const auto recent_count = edit_int(kRecentLocationCount, 0, 50);
+        if (!recent_count) {
+            return reject_field(0, kRecentLocationCount,
+                                L"Recent count must be an integer from 0 through 50.");
+        }
+        const auto default_threads = thread_count_from(item(kThreads));
+        if (!default_threads) {
+            return reject_field(
+                1, kThreads,
+                L"CPU threads must be an integer from 0 through the available logical processor count.");
+        }
+        const std::wstring default_volume = window_text(item(kDefaultVolumeSize));
+        if (!default_volume.empty() && !parse_size_text(default_volume)) {
+            return reject_field(
+                1, kDefaultVolumeSize,
+                L"Split volume size must be a positive integer. Select its unit in the adjacent list.");
+        }
+        const auto recovery_percent = edit_int(kDefaultRecoveryPercent, 0, 100);
+        if (!recovery_percent) {
+            return reject_field(1, kDefaultRecoveryPercent,
+                                L"Recovery must be an integer percentage from 0 through 100.");
+        }
+        const auto cleanup_days = edit_int(kTempCleanupDays, 0, 365);
+        if (!cleanup_days) {
+            return reject_field(2, kTempCleanupDays,
+                                L"Cleanup days must be an integer from 0 through 365.");
+        }
+        const std::wstring io_buffer = window_text(item(kIoBufferSize));
+        if (selected_index(kIoBufferMode, 0) == 1) {
+            const auto size = parse_size_text(io_buffer);
+            if (!size || *size < kMinIoBufferSize || *size > kMaxIoBufferSize) {
+                return reject_field(
+                    10, kIoBufferSize,
+                    L"Custom I/O buffer size must be between 64 KiB and 64 MiB. Examples: 1 MiB, 4 MiB, 8388608.");
+            }
+        }
+        const std::wstring memory_limit = window_text(item(kMemoryLimit));
+        if (selected_index(kMemoryLimitMode, 0) == 1 &&
+            !parse_size_text(memory_limit)) {
+            return reject_field(
+                10, kMemoryLimit,
+                L"Custom memory limit must be a positive byte size, for example 512 MiB or 4 GiB.");
+        }
+        const std::wstring update_url = window_text(item(kUpdateUrl));
+        if (!update_url.empty()) {
+            std::wstring lower = update_url;
+            std::transform(lower.begin(), lower.end(), lower.begin(), [](wchar_t ch) {
+                return static_cast<wchar_t>(std::towlower(ch));
+            });
+            if ((lower.rfind(L"https://", 0) != 0 &&
+                 lower.rfind(L"http://", 0) != 0) ||
+                lower.find_first_of(L" \t\r\n") != std::wstring::npos) {
+                return reject_field(
+                    7, kUpdateUrl,
+                    L"Update URL must be an absolute HTTP or HTTPS URL, or empty to disable feed checks.");
+            }
+        }
+        const auto existing_folder = [&](int mode_id, int custom_index,
+                                         int path_id, int page,
+                                         const wchar_t* message) {
+            if (selected_index(mode_id, 0) != custom_index) return true;
+            const fs::path path = window_text(item(path_id));
+            std::error_code error;
+            if (!path.empty() && fs::is_directory(path, error)) return true;
+            return reject_field(page, path_id, message);
+        };
+        if (!existing_folder(kStartupMode, 3, kStartupCustomPath, 0,
+                             L"Custom startup folder must be an existing Windows folder path.") ||
+            !existing_folder(kArchiveOutputMode, 2, kArchiveOutputFolder, 2,
+                             L"Custom archive folder must be an existing Windows folder path.") ||
+            !existing_folder(kExtractDestinationMode, 2, kExtractDestinationFolder, 2,
+                             L"Custom extraction folder must be an existing Windows folder path.") ||
+            !existing_folder(kTempFolderMode, 2, kTempFolder, 2,
+                             L"Custom temporary folder must be an existing Windows folder path.")) {
+            return false;
+        }
+        if (checkbox_checked(kDefaultSignArchive)) {
+            const fs::path key = window_text(item(kDefaultSigningKey));
+            std::error_code error;
+            if (key.empty() || !fs::is_regular_file(key, error)) {
+                return reject_field(
+                    1, kDefaultSigningKey,
+                    L"Default signing key must be an existing Axiom key file path when archive signing is enabled.");
+            }
+        }
         application_options.theme_mode = selected_index(kThemeMode, 0);
         application_options.accent_color_mode = selected_index(kAccentColorMode, 0);
         if (const auto color = color_from_hex(window_text(item(kCustomAccentColor)))) {
@@ -2105,8 +2690,7 @@ private:
             normalize_toolbar_commands(application_options.toolbar_commands);
         application_options.startup_location_mode = selected_index(kStartupMode, 0);
         application_options.startup_custom_path = window_text(item(kStartupCustomPath));
-        application_options.recent_location_count =
-            edit_int(kRecentLocationCount, 12, 0, 50);
+        application_options.recent_location_count = *recent_count;
 
         application_options.default_level = selected_index(kLevel, 4) + 1;
         application_options.default_dictionary_size =
@@ -2115,12 +2699,12 @@ private:
             selected_combo_value(item(kWordSize), kWordSizeValues);
         application_options.default_solid_block_size =
             selected_combo_value(item(kSolidBlockSize), kSolidBlockValues);
-        application_options.default_thread_count = thread_count_from(item(kThreads));
+        application_options.default_thread_model = selected_index(kThreadModel, 0);
+        application_options.default_thread_count = *default_threads;
         application_options.default_update_mode = selected_index(kDefaultUpdateMode, 0);
-        application_options.default_volume_size = window_text(item(kDefaultVolumeSize));
+        application_options.default_volume_size = default_volume;
         application_options.default_volume_unit = selected_index(kDefaultVolumeUnit, 2);
-        application_options.default_recovery_percent =
-            edit_int(kDefaultRecoveryPercent, 0, 0, 100);
+        application_options.default_recovery_percent = *recovery_percent;
         application_options.default_signing_key = window_text(item(kDefaultSigningKey));
 
         application_options.archive_output_mode = selected_index(kArchiveOutputMode, 0);
@@ -2131,7 +2715,7 @@ private:
             window_text(item(kExtractDestinationFolder));
         application_options.temp_folder_mode = selected_index(kTempFolderMode, 0);
         application_options.temp_folder = window_text(item(kTempFolder));
-        application_options.temp_cleanup_days = edit_int(kTempCleanupDays, 7, 0, 365);
+        application_options.temp_cleanup_days = *cleanup_days;
 
         application_options.file_open_mode = selected_index(kFileOpenMode, 0);
         application_options.external_viewer = window_text(item(kExternalViewer));
@@ -2141,26 +2725,14 @@ private:
         application_options.trusted_keys_folder = window_text(item(kTrustedKeysFolder));
 
         application_options.update_channel = selected_index(kUpdateChannel, 0);
-        application_options.update_url = window_text(item(kUpdateUrl));
+        application_options.update_url = update_url;
 
         application_options.worker_priority = selected_index(kWorkerPriority, 0);
         application_options.log_folder = window_text(item(kLogFolder));
         application_options.io_buffer_mode = selected_index(kIoBufferMode, 0);
-        application_options.io_buffer_size = window_text(item(kIoBufferSize));
-        if (application_options.io_buffer_mode == 1) {
-            const auto size = parse_size_text(application_options.io_buffer_size);
-            if (!size || *size < kMinIoBufferSize || *size > kMaxIoBufferSize) {
-                show_message_dialog(
-                    window_, instance_, dpi_, palette_.dark,
-                    L"Axiom settings",
-                    L"Custom I/O buffer size must be between 64 KiB and 64 MiB. "
-                    L"Examples: 1 MiB, 4 MiB, 8388608.",
-                    MessageDialogIcon::warning);
-                return false;
-            }
-        }
+        application_options.io_buffer_size = io_buffer;
         application_options.memory_limit_mode = selected_index(kMemoryLimitMode, 0);
-        application_options.memory_limit = window_text(item(kMemoryLimit));
+        application_options.memory_limit = memory_limit;
         return true;
     }
 
@@ -2171,6 +2743,7 @@ private:
             application_options.accent_color_mode,
             application_options.custom_accent_color,
             application_options.toolbar_icon_style,
+            application_options.center_child_windows,
         });
         palette_ = make_palette();
         if (window_brush_ != nullptr) {
@@ -2223,7 +2796,7 @@ private:
         RECT client{};
         GetClientRect(window_, &client);
         const int margin = scale(18);
-        const int label_width = scale(125);
+        const int label_width = scale(180);
         const int row_height = scale(30);
         const int gap = scale(12);
         int y = margin;
@@ -2355,7 +2928,7 @@ private:
         const int margin = scale(18);
         const int row = scale(30);
         const int gap = scale(10);
-        const int label_width = scale(150);
+        const int label_width = scale(190);
         const int content_left = margin + scale(12);
         const int content_right = client.right - margin - scale(12);
         const int content_width = std::max(scale(260),
@@ -2364,9 +2937,9 @@ private:
         int y = margin;
         MoveWindow(summary_, margin, y, client.right - margin * 2, scale(24), TRUE);
         y += scale(31);
-        MoveWindow(path_label_, margin, y + scale(6), scale(72), row, TRUE);
+        MoveWindow(path_label_, margin, y + scale(6), scale(120), row, TRUE);
         const int browse_width = scale(86);
-        const int edit_x = margin + scale(78);
+        const int edit_x = margin + scale(126);
         MoveWindow(path_edit_, edit_x, y,
                    std::max(scale(120), static_cast<int>(client.right) -
                             margin - browse_width - gap - edit_x),
@@ -2425,13 +2998,32 @@ private:
                 break;
             }
             case 0:
+                MoveWindow(compression_profile_label_, content_left, y + scale(6),
+                           label_width, row, TRUE);
+                {
+                    const int action_width = scale(72);
+                    const int action_gap = scale(8);
+                    const int combo_width = std::max(
+                        scale(180), content_width - label_width -
+                                        action_width * 2 - action_gap * 2);
+                    const int value_x = content_left + label_width;
+                    MoveWindow(compression_profile_combo_, value_x, y,
+                               combo_width, scale(260), TRUE);
+                    MoveWindow(save_compression_profile_, value_x + combo_width + action_gap,
+                               y, action_width, row, TRUE);
+                    MoveWindow(delete_compression_profile_,
+                               value_x + combo_width + action_gap * 2 + action_width,
+                               y, action_width, row, TRUE);
+                }
+                y += row + scale(12);
                 row_pair(level_label_, level_combo_);
                 row_pair(dictionary_label_, dictionary_combo_);
                 row_pair(word_size_label_, word_size_combo_);
                 row_pair(solid_block_label_, solid_block_combo_);
                 row_pair(threads_label_, threads_combo_, 230);
+                row_pair(thread_model_label_, thread_model_combo_);
                 y += scale(8);
-                move_wrapped(compression_info_, content_left, y, content_width, 38);
+                move_wrapped(compression_info_, content_left, y, content_width, 54);
                 break;
             case 2:
                 MoveWindow(encrypt_data_, content_left, y, content_width, row, TRUE);
@@ -2562,12 +3154,8 @@ private:
         return true;
     }
 
-    std::size_t thread_count() const {
-        try {
-            return static_cast<std::size_t>(std::stoull(window_text(threads_combo_)));
-        } catch (...) {
-            return 0;
-        }
+    std::optional<std::size_t> thread_count() const {
+        return thread_count_from(threads_combo_);
     }
 
     void load_create_values() {
@@ -2584,7 +3172,9 @@ private:
                      value_index(kWordSizeValues, create_options.word_size), 0);
         SendMessageW(solid_block_combo_, CB_SETCURSEL,
                      value_index(kSolidBlockValues, create_options.solid_block_size), 0);
-        set_window_text(threads_combo_, std::to_wstring(create_options.thread_count));
+        SendMessageW(thread_model_combo_, CB_SETCURSEL,
+                     static_cast<WPARAM>(std::clamp(create_options.thread_model, 0, 1)), 0);
+        set_thread_count(threads_combo_, create_options.thread_count);
         SendMessageW(update_mode_combo_, CB_SETCURSEL,
                      static_cast<WPARAM>(create_options.features.update_mode), 0);
         SendMessageW(volume_unit_combo_, CB_SETCURSEL,
@@ -2609,6 +3199,7 @@ private:
                         std::to_wstring(create_options.features.recovery_percent));
         set_window_text(signing_key_edit_, create_options.features.signing_key.wstring());
         clear_options_unsupported_by_selected_format();
+        rebuild_compression_profile_combo(true);
     }
 
     void select_create_page(int page) {
@@ -2767,13 +3358,29 @@ private:
         EnableWindow(dictionary_combo_, native);
         EnableWindow(word_size_combo_, native);
         EnableWindow(solid_block_combo_, native);
+        // Level 7's path-dependent lazy tree parse is the one preset that has no
+        // safe segmented form. Keep the control available everywhere else.
+        const int selected_level =
+            static_cast<int>(SendMessageW(level_combo_, CB_GETCURSEL, 0, 0)) + 1;
+        const bool swarm_applicable = native && selected_level != 7;
+        EnableWindow(thread_model_label_, swarm_applicable);
+        EnableWindow(thread_model_combo_, swarm_applicable);
         set_window_text(
             compression_info_,
-            native
-                ? L"Default values follow the selected compression level. Larger dictionaries "
-                  L"and solid blocks can improve ratio but increase memory use."
-                : L"ZIP uses Deflate compression. The compression level and thread count apply; "
-                  L"Axiom dictionary, word, and solid-block controls are disabled for this format.");
+            !native
+                ? L"ZIP uses Deflate compression. The compression level and thread count apply; "
+                  L"Axiom dictionary, word, and solid-block controls are disabled for this format."
+            : selected_level == 1
+                ? L"Swarm replaces level 1's fastest byte-token parser with a cooperative "
+                  L"full-window hash parse. It improves ratio, but is intentionally slower."
+            : selected_level >= 8
+                ? L"Swarm parallelizes the preliminary tree parse. At level 9, exact global "
+                  L"candidate discovery also runs ahead of the DP; output remains identical."
+            : swarm_applicable
+                ? L"Split blocks compress independent regions in parallel. Swarm lets all cores "
+                  L"share each large block, preserving its full-window ratio."
+                : L"Level 7 uses a path-dependent lazy tree parse, so swarm is unavailable. "
+                  L"Choose Split blocks or another compression level.");
         EnableWindow(update_mode_combo_, available.update);
         EnableWindow(comment_edit_, available.comments);
         EnableWindow(lock_archive_, available.lock);
@@ -2875,12 +3482,21 @@ private:
                                 MessageDialogIcon::information);
             return;
         }
+        const auto threads = thread_count();
+        if (!threads) {
+            show_message_dialog(
+                window_, instance_, dpi_, palette_.dark, L"Axiom",
+                L"Threads must be an integer from 0 through the available logical processor count.",
+                MessageDialogIcon::warning);
+            SetFocus(threads_combo_);
+            return;
+        }
         const LRESULT level_selection = SendMessageW(level_combo_, CB_GETCURSEL, 0, 0);
         if (level_selection != CB_ERR) level_ = static_cast<int>(level_selection) + 1;
         if (mode_ == DialogMode::create_archive) {
             create_options.archive_path = window_text(path_edit_);
             create_options.level = level_;
-            create_options.thread_count = thread_count();
+            create_options.thread_count = *threads;
             create_options.dictionary_size = selected_combo_value(
                 dictionary_combo_, kDictionaryValues);
             create_options.word_size = selected_combo_value(
@@ -2889,12 +3505,12 @@ private:
                 solid_block_combo_, kSolidBlockValues);
         } else if (mode_ == DialogMode::extract_archive) {
             extract_options.destination = window_text(path_edit_);
-            extract_options.thread_count = thread_count();
+            extract_options.thread_count = *threads;
             extract_options.overwrite = overwrite_checked_;
             extract_options.restore_mtime = restore_time_checked_;
         } else {
             application_options.default_level = level_;
-            application_options.default_thread_count = thread_count();
+            application_options.default_thread_count = *threads;
             application_options.confirm_delete = confirm_delete_checked_;
             application_options.show_hidden = show_hidden_checked_;
         }
@@ -2914,13 +3530,43 @@ private:
         const LRESULT level_selection = SendMessageW(level_combo_, CB_GETCURSEL, 0, 0);
         if (level_selection != CB_ERR) level_ = static_cast<int>(level_selection) + 1;
         create_options.level = level_;
-        create_options.thread_count = thread_count();
+        const auto threads = thread_count();
+        if (!threads) {
+            select_create_page(0);
+            show_message_dialog(
+                window_, instance_, dpi_, palette_.dark, L"Compression options",
+                L"Threads must be an integer from 0 through the available logical processor count.",
+                MessageDialogIcon::warning);
+            SetFocus(threads_combo_);
+            return;
+        }
+        if (displayed_output.filename().empty()) {
+            show_message_dialog(window_, instance_, dpi_, palette_.dark,
+                                L"Axiom", L"Output must be a Windows file path, not only a folder path.",
+                                MessageDialogIcon::warning);
+            SetFocus(path_edit_);
+            return;
+        }
+        if (!displayed_output.parent_path().empty()) {
+            std::error_code error;
+            if (!fs::is_directory(displayed_output.parent_path(), error)) {
+                show_message_dialog(
+                    window_, instance_, dpi_, palette_.dark, L"Axiom",
+                    L"The output file's parent folder does not exist.",
+                    MessageDialogIcon::warning);
+                SetFocus(path_edit_);
+                return;
+            }
+        }
+        create_options.thread_count = *threads;
         create_options.dictionary_size = selected_combo_value(
             dictionary_combo_, kDictionaryValues);
         create_options.word_size = selected_combo_value(
             word_size_combo_, kWordSizeValues);
         create_options.solid_block_size = selected_combo_value(
             solid_block_combo_, kSolidBlockValues);
+        create_options.thread_model = static_cast<int>(
+            std::max<LRESULT>(0, SendMessageW(thread_model_combo_, CB_GETCURSEL, 0, 0)));
         create_options.archive_format = selected_archive_format();
         clear_options_unsupported_by_selected_format();
 
@@ -2930,6 +3576,17 @@ private:
         }
         create_options.features.comment = window_text(comment_edit_);
         create_options.features.volume_size = window_text(volume_size_edit_);
+        if (!create_options.features.volume_size.empty() &&
+            !parse_size_text(create_options.features.volume_size)) {
+            select_create_page(3);
+            show_message_dialog(
+                window_, instance_, dpi_, palette_.dark,
+                L"Recovery and volumes",
+                L"Volume size must be a positive integer. Select KiB, MiB, GiB, or TiB in the adjacent list.",
+                MessageDialogIcon::warning);
+            SetFocus(volume_size_edit_);
+            return;
+        }
         if (const LRESULT selection = SendMessageW(volume_unit_combo_, CB_GETCURSEL, 0, 0);
             selection != CB_ERR) {
             create_options.features.volume_unit = static_cast<int>(selection);
@@ -2992,6 +3649,18 @@ private:
                                 MessageDialogIcon::warning);
             return;
         }
+        std::error_code signing_key_error;
+        if (create_options.features.sign_archive &&
+            !fs::is_regular_file(create_options.features.signing_key,
+                                 signing_key_error)) {
+            select_create_page(4);
+            show_message_dialog(window_, instance_, dpi_, palette_.dark,
+                                L"Archive signing",
+                                L"Signing key must be an existing key file path.",
+                                MessageDialogIcon::warning);
+            SetFocus(signing_key_edit_);
+            return;
+        }
         if (create_options.features.create_sfx) {
             displayed_output.replace_extension(L".exe");
             create_options.features.sfx_destination = displayed_output.wstring();
@@ -3042,6 +3711,7 @@ private:
                     ? application_options.show_hidden
                     : show_hidden_checked_;
             case kRestoreWindowPlacement: return application_options.restore_window_placement;
+            case kCenterChildWindows: return application_options.center_child_windows;
             case kConfirmOverwrite: return application_options.confirm_overwrite;
             case kDefaultRecoveryVolumes: return application_options.default_recovery_volumes;
             case kDefaultCreateSfx: return application_options.default_create_sfx;
@@ -3108,6 +3778,10 @@ private:
             case kRestoreWindowPlacement:
                 application_options.restore_window_placement =
                     !application_options.restore_window_placement;
+                break;
+            case kCenterChildWindows:
+                application_options.center_child_windows =
+                    !application_options.center_child_windows;
                 break;
             case kConfirmOverwrite:
                 application_options.confirm_overwrite = !application_options.confirm_overwrite;
@@ -3260,6 +3934,7 @@ private:
             case kConfirmDelete:
             case kShowHidden:
             case kRestoreWindowPlacement:
+            case kCenterChildWindows:
             case kConfirmOverwrite:
             case kDefaultRecoveryVolumes:
             case kDefaultCreateSfx:
@@ -3304,55 +3979,13 @@ private:
     }
 
     void draw_button(const DRAWITEMSTRUCT& draw) const {
-        RECT rect = draw.rcItem;
         const int id = GetDlgCtrlID(draw.hwndItem);
         const bool checkbox = is_checkbox_id(id);
         if (!checkbox) {
             draw_dialog_button(draw, palette_.dark);
             return;
         }
-        const bool disabled = (draw.itemState & ODS_DISABLED) != 0;
-        const bool pressed = (draw.itemState & ODS_SELECTED) != 0;
-        const bool focused = (draw.itemState & ODS_FOCUS) != 0;
-        HBRUSH background = CreateSolidBrush(checkbox ? palette_.window
-            : (pressed ? palette_.pressed : palette_.button));
-        FillRect(draw.hDC, &rect, background);
-        DeleteObject(background);
-        std::wstring text = window_text(draw.hwndItem);
-        SetBkMode(draw.hDC, TRANSPARENT);
-        SetTextColor(draw.hDC, disabled ? palette_.muted : palette_.text);
-        HGDIOBJ old_font = SelectObject(draw.hDC, font_);
-        if (checkbox) {
-            const int box_size = scale(16);
-            RECT box{rect.left + scale(2), rect.top + (rect.bottom - rect.top - box_size) / 2,
-                     rect.left + scale(2) + box_size, rect.top + (rect.bottom - rect.top + box_size) / 2};
-            HBRUSH box_brush = CreateSolidBrush(palette_.edit);
-            FillRect(draw.hDC, &box, box_brush);
-            DeleteObject(box_brush);
-            HBRUSH border_brush = CreateSolidBrush(focused ? palette_.focus : palette_.border);
-            FrameRect(draw.hDC, &box, border_brush);
-            DeleteObject(border_brush);
-            if (checkbox_checked(id)) {
-                HPEN pen = CreatePen(PS_SOLID, scale(2),
-                                     disabled ? palette_.muted : palette_.accent);
-                HGDIOBJ old_pen = SelectObject(draw.hDC, pen);
-                MoveToEx(draw.hDC, box.left + scale(3), box.top + scale(8), nullptr);
-                LineTo(draw.hDC, box.left + scale(7), box.bottom - scale(3));
-                LineTo(draw.hDC, box.right - scale(3), box.top + scale(3));
-                SelectObject(draw.hDC, old_pen);
-                DeleteObject(pen);
-            }
-            rect.left = box.right + scale(8);
-            DrawTextW(draw.hDC, text.c_str(), -1, &rect,
-                      DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-        } else {
-            HBRUSH border = CreateSolidBrush(focused ? palette_.focus : palette_.border);
-            FrameRect(draw.hDC, &rect, border);
-            DeleteObject(border);
-            DrawTextW(draw.hDC, text.c_str(), -1, &rect,
-                      DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-        }
-        SelectObject(draw.hDC, old_font);
+        draw_dialog_checkbox(draw, palette_.dark, checkbox_checked(id));
     }
 
     void rebuild_font_for_dpi() {
@@ -3528,6 +4161,27 @@ private:
                     return 0;
                 }
                 if (mode_ == DialogMode::create_archive &&
+                    id == kCompressionProfile && HIWORD(wparam) == CBN_SELCHANGE) {
+                    apply_selected_compression_profile();
+                    return 0;
+                }
+                if (mode_ == DialogMode::create_archive &&
+                    id == kCompressionProfile && HIWORD(wparam) == CBN_EDITCHANGE) {
+                    update_compression_profile_actions();
+                    return 0;
+                }
+                if (mode_ == DialogMode::create_archive &&
+                    (id == kLevel || id == kDictionarySize || id == kWordSize ||
+                     id == kSolidBlockSize || id == kThreadModel || id == kThreads) &&
+                    (HIWORD(wparam) == CBN_SELCHANGE ||
+                     HIWORD(wparam) == CBN_EDITCHANGE)) {
+                    mark_compression_profile_custom();
+                    if (id == kLevel || id == kThreadModel) {
+                        update_create_dependencies();
+                    }
+                    return 0;
+                }
+                if (mode_ == DialogMode::create_archive &&
                     (id == kPathEdit || id == kVolumeSize) &&
                     HIWORD(wparam) == EN_CHANGE) {
                     if (id == kPathEdit) {
@@ -3553,6 +4207,12 @@ private:
                         if (const auto key = browse_signing_key(window_)) {
                             set_window_text(signing_key_edit_, key->wstring());
                         }
+                        return 0;
+                    case kSaveCompressionProfile:
+                        if (mode_ == DialogMode::create_archive) save_compression_profile();
+                        return 0;
+                    case kDeleteCompressionProfile:
+                        if (mode_ == DialogMode::create_archive) delete_compression_profile();
                         return 0;
                     case kApply:
                         if (mode_ == DialogMode::settings) apply_settings_live(false);
@@ -3643,6 +4303,7 @@ private:
     HBRUSH window_brush_ = nullptr;
     HBRUSH edit_brush_ = nullptr;
     HFONT font_ = nullptr;
+    HWND tooltip_ = nullptr;
     bool accepted_ = false;
     int level_ = 5;
     bool overwrite_checked_ = false;
@@ -3665,6 +4326,10 @@ private:
     HWND browse_ = nullptr;
     HWND format_label_ = nullptr;
     HWND format_combo_ = nullptr;
+    HWND compression_profile_label_ = nullptr;
+    HWND compression_profile_combo_ = nullptr;
+    HWND save_compression_profile_ = nullptr;
+    HWND delete_compression_profile_ = nullptr;
     HWND update_mode_label_ = nullptr;
     HWND update_mode_combo_ = nullptr;
     HWND comment_label_ = nullptr;
@@ -3683,6 +4348,8 @@ private:
     HWND solid_block_combo_ = nullptr;
     HWND threads_label_ = nullptr;
     HWND threads_combo_ = nullptr;
+    HWND thread_model_label_ = nullptr;
+    HWND thread_model_combo_ = nullptr;
     HWND compression_info_ = nullptr;
     HWND encrypt_data_ = nullptr;
     HWND encrypt_names_ = nullptr;
@@ -3716,6 +4383,7 @@ private:
     HWND apply_ = nullptr;
     HWND defaults_ = nullptr;
     HWND settings_shortcut_default_label_ = nullptr;
+    bool applying_compression_profile_ = false;
 };
 
 }  // namespace
@@ -3726,7 +4394,14 @@ bool show_create_archive_dialog(HWND owner,
     OptionsDialog dialog(DialogMode::create_archive);
     dialog.create_options = options;
     dialog.input_count = input_count;
-    if (!dialog.show(owner)) return false;
+    const bool accepted = dialog.show(owner);
+    if (!accepted) {
+        options.compression_profiles =
+            std::move(dialog.create_options.compression_profiles);
+        options.compression_profiles_changed =
+            dialog.create_options.compression_profiles_changed;
+        return false;
+    }
     options = std::move(dialog.create_options);
     return true;
 }

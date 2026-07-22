@@ -6,6 +6,7 @@
 #include <shellapi.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -27,6 +28,7 @@ namespace {
 constexpr wchar_t kEstimateDialogClass[] = L"AxiomCompressionEstimateDialog";
 constexpr int kEstimateButton = 6101;
 constexpr int kCloseButton = 6102;
+constexpr int kCompressionLevel = 6103;
 constexpr UINT kSnapshotMessage = WM_APP + 61;
 constexpr UINT kDoneMessage = WM_APP + 62;
 constexpr UINT kMetadataProgressMessage = WM_APP + 63;
@@ -37,6 +39,10 @@ constexpr DWORD kEstimateDialogStyle =
     WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_CLIPCHILDREN;
 constexpr DWORD kEstimateDialogExStyle = WS_EX_WINDOWEDGE | WS_EX_CONTROLPARENT;
 constexpr auto kMetadataRefreshInterval = std::chrono::milliseconds(50);
+constexpr std::array<const wchar_t*, 9> kCompressionLevelNames{
+    L"1 - Fastest", L"2 - Very fast", L"3 - Fast", L"4 - Normal",
+    L"5 - Balanced", L"6 - Strong", L"7 - High", L"8 - Very high",
+    L"9 - Maximum"};
 
 std::wstring format_bytes(std::uint64_t bytes) {
     constexpr const wchar_t* units[] = {L"B", L"KB", L"MB", L"GB", L"TB"};
@@ -296,6 +302,8 @@ struct EstimateDialogState {
     HWND owner{};
     HWND estimate_button{};
     HWND close_button{};
+    HWND level_combo{};
+    HWND tooltip{};
     HINSTANCE instance{};
     HFONT font{};
     UINT dpi{USER_DEFAULT_SCREEN_DPI};
@@ -352,6 +360,8 @@ void layout_dialog(EstimateDialogState& state) {
                button_width, button_height, TRUE);
     MoveWindow(state.close_button, client.right - margin - button_width, bottom,
                button_width, button_height, TRUE);
+    MoveWindow(state.level_combo, client.right - margin - scale(state, 150),
+               scale(state, 326), scale(state, 150), scale(state, 250), TRUE);
     // Match the About dialog: a DPI relayout must repaint every owner-drawn row,
     // otherwise pixels rendered with the previous monitor's scale can survive.
     InvalidateRect(state.hwnd, nullptr, TRUE);
@@ -361,6 +371,7 @@ void apply_theme(EstimateDialogState& state) {
     apply_dialog_dark_frame(state.hwnd, state.dark);
     apply_dialog_control_theme(state.estimate_button, state.dark);
     apply_dialog_control_theme(state.close_button, state.dark);
+    apply_dialog_control_theme(state.level_combo, state.dark);
     InvalidateRect(state.hwnd, nullptr, TRUE);
 }
 
@@ -369,6 +380,10 @@ void rebuild_font(EstimateDialogState& state) {
     state.font = create_dialog_font(state.dpi);
     set_dialog_control_font(state.estimate_button, state.font);
     set_dialog_control_font(state.close_button, state.font);
+    set_dialog_control_font(state.level_combo, state.font);
+    SendMessageW(state.level_combo, CB_SETITEMHEIGHT, 0, scale(state, 24));
+    SendMessageW(state.level_combo, CB_SETITEMHEIGHT,
+                 static_cast<WPARAM>(-1), scale(state, 24));
 }
 
 void invalidate_dialog_band(const EstimateDialogState& state, int top, int bottom) {
@@ -494,9 +509,11 @@ void paint_dialog(EstimateDialogState& state) {
     fill_rect(dc, separator, colors.border);
     const wchar_t* format = state.options.format == ArchiveFormat::zip ? L"ZIP" : L"AXAR";
     draw_text_line(dc, state.font, colors.disabled_text,
-                   std::wstring(L"Compression estimate: ") + format + L" level " +
-                       std::to_wstring(state.compression_level),
-                   {margin, scale(state, 330), right, scale(state, 354)});
+                   std::wstring(L"Compression estimate: ") + format,
+                   {margin, scale(state, 330), scale(state, 430), scale(state, 354)});
+    draw_text_line(dc, state.font, colors.disabled_text, L"Level",
+                   {right - scale(state, 205), scale(state, 330),
+                    right - scale(state, 158), scale(state, 354)});
 
     double savings = has_result ? result.estimated_savings_percent
                                 : has_snapshot ? snapshot.estimated_savings_percent : 0.0;
@@ -614,6 +631,7 @@ void finish_worker(EstimateDialogState& state) {
     if (!state.closing) {
         SetWindowTextW(state.estimate_button, L"Re-estimate");
         EnableWindow(state.estimate_button, TRUE);
+        EnableWindow(state.level_combo, TRUE);
     }
     InvalidateRect(state.hwnd, nullptr, FALSE);
 }
@@ -697,6 +715,7 @@ void start_estimate(EstimateDialogState& state) {
     state.running = true;
     SetWindowTextW(state.estimate_button, L"Cancel");
     EnableWindow(state.estimate_button, TRUE);
+    EnableWindow(state.level_combo, FALSE);
     InvalidateRect(state.hwnd, nullptr, FALSE);
 
     const HWND target = state.hwnd;
@@ -742,6 +761,42 @@ void request_close(EstimateDialogState& state) {
     SetWindowTextW(state.estimate_button, L"Closing...");
     EnableWindow(state.estimate_button, FALSE);
     EnableWindow(state.close_button, FALSE);
+    EnableWindow(state.level_combo, FALSE);
+}
+
+void select_compression_level(EstimateDialogState& state) {
+    if (state.running) return;
+    const LRESULT selection = SendMessageW(state.level_combo, CB_GETCURSEL, 0, 0);
+    if (selection == CB_ERR) return;
+    const int level = std::clamp(static_cast<int>(selection) + 1, 1, 9);
+    if (level == state.compression_level) return;
+
+    // Rebuild the level preset from defaults so moving down from a high level
+    // cannot retain its larger window or optimal-parser fields. Execution and
+    // file-handling choices are independent of the selected effort preset.
+    const CompressionOptions previous = state.options.compression;
+    CompressionOptions compression;
+    apply_compression_level(compression, level);
+    compression.thread_count = previous.thread_count;
+    compression.io_buffer_size = previous.io_buffer_size;
+    compression.swarm_parse = level == 7 ? false : previous.swarm_parse;
+    compression.force_parallel_blocks = previous.force_parallel_blocks;
+    compression.skip_unreadable_files = previous.skip_unreadable_files;
+    compression.input_open_retries = previous.input_open_retries;
+    compression.enable_file_filters = previous.enable_file_filters;
+    state.options.compression = std::move(compression);
+    state.options.sample_budget = level >= 8 ? 24u << 20
+        : level >= 6 ? 48u << 20 : 64u << 20;
+    state.compression_level = level;
+    {
+        std::lock_guard lock(state.result_mutex);
+        state.snapshot.reset();
+        state.result.reset();
+        state.error.clear();
+    }
+    state.cancelled.store(false, std::memory_order_release);
+    SetWindowTextW(state.estimate_button, L"Estimate");
+    invalidate_dialog_band(state, 324, 540);
 }
 
 LRESULT CALLBACK estimate_dialog_proc(HWND hwnd, UINT message,
@@ -761,6 +816,21 @@ LRESULT CALLBACK estimate_dialog_proc(HWND hwnd, UINT message,
     switch (message) {
         case WM_CREATE:
             state->font = create_dialog_font(state->dpi);
+            state->level_combo = CreateWindowExW(
+                0, L"COMBOBOX", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP |
+                    WS_VSCROLL | CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS,
+                0, 0, 0, 0, hwnd,
+                reinterpret_cast<HMENU>(static_cast<INT_PTR>(kCompressionLevel)),
+                state->instance, nullptr);
+            SendMessageW(state->level_combo, CB_SETITEMHEIGHT, 0, scale(*state, 24));
+            SendMessageW(state->level_combo, CB_SETITEMHEIGHT,
+                         static_cast<WPARAM>(-1), scale(*state, 24));
+            for (const wchar_t* level : kCompressionLevelNames) {
+                SendMessageW(state->level_combo, CB_ADDSTRING, 0,
+                             reinterpret_cast<LPARAM>(level));
+            }
+            SendMessageW(state->level_combo, CB_SETCURSEL,
+                         static_cast<WPARAM>(std::clamp(state->compression_level, 1, 9) - 1), 0);
             state->estimate_button = CreateWindowExW(
                 0, L"BUTTON", L"Estimate", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
                 0, 0, 0, 0, hwnd,
@@ -773,6 +843,11 @@ LRESULT CALLBACK estimate_dialog_proc(HWND hwnd, UINT message,
                 state->instance, nullptr);
             set_dialog_control_font(state->estimate_button, state->font);
             set_dialog_control_font(state->close_button, state->font);
+            set_dialog_control_font(state->level_combo, state->font);
+            state->tooltip = create_dialog_tooltip(hwnd);
+            add_dialog_tooltip(
+                state->tooltip, state->level_combo,
+                L"Select compression level 1 (fastest) through 9 (maximum ratio) for the next estimate.");
             SetWindowTextW(state->estimate_button, L"Scanning...");
             EnableWindow(state->estimate_button, FALSE);
             apply_theme(*state);
@@ -809,9 +884,19 @@ LRESULT CALLBACK estimate_dialog_proc(HWND hwnd, UINT message,
         case WM_ERASEBKGND:
             return 1;
         case WM_DRAWITEM:
-            draw_dialog_button(*reinterpret_cast<const DRAWITEMSTRUCT*>(lparam), state->dark);
+            if (const auto& draw = *reinterpret_cast<const DRAWITEMSTRUCT*>(lparam);
+                draw.CtlType == ODT_COMBOBOX) {
+                draw_dialog_combo_item(draw, state->dark);
+            } else {
+                draw_dialog_button(draw, state->dark);
+            }
             return TRUE;
         case WM_COMMAND:
+            if (LOWORD(wparam) == kCompressionLevel &&
+                HIWORD(wparam) == CBN_SELCHANGE) {
+                select_compression_level(*state);
+                return 0;
+            }
             if (LOWORD(wparam) == kEstimateButton) {
                 start_estimate(*state);
                 return 0;

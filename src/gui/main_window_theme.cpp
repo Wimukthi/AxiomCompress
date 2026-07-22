@@ -70,6 +70,7 @@ axiom::gui::set_dialog_appearance({
     options.accent_color_mode,
     options.custom_accent_color,
     options.toolbar_icon_style,
+    options.center_child_windows,
 });
 }
 

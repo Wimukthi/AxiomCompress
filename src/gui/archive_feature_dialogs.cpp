@@ -57,6 +57,7 @@ struct SimplePasswordDialogState {
     HWND show{};
     HWND ok{};
     HWND cancel{};
+    HWND tooltip{};
     HINSTANCE instance{};
     HFONT font{};
     HBRUSH background_brush{};
@@ -148,7 +149,7 @@ LRESULT CALLBACK simple_password_dialog_proc(HWND hwnd, UINT message,
             state->control_brush = CreateSolidBrush(colors.control_background);
             state->font = create_dialog_font(state->dpi);
             state->label = CreateWindowExW(
-                0, L"STATIC", L"Password",
+                0, L"STATIC", L"Password (text)",
                 WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | SS_NOPREFIX,
                 0, 0, 0, 0, hwnd, nullptr, state->instance, nullptr);
             state->edit = CreateWindowExW(
@@ -158,6 +159,7 @@ LRESULT CALLBACK simple_password_dialog_proc(HWND hwnd, UINT message,
                 0, 0, 0, 0, hwnd,
                 reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSimplePasswordEdit)),
                 state->instance, nullptr);
+            SendMessageW(state->edit, EM_SETLIMITTEXT, 1024, 0);
             state->show = CreateWindowExW(
                 0, L"BUTTON", L"Show password",
                 WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | WS_TABSTOP |
@@ -178,6 +180,12 @@ LRESULT CALLBACK simple_password_dialog_proc(HWND hwnd, UINT message,
             for (HWND control : simple_password_controls(state)) {
                 set_dialog_control_font(control, state->font);
             }
+            state->tooltip = create_dialog_tooltip(hwnd);
+            add_dialog_tooltip(
+                state->tooltip, state->edit,
+                L"Unicode password text used to decrypt this archive. It is not stored in GUI settings.");
+            add_dialog_tooltip(state->tooltip, state->show,
+                               L"Temporarily reveal or conceal the password text.");
             apply_simple_password_theme(state);
             set_password_visible(state->edit, false);
             layout_simple_password_dialog(state);
@@ -220,7 +228,16 @@ LRESULT CALLBACK simple_password_dialog_proc(HWND hwnd, UINT message,
                 return 0;
             }
             if (LOWORD(wparam) == IDOK) {
-                state->password = control_text(state->edit);
+                const std::wstring password = control_text(state->edit);
+                if (password.empty()) {
+                    show_message_dialog(hwnd, state->instance, state->dpi,
+                                        state->dark, L"Archive password",
+                                        L"Password text cannot be empty.",
+                                        MessageDialogIcon::warning);
+                    SetFocus(state->edit);
+                    return 0;
+                }
+                state->password = password;
                 state->accepted = true;
                 SetWindowTextW(state->edit, L"");
                 save_named_window_placement(L"ArchivePasswordPrompt", hwnd);
@@ -295,6 +312,7 @@ struct SimpleCommentDialogState {
     HWND edit{};
     HWND ok{};
     HWND cancel{};
+    HWND tooltip{};
     HINSTANCE instance{};
     HFONT font{};
     HBRUSH background_brush{};
@@ -373,7 +391,7 @@ LRESULT CALLBACK simple_comment_dialog_proc(HWND hwnd, UINT message,
             state->control_brush = CreateSolidBrush(colors.control_background);
             state->font = create_dialog_font(state->dpi);
             state->label = CreateWindowExW(
-                0, L"STATIC", L"Archive comment",
+                0, L"STATIC", L"Archive comment (Unicode text)",
                 WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | SS_NOPREFIX,
                 0, 0, 0, 0, hwnd, nullptr, state->instance, nullptr);
             state->edit = CreateWindowExW(
@@ -383,6 +401,7 @@ LRESULT CALLBACK simple_comment_dialog_proc(HWND hwnd, UINT message,
                 0, 0, 0, 0, hwnd,
                 reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSimpleCommentEdit)),
                 state->instance, nullptr);
+            SendMessageW(state->edit, EM_SETLIMITTEXT, 65535, 0);
             state->ok = CreateWindowExW(
                 0, L"BUTTON", L"OK",
                 WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | WS_TABSTOP | BS_OWNERDRAW,
@@ -396,6 +415,9 @@ LRESULT CALLBACK simple_comment_dialog_proc(HWND hwnd, UINT message,
             for (HWND control : simple_comment_controls(state)) {
                 set_dialog_control_font(control, state->font);
             }
+            state->tooltip = create_dialog_tooltip(hwnd);
+            add_dialog_tooltip(state->tooltip, state->edit,
+                               L"Unicode text stored in the archive comment field.");
             apply_simple_comment_theme(state);
             layout_simple_comment_dialog(state);
             SendMessageW(hwnd, DM_SETDEFID, IDOK, 0);

@@ -1,6 +1,7 @@
 #define NOMINMAX
 #include "gui/sfx_dialog.hpp"
 
+#include "core/cpu.hpp"
 #include "gui/dialog_support.hpp"
 #include "gui/message_dialog.hpp"
 
@@ -178,6 +179,7 @@ private:
 
     void create_controls() {
         font_ = create_dialog_font(dpi_);
+        tooltip_ = create_dialog_tooltip(window_);
         heading_ = create_label((L"Extract " + summary_.archive_name).c_str());
 
         const std::wstring item_summary =
@@ -195,10 +197,11 @@ private:
         security += L"  |  File integrity is verified while extracting";
         security_label_ = create_label(security.c_str());
 
-        destination_label_ = create_label(L"Extract to");
+        destination_label_ = create_label(L"Destination folder path");
         destination_edit_ = create_control(L"EDIT", options_.destination.c_str(),
                                            WS_TABSTOP | ES_AUTOHSCROLL, kDestinationEdit);
         SendMessageW(destination_edit_, EM_SETSEL, 0, 0);
+        SendMessageW(destination_edit_, EM_SETLIMITTEXT, 32767, 0);
         browse_button_ = create_control(L"BUTTON", L"Browse...",
                                         WS_TABSTOP | BS_OWNERDRAW, kBrowseButton);
 
@@ -222,7 +225,8 @@ private:
             kThreadsCombo);
         SendMessageW(threads_combo_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Automatic"));
         thread_values_.push_back(0);
-        const unsigned hardware = std::max(1u, std::thread::hardware_concurrency());
+        const auto hardware = static_cast<unsigned>(
+            axiom::core::logical_processor_count());
         for (unsigned value = 1; value <= hardware; value *= 2) {
             const std::wstring label = std::to_wstring(value);
             SendMessageW(threads_combo_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(label.c_str()));
@@ -255,7 +259,19 @@ private:
         extract_button_ = create_control(L"BUTTON", L"Extract",
                                          WS_TABSTOP | BS_OWNERDRAW, IDOK);
         cancel_button_ = create_control(L"BUTTON", L"Cancel",
-                                        WS_TABSTOP | BS_OWNERDRAW, IDCANCEL);
+                                         WS_TABSTOP | BS_OWNERDRAW, IDCANCEL);
+        add_dialog_tooltip(tooltip_, destination_edit_,
+                           L"Windows folder path that will receive the extracted files.");
+        add_dialog_tooltip(tooltip_, browse_button_,
+                           L"Choose an existing destination folder.");
+        add_dialog_tooltip(tooltip_, overwrite_combo_,
+                           L"Choose how extraction handles files that already exist at the destination.");
+        add_dialog_tooltip(tooltip_, threads_combo_,
+                           L"Select an unsigned CPU thread count, or Automatic to use Axiom's default.");
+        add_dialog_tooltip(tooltip_, restore_checkbox_,
+                           L"Restore each extracted file's stored last-modified timestamp.");
+        add_dialog_tooltip(tooltip_, open_checkbox_,
+                           L"Open the destination folder in Axiom after extraction succeeds.");
         SendMessageW(window_, DM_SETDEFID, IDOK, 0);
     }
 
@@ -462,6 +478,7 @@ private:
     HFONT font_{};
     HBRUSH background_brush_{};
     HBRUSH control_brush_{};
+    HWND tooltip_{};
     std::vector<HWND> controls_;
     std::vector<std::size_t> thread_values_;
     HWND heading_{};

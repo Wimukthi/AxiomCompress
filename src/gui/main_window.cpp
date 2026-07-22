@@ -144,7 +144,7 @@ void MainWindow::apply_edit_margins() const {
 void MainWindow::add_tooltip(HWND control, const wchar_t* text) const {
     if (tooltip_ == nullptr || control == nullptr) return;
     TOOLINFOW tool{};
-    tool.cbSize = sizeof(tool);
+    tool.cbSize = TTTOOLINFOW_V1_SIZE;
     tool.uFlags = TTF_IDISHWND | TTF_SUBCLASS;
     tool.hwnd = hwnd_;
     tool.uId = reinterpret_cast<UINT_PTR>(control);
@@ -341,6 +341,7 @@ void MainWindow::on_create() {
         WS_TABSTOP | WS_VSCROLL | CBS_DROPDOWN | CBS_AUTOHSCROLL |
             CBS_OWNERDRAWFIXED | CBS_HASSTRINGS,
         kAddressEdit);
+    SendMessageW(address_edit_, CB_LIMITTEXT, 32767, 0);
     set_text(address_edit_, L"This PC");
     address_go_ = make_control(L"BUTTON", L"Go", WS_TABSTOP | BS_OWNERDRAW, kAddressGo);
 
@@ -366,6 +367,14 @@ void MainWindow::on_create() {
     add_tooltip(navigate_forward_, L"Forward");
     add_tooltip(navigate_up_, L"Up one level");
     add_tooltip(navigate_refresh_, L"Refresh");
+    add_tooltip(address_edit_,
+                L"Folder/archive path text or a named shell location such as This PC. Press Enter or Go to navigate.");
+    COMBOBOXINFO address_info{sizeof(address_info)};
+    if (GetComboBoxInfo(address_edit_, &address_info)) {
+        add_tooltip(address_info.hwndItem,
+                    L"Folder/archive path text or a named shell location such as This PC. Press Enter or Go to navigate.");
+    }
+    add_tooltip(address_go_, L"Navigate to the folder, archive, or shell location in the path field.");
 
     table_.create(hwnd_, instance_, kList);
     list_ = table_.hwnd();
@@ -671,6 +680,9 @@ axiom::CompressionOptions MainWindow::compression_options() const {
         options.block_size = selected_solid_block_size_;
         options.auto_block_size_for_threads = false;
     }
+    // The dialog disables swarm only for level 7; forwarding the persisted flag
+    // is still safe because that lazy-tree path deliberately ignores it.
+    options.swarm_parse = selected_thread_model_ == 1;
     if (application_options_.memory_limit_mode == 1) {
         if (const auto limit = parse_size_setting(application_options_.memory_limit)) {
             const std::size_t capped = static_cast<std::size_t>(std::min<std::uint64_t>(

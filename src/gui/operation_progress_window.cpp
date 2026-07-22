@@ -263,7 +263,9 @@ void OperationProgressWindow::layout() {
     place(TelemetryField::eta, x0, 224, column_width);
     place(TelemetryField::elapsed, x1, 224, column_width);
     place(TelemetryField::checkpoint_age, x2, 224, column_width);
-    place(TelemetryField::activity, margin, 250, content_width);
+    place(TelemetryField::compressed_size, x0, 250, column_width);
+    place(TelemetryField::compression_ratio, x1, 250, column_width);
+    place(TelemetryField::activity, x2, 250, column_width);
 
     MoveWindow(cancel_button_, client.right - margin - button_width,
                bottom - button_height, button_width, button_height, TRUE);
@@ -364,6 +366,19 @@ void OperationProgressWindow::update_telemetry_fields() {
     set_field_text(TelemetryField::speed,
                    L"Speed: " + format_size(static_cast<std::uint64_t>(
                        std::max(0.0, current_rate_))) + L"/s");
+    set_field_text(TelemetryField::compressed_size,
+                   L"Compressed size: " + format_size(
+                       has_progress_ ? progress_.compressed_bytes : 0));
+    std::wstringstream ratio;
+    ratio.setf(std::ios::fixed);
+    ratio.precision(2);
+    ratio << (has_progress_ && progress_.compressed_bytes != 0
+                  ? static_cast<double>(progress_.compressed_source_bytes) /
+                        static_cast<double>(progress_.compressed_bytes)
+                  : 0.0)
+          << L'x';
+    set_field_text(TelemetryField::compression_ratio,
+                   L"Compression ratio: " + ratio.str());
 
     const auto [file_completed, file_total_bytes] = displayed_file_progress();
     const bool file_total = file_total_bytes > 0;

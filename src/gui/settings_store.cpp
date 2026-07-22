@@ -2,8 +2,12 @@
 
 #include <algorithm>
 #include <array>
+#include <cerrno>
 #include <cwchar>
+#include <limits>
+#include <optional>
 #include <sstream>
+#include <string_view>
 #include <vector>
 
 namespace axiom::gui {
@@ -119,6 +123,97 @@ std::wstring join_int_list(const std::vector<int>& values) {
     return out.str();
 }
 
+std::optional<std::uint64_t> parse_unsigned_profile_field(std::wstring_view text) {
+    if (text.empty() || std::any_of(text.begin(), text.end(), [](wchar_t character) {
+            return character < L'0' || character > L'9';
+        })) {
+        return std::nullopt;
+    }
+    std::wstring value(text);
+    wchar_t* end = nullptr;
+    errno = 0;
+    const unsigned long long parsed = std::wcstoull(value.c_str(), &end, 10);
+    if (errno == ERANGE || end == value.c_str() || *end != L'\0') {
+        return std::nullopt;
+    }
+    return static_cast<std::uint64_t>(parsed);
+}
+
+std::vector<std::wstring_view> split_profile_fields(const std::wstring& value) {
+    std::vector<std::wstring_view> fields;
+    std::size_t start = 0;
+    while (start <= value.size()) {
+        const std::size_t separator = value.find(L'\t', start);
+        fields.emplace_back(value.data() + start,
+                            (separator == std::wstring::npos ? value.size() : separator) - start);
+        if (separator == std::wstring::npos) break;
+        start = separator + 1;
+    }
+    return fields;
+}
+
+std::vector<CompressionProfile> read_compression_profiles(HKEY key) {
+    std::vector<CompressionProfile> profiles;
+    for (const std::wstring& encoded : read_string_list(key, L"CompressionProfiles")) {
+        if (profiles.size() >= 32) break;
+        const auto fields = split_profile_fields(encoded);
+        if (fields.size() != 7 || fields[0].empty() || fields[0].size() > 64 ||
+            std::any_of(fields[0].begin(), fields[0].end(), [](wchar_t character) {
+                return character < L' ' || character == L'\t';
+            })) {
+            continue;
+        }
+        const auto level = parse_unsigned_profile_field(fields[1]);
+        const auto threads = parse_unsigned_profile_field(fields[2]);
+        const auto dictionary = parse_unsigned_profile_field(fields[3]);
+        const auto word = parse_unsigned_profile_field(fields[4]);
+        const auto solid = parse_unsigned_profile_field(fields[5]);
+        const auto thread_model = parse_unsigned_profile_field(fields[6]);
+        if (!level || !threads || !dictionary || !word || !solid || !thread_model ||
+            *level < 1 || *level > 9 || *thread_model > 1 ||
+            *threads > std::numeric_limits<std::size_t>::max() ||
+            *dictionary > std::numeric_limits<std::size_t>::max() ||
+            *word > std::numeric_limits<std::size_t>::max() ||
+            *solid > std::numeric_limits<std::size_t>::max()) {
+            continue;
+        }
+        const bool duplicate = std::any_of(
+            profiles.begin(), profiles.end(), [&](const CompressionProfile& profile) {
+                return _wcsicmp(profile.name.c_str(), std::wstring(fields[0]).c_str()) == 0;
+            });
+        if (duplicate) continue;
+        profiles.push_back({
+            std::wstring(fields[0]), static_cast<int>(*level),
+            static_cast<std::size_t>(*threads), static_cast<std::size_t>(*dictionary),
+            static_cast<std::size_t>(*word), static_cast<std::size_t>(*solid),
+            static_cast<int>(*thread_model),
+        });
+    }
+    return profiles;
+}
+
+void write_compression_profiles(HKEY key,
+                                const std::vector<CompressionProfile>& profiles) {
+    std::vector<std::wstring> encoded;
+    encoded.reserve((std::min)(profiles.size(), std::size_t{32}));
+    for (const CompressionProfile& profile : profiles) {
+        if (encoded.size() >= 32 || profile.name.empty() || profile.name.size() > 64 ||
+            profile.name.find(L'\t') != std::wstring::npos ||
+            profile.name.find(L'\r') != std::wstring::npos ||
+            profile.name.find(L'\n') != std::wstring::npos) {
+            continue;
+        }
+        encoded.push_back(
+            profile.name + L'\t' + std::to_wstring(std::clamp(profile.level, 1, 9)) +
+            L'\t' + std::to_wstring(profile.thread_count) +
+            L'\t' + std::to_wstring(profile.dictionary_size) +
+            L'\t' + std::to_wstring(profile.word_size) +
+            L'\t' + std::to_wstring(profile.solid_block_size) +
+            L'\t' + std::to_wstring(std::clamp(profile.thread_model, 0, 1)));
+    }
+    write_string_list(key, L"CompressionProfiles", encoded);
+}
+
 }  // namespace
 
 PersistedGuiSettings load_gui_settings() {
@@ -133,6 +228,7 @@ PersistedGuiSettings load_gui_settings() {
     settings.application.default_dictionary_size = read_dword(key, L"DictionarySize", 0);
     settings.application.default_word_size = read_dword(key, L"WordSize", 0);
     settings.application.default_solid_block_size = read_dword(key, L"SolidBlockSize", 0);
+    settings.application.default_thread_model = read_clamped_int(key, L"ThreadModel", 0, 0, 1);
     settings.application.default_update_mode = read_clamped_int(key, L"UpdateMode", 0, 0, 4);
     settings.application.default_volume_size = read_string(key, L"VolumeSize");
     settings.application.default_volume_unit = read_clamped_int(key, L"VolumeUnit", 2, 0, 3);
@@ -147,6 +243,8 @@ PersistedGuiSettings load_gui_settings() {
     settings.application.show_hidden = read_bool(key, L"ShowHidden", true);
     settings.application.restore_window_placement =
         read_bool(key, L"RestoreWindowPlacement", true);
+    settings.application.center_child_windows =
+        read_bool(key, L"CenterChildWindows", true);
     settings.application.theme_mode = read_clamped_int(key, L"ThemeMode", 0, 0, 2);
     settings.application.accent_color_mode =
         read_clamped_int(key, L"AccentColorMode", 0, 0, 6);
@@ -216,6 +314,7 @@ PersistedGuiSettings load_gui_settings() {
     settings.application.memory_limit_mode =
         read_clamped_int(key, L"MemoryLimitMode", 0, 0, 1);
     settings.application.memory_limit = read_string(key, L"MemoryLimit");
+    settings.application.compression_profiles = read_compression_profiles(key);
     if (registry_value_exists(key, L"ToolbarCommands")) {
         settings.application.toolbar_commands =
             normalize_toolbar_commands(read_string_list(key, L"ToolbarCommands"));
@@ -267,6 +366,8 @@ void save_gui_settings(const PersistedGuiSettings& settings) {
         settings.application.default_word_size, MAXDWORD)));
     write_dword(key, L"SolidBlockSize", static_cast<DWORD>(std::min<std::size_t>(
         settings.application.default_solid_block_size, MAXDWORD)));
+    write_dword(key, L"ThreadModel",
+                static_cast<DWORD>(std::clamp(settings.application.default_thread_model, 0, 1)));
     write_dword(key, L"UpdateMode",
                 static_cast<DWORD>(std::clamp(settings.application.default_update_mode, 0, 4)));
     write_string(key, L"VolumeSize", settings.application.default_volume_size);
@@ -285,6 +386,8 @@ void save_gui_settings(const PersistedGuiSettings& settings) {
     write_dword(key, L"ShowHidden", settings.application.show_hidden ? 1 : 0);
     write_dword(key, L"RestoreWindowPlacement",
                 settings.application.restore_window_placement ? 1 : 0);
+    write_dword(key, L"CenterChildWindows",
+                settings.application.center_child_windows ? 1 : 0);
     write_dword(key, L"ThemeMode",
                 static_cast<DWORD>(std::clamp(settings.application.theme_mode, 0, 2)));
     write_dword(key, L"AccentColorMode",
@@ -363,6 +466,7 @@ void save_gui_settings(const PersistedGuiSettings& settings) {
     write_dword(key, L"MemoryLimitMode",
                 static_cast<DWORD>(std::clamp(settings.application.memory_limit_mode, 0, 1)));
     write_string(key, L"MemoryLimit", settings.application.memory_limit);
+    write_compression_profiles(key, settings.application.compression_profiles);
     write_string_list(key, L"ToolbarCommands",
                       normalize_toolbar_commands(settings.application.toolbar_commands));
     write_string_list(key, L"ShortcutOverrides",

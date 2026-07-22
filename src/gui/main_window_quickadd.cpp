@@ -27,6 +27,8 @@ public:
         dialog_options.dictionary_size = application_options_.default_dictionary_size;
         dialog_options.word_size = application_options_.default_word_size;
         dialog_options.solid_block_size = application_options_.default_solid_block_size;
+        dialog_options.thread_model = application_options_.default_thread_model;
+        dialog_options.compression_profiles = application_options_.compression_profiles;
         dialog_options.feature_availability = implemented_feature_availability();
         dialog_options.features.update_mode = static_cast<axiom::gui::ArchiveUpdateMode>(
             std::clamp(application_options_.default_update_mode, 0, 4));
@@ -43,8 +45,14 @@ public:
         dialog_options.archive_path = default_archive_path();
         dialog_options.archive_format = axiom::ArchiveFormat::axar;
 
-        if (!axiom::gui::show_create_archive_dialog(
-                hwnd_, inputs_.size(), dialog_options)) {
+        const bool accepted = axiom::gui::show_create_archive_dialog(
+            hwnd_, inputs_.size(), dialog_options);
+        if (dialog_options.compression_profiles_changed) {
+            application_options_.compression_profiles = dialog_options.compression_profiles;
+            persisted_settings_.application = application_options_;
+            axiom::gui::save_gui_settings(persisted_settings_);
+        }
+        if (!accepted) {
             DestroyWindow(hwnd_);
             return 0;
         }

@@ -1169,6 +1169,30 @@ void MainWindow::on_browser_loaded(LPARAM lparam) {
     std::optional<BrowserViewState> tree_restore_state = restore_state;
     begin_browser_table_population(std::move(restore_state), false);
     displayed_browser_location_ = loaded_location;
+    if (pending_find_location_ && *pending_find_location_ == loaded_location) {
+        int found_index = -1;
+        for (int index = 0; index < static_cast<int>(browser_items_.size()); ++index) {
+            const auto& item = browser_items_[static_cast<std::size_t>(index)];
+            if (!pending_find_filesystem_path_.empty() &&
+                same_filesystem_path(item.filesystem_path,
+                                     pending_find_filesystem_path_)) {
+                found_index = index;
+                break;
+            }
+            if (!pending_find_archive_entry_path_.empty() &&
+                item.archive_path == pending_find_archive_entry_path_) {
+                found_index = index;
+                break;
+            }
+        }
+        if (found_index >= 0) {
+            table_.select_index(found_index);
+            SetFocus(list_);
+        }
+        pending_find_location_.reset();
+        pending_find_filesystem_path_.clear();
+        pending_find_archive_entry_path_.clear();
+    }
     if (!result->snapshot.error.empty()) {
         set_status(L"Cannot read location: " + result->snapshot.error);
     } else {

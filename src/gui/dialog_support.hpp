@@ -23,6 +23,13 @@ struct DialogAppearance {
     int accent_color_mode = 0;  // 0 = Windows accent, 1 = Axiom amber, 2..5 presets, 6 = custom.
     COLORREF custom_accent_color = RGB(255, 185, 60);
     int icon_style = 0;  // 0 = theme-tinted, 1 = colorful, 2 = accent-colored.
+    bool center_child_windows = true;
+};
+
+enum class DialogInputFilter {
+    unsigned_integer,
+    byte_size,
+    hexadecimal_color,
 };
 
 int scale_for_dialog_dpi(int value, UINT dpi);
@@ -46,8 +53,13 @@ int dialog_icon_style();
 void apply_dialog_dark_frame(HWND window, bool dark);
 void apply_dialog_control_theme(HWND control, bool dark);
 void set_dialog_control_font(HWND control, HFONT font);
+HWND create_dialog_tooltip(HWND owner);
+void add_dialog_tooltip(HWND tooltip, HWND control, const wchar_t* text);
+void apply_dialog_input_filter(HWND control, DialogInputFilter filter,
+                               UINT maximum_characters = 0);
 void draw_dialog_button(const DRAWITEMSTRUCT& draw, bool dark);
 void draw_dialog_checkbox(const DRAWITEMSTRUCT& draw, bool dark, bool checked);
+void draw_dialog_radio_button(const DRAWITEMSTRUCT& draw, bool dark, bool checked);
 void draw_dialog_combo_item(const DRAWITEMSTRUCT& draw, bool dark);
 bool disable_dialog_owner(HWND owner, HWND dialog);
 void restore_dialog_owner(HWND owner, bool was_enabled);

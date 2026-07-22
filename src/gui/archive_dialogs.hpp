@@ -96,6 +96,18 @@ inline std::vector<std::wstring> normalize_toolbar_commands(
     return result;
 }
 
+struct CompressionProfile {
+    std::wstring name;
+    int level = 5;
+    std::size_t thread_count = 0;
+    std::size_t dictionary_size = 0;
+    std::size_t word_size = 0;
+    std::size_t solid_block_size = 0;
+    int thread_model = 0;
+
+    bool operator==(const CompressionProfile&) const = default;
+};
+
 struct CreateArchiveDialogOptions {
     std::filesystem::path archive_path;
     axiom::ArchiveFormat archive_format = axiom::ArchiveFormat::axar;
@@ -106,6 +118,12 @@ struct CreateArchiveDialogOptions {
     std::size_t dictionary_size = 0;
     std::size_t word_size = 0;
     std::size_t solid_block_size = 0;
+    // Threading model for the parse stage: 0 = split blocks (independent blocks,
+    // one per worker), 1 = swarm (workers cooperate inside each block). Swarm
+    // affects levels 1-6 and 8-9; level 7 keeps its serial lazy-tree parser.
+    int thread_model = 0;
+    std::vector<CompressionProfile> compression_profiles;
+    bool compression_profiles_changed = false;
     ArchiveFeatureOptions features;
     ArchiveFeatureAvailability feature_availability;
 };
@@ -125,6 +143,7 @@ struct ApplicationDialogOptions {
     std::size_t default_dictionary_size = 0;
     std::size_t default_word_size = 0;
     std::size_t default_solid_block_size = 0;
+    int default_thread_model = 0;  // 0 = split blocks, 1 = swarm.
     int default_update_mode = 0;
     std::wstring default_volume_size;
     int default_volume_unit = 2;
@@ -137,6 +156,7 @@ struct ApplicationDialogOptions {
     bool confirm_overwrite = true;
     bool show_hidden = true;
     bool restore_window_placement = true;
+    bool center_child_windows = true;
     int theme_mode = 0;  // 0 = system, 1 = dark, 2 = light.
     int accent_color_mode = 0;  // 0 = Windows accent, 1 = Axiom amber, 2..5 presets, 6 = custom.
     COLORREF custom_accent_color = RGB(255, 185, 60);
@@ -189,6 +209,7 @@ struct ApplicationDialogOptions {
     std::wstring io_buffer_size;
     int memory_limit_mode = 0;  // 0 = automatic, 1 = custom.
     std::wstring memory_limit;
+    std::vector<CompressionProfile> compression_profiles;
     std::vector<std::wstring> toolbar_commands = default_toolbar_commands();
     std::vector<CommandShortcutSetting> shortcut_overrides;
 

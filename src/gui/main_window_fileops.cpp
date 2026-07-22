@@ -22,6 +22,10 @@ struct CommandInputField {
     std::wstring label;
     std::wstring value;
     DWORD style = ES_AUTOHSCROLL;
+    std::optional<DialogInputFilter> filter;
+    unsigned maximum = 0;
+    std::wstring tooltip;
+    std::wstring validation_message;
 };
 
 struct CommandInputDialogState {
@@ -32,6 +36,7 @@ struct CommandInputDialogState {
     std::vector<HWND> edits;
     HWND ok{};
     HWND cancel{};
+    HWND tooltip{};
     HINSTANCE instance{};
     HFONT font{};
     HBRUSH background_brush{};
@@ -44,6 +49,8 @@ struct CommandInputDialogState {
     std::wstring placement_name;
     std::vector<CommandInputField>* fields{};
 };
+
+std::optional<unsigned> parse_unsigned_field(std::wstring text, unsigned maximum);
 
 std::wstring control_text_local(HWND window) {
     const int length = GetWindowTextLengthW(window);
@@ -72,7 +79,7 @@ void layout_command_input_dialog(CommandInputDialogState* state) {
     RECT client{};
     GetClientRect(state->window, &client);
     const int margin = scale_for_dialog_dpi(20, state->dpi);
-    const int label_width = scale_for_dialog_dpi(170, state->dpi);
+    const int label_width = scale_for_dialog_dpi(240, state->dpi);
     const int row_height = scale_for_dialog_dpi(30, state->dpi);
     const int row_gap = scale_for_dialog_dpi(12, state->dpi);
     const int button_width = scale_for_dialog_dpi(88, state->dpi);
@@ -136,6 +143,7 @@ LRESULT CALLBACK command_input_dialog_proc(HWND hwnd, UINT message,
             state->background_brush = CreateSolidBrush(colors.background);
             state->control_brush = CreateSolidBrush(colors.control_background);
             state->font = create_dialog_font(state->dpi);
+            state->tooltip = create_dialog_tooltip(hwnd);
             state->heading = CreateWindowExW(
                 0, L"STATIC", state->heading_text.c_str(),
                 WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | SS_NOPREFIX,
@@ -159,7 +167,14 @@ LRESULT CALLBACK command_input_dialog_proc(HWND hwnd, UINT message,
                 SendMessageW(state->edits[index], EM_SETMARGINS,
                              EC_LEFTMARGIN | EC_RIGHTMARGIN,
                              MAKELPARAM(scale_for_dialog_dpi(8, state->dpi),
-                                        scale_for_dialog_dpi(8, state->dpi)));
+                                         scale_for_dialog_dpi(8, state->dpi)));
+                if (field.filter) {
+                    apply_dialog_input_filter(state->edits[index], *field.filter,
+                                              *field.filter == DialogInputFilter::unsigned_integer
+                                                  ? 20 : 24);
+                }
+                add_dialog_tooltip(state->tooltip, state->edits[index],
+                                   field.tooltip.c_str());
             }
             state->ok = CreateWindowExW(
                 0, L"BUTTON", L"OK",
@@ -211,7 +226,28 @@ LRESULT CALLBACK command_input_dialog_proc(HWND hwnd, UINT message,
             if (LOWORD(wparam) == IDOK) {
                 if (state->fields != nullptr) {
                     for (std::size_t index = 0; index < state->fields->size(); ++index) {
-                        (*state->fields)[index].value = control_text_local(state->edits[index]);
+                        auto& field = (*state->fields)[index];
+                        const std::wstring value = control_text_local(state->edits[index]);
+                        bool valid = true;
+                        if (field.filter == DialogInputFilter::unsigned_integer) {
+                            valid = parse_unsigned_field(value, field.maximum).has_value();
+                        } else if (field.filter == DialogInputFilter::byte_size) {
+                            const auto size = parse_size_setting(value);
+                            valid = size.has_value() && *size != 0;
+                        }
+                        if (!valid) {
+                            show_message_dialog(
+                                hwnd, state->instance, state->dpi, state->dark,
+                                state->title,
+                                field.validation_message.empty()
+                                    ? L"Enter a valid value for this field."
+                                    : field.validation_message,
+                                MessageDialogIcon::warning);
+                            SetFocus(state->edits[index]);
+                            SendMessageW(state->edits[index], EM_SETSEL, 0, -1);
+                            return 0;
+                        }
+                        field.value = value;
                     }
                 }
                 state->accepted = true;
@@ -1440,6 +1476,10 @@ void MainWindow::create_archive_from_paths(
     dialog_options.solid_block_size = selected_solid_block_size_ != 0
         ? selected_solid_block_size_
         : application_options_.default_solid_block_size;
+    dialog_options.thread_model = selected_thread_model_ != 0
+        ? selected_thread_model_
+        : application_options_.default_thread_model;
+    dialog_options.compression_profiles = application_options_.compression_profiles;
     dialog_options.feature_availability = implemented_feature_availability();
     dialog_options.features.update_mode =
         update_mode == axiom::gui::ArchiveUpdateMode::create_new
@@ -1524,7 +1564,13 @@ void MainWindow::create_archive_from_paths(
             }
         }
     }
-    if (!axiom::gui::show_create_archive_dialog(hwnd_, paths.size(), dialog_options)) return;
+    const bool accepted = axiom::gui::show_create_archive_dialog(
+        hwnd_, paths.size(), dialog_options);
+    if (dialog_options.compression_profiles_changed) {
+        application_options_.compression_profiles = dialog_options.compression_profiles;
+        save_current_settings();
+    }
+    if (!accepted) return;
 
     inputs_ = std::move(paths);
     selected_level_ = dialog_options.level;
@@ -1532,6 +1578,7 @@ void MainWindow::create_archive_from_paths(
     selected_dictionary_size_ = dialog_options.dictionary_size;
     selected_word_size_ = dialog_options.word_size;
     selected_solid_block_size_ = dialog_options.solid_block_size;
+    selected_thread_model_ = dialog_options.thread_model;
     pending_archive_path_ = std::move(dialog_options.archive_path);
     pending_archive_format_ = dialog_options.archive_format;
     if (pending_archive_path_.has_parent_path()) {
@@ -1840,7 +1887,13 @@ void MainWindow::on_edit_recovery_record() {
                       L").\n\nEnter 1..100 to rebuild, or 0 to remove."
                 : L"This archive has no recovery record.\n\nEnter 1..100 to create one; 0 leaves it disabled.";
             std::vector<CommandInputField> fields{{
-                L"Recovery percent", info.present ? std::to_wstring(info.percent) : L"0"}};
+                L"Recovery percent (integer 0-100)",
+                info.present ? std::to_wstring(info.percent) : L"0",
+                ES_NUMBER | ES_AUTOHSCROLL,
+                DialogInputFilter::unsigned_integer,
+                100,
+                L"Unsigned integer percentage from 0 through 100.",
+                L"Recovery percent must be an integer from 0 through 100."}};
             if (!show_command_input_dialog(hwnd_, instance_, L"Recovery record",
                                            std::move(heading), fields,
                                            L"Dialog.RecoveryRecord")) return;
@@ -1908,10 +1961,20 @@ void MainWindow::on_split_archive() {
         : application_options_.default_volume_size +
               kUnitSuffixes[std::clamp(application_options_.default_volume_unit, 0, 3)];
     const bool zip = provider->info().format == axiom::ArchiveFormat::zip;
-    std::vector<CommandInputField> fields{{L"Volume size", std::move(default_volume)}};
+    std::vector<CommandInputField> fields{{
+        L"Volume size (byte size)", std::move(default_volume), ES_AUTOHSCROLL,
+        DialogInputFilter::byte_size, 0,
+        L"Positive byte size using B, KiB, MiB, GiB, or TiB; compact K, M, G, and T suffixes are also accepted.",
+        L"Volume size must be a positive byte size, for example 700 MiB or 4 GiB."}};
     if (!zip) {
-        fields.push_back({L"Recovery volumes",
-                          application_options_.default_recovery_volumes ? L"1" : L"0"});
+        fields.push_back({
+            L"Recovery volumes (integer 0-100000)",
+            application_options_.default_recovery_volumes ? L"1" : L"0",
+            ES_NUMBER | ES_AUTOHSCROLL,
+            DialogInputFilter::unsigned_integer,
+            100000,
+            L"Unsigned integer count from 0 through 100000.",
+            L"Recovery volume count must be an integer from 0 through 100000."});
     }
     if (!show_command_input_dialog(
             hwnd_, instance_, L"Split archive",
