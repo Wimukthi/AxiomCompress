@@ -9,16 +9,24 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-# Vendored BLAKE3 with the x86 SIMD backends (runtime-dispatched by cpuid).
+# Vendored BLAKE3. x86 SIMD backends are runtime-dispatched by CPUID; other
+# architectures use the portable implementation because this source snapshot
+# does not include BLAKE3's optional NEON translation unit.
 # Third-party C: keep our strict warnings off it.
 set(BLAKE3_SOURCES
     src/third_party/blake3/blake3.c
     src/third_party/blake3/blake3_dispatch.c
-    src/third_party/blake3/blake3_portable.c
-    src/third_party/blake3/blake3_sse2.c
-    src/third_party/blake3/blake3_sse41.c
-    src/third_party/blake3/blake3_avx2.c
-    src/third_party/blake3/blake3_avx512.c)
+    src/third_party/blake3/blake3_portable.c)
+
+set(AXIOM_X86 FALSE)
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|i[3-6]86)$")
+    set(AXIOM_X86 TRUE)
+    list(APPEND BLAKE3_SOURCES
+        src/third_party/blake3/blake3_sse2.c
+        src/third_party/blake3/blake3_sse41.c
+        src/third_party/blake3/blake3_avx2.c
+        src/third_party/blake3/blake3_avx512.c)
+endif()
 
 # Vendored Monocypher (XChaCha20-Poly1305 + Argon2id). Single C file; warnings off.
 set(MONOCYPHER_SOURCES
@@ -90,21 +98,29 @@ target_include_directories(axiom
 
 target_compile_features(axiom PUBLIC cxx_std_20)
 
+if(NOT AXIOM_X86)
+    target_compile_definitions(axiom PRIVATE
+        BLAKE3_NO_SSE2 BLAKE3_NO_SSE41 BLAKE3_NO_AVX2 BLAKE3_NO_AVX512
+        BLAKE3_USE_NEON=0)
+endif()
+
 if(MSVC)
     target_compile_options(axiom PRIVATE /W4 /permissive-)
     set_source_files_properties(${BLAKE3_SOURCES} ${MONOCYPHER_SOURCES} ${MINIZ_SOURCES} ${MINIZIP_NG_SOURCES} PROPERTIES COMPILE_OPTIONS /w)
-    set_source_files_properties(src/third_party/blake3/blake3_avx2.c PROPERTIES COMPILE_OPTIONS "/w;/arch:AVX2")
-    set_source_files_properties(src/third_party/blake3/blake3_avx512.c PROPERTIES COMPILE_OPTIONS "/w;/arch:AVX512")
+    if(AXIOM_X86)
+        set_source_files_properties(src/third_party/blake3/blake3_avx2.c PROPERTIES COMPILE_OPTIONS "/w;/arch:AVX2")
+        set_source_files_properties(src/third_party/blake3/blake3_avx512.c PROPERTIES COMPILE_OPTIONS "/w;/arch:AVX512")
+    endif()
 else()
     target_compile_options(axiom PRIVATE -Wall -Wextra -Wpedantic)
     set_source_files_properties(${BLAKE3_SOURCES} ${MONOCYPHER_SOURCES} ${MINIZ_SOURCES} ${MINIZIP_NG_SOURCES} PROPERTIES COMPILE_OPTIONS -w)
-    if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|i686")
+    if(AXIOM_X86)
         set_source_files_properties(src/core/checksum_clmul.cpp PROPERTIES COMPILE_OPTIONS "-msse4.1;-mpclmul")
+        set_source_files_properties(src/third_party/blake3/blake3_sse2.c PROPERTIES COMPILE_OPTIONS "-w;-msse2")
+        set_source_files_properties(src/third_party/blake3/blake3_sse41.c PROPERTIES COMPILE_OPTIONS "-w;-msse4.1")
+        set_source_files_properties(src/third_party/blake3/blake3_avx2.c PROPERTIES COMPILE_OPTIONS "-w;-mavx2")
+        set_source_files_properties(src/third_party/blake3/blake3_avx512.c PROPERTIES COMPILE_OPTIONS "-w;-mavx512f;-mavx512vl")
     endif()
-    set_source_files_properties(src/third_party/blake3/blake3_sse2.c PROPERTIES COMPILE_OPTIONS "-w;-msse2")
-    set_source_files_properties(src/third_party/blake3/blake3_sse41.c PROPERTIES COMPILE_OPTIONS "-w;-msse4.1")
-    set_source_files_properties(src/third_party/blake3/blake3_avx2.c PROPERTIES COMPILE_OPTIONS "-w;-mavx2")
-    set_source_files_properties(src/third_party/blake3/blake3_avx512.c PROPERTIES COMPILE_OPTIONS "-w;-mavx512f;-mavx512vl")
 endif()
 
 # Windows CSPRNG (BCryptGenRandom) used by core/crypto.
