@@ -31,6 +31,7 @@ theme.dark = preference == 1
     ? true
     : preference == 2 ? false : system_prefers_dark_mode();
 if (high_contrast_enabled()) {
+    theme.dark = false;
     theme.accent = GetSysColor(COLOR_HIGHLIGHT);
     theme.selection = GetSysColor(COLOR_HIGHLIGHT);
     theme.selection_text = GetSysColor(COLOR_HIGHLIGHTTEXT);
@@ -39,7 +40,7 @@ if (high_contrast_enabled()) {
 }
 theme.accent = axiom::gui::resolve_dialog_accent_color(accent_mode, custom_accent);
 if (theme.dark) {
-    theme.window = RGB(32, 32, 32);
+    theme.window = RGB(31, 31, 31);
     theme.panel = RGB(45, 45, 48);
     theme.edit = RGB(37, 37, 38);
     theme.text = RGB(241, 241, 241);
@@ -55,11 +56,21 @@ if (theme.dark) {
     theme.scrollbar_thumb = RGB(92, 92, 96);
     theme.scrollbar_thumb_pressed = RGB(122, 122, 126);
 } else {
+    theme.window = RGB(250, 250, 250);
+    theme.panel = RGB(246, 246, 246);
+    theme.edit = RGB(255, 255, 255);
+    theme.text = RGB(32, 32, 32);
+    theme.muted_text = RGB(96, 96, 96);
+    theme.border = RGB(204, 204, 204);
+    theme.button = RGB(255, 255, 255);
     theme.button_hot = blend_color(theme.button, theme.accent, 12);
     theme.button_pressed = blend_color(theme.button, theme.accent, 22);
     theme.selection = theme.accent;
     theme.selection_text = readable_selection_text(theme.selection);
     theme.focus = theme.accent;
+    theme.scrollbar_track = RGB(242, 242, 242);
+    theme.scrollbar_thumb = RGB(176, 176, 176);
+    theme.scrollbar_thumb_pressed = RGB(128, 128, 128);
 }
 return theme;
 }
@@ -259,13 +270,13 @@ void MainWindow::apply_theme() {
     }
     axiom::gui::apply_dialog_control_theme(address_edit_, theme_.dark);
     menu_bar_.set_theme({
-        theme_.dark ? RGB(31, 31, 31) : RGB(250, 250, 250),
+        theme_.dark ? RGB(31, 31, 31) : theme_.panel,
         theme_.button_hot,
         theme_.button_pressed,
         theme_.text,
         theme_.muted_text,
-        theme_.dark ? RGB(42, 42, 42) : RGB(210, 210, 210),
-        theme_.dark ? RGB(54, 54, 54) : RGB(210, 210, 210),
+        theme_.dark ? RGB(42, 42, 42) : theme_.border,
+        theme_.dark ? RGB(54, 54, 54) : theme_.border,
     });
     table_.set_theme(theme_);
     tree_view_.set_theme(theme_);

@@ -474,7 +474,21 @@ void draw_toolbar_icon(HDC dc,
                        int logical_size,
                        ToolbarIconStyle style) {
     const int size = scale_for_dpi(logical_size, dpi);
+    const COLORREF theme_text = color;
     color = color_for_icon(icon, color, style);
+    if (style == ToolbarIconStyle::colorful) {
+        const int theme_luminance = GetRValue(theme_text) * 299 +
+                                    GetGValue(theme_text) * 587 +
+                                    GetBValue(theme_text) * 114;
+        if (theme_luminance < 150000) {
+            // The colorful palette is intentionally bright on dark surfaces.
+            // Deepen it on light surfaces so thin antialiased strokes retain
+            // the same clarity and visual weight.
+            color = RGB(GetRValue(color) * 72 / 100,
+                        GetGValue(color) * 72 / 100,
+                        GetBValue(color) * 72 / 100);
+        }
+    }
     if (dc != nullptr && generated_icon(icon)) {
         draw_generated_toolbar_icon(dc, icon, bounds, color, dpi, logical_size);
         return;

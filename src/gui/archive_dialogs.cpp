@@ -370,16 +370,17 @@ bool use_dark_theme() {
 
 struct Palette {
     bool dark = false;
-    COLORREF window = GetSysColor(COLOR_WINDOW);
-    COLORREF edit = GetSysColor(COLOR_WINDOW);
-    COLORREF button = GetSysColor(COLOR_BTNFACE);
-    COLORREF hot = GetSysColor(COLOR_BTNHIGHLIGHT);
-    COLORREF pressed = GetSysColor(COLOR_BTNSHADOW);
-    COLORREF border = GetSysColor(COLOR_ACTIVEBORDER);
-    COLORREF text = GetSysColor(COLOR_WINDOWTEXT);
-    COLORREF muted = GetSysColor(COLOR_GRAYTEXT);
+    COLORREF window = RGB(250, 250, 250);
+    COLORREF edit = RGB(255, 255, 255);
+    COLORREF button = RGB(255, 255, 255);
+    COLORREF hot = RGB(244, 244, 244);
+    COLORREF pressed = RGB(235, 235, 235);
+    COLORREF border = RGB(204, 204, 204);
+    COLORREF text = RGB(32, 32, 32);
+    COLORREF muted = RGB(96, 96, 96);
     COLORREF focus = GetSysColor(COLOR_HIGHLIGHT);
     COLORREF accent = GetSysColor(COLOR_HIGHLIGHT);
+    COLORREF selection_text = GetSysColor(COLOR_HIGHLIGHTTEXT);
 };
 
 struct PageControl {
@@ -401,18 +402,26 @@ Palette make_palette() {
     Palette result;
     result.dark = use_dark_theme();
     result.accent = dialog_accent_color();
-    if (result.dark) {
-        result.window = RGB(30, 30, 30);
-        result.edit = RGB(36, 36, 36);
-        result.button = RGB(45, 45, 48);
-        result.hot = RGB(58, 58, 61);
-        result.pressed = RGB(72, 72, 76);
-        result.border = RGB(63, 63, 67);
-        result.text = RGB(242, 242, 242);
-        result.muted = RGB(176, 176, 176);
-        result.focus = result.accent;
-    } else {
-        result.focus = result.accent;
+    const DialogColors shared = dialog_colors(result.dark);
+    result.window = shared.background;
+    result.edit = shared.control_background;
+    result.button = shared.control_background;
+    result.hot = blend_color(result.button, shared.focus_border,
+                             result.dark ? 10 : 8);
+    result.pressed = blend_color(result.button, shared.focus_border,
+                                 result.dark ? 18 : 16);
+    result.border = shared.border;
+    result.text = shared.text;
+    result.muted = shared.disabled_text;
+    result.focus = shared.focus_border;
+    result.selection_text = shared.selection_text;
+    if (high_contrast_enabled()) {
+        result.dark = false;
+        result.button = GetSysColor(COLOR_BTNFACE);
+        result.hot = GetSysColor(COLOR_HIGHLIGHT);
+        result.pressed = GetSysColor(COLOR_HIGHLIGHT);
+        result.accent = result.focus;
+        return result;
     }
     return result;
 }
@@ -739,6 +748,8 @@ LRESULT CALLBACK dark_tab_window_proc(HWND window, UINT message,
                 HBRUSH brush = CreateSolidBrush(fill);
                 FillRect(memory, &tab, brush);
                 DeleteObject(brush);
+                SetTextColor(memory, index == state->selected
+                    ? colors.selection_text : colors.text);
                 HBRUSH border = CreateSolidBrush(colors.border);
                 FrameRect(memory, &tab, border);
                 DeleteObject(border);
@@ -923,6 +934,8 @@ LRESULT CALLBACK settings_nav_window_proc(HWND window, UINT message,
                 HBRUSH brush = CreateSolidBrush(fill);
                 FillRect(memory, &item, brush);
                 DeleteObject(brush);
+                SetTextColor(memory, selected
+                    ? colors.selection_text : colors.text);
 
                 HBRUSH border = CreateSolidBrush(colors.border);
                 FrameRect(memory, &item, border);
@@ -2759,8 +2772,12 @@ private:
         set_dark_title(window_, palette_.dark);
         EnumChildWindows(window_, [](HWND child, LPARAM self_param) -> BOOL {
             auto* self = reinterpret_cast<OptionsDialog*>(self_param);
-            apply_dialog_control_theme(child, self->palette_.dark);
-            InvalidateRect(child, nullptr, FALSE);
+            // Owner-drawn hidden combo boxes can still send WM_DRAWITEM while
+            // their native theme is reset. Defer those pages until they are
+            // selected so they cannot paint onto the active page's surface.
+            if (IsWindowVisible(child)) {
+                apply_dialog_control_theme(child, self->palette_.dark);
+            }
             return TRUE;
         }, reinterpret_cast<LPARAM>(this));
         if (toolbar_list_.hwnd() != nullptr) {
@@ -2768,7 +2785,11 @@ private:
             rebuild_toolbar_settings_image_list();
             refresh_toolbar_settings_list();
         }
-        InvalidateRect(window_, nullptr, TRUE);
+        SetWindowPos(window_, nullptr, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER |
+                         SWP_NOACTIVATE | SWP_FRAMECHANGED);
+        RedrawWindow(window_, nullptr, nullptr,
+                     RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_UPDATENOW);
     }
 
     bool apply_settings_live(bool close_after) {
@@ -3223,13 +3244,24 @@ private:
     void select_settings_page(int page) {
         settings_page_ = std::clamp(page, 0, static_cast<int>(kSettingsTabNames.size()) - 1);
         for (const SettingControl& control : settings_controls_) {
-            ShowWindow(control.window,
-                       control.page == settings_page_ ? SW_SHOWNA : SW_HIDE);
+            if (control.page != settings_page_) {
+                ShowWindow(control.window, SW_HIDE);
+                continue;
+            }
+            // A page that was hidden during a live theme change still carries
+            // its previous native theme. Suppress its first paint until the
+            // new theme and restored edge styles are installed.
+            SendMessageW(control.window, WM_SETREDRAW, FALSE, 0);
+            ShowWindow(control.window, SW_SHOWNA);
+            apply_dialog_control_theme(control.window, palette_.dark);
+            SendMessageW(control.window, WM_SETREDRAW, TRUE, 0);
         }
         SendMessageW(settings_tabs_, kDarkTabSetSelection,
                      static_cast<WPARAM>(settings_page_), 0);
         sync_toolbar_status_combo();
-        InvalidateRect(window_, nullptr, TRUE);
+        RedrawWindow(window_, nullptr, nullptr,
+                     RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN |
+                         RDW_ERASENOW | RDW_UPDATENOW);
     }
 
     void set_password_visibility() {

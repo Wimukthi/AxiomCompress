@@ -57,13 +57,35 @@ Gdiplus::Color gdiplus_color(COLORREF color) {
     return Gdiplus::Color(255, GetRValue(color), GetGValue(color), GetBValue(color));
 }
 
-void draw_antialiased_checkmark(HDC dc, const RECT& box, UINT dpi, COLORREF color) {
-    if (!gdiplus_ready()) return;
-    Gdiplus::Graphics graphics(dc);
+void configure_antialiased_shape_drawing(Gdiplus::Graphics& graphics) {
+    graphics.SetCompositingMode(Gdiplus::CompositingModeSourceOver);
+    // Gamma-corrected coverage keeps saturated accents from looking washed out
+    // against the light theme while retaining smooth round edges.
+    graphics.SetCompositingQuality(Gdiplus::CompositingQualityGammaCorrected);
     graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
     graphics.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
+}
+
+void draw_antialiased_checkmark(HDC dc, const RECT& box, UINT dpi, COLORREF color) {
+    if (!gdiplus_ready()) {
+        HPEN pen = CreatePen(PS_SOLID, scale_for_dialog_dpi(2, dpi), color);
+        HGDIOBJ old_pen = SelectObject(dc, pen);
+        MoveToEx(dc, box.left + scale_for_dialog_dpi(3, dpi),
+                 box.top + scale_for_dialog_dpi(8, dpi), nullptr);
+        LineTo(dc, box.left + scale_for_dialog_dpi(7, dpi),
+               box.bottom - scale_for_dialog_dpi(3, dpi));
+        LineTo(dc, box.right - scale_for_dialog_dpi(3, dpi),
+               box.top + scale_for_dialog_dpi(3, dpi));
+        SelectObject(dc, old_pen);
+        DeleteObject(pen);
+        return;
+    }
+    Gdiplus::Graphics graphics(dc);
+    configure_antialiased_shape_drawing(graphics);
+    const Gdiplus::REAL scaled_width = static_cast<Gdiplus::REAL>(
+        scale_for_dialog_dpi(2, dpi));
     Gdiplus::Pen pen(gdiplus_color(color),
-                     static_cast<Gdiplus::REAL>(scale_for_dialog_dpi(2, dpi)));
+                     scaled_width < 1.75f ? 1.75f : scaled_width);
     pen.SetLineCap(Gdiplus::LineCapRound, Gdiplus::LineCapRound,
                    Gdiplus::DashCapRound);
     pen.SetLineJoin(Gdiplus::LineJoinRound);
@@ -83,15 +105,20 @@ void draw_selection_control_text(const DRAWITEMSTRUCT& draw, const RECT& glyph,
     wchar_t text[256]{};
     GetWindowTextW(draw.hwndItem, text,
                    static_cast<int>(sizeof(text) / sizeof(text[0])));
+    const int saved_dc = SaveDC(draw.hDC);
     HFONT font = reinterpret_cast<HFONT>(SendMessageW(draw.hwndItem, WM_GETFONT, 0, 0));
-    HGDIOBJ old_font = font != nullptr ? SelectObject(draw.hDC, font) : nullptr;
-    SetBkMode(draw.hDC, TRANSPARENT);
+    if (font != nullptr) SelectObject(draw.hDC, font);
+    // The control background has already been painted. Supplying that exact
+    // color as an opaque ClearType composition surface makes owner-drawn
+    // labels match adjacent native static labels pixel-for-pixel.
+    SetBkMode(draw.hDC, OPAQUE);
+    SetBkColor(draw.hDC, colors.background);
     SetTextColor(draw.hDC, enabled ? colors.text : colors.disabled_text);
     RECT text_rect = draw.rcItem;
     text_rect.left = glyph.right + scale_for_dialog_dpi(8, dpi);
     DrawTextW(draw.hDC, text, -1, &text_rect,
               DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-    if (old_font != nullptr) SelectObject(draw.hDC, old_font);
+    RestoreDC(draw.hDC, saved_dc);
 }
 
 bool input_character_allowed(DialogInputFilter filter, wchar_t character) {
@@ -404,24 +431,32 @@ void apply_combo_child_theme(HWND combo, bool dark) {
         restore_control_edges(combo);
     }
     if (info.hwndList != nullptr) {
-        SetWindowTheme(info.hwndList, theme, nullptr);
         if (dark) {
+            SetWindowTheme(info.hwndList, theme, nullptr);
             strip_light_control_edges(info.hwndList);
         } else {
             restore_control_edges(info.hwndList);
+            SetWindowTheme(info.hwndList, theme, nullptr);
         }
-        RedrawWindow(info.hwndList, nullptr, nullptr,
-                     RDW_INVALIDATE | RDW_FRAME | RDW_ALLCHILDREN);
+        if (IsWindowVisible(info.hwndList)) {
+            RedrawWindow(info.hwndList, nullptr, nullptr,
+                         RDW_INVALIDATE | RDW_ERASE | RDW_FRAME |
+                             RDW_ALLCHILDREN | RDW_UPDATENOW);
+        }
     }
     if (info.hwndItem != nullptr && info.hwndItem != combo) {
-        SetWindowTheme(info.hwndItem, theme, nullptr);
         if (dark) {
+            SetWindowTheme(info.hwndItem, theme, nullptr);
             strip_light_control_edges(info.hwndItem);
         } else {
             restore_control_edges(info.hwndItem);
+            SetWindowTheme(info.hwndItem, theme, nullptr);
         }
-        RedrawWindow(info.hwndItem, nullptr, nullptr,
-                     RDW_INVALIDATE | RDW_FRAME | RDW_ALLCHILDREN);
+        if (IsWindowVisible(info.hwndItem)) {
+            RedrawWindow(info.hwndItem, nullptr, nullptr,
+                         RDW_INVALIDATE | RDW_ERASE | RDW_FRAME |
+                             RDW_ALLCHILDREN | RDW_UPDATENOW);
+        }
     }
 }
 
@@ -726,6 +761,14 @@ void apply_axiom_window_icons(HWND window, HINSTANCE instance) {
 }
 
 DialogColors dialog_colors(bool dark) {
+    if (high_contrast_enabled()) {
+        return {
+            GetSysColor(COLOR_WINDOW), GetSysColor(COLOR_WINDOWTEXT),
+            GetSysColor(COLOR_WINDOW), GetSysColor(COLOR_HIGHLIGHT),
+            GetSysColor(COLOR_HIGHLIGHTTEXT), GetSysColor(COLOR_GRAYTEXT),
+            GetSysColor(COLOR_WINDOWFRAME), GetSysColor(COLOR_HOTLIGHT),
+        };
+    }
     const COLORREF accent = dialog_accent_color();
     if (dark) {
         const COLORREF selection = blend_color(RGB(31, 31, 31), accent, 42);
@@ -736,9 +779,9 @@ DialogColors dialog_colors(bool dark) {
         };
     }
     return {
-        RGB(240, 240, 240), RGB(0, 0, 0), RGB(255, 255, 255),
-        accent, readable_text_color(accent), RGB(120, 120, 120),
-        RGB(170, 170, 170), accent,
+        RGB(250, 250, 250), RGB(32, 32, 32), RGB(255, 255, 255),
+        accent, readable_text_color(accent), RGB(105, 105, 105),
+        RGB(200, 200, 200), accent,
     };
 }
 
@@ -832,21 +875,34 @@ void apply_dialog_control_theme(HWND control, bool dark) {
         GetClassNameW(control, class_name,
                       static_cast<int>(sizeof(class_name) / sizeof(class_name[0])));
         const bool combo_box = lstrcmpiW(class_name, L"ComboBox") == 0;
-        SetWindowTheme(control,
-                       dark ? (combo_box ? L"" : L"DarkMode_Explorer")
-                            : nullptr,
-                       dark && combo_box ? L"" : nullptr);
         if (combo_box) {
             if (dark) {
+                SetWindowTheme(control, L"", L"");
                 SetWindowSubclass(control, dark_combo_subclass_proc,
                                   kDarkComboSubclass, 1);
+                apply_combo_child_theme(control, true);
             } else {
+                // Remove the custom painter before resetting the native theme.
+                // SetWindowTheme synchronously sends WM_THEMECHANGED; leaving
+                // the subclass installed lets it paint one final dark frame
+                // over the restored light combo.
+                SendMessageW(control, CB_SHOWDROPDOWN, FALSE, 0);
                 RemoveWindowSubclass(control, dark_combo_subclass_proc,
                                      kDarkComboSubclass);
+                RemovePropW(control, kDarkComboHotProperty);
+                RemovePropW(control, kDarkComboTrackingProperty);
+                apply_combo_child_theme(control, false);
+                SetWindowTheme(control, nullptr, nullptr);
             }
-            apply_combo_child_theme(control, dark);
+        } else {
+            SetWindowTheme(control, dark ? L"DarkMode_Explorer" : nullptr,
+                           nullptr);
         }
-        RedrawWindow(control, nullptr, nullptr, RDW_INVALIDATE | RDW_FRAME | RDW_ALLCHILDREN);
+        if (IsWindowVisible(control)) {
+            RedrawWindow(control, nullptr, nullptr,
+                         RDW_INVALIDATE | RDW_ERASE | RDW_FRAME |
+                             RDW_ALLCHILDREN | RDW_UPDATENOW);
+        }
     }
 }
 
@@ -945,13 +1001,13 @@ void draw_dialog_button(const DRAWITEMSTRUCT& draw, bool dark) {
     const bool pressed = (draw.itemState & ODS_SELECTED) != 0;
     const bool focused = (draw.itemState & ODS_FOCUS) != 0;
     const bool hot = (draw.itemState & ODS_HOTLIGHT) != 0;
-    COLORREF fill = dark ? colors.control_background : GetSysColor(COLOR_BTNFACE);
+    COLORREF fill = colors.control_background;
     if (pressed) {
         fill = dark ? blend_color(colors.control_background, colors.focus_border, 18)
-                    : blend_color(GetSysColor(COLOR_BTNFACE), colors.focus_border, 22);
+                    : blend_color(colors.control_background, colors.focus_border, 16);
     } else if (hot || focused) {
         fill = dark ? blend_color(colors.control_background, colors.focus_border, 10)
-                    : blend_color(GetSysColor(COLOR_BTNFACE), colors.focus_border, 12);
+                    : blend_color(colors.control_background, colors.focus_border, 8);
     }
 
     HBRUSH brush = CreateSolidBrush(fill);
@@ -1023,6 +1079,8 @@ void draw_dialog_checkbox(const DRAWITEMSTRUCT& draw, bool dark, bool checked) {
     const DialogColors colors = dialog_colors(dark);
     const bool enabled = (draw.itemState & ODS_DISABLED) == 0;
     const bool focused = (draw.itemState & ODS_FOCUS) != 0;
+    const bool pressed = (draw.itemState & ODS_SELECTED) != 0;
+    const bool hot = (draw.itemState & ODS_HOTLIGHT) != 0;
     HBRUSH background = CreateSolidBrush(colors.background);
     FillRect(draw.hDC, &draw.rcItem, background);
     DeleteObject(background);
@@ -1035,17 +1093,29 @@ void draw_dialog_checkbox(const DRAWITEMSTRUCT& draw, bool dark, bool checked) {
         draw.rcItem.left + scale_for_dialog_dpi(2, dpi) + box_size,
         draw.rcItem.top + (draw.rcItem.bottom - draw.rcItem.top + box_size) / 2,
     };
-    HBRUSH box_brush = CreateSolidBrush(colors.control_background);
+    COLORREF box_fill = colors.control_background;
+    COLORREF box_border = focused ? colors.focus_border : colors.border;
+    COLORREF mark_color = colors.selection_text;
+    if (checked) {
+        box_fill = enabled
+            ? colors.focus_border
+            : blend_color(colors.control_background, colors.disabled_text, 45);
+        box_border = box_fill;
+        mark_color = enabled ? readable_text_color(box_fill) : colors.control_background;
+    } else if (enabled && (pressed || hot || focused)) {
+        box_fill = blend_color(colors.control_background, colors.focus_border,
+                               pressed ? 15 : 7);
+        box_border = colors.focus_border;
+    }
+    HBRUSH box_brush = CreateSolidBrush(box_fill);
     FillRect(draw.hDC, &box, box_brush);
     DeleteObject(box_brush);
-    HBRUSH border = CreateSolidBrush(focused ? colors.focus_border : colors.border);
+    HBRUSH border = CreateSolidBrush(box_border);
     FrameRect(draw.hDC, &box, border);
     DeleteObject(border);
 
     if (checked) {
-        draw_antialiased_checkmark(
-            draw.hDC, box, dpi,
-            enabled ? colors.focus_border : colors.disabled_text);
+        draw_antialiased_checkmark(draw.hDC, box, dpi, mark_color);
     }
 
     draw_selection_control_text(draw, box, dpi, colors, enabled);
@@ -1058,6 +1128,8 @@ void draw_dialog_radio_button(const DRAWITEMSTRUCT& draw, bool dark, bool checke
     const DialogColors colors = dialog_colors(dark);
     const bool enabled = (draw.itemState & ODS_DISABLED) == 0;
     const bool focused = (draw.itemState & ODS_FOCUS) != 0;
+    const bool pressed = (draw.itemState & ODS_SELECTED) != 0;
+    const bool hot = (draw.itemState & ODS_HOTLIGHT) != 0;
     HBRUSH background = CreateSolidBrush(colors.background);
     FillRect(draw.hDC, &draw.rcItem, background);
     DeleteObject(background);
@@ -1070,13 +1142,20 @@ void draw_dialog_radio_button(const DRAWITEMSTRUCT& draw, bool dark, bool checke
         draw.rcItem.left + scale_for_dialog_dpi(2, dpi) + diameter,
         draw.rcItem.top + (draw.rcItem.bottom - draw.rcItem.top + diameter) / 2,
     };
+    const COLORREF active_color = enabled ? colors.focus_border : colors.disabled_text;
+    const COLORREF outline_color = checked || focused
+        ? active_color
+        : colors.border;
+    const COLORREF fill_color = enabled && !checked && (pressed || hot)
+        ? blend_color(colors.control_background, colors.focus_border,
+                      pressed ? 15 : 7)
+        : colors.control_background;
     if (gdiplus_ready()) {
         Gdiplus::Graphics graphics(draw.hDC);
-        graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
-        graphics.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
-        Gdiplus::SolidBrush fill(gdiplus_color(colors.control_background));
-        Gdiplus::Pen outline(gdiplus_color(focused ? colors.focus_border : colors.border),
-                             1.0f);
+        configure_antialiased_shape_drawing(graphics);
+        Gdiplus::SolidBrush fill(gdiplus_color(fill_color));
+        Gdiplus::Pen outline(gdiplus_color(outline_color),
+                             checked ? 1.5f : 1.0f);
         const Gdiplus::RectF bounds(
             static_cast<Gdiplus::REAL>(circle.left) + 0.5f,
             static_cast<Gdiplus::REAL>(circle.top) + 0.5f,
@@ -1085,15 +1164,33 @@ void draw_dialog_radio_button(const DRAWITEMSTRUCT& draw, bool dark, bool checke
         graphics.FillEllipse(&fill, bounds);
         graphics.DrawEllipse(&outline, bounds);
         if (checked) {
-            const int inset = scale_for_dialog_dpi(5, dpi);
-            Gdiplus::SolidBrush dot(gdiplus_color(
-                enabled ? colors.focus_border : colors.disabled_text));
+            const int inset = scale_for_dialog_dpi(4, dpi);
+            Gdiplus::SolidBrush dot(gdiplus_color(active_color));
             graphics.FillEllipse(
                 &dot, static_cast<Gdiplus::REAL>(circle.left + inset),
                 static_cast<Gdiplus::REAL>(circle.top + inset),
                 static_cast<Gdiplus::REAL>(diameter - inset * 2),
                 static_cast<Gdiplus::REAL>(diameter - inset * 2));
         }
+    } else {
+        HBRUSH fill = CreateSolidBrush(fill_color);
+        HPEN outline = CreatePen(PS_SOLID, 1, outline_color);
+        HGDIOBJ old_brush = SelectObject(draw.hDC, fill);
+        HGDIOBJ old_pen = SelectObject(draw.hDC, outline);
+        Ellipse(draw.hDC, circle.left, circle.top, circle.right, circle.bottom);
+        if (checked) {
+            const int inset = scale_for_dialog_dpi(4, dpi);
+            HBRUSH dot = CreateSolidBrush(active_color);
+            SelectObject(draw.hDC, dot);
+            Ellipse(draw.hDC, circle.left + inset, circle.top + inset,
+                    circle.right - inset, circle.bottom - inset);
+            SelectObject(draw.hDC, fill);
+            DeleteObject(dot);
+        }
+        SelectObject(draw.hDC, old_pen);
+        SelectObject(draw.hDC, old_brush);
+        DeleteObject(outline);
+        DeleteObject(fill);
     }
     draw_selection_control_text(draw, circle, dpi, colors, enabled);
 }

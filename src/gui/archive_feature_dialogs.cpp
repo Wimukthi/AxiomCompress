@@ -726,6 +726,20 @@ struct ArchiveSummaryPalette {
 };
 
 ArchiveSummaryPalette archive_summary_palette(bool dark) {
+    HIGHCONTRASTW contrast{sizeof(contrast)};
+    const bool high_contrast =
+        SystemParametersInfoW(SPI_GETHIGHCONTRAST, sizeof(contrast), &contrast, 0) &&
+        (contrast.dwFlags & HCF_HIGHCONTRASTON) != 0;
+    if (high_contrast) {
+        return {
+            GetSysColor(COLOR_WINDOW), GetSysColor(COLOR_WINDOW),
+            GetSysColor(COLOR_WINDOW), GetSysColor(COLOR_BTNFACE),
+            GetSysColor(COLOR_WINDOWFRAME), GetSysColor(COLOR_WINDOWTEXT),
+            GetSysColor(COLOR_GRAYTEXT), GetSysColor(COLOR_HIGHLIGHT),
+            GetSysColor(COLOR_BTNFACE), GetSysColor(COLOR_BTNSHADOW),
+            GetSysColor(COLOR_3DDKSHADOW),
+        };
+    }
     if (dark) {
         return {
             RGB(31, 31, 31), RGB(37, 37, 38), RGB(34, 34, 35),
