@@ -30,6 +30,12 @@
     <ClInclude Include="src\archive\container_internal.hpp">
       <Filter>Archive</Filter>
     </ClInclude>
+    <ClInclude Include="src\archive\seven_zip_abi.hpp">
+      <Filter>Archive</Filter>
+    </ClInclude>
+    <ClInclude Include="src\archive\seven_zip_library.hpp">
+      <Filter>Archive</Filter>
+    </ClInclude>
     <ClInclude Include="src\archive\system_provider.hpp">
       <Filter>Archive</Filter>
     </ClInclude>
@@ -126,6 +132,9 @@
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="src\archive\container.cpp">
+      <Filter>Archive</Filter>
+    </ClCompile>
+    <ClCompile Include="src\archive\seven_zip_library.cpp">
       <Filter>Archive</Filter>
     </ClCompile>
     <ClCompile Include="src\archive\container_formats.cpp">

@@ -171,8 +171,9 @@ SFX packaging works for both AXAR and ZIP and emits only the merged executable.
 
 On Windows, Axiom also exposes read-only archive providers for common formats.
 ISO browsing uses Axiom's native ISO9660/Joliet directory reader so large images
-display immediately; ISO extraction/test still use the bundled 7-Zip backend.
-The bundled 7-Zip backend also handles `.7z`, `.rar`, and `.cab`; Windows
+display immediately; hybrid ISO/UDF images use their complete UDF catalog.
+The bundled `7z.dll` engine handles `.7z`, `.rar`, `.cab`, and ISO/UDF
+extraction and testing without launching a helper process; Windows
 `tar.exe` handles `.tar`, `.tar.gz`, `.tgz`, `.tar.xz`, `.txz`, `.tar.bz2`,
 `.tbz2`, `.tar.zst`, and `.tzst`. These formats never appear as Add-to-archive
 creation targets.
@@ -246,7 +247,13 @@ The Settings dialog has these pages:
 - Security
 - Integration
 - Updates
+- Shortcuts
+- Toolbar
 - Advanced
+
+The General page can follow the Windows accent, use an Axiom preset, or choose a
+custom color with the DPI-aware dark/light color picker. Accent changes apply
+across selections, progress indicators, buttons, and optional accent-colored icons.
 
 The Integration page can register per-user file associations for AXAR,
 ZIP/JAR/WAR/APK, 7z, RAR, TAR-family, ISO, and CAB files. Read-only formats use
@@ -566,7 +573,7 @@ third-party components include:
 - miniz 3.1.1 for ZIP read/write support, under the MIT license.
 - minizip-ng 4.2.2 container/split-stream core, privately namespaced for
   standard split-ZIP support, under the zlib license.
-- 7-Zip console backend for read-only 7z/RAR/ISO/CAB support, under LGPL/BSD
+- 7-Zip engine DLL for read-only 7z/RAR/ISO/CAB support, under LGPL/BSD
   terms with the upstream unRAR restriction for some RAR code.
 - Monocypher for cryptographic primitives, under the BSD 2-Clause license.
 - BLAKE3 for hashing and integrity primitives, under CC0/Apache-2.0 licensing.

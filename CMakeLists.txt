@@ -66,6 +66,7 @@ add_library(axiom STATIC
     src/archive/container.cpp
     src/archive/container_formats.cpp
     src/archive/container_zip.cpp
+    src/archive/seven_zip_library.cpp
     src/archive/zip_split_backend.cpp
     src/archive/system_provider.cpp
     src/codec/block.cpp
@@ -125,7 +126,7 @@ endif()
 
 # Windows CSPRNG (BCryptGenRandom) used by core/crypto.
 if(WIN32)
-    target_link_libraries(axiom PUBLIC bcrypt)
+    target_link_libraries(axiom PUBLIC bcrypt ole32 oleaut32)
 endif()
 
 set(AXIOMC_SOURCES

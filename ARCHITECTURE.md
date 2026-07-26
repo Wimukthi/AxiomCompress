@@ -13,7 +13,8 @@ Use this document when you need to know where a feature belongs:
 | `src/archive/container.cpp` | The AXAR engine: directory parsing, solid blocks, encryption, recovery, volumes, signing, SFX |
 | `src/archive/container_zip.cpp` | ZIP read/write: miniz wrappers, ZipCrypto/AES-256 entries, the ZIP provider |
 | `src/archive/container_formats.cpp` | Format detection (magic/extension sniffing) and the provider registry |
-| `src/archive/system_provider.cpp` | Read-only providers backed by bundled 7-Zip and Windows `tar.exe` |
+| `src/archive/system_provider.cpp` | Read-only provider policy, native ISO bridge browsing, and Windows `tar.exe` integration |
+| `src/archive/seven_zip_library.cpp` | Direct `7z.dll` adapter for structured listing, testing, extraction, encryption, volumes, progress, pause, and cancellation |
 | `src/archive/container_internal.hpp` | Internal helpers shared between the archive translation units |
 | `src/core` | Shared utilities: checksums, crypto, filesystem metadata, Reed-Solomon |
 | `src/cli` | `axiomc` command parsing and CLI workflows |
@@ -122,9 +123,10 @@ providers are:
   but are not edited in place yet. Existing unchanged plaintext entries are
   preserved by cloning them into an atomically rewritten ZIP. AXAR and ZIP can
   both be packaged behind the native self-extractor stub.
-- `system-readonly`: a Windows-only read-only provider. It uses Axiom's bundled
-  7-Zip console backend for 7z, RAR/RAR5, ISO, and CAB, and Windows `tar.exe`
-  for TAR-family archives. It never advertises create, update, delete, or move.
+- `system-readonly`: a Windows-only read-only provider. It loads Axiom's bundled
+  `7z.dll` engine directly for 7z, RAR/RAR5, hybrid ISO/UDF, and CAB, and uses
+  Windows `tar.exe` for TAR-family archives. It never advertises create,
+  update, delete, or move.
 
 The GUI asks the provider for:
 
@@ -152,13 +154,12 @@ The intended support split is:
 - AXAR and ZIP are the only creation targets in the GUI. The Add-to-archive
   dialog filters out read-only providers even though the Open dialog can browse
   them;
-- 7z/RAR/CAB support is view/extract/test through the bundled 7-Zip backend.
-  ISO browsing uses a native ISO9660/Joliet directory reader for immediate
-  display; ISO extraction/test still use the bundled 7-Zip backend.
-  TAR-family support remains view/extract/test through Windows `tar.exe`. A
-  future direct libarchive or 7-Zip SDK backend can replace either
-  implementation behind the same provider interface if better progress reporting
-  or sandboxing is needed.
+- 7z/RAR/CAB support is view/extract/test through the bundled `7z.dll` engine.
+  Pure ISO9660/Joliet browsing uses Axiom's native directory reader for
+  immediate display; hybrid media use the authoritative UDF catalog from the
+  DLL. TAR-family support remains view/extract/test through Windows `tar.exe`.
+  The DLL adapter consumes structured properties and callbacks rather than
+  launching a helper process or parsing console text.
 
 For ZIP specifically, Axiom currently vendors miniz 3.1.1 because it provides a
 small, build-system-friendly ZIP container reader/writer and Deflate/Inflate
@@ -482,10 +483,11 @@ threads never paint, format status text, query HWNDs, inspect a growing output
 file, or enqueue progress messages. The GUI samples at its own cadence, computes
 rate and ETA from a rolling phase-local window, displays compressed size and
 source-to-archive ratio as independent fields, and repaints a liveness heartbeat
-even when an external backend is between measurable checkpoints. Bundled 7-Zip
-operations request and parse its native percentage stream for accurate progress.
-Pause and cancellation retain their cooperative `OperationControl` checkpoints;
-the unpaused checkpoint path is an atomic fast path.
+even when an external backend is between measurable checkpoints. The bundled
+`7z.dll` adapter publishes structured progress and per-file write callbacks
+directly into the same atomic snapshot. Pause and cancellation retain their
+cooperative `OperationControl` checkpoints; the unpaused checkpoint path is an
+atomic fast path.
 
 Archive drag-out has two explicit telemetry phases. The provider first extracts
 selected entries into Axiom's private staging directory. After the drop is

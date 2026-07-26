@@ -1930,6 +1930,36 @@ void test_bundled_7z_provider_layer() {
     AXIOM_CHECK(read_all(selected / "alpha.txt") == alpha);
     AXIOM_CHECK(!fs::exists(selected / "folder" / "beta.txt"));
 
+    std::vector<std::uint8_t> split_payload(8u * 1024u);
+    for (std::size_t index = 0; index < split_payload.size(); ++index) {
+        split_payload[index] =
+            static_cast<std::uint8_t>((index * 131u + 17u) & 0xFFu);
+    }
+    write_all(source / "split.bin", split_payload);
+    const auto split_archive = root / "split.7z";
+    const std::string split_command =
+        "cd /d " + quote_for_command(source) + " && " +
+        quote_for_command(*seven_zip) +
+        " a -t7z -mx0 -v1k " + quote_for_command(split_archive) +
+        " split.bin >nul";
+    AXIOM_CHECK(std::system(split_command.c_str()) == 0);
+
+    const auto first_volume = root / "split.7z.001";
+    AXIOM_CHECK(fs::exists(root / "split.7z.002"));
+    const auto* split_provider =
+        axiom::archive_provider_for_path(first_volume);
+    AXIOM_CHECK(split_provider != nullptr);
+    const auto split_entries = split_provider->list(first_volume);
+    AXIOM_CHECK(std::any_of(
+        split_entries.begin(), split_entries.end(),
+        [](const axiom::ArchiveEntry& entry) {
+            return entry.path == "split.bin" && !entry.is_directory;
+        }));
+    split_provider->test(first_volume);
+    const auto split_destination = root / "split-extracted";
+    split_provider->extract_all(first_volume, split_destination, {});
+    AXIOM_CHECK(read_all(split_destination / "split.bin") == split_payload);
+
     std::error_code ec;
     fs::remove_all(root, ec);
 }

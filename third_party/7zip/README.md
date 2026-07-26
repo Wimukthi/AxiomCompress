@@ -1,14 +1,18 @@
-# Bundled 7-Zip backend
+# Bundled 7-Zip library backend
 
-Axiom bundles the 64-bit 7-Zip console backend so read-only support for 7z,
-RAR/RAR5, ISO, and CAB works out of the box on Windows.
+Axiom loads the 64-bit 7-Zip engine DLL directly so read-only support for 7z,
+RAR/RAR5, ISO/UDF, and CAB works out of the box on Windows without launching a
+console helper process or requiring 7-Zip to be installed.
 
-Bundled files:
+Files shipped with Axiom:
 
-- `win-x64/7z.exe`
 - `win-x64/7z.dll`
 - `win-x64/License.txt`
 - `win-x64/readme.txt`
+
+`win-x64/7z.exe` remains in the source tree only as a test-fixture generator
+for interoperability tests. It is not included in Axiom installers or portable
+packages.
 
 The bundled copy is 7-Zip 26.00 for Windows x64.
 

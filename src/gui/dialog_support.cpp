@@ -1065,11 +1065,6 @@ void draw_dialog_button(const DRAWITEMSTRUCT& draw, bool dark) {
     }
     if (old_font != nullptr) SelectObject(draw.hDC, old_font);
 
-    if (focused) {
-        RECT focus_rect = draw.rcItem;
-        InflateRect(&focus_rect, -3, -3);
-        DrawFocusRect(draw.hDC, &focus_rect);
-    }
 }
 
 void draw_dialog_checkbox(const DRAWITEMSTRUCT& draw, bool dark, bool checked) {

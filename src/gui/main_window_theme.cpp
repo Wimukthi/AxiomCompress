@@ -433,11 +433,6 @@ void MainWindow::draw_address_entry(const DRAWITEMSTRUCT& draw) const {
     DrawTextW(draw.hDC, entry.label.c_str(), -1, &text_rect,
               DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
     SelectObject(draw.hDC, old_font);
-    if ((draw.itemState & ODS_FOCUS) != 0) {
-        RECT focus = draw.rcItem;
-        InflateRect(&focus, -2, -2);
-        DrawFocusRect(draw.hDC, &focus);
-    }
 }
 
 }  // namespace axiom::gui

@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <cmath>
 #include <cwchar>
 #include <cwctype>
 #include <limits>
@@ -73,6 +74,7 @@ constexpr int kToolbarIconStyle = 2237;
 constexpr int kAccentColorMode = 2238;
 constexpr int kCustomAccentColor = 2239;
 constexpr int kCenterChildWindows = 2240;
+constexpr int kPickAccentColor = 2241;
 constexpr int kDefaultUpdateMode = 2250;
 constexpr int kDefaultVolumeSize = 2251;
 constexpr int kDefaultVolumeUnit = 2252;
@@ -759,10 +761,6 @@ LRESULT CALLBACK dark_tab_window_proc(HWND window, UINT message,
                 DrawTextW(memory, dark_tab_text(window, index), -1, &text_rect,
                           DT_CENTER | DT_VCENTER | DT_SINGLELINE |
                               DT_NOPREFIX | DT_END_ELLIPSIS);
-                if (index == state->selected && GetFocus() == window) {
-                    InflateRect(&tab, -3, -3);
-                    DrawFocusRect(memory, &tab);
-                }
             }
             SelectObject(memory, old_font);
             BitBlt(target, 0, 0, client.right, client.bottom, memory, 0, 0, SRCCOPY);
@@ -947,11 +945,6 @@ LRESULT CALLBACK settings_nav_window_proc(HWND window, UINT message,
                 DrawTextW(memory, dark_tab_text(window, index), -1, &text_rect,
                           DT_LEFT | DT_VCENTER | DT_SINGLELINE |
                               DT_NOPREFIX | DT_END_ELLIPSIS);
-                if (selected && GetFocus() == window) {
-                    RECT focus_rect = item;
-                    InflateRect(&focus_rect, -3, -3);
-                    DrawFocusRect(memory, &focus_rect);
-                }
             }
 
             RECT divider{client.right - 1, 0, client.right, client.bottom};
@@ -1005,6 +998,657 @@ std::optional<fs::path> browse_folder(HWND owner,
     fs::path result(path);
     CoTaskMemFree(path);
     return result;
+}
+
+struct HsvColor {
+    double hue = 0.0;
+    double saturation = 0.0;
+    double value = 0.0;
+};
+
+HsvColor rgb_to_hsv(COLORREF color) {
+    const double red = static_cast<double>(GetRValue(color)) / 255.0;
+    const double green = static_cast<double>(GetGValue(color)) / 255.0;
+    const double blue = static_cast<double>(GetBValue(color)) / 255.0;
+    const double maximum = std::max({red, green, blue});
+    const double minimum = std::min({red, green, blue});
+    const double range = maximum - minimum;
+
+    HsvColor result;
+    result.value = maximum;
+    result.saturation = maximum == 0.0 ? 0.0 : range / maximum;
+    if (range == 0.0) {
+        result.hue = 0.0;
+    } else if (maximum == red) {
+        result.hue = 60.0 * std::fmod((green - blue) / range, 6.0);
+    } else if (maximum == green) {
+        result.hue = 60.0 * (((blue - red) / range) + 2.0);
+    } else {
+        result.hue = 60.0 * (((red - green) / range) + 4.0);
+    }
+    if (result.hue < 0.0) result.hue += 360.0;
+    return result;
+}
+
+COLORREF hsv_to_rgb(HsvColor color) {
+    color.hue = std::fmod(color.hue, 360.0);
+    if (color.hue < 0.0) color.hue += 360.0;
+    color.saturation = std::clamp(color.saturation, 0.0, 1.0);
+    color.value = std::clamp(color.value, 0.0, 1.0);
+
+    const double chroma = color.value * color.saturation;
+    const double hue_section = color.hue / 60.0;
+    const double secondary =
+        chroma * (1.0 - std::abs(std::fmod(hue_section, 2.0) - 1.0));
+    double red = 0.0;
+    double green = 0.0;
+    double blue = 0.0;
+    if (hue_section < 1.0) {
+        red = chroma;
+        green = secondary;
+    } else if (hue_section < 2.0) {
+        red = secondary;
+        green = chroma;
+    } else if (hue_section < 3.0) {
+        green = chroma;
+        blue = secondary;
+    } else if (hue_section < 4.0) {
+        green = secondary;
+        blue = chroma;
+    } else if (hue_section < 5.0) {
+        red = secondary;
+        blue = chroma;
+    } else {
+        red = chroma;
+        blue = secondary;
+    }
+    const double offset = color.value - chroma;
+    const auto channel = [offset](double value) {
+        return static_cast<BYTE>(std::lround(
+            std::clamp(value + offset, 0.0, 1.0) * 255.0));
+    };
+    return RGB(channel(red), channel(green), channel(blue));
+}
+
+class AccentColorPicker {
+public:
+    std::optional<COLORREF> show(HWND owner, COLORREF initial) {
+        owner_ = owner;
+        instance_ = reinterpret_cast<HINSTANCE>(
+            GetWindowLongPtrW(owner, GWLP_HINSTANCE));
+        dpi_ = GetDpiForWindow(owner);
+        palette_ = make_palette();
+        color_ = initial;
+        hsv_ = rgb_to_hsv(initial);
+        if (!register_class()) return std::nullopt;
+
+        constexpr DWORD style = WS_POPUP | WS_CAPTION | WS_SYSMENU |
+                                WS_CLIPCHILDREN;
+        constexpr DWORD extended_style = WS_EX_DLGMODALFRAME;
+        const SIZE desired_size = dialog_window_size_for_client(
+            580, 350, style, extended_style, dpi_);
+        RECT owner_rect{};
+        GetWindowRect(owner, &owner_rect);
+        int width = desired_size.cx;
+        int height = desired_size.cy;
+        MONITORINFO monitor{sizeof(monitor)};
+        int x = owner_rect.left +
+            ((owner_rect.right - owner_rect.left) - width) / 2;
+        int y = owner_rect.top +
+            ((owner_rect.bottom - owner_rect.top) - height) / 2;
+        if (GetMonitorInfoW(
+                MonitorFromWindow(owner, MONITOR_DEFAULTTONEAREST), &monitor)) {
+            width = std::min(
+                width,
+                static_cast<int>(monitor.rcWork.right - monitor.rcWork.left) -
+                    scale(24));
+            height = std::min(
+                height,
+                static_cast<int>(monitor.rcWork.bottom - monitor.rcWork.top) -
+                    scale(24));
+            x = owner_rect.left +
+                ((owner_rect.right - owner_rect.left) - width) / 2;
+            y = owner_rect.top +
+                ((owner_rect.bottom - owner_rect.top) - height) / 2;
+            x = std::clamp(
+                x, static_cast<int>(monitor.rcWork.left),
+                std::max(static_cast<int>(monitor.rcWork.left),
+                         static_cast<int>(monitor.rcWork.right) - width));
+            y = std::clamp(
+                y, static_cast<int>(monitor.rcWork.top),
+                std::max(static_cast<int>(monitor.rcWork.top),
+                         static_cast<int>(monitor.rcWork.bottom) - height));
+        }
+        window_ = CreateWindowExW(
+            extended_style, class_name(), L"Choose accent color", style,
+            x, y, width, height, owner, nullptr, instance_, this);
+        if (window_ == nullptr) return std::nullopt;
+
+        owner_was_enabled_ = disable_dialog_owner(owner, window_);
+        ShowWindow(window_, SW_SHOW);
+        UpdateWindow(window_);
+        MSG message{};
+        while (IsWindow(window_) && GetMessageW(&message, nullptr, 0, 0) > 0) {
+            if (!IsDialogMessageW(window_, &message)) {
+                TranslateMessage(&message);
+                DispatchMessageW(&message);
+            }
+        }
+        restore_dialog_owner(owner_, owner_was_enabled_);
+        owner_was_enabled_ = false;
+        return accepted_ ? std::optional<COLORREF>(color_) : std::nullopt;
+    }
+
+private:
+    static constexpr int kHexEdit = 2920;
+    static constexpr int kAcceptColor = IDOK;
+    static constexpr int kCancelColor = IDCANCEL;
+
+    static const wchar_t* class_name() {
+        return L"AxiomAccentColorPicker";
+    }
+
+    bool register_class() const {
+        static ATOM atom = 0;
+        if (atom != 0) return true;
+        WNDCLASSEXW window_class{sizeof(window_class)};
+        window_class.lpfnWndProc = &AccentColorPicker::window_proc;
+        window_class.hInstance = instance_;
+        window_class.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        window_class.lpszClassName = class_name();
+        assign_axiom_window_class_icons(window_class, instance_);
+        atom = RegisterClassExW(&window_class);
+        return atom != 0 || GetLastError() == ERROR_CLASS_ALREADY_EXISTS;
+    }
+
+    int scale(int value) const {
+        return MulDiv(value, static_cast<int>(dpi_), USER_DEFAULT_SCREEN_DPI);
+    }
+
+    RECT saturation_value_rect() const {
+        return {scale(18), scale(64), scale(338), scale(254)};
+    }
+
+    RECT hue_rect() const {
+        return {scale(354), scale(64), scale(382), scale(254)};
+    }
+
+    RECT preview_rect() const {
+        return {scale(410), scale(64), scale(552), scale(132)};
+    }
+
+    void create_font() {
+        if (font_ != nullptr) {
+            DeleteObject(font_);
+            font_ = nullptr;
+        }
+        NONCLIENTMETRICSW metrics{sizeof(metrics)};
+        if (!SystemParametersInfoForDpi(
+                SPI_GETNONCLIENTMETRICS, sizeof(metrics), &metrics, 0, dpi_)) {
+            SystemParametersInfoW(
+                SPI_GETNONCLIENTMETRICS, sizeof(metrics), &metrics, 0);
+        }
+        font_ = CreateFontIndirectW(&metrics.lfMessageFont);
+    }
+
+    HWND create_control(const wchar_t* type, const wchar_t* text,
+                        DWORD style, int id) {
+        HWND result = CreateWindowExW(
+            0, type, text, WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | style,
+            0, 0, 0, 0, window_,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),
+            instance_, nullptr);
+        SendMessageW(result, WM_SETFONT, reinterpret_cast<WPARAM>(font_), TRUE);
+        apply_dialog_control_theme(result, palette_.dark);
+        return result;
+    }
+
+    void create_controls() {
+        create_font();
+        window_brush_ = CreateSolidBrush(palette_.window);
+        edit_brush_ = CreateSolidBrush(palette_.edit);
+        hex_edit_ = create_control(
+            L"EDIT", L"", WS_TABSTOP | WS_BORDER | ES_CENTER |
+                           ES_UPPERCASE | ES_AUTOHSCROLL,
+            kHexEdit);
+        SendMessageW(hex_edit_, EM_SETLIMITTEXT, 7, 0);
+        SendMessageW(hex_edit_, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN,
+                     MAKELPARAM(scale(6), scale(6)));
+        apply_dialog_input_filter(
+            hex_edit_, DialogInputFilter::hexadecimal_color, 7);
+        accept_ = create_control(
+            L"BUTTON", L"OK",
+            WS_TABSTOP | BS_DEFPUSHBUTTON | BS_OWNERDRAW, kAcceptColor);
+        cancel_ = create_control(
+            L"BUTTON", L"Cancel", WS_TABSTOP | BS_OWNERDRAW, kCancelColor);
+        sync_hex_edit();
+        layout();
+    }
+
+    void layout() const {
+        if (window_ == nullptr || hex_edit_ == nullptr) return;
+        RECT client{};
+        GetClientRect(window_, &client);
+        const int margin = scale(18);
+        const int row = scale(30);
+        const int button_width = scale(88);
+        const int button_y = client.bottom - margin - row;
+        MoveWindow(hex_edit_, scale(410), scale(168), scale(142), row, TRUE);
+        MoveWindow(cancel_, client.right - margin - button_width, button_y,
+                   button_width, row, TRUE);
+        MoveWindow(accept_, client.right - margin - button_width * 2 - scale(8),
+                   button_y, button_width, row, TRUE);
+    }
+
+    void sync_hex_edit() {
+        if (hex_edit_ == nullptr) return;
+        updating_edit_ = true;
+        set_window_text(hex_edit_, color_to_hex(color_));
+        updating_edit_ = false;
+    }
+
+    void set_color(COLORREF color, bool update_hsv) {
+        color_ = color;
+        if (update_hsv) hsv_ = rgb_to_hsv(color);
+        sync_hex_edit();
+        InvalidateRect(window_, nullptr, FALSE);
+    }
+
+    void update_saturation_value(POINT point) {
+        const RECT rect = saturation_value_rect();
+        const int width = std::max(
+            1, static_cast<int>(rect.right - rect.left - 1));
+        const int height = std::max(
+            1, static_cast<int>(rect.bottom - rect.top - 1));
+        hsv_.saturation = std::clamp(
+            static_cast<double>(point.x - rect.left) / width, 0.0, 1.0);
+        hsv_.value = 1.0 - std::clamp(
+            static_cast<double>(point.y - rect.top) / height, 0.0, 1.0);
+        set_color(hsv_to_rgb(hsv_), false);
+    }
+
+    void update_hue(POINT point) {
+        const RECT rect = hue_rect();
+        const int height = std::max(
+            1, static_cast<int>(rect.bottom - rect.top - 1));
+        hsv_.hue = std::clamp(
+            static_cast<double>(point.y - rect.top) / height, 0.0, 1.0) * 359.999;
+        set_color(hsv_to_rgb(hsv_), false);
+    }
+
+    static std::uint32_t dib_pixel(COLORREF color) {
+        return (static_cast<std::uint32_t>(GetRValue(color)) << 16) |
+               (static_cast<std::uint32_t>(GetGValue(color)) << 8) |
+               static_cast<std::uint32_t>(GetBValue(color));
+    }
+
+    template <typename PixelFunction>
+    void draw_gradient(HDC target, const RECT& rect, PixelFunction pixel) const {
+        const int width = std::max(
+            1, static_cast<int>(rect.right - rect.left));
+        const int height = std::max(
+            1, static_cast<int>(rect.bottom - rect.top));
+        BITMAPINFO info{};
+        info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        info.bmiHeader.biWidth = width;
+        info.bmiHeader.biHeight = -height;
+        info.bmiHeader.biPlanes = 1;
+        info.bmiHeader.biBitCount = 32;
+        info.bmiHeader.biCompression = BI_RGB;
+        void* bits = nullptr;
+        HBITMAP bitmap = CreateDIBSection(
+            target, &info, DIB_RGB_COLORS, &bits, nullptr, 0);
+        if (bitmap == nullptr || bits == nullptr) {
+            if (bitmap != nullptr) DeleteObject(bitmap);
+            return;
+        }
+        auto* pixels = static_cast<std::uint32_t*>(bits);
+        for (int y = 0; y < height; ++y) {
+            for (int x = 0; x < width; ++x) {
+                pixels[static_cast<std::size_t>(y) * width + x] =
+                    dib_pixel(pixel(x, y, width, height));
+            }
+        }
+        HDC memory = CreateCompatibleDC(target);
+        HGDIOBJ old_bitmap = SelectObject(memory, bitmap);
+        BitBlt(target, rect.left, rect.top, width, height,
+               memory, 0, 0, SRCCOPY);
+        SelectObject(memory, old_bitmap);
+        DeleteDC(memory);
+        DeleteObject(bitmap);
+    }
+
+    void draw_picker(HDC target, const RECT& client) const {
+        HDC memory = CreateCompatibleDC(target);
+        HBITMAP bitmap = CreateCompatibleBitmap(
+            target, std::max(1, static_cast<int>(client.right)),
+            std::max(1, static_cast<int>(client.bottom)));
+        HGDIOBJ old_bitmap = SelectObject(memory, bitmap);
+        HBRUSH background = CreateSolidBrush(palette_.window);
+        FillRect(memory, &client, background);
+        DeleteObject(background);
+
+        HGDIOBJ old_font = SelectObject(memory, font_);
+        SetBkMode(memory, TRANSPARENT);
+        SetTextColor(memory, palette_.text);
+        RECT heading{scale(18), scale(14), client.right - scale(18), scale(40)};
+        DrawTextW(memory, L"Choose the color used for selections, progress, and accents.",
+                  -1, &heading, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+
+        RECT sv_label{scale(18), scale(41), scale(338), scale(64)};
+        RECT hue_label{scale(350), scale(41), scale(386), scale(64)};
+        RECT preview_label{scale(410), scale(41), scale(552), scale(64)};
+        DrawTextW(memory, L"Saturation and brightness", -1, &sv_label,
+                  DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        DrawTextW(memory, L"Hue", -1, &hue_label,
+                  DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        DrawTextW(memory, L"Preview", -1, &preview_label,
+                  DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+
+        const RECT sv = saturation_value_rect();
+        draw_gradient(memory, sv, [this](int x, int y, int width, int height) {
+            HsvColor color = hsv_;
+            color.saturation = width <= 1 ? 0.0
+                : static_cast<double>(x) / (width - 1);
+            color.value = height <= 1 ? 1.0
+                : 1.0 - static_cast<double>(y) / (height - 1);
+            return hsv_to_rgb(color);
+        });
+        const RECT hue = hue_rect();
+        draw_gradient(memory, hue, [](int, int y, int, int height) {
+            const double fraction = height <= 1 ? 0.0
+                : static_cast<double>(y) / (height - 1);
+            return hsv_to_rgb({fraction * 359.999, 1.0, 1.0});
+        });
+
+        HBRUSH border = CreateSolidBrush(palette_.border);
+        FrameRect(memory, &sv, border);
+        FrameRect(memory, &hue, border);
+        const RECT preview = preview_rect();
+        HBRUSH preview_brush = CreateSolidBrush(color_);
+        FillRect(memory, &preview, preview_brush);
+        DeleteObject(preview_brush);
+        FrameRect(memory, &preview, border);
+        DeleteObject(border);
+
+        const int sv_width = std::max(
+            1, static_cast<int>(sv.right - sv.left - 1));
+        const int sv_height = std::max(
+            1, static_cast<int>(sv.bottom - sv.top - 1));
+        const int marker_x = sv.left +
+            static_cast<int>(std::lround(hsv_.saturation * sv_width));
+        const int marker_y = sv.top +
+            static_cast<int>(std::lround((1.0 - hsv_.value) * sv_height));
+        HPEN outer_pen = CreatePen(PS_SOLID, scale(3), RGB(0, 0, 0));
+        HPEN inner_pen = CreatePen(PS_SOLID, scale(1), RGB(255, 255, 255));
+        HGDIOBJ old_pen = SelectObject(memory, outer_pen);
+        HGDIOBJ old_brush = SelectObject(memory, GetStockObject(NULL_BRUSH));
+        const int radius = scale(6);
+        Ellipse(memory, marker_x - radius, marker_y - radius,
+                marker_x + radius + 1, marker_y + radius + 1);
+        SelectObject(memory, inner_pen);
+        Ellipse(memory, marker_x - radius, marker_y - radius,
+                marker_x + radius + 1, marker_y + radius + 1);
+        SelectObject(memory, old_brush);
+        SelectObject(memory, old_pen);
+        DeleteObject(inner_pen);
+        DeleteObject(outer_pen);
+
+        const int hue_height = std::max(
+            1, static_cast<int>(hue.bottom - hue.top - 1));
+        const int hue_y = hue.top +
+            static_cast<int>(std::lround((hsv_.hue / 359.999) * hue_height));
+        HPEN hue_outer = CreatePen(PS_SOLID, scale(3), RGB(0, 0, 0));
+        HPEN hue_inner = CreatePen(PS_SOLID, scale(1), RGB(255, 255, 255));
+        old_pen = SelectObject(memory, hue_outer);
+        MoveToEx(memory, hue.left - scale(4), hue_y, nullptr);
+        LineTo(memory, hue.right + scale(4), hue_y);
+        SelectObject(memory, hue_inner);
+        MoveToEx(memory, hue.left - scale(4), hue_y, nullptr);
+        LineTo(memory, hue.right + scale(4), hue_y);
+        SelectObject(memory, old_pen);
+        DeleteObject(hue_inner);
+        DeleteObject(hue_outer);
+
+        RECT hex_label{scale(410), scale(142), scale(552), scale(166)};
+        DrawTextW(memory, L"Hex color", -1, &hex_label,
+                  DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        RECT hint{scale(410), scale(208), scale(552), scale(261)};
+        SetTextColor(memory, palette_.muted);
+        DrawTextW(memory, L"Drag the palettes, use arrow keys, or type #RRGGBB.",
+                  -1, &hint, DT_LEFT | DT_TOP | DT_WORDBREAK |
+                                 DT_NOPREFIX | DT_EDITCONTROL);
+        SelectObject(memory, old_font);
+
+        BitBlt(target, 0, 0, client.right, client.bottom,
+               memory, 0, 0, SRCCOPY);
+        SelectObject(memory, old_bitmap);
+        DeleteObject(bitmap);
+        DeleteDC(memory);
+    }
+
+    void accept() {
+        const auto parsed = color_from_hex(window_text(hex_edit_));
+        if (!parsed) {
+            MessageBeep(MB_ICONWARNING);
+            SetFocus(hex_edit_);
+            SendMessageW(hex_edit_, EM_SETSEL, 0, -1);
+            return;
+        }
+        color_ = *parsed;
+        accepted_ = true;
+        DestroyWindow(window_);
+        window_ = nullptr;
+    }
+
+    void cancel() {
+        accepted_ = false;
+        DestroyWindow(window_);
+        window_ = nullptr;
+    }
+
+    LRESULT handle(UINT message, WPARAM wparam, LPARAM lparam) {
+        switch (message) {
+            case WM_CREATE:
+                set_dark_title(window_, palette_.dark);
+                apply_axiom_window_icons(window_, instance_);
+                create_controls();
+                return 0;
+            case WM_GETDLGCODE:
+                return DLGC_WANTARROWS;
+            case WM_DPICHANGED: {
+                dpi_ = HIWORD(wparam);
+                const auto* suggested = reinterpret_cast<const RECT*>(lparam);
+                SetWindowPos(window_, nullptr, suggested->left, suggested->top,
+                             suggested->right - suggested->left,
+                             suggested->bottom - suggested->top,
+                             SWP_NOZORDER | SWP_NOACTIVATE);
+                apply_axiom_window_icons(window_, instance_);
+                create_font();
+                for (HWND control : {hex_edit_, accept_, cancel_}) {
+                    if (control != nullptr) {
+                        SendMessageW(control, WM_SETFONT,
+                                     reinterpret_cast<WPARAM>(font_), TRUE);
+                    }
+                }
+                layout();
+                InvalidateRect(window_, nullptr, FALSE);
+                return 0;
+            }
+            case WM_ERASEBKGND:
+                return 1;
+            case WM_PAINT: {
+                PAINTSTRUCT paint{};
+                HDC dc = BeginPaint(window_, &paint);
+                RECT client{};
+                GetClientRect(window_, &client);
+                draw_picker(dc, client);
+                EndPaint(window_, &paint);
+                return 0;
+            }
+            case WM_CTLCOLORSTATIC:
+            case WM_CTLCOLORBTN:
+                SetBkColor(reinterpret_cast<HDC>(wparam), palette_.window);
+                SetTextColor(reinterpret_cast<HDC>(wparam), palette_.text);
+                return reinterpret_cast<LRESULT>(window_brush_);
+            case WM_CTLCOLOREDIT:
+                SetBkColor(reinterpret_cast<HDC>(wparam), palette_.edit);
+                SetTextColor(reinterpret_cast<HDC>(wparam), palette_.text);
+                return reinterpret_cast<LRESULT>(edit_brush_);
+            case WM_DRAWITEM:
+                draw_dialog_button(
+                    *reinterpret_cast<DRAWITEMSTRUCT*>(lparam), palette_.dark);
+                return TRUE;
+            case WM_LBUTTONDOWN: {
+                POINT point{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
+                const RECT saturation_value = saturation_value_rect();
+                const RECT hue = hue_rect();
+                if (PtInRect(&saturation_value, point)) {
+                    dragging_saturation_value_ = true;
+                    SetCapture(window_);
+                    SetFocus(window_);
+                    update_saturation_value(point);
+                    return 0;
+                }
+                if (PtInRect(&hue, point)) {
+                    dragging_hue_ = true;
+                    SetCapture(window_);
+                    SetFocus(window_);
+                    update_hue(point);
+                    return 0;
+                }
+                break;
+            }
+            case WM_MOUSEMOVE:
+                if (GetCapture() == window_) {
+                    POINT point{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
+                    if (dragging_saturation_value_) {
+                        update_saturation_value(point);
+                    } else if (dragging_hue_) {
+                        update_hue(point);
+                    }
+                    return 0;
+                }
+                break;
+            case WM_LBUTTONUP:
+                if (GetCapture() == window_) ReleaseCapture();
+                dragging_saturation_value_ = false;
+                dragging_hue_ = false;
+                return 0;
+            case WM_CAPTURECHANGED:
+                dragging_saturation_value_ = false;
+                dragging_hue_ = false;
+                return 0;
+            case WM_KEYDOWN:
+                if (wparam == VK_ESCAPE) {
+                    cancel();
+                    return 0;
+                }
+                if (wparam == VK_LEFT || wparam == VK_RIGHT ||
+                    wparam == VK_UP || wparam == VK_DOWN) {
+                    const bool adjust_hue = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+                    if (adjust_hue) {
+                        const double direction =
+                            (wparam == VK_LEFT || wparam == VK_UP) ? -1.0 : 1.0;
+                        hsv_.hue = std::fmod(hsv_.hue + direction + 360.0, 360.0);
+                    } else if (wparam == VK_LEFT || wparam == VK_RIGHT) {
+                        const double direction = wparam == VK_LEFT ? -1.0 : 1.0;
+                        hsv_.saturation = std::clamp(
+                            hsv_.saturation + direction / 255.0, 0.0, 1.0);
+                    } else {
+                        const double direction = wparam == VK_UP ? 1.0 : -1.0;
+                        hsv_.value = std::clamp(
+                            hsv_.value + direction / 255.0, 0.0, 1.0);
+                    }
+                    set_color(hsv_to_rgb(hsv_), false);
+                    return 0;
+                }
+                break;
+            case WM_COMMAND: {
+                const int id = LOWORD(wparam);
+                if (id == kHexEdit && HIWORD(wparam) == EN_CHANGE &&
+                    !updating_edit_) {
+                    if (const auto parsed =
+                            color_from_hex(window_text(hex_edit_))) {
+                        color_ = *parsed;
+                        hsv_ = rgb_to_hsv(color_);
+                        InvalidateRect(window_, nullptr, FALSE);
+                    }
+                    return 0;
+                }
+                if (id == kAcceptColor) {
+                    accept();
+                    return 0;
+                }
+                if (id == kCancelColor) {
+                    cancel();
+                    return 0;
+                }
+                break;
+            }
+            case WM_CLOSE:
+                cancel();
+                return 0;
+            case WM_NCDESTROY:
+                SetWindowLongPtrW(window_, GWLP_USERDATA, 0);
+                if (font_ != nullptr) {
+                    DeleteObject(font_);
+                    font_ = nullptr;
+                }
+                if (window_brush_ != nullptr) {
+                    DeleteObject(window_brush_);
+                    window_brush_ = nullptr;
+                }
+                if (edit_brush_ != nullptr) {
+                    DeleteObject(edit_brush_);
+                    edit_brush_ = nullptr;
+                }
+                return 0;
+        }
+        return DefWindowProcW(window_, message, wparam, lparam);
+    }
+
+    static LRESULT CALLBACK window_proc(HWND window, UINT message,
+                                        WPARAM wparam, LPARAM lparam) {
+        AccentColorPicker* self = nullptr;
+        if (message == WM_NCCREATE) {
+            auto* create = reinterpret_cast<CREATESTRUCTW*>(lparam);
+            self = static_cast<AccentColorPicker*>(create->lpCreateParams);
+            self->window_ = window;
+            SetWindowLongPtrW(
+                window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(self));
+        } else {
+            self = reinterpret_cast<AccentColorPicker*>(
+                GetWindowLongPtrW(window, GWLP_USERDATA));
+        }
+        return self != nullptr
+            ? self->handle(message, wparam, lparam)
+            : DefWindowProcW(window, message, wparam, lparam);
+    }
+
+    HWND owner_ = nullptr;
+    HWND window_ = nullptr;
+    HINSTANCE instance_ = nullptr;
+    UINT dpi_ = USER_DEFAULT_SCREEN_DPI;
+    bool owner_was_enabled_ = false;
+    bool accepted_ = false;
+    bool updating_edit_ = false;
+    bool dragging_saturation_value_ = false;
+    bool dragging_hue_ = false;
+    Palette palette_;
+    COLORREF color_ = RGB(255, 185, 60);
+    HsvColor hsv_;
+    HFONT font_ = nullptr;
+    HBRUSH window_brush_ = nullptr;
+    HBRUSH edit_brush_ = nullptr;
+    HWND hex_edit_ = nullptr;
+    HWND accept_ = nullptr;
+    HWND cancel_ = nullptr;
+};
+
+std::optional<COLORREF> choose_accent_color(HWND owner, COLORREF initial) {
+    AccentColorPicker picker;
+    return picker.show(owner, initial);
 }
 
 enum class DialogMode { create_archive, extract_archive, settings };
@@ -1544,10 +2188,13 @@ private:
         setting_combo(0, kThemeMode, kThemeModeNames, 180, 36, 260);
         setting_label(0, L"Accent color", 0, 84, 170);
         setting_combo(0, kAccentColorMode, kAccentColorNames, 180, 78, 260);
-        setting_label(0, L"Custom accent (hex)", 0, 126, 170);
+        setting_label(0, L"Custom accent", 0, 126, 170);
         setting_edit(0, kCustomAccentColor, 180, 120, 150);
-        setting_label(0, L"Use #RRGGBB when Accent color is set to Custom.",
-                      344, 126, 380, 32, true);
+        setting_control(0, L"BUTTON", L"Pick color...",
+                        WS_TABSTOP | BS_OWNERDRAW,
+                        kPickAccentColor, 340, 120, 110, 30);
+        setting_label(0, L"Pick a color or enter #RRGGBB; select Custom above to use it.",
+                      464, 126, 300, 38, true);
         setting_label(0, L"Button icons", 0, 168, 170);
         setting_combo(0, kToolbarIconStyle, kToolbarIconStyleNames, 180, 162, 260);
         setting_label(0, L"Startup location", 0, 210, 170);
@@ -1779,6 +2426,8 @@ private:
 
         add_dialog_tooltip(tooltip_, item(kCustomAccentColor),
                            L"Hexadecimal RGB color. Enter exactly #RRGGBB, for example #FFB93C.");
+        add_dialog_tooltip(tooltip_, item(kPickAccentColor),
+                           L"Open Axiom's accent color picker and select a custom RGB color.");
         add_dialog_tooltip(tooltip_, item(kStartupCustomPath),
                            L"Windows folder path used when Startup location is Custom.");
         add_dialog_tooltip(tooltip_, item(kBrowseStartupCustomPath),
@@ -3116,6 +3765,20 @@ private:
         }
     }
 
+    void pick_settings_accent_color() {
+        COLORREF initial = application_options.custom_accent_color;
+        if (const auto parsed =
+                color_from_hex(window_text(item(kCustomAccentColor)))) {
+            initial = *parsed;
+        }
+        if (const auto selected = choose_accent_color(window_, initial)) {
+            application_options.custom_accent_color = *selected;
+            set_window_text(item(kCustomAccentColor), color_to_hex(*selected));
+            set_selected_index(kAccentColorMode, 6);
+            InvalidateRect(item(kCustomAccentColor), nullptr, TRUE);
+        }
+    }
+
     bool browse_settings_path(int id) {
         int target = 0;
         std::optional<fs::path> selected;
@@ -4224,6 +4887,11 @@ private:
                 }
                 switch (id) {
                     case kBrowse: browse(); return 0;
+                    case kPickAccentColor:
+                        if (mode_ == DialogMode::settings) {
+                            pick_settings_accent_color();
+                        }
+                        return 0;
                     case kBrowseStartupCustomPath:
                     case kBrowseDefaultSigningKey:
                     case kBrowseArchiveOutputFolder:

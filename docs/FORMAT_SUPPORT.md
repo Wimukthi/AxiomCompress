@@ -10,11 +10,11 @@ commands that are safe for that format.
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---|
 | AXAR | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Estimated | Native format with encryption, recovery records, directly readable read-only split volumes, comments, locking, signatures, metadata, links, and SFX packaging. |
 | ZIP | Yes | Yes | Yes | Yes | Yes, plaintext only | Yes, plaintext only | Yes, plaintext only | Yes | Stored/Deflate ZIP archives, WinZip AES-256 creation, SFX, and standard split volumes. ZIP edits are atomic rewrites. Split sets are read-only. |
-| 7z | Windows | Windows | Windows | No | No | No | No | Yes | Read-only bundled 7-Zip backend. Encrypted 7z archives prompt for a password. |
-| RAR/RAR5 | Windows | Windows | Windows | No | No | No | No | Yes | Read-only bundled 7-Zip backend. RAR creation is intentionally unsupported. |
+| 7z | Windows | Windows | Windows | No | No | No | No | Yes | Read-only bundled `7z.dll` backend. Encrypted 7z archives prompt for a password; numbered split volumes are read as one logical stream. |
+| RAR/RAR5 | Windows | Windows | Windows | No | No | No | No | Yes | Read-only bundled `7z.dll` backend. RAR creation is intentionally unsupported. |
 | TAR family | Windows | Windows | Windows | No | No | No | No | No | Covers `.tar`, `.tar.gz`, `.tgz`, `.tar.xz`, `.txz`, `.tar.bz2`, `.tbz2`, `.tar.zst`, and `.tzst` when supported by Windows `tar.exe`. |
-| ISO | Windows | Windows | Windows | No | No | No | No | Partial | Native ISO9660/Joliet listing for fast browsing; bundled 7-Zip handles extraction/test and fallback cases. |
-| CAB | Windows | Windows | Windows | No | No | No | No | Partial | Read-only bundled 7-Zip backend. |
+| ISO | Windows | Windows | Windows | No | No | No | No | Partial | Native ISO9660/Joliet listing for fast browsing; hybrid/UDF media and fallback cases use the bundled `7z.dll` backend. |
+| CAB | Windows | Windows | Windows | No | No | No | No | Partial | Read-only bundled `7z.dll` backend. |
 
 ZIP stores exact compressed sizes per central-directory entry. AXAR uses solid
 blocks, so per-file Packed values are proportional estimates and the GUI marks
@@ -27,13 +27,13 @@ AXAR-only services: archive comments, locking, recovery records/recovery volumes
 signatures, encrypted names, and Axiom metadata. SFX packaging is supported for
 single-file ZIP archives.
 
-The Windows system provider is intentionally read-only. It uses a bundled 7-Zip
-console backend for 7z, RAR/RAR5, ISO, and CAB, and Windows `tar.exe` for TAR
-families. It uses signature checks where possible, falls back to extensions for
-wrapped/compressed TAR names, and routes extraction through a temporary staging
-directory before copying files into the requested destination. It does not
-provide comments, write operations, or fine-grained byte progress for these
-read-only formats.
+The Windows system provider is intentionally read-only. It loads the bundled
+`7z.dll` engine directly for 7z, RAR/RAR5, ISO/UDF, and CAB, and uses Windows
+`tar.exe` for TAR families. It uses signature checks where possible, falls back
+to extensions for wrapped/compressed TAR names, and routes extraction through a
+temporary staging directory before copying files into the requested destination.
+The DLL path exposes structured metadata and progress callbacks without a helper
+process. These formats do not provide comments or write operations.
 
 ## Full-support targets
 
@@ -80,10 +80,10 @@ taking in the first pass.
 
 | Format | First scope | Reason |
 |---|---|---|
-| 7z | Browse, extract, test | Implemented on Windows through the bundled 7-Zip backend. |
-| RAR | Browse, extract, test | Implemented on Windows through the bundled 7-Zip backend; creation remains proprietary and unsupported. |
-| ISO | Browse, extract/test | Browsing uses Axiom's native ISO9660/Joliet reader for immediate directory display. Extraction/test use the bundled 7-Zip backend. Creation is a separate authoring workflow. |
-| CAB | Browse, extract/test | Implemented on Windows through the bundled 7-Zip backend. |
+| 7z | Browse, extract, test | Implemented on Windows through the bundled `7z.dll` engine. Axiom consumes structured entry properties and progress callbacks directly; no helper process is launched. |
+| RAR | Browse, extract, test | Implemented on Windows through the bundled `7z.dll` engine; creation remains proprietary and unsupported. |
+| ISO | Browse, extract/test | Pure ISO9660/Joliet images use Axiom's native reader for immediate directory display. Hybrid images use their authoritative UDF catalog through the bundled `7z.dll` engine so bridge-only trees are not mistaken for the complete disc. Creation is a separate authoring workflow. |
+| CAB | Browse, extract/test | Implemented on Windows through the bundled `7z.dll` engine. |
 | GZip/BZip2/XZ single streams | Extract/test, optional create | These are compressed streams, not multi-file archives. Surface them as single-file operations or as TAR codecs. |
 
 ## GUI behavior

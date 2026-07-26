@@ -113,8 +113,11 @@ function Copy-BundledBackends {
         throw "Bundled 7-Zip backend was not found: $backendSource"
     }
     $backendDest = Join-Path $script:RepoRoot "out\$Configuration\backends\7zip"
+    if (Test-Path -LiteralPath $backendDest) {
+        Remove-Item -LiteralPath $backendDest -Recurse -Force
+    }
     New-Item -ItemType Directory -Force -Path $backendDest | Out-Null
-    foreach ($name in @("7z.exe", "7z.dll", "License.txt", "readme.txt")) {
+    foreach ($name in @("7z.dll", "License.txt", "readme.txt")) {
         Copy-Item -LiteralPath (Join-Path $backendSource $name) -Destination $backendDest -Force
     }
 }

@@ -38,8 +38,10 @@ if ($LASTEXITCODE -ne 0) {
 $BundledBackend = Join-Path $Root "third_party\7zip\win-x64"
 if (Test-Path -LiteralPath $BundledBackend) {
     $BackendOut = Join-Path $Root "out\$Configuration\backends\7zip"
+    if (Test-Path -LiteralPath $BackendOut) {
+        Remove-Item -LiteralPath $BackendOut -Recurse -Force
+    }
     New-Item -ItemType Directory -Force -Path $BackendOut | Out-Null
-    Copy-Item -LiteralPath (Join-Path $BundledBackend "7z.exe") -Destination $BackendOut -Force
     Copy-Item -LiteralPath (Join-Path $BundledBackend "7z.dll") -Destination $BackendOut -Force
     Copy-Item -LiteralPath (Join-Path $BundledBackend "License.txt") -Destination $BackendOut -Force
     Copy-Item -LiteralPath (Join-Path $BundledBackend "readme.txt") -Destination $BackendOut -Force

@@ -1,5 +1,5 @@
 #include "archive/system_provider.hpp"
-#include "core/windows_time.hpp"
+#include "archive/seven_zip_library.hpp"
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -11,7 +11,6 @@
 #include <array>
 #include <atomic>
 #include <cctype>
-#include <charconv>
 #include <cstdio>
 #include <cstdint>
 #include <ctime>
@@ -324,19 +323,6 @@ std::optional<fs::path> find_on_path(std::wstring_view executable_name) {
     return std::nullopt;
 }
 
-fs::path current_executable_directory() {
-    std::vector<wchar_t> buffer(MAX_PATH);
-    for (;;) {
-        const DWORD length = GetModuleFileNameW(nullptr, buffer.data(),
-                                                static_cast<DWORD>(buffer.size()));
-        if (length == 0) return {};
-        if (length < buffer.size() - 1) {
-            return fs::path(std::wstring(buffer.data(), buffer.data() + length)).parent_path();
-        }
-        buffer.resize(buffer.size() * 2);
-    }
-}
-
 std::optional<fs::path> system_tar_executable() {
     wchar_t system_dir[MAX_PATH]{};
     const UINT length = GetSystemDirectoryW(system_dir, MAX_PATH);
@@ -348,83 +334,16 @@ std::optional<fs::path> system_tar_executable() {
     return find_on_path(L"tar.exe");
 }
 
-std::optional<fs::path> system_7z_executable() {
-    static const std::optional<fs::path> cached = []() -> std::optional<fs::path> {
-        const fs::path exe_dir = current_executable_directory();
-        if (!exe_dir.empty()) {
-            for (const auto& root : {exe_dir, exe_dir.parent_path()}) {
-                if (auto bundled = path_if_exists(root / L"backends" / L"7zip" / L"7z.exe")) {
-                    return bundled;
-                }
-            }
-        }
-
-        const fs::path cwd = fs::current_path();
-        for (const auto& root : {cwd, cwd.parent_path()}) {
-            if (auto bundled = path_if_exists(root / L"third_party" / L"7zip" /
-                                              L"win-x64" / L"7z.exe")) {
-                return bundled;
-            }
-        }
-
-        return std::nullopt;
-    }();
-    return cached;
-}
-
 struct ProcessResult {
     DWORD exit_code = 0;
     std::string output;
 };
 
-struct ProcessProgressSpec {
-    OperationStage stage = OperationStage::reading;
-    std::uint64_t total_bytes = 0;
-    std::uint64_t total_items = 0;
-};
-
-std::optional<unsigned> latest_7z_percent(std::string_view output) {
-    const std::size_t marker = output.find_last_of('%');
-    if (marker == std::string_view::npos) return std::nullopt;
-    std::size_t start = marker;
-    while (start > 0 && output[start - 1] >= '0' && output[start - 1] <= '9') --start;
-    if (start == marker) return std::nullopt;
-    unsigned value = 0;
-    for (std::size_t index = start; index < marker; ++index) {
-        value = value * 10 + static_cast<unsigned>(output[index] - '0');
-    }
-    return value <= 100 ? std::optional<unsigned>(value) : std::nullopt;
-}
-
-std::string latest_7z_path(std::string_view output) {
-    const std::size_t marker = output.find_last_of('%');
-    if (marker == std::string_view::npos) return {};
-    std::size_t end = output.find_first_of("\r\n\b", marker + 1);
-    if (end == std::string_view::npos) end = output.size();
-    std::string_view suffix = output.substr(marker + 1, end - marker - 1);
-    std::size_t path = suffix.find(" T ");
-    if (path != std::string_view::npos) {
-        suffix.remove_prefix(path + 3);
-    } else if ((path = suffix.find(" - ")) != std::string_view::npos) {
-        suffix.remove_prefix(path + 3);
-    } else {
-        return {};
-    }
-    while (!suffix.empty() && std::isspace(static_cast<unsigned char>(suffix.front()))) {
-        suffix.remove_prefix(1);
-    }
-    while (!suffix.empty() && std::isspace(static_cast<unsigned char>(suffix.back()))) {
-        suffix.remove_suffix(1);
-    }
-    return std::string(suffix);
-}
-
 ProcessResult run_process(const fs::path& executable,
                           const std::vector<std::wstring>& arguments,
                           bool capture_stdout,
                           const std::shared_ptr<OperationControl>& operation,
-                          std::string_view tool_name,
-                          std::optional<ProcessProgressSpec> progress_spec = std::nullopt) {
+                          std::string_view tool_name) {
     SECURITY_ATTRIBUTES security{};
     security.nLength = sizeof(security);
     security.bInheritHandle = TRUE;
@@ -492,7 +411,6 @@ ProcessResult run_process(const fs::path& executable,
         try {
             std::array<char, 64 * 1024> buffer{};
             DWORD read = 0;
-            unsigned last_percent = 101;
             while (ReadFile(read_pipe, buffer.data(), static_cast<DWORD>(buffer.size()),
                             &read, nullptr) && read != 0) {
                 if (output.size() + read > (64u << 20)) {
@@ -501,23 +419,6 @@ ProcessResult run_process(const fs::path& executable,
                     break;
                 }
                 output.append(buffer.data(), buffer.data() + read);
-                if (operation && progress_spec) {
-                    const std::size_t tail_start = output.size() > 4096
-                        ? output.size() - 4096 : 0;
-                    const std::string_view tail =
-                        std::string_view(output).substr(tail_start);
-                    if (const auto percent = latest_7z_percent(tail);
-                        percent && *percent != last_percent) {
-                        last_percent = *percent;
-                        report_operation(
-                            operation, progress_spec->stage,
-                            progress_spec->total_bytes * *percent / 100,
-                            progress_spec->total_bytes,
-                            progress_spec->total_items * *percent / 100,
-                            progress_spec->total_items,
-                            latest_7z_path(tail));
-                    }
-                }
             }
         } catch (...) {
             reader_failure = std::current_exception();
@@ -560,26 +461,8 @@ ProcessResult run_tar(const std::vector<std::wstring>& arguments,
     return run_process(*executable, arguments, capture_stdout, operation, "Windows tar.exe");
 }
 
-ProcessResult run_7z(const std::vector<std::wstring>& arguments,
-                     bool capture_stdout,
-                     const std::shared_ptr<OperationControl>& operation,
-                     std::optional<ProcessProgressSpec> progress_spec = std::nullopt) {
-    const auto executable = system_7z_executable();
-    if (!executable) {
-        throw std::runtime_error("Axiom's bundled 7-Zip backend was not found");
-    }
-    return run_process(*executable, arguments, capture_stdout, operation, "7-Zip",
-                       progress_spec);
-}
-
 std::runtime_error tar_error(std::string action, const ProcessResult& result) {
     std::string message = "system archive reader failed while " + std::move(action);
-    if (!result.output.empty()) message += ": " + result.output;
-    return std::runtime_error(message);
-}
-
-std::runtime_error seven_zip_error(std::string action, const ProcessResult& result) {
-    std::string message = "7-Zip backend failed while " + std::move(action);
     if (!result.output.empty()) message += ": " + result.output;
     return std::runtime_error(message);
 }
@@ -609,73 +492,6 @@ std::string trim_copy(std::string text) {
     }
     return text;
 }
-
-std::string_view trim_view(std::string_view text) {
-    while (!text.empty() && std::isspace(static_cast<unsigned char>(text.front()))) {
-        text.remove_prefix(1);
-    }
-    while (!text.empty() && std::isspace(static_cast<unsigned char>(text.back()))) {
-        text.remove_suffix(1);
-    }
-    return text;
-}
-
-std::optional<std::uint64_t> parse_u64(std::string_view text) {
-    text = trim_view(text);
-    if (text.empty()) return std::nullopt;
-    std::uint64_t value = 0;
-    const auto parsed = std::from_chars(text.data(), text.data() + text.size(), value, 10);
-    return parsed.ec == std::errc{} && parsed.ptr == text.data() + text.size()
-        ? std::optional<std::uint64_t>{value}
-        : std::nullopt;
-}
-
-std::optional<std::uint32_t> parse_hex_u32(std::string_view text) {
-    text = trim_view(text);
-    if (text.empty()) return std::nullopt;
-    std::uint32_t value = 0;
-    const auto parsed = std::from_chars(text.data(), text.data() + text.size(), value, 16);
-    return parsed.ec == std::errc{} && parsed.ptr == text.data() + text.size()
-        ? std::optional<std::uint32_t>{value}
-        : std::nullopt;
-}
-
-bool parse_fixed_decimal(std::string_view text, std::size_t offset,
-                         std::size_t length, WORD& result) {
-    if (offset + length > text.size()) return false;
-    unsigned value = 0;
-    for (std::size_t index = offset; index < offset + length; ++index) {
-        const char character = text[index];
-        if (character < '0' || character > '9') return false;
-        value = value * 10u + static_cast<unsigned>(character - '0');
-    }
-    if (value > std::numeric_limits<WORD>::max()) return false;
-    result = static_cast<WORD>(value);
-    return true;
-}
-
-struct SevenZipTimeCache {
-    core::LocalTimeConverter converter;
-
-    std::int64_t to_unix(std::string_view text) {
-        text = trim_view(text);
-        if (text.size() < 19 || text[4] != '-' || text[7] != '-' || text[10] != ' ' ||
-            text[13] != ':' || text[16] != ':') {
-            return 0;
-        }
-        SYSTEMTIME local{};
-        if (!parse_fixed_decimal(text, 0, 4, local.wYear) ||
-            !parse_fixed_decimal(text, 5, 2, local.wMonth) ||
-            !parse_fixed_decimal(text, 8, 2, local.wDay) ||
-            !parse_fixed_decimal(text, 11, 2, local.wHour) ||
-            !parse_fixed_decimal(text, 14, 2, local.wMinute) ||
-            !parse_fixed_decimal(text, 17, 2, local.wSecond)) {
-            return 0;
-        }
-
-        return converter.local_to_unix(local);
-    }
-};
 
 std::optional<ArchiveEntry> parse_verbose_line(const std::string& line) {
     std::array<std::string_view, 8> fields{};
@@ -717,142 +533,6 @@ std::optional<ArchiveEntry> parse_verbose_line(const std::string& line) {
         throw FormatError("archive contains an unsafe path: " + entry.path);
     }
     return entry;
-}
-
-struct SevenZipEntryFields {
-    std::string_view path;
-    std::string_view size;
-    std::string_view packed_size;
-    std::string_view modified;
-    std::string_view attributes;
-    std::string_view crc;
-    std::string_view encrypted;
-    std::string_view folder;
-    std::string_view symlink;
-};
-
-std::string normalize_7z_path(std::string_view source) {
-    source = trim_view(source);
-    std::string path(source);
-    std::replace(path.begin(), path.end(), '\\', '/');
-    while (path.size() > 1 && path.back() == '/') path.pop_back();
-    return path;
-}
-
-void assign_7z_field(SevenZipEntryFields& fields,
-                     std::string_view key,
-                     std::string_view value) {
-    key = trim_view(key);
-    value = trim_view(value);
-    if (key == "Path") fields.path = value;
-    else if (key == "Size") fields.size = value;
-    else if (key == "Packed Size") fields.packed_size = value;
-    else if (key == "Modified") fields.modified = value;
-    else if (key == "Attributes") fields.attributes = value;
-    else if (key == "CRC") fields.crc = value;
-    else if (key == "Encrypted") fields.encrypted = value;
-    else if (key == "Folder") fields.folder = value;
-    else if (key == "Symbolic Link") fields.symlink = value;
-}
-
-std::optional<ArchiveEntry> archive_entry_from_7z_fields(const SevenZipEntryFields& fields,
-                                                         bool* encrypted,
-                                                         SevenZipTimeCache& time_cache) {
-    if (encrypted != nullptr && trim_view(fields.encrypted) == "+") {
-        *encrypted = true;
-    }
-    std::string path = normalize_7z_path(fields.path);
-    if (path.empty()) return std::nullopt;
-
-    ArchiveEntry entry;
-    entry.path = std::move(path);
-    entry.is_directory = trim_view(fields.folder) == "+" ||
-                         fields.attributes.find('D') != std::string::npos;
-    entry.is_symlink = !fields.symlink.empty();
-    entry.link_target.assign(fields.symlink);
-    if (auto size = parse_u64(fields.size)) entry.size = *size;
-    if (auto packed = parse_u64(fields.packed_size)) entry.packed_size = *packed;
-    if (auto crc = parse_hex_u32(fields.crc)) {
-        entry.crc32 = *crc;
-        entry.has_crc32 = true;
-    }
-    entry.mtime = time_cache.to_unix(fields.modified);
-    if (!is_safe_relative(entry.path)) {
-        throw FormatError("archive contains an unsafe path: " + entry.path);
-    }
-    return entry;
-}
-
-std::vector<ArchiveEntry> parse_7z_slt_listing(std::string_view output,
-                                               bool* any_encrypted = nullptr) {
-    std::vector<ArchiveEntry> entries;
-    entries.reserve(output.size() / 192u);
-    SevenZipTimeCache time_cache;
-    SevenZipEntryFields current;
-    bool in_entries = false;
-    bool have_current = false;
-
-    auto commit = [&]() {
-        if (!have_current) return;
-        auto entry = archive_entry_from_7z_fields(current, any_encrypted, time_cache);
-        if (entry) entries.push_back(std::move(*entry));
-        current = SevenZipEntryFields{};
-        have_current = false;
-    };
-
-    std::size_t start = 0;
-    while (start <= output.size()) {
-        std::size_t end = output.find('\n', start);
-        if (end == std::string_view::npos) end = output.size();
-        std::string_view line = output.substr(start, end - start);
-        while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) {
-            line.remove_suffix(1);
-        }
-        const std::string_view trimmed = trim_view(line);
-        if (!in_entries) {
-            if (trimmed == "----------") in_entries = true;
-        } else if (!trimmed.empty()) {
-            const std::size_t separator = line.find(" = ");
-            if (separator != std::string::npos) {
-                const std::string_view key = line.substr(0, separator);
-                const std::string_view value = line.substr(separator + 3);
-                if (trim_view(key) == "Path") {
-                    commit();
-                    have_current = true;
-                }
-                if (have_current) assign_7z_field(current, key, value);
-            }
-        }
-        if (end == output.size()) break;
-        start = end + 1;
-    }
-    commit();
-    return entries;
-}
-
-bool seven_zip_listing_reports_encryption(std::string_view output) {
-    std::size_t start = 0;
-    while (start <= output.size()) {
-        std::size_t end = output.find('\n', start);
-        if (end == std::string_view::npos) end = output.size();
-        std::string_view line = output.substr(start, end - start);
-        while (!line.empty() && (line.back() == '\r' || line.back() == '\n' ||
-                                 line.back() == ' ' || line.back() == '\t')) {
-            line.remove_suffix(1);
-        }
-        while (!line.empty() && (line.front() == ' ' || line.front() == '\t')) {
-            line.remove_prefix(1);
-        }
-        constexpr std::string_view key = "Encrypted = ";
-        if (line.size() >= key.size() &&
-            line.substr(0, key.size()) == key &&
-            line.substr(key.size()).find('+') != std::string_view::npos) {
-            return true;
-        }
-        if (end == output.size()) break;
-        start = end + 1;
-    }
-    return false;
 }
 
 bool seven_zip_error_indicates_encrypted(std::string text) {
@@ -1006,6 +686,45 @@ bool is_joliet_descriptor(const std::vector<std::uint8_t>& descriptor) {
            (descriptor[90] == '@' || descriptor[90] == 'C' || descriptor[90] == 'E');
 }
 
+bool iso_contains_udf_volume(std::ifstream& stream, std::uint64_t file_size) {
+    // Hybrid installation media commonly carries both a small ISO9660 bridge
+    // tree and the authoritative UDF tree. A successful ISO9660 parse is not
+    // evidence that the result is complete: Microsoft media, for example, can
+    // expose only a README through the bridge. Recognize the ordered ECMA-167
+    // Volume Recognition Sequence so list() can select the bundled UDF reader.
+    bool saw_begin = false;
+    bool saw_namespace = false;
+    for (std::uint32_t sector = 16;
+         sector < 256 && iso_byte_offset(sector + 1) <= file_size;
+         ++sector) {
+        const auto descriptor = read_iso_bytes(stream, file_size,
+                                               iso_byte_offset(sector),
+                                               kIsoSectorSize);
+        const std::string_view identifier(
+            reinterpret_cast<const char*>(descriptor.data() + 1), 5);
+        if (identifier == "BEA01") {
+            saw_begin = true;
+            saw_namespace = false;
+        } else if (saw_begin &&
+                   (identifier == "NSR02" || identifier == "NSR03")) {
+            saw_namespace = true;
+        } else if (saw_namespace && identifier == "TEA01") {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool iso_contains_udf_volume(const fs::path& archive_path) {
+    std::ifstream stream(archive_path, std::ios::binary);
+    if (!stream) throw std::runtime_error("could not open ISO image");
+
+    stream.seekg(0, std::ios::end);
+    const auto signed_size = stream.tellg();
+    if (signed_size < 0) throw std::runtime_error("could not determine ISO image size");
+    return iso_contains_udf_volume(stream, static_cast<std::uint64_t>(signed_size));
+}
+
 IsoVolume read_iso_volume(std::ifstream& stream, std::uint64_t file_size) {
     std::optional<IsoVolume> primary;
     std::optional<IsoVolume> joliet;
@@ -1127,36 +846,29 @@ std::vector<ArchiveEntry> list_iso_native(const fs::path& archive_path) {
     return entries;
 }
 
-std::wstring seven_zip_password_argument(const std::string& password) {
-    std::wstring argument = L"-p";
-    argument += utf8_to_wide(password);
-    return argument;
-}
-
-std::vector<std::wstring> seven_zip_list_arguments(const fs::path& archive_path,
-                                                   const std::string& password) {
-    return {L"l", L"-slt", L"-sccUTF-8",
-            seven_zip_password_argument(password), archive_path.wstring()};
-}
-
-struct SevenZipListCacheEntry {
+struct SevenZipLibraryCacheEntry {
     fs::path path;
     std::uintmax_t file_size = 0;
     fs::file_time_type modified{};
-    std::shared_ptr<const ProcessResult> result;
+    ArchiveFormat format = ArchiveFormat::seven_z;
+    bool prefer_udf = false;
+    std::shared_ptr<const SevenZipCatalog> catalog;
 };
 
-std::mutex& seven_zip_list_cache_mutex() {
+std::mutex& seven_zip_library_cache_mutex() {
     static std::mutex mutex;
     return mutex;
 }
 
-std::optional<SevenZipListCacheEntry>& seven_zip_list_cache() {
-    static std::optional<SevenZipListCacheEntry> cache;
+std::optional<SevenZipLibraryCacheEntry>& seven_zip_library_cache() {
+    static std::optional<SevenZipLibraryCacheEntry> cache;
     return cache;
 }
 
-std::optional<SevenZipListCacheEntry> seven_zip_cache_key(const fs::path& archive_path) {
+std::optional<SevenZipLibraryCacheEntry> seven_zip_library_cache_key(
+    const fs::path& archive_path,
+    ArchiveFormat format,
+    bool prefer_udf) {
     std::error_code ec;
     fs::path absolute = fs::absolute(archive_path, ec);
     if (ec) absolute = archive_path;
@@ -1164,44 +876,55 @@ std::optional<SevenZipListCacheEntry> seven_zip_cache_key(const fs::path& archiv
     if (ec) return std::nullopt;
     const auto modified = fs::last_write_time(archive_path, ec);
     if (ec) return std::nullopt;
-    SevenZipListCacheEntry key;
+    SevenZipLibraryCacheEntry key;
     key.path = absolute.lexically_normal();
     key.file_size = file_size;
     key.modified = modified;
+    key.format = format;
+    key.prefer_udf = prefer_udf;
     return key;
 }
 
-bool same_seven_zip_cache_key(const SevenZipListCacheEntry& left,
-                              const SevenZipListCacheEntry& right) {
+bool same_seven_zip_library_cache_key(
+    const SevenZipLibraryCacheEntry& left,
+    const SevenZipLibraryCacheEntry& right) {
     return left.path == right.path &&
            left.file_size == right.file_size &&
-           left.modified == right.modified;
+           left.modified == right.modified &&
+           left.format == right.format &&
+           left.prefer_udf == right.prefer_udf;
 }
 
-std::shared_ptr<const ProcessResult> run_7z_list_cached(const fs::path& archive_path,
-                                                        const std::string& password) {
+std::shared_ptr<const SevenZipCatalog> list_with_seven_zip_library_cached(
+    const fs::path& archive_path,
+    ArchiveFormat format,
+    bool prefer_udf,
+    const std::string& password) {
     if (!password.empty()) {
-        return std::make_shared<const ProcessResult>(
-            run_7z(seven_zip_list_arguments(archive_path, password), true, nullptr));
+        return std::make_shared<const SevenZipCatalog>(
+            seven_zip_library_list(
+                archive_path, format, prefer_udf, password));
     }
 
-    auto key = seven_zip_cache_key(archive_path);
+    auto key = seven_zip_library_cache_key(
+        archive_path, format, prefer_udf);
     if (key) {
-        std::scoped_lock lock(seven_zip_list_cache_mutex());
-        const auto& cache = seven_zip_list_cache();
-        if (cache && same_seven_zip_cache_key(*cache, *key)) {
-            return cache->result;
+        std::scoped_lock lock(seven_zip_library_cache_mutex());
+        const auto& cache = seven_zip_library_cache();
+        if (cache && same_seven_zip_library_cache_key(*cache, *key)) {
+            return cache->catalog;
         }
     }
 
-    auto result = std::make_shared<const ProcessResult>(
-        run_7z(seven_zip_list_arguments(archive_path, password), true, nullptr));
+    auto catalog = std::make_shared<const SevenZipCatalog>(
+        seven_zip_library_list(
+            archive_path, format, prefer_udf, password));
     if (key) {
-        key->result = result;
-        std::scoped_lock lock(seven_zip_list_cache_mutex());
-        seven_zip_list_cache() = std::move(*key);
+        key->catalog = catalog;
+        std::scoped_lock lock(seven_zip_library_cache_mutex());
+        seven_zip_library_cache() = std::move(*key);
     }
-    return result;
+    return catalog;
 }
 
 bool selected_entry(const ArchiveEntry& entry, const std::vector<std::string>& wanted) {
@@ -1294,11 +1017,16 @@ public:
             return result;
         }
 
-        const auto listed = run_7z_list_cached(archive_path, password);
-        if (listed->exit_code == 0) {
-            result.encrypted = seven_zip_listing_reports_encryption(listed->output);
-            result.directory_encrypted = false;
-        } else if (seven_zip_error_indicates_encrypted(listed->output)) {
+        try {
+            const auto catalog = list_with_seven_zip_library_cached(
+                archive_path, info_.format,
+                prefers_udf_catalog(archive_path), password);
+            result.encrypted = catalog->encrypted;
+            result.directory_encrypted = catalog->directory_encrypted;
+        } catch (const std::exception& error) {
+            if (!seven_zip_error_indicates_encrypted(error.what())) {
+                return result;
+            }
             result.encrypted = true;
             result.directory_encrypted = true;
         }
@@ -1308,11 +1036,23 @@ public:
     std::vector<ArchiveEntry> list(const fs::path& archive_path,
                                    const std::string& password) const override {
         if (info_.format == ArchiveFormat::iso) {
-            try {
-                auto entries = list_iso_native(archive_path);
-                if (!entries.empty() || !use_7z_backend()) return entries;
-            } catch (...) {
-                if (!use_7z_backend()) throw;
+            const bool has_7z = use_7z_backend();
+            bool prefer_udf_catalog = false;
+            if (has_7z) {
+                try {
+                    prefer_udf_catalog = iso_contains_udf_volume(archive_path);
+                } catch (...) {
+                    // The native catalog attempt below preserves the previous
+                    // error/fallback behavior for unreadable or unusual media.
+                }
+            }
+            if (!prefer_udf_catalog) {
+                try {
+                    auto entries = list_iso_native(archive_path);
+                    if (!entries.empty() || !has_7z) return entries;
+                } catch (...) {
+                    if (!has_7z) throw;
+                }
             }
         }
 
@@ -1320,13 +1060,10 @@ public:
             throw std::runtime_error("7-Zip backend is required for this archive format");
         }
         if (use_7z_backend()) {
-            const auto result = run_7z_list_cached(archive_path, password);
-            if (result->exit_code != 0) throw seven_zip_error("listing", *result);
-            auto entries = parse_7z_slt_listing(result->output);
-            if (entries.empty() && !result->output.empty()) {
-                throw FormatError("7-Zip archive listing could not be parsed");
-            }
-            return entries;
+            return list_with_seven_zip_library_cached(
+                       archive_path, info_.format,
+                       prefers_udf_catalog(archive_path), password)
+                ->entries;
         }
 
         const auto result = run_tar({L"-tvf", archive_path.wstring()}, true, nullptr);
@@ -1350,12 +1087,10 @@ public:
             throw std::runtime_error("7-Zip backend is required for this archive format");
         }
         if (use_7z_backend()) {
-            const auto result = run_7z({L"t", L"-y", L"-sccUTF-8", L"-bsp1",
-                                        seven_zip_password_argument(options.password),
-                                        archive_path.wstring()},
-                                       true, options.operation,
-                                       ProcessProgressSpec{OperationStage::testing, 0, 100});
-            if (result.exit_code != 0) throw seven_zip_error("testing", result);
+            seven_zip_library_test(
+                archive_path, info_.format,
+                prefers_udf_catalog(archive_path),
+                options.password, options.operation);
         } else {
             const auto result = run_tar({L"-tf", archive_path.wstring()}, false,
                                         options.operation);
@@ -1405,7 +1140,16 @@ public:
 
 private:
     bool use_7z_backend() const {
-        return prefer_7z_ && system_7z_executable().has_value();
+        return prefer_7z_ && seven_zip_library_available();
+    }
+
+    bool prefers_udf_catalog(const fs::path& archive_path) const {
+        if (info_.format != ArchiveFormat::iso) return false;
+        try {
+            return iso_contains_udf_volume(archive_path);
+        } catch (...) {
+            return false;
+        }
     }
 
     void extract_matching(const fs::path& archive_path,
@@ -1455,7 +1199,7 @@ private:
         std::vector<std::wstring> arguments;
         fs::path selection_file;
         std::unique_ptr<TempFileGuard> selection_guard;
-        if (!wanted.empty()) {
+        if (!wanted.empty() && !use_7z_backend()) {
             std::vector<std::string> names;
             names.reserve(selected.size());
             for (const auto& entry : selected) names.push_back(entry.path);
@@ -1465,17 +1209,16 @@ private:
         }
 
         if (use_7z_backend()) {
-            arguments = {L"x", L"-y", L"-sccUTF-8", L"-bsp1",
-                         seven_zip_password_argument(options.password),
-                         L"-o" + staging.path().wstring(), archive_path.wstring()};
-            if (!selection_file.empty()) {
-                arguments.push_back(L"-scsUTF-8");
-                arguments.push_back(L"@" + selection_file.wstring());
+            std::vector<std::string> selected_paths;
+            selected_paths.reserve(selected.size());
+            for (const auto& entry : selected) {
+                selected_paths.push_back(entry.path);
             }
-            const auto result = run_7z(
-                arguments, true, options.operation,
-                ProcessProgressSpec{OperationStage::extracting, total_bytes, 0});
-            if (result.exit_code != 0) throw seven_zip_error("extracting", result);
+            seven_zip_library_extract(
+                archive_path, info_.format,
+                prefers_udf_catalog(archive_path),
+                selected_paths, staging.path(), options.password,
+                options.operation, total_bytes, selected.size());
         } else {
             arguments = {L"-xf", archive_path.wstring(), L"-C", staging.path().wstring()};
             if (!selection_file.empty()) {
