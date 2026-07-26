@@ -12,12 +12,11 @@
 #include <gdiplus.h>
 #include <new>
 #include <string>
-#include <uxtheme.h>
+#include <wimukthi/win32_theme.hpp>
 
 namespace axiom::gui {
 namespace {
 
-constexpr DWORD kOlderImmersiveDarkMode = 19;
 constexpr UINT_PTR kDarkComboSubclass = 1;
 constexpr UINT_PTR kModalOwnerSubclass = 2;
 constexpr UINT_PTR kTypedInputSubclass = 3;
@@ -213,9 +212,7 @@ LRESULT CALLBACK modal_owner_subclass_proc(HWND window, UINT message,
 }
 
 bool high_contrast_enabled() {
-    HIGHCONTRASTW contrast{sizeof(contrast)};
-    return SystemParametersInfoW(SPI_GETHIGHCONTRAST, sizeof(contrast), &contrast, 0) &&
-           (contrast.dwFlags & HCF_HIGHCONTRASTON) != 0;
+    return wimukthi::win32_theme::is_high_contrast();
 }
 
 COLORREF blend_color(COLORREF base, COLORREF overlay, int overlay_percent) {
@@ -424,7 +421,6 @@ bool read_window_placement(std::wstring_view name, WINDOWPLACEMENT& placement,
 void apply_combo_child_theme(HWND combo, bool dark) {
     COMBOBOXINFO info{sizeof(info)};
     if (!GetComboBoxInfo(combo, &info)) return;
-    const wchar_t* theme = dark ? L"DarkMode_Explorer" : nullptr;
     if (dark) {
         strip_light_control_edges(combo);
     } else {
@@ -432,11 +428,11 @@ void apply_combo_child_theme(HWND combo, bool dark) {
     }
     if (info.hwndList != nullptr) {
         if (dark) {
-            SetWindowTheme(info.hwndList, theme, nullptr);
+            wimukthi::win32_theme::apply_control(info.hwndList, nullptr);
             strip_light_control_edges(info.hwndList);
         } else {
             restore_control_edges(info.hwndList);
-            SetWindowTheme(info.hwndList, theme, nullptr);
+            wimukthi::win32_theme::apply_control(info.hwndList, nullptr);
         }
         if (IsWindowVisible(info.hwndList)) {
             RedrawWindow(info.hwndList, nullptr, nullptr,
@@ -446,11 +442,11 @@ void apply_combo_child_theme(HWND combo, bool dark) {
     }
     if (info.hwndItem != nullptr && info.hwndItem != combo) {
         if (dark) {
-            SetWindowTheme(info.hwndItem, theme, nullptr);
+            wimukthi::win32_theme::apply_control(info.hwndItem, nullptr);
             strip_light_control_edges(info.hwndItem);
         } else {
             restore_control_edges(info.hwndItem);
-            SetWindowTheme(info.hwndItem, theme, nullptr);
+            wimukthi::win32_theme::apply_control(info.hwndItem, nullptr);
         }
         if (IsWindowVisible(info.hwndItem)) {
             RedrawWindow(info.hwndItem, nullptr, nullptr,
@@ -796,16 +792,61 @@ SIZE dialog_window_size_for_client(int logical_width, int logical_height,
 }
 
 bool dialog_system_prefers_dark_mode() {
-    if (high_contrast_enabled()) {
-        return false;
-    }
-    DWORD value = 1;
-    DWORD size = sizeof(value);
-    const LSTATUS status = RegGetValueW(
-        HKEY_CURRENT_USER,
-        L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
-        L"AppsUseLightTheme", RRF_RT_REG_DWORD, nullptr, &value, &size);
-    return status == ERROR_SUCCESS && value == 0;
+    return wimukthi::win32_theme::system_prefers_dark();
+}
+
+bool dialog_high_contrast_enabled() {
+    return wimukthi::win32_theme::is_high_contrast();
+}
+
+namespace {
+
+void configure_windows_theme() {
+    using namespace wimukthi::win32_theme;
+
+    const bool palette_dark =
+        g_dialog_appearance.theme_mode == 1 ||
+        (g_dialog_appearance.theme_mode == 0 && system_prefers_dark());
+    const DialogColors colors = dialog_colors(palette_dark);
+    const COLORREF hot_background =
+        blend_color(colors.control_background, colors.focus_border,
+                    palette_dark ? 12 : 8);
+
+    Configuration configuration;
+    configuration.mode =
+        g_dialog_appearance.theme_mode == 1 ? Mode::dark
+        : g_dialog_appearance.theme_mode == 2 ? Mode::light
+                                               : Mode::system;
+    configuration.use_custom_palette = !is_high_contrast();
+    configuration.palette = {
+        colors.background,
+        colors.control_background,
+        hot_background,
+        colors.background,
+        palette_dark ? RGB(82, 38, 38) : RGB(255, 240, 240),
+        colors.text,
+        colors.disabled_text,
+        colors.disabled_text,
+        colors.focus_border,
+        colors.border,
+        colors.focus_border,
+        colors.border,
+        colors.selection_background,
+        colors.control_background,
+        colors.text,
+        colors.border,
+        colors.control_background,
+        hot_background,
+        colors.text,
+        colors.border,
+    };
+    configure(configuration);
+}
+
+}  // namespace
+
+bool handle_dialog_theme_setting_change(LPARAM lparam) {
+    return wimukthi::win32_theme::handle_setting_change(lparam);
 }
 
 void set_dialog_appearance(const DialogAppearance& appearance) {
@@ -814,6 +855,7 @@ void set_dialog_appearance(const DialogAppearance& appearance) {
     g_dialog_appearance.accent_color_mode =
         std::clamp(g_dialog_appearance.accent_color_mode, 0, 6);
     g_dialog_appearance.icon_style = std::clamp(g_dialog_appearance.icon_style, 0, 2);
+    configure_windows_theme();
 }
 
 DialogAppearance dialog_appearance() {
@@ -821,9 +863,8 @@ DialogAppearance dialog_appearance() {
 }
 
 bool dialog_should_use_dark() {
-    if (g_dialog_appearance.theme_mode == 1) return true;
-    if (g_dialog_appearance.theme_mode == 2) return false;
-    return dialog_system_prefers_dark_mode();
+    configure_windows_theme();
+    return wimukthi::win32_theme::is_dark();
 }
 
 COLORREF resolve_dialog_accent_color(int mode, COLORREF custom_color) {
@@ -862,11 +903,9 @@ int dialog_icon_style() {
 }
 
 void apply_dialog_dark_frame(HWND window, bool dark) {
-    BOOL enabled = dark ? TRUE : FALSE;
-    constexpr DWORD immersive_dark_mode = 20;
-    if (FAILED(DwmSetWindowAttribute(window, immersive_dark_mode, &enabled, sizeof(enabled)))) {
-        DwmSetWindowAttribute(window, kOlderImmersiveDarkMode, &enabled, sizeof(enabled));
-    }
+    (void)dark;
+    configure_windows_theme();
+    wimukthi::win32_theme::apply_title_bar(window);
 }
 
 void apply_dialog_control_theme(HWND control, bool dark) {
@@ -877,26 +916,25 @@ void apply_dialog_control_theme(HWND control, bool dark) {
         const bool combo_box = lstrcmpiW(class_name, L"ComboBox") == 0;
         if (combo_box) {
             if (dark) {
-                SetWindowTheme(control, L"", L"");
+                wimukthi::win32_theme::apply_theme_class(control, L"", nullptr);
                 SetWindowSubclass(control, dark_combo_subclass_proc,
                                   kDarkComboSubclass, 1);
                 apply_combo_child_theme(control, true);
             } else {
                 // Remove the custom painter before resetting the native theme.
-                // SetWindowTheme synchronously sends WM_THEMECHANGED; leaving
-                // the subclass installed lets it paint one final dark frame
-                // over the restored light combo.
+                // Resetting the native theme synchronously sends
+                // WM_THEMECHANGED. Remove the custom painter first so it cannot
+                // paint one final dark frame over the restored light combo.
                 SendMessageW(control, CB_SHOWDROPDOWN, FALSE, 0);
                 RemoveWindowSubclass(control, dark_combo_subclass_proc,
                                      kDarkComboSubclass);
                 RemovePropW(control, kDarkComboHotProperty);
                 RemovePropW(control, kDarkComboTrackingProperty);
                 apply_combo_child_theme(control, false);
-                SetWindowTheme(control, nullptr, nullptr);
+                wimukthi::win32_theme::apply_theme_class(control, L"", nullptr);
             }
         } else {
-            SetWindowTheme(control, dark ? L"DarkMode_Explorer" : nullptr,
-                           nullptr);
+            wimukthi::win32_theme::apply_control(control);
         }
         if (IsWindowVisible(control)) {
             RedrawWindow(control, nullptr, nullptr,

@@ -14,6 +14,10 @@
 #define Platform "x64"
 #endif
 
+#ifndef ThemeRoot
+#define ThemeRoot "..\..\Wimukthi.Win32Theme"
+#endif
+
 #define AppName "Axiom"
 #define AppPublisher "Wimukthi Bandara"
 #define SourceRoot ".."
@@ -61,7 +65,13 @@ Source: "{#SourceRoot}\CLI_GUIDE.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceRoot}\ARCHITECTURE.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceRoot}\FORMAT.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceRoot}\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#SourceRoot}\THIRD_PARTY_NOTICES.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceRoot}\docs\*"; DestDir: "{app}\docs"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{#ThemeRoot}\LICENSE"; DestDir: "{app}\licenses"; DestName: "Wimukthi.Win32Theme-LICENSE.txt"; Flags: ignoreversion
+Source: "{#ThemeRoot}\THIRD_PARTY_NOTICES.md"; DestDir: "{app}\licenses"; DestName: "Wimukthi.Win32Theme-NOTICES.md"; Flags: ignoreversion
+Source: "{#ThemeRoot}\third_party\darkmodelib\LICENSE.md"; DestDir: "{app}\licenses"; DestName: "Darkmodelib-MPL-2.0.txt"; Flags: ignoreversion
+Source: "{#ThemeRoot}\third_party\darkmodelib\LICENSE-MIT.md"; DestDir: "{app}\licenses"; DestName: "Darkmodelib-MIT.txt"; Flags: ignoreversion
+Source: "{#ThemeRoot}\third_party\darkmodelib\*"; DestDir: "{app}\licenses\source\darkmodelib"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
 Name: "{group}\Axiom"; Filename: "{app}\Axiom.exe"; WorkingDir: "{app}"

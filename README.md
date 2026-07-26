@@ -61,7 +61,8 @@ Most users need one of these paths:
 
 Open `AxiomCompress.sln` in Visual Studio and build `Release|x64`.
 The checked-in Visual Studio projects target the installed Visual C++ toolset
-`v145`.
+`v145`. On Windows, keep the `Wimukthi.Win32Theme` repository beside
+`AxiomCompress`; the GUI project imports its property sheet.
 
 From PowerShell:
 
@@ -75,6 +76,10 @@ Or use the helper scripts:
 .\tools\build_msvc.ps1 -Configuration Release
 .\tools\test_msvc.ps1 -Configuration Release
 ```
+
+Use `-ThemeRoot <path>` with either helper, or pass the MSBuild property
+`/p:WimukthiWin32ThemeRoot=<path>`, when the framework is not in the default
+sibling directory.
 
 The solution contains:
 
@@ -113,6 +118,10 @@ If Ninja is not installed but Visual Studio 2022 is available:
 cmake --preset vs2022
 cmake --build --preset vs2022 --config Release
 ```
+
+Windows CMake builds use the same sibling repository by default. Override it
+with `-DWIMUKTHI_WIN32_THEME_ROOT=<path>`. Non-Windows builds do not need the
+Win32 theme framework.
 
 ## GUI
 
@@ -220,7 +229,10 @@ archive next to it.
 
 ### Dark mode and DPI
 
-The GUI is designed to stay native while still looking correct in dark mode:
+The GUI is designed to stay native while still looking correct in dark mode.
+System preference detection, High Contrast handling, native title bars, and
+standard control theming come from the shared `Wimukthi.Win32Theme` framework;
+Axiom retains its application-specific palette and owner drawing:
 
 - Dark title bars, menus, dialogs, list views, progress controls, combo boxes, and
   custom message boxes.
@@ -557,14 +569,16 @@ installer\output\AxiomSetup-<version>-win-x64.exe
 
 GitHub releases also carry a portable zip asset named
 `Axiom-<version>-win-x64.zip` containing `Axiom.exe`, `axiomc.exe`, the bundled
-read-only archive backend, the license, and the user/developer docs.
+read-only archive backend, licenses and corresponding Darkmodelib source, and
+the user/developer docs.
 
 Details: [docs/INSTALLER.md](docs/INSTALLER.md).
 
 ## License
 
 AxiomCompress is licensed under the GNU General Public License version 3. See
-[LICENSE](LICENSE).
+[LICENSE](LICENSE). Component details and binary redistribution locations are
+recorded in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 Vendored third-party components keep their license notices under
 `src/third_party`, `third_party`, and the installed `backends` folder. Current
@@ -579,3 +593,7 @@ third-party components include:
 - BLAKE3 for hashing and integrity primitives, under CC0/Apache-2.0 licensing.
 - A generated subset of Microsoft Fluent UI System Icons for the native GUI,
   under the MIT license.
+- Wimukthi.Win32Theme for shared native Windows theme integration, under the
+  MIT license.
+- Darkmodelib 0.75.0, used by the shared theme framework, primarily under
+  MPL-2.0 with MIT-licensed portions.

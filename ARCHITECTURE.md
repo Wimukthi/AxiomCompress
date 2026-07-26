@@ -22,6 +22,7 @@ Use this document when you need to know where a feature belongs:
 | `src/gui/main_window.cpp` | Main window creation, layout, message dispatch, and the `run_axiom_gui` entry point |
 | `src/gui/main_window_*.cpp` | The other main-window method groups: browser/tree wiring, address bar, theming, dark-drawn views, find dialog, commands, file operations, helpers, quick-add/SFX startup |
 | `src/gui/main_window_internal.hpp` | Declarations shared between the main-window translation units |
+| `src/gui/dialog_support.cpp` | Axiom dialog palette/drawing plus the adapter to the shared `Wimukthi.Win32Theme` Windows integration |
 | `tests` | Round-trip, safety, and regression tests |
 
 The important design rule is simple: compression may spend more CPU to find a
@@ -86,6 +87,11 @@ The codec currently implements:
   pause/cancel through an `OperationControl` passed in the option structs;
   cancellation throws `OperationCancelled` and leaves no partial output (writes
   are atomic).
+
+The Windows GUI delegates system light/dark detection, High Contrast behavior,
+native title bars, control theme classes, and setting-change invalidation to
+the sibling `Wimukthi.Win32Theme` framework. Axiom continues to own its accent
+selection, semantic colors, custom menus, and owner-drawn archive controls.
 
 The container embeds one `axiom::compress` `.axc` stream per solid block, so the
 single-stream codec and the archive share exactly the same encode/decode path.

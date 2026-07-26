@@ -726,11 +726,7 @@ struct ArchiveSummaryPalette {
 };
 
 ArchiveSummaryPalette archive_summary_palette(bool dark) {
-    HIGHCONTRASTW contrast{sizeof(contrast)};
-    const bool high_contrast =
-        SystemParametersInfoW(SPI_GETHIGHCONTRAST, sizeof(contrast), &contrast, 0) &&
-        (contrast.dwFlags & HCF_HIGHCONTRASTON) != 0;
-    if (high_contrast) {
+    if (dialog_high_contrast_enabled()) {
         return {
             GetSysColor(COLOR_WINDOW), GetSysColor(COLOR_WINDOW),
             GetSysColor(COLOR_WINDOW), GetSysColor(COLOR_BTNFACE),

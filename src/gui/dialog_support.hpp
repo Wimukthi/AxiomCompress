@@ -44,9 +44,11 @@ void apply_axiom_window_icons(HWND window, HINSTANCE instance);
 
 DialogColors dialog_colors(bool dark);
 bool dialog_system_prefers_dark_mode();
+bool dialog_high_contrast_enabled();
 void set_dialog_appearance(const DialogAppearance& appearance);
 DialogAppearance dialog_appearance();
 bool dialog_should_use_dark();
+bool handle_dialog_theme_setting_change(LPARAM lparam);
 COLORREF resolve_dialog_accent_color(int mode, COLORREF custom_color);
 COLORREF dialog_accent_color();
 int dialog_icon_style();

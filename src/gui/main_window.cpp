@@ -733,7 +733,11 @@ LRESULT MainWindow::handle_message(UINT message, WPARAM wparam, LPARAM lparam) {
             paint_shell();
             return 0;
         case WM_SETTINGCHANGE:
+            handle_dialog_theme_setting_change(lparam);
+            apply_theme();
+            return 0;
         case WM_THEMECHANGED:
+        case WM_SYSCOLORCHANGE:
             apply_theme();
             return 0;
         case WM_CTLCOLORSTATIC:

@@ -22,8 +22,20 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v6
+      - name: Checkout Wimukthi.Win32Theme
+        if: runner.os == 'Windows'
+        uses: actions/checkout@v6
+        with:
+          repository: Wimukthi/Wimukthi.Win32Theme
+          ref: f39163076210144c492f79c82979218a10553bfb
+          path: Wimukthi.Win32Theme
       - name: Configure
+        if: runner.os != 'Windows'
         run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+      - name: Configure Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release "-DWIMUKTHI_WIN32_THEME_ROOT=$env:GITHUB_WORKSPACE\Wimukthi.Win32Theme"
       - name: Build
         run: cmake --build build --config Release
       - name: Test
@@ -108,9 +120,15 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v6
+      - name: Checkout Wimukthi.Win32Theme
+        uses: actions/checkout@v6
+        with:
+          repository: Wimukthi/Wimukthi.Win32Theme
+          ref: f39163076210144c492f79c82979218a10553bfb
+          path: Wimukthi.Win32Theme
       - name: Build axiomc (for seed corpus)
         run: |
-          cmake -B build -DCMAKE_BUILD_TYPE=Release
+          cmake -B build -DCMAKE_BUILD_TYPE=Release "-DWIMUKTHI_WIN32_THEME_ROOT=$env:GITHUB_WORKSPACE\Wimukthi.Win32Theme"
           cmake --build build --config Release
           Copy-Item build/Release/axiomc.exe out/Release/axiomc.exe -Force -ErrorAction SilentlyContinue
         shell: pwsh

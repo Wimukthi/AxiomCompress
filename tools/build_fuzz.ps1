@@ -34,6 +34,7 @@ $libSources = @(
     "src\archive\container.cpp",
     "src\archive\container_formats.cpp",
     "src\archive\container_zip.cpp",
+    "src\archive\seven_zip_library.cpp",
     "src\archive\system_provider.cpp",
     "src\archive\zip_split_backend.cpp",
     "src\codec\block.cpp",
@@ -82,7 +83,8 @@ foreach ($t in $targets) {
     $flags = "/nologo /std:c++20 /O1 /Zi /FS /Fd:`"$pdb`" /EHsc /MD /fsanitize=fuzzer /fsanitize=address /DMZ_ZIP_NO_CRYPTO /D_CRT_SECURE_NO_DEPRECATE /D_CRT_NONSTDC_NO_DEPRECATE $blake3Defs"
     $includes = "/I `"$Root\include`" /I `"$Root\src`""
     $inputs = ($libSources -join ' ') + " `"$Root\fuzz\$t.cpp`""
-    $cl = "cl $flags $includes $inputs /Fe:`"$outDir\$t.exe`" /Fo:`"$objDir\\`""
+    $systemLibraries = "Ole32.lib OleAut32.lib"
+    $cl = "cl $flags $includes $inputs $systemLibraries /Fe:`"$outDir\$t.exe`" /Fo:`"$objDir\\`""
     $bat = Join-Path $outDir "build_$t.bat"
     "@echo off`r`ncall `"$vcvars`" >nul 2>&1`r`n$cl" | Set-Content -Encoding ascii $bat
     Write-Host "Building $t ..."

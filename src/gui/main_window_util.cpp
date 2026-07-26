@@ -522,11 +522,7 @@ return shell_item_path(item.get());
 }
 
 bool high_contrast_enabled() {
-HIGHCONTRASTW high_contrast{};
-high_contrast.cbSize = sizeof(high_contrast);
-return SystemParametersInfoW(SPI_GETHIGHCONTRAST, sizeof(high_contrast),
-                             &high_contrast, 0) &&
-       (high_contrast.dwFlags & HCF_HIGHCONTRASTON) != 0;
+return dialog_high_contrast_enabled();
 }
 
 COLORREF blend_color(COLORREF base, COLORREF overlay, int overlay_percent) {
@@ -545,12 +541,7 @@ return luminance > 150000 ? RGB(0, 0, 0) : RGB(255, 255, 255);
 }
 
 void set_dark_title_bar(HWND hwnd, bool dark) {
-BOOL value = dark ? TRUE : FALSE;
-if (FAILED(DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE,
-                                 &value, sizeof(value)))) {
-    constexpr DWORD kOlderDarkModeAttribute = 19;
-    (void)DwmSetWindowAttribute(hwnd, kOlderDarkModeAttribute, &value, sizeof(value));
-}
+apply_dialog_dark_frame(hwnd, dark);
 }
 
 bool is_button_id(UINT id) {

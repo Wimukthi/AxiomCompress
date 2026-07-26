@@ -4,9 +4,6 @@
 #include "gui/dialog_support.hpp"
 #include "gui/toolbar_icons.hpp"
 
-#include <dwmapi.h>
-#include <uxtheme.h>
-
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
@@ -86,13 +83,31 @@ void frame_rect(HDC dc, const RECT& rect, COLORREF color) {
     DeleteObject(brush);
 }
 
-void apply_dark_title_bar(HWND hwnd, bool dark) {
-    constexpr DWORD kImmersiveDarkMode = 20;
-    BOOL enabled = dark ? TRUE : FALSE;
-    if (FAILED(DwmSetWindowAttribute(hwnd, kImmersiveDarkMode, &enabled, sizeof(enabled)))) {
-        constexpr DWORD kOlderImmersiveDarkMode = 19;
-        DwmSetWindowAttribute(hwnd, kOlderImmersiveDarkMode, &enabled, sizeof(enabled));
-    }
+COLORREF blend_theme_color(COLORREF base, COLORREF overlay, int overlay_percent) {
+    const int base_percent = 100 - overlay_percent;
+    return RGB(
+        (GetRValue(base) * base_percent + GetRValue(overlay) * overlay_percent) / 100,
+        (GetGValue(base) * base_percent + GetGValue(overlay) * overlay_percent) / 100,
+        (GetBValue(base) * base_percent + GetBValue(overlay) * overlay_percent) / 100);
+}
+
+void refresh_operation_theme(OperationWindowTheme& theme) {
+    theme.dark = dialog_should_use_dark();
+    const DialogColors colors = dialog_colors(theme.dark);
+    theme.background = colors.background;
+    theme.panel = colors.control_background;
+    theme.text = colors.text;
+    theme.muted_text = colors.disabled_text;
+    theme.border = colors.border;
+    theme.button = colors.control_background;
+    theme.button_hot =
+        blend_theme_color(colors.control_background, colors.focus_border,
+                          theme.dark ? 10 : 8);
+    theme.button_pressed =
+        blend_theme_color(colors.control_background, colors.focus_border,
+                          theme.dark ? 18 : 16);
+    theme.progress_track = colors.control_background;
+    theme.progress_fill = colors.focus_border;
 }
 
 } // namespace
@@ -209,11 +224,11 @@ void OperationProgressWindow::create_controls() {
 }
 
 void OperationProgressWindow::apply_theme() {
-    apply_dark_title_bar(hwnd_, theme_.dark);
+    apply_dialog_dark_frame(hwnd_, theme_.dark);
     if (background_brush_ != nullptr) DeleteObject(background_brush_);
     background_brush_ = CreateSolidBrush(theme_.background);
-    SetWindowTheme(pause_button_, theme_.dark ? L"DarkMode_Explorer" : nullptr, nullptr);
-    SetWindowTheme(cancel_button_, theme_.dark ? L"DarkMode_Explorer" : nullptr, nullptr);
+    apply_dialog_control_theme(pause_button_, theme_.dark);
+    apply_dialog_control_theme(cancel_button_, theme_.dark);
     InvalidateRect(hwnd_, nullptr, TRUE);
     for (HWND control : telemetry_fields_) {
         if (control != nullptr) InvalidateRect(control, nullptr, TRUE);
@@ -727,7 +742,15 @@ LRESULT OperationProgressWindow::handle_message(UINT message, WPARAM wparam, LPA
             if (LOWORD(wparam) == kCancelButton) { request_cancel(); return 0; }
             break;
         case WM_SETTINGCHANGE:
-        case WM_THEMECHANGED: apply_theme(); return 0;
+            handle_dialog_theme_setting_change(lparam);
+            refresh_operation_theme(theme_);
+            apply_theme();
+            return 0;
+        case WM_THEMECHANGED:
+        case WM_SYSCOLORCHANGE:
+            refresh_operation_theme(theme_);
+            apply_theme();
+            return 0;
         case WM_CLOSE: request_cancel(); return 0;
         case WM_DESTROY:
             KillTimer(hwnd_, kAnimationTimer);

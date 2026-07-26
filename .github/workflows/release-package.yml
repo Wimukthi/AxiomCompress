@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: Expected app version after the build auto-increments src/gui/axiom_gui.rc
+        description: Committed four-part app version from src/gui/axiom_gui.rc
         required: true
 
 jobs:
@@ -16,11 +16,18 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
 
+      - name: Checkout Wimukthi.Win32Theme
+        uses: actions/checkout@v6
+        with:
+          repository: Wimukthi/Wimukthi.Win32Theme
+          ref: f39163076210144c492f79c82979218a10553bfb
+          path: Wimukthi.Win32Theme
+
       - name: Add MSBuild to PATH
         uses: microsoft/setup-msbuild@v3
 
       - name: Build Release
-        run: .\tools\build_msvc.ps1 -Configuration Release
+        run: .\tools\build_msvc.ps1 -Configuration Release -AutoIncrementVersion:$false -ThemeRoot "$env:GITHUB_WORKSPACE\Wimukthi.Win32Theme"
 
       - name: Test Release
         run: .\out\Release\axiom_roundtrip.exe
@@ -54,7 +61,16 @@ jobs:
           Copy-Item -LiteralPath ".\ARCHITECTURE.md" -Destination $stage
           Copy-Item -LiteralPath ".\FORMAT.md" -Destination $stage
           Copy-Item -LiteralPath ".\LICENSE" -Destination $stage
+          Copy-Item -LiteralPath ".\THIRD_PARTY_NOTICES.md" -Destination $stage
           Copy-Item -LiteralPath ".\docs" -Destination (Join-Path $stage "docs") -Recurse
+          $licenses = Join-Path $stage "licenses"
+          $source = Join-Path $licenses "source"
+          New-Item -ItemType Directory -Path $source -Force | Out-Null
+          Copy-Item -LiteralPath ".\Wimukthi.Win32Theme\LICENSE" -Destination (Join-Path $licenses "Wimukthi.Win32Theme-LICENSE.txt")
+          Copy-Item -LiteralPath ".\Wimukthi.Win32Theme\THIRD_PARTY_NOTICES.md" -Destination (Join-Path $licenses "Wimukthi.Win32Theme-NOTICES.md")
+          Copy-Item -LiteralPath ".\Wimukthi.Win32Theme\third_party\darkmodelib\LICENSE.md" -Destination (Join-Path $licenses "Darkmodelib-MPL-2.0.txt")
+          Copy-Item -LiteralPath ".\Wimukthi.Win32Theme\third_party\darkmodelib\LICENSE-MIT.md" -Destination (Join-Path $licenses "Darkmodelib-MIT.txt")
+          Copy-Item -LiteralPath ".\Wimukthi.Win32Theme\third_party\darkmodelib" -Destination (Join-Path $source "darkmodelib") -Recurse
 
           Compress-Archive -Path (Join-Path $stage "*") -DestinationPath $zip -Force
 
@@ -64,7 +80,7 @@ jobs:
 
       - name: Create Installer
         shell: pwsh
-        run: .\installer\build-installer.ps1 -Version "$env:PACKAGE_VERSION" -SkipBuild -SkipTests
+        run: .\installer\build-installer.ps1 -Version "$env:PACKAGE_VERSION" -SkipBuild -SkipTests -ThemeRoot "$env:GITHUB_WORKSPACE\Wimukthi.Win32Theme"
 
       - name: Upload ZIP
         uses: actions/upload-artifact@v7

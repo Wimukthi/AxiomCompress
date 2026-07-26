@@ -30,6 +30,8 @@ and test first with auto-increment disabled, then package without rebuilding:
 
 - Release x64 build tools from Visual Studio.
 - Inno Setup 6.
+- The `Wimukthi.Win32Theme` repository beside `AxiomCompress`, or its location
+  supplied with `-ThemeRoot <path>`.
 
 Install Inno Setup locally with:
 
@@ -44,6 +46,9 @@ From the repository root:
 ```powershell
 .\installer\build-installer.ps1
 ```
+
+Use `-ThemeRoot <path>` if the framework is not in its default sibling
+directory.
 
 Output:
 
@@ -80,6 +85,9 @@ Recommended contents:
 - `ARCHITECTURE.md`.
 - `FORMAT.md`.
 - `LICENSE`.
+- `THIRD_PARTY_NOTICES.md`.
+- `licenses\`, including the Wimukthi.Win32Theme and Darkmodelib licenses and
+  complete corresponding Darkmodelib source.
 - `docs\`.
 
 Build the zip from the same Release output and docs used by the installer so
@@ -96,6 +104,9 @@ The installer writes:
 - `ARCHITECTURE.md`.
 - `FORMAT.md`.
 - `LICENSE`.
+- `THIRD_PARTY_NOTICES.md`.
+- `licenses\`, including the Wimukthi.Win32Theme and Darkmodelib licenses and
+  complete corresponding Darkmodelib source.
 - `docs\`.
 
 It also creates a Start Menu shortcut, offers an optional desktop shortcut, and

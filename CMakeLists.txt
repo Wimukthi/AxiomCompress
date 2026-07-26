@@ -140,6 +140,18 @@ target_link_libraries(axiomc PRIVATE axiom)
 target_include_directories(axiomc PRIVATE src)
 
 if(WIN32)
+    set(WIMUKTHI_WIN32_THEME_ROOT
+        "${CMAKE_CURRENT_SOURCE_DIR}/../Wimukthi.Win32Theme"
+        CACHE PATH "Path to the Wimukthi.Win32Theme source checkout")
+    if(NOT EXISTS "${WIMUKTHI_WIN32_THEME_ROOT}/CMakeLists.txt")
+        message(FATAL_ERROR
+            "Wimukthi.Win32Theme was not found at '${WIMUKTHI_WIN32_THEME_ROOT}'. "
+            "Clone it beside AxiomCompress or set WIMUKTHI_WIN32_THEME_ROOT.")
+    endif()
+    add_subdirectory(
+        "${WIMUKTHI_WIN32_THEME_ROOT}"
+        "${CMAKE_CURRENT_BINARY_DIR}/wimukthi-win32-theme")
+
     add_executable(axiom_gui WIN32
         src/gui/main.cpp
         src/gui/main_window.cpp
@@ -170,7 +182,7 @@ if(WIN32)
         src/gui/about_dialog.cpp
         src/gui/update_checker.cpp
         src/gui/axiom_gui.rc)
-    target_link_libraries(axiom_gui PRIVATE axiom Bcrypt Comctl32 Dwmapi Gdiplus Msimg32 Ole32 Shell32 Shlwapi Uxtheme Version Winhttp)
+    target_link_libraries(axiom_gui PRIVATE axiom Wimukthi::Win32Theme Bcrypt Comctl32 Dwmapi Gdiplus Msimg32 Ole32 Shell32 Shlwapi Version Winhttp)
     target_include_directories(axiom_gui PRIVATE src)
     target_compile_definitions(axiom_gui PRIVATE UNICODE _UNICODE)
     set_target_properties(axiom_gui PROPERTIES OUTPUT_NAME "Axiom")

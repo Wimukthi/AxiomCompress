@@ -6,21 +6,7 @@
 namespace axiom::gui {
 
 bool system_prefers_dark_mode() {
-if (high_contrast_enabled()) {
-    return false;
-}
-
-DWORD apps_use_light_theme = 1;
-DWORD size = sizeof(apps_use_light_theme);
-const auto result = RegGetValueW(
-    HKEY_CURRENT_USER,
-    L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
-    L"AppsUseLightTheme",
-    RRF_RT_REG_DWORD,
-    nullptr,
-    &apps_use_light_theme,
-    &size);
-return result == ERROR_SUCCESS && apps_use_light_theme == 0;
+return dialog_system_prefers_dark_mode();
 }
 
 ThemePalette make_theme(int preference,
@@ -241,11 +227,7 @@ void MainWindow::rebuild_theme_brushes() {
 }
 
 void MainWindow::apply_theme_to_control(HWND control) const {
-    if (control == nullptr) {
-        return;
-    }
-    SetWindowTheme(control, theme_.dark ? L"DarkMode_Explorer" : nullptr, nullptr);
-    InvalidateRect(control, nullptr, FALSE);
+    apply_dialog_control_theme(control, theme_.dark);
 }
 
 void MainWindow::apply_theme() {
@@ -268,7 +250,6 @@ void MainWindow::apply_theme() {
     for (const ToolbarButton& button : toolbar_buttons_) {
         apply_theme_to_control(button.window);
     }
-    axiom::gui::apply_dialog_control_theme(address_edit_, theme_.dark);
     menu_bar_.set_theme({
         theme_.dark ? RGB(31, 31, 31) : theme_.panel,
         theme_.button_hot,

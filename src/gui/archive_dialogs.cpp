@@ -5,9 +5,7 @@
 #include "gui/main_window_internal.hpp"
 #include "gui/message_dialog.hpp"
 
-#include <dwmapi.h>
 #include <shobjidl.h>
-#include <uxtheme.h>
 #include <windowsx.h>
 
 #include <algorithm>
@@ -429,12 +427,7 @@ Palette make_palette() {
 }
 
 void set_dark_title(HWND window, bool dark) {
-    BOOL enabled = dark ? TRUE : FALSE;
-    constexpr DWORD immersive_dark_mode = 20;
-    if (FAILED(DwmSetWindowAttribute(window, immersive_dark_mode, &enabled, sizeof(enabled)))) {
-        constexpr DWORD older_immersive_dark_mode = 19;
-        DwmSetWindowAttribute(window, older_immersive_dark_mode, &enabled, sizeof(enabled));
-    }
+    apply_dialog_dark_frame(window, dark);
 }
 
 std::wstring window_text(HWND window) {

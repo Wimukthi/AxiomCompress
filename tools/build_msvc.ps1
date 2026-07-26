@@ -5,13 +5,23 @@ param(
     [ValidateSet("x64")]
     [string]$Platform = "x64",
 
-    [bool]$AutoIncrementVersion = $true
+    [bool]$AutoIncrementVersion = $true,
+
+    [string]$ThemeRoot = ""
 )
 
 $ErrorActionPreference = "Stop"
 
 $Root = Split-Path -Parent $PSScriptRoot
 $VsWhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+
+if ([string]::IsNullOrWhiteSpace($ThemeRoot)) {
+    $ThemeRoot = Join-Path (Split-Path $Root -Parent) "Wimukthi.Win32Theme"
+}
+if (-not (Test-Path -LiteralPath (Join-Path $ThemeRoot "Wimukthi.Win32Theme.props"))) {
+    throw "Wimukthi.Win32Theme was not found at '$ThemeRoot'. Pass -ThemeRoot to override."
+}
+$ThemeRoot = (Resolve-Path -LiteralPath $ThemeRoot).Path
 
 if (Test-Path $VsWhere) {
     $InstallPath = & $VsWhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
@@ -30,7 +40,7 @@ if ([string]::IsNullOrWhiteSpace($MsBuild) -or -not (Test-Path -LiteralPath $MsB
     throw "MSBuild.exe was not found."
 }
 
-& $MsBuild (Join-Path $Root "AxiomCompress.sln") /m /p:Configuration=$Configuration /p:Platform=$Platform /p:AutoIncrementVersion=$AutoIncrementVersion
+& $MsBuild (Join-Path $Root "AxiomCompress.sln") /m /p:Configuration=$Configuration /p:Platform=$Platform /p:AutoIncrementVersion=$AutoIncrementVersion "/p:WimukthiWin32ThemeRoot=$ThemeRoot"
 if ($LASTEXITCODE -ne 0) {
     throw "MSBuild failed with exit code $LASTEXITCODE."
 }

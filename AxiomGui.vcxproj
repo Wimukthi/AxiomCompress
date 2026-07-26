@@ -40,6 +40,10 @@
   <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
   </ImportGroup>
+  <PropertyGroup>
+    <WimukthiWin32ThemeRoot Condition="'$(WimukthiWin32ThemeRoot)'==''">$(MSBuildProjectDirectory)\..\Wimukthi.Win32Theme</WimukthiWin32ThemeRoot>
+  </PropertyGroup>
+  <Import Project="$(WimukthiWin32ThemeRoot)\Wimukthi.Win32Theme.props" Condition="Exists('$(WimukthiWin32ThemeRoot)\Wimukthi.Win32Theme.props')" />
   <PropertyGroup Label="UserMacros" />
   <PropertyGroup>
     <OutDir>$(SolutionDir)out\$(Configuration)\</OutDir>
@@ -62,7 +66,7 @@
       <SubSystem>Windows</SubSystem>
       <ProgramDatabaseFile>$(OutDir)AxiomGui.pdb</ProgramDatabaseFile>
       <ImportLibrary>$(OutDir)AxiomGui.lib</ImportLibrary>
-      <AdditionalDependencies>Bcrypt.lib;Comctl32.lib;Dwmapi.lib;Gdiplus.lib;Msimg32.lib;Ole32.lib;OleAut32.lib;Shell32.lib;Shlwapi.lib;Uxtheme.lib;Version.lib;Winhttp.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>Bcrypt.lib;Comctl32.lib;Dwmapi.lib;Gdiplus.lib;Msimg32.lib;Ole32.lib;OleAut32.lib;Shell32.lib;Shlwapi.lib;Version.lib;Winhttp.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
@@ -82,7 +86,7 @@
       <OptimizeReferences>true</OptimizeReferences>
       <ProgramDatabaseFile>$(OutDir)AxiomGui.pdb</ProgramDatabaseFile>
       <ImportLibrary>$(OutDir)AxiomGui.lib</ImportLibrary>
-      <AdditionalDependencies>Bcrypt.lib;Comctl32.lib;Dwmapi.lib;Gdiplus.lib;Msimg32.lib;Ole32.lib;OleAut32.lib;Shell32.lib;Shlwapi.lib;Uxtheme.lib;Version.lib;Winhttp.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>Bcrypt.lib;Comctl32.lib;Dwmapi.lib;Gdiplus.lib;Msimg32.lib;Ole32.lib;OleAut32.lib;Shell32.lib;Shlwapi.lib;Version.lib;Winhttp.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
@@ -161,6 +165,9 @@
     </ProjectReference>
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <Target Name="ValidateWimukthiWin32Theme" BeforeTargets="PrepareForBuild" Condition="!Exists('$(WimukthiWin32ThemeRoot)\Wimukthi.Win32Theme.props')">
+    <Error Text="Wimukthi.Win32Theme was not found at '$(WimukthiWin32ThemeRoot)'. Clone it beside AxiomCompress or set WimukthiWin32ThemeRoot." />
+  </Target>
   <Target Name="IncrementAxiomVersion" BeforeTargets="PrepareForBuild" Condition="'$(AutoIncrementVersion)' == 'true' and '$(DesignTimeBuild)' != 'true'">
     <Exec Command="powershell.exe -NoProfile -ExecutionPolicy Bypass -File &quot;$(MSBuildProjectDirectory)\tools\Update-AxiomVersion.ps1&quot; -ResourceFile &quot;$(MSBuildProjectDirectory)\src\gui\axiom_gui.rc&quot; -IncrementBuild" />
   </Target>

@@ -29,11 +29,9 @@
 #include <windows.h>
 #include <windowsx.h>
 #include <commctrl.h>
-#include <dwmapi.h>
 #include <shlobj.h>
 #include <shobjidl.h>
 #include <shellapi.h>
-#include <uxtheme.h>
 
 #include <algorithm>
 #include <array>
@@ -67,10 +65,8 @@
 #include <vector>
 
 #pragma comment(lib, "Comctl32.lib")
-#pragma comment(lib, "Dwmapi.lib")
 #pragma comment(lib, "Ole32.lib")
 #pragma comment(lib, "Shell32.lib")
-#pragma comment(lib, "Uxtheme.lib")
 
 namespace axiom::gui {
 
@@ -89,9 +85,6 @@ constexpr UINT kSelectedArchiveCapabilitiesMessage = WM_APP + 12;
 constexpr UINT kBackgroundUiTaskMessage = WM_APP + 13;
 constexpr UINT_PTR kBrowserPopulateTimer = 42;
 constexpr UINT_PTR kDirectoryRefreshTimer = 41;
-#ifndef DWMWA_USE_IMMERSIVE_DARK_MODE
-constexpr DWORD DWMWA_USE_IMMERSIVE_DARK_MODE = 20;
-#endif
 enum ControlId : int {
     kAddFiles = 1005,
     kOpenArchive = 1008,
