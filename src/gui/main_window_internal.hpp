@@ -23,6 +23,8 @@
 #include "gui/resource.hpp"
 #include "gui/settings_store.hpp"
 #include "gui/sfx_dialog.hpp"
+#include "sfx/module_file.hpp"
+#include "sfx/runtime.hpp"
 #include "gui/toolbar_icons.hpp"
 #include "gui/update_checker.hpp"
 
@@ -83,6 +85,7 @@ constexpr UINT kSplitterLayoutMessage = WM_APP + 10;
 constexpr UINT kTreeArchiveProbeMessage = WM_APP + 11;
 constexpr UINT kSelectedArchiveCapabilitiesMessage = WM_APP + 12;
 constexpr UINT kBackgroundUiTaskMessage = WM_APP + 13;
+constexpr UINT kTableColumnReorderMessage = WM_APP + 14;
 constexpr UINT_PTR kBrowserPopulateTimer = 42;
 constexpr UINT_PTR kDirectoryRefreshTimer = 41;
 enum ControlId : int {
@@ -104,10 +107,11 @@ enum ControlId : int {
     kInfo = 1030,
     kSettings = 1031,
     kMenuFile = 1100,
-    kMenuCommands = 1101,
-    kMenuTools = 1102,
-    kMenuOptions = 1103,
-    kMenuHelp = 1104,
+    kMenuEdit = 1101,
+    kMenuArchive = 1102,
+    kMenuView = 1103,
+    kMenuTools = 1104,
+    kMenuHelp = 1105,
     kExitApplication = 1110,
     kSelectAll = 1111,
     kAbout = 1112,
@@ -148,6 +152,7 @@ enum ControlId : int {
     kSignArchive = 1154,
     kCompressStream = 1155,
     kDecompressStream = 1156,
+    kClearTempFiles = 1157,
 };
 
 struct BackgroundUiTaskResult {
@@ -384,6 +389,9 @@ struct TableViewOptions {
     bool show_grid_lines = true;
     bool show_horizontal_scrollbar = true;
     bool full_row_select = true;
+    bool drag_select_rows = true;
+    bool allow_column_reorder = false;
+    bool fixed_first_column = false;
 };
 // Native report/list controls still leak light header and scrollbar pixels on some
 // Windows builds, so Axiom owns every table pixel through this lightweight view.
@@ -462,6 +470,7 @@ private:
     int max_scroll_x(const RECT& client) const;
     int max_scroll_x() const;
     int column_separator_at(POINT point, const RECT& client) const;
+    int column_at_x(int x, const RECT& client) const;
     RECT scrollbar_track_rect(const RECT& client) const;
     RECT scrollbar_thumb_rect(const RECT& client) const;
     RECT horizontal_scrollbar_track_rect(const RECT& client) const;
@@ -477,6 +486,8 @@ private:
     int find_typeahead_match(std::wstring_view needle, bool cycle) const;
     bool handle_typeahead_char(wchar_t character);
     bool point_can_select_row(POINT point, int row, const RECT& client) const;
+    bool point_hits_primary_icon(POINT point, int row,
+                                 const RECT& client) const;
     int selectable_row_at_point(POINT point, const RECT& client) const;
     void begin_marquee_selection(POINT point, bool preserve_selection);
     void update_marquee_selection(POINT point);
@@ -542,6 +553,14 @@ private:
 
     int resize_start_width_ = 0;
 
+    int header_drag_candidate_ = -1;
+
+    int header_drag_target_ = -1;
+
+    bool header_dragging_ = false;
+
+    POINT header_drag_start_{};
+
     bool drag_candidate_ = false;
 
     bool drag_started_ = false;
@@ -549,6 +568,10 @@ private:
     POINT drag_start_{};
 
     int collapse_selection_on_click_ = -1;
+
+    bool drag_select_candidate_ = false;
+
+    bool drag_select_preserve_ = false;
 
     bool marquee_selecting_ = false;
 
@@ -1040,6 +1063,9 @@ private:
     int selected_level() const;
     axiom::CompressionOptions compression_options() const;
     void apply_table_options();
+    void capture_file_list_column_widths();
+    void apply_file_list_columns();
+    int visible_sort_column_index() const;
     void add_address_entry(std::wstring label, std::wstring value,
                            ShellIconRef icon = {});
     void add_known_address(const wchar_t* label, REFKNOWNFOLDERID folder_id);
@@ -1162,6 +1188,7 @@ private:
                                         bool sort_items = true);
     void on_browser_populate_timer();
     void on_table_sort(int column);
+    void on_table_column_reorder(int from, int to);
     void on_browser_loaded(LPARAM lparam);
     void on_navigate_back();
     void on_navigate_forward();
@@ -1199,6 +1226,7 @@ private:
     void on_decompress_stream();
     void on_about();
     void on_benchmark();
+    void on_clear_temp_files();
     void maybe_start_automatic_update_check();
     void begin_update_check(axiom::gui::UpdateCheckKind kind);
     void begin_update_download(const axiom::gui::UpdateInfo& update);
@@ -1285,6 +1313,8 @@ private:
     DarkDirectoryTreeView tree_view_;
 
     DarkTableView table_;
+
+    std::vector<axiom::gui::FileListColumnId> visible_file_columns_;
 
     axiom::gui::OperationProgressWindow operation_window_;
 
@@ -1469,6 +1499,4 @@ private:
 };
 int run_quick_add_to_archive(HINSTANCE instance, const std::vector<std::wstring>& paths);
 int run_quick_extract_archive(HINSTANCE instance, const std::wstring& path);
-std::optional<int> run_embedded_sfx(HINSTANCE instance, const std::wstring& requested_destination);
-
 }  // namespace axiom::gui

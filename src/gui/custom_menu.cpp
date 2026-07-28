@@ -95,6 +95,9 @@ struct PopupState {
     std::vector<PopupItemLayout> items;
     int hot_index{-1};
     UINT command{};
+    std::function<int(POINT)> menu_bar_hit_test;
+    int active_menu_index{-1};
+    int requested_menu_index{-1};
     PaintBuffer paint_buffer;
     HBRUSH background_brush{};
     HBRUSH hot_brush{};
@@ -395,6 +398,17 @@ LRESULT CALLBACK popup_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpara
         case WM_ERASEBKGND: return 1;
         case WM_SETCURSOR: SetCursor(LoadCursorW(nullptr, IDC_ARROW)); return TRUE;
         case WM_MOUSEMOVE: {
+            if (state != nullptr && state->menu_bar_hit_test) {
+                POINT screen_point{};
+                if (GetCursorPos(&screen_point)) {
+                    const int menu_index = state->menu_bar_hit_test(screen_point);
+                    if (menu_index >= 0 && menu_index != state->active_menu_index) {
+                        state->requested_menu_index = menu_index;
+                        DestroyWindow(hwnd);
+                        return 0;
+                    }
+                }
+            }
             POINT point{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
             const int hit = popup_hit_test(state, point);
             if (state != nullptr && state->hot_index != hit) {
@@ -500,15 +514,26 @@ POINT clamp_popup(POINT point, SIZE size) {
     return point;
 }
 
-UINT show_popup(HWND owner, HINSTANCE instance, UINT dpi, HFONT font,
-                const CustomMenuTheme& theme, std::vector<CustomMenuItem> source,
-                POINT point) {
-    if (source.empty() || !register_window_class(instance, kPopupClass, popup_proc)) return 0;
+struct PopupResult {
+    UINT command{};
+    int requested_menu_index{-1};
+};
+
+PopupResult show_popup(HWND owner, HINSTANCE instance, UINT dpi, HFONT font,
+                       const CustomMenuTheme& theme,
+                       std::vector<CustomMenuItem> source, POINT point,
+                       std::function<int(POINT)> menu_bar_hit_test = {},
+                       int active_menu_index = -1) {
+    if (source.empty() || !register_window_class(instance, kPopupClass, popup_proc)) {
+        return {};
+    }
     PopupState state{};
     state.owner = owner;
     state.dpi = dpi;
     state.font = font;
     state.theme = theme;
+    state.menu_bar_hit_test = std::move(menu_bar_hit_test);
+    state.active_menu_index = active_menu_index;
     state.background_brush = CreateSolidBrush(theme.background);
     state.hot_brush = CreateSolidBrush(theme.hot);
     state.border_brush = CreateSolidBrush(theme.border);
@@ -529,7 +554,7 @@ UINT show_popup(HWND owner, HINSTANCE instance, UINT dpi, HFONT font,
         point.x, point.y, size.cx, size.cy, owner, nullptr, instance, &state);
     if (popup == nullptr) {
         if (state.shadow != nullptr) DestroyWindow(state.shadow);
-        return 0;
+        return {};
     }
     if (state.shadow != nullptr) {
         SetWindowPos(state.shadow, popup, 0, 0, 0, 0,
@@ -557,7 +582,7 @@ UINT show_popup(HWND owner, HINSTANCE instance, UINT dpi, HFONT font,
         TranslateMessage(&message);
         DispatchMessageW(&message);
     }
-    return state.command;
+    return {state.command, state.requested_menu_index};
 }
 
 } // namespace
@@ -799,16 +824,36 @@ void CustomMenuBar::exit_keyboard_mode(bool restore_focus) {
 
 void CustomMenuBar::show_menu(int index) {
     if (index < 0 || index >= static_cast<int>(entries_.size()) || !item_provider_) return;
-    active_index_ = index;
-    set_hot_index(index);
-    invalidate_entry(index);
-    UpdateWindow(hwnd_);
-    RECT anchor = entries_[static_cast<std::size_t>(index)].rect;
-    MapWindowPoints(hwnd_, HWND_DESKTOP, reinterpret_cast<POINT*>(&anchor), 2);
-    SetForegroundWindow(parent_);
-    const UINT command = show_popup(parent_, instance_, dpi_, font_, theme_,
-                                    item_provider_(entries_[static_cast<std::size_t>(index)].id),
-                                    {anchor.left, anchor.bottom});
+    UINT command = 0;
+    int requested_index = index;
+    while (requested_index >= 0 &&
+           requested_index < static_cast<int>(entries_.size())) {
+        const int previous_active = active_index_;
+        active_index_ = requested_index;
+        invalidate_entry(previous_active);
+        set_hot_index(requested_index);
+        invalidate_entry(requested_index);
+        UpdateWindow(hwnd_);
+
+        RECT anchor = entries_[static_cast<std::size_t>(requested_index)].rect;
+        MapWindowPoints(hwnd_, HWND_DESKTOP, reinterpret_cast<POINT*>(&anchor), 2);
+        SetForegroundWindow(parent_);
+        const PopupResult result = show_popup(
+            parent_, instance_, dpi_, font_, theme_,
+            item_provider_(entries_[static_cast<std::size_t>(requested_index)].id),
+            {anchor.left, anchor.bottom},
+            [this](POINT screen_point) {
+                ScreenToClient(hwnd_, &screen_point);
+                return hit_test(screen_point);
+            },
+            requested_index);
+        command = result.command;
+        if (command != 0 || result.requested_menu_index < 0 ||
+            result.requested_menu_index == requested_index) {
+            break;
+        }
+        requested_index = result.requested_menu_index;
+    }
     active_index_ = -1;
     set_hot_index(-1);
     mouse_tracking_ = false;
@@ -862,7 +907,8 @@ bool CustomMenuBar::translate_message(const MSG& message) {
 
 UINT CustomMenuBar::show_context_menu(std::vector<CustomMenuItem> items, POINT screen_point) {
     SetForegroundWindow(parent_);
-    return show_popup(parent_, instance_, dpi_, font_, theme_, std::move(items), screen_point);
+    return show_popup(parent_, instance_, dpi_, font_, theme_,
+                      std::move(items), screen_point).command;
 }
 
 LRESULT CustomMenuBar::handle_message(UINT message, WPARAM wparam, LPARAM lparam) {

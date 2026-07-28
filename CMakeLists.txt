@@ -132,7 +132,9 @@ endif()
 set(AXIOMC_SOURCES
     src/cli/main.cpp)
 if(WIN32)
-    list(APPEND AXIOMC_SOURCES src/cli/axiom_cli.rc)
+    list(APPEND AXIOMC_SOURCES
+        src/cli/axiom_cli.rc
+        src/sfx/module_file.cpp)
 endif()
 
 add_executable(axiomc ${AXIOMC_SOURCES})
@@ -151,6 +153,25 @@ if(WIN32)
     add_subdirectory(
         "${WIMUKTHI_WIN32_THEME_ROOT}"
         "${CMAKE_CURRENT_BINARY_DIR}/wimukthi-win32-theme")
+
+    add_executable(axiom_sfx_module WIN32
+        src/sfx/main.cpp
+        src/sfx/runtime.cpp
+        src/gui/sfx_dialog.cpp
+        src/gui/archive_feature_dialogs.cpp
+        src/gui/operation_progress_window.cpp
+        src/gui/dialog_support.cpp
+        src/gui/message_dialog.cpp
+        src/gui/toolbar_icons.cpp
+        src/sfx/sfx_stub.rc)
+    target_link_libraries(axiom_sfx_module PRIVATE
+        axiom Wimukthi::Win32Theme Bcrypt Comctl32 Dwmapi Gdiplus
+        Msimg32 Ole32 Shell32 Shlwapi Version)
+    target_include_directories(axiom_sfx_module PRIVATE src)
+    target_compile_definitions(axiom_sfx_module PRIVATE UNICODE _UNICODE)
+    set_target_properties(axiom_sfx_module PROPERTIES
+        OUTPUT_NAME "AxiomSfx"
+        SUFFIX ".bin")
 
     add_executable(axiom_gui WIN32
         src/gui/main.cpp
@@ -181,11 +202,15 @@ if(WIN32)
         src/gui/message_dialog.cpp
         src/gui/about_dialog.cpp
         src/gui/update_checker.cpp
+        src/sfx/runtime.cpp
+        src/sfx/module_file.cpp
         src/gui/axiom_gui.rc)
     target_link_libraries(axiom_gui PRIVATE axiom Wimukthi::Win32Theme Bcrypt Comctl32 Dwmapi Gdiplus Msimg32 Ole32 Shell32 Shlwapi Version Winhttp)
     target_include_directories(axiom_gui PRIVATE src)
     target_compile_definitions(axiom_gui PRIVATE UNICODE _UNICODE)
     set_target_properties(axiom_gui PROPERTIES OUTPUT_NAME "Axiom")
+    add_dependencies(axiom_gui axiom_sfx_module)
+    add_dependencies(axiomc axiom_sfx_module)
 endif()
 
 enable_testing()

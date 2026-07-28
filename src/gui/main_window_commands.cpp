@@ -28,6 +28,7 @@ std::wstring_view shortcut_action_for_command(UINT command) {
         case kInfo: return L"tools.info";
         case kFind: return L"tools.find";
         case kBenchmark: return L"tools.benchmark";
+        case kClearTempFiles: return L"tools.clear_temp";
         case kEditArchiveComment: return L"tools.edit_comment";
         case kLockArchive: return L"tools.lock";
         case kRepairArchive: return L"tools.repair";
@@ -75,6 +76,7 @@ UINT command_for_shortcut_action(std::wstring_view action) {
     if (action == L"tools.info") return kInfo;
     if (action == L"tools.find") return kFind;
     if (action == L"tools.benchmark") return kBenchmark;
+    if (action == L"tools.clear_temp") return kClearTempFiles;
     if (action == L"tools.edit_comment") return kEditArchiveComment;
     if (action == L"tools.lock") return kLockArchive;
     if (action == L"tools.repair") return kRepairArchive;
@@ -152,6 +154,7 @@ bool MainWindow::can_execute_shortcut_command(UINT command) const {
         case kJoinArchive:
         case kGenerateSigningKey:
         case kBenchmark:
+        case kClearTempFiles:
         case kSettings:
             return !busy_;
         case kExitApplication:
@@ -196,7 +199,9 @@ bool MainWindow::can_execute_shortcut_command(UINT command) const {
         case kSelectAll:
             return !browser_items_.empty();
         case kInfo:
-            return has_archive || has_selection;
+            return has_archive || has_selection ||
+                   history_.current().kind ==
+                       axiom::gui::BrowserLocationKind::filesystem;
         case kFind:
             return !browser_items_.empty();
         case kCopyPath:
@@ -298,6 +303,7 @@ std::vector<axiom::gui::CustomMenuItem> MainWindow::menu_items(UINT menu_id) con
     const bool has_archive = active_archive_path().has_value();
     const bool browsing_archive =
         history_.current().kind == axiom::gui::BrowserLocationKind::archive;
+    const bool has_selected_crc32 = selected_has_crc32();
     const axiom::gui::ArchiveCapabilities capabilities = active_archive_capabilities();
     const bool archive_editable = capabilities.update && !capabilities.locked &&
                                   !capabilities.directory_encrypted;
@@ -308,20 +314,38 @@ std::vector<axiom::gui::CustomMenuItem> MainWindow::menu_items(UINT menu_id) con
         case kMenuFile:
             return {
                 {kOpenArchive, L"&Open archive...", shortcut(kOpenArchive), !busy_},
+                {kInfo, L"&Information", shortcut(kInfo),
+                 has_archive || has_selection ||
+                     history_.current().kind ==
+                         axiom::gui::BrowserLocationKind::filesystem},
                 {0, L"", L"", false, true},
                 {kCompressStream, L"&Compress single file...", shortcut(kCompressStream), !busy_},
                 {kDecompressStream, L"&Decompress stream...", shortcut(kDecompressStream), !busy_},
                 {0, L"", L"", false, true},
                 {kExitApplication, L"E&xit", shortcut(kExitApplication)},
             };
-        case kMenuCommands:
+        case kMenuEdit:
+            return {
+                {kFind, L"&Find files...", shortcut(kFind), !browser_items_.empty()},
+                {0, L"", L"", false, true},
+                {kDelete, browsing_archive ? L"&Delete selected archive entries"
+                                           : L"&Delete selection",
+                 shortcut(kDelete), !busy_ && has_selection &&
+                      (!browsing_archive || archive_editable)},
+                {kSelectAll, L"Select &all", shortcut(kSelectAll), !browser_items_.empty()},
+                {0, L"", L"", false, true},
+                {kCopyPath, L"Copy &path", shortcut(kCopyPath), has_selection ||
+                     history_.current().kind != axiom::gui::BrowserLocationKind::computer},
+                {kCopyCrc32, L"Copy CRC-&32", shortcut(kCopyCrc32), has_selected_crc32},
+            };
+        case kMenuArchive:
             return {
                 {kAddFiles, L"&Add to archive...", shortcut(kAddFiles),
                  !busy_ && (!browsing_archive || archive_editable)},
                 {kExtract, L"&Extract...", shortcut(kExtract),
-                 !busy_ && has_archive && capabilities.extract},
+                  !busy_ && has_archive && capabilities.extract},
                 {kTest, L"&Test archive", shortcut(kTest),
-                 !busy_ && has_archive && capabilities.test},
+                  !busy_ && has_archive && capabilities.test},
                 {0, L"", L"", false, true},
                 {kUpdateArchive, L"&Update archive...", shortcut(kUpdateArchive),
                   !busy_ && has_archive && archive_editable},
@@ -329,26 +353,12 @@ std::vector<axiom::gui::CustomMenuItem> MainWindow::menu_items(UINT menu_id) con
                  !busy_ && has_archive && archive_editable},
                 {kSynchronizeArchive, L"S&ynchronize archive...", shortcut(kSynchronizeArchive),
                   !busy_ && has_archive && archive_editable},
-                {kDeleteArchiveEntries, L"Delete from archive...", shortcut(kDeleteArchiveEntries),
-                  !busy_ && browsing_archive && has_selection && archive_editable},
                 {kRepackArchive, L"&Repack archive...", shortcut(kRepackArchive),
                   !busy_ && has_archive && archive_editable},
+                {0, L"", L"", false, true},
                 {kSplitArchive, L"S&plit archive...", shortcut(kSplitArchive),
                  !busy_ && has_archive && capabilities.can_create_volumes},
                 {kJoinArchive, L"&Join archive volumes...", shortcut(kJoinArchive), !busy_},
-                {0, L"", L"", false, true},
-                {kView, L"&View", shortcut(kView), has_selection},
-                {kDelete, browsing_archive ? L"&Delete from archive" : L"&Delete",
-                 shortcut(kDelete), !busy_ && has_selection &&
-                      (!browsing_archive || archive_editable)},
-                {kSelectAll, L"Select &all", shortcut(kSelectAll), !browser_items_.empty()},
-            };
-        case kMenuTools:
-            return {
-                {kInfo, L"Archive &information", shortcut(kInfo), has_archive || has_selection},
-                {kFind, L"&Find files...", shortcut(kFind), !browser_items_.empty()},
-                {0, L"", L"", false, true},
-                {kBenchmark, L"&Benchmark...", shortcut(kBenchmark), !busy_},
                 {0, L"", L"", false, true},
                 {kEditArchiveComment, L"Edit archive &comment...", shortcut(kEditArchiveComment),
                   !busy_ && has_archive && capabilities.comments && archive_editable},
@@ -357,26 +367,43 @@ std::vector<axiom::gui::CustomMenuItem> MainWindow::menu_items(UINT menu_id) con
                 {kRepairArchive, L"&Repair archive...", shortcut(kRepairArchive),
                  !busy_ && has_archive && capabilities.recovery_records},
                 {kEditRecoveryRecord, L"Recovery &record...", shortcut(kEditRecoveryRecord),
-                 !busy_ && has_archive && capabilities.recovery_records && archive_editable},
+                  !busy_ && has_archive && capabilities.recovery_records && archive_editable},
                 {0, L"", L"", false, true},
-                {kGenerateSigningKey, L"&Generate signing key...", shortcut(kGenerateSigningKey),
-                 !busy_},
-                {kSignArchive, L"&Sign archive...", shortcut(kSignArchive),
-                 !busy_ && has_archive && capabilities.authenticity && archive_editable},
-                {kVerifyArchiveSignature, L"Verify &signature...", shortcut(kVerifyArchiveSignature),
-                 !busy_ && has_archive && capabilities.authenticity},
                 {kCreateSfx, L"Create &self-extracting archive...", shortcut(kCreateSfx),
                  !busy_ && has_archive && capabilities.sfx},
+                {kSignArchive, L"&Sign archive...", shortcut(kSignArchive),
+                  !busy_ && has_archive && capabilities.authenticity && archive_editable},
+                {kVerifyArchiveSignature, L"Verify &signature...", shortcut(kVerifyArchiveSignature),
+                  !busy_ && has_archive && capabilities.authenticity},
             };
-        case kMenuOptions:
+        case kMenuView:
             return {
+                {kView, L"&Open selected item", shortcut(kView), has_selection},
+                {0, L"", L"", false, true},
+                {kNavigateBack, L"Go &back", shortcut(kNavigateBack),
+                 can_execute_shortcut_command(kNavigateBack)},
+                {kNavigateForward, L"Go &forward", shortcut(kNavigateForward),
+                 can_execute_shortcut_command(kNavigateForward)},
+                {kNavigateUp, L"Go &up one level", shortcut(kNavigateUp),
+                 can_execute_shortcut_command(kNavigateUp)},
+                {kNavigateRefresh, L"&Refresh", shortcut(kNavigateRefresh),
+                 can_execute_shortcut_command(kNavigateRefresh)},
+                {0, L"", L"", false, true},
                 {kToggleTreePane, L"Show &tree pane", shortcut(kToggleTreePane), true, false,
                  tree_pane_visible_},
                 {0, L"", L"", false, true},
                 {static_cast<UINT>(favorite ? kRemoveFavorite : kAddFavorite),
-                 favorite ? L"Remove current location from &Favorites"
-                          : L"Pin current location to &Favorites",
-                 shortcut(favorite ? kRemoveFavorite : kAddFavorite), !current_location.empty()},
+                  favorite ? L"Remove current location from &Favorites"
+                           : L"Pin current location to &Favorites",
+                  shortcut(favorite ? kRemoveFavorite : kAddFavorite), !current_location.empty()},
+            };
+        case kMenuTools:
+            return {
+                {kBenchmark, L"&Benchmark...", shortcut(kBenchmark), !busy_},
+                {kClearTempFiles, L"&Delete Axiom temporary files...",
+                 shortcut(kClearTempFiles), !busy_},
+                {kGenerateSigningKey, L"&Generate signing key...", shortcut(kGenerateSigningKey),
+                 !busy_},
                 {0, L"", L"", false, true},
                 {kSettings, L"&Settings...", shortcut(kSettings), !busy_},
             };
@@ -494,7 +521,8 @@ void MainWindow::show_tree_context_menu(POINT point) {
          !busy_ && is_archive && capabilities.extract},
         {kTreeTestArchive, L"&Test archive", shortcut_for_command(kTest),
          !busy_ && is_archive && capabilities.test},
-        {kTreeArchiveInfo, L"Archive &information", shortcut_for_command(kInfo), is_archive},
+        {kTreeArchiveInfo, L"&Information", shortcut_for_command(kInfo),
+         is_filesystem},
     };
     if (const auto location = tree_location_value(node)) {
         const bool favorite = favorite_contains(*location);
@@ -555,6 +583,17 @@ void MainWindow::show_tree_context_menu(POINT point) {
             if (archive_path) {
                 navigate_to(axiom::gui::BrowserLocation::archive(*archive_path));
                 on_info();
+            } else if (is_filesystem) {
+                axiom::CompressionEstimateOptions options;
+                options.format = axiom::ArchiveFormat::axar;
+                options.compression = compression_options();
+                options.sample_budget = selected_level() >= 8 ? 24u << 20
+                    : selected_level() >= 6 ? 48u << 20 : 64u << 20;
+                options.sample_chunk_size = 512u << 10;
+                options.time_budget = std::chrono::seconds(5);
+                axiom::gui::show_filesystem_information_dialog(
+                    hwnd_, {node.filesystem_path}, std::move(options),
+                    selected_level());
             }
             break;
         case kTreeAddFavorite:
@@ -653,21 +692,212 @@ void MainWindow::on_copy_crc32() {
 
 void MainWindow::on_info() {
     const auto indices = selected_browser_indices();
-    std::uint64_t bytes = 0;
-    for (int index : indices) bytes += browser_items_[index].size;
-    if (const auto archive = active_archive_path()) {
+    const auto make_estimate_options = [this] {
+        axiom::CompressionEstimateOptions options;
+        options.format = axiom::ArchiveFormat::axar;
+        options.compression = compression_options();
+        // This is an adaptive ceiling, not a fixed cost. Higher codec levels
+        // use a smaller cap because each representative probe takes longer.
+        options.sample_budget = selected_level() >= 8 ? 24u << 20
+            : selected_level() >= 6 ? 48u << 20 : 64u << 20;
+        options.sample_chunk_size = 512u << 10;
+        options.time_budget = std::chrono::seconds(5);
+        return options;
+    };
+
+    const bool browsing_archive =
+        history_.current().kind == axiom::gui::BrowserLocationKind::archive;
+
+    // A selection inside an archive describes entries, not the archive
+    // container.  Keep this path immediate and use the packed values already
+    // present in the browser model rather than re-reading the archive.
+    if (browsing_archive && !indices.empty()) {
         axiom::gui::ArchiveSummaryRows details;
-        details.push_back({L"Location", history_.current().display_name()});
-        details.push_back({
-            indices.empty() ? L"Items" : L"Selection",
-            indices.empty()
-                ? quote_count(browser_items_.size(), L"item", L"items")
-                : quote_count(indices.size(), L"selected item", L"selected items")
-        });
-        if (bytes != 0) {
-            details.push_back({L"Selected size", format_size(bytes)});
+        std::uint64_t unpacked_total = 0;
+        std::uint64_t packed_total = 0;
+        std::size_t packed_count = 0;
+        std::size_t estimated_packed_count = 0;
+        std::size_t file_count = 0;
+        std::size_t folder_count = 0;
+        std::size_t archive_count = 0;
+        std::size_t link_count = 0;
+
+        for (const int index : indices) {
+            const auto& item = browser_items_[static_cast<std::size_t>(index)];
+            unpacked_total += item.size;
+            if (item.packed_size) {
+                packed_total += *item.packed_size;
+                ++packed_count;
+                if (item.packed_size_estimated) ++estimated_packed_count;
+            }
+            switch (item.kind) {
+                case axiom::gui::BrowserItemKind::directory:
+                    ++folder_count;
+                    break;
+                case axiom::gui::BrowserItemKind::archive:
+                    ++archive_count;
+                    break;
+                case axiom::gui::BrowserItemKind::symlink:
+                case axiom::gui::BrowserItemKind::hardlink:
+                    ++link_count;
+                    break;
+                default:
+                    ++file_count;
+                    break;
+            }
         }
-        details.push_back({L"Archive path", archive->wstring()});
+
+        std::wstring heading;
+        std::wstring subheading;
+        if (indices.size() == 1) {
+            const auto& item =
+                browser_items_[static_cast<std::size_t>(indices.front())];
+            heading = item.name;
+            subheading = L"Archive entry  -  " +
+                         history_.current().display_name();
+            details.push_back({L"Type", item.type.empty() ? L"Archive entry"
+                                                           : item.type});
+            details.push_back({L"Size", format_size(item.size)});
+            if (item.packed_size) {
+                details.push_back({
+                    item.packed_size_estimated ? L"Packed size (estimated)"
+                                               : L"Packed size",
+                    format_packed_size(item.packed_size,
+                                       item.packed_size_estimated)});
+                if (item.size != 0) {
+                    details.push_back(
+                        {L"Compression ratio",
+                         format_ratio(*item.packed_size, item.size)});
+                }
+            } else {
+                details.push_back({L"Packed size", L"Not available"});
+            }
+            if (!item.modified.empty()) {
+                details.push_back({L"Modified", item.modified});
+            }
+            if (!item.created.empty()) {
+                details.push_back({L"Created", item.created});
+            }
+            if (!item.accessed.empty()) {
+                details.push_back({L"Accessed", item.accessed});
+            }
+            if (item.crc32) {
+                details.push_back({L"CRC-32", format_crc32(item.crc32)});
+            }
+            if (!item.attributes.empty()) {
+                details.push_back({L"Attributes", item.attributes});
+            }
+            details.push_back({
+                L"Entry path",
+                item.archive_path.empty() ? item.name : widen(item.archive_path)});
+        } else {
+            heading = quote_count(indices.size(), L"selected item",
+                                  L"selected items");
+            subheading = L"Archive selection  -  " +
+                         history_.current().display_name();
+            details.push_back({L"Selection",
+                               quote_count(indices.size(), L"item", L"items")});
+            if (file_count != 0) {
+                details.push_back(
+                    {L"Files", std::to_wstring(file_count)});
+            }
+            if (folder_count != 0) {
+                details.push_back(
+                    {L"Folders", std::to_wstring(folder_count)});
+            }
+            if (archive_count != 0) {
+                details.push_back(
+                    {L"Archives", std::to_wstring(archive_count)});
+            }
+            if (link_count != 0) {
+                details.push_back(
+                    {L"Links", std::to_wstring(link_count)});
+            }
+            details.push_back({L"Unpacked total", format_size(unpacked_total)});
+            if (packed_count != 0) {
+                std::wstring label =
+                    packed_count == indices.size() ? L"Packed total"
+                                                   : L"Known packed size";
+                if (estimated_packed_count != 0) label += L" (estimated)";
+                std::wstring value = format_size(packed_total);
+                if (packed_count != indices.size()) {
+                    value += L" for " + std::to_wstring(packed_count) +
+                             L" of " + std::to_wstring(indices.size()) +
+                             L" items";
+                }
+                details.push_back({std::move(label), std::move(value)});
+                if (packed_count == indices.size() &&
+                    unpacked_total != 0) {
+                    details.push_back(
+                        {L"Compression ratio",
+                         format_ratio(packed_total, unpacked_total)});
+                }
+            } else {
+                details.push_back({L"Packed total", L"Not available"});
+            }
+        }
+        details.push_back(
+            {L"Archive path", history_.current().archive_path.wstring()});
+        axiom::gui::show_information_summary_dialog(
+            hwnd_, std::move(heading), std::move(subheading),
+            std::move(details));
+        set_status(L"Information closed.");
+        return;
+    }
+
+    const axiom::gui::BrowserItem* selected_archive_item = nullptr;
+    if (!browsing_archive && indices.size() == 1) {
+        const auto& item =
+            browser_items_[static_cast<std::size_t>(indices.front())];
+        if (item.kind == axiom::gui::BrowserItemKind::archive &&
+            !item.filesystem_path.empty()) {
+            selected_archive_item = &item;
+        }
+    }
+
+    std::optional<fs::path> information_archive;
+    if (browsing_archive) {
+        information_archive = history_.current().archive_path;
+    } else if (selected_archive_item != nullptr) {
+        information_archive = selected_archive_item->filesystem_path;
+    }
+
+    if (information_archive) {
+        axiom::gui::ArchiveSummaryRows details;
+        if (selected_archive_item != nullptr) {
+            details.push_back(
+                {L"Location",
+                 selected_archive_item->filesystem_path.parent_path().wstring()});
+            details.push_back({
+                L"Type", selected_archive_item->type.empty()
+                    ? L"Archive" : selected_archive_item->type});
+            details.push_back(
+                {L"File size", format_size(selected_archive_item->size)});
+            if (!selected_archive_item->modified.empty()) {
+                details.push_back(
+                    {L"Modified", selected_archive_item->modified});
+            }
+            if (!selected_archive_item->created.empty()) {
+                details.push_back(
+                    {L"Created", selected_archive_item->created});
+            }
+            if (!selected_archive_item->accessed.empty()) {
+                details.push_back(
+                    {L"Accessed", selected_archive_item->accessed});
+            }
+            if (!selected_archive_item->attributes.empty()) {
+                details.push_back(
+                    {L"Attributes", selected_archive_item->attributes});
+            }
+        } else {
+            details.push_back({L"Location",
+                               history_.current().display_name()});
+            details.push_back({
+                L"Items",
+                quote_count(browser_items_.size(), L"item", L"items")});
+        }
+        details.push_back(
+            {L"Archive path", information_archive->wstring()});
         const auto* provider = active_archive_provider();
         const auto cached_capabilities = active_archive_capabilities();
         if (provider != nullptr) {
@@ -675,19 +905,35 @@ void MainWindow::on_info() {
         }
         std::string metadata_password;
         if (cached_capabilities.encrypted) {
-            auto password = password_for_archive_edit(*archive);
+            auto password = password_for_archive_edit(*information_archive);
             if (!password) return;
             metadata_password = std::move(*password);
         }
-        const fs::path path = *archive;
-        const bool native = provider != nullptr && provider->info().native;
+        const fs::path path = *information_archive;
         const auto catalog = archive_catalog_ &&
                 same_filesystem_path(archive_catalog_->path(), path)
             ? archive_catalog_ : std::shared_ptr<const axiom::gui::ArchiveCatalog>{};
+
+        std::function<void(HWND)> estimate_action;
+        if (selected_archive_item != nullptr) {
+            std::vector<fs::path> estimate_inputs{
+                selected_archive_item->filesystem_path};
+            auto estimate_options = make_estimate_options();
+            const int estimate_level = selected_level();
+            estimate_action =
+                [inputs = std::move(estimate_inputs),
+                 options = std::move(estimate_options),
+                 estimate_level](HWND dialog_owner) mutable {
+                    axiom::gui::show_filesystem_information_dialog(
+                        dialog_owner, inputs, options, estimate_level);
+                };
+        }
+
         begin_background_ui_task(
-            L"Reading archive information...",
-            [this, path, provider, native, cached_capabilities,
+            L"Reading information...",
+            [this, path, provider, cached_capabilities,
              details = std::move(details), catalog,
+             estimate_action = std::move(estimate_action),
              password = std::move(metadata_password)]() mutable {
                 auto capabilities = cached_capabilities;
                 std::wstring comment;
@@ -695,9 +941,20 @@ void MainWindow::on_info() {
                 const auto file_size = fs::file_size(path, size_error);
                 if (!size_error) details.push_back({L"Packed total", format_size(file_size)});
                 try {
-                    if (provider != nullptr) {
-                        capabilities = provider->capabilities(path, password);
+                    const auto* effective_provider = provider != nullptr
+                        ? provider : axiom::archive_provider_for_path(path);
+                    if (effective_provider != nullptr) {
+                        if (provider == nullptr) {
+                            details.push_back({
+                                L"Format",
+                                widen(effective_provider->info().display_name)});
+                        }
+                        capabilities =
+                            effective_provider->capabilities(path, password);
                     }
+                    const bool native =
+                        effective_provider != nullptr &&
+                        effective_provider->info().native;
                     if (native) {
                         const auto encryption = axiom::archive_encryption_mode(path);
                         details.push_back({L"Encryption",
@@ -719,8 +976,10 @@ void MainWindow::on_info() {
                     const std::vector<axiom::ArchiveEntry>* entries = nullptr;
                     if (catalog) {
                         entries = &catalog->entries();
-                    } else if (provider != nullptr && capabilities.list) {
-                        loaded_entries = provider->list(path, password);
+                    } else if (effective_provider != nullptr &&
+                               capabilities.list) {
+                        loaded_entries =
+                            effective_provider->list(path, password);
                         entries = &loaded_entries;
                     }
                     if (entries) {
@@ -737,10 +996,13 @@ void MainWindow::on_info() {
                 }
                 secure_clear(password);
                 return [this, path, details = std::move(details), capabilities,
-                        comment = std::move(comment)]() mutable {
-                    set_status(L"Archive information loaded.");
+                        comment = std::move(comment),
+                        estimate_action =
+                            std::move(estimate_action)]() mutable {
+                    set_status(L"Information loaded.");
                     axiom::gui::show_archive_information_dialog(
-                        hwnd_, path, details, capabilities, std::move(comment));
+                        hwnd_, path, details, capabilities,
+                        std::move(comment), std::move(estimate_action));
                 };
             });
         return;
@@ -751,23 +1013,13 @@ void MainWindow::on_info() {
         inputs.push_back(history_.current().filesystem_path);
     }
     if (inputs.empty()) {
-        show_app_message(L"Select a file or folder to estimate its compression.",
+        show_app_message(L"Select a file or folder to view its information.",
                          axiom::gui::MessageDialogIcon::information, L"Information");
         return;
     }
 
-    axiom::CompressionEstimateOptions estimate_options;
-    estimate_options.format = axiom::ArchiveFormat::axar;
-    estimate_options.compression = compression_options();
-    // This is an adaptive ceiling, not a fixed cost. Higher codec levels use a
-    // smaller cap because each representative probe takes longer to encode.
-    estimate_options.sample_budget = selected_level() >= 8 ? 24u << 20
-        : selected_level() >= 6 ? 48u << 20 : 64u << 20;
-    estimate_options.sample_chunk_size = 512u << 10;
-    estimate_options.time_budget = std::chrono::seconds(5);
-
     axiom::gui::show_filesystem_information_dialog(
-        hwnd_, std::move(inputs), std::move(estimate_options), selected_level());
+        hwnd_, std::move(inputs), make_estimate_options(), selected_level());
     set_status(L"Information closed.");
 }
 
@@ -963,6 +1215,7 @@ void MainWindow::on_find_files() {
 
 void MainWindow::apply_application_options(
     const axiom::gui::ApplicationDialogOptions& updated_options) {
+    capture_file_list_column_widths();
     const auto previous = application_options_;
     if (updated_options == previous) {
         return;
@@ -996,6 +1249,9 @@ void MainWindow::apply_application_options(
         application_options_.show_horizontal_scrollbar !=
             previous.show_horizontal_scrollbar ||
         application_options_.full_row_select != previous.full_row_select;
+    const bool file_list_columns_changed =
+        normalize_file_list_columns(application_options_.file_list_columns) !=
+        normalize_file_list_columns(previous.file_list_columns);
     const bool address_options_changed =
         application_options_.show_address_shell_locations !=
             previous.show_address_shell_locations ||
@@ -1032,6 +1288,11 @@ void MainWindow::apply_application_options(
         update_toolbar_button_states();
     }
     if (table_options_changed) apply_table_options();
+    if (file_list_columns_changed) {
+        const BrowserViewState state = capture_browser_view_state();
+        apply_file_list_columns();
+        begin_browser_table_population(state);
+    }
     if (address_options_changed) {
         const int limit = std::clamp(application_options_.recent_location_count, 0, 50);
         if (limit == 0) {
@@ -1055,6 +1316,7 @@ void MainWindow::apply_application_options(
 }
 
 void MainWindow::on_settings() {
+    capture_file_list_column_widths();
     auto dialog_options = application_options_;
     if (!axiom::gui::show_application_settings_dialog(
             hwnd_, dialog_options,
@@ -1425,6 +1687,7 @@ void MainWindow::on_drop_files(HDROP drop) {
 }
 
 void MainWindow::save_current_settings() {
+    capture_file_list_column_widths();
     persisted_settings_.application = application_options_;
     persisted_settings_.sort_column = sort_column_;
     persisted_settings_.sort_ascending = sort_ascending_;

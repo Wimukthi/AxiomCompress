@@ -12,6 +12,9 @@
     <ClCompile Include="src\cli\main.cpp">
       <Filter>CLI</Filter>
     </ClCompile>
+    <ClCompile Include="src\sfx\module_file.cpp">
+      <Filter>CLI</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="src\cli\axiom_cli.rc">

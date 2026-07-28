@@ -549,9 +549,10 @@ bool run_simple_password_dialog(HWND owner, std::wstring& password) {
         return false;
     }
     apply_axiom_window_icons(dialog, instance);
-    restore_named_window_placement(dialog, owner, L"ArchivePasswordPrompt");
+    const int show_command =
+        restore_named_window_placement(dialog, owner, L"ArchivePasswordPrompt");
     const bool owner_was_enabled = disable_dialog_owner(owner, dialog);
-    ShowWindow(dialog, SW_SHOW);
+    ShowWindow(dialog, show_command);
     UpdateWindow(dialog);
     MSG message{};
     while (IsWindow(dialog)) {
@@ -621,9 +622,10 @@ bool run_simple_comment_dialog(HWND owner, std::wstring& comment) {
         return false;
     }
     apply_axiom_window_icons(dialog, instance);
-    restore_named_window_placement(dialog, owner, L"ArchiveCommentEditor");
+    const int show_command =
+        restore_named_window_placement(dialog, owner, L"ArchiveCommentEditor");
     const bool owner_was_enabled = disable_dialog_owner(owner, dialog);
-    ShowWindow(dialog, SW_SHOW);
+    ShowWindow(dialog, show_command);
     UpdateWindow(dialog);
     MSG message{};
     while (IsWindow(dialog)) {
@@ -654,6 +656,7 @@ constexpr DWORD kArchiveSummaryDialogStyle =
     WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_CLIPCHILDREN;
 constexpr DWORD kArchiveSummaryDialogExStyle =
     WS_EX_WINDOWEDGE | WS_EX_CONTROLPARENT;
+constexpr int kSummaryAction = 6401;
 
 struct ArchiveSummaryCapabilityRow {
     std::wstring label;
@@ -667,12 +670,15 @@ struct ArchiveSummaryDialogData {
     ArchiveSummaryRows details;
     std::wstring archive_comment;
     std::vector<ArchiveSummaryCapabilityRow> capabilities;
+    std::wstring action_label;
+    std::function<void(HWND)> action;
 };
 
 struct ArchiveSummaryDialogState {
     HWND hwnd{};
     HWND owner{};
     HWND ok{};
+    HWND action{};
     HINSTANCE instance{};
     HFONT font{};
     HFONT title_font{};
@@ -702,9 +708,9 @@ HFONT create_scaled_font(HFONT base, UINT dpi, int point_height, int weight) {
     return CreateFontIndirectW(&description);
 }
 
-std::array<HWND, 1> summary_controls(ArchiveSummaryDialogState* state) {
+std::array<HWND, 2> summary_controls(ArchiveSummaryDialogState* state) {
     if (state == nullptr) return {};
-    return {state->ok};
+    return {state->ok, state->action};
 }
 
 int summary_button_height(const ArchiveSummaryDialogState* state) {
@@ -953,6 +959,10 @@ void layout_summary(ArchiveSummaryDialogState* state) {
     const int button_height = scale_for_dialog_dpi(30, state->dpi);
     MoveWindow(state->ok, client.right - margin - button_width,
                client.bottom - margin - button_height, button_width, button_height, TRUE);
+    if (state->action != nullptr) {
+        MoveWindow(state->action, margin, client.bottom - margin - button_height,
+                   scale_for_dialog_dpi(150, state->dpi), button_height, TRUE);
+    }
     update_summary_scrollbar(state);
     InvalidateRect(state->hwnd, nullptr, FALSE);
 }
@@ -1177,7 +1187,18 @@ LRESULT CALLBACK archive_summary_proc(HWND hwnd, UINT message, WPARAM wparam, LP
                 WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | WS_TABSTOP | BS_OWNERDRAW,
                 0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(IDOK),
                 state->instance, nullptr);
+            if (state->data.action && !state->data.action_label.empty()) {
+                state->action = CreateWindowExW(
+                    0, L"BUTTON", state->data.action_label.c_str(),
+                    WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS |
+                        WS_TABSTOP | BS_OWNERDRAW,
+                    0, 0, 0, 0, hwnd,
+                    reinterpret_cast<HMENU>(
+                        static_cast<INT_PTR>(kSummaryAction)),
+                    state->instance, nullptr);
+            }
             for (HWND control : summary_controls(state)) {
+                if (control == nullptr) continue;
                 set_dialog_control_font(control, state->font);
             }
             apply_summary_theme(state);
@@ -1301,6 +1322,11 @@ LRESULT CALLBACK archive_summary_proc(HWND hwnd, UINT message, WPARAM wparam, LP
             }
             return 0;
         case WM_COMMAND:
+            if (LOWORD(wparam) == kSummaryAction &&
+                state != nullptr && state->data.action) {
+                state->data.action(hwnd);
+                return 0;
+            }
             if (LOWORD(wparam) == IDOK || LOWORD(wparam) == IDCANCEL) {
                 save_named_window_placement(L"ArchiveSummaryDialog", hwnd);
                 DestroyWindow(hwnd);
@@ -1440,9 +1466,10 @@ void show_archive_summary_dialog(HWND owner, ArchiveSummaryDialogData data) {
         return;
     }
     apply_axiom_window_icons(dialog, instance);
-    restore_named_window_placement(dialog, owner, L"ArchiveSummaryDialog");
+    const int show_command =
+        restore_named_window_placement(dialog, owner, L"ArchiveSummaryDialog");
     const bool owner_was_enabled = disable_dialog_owner(owner, dialog);
-    ShowWindow(dialog, SW_SHOW);
+    ShowWindow(dialog, show_command);
     UpdateWindow(dialog);
     MSG message{};
     while (IsWindow(dialog)) {
@@ -1480,15 +1507,33 @@ void show_archive_information_dialog(
     const std::filesystem::path& archive_path,
     const ArchiveSummaryRows& details,
     const ArchiveCapabilities& capabilities,
-    std::wstring archive_comment) {
+    std::wstring archive_comment,
+    std::function<void(HWND)> estimate_action) {
     ArchiveSummaryDialogData data;
-    data.title = L"Archive information";
+    data.title = L"Information - Axiom";
     data.heading = archive_path.filename().wstring();
     data.subheading = provider_name_for_archive(archive_path) + L"  -  " +
                       archive_path.wstring();
     data.details = details;
     data.archive_comment = std::move(archive_comment);
     data.capabilities = summary_capabilities(capabilities);
+    if (estimate_action) {
+        data.action_label = L"Estimate...";
+        data.action = std::move(estimate_action);
+    }
+    show_archive_summary_dialog(owner, std::move(data));
+}
+
+void show_information_summary_dialog(
+    HWND owner,
+    std::wstring heading,
+    std::wstring subheading,
+    ArchiveSummaryRows details) {
+    ArchiveSummaryDialogData data;
+    data.title = L"Information - Axiom";
+    data.heading = std::move(heading);
+    data.subheading = std::move(subheading);
+    data.details = std::move(details);
     show_archive_summary_dialog(owner, std::move(data));
 }
 

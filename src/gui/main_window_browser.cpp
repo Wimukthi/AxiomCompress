@@ -4,6 +4,95 @@
 #include "gui/main_window_internal.hpp"
 
 namespace axiom::gui {
+namespace {
+
+std::wstring browser_item_extension(const BrowserItem& item) {
+    if (item.kind == BrowserItemKind::parent ||
+        item.kind == BrowserItemKind::drive ||
+        item.kind == BrowserItemKind::directory) {
+        return {};
+    }
+    return fs::path(item.name).extension().wstring();
+}
+
+std::wstring browser_item_path(const BrowserItem& item) {
+    if (!item.filesystem_path.empty()) {
+        return item.filesystem_path.parent_path().wstring();
+    }
+    if (!item.archive_path.empty()) {
+        const auto separator = item.archive_path.find_last_of('/');
+        if (separator != std::string::npos) {
+            return widen(std::string_view(item.archive_path).substr(0, separator));
+        }
+    }
+    return {};
+}
+
+std::wstring browser_item_ratio(const BrowserItem& item) {
+    if (!item.packed_size || item.size == 0) return {};
+    wchar_t text[32]{};
+    const double percent =
+        static_cast<double>(*item.packed_size) * 100.0 /
+        static_cast<double>(item.size);
+    swprintf_s(text, L"%.1f%%", percent);
+    return text;
+}
+
+int compare_browser_items_by_column(const BrowserItem& left,
+                                    const BrowserItem& right,
+                                    FileListColumnId column) {
+    const auto compare_u64 = [](std::uint64_t a, std::uint64_t b) {
+        return a < b ? -1 : (a > b ? 1 : 0);
+    };
+    switch (column) {
+        case FileListColumnId::size:
+            return compare_u64(left.size, right.size);
+        case FileListColumnId::packed:
+            return compare_u64(left.packed_size.value_or(0),
+                               right.packed_size.value_or(0));
+        case FileListColumnId::type:
+            return _wcsicmp(left.type.c_str(), right.type.c_str());
+        case FileListColumnId::modified:
+            return _wcsicmp(left.modified.c_str(), right.modified.c_str());
+        case FileListColumnId::crc32:
+            return compare_u64(left.crc32.value_or(0), right.crc32.value_or(0));
+        case FileListColumnId::attributes:
+            return _wcsicmp(left.attributes.c_str(), right.attributes.c_str());
+        case FileListColumnId::ratio: {
+            const long double left_ratio =
+                left.packed_size && left.size != 0
+                ? static_cast<long double>(*left.packed_size) /
+                      static_cast<long double>(left.size)
+                : -1.0L;
+            const long double right_ratio =
+                right.packed_size && right.size != 0
+                ? static_cast<long double>(*right.packed_size) /
+                      static_cast<long double>(right.size)
+                : -1.0L;
+            return left_ratio < right_ratio ? -1
+                : (left_ratio > right_ratio ? 1 : 0);
+        }
+        case FileListColumnId::extension: {
+            const auto left_extension = browser_item_extension(left);
+            const auto right_extension = browser_item_extension(right);
+            return _wcsicmp(left_extension.c_str(), right_extension.c_str());
+        }
+        case FileListColumnId::created:
+            return _wcsicmp(left.created.c_str(), right.created.c_str());
+        case FileListColumnId::accessed:
+            return _wcsicmp(left.accessed.c_str(), right.accessed.c_str());
+        case FileListColumnId::path: {
+            const auto left_path = browser_item_path(left);
+            const auto right_path = browser_item_path(right);
+            return _wcsicmp(left_path.c_str(), right_path.c_str());
+        }
+        case FileListColumnId::name:
+        default:
+            return _wcsicmp(left.name.c_str(), right.name.c_str());
+    }
+}
+
+}  // namespace
 
 ShellIconRef MainWindow::tree_icon_for_filesystem(const fs::path& path, bool drive,
                                                    bool directory,
@@ -914,31 +1003,9 @@ void MainWindow::navigate_to(axiom::gui::BrowserLocation location, bool record_h
                 [&](const auto& left, const auto& right) {
                     if (rank(left) != rank(right)) return rank(left) < rank(right);
                     int comparison = 0;
-                    switch (load_sort_column) {
-                        case 1:
-                            comparison = left.size < right.size ? -1
-                                : (left.size > right.size ? 1 : 0);
-                            break;
-                        case 2: {
-                            const auto left_size = left.packed_size.value_or(0);
-                            const auto right_size = right.packed_size.value_or(0);
-                            comparison = left_size < right_size ? -1
-                                : (left_size > right_size ? 1 : 0);
-                            break;
-                        }
-                        case 3: comparison = _wcsicmp(left.type.c_str(), right.type.c_str()); break;
-                        case 4: comparison = _wcsicmp(left.modified.c_str(), right.modified.c_str()); break;
-                        case 5:
-                            comparison = left.crc32.value_or(0) < right.crc32.value_or(0) ? -1
-                                : (left.crc32.value_or(0) > right.crc32.value_or(0) ? 1 : 0);
-                            break;
-                        case 6:
-                            comparison = _wcsicmp(left.attributes.c_str(), right.attributes.c_str());
-                            break;
-                        default:
-                            comparison = _wcsicmp(left.name.c_str(), right.name.c_str());
-                            break;
-                    }
+                    comparison = compare_browser_items_by_column(
+                        left, right,
+                        static_cast<FileListColumnId>(load_sort_column));
                     if (comparison == 0) {
                         comparison = _wcsicmp(left.name.c_str(), right.name.c_str());
                     }
@@ -964,25 +1031,8 @@ void MainWindow::sort_browser_items_for_table() {
                      [&](const auto& left, const auto& right) {
         if (rank(left) != rank(right)) return rank(left) < rank(right);
         int comparison = 0;
-        switch (sort_column_) {
-            case 1:
-                comparison = left.size < right.size ? -1 : (left.size > right.size ? 1 : 0);
-                break;
-            case 2: {
-                const auto left_size = left.packed_size.value_or(0);
-                const auto right_size = right.packed_size.value_or(0);
-                comparison = left_size < right_size ? -1 : (left_size > right_size ? 1 : 0);
-                break;
-            }
-            case 3: comparison = _wcsicmp(left.type.c_str(), right.type.c_str()); break;
-            case 4: comparison = _wcsicmp(left.modified.c_str(), right.modified.c_str()); break;
-            case 5:
-                comparison = left.crc32.value_or(0) < right.crc32.value_or(0) ? -1
-                    : (left.crc32.value_or(0) > right.crc32.value_or(0) ? 1 : 0);
-                break;
-            case 6: comparison = _wcsicmp(left.attributes.c_str(), right.attributes.c_str()); break;
-            default: comparison = _wcsicmp(left.name.c_str(), right.name.c_str()); break;
-        }
+        comparison = compare_browser_items_by_column(
+            left, right, static_cast<FileListColumnId>(sort_column_));
         if (comparison == 0) comparison = _wcsicmp(left.name.c_str(), right.name.c_str());
         return sort_ascending_ ? comparison < 0 : comparison > 0;
     });
@@ -993,15 +1043,50 @@ std::vector<std::wstring> MainWindow::browser_row_for_item(
     const bool show_size = item.kind == axiom::gui::BrowserItemKind::file ||
                            item.kind == axiom::gui::BrowserItemKind::archive ||
                            item.kind == axiom::gui::BrowserItemKind::drive;
-    return {
-        item.name,
-        show_size ? format_size(item.size) : L"",
-        format_packed_size(item.packed_size, item.packed_size_estimated),
-        item.type,
-        item.modified,
-        format_crc32(item.crc32),
-        item.attributes,
-    };
+    std::vector<std::wstring> row;
+    row.reserve(visible_file_columns_.size());
+    for (const auto column : visible_file_columns_) {
+        switch (column) {
+            case FileListColumnId::name:
+                row.push_back(item.name);
+                break;
+            case FileListColumnId::size:
+                row.push_back(show_size ? format_size(item.size) : L"");
+                break;
+            case FileListColumnId::packed:
+                row.push_back(format_packed_size(
+                    item.packed_size, item.packed_size_estimated));
+                break;
+            case FileListColumnId::type:
+                row.push_back(item.type);
+                break;
+            case FileListColumnId::modified:
+                row.push_back(item.modified);
+                break;
+            case FileListColumnId::crc32:
+                row.push_back(format_crc32(item.crc32));
+                break;
+            case FileListColumnId::attributes:
+                row.push_back(item.attributes);
+                break;
+            case FileListColumnId::ratio:
+                row.push_back(browser_item_ratio(item));
+                break;
+            case FileListColumnId::extension:
+                row.push_back(browser_item_extension(item));
+                break;
+            case FileListColumnId::created:
+                row.push_back(item.created);
+                break;
+            case FileListColumnId::accessed:
+                row.push_back(item.accessed);
+                break;
+            case FileListColumnId::path:
+                row.push_back(browser_item_path(item));
+                break;
+        }
+    }
+    return row;
 }
 
 bool MainWindow::append_browser_table_batch() {
@@ -1056,7 +1141,7 @@ void MainWindow::begin_browser_table_population(std::optional<BrowserViewState> 
                                                 bool sort_items) {
     cancel_browser_table_population();
     if (sort_items) sort_browser_items_for_table();
-    table_.set_sort_indicator(sort_column_, sort_ascending_);
+    table_.set_sort_indicator(visible_sort_column_index(), sort_ascending_);
     pending_table_restore_state_ = std::move(restore_state);
     table_population_generation_ = browser_generation_;
     table_population_active_ = false;
@@ -1102,16 +1187,54 @@ void MainWindow::on_browser_populate_timer() {
 }
 
 void MainWindow::on_table_sort(int column) {
+    if (column < 0 ||
+        column >= static_cast<int>(visible_file_columns_.size())) {
+        return;
+    }
+    const int requested_column =
+        static_cast<int>(visible_file_columns_[static_cast<std::size_t>(column)]);
     BrowserViewState state = table_population_active_ && pending_table_restore_state_
         ? *pending_table_restore_state_
         : capture_browser_view_state();
-    if (column == sort_column_) {
+    if (requested_column == sort_column_) {
         sort_ascending_ = !sort_ascending_;
     } else {
-        sort_column_ = column;
+        sort_column_ = requested_column;
         sort_ascending_ = true;
     }
     begin_browser_table_population(std::move(state));
+}
+
+void MainWindow::on_table_column_reorder(int from, int to) {
+    if (from <= 0 || to <= 0 ||
+        from >= static_cast<int>(visible_file_columns_.size()) ||
+        to >= static_cast<int>(visible_file_columns_.size()) ||
+        from == to) {
+        return;
+    }
+    capture_file_list_column_widths();
+    auto columns = normalize_file_list_columns(
+        application_options_.file_list_columns);
+    std::vector<std::size_t> visible_positions;
+    std::vector<FileListColumnSetting> visible_settings;
+    for (std::size_t index = 0; index < columns.size(); ++index) {
+        if (!columns[index].visible) continue;
+        visible_positions.push_back(index);
+        visible_settings.push_back(columns[index]);
+    }
+    if (from >= static_cast<int>(visible_settings.size()) ||
+        to >= static_cast<int>(visible_settings.size())) {
+        return;
+    }
+    auto moved = visible_settings[static_cast<std::size_t>(from)];
+    visible_settings.erase(visible_settings.begin() + from);
+    visible_settings.insert(visible_settings.begin() + to, std::move(moved));
+    for (std::size_t index = 0; index < visible_positions.size(); ++index) {
+        columns[visible_positions[index]] = std::move(visible_settings[index]);
+    }
+    application_options_.file_list_columns = std::move(columns);
+    apply_file_list_columns();
+    save_current_settings();
 }
 
 void MainWindow::on_browser_loaded(LPARAM lparam) {

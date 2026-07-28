@@ -187,7 +187,7 @@ void activate_restored_owner(HWND owner) {
     // SetActiveWindow alone cannot recover after Windows has already selected
     // another application's window. Calling this while the modal child is still
     // being destroyed keeps the foreground transition within Axiom.
-    SetActiveWindow(owner);
+    if (GetActiveWindow() != owner) SetActiveWindow(owner);
     if (GetForegroundWindow() != owner) SetForegroundWindow(owner);
 }
 
@@ -903,8 +903,33 @@ int dialog_icon_style() {
 }
 
 void apply_dialog_dark_frame(HWND window, bool dark) {
-    (void)dark;
     configure_windows_theme();
+
+    // DWM owns the caption and resize border.  On Windows 11 it can animate
+    // those surfaces from the system's default (usually light) colors even
+    // when immersive dark mode was set before the first ShowWindow call.  Set
+    // every non-client color explicitly and suppress that transition before
+    // asking the shared theme layer to install its remaining attributes.  This
+    // keeps the first composed frame dark instead of briefly exposing a white
+    // title bar or border.
+    const BOOL transitions_disabled = TRUE;
+    DwmSetWindowAttribute(window, DWMWA_TRANSITIONS_FORCEDISABLED,
+                          &transitions_disabled,
+                          sizeof(transitions_disabled));
+
+    if (!high_contrast_enabled()) {
+        const DialogColors colors = dialog_colors(dark);
+        const COLORREF caption_color = colors.background;
+        const COLORREF border_color = colors.border;
+        const COLORREF text_color = colors.text;
+        DwmSetWindowAttribute(window, DWMWA_CAPTION_COLOR,
+                              &caption_color, sizeof(caption_color));
+        DwmSetWindowAttribute(window, DWMWA_BORDER_COLOR,
+                              &border_color, sizeof(border_color));
+        DwmSetWindowAttribute(window, DWMWA_TEXT_COLOR,
+                              &text_color, sizeof(text_color));
+    }
+
     wimukthi::win32_theme::apply_title_bar(window);
 }
 
@@ -1298,7 +1323,12 @@ bool disable_dialog_owner(HWND owner, HWND dialog) {
 
 void restore_dialog_owner(HWND owner, bool was_enabled) {
     if (!was_enabled || owner == nullptr || !IsWindow(owner)) return;
-    activate_restored_owner(owner);
+    // The modal-child subclass normally restores the owner during WM_DESTROY,
+    // before Windows can activate an unrelated window beneath Axiom. Most
+    // callers also invoke this function after DestroyWindow as a fallback.
+    // Do not activate the owner a second time: that redundant foreground
+    // transition causes a visible flash and can briefly disturb the z-order.
+    if (!IsWindowEnabled(owner)) activate_restored_owner(owner);
 }
 
 bool message_targets_window(HWND window, const MSG& message) {
@@ -1329,14 +1359,15 @@ POINT centered_window_position(HWND owner, int width, int height) {
     return POINT{x, y};
 }
 
-void restore_named_window_placement(HWND window, HWND owner, std::wstring_view name) {
-    if (window == nullptr) return;
+int restore_named_window_placement(HWND window, HWND owner, std::wstring_view name) {
+    if (window == nullptr) return SW_SHOW;
     WINDOWPLACEMENT placement{sizeof(placement)};
     UINT saved_dpi = 0;
     if (!g_dialog_appearance.center_child_windows &&
         read_window_placement(name, placement, saved_dpi) &&
         window_placement_is_visible(placement)) {
-        if (placement.showCmd == SW_SHOWMINIMIZED) placement.showCmd = SW_SHOWNORMAL;
+        const int show_command =
+            placement.showCmd == SW_SHOWMAXIMIZED ? SW_SHOWMAXIMIZED : SW_SHOW;
 
         // WINDOWPLACEMENT stores physical pixels for a per-monitor-aware window.
         // Move first so Windows establishes the destination monitor DPI, then
@@ -1357,16 +1388,27 @@ void restore_named_window_placement(HWND window, HWND owner, std::wstring_view n
             placement.rcNormalPosition.right = placement.rcNormalPosition.left + width;
             placement.rcNormalPosition.bottom = placement.rcNormalPosition.top + height;
         }
-        SetWindowPlacement(window, &placement);
-        return;
+        // SetWindowPlacement also applies showCmd and can expose a hidden
+        // window before its dark non-client frame and first client frame are
+        // ready. Restore the normal geometry directly and let the caller show
+        // the fully initialized window once.
+        SetWindowPos(
+            window, nullptr,
+            placement.rcNormalPosition.left,
+            placement.rcNormalPosition.top,
+            placement.rcNormalPosition.right - placement.rcNormalPosition.left,
+            placement.rcNormalPosition.bottom - placement.rcNormalPosition.top,
+            SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+        return show_command;
     }
 
     RECT rect{};
-    if (!GetWindowRect(window, &rect)) return;
+    if (!GetWindowRect(window, &rect)) return SW_SHOW;
     const POINT position = centered_window_position(owner, rect.right - rect.left,
                                                     rect.bottom - rect.top);
     SetWindowPos(window, nullptr, position.x, position.y, 0, 0,
                  SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+    return SW_SHOW;
 }
 
 void save_named_window_placement(std::wstring_view name, HWND window) {

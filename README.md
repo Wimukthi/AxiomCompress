@@ -177,6 +177,10 @@ volumes, signatures, encrypted names, and Axiom metadata remain disabled
 when ZIP is selected. ZIP can create and open standard `.z01`, `.z02`, ..., `.zip`
 split sets; split sets are read-only and must be recreated to change their entries.
 SFX packaging works for both AXAR and ZIP and emits only the merged executable.
+A dedicated read-only SFX runtime is installed as the non-executable
+`AxiomSfx.bin` module. Axiom reads it only while creating an SFX, so the GUI and
+CLI do not carry or map a duplicate archive runtime. Generated extractors do not
+contain the full archive-manager GUI.
 
 On Windows, Axiom also exposes read-only archive providers for common formats.
 ISO browsing uses Axiom's native ISO9660/Joliet directory reader so large images
@@ -568,7 +572,8 @@ installer\output\AxiomSetup-<version>-win-x64.exe
 ```
 
 GitHub releases also carry a portable zip asset named
-`Axiom-<version>-win-x64.zip` containing `Axiom.exe`, `axiomc.exe`, the bundled
+`Axiom-<version>-win-x64.zip` containing `Axiom.exe`, `axiomc.exe`,
+`AxiomSfx.bin`, the bundled
 read-only archive backend, licenses and corresponding Darkmodelib source, and
 the user/developer docs.
 

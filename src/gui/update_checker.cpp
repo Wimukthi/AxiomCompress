@@ -609,7 +609,7 @@ void post_owned_result(HWND window, UINT message, std::unique_ptr<Result> result
 
 bool automatic_update_checks_enabled() {
     if (auto value = read_setting_dword(kAutoUpdateSetting)) return *value != 0;
-    return false;
+    return true;
 }
 
 void set_automatic_update_checks_enabled(bool enabled) {
@@ -646,7 +646,6 @@ std::wstring current_executable_version(HINSTANCE instance) {
 
 void start_update_check(HWND notify_window, HINSTANCE instance, UpdateCheckKind kind) {
     const std::wstring url = update_feed_url();
-    write_setting_dword(kLastUpdateCheckSetting, unix_seconds_now());
     std::thread([notify_window, instance, kind, url] {
         auto result = std::make_unique<UpdateCheckResult>();
         result->kind = kind;
@@ -664,6 +663,9 @@ void start_update_check(HWND notify_window, HINSTANCE instance, UpdateCheckKind 
             return;
         }
         result->success = true;
+        // A failed request is not a completed check. Record the throttle timestamp
+        // only after a valid release response so the next startup can retry silently.
+        write_setting_dword(kLastUpdateCheckSetting, unix_seconds_now());
         if (!update->version.empty()) {
             result->update_available = true;
             result->update = std::move(*update);

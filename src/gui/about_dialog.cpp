@@ -386,7 +386,8 @@ void show_about_dialog(HWND owner, HINSTANCE instance, UINT dpi, bool dark,
         return;
     }
     apply_axiom_window_icons(dialog, instance);
-    restore_named_window_placement(dialog, owner, L"AboutDialog");
+    const int show_command =
+        restore_named_window_placement(dialog, owner, L"AboutDialog");
     RECT restored_rect{};
     GetWindowRect(dialog, &restored_rect);
     int restored_width = restored_rect.right - restored_rect.left;
@@ -398,7 +399,7 @@ void show_about_dialog(HWND owner, HINSTANCE instance, UINT dpi, bool dark,
     SetWindowPos(dialog, nullptr, restored_rect.left, restored_rect.top,
                  restored_width, restored_height, SWP_NOZORDER | SWP_NOACTIVATE);
     const bool owner_was_enabled = disable_dialog_owner(owner, dialog);
-    ShowWindow(dialog, SW_SHOW);
+    ShowWindow(dialog, show_command);
     UpdateWindow(dialog);
     MSG message{};
     while (IsWindow(dialog)) {

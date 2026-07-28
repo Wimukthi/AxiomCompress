@@ -1,7 +1,7 @@
-// The quick "Add to archive" flow used by shell integration and
-// the embedded self-extractor startup path.
+// The quick Add/Extract flows used by shell integration.
 
 #include "gui/main_window_internal.hpp"
+#include "sfx/module_file.hpp"
 
 namespace axiom::gui {
 
@@ -318,15 +318,6 @@ private:
         return options;
     }
 
-    static fs::path current_executable_path() {
-        std::wstring buffer(32768, L'\0');
-        const DWORD length = GetModuleFileNameW(nullptr, buffer.data(),
-                                                static_cast<DWORD>(buffer.size()));
-        if (length == 0 || length >= buffer.size()) return {};
-        buffer.resize(length);
-        return fs::path(std::move(buffer));
-    }
-
     void apply_operation_priority() {
         operation_priority_changed_ = false;
         previous_priority_class_ = 0;
@@ -470,7 +461,6 @@ private:
             }
         }
 
-        const fs::path sfx_stub = current_executable_path();
         axiom::ArchiveSigningKey signing_key;
         if (sign_after) {
             std::ifstream key_file(dialog_options.features.signing_key, std::ios::binary);
@@ -523,7 +513,7 @@ private:
             running, success,
             [inputs, archive, options, mode, comment, set_comment,
              repack_after, lock_after, sign_after, signing_key,
-             create_sfx_after, sfx_output, sfx_stub, split_after,
+             create_sfx_after, sfx_output, split_after,
              volume_size = *volume_size, recovery_volumes](
                 std::shared_ptr<axiom::OperationControl> operation) mutable {
                 auto run_options = options;
@@ -587,8 +577,9 @@ private:
                         axiom::create_zip_volumes(archive, volume_size, operation);
                     }
                     if (create_sfx_after) {
-                        axiom::create_sfx_archive(archive, sfx_stub, sfx_output,
-                                                  operation, options.io_buffer_size);
+                        axiom::sfx::create_from_module_file(
+                            GetModuleHandleW(nullptr), archive, sfx_output,
+                            operation, options.io_buffer_size);
                         std::error_code remove_error;
                         if (!fs::remove(archive, remove_error) && remove_error) {
                             std::error_code cleanup_error;
@@ -1065,195 +1056,5 @@ int run_quick_extract_archive(HINSTANCE instance, const std::wstring& path) {
     return controller.run(instance, path);
 }
 
-std::optional<int> run_embedded_sfx(HINSTANCE instance, const std::wstring& requested_destination) {
-constexpr std::array<char, 8> magic = {'A', 'X', 'I', 'O', 'M', 'S', 'F', 'X'};
-std::wstring module(32768, L'\0');
-const DWORD module_length = GetModuleFileNameW(nullptr, module.data(),
-                                               static_cast<DWORD>(module.size()));
-if (module_length == 0 || module_length >= module.size()) return std::nullopt;
-module.resize(module_length);
-const fs::path executable(module);
-
-std::ifstream input(executable, std::ios::binary);
-if (!input) return std::nullopt;
-input.seekg(0, std::ios::end);
-const auto end = input.tellg();
-if (end < static_cast<std::streamoff>(16)) return std::nullopt;
-input.seekg(end - static_cast<std::streamoff>(16));
-std::array<char, 8> found{};
-input.read(found.data(), static_cast<std::streamsize>(found.size()));
-std::array<std::uint8_t, 8> encoded_size{};
-input.read(reinterpret_cast<char*>(encoded_size.data()),
-           static_cast<std::streamsize>(encoded_size.size()));
-if (!input || found != magic) return std::nullopt;
-std::uint64_t archive_size = 0;
-for (unsigned index = 0; index < 8; ++index) {
-    archive_size |= static_cast<std::uint64_t>(encoded_size[index]) << (index * 8);
-}
-const std::uint64_t file_size = static_cast<std::uint64_t>(end);
-if (archive_size == 0 || archive_size > file_size - 16) return std::nullopt;
-const std::uint64_t archive_offset = file_size - 16 - archive_size;
-
-fs::path destination = requested_destination.empty()
-    ? executable.parent_path() / executable.stem()
-    : fs::path(requested_destination);
-const bool dark = system_prefers_dark_mode();
-
-wchar_t temp_path[MAX_PATH + 1]{};
-if (GetTempPathW(MAX_PATH, temp_path) == 0) return 1;
-const fs::path temporary = fs::path(temp_path) /
-    (L"AxiomSfx-" + std::to_wstring(GetCurrentProcessId()) + L".payload");
-try {
-    const auto persisted = axiom::gui::load_gui_settings();
-    const std::size_t io_buffer_size = configured_io_buffer_size(persisted.application);
-    input.clear();
-    input.seekg(static_cast<std::streamoff>(archive_offset));
-    std::ofstream archive(temporary, std::ios::binary | std::ios::trunc);
-    if (!archive) throw std::runtime_error("cannot create the temporary archive");
-    const std::size_t copy_buffer_size = io_buffer_size == 0
-        ? (std::size_t{1} << 20)
-        : std::clamp<std::size_t>(io_buffer_size, 64u << 10, 64u << 20);
-    std::vector<char> buffer(copy_buffer_size);
-    std::uint64_t remaining = archive_size;
-    while (remaining > 0) {
-        const auto count = static_cast<std::streamsize>(
-            std::min<std::uint64_t>(remaining, buffer.size()));
-        input.read(buffer.data(), count);
-        if (input.gcount() != count) throw std::runtime_error("SFX payload is truncated");
-        archive.write(buffer.data(), count);
-        remaining -= static_cast<std::uint64_t>(count);
-    }
-    archive.close();
-    const auto* provider = axiom::archive_provider_for_contents(temporary);
-    if (provider == nullptr) {
-        throw std::runtime_error("SFX payload is not a supported archive");
-    }
-    axiom::ExtractOptions options;
-    options.overwrite = axiom::ExtractOptions::Overwrite::overwrite;
-    auto capabilities = provider->capabilities(temporary);
-    if (capabilities.encrypted) {
-        std::wstring password;
-        if (!axiom::gui::show_archive_password_dialog(nullptr, password)) {
-            std::error_code ignored;
-            fs::remove(temporary, ignored);
-            return 0;
-        }
-        options.password = utf8(password);
-        secure_clear(password);
-        capabilities = provider->capabilities(temporary, options.password);
-    }
-    if (!capabilities.extract) {
-        throw std::runtime_error("SFX payload cannot be extracted with the supplied password");
-    }
-    axiom::ArchiveSignatureInfo signature;
-    if (provider->info().native) {
-        signature = axiom::verify_archive_signature(temporary, options.password);
-    }
-    if (signature.present && !signature.valid) {
-        throw std::runtime_error("archive authenticity signature is invalid");
-    }
-
-    const auto entries = provider->list(temporary, options.password);
-    axiom::gui::SfxArchiveSummary summary;
-    summary.archive_name = executable.filename().wstring();
-    summary.encrypted = capabilities.encrypted;
-    summary.signature_present = signature.present;
-    summary.signature_valid = signature.valid;
-    if (provider->info().native) {
-        summary.comment = widen(axiom::archive_comment(temporary, options.password));
-    }
-    for (const auto& entry : entries) {
-        if (entry.is_directory) {
-            ++summary.directory_count;
-        } else {
-            ++summary.file_count;
-            summary.unpacked_size += entry.size;
-        }
-    }
-
-    axiom::gui::SfxExtractDialogOptions dialog_options;
-    dialog_options.destination = destination;
-    dialog_options.overwrite = axiom::ExtractOptions::Overwrite::overwrite;
-    if (!axiom::gui::show_sfx_extract_dialog(nullptr, instance, summary, dialog_options)) {
-        std::error_code ignored;
-        fs::remove(temporary, ignored);
-        return 0;
-    }
-    destination = dialog_options.destination;
-    options.overwrite = dialog_options.overwrite;
-    options.restore_mtime = dialog_options.restore_mtime;
-    options.thread_count = dialog_options.thread_count;
-    options.io_buffer_size = io_buffer_size;
-
-    auto operation = std::make_shared<axiom::OperationControl>();
-    options.operation = operation;
-
-    std::atomic_bool completed = false;
-    std::atomic_bool cancelled = false;
-    std::exception_ptr failure;
-    axiom::gui::OperationProgressWindow progress_window;
-    configure_dialog_appearance(persisted.application);
-    const auto operation_theme = make_operation_window_theme(
-        make_theme(persisted.application.theme_mode,
-                   persisted.application.accent_color_mode,
-                   persisted.application.custom_accent_color));
-    progress_window.create(
-        nullptr, instance, L"Extracting archive", {}, operation_theme,
-        [operation](bool paused) { operation->set_paused(paused); },
-        [operation] { operation->request_cancel(); });
-    progress_window.set_progress_source(operation);
-
-    std::jthread worker([&] {
-        try {
-            provider->extract_all(temporary, destination, options);
-        } catch (const axiom::OperationCancelled&) {
-            cancelled.store(true, std::memory_order_release);
-        } catch (...) {
-            failure = std::current_exception();
-        }
-        completed.store(true, std::memory_order_release);
-    });
-
-    while (!completed.load(std::memory_order_acquire)) {
-        MSG message{};
-        while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
-            if (message.message == WM_QUIT) {
-                operation->request_cancel();
-                continue;
-            }
-            if (progress_window.hwnd() != nullptr &&
-                IsDialogMessageW(progress_window.hwnd(), &message)) {
-                continue;
-            }
-            TranslateMessage(&message);
-            DispatchMessageW(&message);
-        }
-        MsgWaitForMultipleObjectsEx(0, nullptr, 33, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
-    }
-    worker.join();
-    progress_window.close();
-    if (failure) std::rethrow_exception(failure);
-
-    std::error_code ignored;
-    fs::remove(temporary, ignored);
-    if (cancelled.load(std::memory_order_acquire)) return 0;
-    if (dialog_options.open_destination) {
-        ShellExecuteW(nullptr, L"open", destination.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
-    }
-    axiom::gui::show_message_dialog(
-        nullptr, instance, GetDpiForSystem(), dark, L"Axiom Self-Extractor",
-        L"Files were extracted to:\n\n" + destination.wstring(),
-        axiom::gui::MessageDialogIcon::information);
-    return 0;
-} catch (const std::exception& error) {
-    std::error_code ignored;
-    fs::remove(temporary, ignored);
-    axiom::gui::show_message_dialog(
-        nullptr, instance, GetDpiForSystem(), dark, L"Axiom Self-Extractor",
-        L"Extraction failed:\n\n" + widen(error.what()),
-        axiom::gui::MessageDialogIcon::error);
-    return 1;
-}
-}
 
 }  // namespace axiom::gui

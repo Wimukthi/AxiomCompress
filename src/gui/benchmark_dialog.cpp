@@ -2061,9 +2061,10 @@ void show_benchmark_dialog(HWND owner, HINSTANCE instance, UINT dpi, bool dark) 
         return;
     }
     apply_axiom_window_icons(dialog, instance);
-    restore_named_window_placement(dialog, owner, kBenchmarkLayoutName);
+    const int show_command =
+        restore_named_window_placement(dialog, owner, kBenchmarkLayoutName);
     state.owner_was_enabled = disable_dialog_owner(owner, dialog);
-    ShowWindow(dialog, SW_SHOW);
+    ShowWindow(dialog, show_command);
     UpdateWindow(dialog);
     MSG message{};
     while (IsWindow(dialog)) {

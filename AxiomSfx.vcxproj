@@ -13,8 +13,8 @@
   <PropertyGroup Label="Globals">
     <VCProjectVersion>18.0</VCProjectVersion>
     <Keyword>Win32Proj</Keyword>
-    <ProjectGuid>{11C2DE30-B893-4CF7-8FD7-01061437D745}</ProjectGuid>
-    <RootNamespace>AxiomC</RootNamespace>
+    <ProjectGuid>{9D28131A-22D1-4D07-9865-C6E975454A61}</ProjectGuid>
+    <RootNamespace>AxiomSfx</RootNamespace>
     <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
@@ -40,24 +40,33 @@
   <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
   </ImportGroup>
+  <PropertyGroup>
+    <WimukthiWin32ThemeRoot Condition="'$(WimukthiWin32ThemeRoot)'==''">$(MSBuildProjectDirectory)\..\Wimukthi.Win32Theme</WimukthiWin32ThemeRoot>
+  </PropertyGroup>
+  <Import Project="$(WimukthiWin32ThemeRoot)\Wimukthi.Win32Theme.props" Condition="Exists('$(WimukthiWin32ThemeRoot)\Wimukthi.Win32Theme.props')" />
   <PropertyGroup Label="UserMacros" />
   <PropertyGroup>
     <OutDir>$(SolutionDir)out\$(Configuration)\</OutDir>
     <IntDir>$(SolutionDir)build\msvc\$(ProjectName)\$(Configuration)\</IntDir>
-    <TargetName>axiomc</TargetName>
+    <TargetName>AxiomSfx</TargetName>
+    <TargetExt>.bin</TargetExt>
+    <AutoIncrementVersion Condition="'$(AutoIncrementVersion)' == ''">true</AutoIncrementVersion>
+    <DisableFastUpToDateCheck>true</DisableFastUpToDateCheck>
   </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <ClCompile>
       <WarningLevel>Level4</WarningLevel>
       <SDLCheck>true</SDLCheck>
-      <PreprocessorDefinitions>_DEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>_DEBUG;_WINDOWS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <AdditionalIncludeDirectories>$(ProjectDir)include;$(ProjectDir)src;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <LanguageStandard>stdcpp20</LanguageStandard>
       <ConformanceMode>true</ConformanceMode>
     </ClCompile>
     <Link>
-      <SubSystem>Console</SubSystem>
-      <AdditionalDependencies>Bcrypt.lib;Ole32.lib;OleAut32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <SubSystem>Windows</SubSystem>
+      <ProgramDatabaseFile>$(OutDir)AxiomSfx.pdb</ProgramDatabaseFile>
+      <ImportLibrary>$(OutDir)AxiomSfx.lib</ImportLibrary>
+      <AdditionalDependencies>Bcrypt.lib;Comctl32.lib;Dwmapi.lib;Gdiplus.lib;Msimg32.lib;Ole32.lib;OleAut32.lib;Shell32.lib;Shlwapi.lib;Version.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
@@ -66,34 +75,57 @@
       <FunctionLevelLinking>true</FunctionLevelLinking>
       <IntrinsicFunctions>true</IntrinsicFunctions>
       <SDLCheck>true</SDLCheck>
-      <PreprocessorDefinitions>NDEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>NDEBUG;_WINDOWS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <AdditionalIncludeDirectories>$(ProjectDir)include;$(ProjectDir)src;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <LanguageStandard>stdcpp20</LanguageStandard>
       <ConformanceMode>true</ConformanceMode>
     </ClCompile>
     <Link>
-      <SubSystem>Console</SubSystem>
-      <AdditionalDependencies>Bcrypt.lib;Ole32.lib;OleAut32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <SubSystem>Windows</SubSystem>
       <EnableCOMDATFolding>true</EnableCOMDATFolding>
       <OptimizeReferences>true</OptimizeReferences>
+      <ProgramDatabaseFile>$(OutDir)AxiomSfx.pdb</ProgramDatabaseFile>
+      <ImportLibrary>$(OutDir)AxiomSfx.lib</ImportLibrary>
+      <AdditionalDependencies>Bcrypt.lib;Comctl32.lib;Dwmapi.lib;Gdiplus.lib;Msimg32.lib;Ole32.lib;OleAut32.lib;Shell32.lib;Shlwapi.lib;Version.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <ClCompile Include="src\cli\main.cpp" />
-    <ClCompile Include="src\sfx\module_file.cpp" />
+    <ClCompile Include="src\sfx\main.cpp" />
+    <ClCompile Include="src\sfx\runtime.cpp" />
+    <ClCompile Include="src\gui\sfx_dialog.cpp" />
+    <ClCompile Include="src\gui\archive_feature_dialogs.cpp" />
+    <ClCompile Include="src\gui\operation_progress_window.cpp" />
+    <ClCompile Include="src\gui\dialog_support.cpp" />
+    <ClCompile Include="src\gui\message_dialog.cpp" />
+    <ClCompile Include="src\gui\toolbar_icons.cpp" />
   </ItemGroup>
   <ItemGroup>
-    <ResourceCompile Include="src\cli\axiom_cli.rc" />
+    <ClInclude Include="src\sfx\runtime.hpp" />
+    <ClInclude Include="src\sfx\resource.hpp" />
+    <ClInclude Include="src\gui\sfx_dialog.hpp" />
+    <ClInclude Include="src\gui\archive_feature_dialogs.hpp" />
+    <ClInclude Include="src\gui\operation_progress_window.hpp" />
+    <ClInclude Include="src\gui\dialog_support.hpp" />
+    <ClInclude Include="src\gui\message_dialog.hpp" />
+    <ClInclude Include="src\gui\toolbar_icons.hpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <ResourceCompile Include="src\sfx\sfx_stub.rc" />
+  </ItemGroup>
+  <ItemGroup>
+    <Image Include="Icons\axiom.ico" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="AxiomLib.vcxproj">
       <Project>{A16F0B4E-82B2-43BB-A779-0E9563F8EC11}</Project>
     </ProjectReference>
-    <ProjectReference Include="AxiomSfx.vcxproj">
-      <Project>{9D28131A-22D1-4D07-9865-C6E975454A61}</Project>
-      <LinkLibraryDependencies>false</LinkLibraryDependencies>
-    </ProjectReference>
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <Target Name="ValidateWimukthiWin32Theme" BeforeTargets="PrepareForBuild" Condition="!Exists('$(WimukthiWin32ThemeRoot)\Wimukthi.Win32Theme.props')">
+    <Error Text="Wimukthi.Win32Theme was not found at '$(WimukthiWin32ThemeRoot)'. Clone it beside AxiomCompress or set WimukthiWin32ThemeRoot." />
+  </Target>
+  <Target Name="IncrementAxiomVersion" BeforeTargets="PrepareForBuild" Condition="'$(AutoIncrementVersion)' == 'true' and '$(DesignTimeBuild)' != 'true'">
+    <Exec Command="powershell.exe -NoProfile -ExecutionPolicy Bypass -File &quot;$(MSBuildProjectDirectory)\tools\Update-AxiomVersion.ps1&quot; -ResourceFile &quot;$(MSBuildProjectDirectory)\src\gui\axiom_gui.rc&quot; -IncrementBuild" />
+  </Target>
   <ImportGroup Label="ExtensionTargets" />
 </Project>

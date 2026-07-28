@@ -79,6 +79,7 @@ Recommended contents:
 
 - `Axiom.exe`.
 - `axiomc.exe`.
+- `AxiomSfx.bin`, the non-executable SFX creation module.
 - `backends\7zip\` for bundled read-only 7z/RAR/ISO/CAB support.
 - `README.md`.
 - `CLI_GUIDE.md`.
@@ -90,6 +91,9 @@ Recommended contents:
   complete corresponding Darkmodelib source.
 - `docs\`.
 
+`AxiomSfx.bin` must remain beside `Axiom.exe` and `axiomc.exe`. It is read only
+when an SFX is created and cannot be launched as a standalone program.
+
 Build the zip from the same Release output and docs used by the installer so
 both release assets describe the same version.
 
@@ -99,6 +103,7 @@ The installer writes:
 
 - `Axiom.exe`.
 - `axiomc.exe`.
+- `AxiomSfx.bin`.
 - `README.md`.
 - `CLI_GUIDE.md`.
 - `ARCHITECTURE.md`.

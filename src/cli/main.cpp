@@ -4,6 +4,9 @@
 #include "core/cpu.hpp"
 #include "core/path_text.hpp"
 #include "core/windows_time.hpp"
+#ifdef _WIN32
+#include "sfx/module_file.hpp"
+#endif
 
 #include <array>
 #include <algorithm>
@@ -67,7 +70,7 @@ void print_usage() {
         "  axiomc keygen <secret.key> <public.key>          generate an archive signing key\n"
         "  axiomc sign [options] <archive.axar> <secret.key> sign an archive\n"
         "  axiomc verify [options] <archive.axar> [public.key] verify authenticity\n"
-        "  axiomc sfx <archive.axar> <output.exe> [stub.exe] create a self-extractor\n"
+        "  axiomc sfx <archive> <output.exe> [compatible-stub] create a self-extractor\n"
         "\n"
         "Single-stream commands:\n"
         "  axiomc c [options] <input> <output.axc>         compress one stream\n"
@@ -1088,11 +1091,19 @@ int run_sfx(const std::vector<std::string>& args) {
         print_usage();
         return 2;
     }
-    const fs::path stub = args.size() == 3
-        ? fs::path(args[2])
-        : executable_path.parent_path() / "Axiom.exe";
     ScopedInteractiveProgress progress("creating self-extractor");
-    axiom::create_sfx_archive(args[0], stub, args[1], progress.operation());
+    if (args.size() == 3) {
+        axiom::create_sfx_archive(
+            args[0], fs::path(args[2]), args[1], progress.operation());
+    } else {
+#ifdef _WIN32
+        axiom::sfx::create_from_module_file(
+            GetModuleHandleW(nullptr), args[0], args[1], progress.operation());
+#else
+        throw std::runtime_error(
+            "the embedded Windows SFX module is available only in Windows builds");
+#endif
+    }
     progress.complete();
     std::cout << "self-extracting archive created\n";
     return 0;

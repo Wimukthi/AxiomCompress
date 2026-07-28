@@ -274,6 +274,8 @@ BrowserSnapshot load_filesystem(const BrowserLocation& location, std::stop_token
         item.size = directory ? 0
             : (static_cast<std::uint64_t>(data.nFileSizeHigh) << 32) | data.nFileSizeLow;
         item.modified = file_time_text(data.ftLastWriteTime, &time_converter);
+        item.created = file_time_text(data.ftCreationTime, &time_converter);
+        item.accessed = file_time_text(data.ftLastAccessTime, &time_converter);
         item.attributes = attributes_text(data.dwFileAttributes);
         item.id = stable_id(item.filesystem_path.wstring());
         snapshot.items.push_back(std::move(item));

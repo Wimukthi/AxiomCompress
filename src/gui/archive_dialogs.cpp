@@ -5,6 +5,7 @@
 #include "gui/main_window_internal.hpp"
 #include "gui/message_dialog.hpp"
 
+#include <dwmapi.h>
 #include <shobjidl.h>
 #include <windowsx.h>
 
@@ -99,6 +100,7 @@ constexpr int kFullRowSelect = 2353;
 constexpr int kShowAddressShellLocations = 2354;
 constexpr int kShowAddressRecentLocations = 2355;
 constexpr int kShowAddressArchiveChildren = 2356;
+constexpr int kCustomizeFileColumns = 2365;
 constexpr int kFileOpenMode = 2400;
 constexpr int kExternalViewer = 2401;
 constexpr int kExternalEditor = 2402;
@@ -602,7 +604,17 @@ std::optional<fs::path> browse_executable(HWND owner, const fs::path& initial = 
 
 constexpr wchar_t kDarkTabClass[] = L"AxiomDarkTabControl";
 constexpr wchar_t kSettingsNavClass[] = L"AxiomSettingsNavigation";
+constexpr wchar_t kSettingsViewportClass[] = L"AxiomSettingsViewport";
 constexpr UINT kDarkTabSetSelection = WM_APP + 41;
+constexpr UINT kSettingsViewportSetMetrics = WM_APP + 81;
+constexpr UINT kSettingsViewportGetOffset = WM_APP + 82;
+constexpr UINT kSettingsViewportScrollBy = WM_APP + 83;
+constexpr UINT kSettingsViewportOffsetChanged = WM_APP + 84;
+
+struct SettingsViewportMetrics {
+    int content_height = 0;
+    int line_height = 0;
+};
 
 struct DarkTabState {
     int selected = 0;
@@ -795,7 +807,7 @@ int scale_for_window(HWND window, int value) {
 }
 
 int settings_nav_item_height(HWND window) {
-    return scale_for_window(window, 38);
+    return scale_for_window(window, 34);
 }
 
 int settings_nav_index_at_position(HWND window, int y) {
@@ -991,6 +1003,238 @@ std::optional<fs::path> browse_folder(HWND owner,
     fs::path result(path);
     CoTaskMemFree(path);
     return result;
+}
+
+struct SettingsViewportState {
+    int content_height = 0;
+    int offset = 0;
+    int line_height = 34;
+    int wheel_remainder = 0;
+    bool dragging = false;
+    int drag_anchor_y = 0;
+    int drag_anchor_offset = 0;
+};
+
+int settings_viewport_max_offset(HWND window,
+                                 const SettingsViewportState& state) {
+    RECT client{};
+    GetClientRect(window, &client);
+    return std::max(0, state.content_height -
+                           static_cast<int>(client.bottom - client.top));
+}
+
+RECT settings_viewport_track_rect(HWND window) {
+    RECT client{};
+    GetClientRect(window, &client);
+    const int width = scale_for_window(window, 12);
+    return {std::max(0, static_cast<int>(client.right) - width),
+            client.top, client.right, client.bottom};
+}
+
+RECT settings_viewport_thumb_rect(HWND window,
+                                  const SettingsViewportState& state) {
+    const RECT track = settings_viewport_track_rect(window);
+    const int track_height = std::max(0, static_cast<int>(track.bottom - track.top));
+    const int maximum = settings_viewport_max_offset(window, state);
+    if (maximum <= 0 || track_height <= 0) return track;
+    RECT client{};
+    GetClientRect(window, &client);
+    const int viewport_height =
+        std::max(1, static_cast<int>(client.bottom - client.top));
+    const int thumb_height = std::clamp(
+        MulDiv(track_height, viewport_height,
+               std::max(viewport_height, state.content_height)),
+        scale_for_window(window, 30), track_height);
+    const int travel = std::max(0, track_height - thumb_height);
+    const int top = track.top +
+        (maximum == 0 ? 0 : MulDiv(travel, state.offset, maximum));
+    return {track.left + scale_for_window(window, 2), top,
+            track.right - scale_for_window(window, 2), top + thumb_height};
+}
+
+void set_settings_viewport_offset(HWND window, SettingsViewportState& state,
+                                  int requested) {
+    const int offset = std::clamp(
+        requested, 0, settings_viewport_max_offset(window, state));
+    if (offset == state.offset) return;
+    state.offset = offset;
+    InvalidateRect(window, nullptr, FALSE);
+    SendMessageW(GetParent(window), kSettingsViewportOffsetChanged,
+                 static_cast<WPARAM>(offset), 0);
+}
+
+LRESULT CALLBACK settings_viewport_window_proc(HWND window, UINT message,
+                                               WPARAM wparam, LPARAM lparam) {
+    auto* state = reinterpret_cast<SettingsViewportState*>(
+        GetWindowLongPtrW(window, GWLP_USERDATA));
+    if (message == WM_NCCREATE) {
+        state = new SettingsViewportState{};
+        SetWindowLongPtrW(window, GWLP_USERDATA,
+                          reinterpret_cast<LONG_PTR>(state));
+    }
+    if (state == nullptr) return DefWindowProcW(window, message, wparam, lparam);
+
+    switch (message) {
+        case kSettingsViewportSetMetrics: {
+            const auto* metrics =
+                reinterpret_cast<const SettingsViewportMetrics*>(lparam);
+            if (metrics != nullptr) {
+                state->content_height = std::max(0, metrics->content_height);
+                state->line_height = std::max(1, metrics->line_height);
+                state->offset = std::clamp(
+                    state->offset, 0,
+                    settings_viewport_max_offset(window, *state));
+                InvalidateRect(window, nullptr, FALSE);
+            }
+            return state->offset;
+        }
+        case kSettingsViewportGetOffset:
+            return state->offset;
+        case kSettingsViewportScrollBy:
+            set_settings_viewport_offset(
+                window, *state, state->offset + static_cast<int>(wparam));
+            return 0;
+        case WM_SIZE:
+            state->offset = std::clamp(
+                state->offset, 0,
+                settings_viewport_max_offset(window, *state));
+            InvalidateRect(window, nullptr, FALSE);
+            return 0;
+        case WM_MOUSEWHEEL: {
+            state->wheel_remainder += GET_WHEEL_DELTA_WPARAM(wparam);
+            const int steps = state->wheel_remainder / WHEEL_DELTA;
+            state->wheel_remainder %= WHEEL_DELTA;
+            if (steps != 0) {
+                set_settings_viewport_offset(
+                    window, *state,
+                    state->offset - steps * state->line_height * 3);
+            }
+            return 0;
+        }
+        case WM_KEYDOWN:
+            if (wparam == VK_PRIOR || wparam == VK_NEXT) {
+                RECT client{};
+                GetClientRect(window, &client);
+                const int direction = wparam == VK_PRIOR ? -1 : 1;
+                set_settings_viewport_offset(
+                    window, *state,
+                    state->offset + direction *
+                        std::max(state->line_height,
+                                 static_cast<int>(client.bottom) -
+                                     state->line_height));
+                return 0;
+            }
+            break;
+        case WM_LBUTTONDOWN: {
+            if (settings_viewport_max_offset(window, *state) <= 0) break;
+            const POINT point{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
+            const RECT track = settings_viewport_track_rect(window);
+            if (!PtInRect(&track, point)) break;
+            const RECT thumb = settings_viewport_thumb_rect(window, *state);
+            if (PtInRect(&thumb, point)) {
+                state->dragging = true;
+                state->drag_anchor_y = point.y;
+                state->drag_anchor_offset = state->offset;
+                SetCapture(window);
+            } else {
+                RECT client{};
+                GetClientRect(window, &client);
+                const int direction = point.y < thumb.top ? -1 : 1;
+                set_settings_viewport_offset(
+                    window, *state,
+                    state->offset + direction *
+                        std::max(state->line_height,
+                                 static_cast<int>(client.bottom) -
+                                     state->line_height));
+            }
+            return 0;
+        }
+        case WM_MOUSEMOVE:
+            if (state->dragging && GetCapture() == window) {
+                const RECT track = settings_viewport_track_rect(window);
+                const RECT thumb = settings_viewport_thumb_rect(window, *state);
+                const int travel = std::max(
+                    1, static_cast<int>(track.bottom - track.top) -
+                           static_cast<int>(thumb.bottom - thumb.top));
+                const int maximum = settings_viewport_max_offset(window, *state);
+                const int delta = GET_Y_LPARAM(lparam) - state->drag_anchor_y;
+                set_settings_viewport_offset(
+                    window, *state,
+                    state->drag_anchor_offset + MulDiv(delta, maximum, travel));
+                return 0;
+            }
+            break;
+        case WM_LBUTTONUP:
+            if (state->dragging) {
+                state->dragging = false;
+                if (GetCapture() == window) ReleaseCapture();
+                InvalidateRect(window, nullptr, FALSE);
+                return 0;
+            }
+            break;
+        case WM_CAPTURECHANGED:
+            state->dragging = false;
+            InvalidateRect(window, nullptr, FALSE);
+            return 0;
+        case WM_ERASEBKGND:
+            return 1;
+        case WM_PAINT: {
+            PAINTSTRUCT paint{};
+            HDC dc = BeginPaint(window, &paint);
+            RECT client{};
+            GetClientRect(window, &client);
+            const Palette colors = make_palette();
+            HBRUSH background = CreateSolidBrush(colors.window);
+            FillRect(dc, &client, background);
+            DeleteObject(background);
+            if (settings_viewport_max_offset(window, *state) > 0) {
+                const RECT track = settings_viewport_track_rect(window);
+                const RECT thumb = settings_viewport_thumb_rect(window, *state);
+                HBRUSH track_brush = CreateSolidBrush(
+                    blend_color(colors.window, colors.border,
+                                colors.dark ? 28 : 18));
+                FillRect(dc, &track, track_brush);
+                DeleteObject(track_brush);
+                HBRUSH thumb_brush = CreateSolidBrush(
+                    state->dragging ? colors.accent
+                                    : blend_color(colors.border, colors.text, 28));
+                FillRect(dc, &thumb, thumb_brush);
+                DeleteObject(thumb_brush);
+            }
+            EndPaint(window, &paint);
+            return 0;
+        }
+        case WM_COMMAND:
+        case WM_DRAWITEM:
+        case WM_MEASUREITEM:
+        case WM_NOTIFY:
+        case WM_CTLCOLORSTATIC:
+        case WM_CTLCOLORBTN:
+        case WM_CTLCOLOREDIT:
+        case WM_CTLCOLORLISTBOX:
+            return SendMessageW(GetParent(window), message, wparam, lparam);
+        case kTableActivateMessage:
+        case kTableSelectionChangedMessage:
+        case kTableParentMessage:
+        case kTableSortMessage:
+            return SendMessageW(GetParent(window), message, wparam, lparam);
+        case WM_NCDESTROY:
+            SetWindowLongPtrW(window, GWLP_USERDATA, 0);
+            delete state;
+            return 0;
+    }
+    return DefWindowProcW(window, message, wparam, lparam);
+}
+
+bool register_settings_viewport_class(HINSTANCE instance) {
+    WNDCLASSEXW window_class{sizeof(window_class)};
+    window_class.style = CS_DBLCLKS;
+    window_class.lpfnWndProc = settings_viewport_window_proc;
+    window_class.hInstance = instance;
+    window_class.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    window_class.lpszClassName = kSettingsViewportClass;
+    return RegisterClassExW(&window_class) != 0 ||
+           GetLastError() == ERROR_CLASS_ALREADY_EXISTS;
 }
 
 struct HsvColor {
@@ -1644,6 +1888,395 @@ std::optional<COLORREF> choose_accent_color(HWND owner, COLORREF initial) {
     return picker.show(owner, initial);
 }
 
+class FileColumnsDialog {
+public:
+    explicit FileColumnsDialog(ThemePalette theme) : theme_(theme) {}
+
+    ~FileColumnsDialog() {
+        if (font_ != nullptr) DeleteObject(font_);
+        if (window_brush_ != nullptr) DeleteObject(window_brush_);
+        if (edit_brush_ != nullptr) DeleteObject(edit_brush_);
+    }
+
+    bool show(HWND owner, std::vector<FileListColumnSetting>& columns) {
+        owner_ = owner;
+        instance_ = reinterpret_cast<HINSTANCE>(
+            GetWindowLongPtrW(owner, GWLP_HINSTANCE));
+        dpi_ = GetDpiForWindow(owner);
+        columns_ = normalize_file_list_columns(columns);
+        if (!register_class()) return false;
+
+        const DWORD style = WS_POPUP | WS_CAPTION | WS_SYSMENU |
+                            WS_THICKFRAME | WS_CLIPCHILDREN;
+        const DWORD ex_style = WS_EX_DLGMODALFRAME;
+        const SIZE size = dialog_window_size_for_client(
+            760, 520, style, ex_style, dpi_);
+        RECT owner_rect{};
+        GetWindowRect(owner, &owner_rect);
+        const int x = owner_rect.left +
+            ((owner_rect.right - owner_rect.left) - size.cx) / 2;
+        const int y = owner_rect.top +
+            ((owner_rect.bottom - owner_rect.top) - size.cy) / 2;
+        window_ = CreateWindowExW(
+            ex_style, class_name(), L"Customize file-list columns", style,
+            x, y, size.cx, size.cy, owner, nullptr, instance_, this);
+        if (window_ == nullptr) return false;
+        const int show_command =
+            restore_named_window_placement(window_, owner, L"FileListColumns");
+        owner_was_enabled_ = disable_dialog_owner(owner, window_);
+        ShowWindow(window_, show_command);
+        UpdateWindow(window_);
+
+        MSG message{};
+        while (IsWindow(window_) && GetMessageW(&message, nullptr, 0, 0) > 0) {
+            if (message.message == WM_KEYDOWN && message.wParam == VK_SPACE &&
+                message.hwnd == table_.hwnd()) {
+                toggle_selected();
+                continue;
+            }
+            if (!IsDialogMessageW(window_, &message)) {
+                TranslateMessage(&message);
+                DispatchMessageW(&message);
+            }
+        }
+        if (accepted_) columns = std::move(columns_);
+        return accepted_;
+    }
+
+private:
+    enum : int {
+        kTable = 2860,
+        kToggle = 2861,
+        kMoveUp = 2862,
+        kMoveDown = 2863,
+        kDefaults = 2864,
+        kAccept = IDOK,
+        kCancel = IDCANCEL,
+    };
+
+    static const wchar_t* class_name() {
+        return L"AxiomFileColumnsDialog";
+    }
+
+    bool register_class() const {
+        WNDCLASSEXW existing{};
+        existing.cbSize = sizeof(existing);
+        if (GetClassInfoExW(instance_, class_name(), &existing)) return true;
+        WNDCLASSEXW window_class{};
+        window_class.cbSize = sizeof(window_class);
+        window_class.hInstance = instance_;
+        window_class.lpfnWndProc = &FileColumnsDialog::window_proc;
+        window_class.lpszClassName = class_name();
+        window_class.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        assign_axiom_window_class_icons(window_class, instance_);
+        return RegisterClassExW(&window_class) != 0;
+    }
+
+    int scale(int value) const {
+        return MulDiv(value, static_cast<int>(dpi_), USER_DEFAULT_SCREEN_DPI);
+    }
+
+    HWND button(const wchar_t* text, int id) {
+        HWND control = CreateWindowExW(
+            0, L"BUTTON", text,
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+            0, 0, 0, 0, window_,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),
+            instance_, nullptr);
+        SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(font_), TRUE);
+        apply_dialog_control_theme(control, palette_.dark);
+        return control;
+    }
+
+    void rebuild_font() {
+        if (font_ != nullptr) DeleteObject(font_);
+        NONCLIENTMETRICSW metrics{sizeof(metrics)};
+        if (!SystemParametersInfoForDpi(
+                SPI_GETNONCLIENTMETRICS, sizeof(metrics), &metrics, 0, dpi_)) {
+            SystemParametersInfoW(
+                SPI_GETNONCLIENTMETRICS, sizeof(metrics), &metrics, 0);
+        }
+        font_ = CreateFontIndirectW(&metrics.lfMessageFont);
+        EnumChildWindows(window_, [](HWND child, LPARAM font) -> BOOL {
+            SendMessageW(child, WM_SETFONT, static_cast<WPARAM>(font), TRUE);
+            return TRUE;
+        }, reinterpret_cast<LPARAM>(font_));
+        table_.set_font(font_);
+        table_.set_dpi(dpi_);
+    }
+
+    void create_controls() {
+        palette_ = make_palette();
+        window_brush_ = CreateSolidBrush(palette_.window);
+        edit_brush_ = CreateSolidBrush(palette_.edit);
+        set_dark_title(window_, palette_.dark);
+        apply_axiom_window_icons(window_, instance_);
+        rebuild_font();
+
+        description_ = CreateWindowExW(
+            0, L"STATIC",
+            L"Select fields to show and arrange their left-to-right order. "
+            L"You can also drag headers directly in the main file list.",
+            WS_CHILD | WS_VISIBLE | SS_LEFT | SS_EDITCONTROL,
+            0, 0, 0, 0, window_, nullptr, instance_, nullptr);
+        SendMessageW(description_, WM_SETFONT,
+                     reinterpret_cast<WPARAM>(font_), TRUE);
+
+        table_.create(window_, instance_, kTable);
+        table_.set_font(font_);
+        table_.set_dpi(dpi_);
+        table_.set_theme(theme_);
+        table_.set_options({true, false, true, false});
+        table_.set_columns({
+            {L"Column", 330},
+            {L"Visibility", 130},
+            {L"Current width", 130},
+        });
+        table_.set_sort_indicator(-1, true);
+        refresh_rows(0);
+
+        toggle_ = button(L"Show / hide", kToggle);
+        move_up_ = button(L"Move up", kMoveUp);
+        move_down_ = button(L"Move down", kMoveDown);
+        defaults_ = button(L"Defaults", kDefaults);
+        accept_ = button(L"OK", kAccept);
+        cancel_ = button(L"Cancel", kCancel);
+        layout();
+    }
+
+    void refresh_rows(int selected_row = -1) {
+        columns_ = normalize_file_list_columns(columns_);
+        const int focused =
+            selected_row >= 0 ? selected_row : table_.focused_index();
+        const int scroll_y = table_.vertical_scroll_position();
+        std::vector<std::vector<std::wstring>> rows;
+        rows.reserve(columns_.size());
+        for (const auto& column : columns_) {
+            const auto* info = file_list_column_info(column.id);
+            if (info == nullptr) continue;
+            rows.push_back({
+                info->title,
+                column.visible ? L"Shown" : L"Hidden",
+                std::to_wstring(column.width) + L" px",
+            });
+        }
+        table_.set_rows(std::move(rows), {}, nullptr);
+        if (focused >= 0 && focused < static_cast<int>(columns_.size())) {
+            table_.set_selection_and_scroll({focused}, focused, 0, scroll_y);
+        }
+    }
+
+    void toggle_selected() {
+        const int row = table_.focused_index();
+        if (row < 0 || row >= static_cast<int>(columns_.size())) return;
+        auto& column = columns_[static_cast<std::size_t>(row)];
+        if (column.id == FileListColumnId::name) return;
+        column.visible = !column.visible;
+        refresh_rows(row);
+    }
+
+    void move_selected(int direction) {
+        const int row = table_.focused_index();
+        const int target = row + direction;
+        if (row <= 0 || target <= 0 ||
+            row >= static_cast<int>(columns_.size()) ||
+            target >= static_cast<int>(columns_.size())) {
+            return;
+        }
+        std::swap(columns_[static_cast<std::size_t>(row)],
+                  columns_[static_cast<std::size_t>(target)]);
+        refresh_rows(target);
+    }
+
+    void layout() {
+        if (window_ == nullptr) return;
+        RECT client{};
+        GetClientRect(window_, &client);
+        const int margin = scale(16);
+        const int gap = scale(10);
+        const int button_height = scale(30);
+        const int button_width = scale(86);
+        const int description_height = scale(42);
+        const int footer_y = client.bottom - margin - button_height;
+        const int description_width =
+            std::max(1, static_cast<int>(client.right) - margin * 2);
+        const int table_y = margin + description_height + gap;
+        const int table_height =
+            std::max(scale(160), footer_y - gap - table_y);
+
+        const int toggle_width = scale(104);
+        const int move_up_width = scale(82);
+        const int move_down_width = scale(92);
+        const int defaults_width = scale(104);
+        int left = margin;
+        const int toggle_x = left;
+        left += toggle_width + gap;
+        const int move_up_x = left;
+        left += move_up_width + gap;
+        const int move_down_x = left;
+        left += move_down_width + gap;
+        const int defaults_x = left;
+
+        int right = client.right - margin;
+        const int cancel_x = right - button_width;
+        right = cancel_x - gap;
+        const int accept_x = right - button_width;
+
+        // Batch the resize so the footer never exposes intermediate,
+        // overlapping button positions while the user drags the frame.
+        HDWP positions = BeginDeferWindowPos(8);
+        const auto place = [&positions](
+                               HWND control, int x, int y,
+                               int width, int height) {
+            if (positions == nullptr) return;
+            positions = DeferWindowPos(
+                positions, control, nullptr, x, y, width, height,
+                SWP_NOACTIVATE | SWP_NOZORDER);
+        };
+        place(description_, margin, margin, description_width,
+              description_height);
+        place(table_.hwnd(), margin, table_y, description_width, table_height);
+        place(toggle_, toggle_x, footer_y, toggle_width, button_height);
+        place(move_up_, move_up_x, footer_y, move_up_width, button_height);
+        place(move_down_, move_down_x, footer_y, move_down_width, button_height);
+        place(defaults_, defaults_x, footer_y, defaults_width, button_height);
+        place(accept_, accept_x, footer_y, button_width, button_height);
+        place(cancel_, cancel_x, footer_y, button_width, button_height);
+        if (positions != nullptr) EndDeferWindowPos(positions);
+    }
+
+    void close(bool accepted) {
+        accepted_ = accepted;
+        save_named_window_placement(L"FileListColumns", window_);
+        HWND owner = owner_;
+        const bool owner_was_enabled = owner_was_enabled_;
+        owner_was_enabled_ = false;
+        if (window_ != nullptr && IsWindow(window_)) DestroyWindow(window_);
+        restore_dialog_owner(owner, owner_was_enabled);
+    }
+
+    LRESULT handle(UINT message, WPARAM wparam, LPARAM lparam) {
+        switch (message) {
+            case WM_CREATE:
+                create_controls();
+                return 0;
+            case WM_SIZE:
+                layout();
+                return 0;
+            case WM_GETMINMAXINFO: {
+                auto* limits = reinterpret_cast<MINMAXINFO*>(lparam);
+                const DWORD style = static_cast<DWORD>(
+                    GetWindowLongPtrW(window_, GWL_STYLE));
+                const DWORD ex_style = static_cast<DWORD>(
+                    GetWindowLongPtrW(window_, GWL_EXSTYLE));
+                const SIZE minimum = dialog_window_size_for_client(
+                    700, 430, style, ex_style, dpi_);
+                limits->ptMinTrackSize = {minimum.cx, minimum.cy};
+                return 0;
+            }
+            case WM_DPICHANGED: {
+                dpi_ = HIWORD(wparam);
+                const auto* suggested = reinterpret_cast<const RECT*>(lparam);
+                SetWindowPos(window_, nullptr, suggested->left, suggested->top,
+                             suggested->right - suggested->left,
+                             suggested->bottom - suggested->top,
+                             SWP_NOZORDER | SWP_NOACTIVATE);
+                rebuild_font();
+                apply_axiom_window_icons(window_, instance_);
+                layout();
+                return 0;
+            }
+            case WM_ERASEBKGND: {
+                RECT client{};
+                GetClientRect(window_, &client);
+                FillRect(reinterpret_cast<HDC>(wparam), &client, window_brush_);
+                return 1;
+            }
+            case WM_CTLCOLORSTATIC:
+                SetBkColor(reinterpret_cast<HDC>(wparam), palette_.window);
+                SetTextColor(reinterpret_cast<HDC>(wparam), palette_.text);
+                return reinterpret_cast<LRESULT>(window_brush_);
+            case WM_DRAWITEM:
+                draw_dialog_button(
+                    *reinterpret_cast<DRAWITEMSTRUCT*>(lparam), palette_.dark);
+                return TRUE;
+            case kTableActivateMessage:
+                toggle_selected();
+                return 0;
+            case kTableSelectionChangedMessage:
+            case kTableSortMessage:
+            case kTableParentMessage:
+                return 0;
+            case WM_COMMAND:
+                switch (LOWORD(wparam)) {
+                    case kToggle:
+                        toggle_selected();
+                        return 0;
+                    case kMoveUp:
+                        move_selected(-1);
+                        return 0;
+                    case kMoveDown:
+                        move_selected(1);
+                        return 0;
+                    case kDefaults:
+                        columns_ = default_file_list_columns();
+                        refresh_rows(0);
+                        return 0;
+                    case kAccept:
+                        close(true);
+                        return 0;
+                    case kCancel:
+                        close(false);
+                        return 0;
+                }
+                break;
+            case WM_CLOSE:
+                close(false);
+                return 0;
+        }
+        return DefWindowProcW(window_, message, wparam, lparam);
+    }
+
+    static LRESULT CALLBACK window_proc(
+        HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
+        FileColumnsDialog* self = nullptr;
+        if (message == WM_NCCREATE) {
+            const auto* create = reinterpret_cast<CREATESTRUCTW*>(lparam);
+            self = static_cast<FileColumnsDialog*>(create->lpCreateParams);
+            self->window_ = window;
+            SetWindowLongPtrW(
+                window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(self));
+        } else {
+            self = reinterpret_cast<FileColumnsDialog*>(
+                GetWindowLongPtrW(window, GWLP_USERDATA));
+        }
+        return self != nullptr
+            ? self->handle(message, wparam, lparam)
+            : DefWindowProcW(window, message, wparam, lparam);
+    }
+
+    HWND owner_ = nullptr;
+    HWND window_ = nullptr;
+    HINSTANCE instance_ = nullptr;
+    UINT dpi_ = USER_DEFAULT_SCREEN_DPI;
+    bool owner_was_enabled_ = false;
+    bool accepted_ = false;
+    Palette palette_;
+    ThemePalette theme_;
+    HBRUSH window_brush_ = nullptr;
+    HBRUSH edit_brush_ = nullptr;
+    HFONT font_ = nullptr;
+    HWND description_ = nullptr;
+    DarkTableView table_;
+    HWND toggle_ = nullptr;
+    HWND move_up_ = nullptr;
+    HWND move_down_ = nullptr;
+    HWND defaults_ = nullptr;
+    HWND accept_ = nullptr;
+    HWND cancel_ = nullptr;
+    std::vector<FileListColumnSetting> columns_;
+};
+
 enum class DialogMode { create_archive, extract_archive, settings };
 
 class OptionsDialog {
@@ -1660,17 +2293,26 @@ public:
         owner_ = owner;
         instance_ = reinterpret_cast<HINSTANCE>(GetWindowLongPtrW(owner, GWLP_HINSTANCE));
         dpi_ = GetDpiForWindow(owner);
+        // Establish the non-client appearance before USER32 creates the frame.
+        // Applying it later in WM_CREATE permits one compositor frame with the
+        // default light border on a dark desktop.
+        palette_ = make_palette();
         if (!register_class()) return false;
         const DWORD window_style = WS_POPUP | WS_CAPTION | WS_SYSMENU |
             WS_CLIPCHILDREN |
             (mode_ == DialogMode::create_archive || mode_ == DialogMode::settings
                  ? WS_THICKFRAME | WS_MAXIMIZEBOX : 0);
-        const DWORD extended_style = WS_EX_DLGMODALFRAME;
+        // Thick-frame dialogs already have a complete non-client frame.
+        // WS_EX_DLGMODALFRAME adds a second legacy edge which can briefly paint
+        // in the system light color before DWM applies the requested theme.
+        const DWORD extended_style =
+            WS_EX_LAYERED |
+            (mode_ == DialogMode::extract_archive ? WS_EX_DLGMODALFRAME : 0);
         const SIZE initial_size = dialog_window_size_for_client(
             mode_ == DialogMode::create_archive
-                ? 840 : mode_ == DialogMode::settings ? 1040 : 540,
+                ? 840 : mode_ == DialogMode::settings ? 920 : 540,
             mode_ == DialogMode::create_archive
-                ? 690 : mode_ == DialogMode::settings ? 760 : 290,
+                ? 690 : mode_ == DialogMode::settings ? 650 : 290,
             window_style, extended_style, dpi_);
         int width = initial_size.cx;
         int height = initial_size.cy;
@@ -1691,10 +2333,28 @@ public:
                                   window_style,
                                   x, y, width, height, owner, nullptr, instance_, this);
         if (!window_) return false;
-        restore_named_window_placement(window_, owner, layout_name());
+        // Unlike DWMWA_CLOAK, layered alpha is applied synchronously by USER32
+        // before a window can become visible.  Keep the complete window,
+        // including its DWM-owned non-client frame, transparent until its
+        // first dark frame has been realized.
+        layered_reveal_pending_ =
+            SetLayeredWindowAttributes(window_, 0, 0, LWA_ALPHA) != FALSE;
+        const int show_command =
+            restore_named_window_placement(window_, owner, layout_name());
         owner_was_enabled_ = disable_dialog_owner(owner, window_);
-        ShowWindow(window_, SW_SHOW);
-        UpdateWindow(window_);
+
+        ShowWindow(window_, show_command);
+        RedrawWindow(window_, nullptr, nullptr,
+                     RDW_INVALIDATE | RDW_ERASE | RDW_FRAME |
+                         RDW_ALLCHILDREN | RDW_UPDATENOW);
+        if (layered_reveal_pending_) {
+            // Showing a thick-frame window queues additional non-client work.
+            // Let the nested modal loop process that work before revealing the
+            // surface.  A one-shot timer runs only after higher-priority
+            // messages and prevents the otherwise visible light frame.
+            DwmFlush();
+            SetTimer(window_, kCompositorRevealTimer, 1, nullptr);
+        }
         MSG message{};
         while (IsWindow(window_) && GetMessageW(&message, nullptr, 0, 0) > 0) {
             if (tooltip_ != nullptr && message.message >= WM_MOUSEFIRST &&
@@ -1715,7 +2375,40 @@ public:
                 toggle_toolbar_settings_row(toolbar_list_.focused_index());
                 continue;
             }
-            if (!IsDialogMessageW(window_, &message)) {
+            if (mode_ == DialogMode::settings &&
+                settings_viewport_ != nullptr &&
+                (message.hwnd == settings_viewport_ ||
+                 IsChild(settings_viewport_, message.hwnd))) {
+                wchar_t class_name[32]{};
+                GetClassNameW(message.hwnd, class_name,
+                              static_cast<int>(std::size(class_name)));
+                const bool combo =
+                    lstrcmpiW(class_name, L"ComboBox") == 0 ||
+                    lstrcmpiW(class_name, L"ComboLBox") == 0;
+                const bool table =
+                    message.hwnd == toolbar_list_.hwnd() ||
+                    (toolbar_list_.hwnd() != nullptr &&
+                     IsChild(toolbar_list_.hwnd(), message.hwnd));
+                if (message.message == WM_MOUSEWHEEL && !combo && !table) {
+                    SendMessageW(settings_viewport_, WM_MOUSEWHEEL,
+                                 message.wParam, message.lParam);
+                    continue;
+                }
+                if (message.message == WM_KEYDOWN && !combo && !table &&
+                    (message.wParam == VK_PRIOR ||
+                     message.wParam == VK_NEXT)) {
+                    SendMessageW(settings_viewport_, WM_KEYDOWN,
+                                 message.wParam, message.lParam);
+                    continue;
+                }
+            }
+            const bool handled = IsDialogMessageW(window_, &message) != FALSE;
+            if (mode_ == DialogMode::settings &&
+                message.message == WM_KEYDOWN &&
+                message.wParam == VK_TAB) {
+                ensure_settings_focus_visible(GetFocus());
+            }
+            if (!handled) {
                 TranslateMessage(&message);
                 DispatchMessageW(&message);
             }
@@ -1734,6 +2427,7 @@ public:
 
 private:
     static const wchar_t* class_name() { return L"AxiomDarkOptionsDialog"; }
+    static constexpr UINT_PTR kCompositorRevealTimer = 0xA710;
 
     const wchar_t* layout_name() const {
         switch (mode_) {
@@ -1753,12 +2447,14 @@ private:
             wc.hInstance = instance_;
             wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
             wc.lpszClassName = class_name();
+            assign_axiom_window_class_icons(wc, instance_);
             atom = RegisterClassExW(&wc);
             dialog_registered = atom != 0 ||
                                 GetLastError() == ERROR_CLASS_ALREADY_EXISTS;
         }
         return dialog_registered && register_dark_tab_class(instance_) &&
-               register_settings_nav_class(instance_);
+               register_settings_nav_class(instance_) &&
+               register_settings_viewport_class(instance_);
     }
 
     int scale(int value) const {
@@ -1885,7 +2581,13 @@ private:
                          DWORD style, int id, int x, int y, int width, int height,
                          bool wrapped = false) {
         HWND result = control(type, text, style, id);
+        if (settings_viewport_ != nullptr) {
+            SetParent(result, settings_viewport_);
+        }
         settings_controls_.push_back({result, page, x, y, width, height, wrapped});
+        if (page != settings_page_) {
+            ShowWindow(result, SW_HIDE);
+        }
         return result;
     }
 
@@ -2092,7 +2794,7 @@ private:
     }
 
     void create_toolbar_settings_list(int page, int x, int y, int width, int height) {
-        toolbar_list_.create(window_, instance_, kToolbarList);
+        toolbar_list_.create(settings_viewport_, instance_, kToolbarList);
         toolbar_list_.set_font(font_);
         toolbar_list_.set_dpi(dpi_);
         toolbar_list_.set_theme(toolbar_table_theme());
@@ -2100,6 +2802,7 @@ private:
             true,
             true,
             true,
+            false,
         });
         toolbar_list_.set_columns({
             {L"Icon", 58},
@@ -2116,6 +2819,7 @@ private:
             WS_TABSTOP | WS_VSCROLL | CBS_DROPDOWNLIST |
                 CBS_OWNERDRAWFIXED | CBS_HASSTRINGS | CBS_NOINTEGRALHEIGHT,
             kToolbarStatusCombo);
+        SetParent(toolbar_status_combo_, settings_viewport_);
         SendMessageW(toolbar_status_combo_, CB_SETITEMHEIGHT, 0, scale(24));
         SendMessageW(toolbar_status_combo_, CB_SETITEMHEIGHT,
                      static_cast<WPARAM>(-1), scale(24));
@@ -2126,6 +2830,15 @@ private:
         SendMessageW(toolbar_status_combo_, CB_SETMINVISIBLE,
                      static_cast<WPARAM>(kToolbarStatusNames.size()), 0);
         ShowWindow(toolbar_status_combo_, SW_HIDE);
+    }
+
+    void ensure_toolbar_settings_list() {
+        if (toolbar_list_.hwnd() != nullptr) return;
+        // Icon rasterization and table population are the most expensive part
+        // of settings construction. Defer them until the Toolbar page is
+        // actually requested so opening Settings is independent of toolbar
+        // catalog size and does not initialize GDI+ on the first frame.
+        create_toolbar_settings_list(9, 0, 76, 2000, 462);
     }
 
     void toggle_toolbar_settings_row(int row) {
@@ -2172,9 +2885,24 @@ private:
         refresh_toolbar_settings_list(row);
     }
 
+    void customize_file_columns() {
+        FileColumnsDialog dialog(toolbar_table_theme());
+        auto columns = application_options.file_list_columns;
+        if (dialog.show(window_, columns)) {
+            application_options.file_list_columns =
+                normalize_file_list_columns(columns);
+        }
+    }
+
     void create_settings_controls() {
         settings_tabs_ = control(kSettingsNavClass, L"", WS_TABSTOP | WS_GROUP,
                                  kSettingsTabs);
+        settings_viewport_ = CreateWindowExW(
+            WS_EX_CONTROLPARENT, kSettingsViewportClass, L"",
+            WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN | WS_CLIPSIBLINGS,
+            0, 0, 0, 0, window_, nullptr, instance_, nullptr);
+        SendMessageW(settings_viewport_, WM_SETFONT,
+                     reinterpret_cast<WPARAM>(font_), TRUE);
 
         setting_label(0, L"Application behavior", 0, 0, 660);
         setting_label(0, L"Theme", 0, 42, 170);
@@ -2259,7 +2987,8 @@ private:
         setting_edit(2, kTempCleanupDays, 180, 288, 80, ES_NUMBER | ES_AUTOHSCROLL);
         setting_label(2,
                       L"Last-used folders are remembered after successful dialog confirmation. "
-                      L"Temporary cleanup removes old Axiom staging folders on startup.",
+                      L"Temporary cleanup removes old Axiom staging folders on startup. "
+                      L"Use Tools > Delete Axiom temporary files for immediate cleanup.",
                       0, 340, 660, 54, true);
 
         setting_label(3, L"File browser", 0, 0, 660);
@@ -2274,6 +3003,15 @@ private:
                          L"Address dropdown: show recent locations", 0, 266);
         setting_checkbox(3, kShowAddressArchiveChildren,
                          L"Address dropdown: show folders in the current location", 0, 300);
+        setting_label(3, L"File-list columns", 0, 352, 660);
+        setting_label(
+            3,
+            L"Choose visible fields and their order in a dedicated editor. "
+            L"Visible headers can also be dragged directly in the main file list.",
+            0, 382, 700, 48, true);
+        setting_control(3, L"BUTTON", L"Customize columns...",
+                        WS_TABSTOP | BS_OWNERDRAW,
+                        kCustomizeFileColumns, 0, 442, 170, 30);
 
         setting_label(4, L"Viewing files from archives", 0, 0, 660);
         setting_label(4, L"Double-click action", 0, 42, 170);
@@ -2331,14 +3069,15 @@ private:
 
         setting_label(7, L"Updates", 0, 0, 660);
         setting_checkbox(7, kAutomaticUpdateChecks,
-                         L"Check for updates automatically on startup", 0, 42);
+                         L"Silently check for updates at startup (at most once every 24 hours)",
+                         0, 42, 660);
         setting_label(7, L"Release channel", 0, 92, 170);
         setting_combo(7, kUpdateChannel, kUpdateChannelNames, 180, 86, 260);
-        setting_label(7, L"Update URL (http/https)", 0, 134, 170);
+        setting_label(7, L"Update URL (HTTPS)", 0, 134, 170);
         setting_edit(7, kUpdateUrl, 180, 128, 470);
         setting_label(7,
-                      L"The existing update checker reads this URL directly. Leave it empty to "
-                      L"disable automatic checks until a release feed is configured.",
+                      L"Leave this empty to use Axiom's official GitHub release feed. Custom "
+                      L"feeds must use HTTPS and may include {channel}.",
                       0, 184, 660, 54, true);
 
         setting_label(8, L"Keyboard shortcuts", 0, 0, 660);
@@ -2367,7 +3106,6 @@ private:
                       L"Choose which commands appear on the main command toolbar. "
                       L"Buttons keep this order and wrap when needed.",
                       0, 30, 760, 38, true);
-        create_toolbar_settings_list(9, 0, 76, 2000, 462);
         setting_control(9, L"BUTTON", L"Restore default toolbar",
                         WS_TABSTOP | BS_OWNERDRAW,
                         kToolbarResetDefaults, 0, 552, 180, 30);
@@ -2466,7 +3204,7 @@ private:
         add_dialog_tooltip(tooltip_, item(kBrowseTrustedKeysFolder),
                            L"Choose an existing trusted-keys folder.");
         add_dialog_tooltip(tooltip_, item(kUpdateUrl),
-                           L"Absolute HTTP or HTTPS URL for the update feed. Leave empty to disable feed checks.");
+                           L"Absolute HTTPS URL for a custom update feed. Leave empty to use Axiom's official GitHub release feed.");
         add_dialog_tooltip(tooltip_, item(kShortcutValue),
                            L"Key-chord text such as Ctrl+O, Alt+Left, F5, Delete, or None.");
         add_dialog_tooltip(tooltip_, item(kLogFolder),
@@ -2646,6 +3384,7 @@ private:
     void create_controls() {
         palette_ = make_palette();
         set_dark_title(window_, palette_.dark);
+        apply_axiom_window_icons(window_, instance_);
         tooltip_ = create_dialog_tooltip(window_);
         window_brush_ = CreateSolidBrush(palette_.window);
         edit_brush_ = CreateSolidBrush(palette_.edit);
@@ -2757,7 +3496,9 @@ private:
     }
 
     HWND item(int id) const {
-        return GetDlgItem(window_, id);
+        if (HWND result = GetDlgItem(window_, id)) return result;
+        return settings_viewport_ != nullptr
+            ? GetDlgItem(settings_viewport_, id) : nullptr;
     }
 
     int selected_index(int id, int fallback = 0) const {
@@ -3154,6 +3895,8 @@ private:
         application_options.toolbar_commands =
             normalize_toolbar_commands(application_options.toolbar_commands);
         refresh_toolbar_settings_list();
+        application_options.file_list_columns =
+            normalize_file_list_columns(application_options.file_list_columns);
         set_selected_index(kStartupMode,
                            std::clamp(application_options.startup_location_mode, 0, 3));
         set_window_text(item(kStartupCustomPath), application_options.startup_custom_path);
@@ -3229,8 +3972,33 @@ private:
 
     void update_settings_dependencies() {
         if (mode_ != DialogMode::settings) return;
+        EnableWindow(item(kCustomAccentColor),
+                     selected_index(kAccentColorMode, 0) == 6);
+        EnableWindow(item(kPickAccentColor),
+                     selected_index(kAccentColorMode, 0) == 6);
+        EnableWindow(item(kStartupCustomPath),
+                     selected_index(kStartupMode, 0) == 3);
+        EnableWindow(item(kBrowseStartupCustomPath),
+                     selected_index(kStartupMode, 0) == 3);
+        EnableWindow(item(kArchiveOutputFolder),
+                     selected_index(kArchiveOutputMode, 0) == 2);
+        EnableWindow(item(kBrowseArchiveOutputFolder),
+                     selected_index(kArchiveOutputMode, 0) == 2);
+        EnableWindow(item(kExtractDestinationFolder),
+                     selected_index(kExtractDestinationMode, 0) == 2);
+        EnableWindow(item(kBrowseExtractDestinationFolder),
+                     selected_index(kExtractDestinationMode, 0) == 2);
+        EnableWindow(item(kTempFolder),
+                     selected_index(kTempFolderMode, 0) == 2);
+        EnableWindow(item(kBrowseTempFolder),
+                     selected_index(kTempFolderMode, 0) == 2);
+        EnableWindow(item(kDefaultSigningKey),
+                     checkbox_checked(kDefaultSignArchive));
+        EnableWindow(item(kBrowseDefaultSigningKey),
+                     checkbox_checked(kDefaultSignArchive));
         EnableWindow(item(kIoBufferSize), selected_index(kIoBufferMode, 0) == 1);
         EnableWindow(item(kMemoryLimit), selected_index(kMemoryLimitMode, 0) == 1);
+        layout_settings();
     }
 
     bool apply_settings_values() {
@@ -3292,12 +4060,11 @@ private:
             std::transform(lower.begin(), lower.end(), lower.begin(), [](wchar_t ch) {
                 return static_cast<wchar_t>(std::towlower(ch));
             });
-            if ((lower.rfind(L"https://", 0) != 0 &&
-                 lower.rfind(L"http://", 0) != 0) ||
+            if (lower.rfind(L"https://", 0) != 0 ||
                 lower.find_first_of(L" \t\r\n") != std::wstring::npos) {
                 return reject_field(
                     7, kUpdateUrl,
-                    L"Update URL must be an absolute HTTP or HTTPS URL, or empty to disable feed checks.");
+                    L"Update URL must be an absolute HTTPS URL, or empty to use Axiom's official release feed.");
             }
         }
         const auto existing_folder = [&](int mode_id, int custom_index,
@@ -3515,52 +4282,241 @@ private:
     }
 
     void layout_settings() {
+        if (settings_viewport_ == nullptr) return;
         RECT client{};
         GetClientRect(window_, &client);
-        const int margin = scale(18);
+        const SIZE client_size{
+            static_cast<LONG>(client.right - client.left),
+            static_cast<LONG>(client.bottom - client.top)};
+        const bool resized =
+            client_size.cx != settings_layout_client_size_.cx ||
+            client_size.cy != settings_layout_client_size_.cy;
+        settings_layout_client_size_ = client_size;
+        if (resized) {
+            // Moving a clipped child viewport can otherwise make USER32 copy
+            // pixels from its former client area into the newly exposed
+            // footer. Suppress intermediate paints and produce one complete
+            // frame after every live-resize layout.
+            SendMessageW(window_, WM_SETREDRAW, FALSE, 0);
+        }
+        const int margin = scale(14);
         const int row = scale(30);
-        const int button_width = scale(88);
+        const int button_width = scale(86);
         const int button_y = client.bottom - margin - row;
-        MoveWindow(defaults_, margin, button_y, scale(112), row, TRUE);
-        MoveWindow(cancel_, client.right - margin - button_width, button_y,
-                   button_width, row, TRUE);
-        MoveWindow(apply_, client.right - margin - button_width * 2 - scale(8),
-                   button_y, button_width, row, TRUE);
-        MoveWindow(accept_, client.right - margin - button_width * 3 - scale(16),
-                   button_y, button_width, row, TRUE);
+        HDWP footer = BeginDeferWindowPos(5);
+        footer = DeferWindowPos(footer, defaults_, nullptr,
+                                margin, button_y, scale(104), row,
+                                SWP_NOZORDER | SWP_NOACTIVATE |
+                                    SWP_NOCOPYBITS);
+        footer = DeferWindowPos(footer, cancel_, nullptr,
+                                client.right - margin - button_width, button_y,
+                                button_width, row,
+                                SWP_NOZORDER | SWP_NOACTIVATE |
+                                    SWP_NOCOPYBITS);
+        footer = DeferWindowPos(footer, apply_, nullptr,
+                                client.right - margin - button_width * 2 - scale(8),
+                                button_y, button_width, row,
+                                SWP_NOZORDER | SWP_NOACTIVATE |
+                                    SWP_NOCOPYBITS);
+        footer = DeferWindowPos(footer, accept_, nullptr,
+                                client.right - margin - button_width * 3 - scale(16),
+                                button_y, button_width, row,
+                                SWP_NOZORDER | SWP_NOACTIVATE |
+                                    SWP_NOCOPYBITS);
 
         const int bottom_limit = button_y - scale(12);
-        const int nav_width = scale(178);
-        const int nav_gap = scale(22);
-        MoveWindow(settings_tabs_, margin, margin, nav_width,
-                   std::max(row, bottom_limit - margin), TRUE);
+        const int nav_width = scale(154);
+        const int nav_gap = scale(16);
+        footer = DeferWindowPos(
+            footer, settings_tabs_, nullptr, margin, margin, nav_width,
+            std::max(row, bottom_limit - margin),
+            SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS);
+        if (footer != nullptr) EndDeferWindowPos(footer);
+
         const int content_left = margin + nav_width + nav_gap;
-        const int content_top = margin;
-        const int content_width = std::max(
-            scale(360), static_cast<int>(client.right) - margin - content_left);
+        const int viewport_width = std::max(
+            scale(300), static_cast<int>(client.right) - margin - content_left);
+        const int viewport_height = std::max(row, bottom_limit - margin);
+        SetWindowPos(settings_viewport_, nullptr, content_left, margin,
+                     viewport_width, viewport_height,
+                     SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS);
+
+        RECT viewport{};
+        GetClientRect(settings_viewport_, &viewport);
+        const int scrollbar_gutter = scale(16);
+        const int usable_width = std::max(
+            scale(260), static_cast<int>(viewport.right) - scrollbar_gutter);
+        const int design_width = scale(760);
+        const int horizontal_numerator = std::min(usable_width, design_width);
+
+        const bool custom_accent = selected_index(kAccentColorMode, 0) == 6;
+        const bool custom_startup = selected_index(kStartupMode, 0) == 3;
+        const bool custom_archive = selected_index(kArchiveOutputMode, 0) == 2;
+        const bool custom_extract =
+            selected_index(kExtractDestinationMode, 0) == 2;
+        const bool custom_temp = selected_index(kTempFolderMode, 0) == 2;
+        const bool signing_enabled = checkbox_checked(kDefaultSignArchive);
+        const bool custom_io = selected_index(kIoBufferMode, 0) == 1;
+        const bool custom_memory = selected_index(kMemoryLimitMode, 0) == 1;
+
+        struct Placement {
+            const SettingControl* control = nullptr;
+            int x = 0;
+            int y = 0;
+            int width = 0;
+            int height = 0;
+            int extent_height = 0;
+            bool visible = false;
+        };
+        std::vector<Placement> placements;
+        placements.reserve(settings_controls_.size());
+        int content_height = 0;
+
+        const auto is_combo = [](HWND window) {
+            wchar_t class_name[32]{};
+            GetClassNameW(window, class_name,
+                          static_cast<int>(std::size(class_name)));
+            return lstrcmpiW(class_name, L"ComboBox") == 0;
+        };
+
         for (const SettingControl& control : settings_controls_) {
-            const int available_width = std::max(
-                scale(80), content_width - scale(control.x));
-            const int width = std::min(scale(control.width), available_width);
-            int height = scale(control.height);
-            if (control.wrapped) {
-                HDC dc = GetDC(control.window);
-                HGDIOBJ old_font = SelectObject(dc, font_);
-                RECT measured{0, 0, width, 0};
-                const std::wstring text = window_text(control.window);
-                DrawTextW(dc, text.c_str(), -1, &measured,
-                          DT_CALCRECT | DT_WORDBREAK | DT_NOPREFIX | DT_EDITCONTROL);
-                SelectObject(dc, old_font);
-                ReleaseDC(control.window, dc);
-                height = std::max(height, static_cast<int>(measured.bottom) + scale(3));
+            bool dependency_visible = true;
+            int compact_y = control.y;
+            const int id = GetDlgCtrlID(control.window);
+            if (control.page == 0) {
+                if (!custom_accent) {
+                    if (control.y >= 120 && control.y <= 150) {
+                        dependency_visible = false;
+                    } else if (control.y > 150) {
+                        compact_y -= 42;
+                    }
+                }
+                if (!custom_startup) {
+                    if (control.y >= 246 && control.y <= 276) {
+                        dependency_visible = false;
+                    } else if (control.y > 276) {
+                        compact_y -= 42;
+                    }
+                }
+            } else if (control.page == 1 && !signing_enabled &&
+                       control.y >= 518 && control.y <= 548) {
+                dependency_visible = false;
+            } else if (control.page == 2) {
+                if (!custom_archive) {
+                    if (control.y >= 78 && control.y <= 108) {
+                        dependency_visible = false;
+                    } else if (control.y > 108) {
+                        compact_y -= 42;
+                    }
+                }
+                if (!custom_extract) {
+                    if (control.y >= 162 && control.y <= 192) {
+                        dependency_visible = false;
+                    } else if (control.y > 192) {
+                        compact_y -= 42;
+                    }
+                }
+                if (!custom_temp) {
+                    if (control.y >= 246 && control.y <= 276) {
+                        dependency_visible = false;
+                    } else if (control.y > 276) {
+                        compact_y -= 42;
+                    }
+                }
+            } else if (control.page == 10) {
+                if (id == kIoBufferSize && !custom_io) {
+                    dependency_visible = false;
+                }
+                if (id == kMemoryLimit && !custom_memory) {
+                    dependency_visible = false;
+                }
             }
-            const int y = content_top + scale(control.y);
-            MoveWindow(control.window,
-                       content_left + scale(control.x), y,
-                       width, std::min(height, std::max(scale(20), bottom_limit - y)),
-                       TRUE);
+
+            int x = MulDiv(scale(control.x), horizontal_numerator, design_width);
+            int y = MulDiv(scale(compact_y), 9, 10);
+            int width = MulDiv(scale(control.width),
+                               horizontal_numerator, design_width);
+            width = std::min(width, std::max(scale(64), usable_width - x));
+            int height = scale(control.height);
+            int extent_height = is_combo(control.window)
+                ? row : height;
+
+            if (control.window == toolbar_list_.hwnd()) {
+                x = 0;
+                y = scale(68);
+                width = usable_width;
+                height = std::max(
+                    scale(150), static_cast<int>(viewport.bottom) -
+                                    y - scale(48));
+                extent_height = height;
+            } else if (id == kToolbarResetDefaults) {
+                x = 0;
+                y = std::max(scale(226),
+                             static_cast<int>(viewport.bottom) - scale(34));
+                width = std::min(scale(180), usable_width);
+                height = row;
+                extent_height = row;
+            } else if (control.wrapped) {
+                height = wrapped_height(control.window, width, height);
+                extent_height = height;
+            }
+
+            const bool visible =
+                control.page == settings_page_ && dependency_visible;
+            placements.push_back({
+                &control, x, y, width, height, extent_height, visible});
+            if (control.page == settings_page_ && dependency_visible) {
+                content_height = std::max(content_height, y + extent_height);
+            }
         }
+
+        if (settings_page_ == 9) {
+            content_height = viewport.bottom;
+        } else {
+            content_height += scale(10);
+        }
+        const SettingsViewportMetrics metrics{
+            content_height, scale(32)};
+        SendMessageW(settings_viewport_, kSettingsViewportSetMetrics, 0,
+                     reinterpret_cast<LPARAM>(&metrics));
+        int scroll_offset = static_cast<int>(
+            SendMessageW(settings_viewport_, kSettingsViewportGetOffset, 0, 0));
+        const int desired_offset =
+            settings_scroll_offsets_[static_cast<std::size_t>(settings_page_)];
+        if (desired_offset != scroll_offset) {
+            SendMessageW(settings_viewport_, kSettingsViewportScrollBy,
+                         static_cast<WPARAM>(desired_offset - scroll_offset), 0);
+            scroll_offset = static_cast<int>(
+                SendMessageW(settings_viewport_,
+                             kSettingsViewportGetOffset, 0, 0));
+        }
+        settings_scroll_offsets_[static_cast<std::size_t>(settings_page_)] =
+            scroll_offset;
+
+        SendMessageW(settings_viewport_, WM_SETREDRAW, FALSE, 0);
+        HDWP controls = BeginDeferWindowPos(
+            static_cast<int>(placements.size()));
+        for (const Placement& placement : placements) {
+            const UINT flags = SWP_NOZORDER | SWP_NOACTIVATE |
+                SWP_NOCOPYBITS |
+                (placement.visible ? SWP_SHOWWINDOW : SWP_HIDEWINDOW);
+            controls = DeferWindowPos(
+                controls, placement.control->window, nullptr,
+                placement.x, placement.y - scroll_offset,
+                placement.width, placement.height, flags);
+        }
+        if (controls != nullptr) EndDeferWindowPos(controls);
+        SendMessageW(settings_viewport_, WM_SETREDRAW, TRUE, 0);
         sync_toolbar_status_combo();
+        if (resized) {
+            SendMessageW(window_, WM_SETREDRAW, TRUE, 0);
+            RedrawWindow(window_, nullptr, nullptr,
+                         RDW_INVALIDATE | RDW_ERASE | RDW_FRAME |
+                             RDW_ALLCHILDREN | RDW_UPDATENOW);
+        } else {
+            RedrawWindow(settings_viewport_, nullptr, nullptr,
+                         RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);
+        }
     }
 
     int wrapped_height(HWND control_window, int width, int minimum) const {
@@ -3898,7 +4854,15 @@ private:
     }
 
     void select_settings_page(int page) {
+        if (settings_viewport_ != nullptr) {
+            settings_scroll_offsets_[static_cast<std::size_t>(settings_page_)] =
+                static_cast<int>(SendMessageW(
+                    settings_viewport_, kSettingsViewportGetOffset, 0, 0));
+        }
         settings_page_ = std::clamp(page, 0, static_cast<int>(kSettingsTabNames.size()) - 1);
+        if (settings_page_ == 9) {
+            ensure_toolbar_settings_list();
+        }
         for (const SettingControl& control : settings_controls_) {
             if (control.page != settings_page_) {
                 ShowWindow(control.window, SW_HIDE);
@@ -3908,16 +4872,41 @@ private:
             // its previous native theme. Suppress its first paint until the
             // new theme and restored edge styles are installed.
             SendMessageW(control.window, WM_SETREDRAW, FALSE, 0);
-            ShowWindow(control.window, SW_SHOWNA);
             apply_dialog_control_theme(control.window, palette_.dark);
             SendMessageW(control.window, WM_SETREDRAW, TRUE, 0);
         }
         SendMessageW(settings_tabs_, kDarkTabSetSelection,
                      static_cast<WPARAM>(settings_page_), 0);
-        sync_toolbar_status_combo();
-        RedrawWindow(window_, nullptr, nullptr,
-                     RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN |
-                         RDW_ERASENOW | RDW_UPDATENOW);
+        layout_settings();
+        RedrawWindow(settings_viewport_, nullptr, nullptr,
+                     RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);
+    }
+
+    void ensure_settings_focus_visible(HWND focus) {
+        if (settings_viewport_ == nullptr || focus == nullptr) return;
+        HWND settings_control = focus;
+        while (settings_control != nullptr &&
+               GetParent(settings_control) != settings_viewport_) {
+            settings_control = GetParent(settings_control);
+        }
+        if (settings_control == nullptr) return;
+        RECT control_rect{};
+        GetWindowRect(settings_control, &control_rect);
+        MapWindowPoints(nullptr, settings_viewport_,
+                        reinterpret_cast<POINT*>(&control_rect), 2);
+        RECT viewport{};
+        GetClientRect(settings_viewport_, &viewport);
+        const int padding = scale(8);
+        int delta = 0;
+        if (control_rect.top < viewport.top + padding) {
+            delta = control_rect.top - viewport.top - padding;
+        } else if (control_rect.bottom > viewport.bottom - padding) {
+            delta = control_rect.bottom - viewport.bottom + padding;
+        }
+        if (delta != 0) {
+            SendMessageW(settings_viewport_, kSettingsViewportScrollBy,
+                         static_cast<WPARAM>(delta), 0);
+        }
     }
 
     void set_password_visibility() {
@@ -4612,6 +5601,8 @@ private:
         if (mode_ == DialogMode::create_archive) {
             update_create_dependencies();
             update_output_preview();
+        } else if (mode_ == DialogMode::settings) {
+            update_settings_dependencies();
         }
     }
 
@@ -4712,7 +5703,50 @@ private:
     LRESULT handle(UINT message, WPARAM wparam, LPARAM lparam) {
         switch (message) {
             case WM_CREATE: create_controls(); return 0;
+            case WM_TIMER:
+                if (wparam == kCompositorRevealTimer &&
+                    layered_reveal_pending_) {
+                    KillTimer(window_, kCompositorRevealTimer);
+                    RedrawWindow(window_, nullptr, nullptr,
+                                 RDW_INVALIDATE | RDW_ERASE | RDW_FRAME |
+                                     RDW_ALLCHILDREN | RDW_UPDATENOW);
+                    DwmFlush();
+                    SetLayeredWindowAttributes(
+                        window_, 0, 255, LWA_ALPHA);
+                    DwmFlush();
+                    // Layering is only an opening-frame gate.  Keeping
+                    // WS_EX_LAYERED on a control-heavy, resizable dialog makes
+                    // USER32 redirect every live-resize paint and causes the
+                    // controls to flicker.  Return to the normal DWM path once
+                    // the fully dark first frame has been committed.
+                    const LONG_PTR extended_style =
+                        GetWindowLongPtrW(window_, GWL_EXSTYLE);
+                    SetWindowLongPtrW(
+                        window_, GWL_EXSTYLE,
+                        extended_style & ~static_cast<LONG_PTR>(WS_EX_LAYERED));
+                    SetWindowPos(
+                        window_, nullptr, 0, 0, 0, 0,
+                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER |
+                            SWP_NOACTIVATE | SWP_NOOWNERZORDER |
+                            SWP_FRAMECHANGED);
+                    RedrawWindow(window_, nullptr, nullptr,
+                                 RDW_INVALIDATE | RDW_ERASE | RDW_FRAME |
+                                     RDW_ALLCHILDREN | RDW_UPDATENOW);
+                    DwmFlush();
+                    layered_reveal_pending_ = false;
+                    return 0;
+                }
+                break;
             case WM_SIZE: layout(); return 0;
+            case kSettingsViewportOffsetChanged:
+                if (mode_ == DialogMode::settings) {
+                    settings_scroll_offsets_[
+                        static_cast<std::size_t>(settings_page_)] =
+                        static_cast<int>(wparam);
+                    layout_settings();
+                    return 0;
+                }
+                break;
             case kTableActivateMessage:
                 if (mode_ == DialogMode::settings && settings_page_ == 9) {
                     sync_toolbar_status_combo();
@@ -4743,8 +5777,8 @@ private:
                     const DWORD ex_style = static_cast<DWORD>(
                         GetWindowLongPtrW(window_, GWL_EXSTYLE));
                     const SIZE minimum = dialog_window_size_for_client(
-                        mode_ == DialogMode::settings ? 1000 : 650,
-                        mode_ == DialogMode::settings ? 720 : 520,
+                        mode_ == DialogMode::settings ? 780 : 650,
+                        mode_ == DialogMode::settings ? 520 : 520,
                         style, ex_style, dpi_);
                     int minimum_width = minimum.cx;
                     int minimum_height = minimum.cy;
@@ -4813,7 +5847,11 @@ private:
                     return 0;
                 }
                 if (mode_ == DialogMode::settings &&
-                    (id == kIoBufferMode || id == kMemoryLimitMode) &&
+                    (id == kAccentColorMode || id == kStartupMode ||
+                     id == kArchiveOutputMode ||
+                     id == kExtractDestinationMode ||
+                     id == kTempFolderMode ||
+                     id == kIoBufferMode || id == kMemoryLimitMode) &&
                     HIWORD(wparam) == CBN_SELCHANGE) {
                     update_settings_dependencies();
                     return 0;
@@ -4933,6 +5971,11 @@ private:
                             InvalidateRect(window_, nullptr, TRUE);
                         }
                         return 0;
+                    case kCustomizeFileColumns:
+                        if (mode_ == DialogMode::settings) {
+                            customize_file_columns();
+                        }
+                        return 0;
                     case kDefaults:
                         if (mode_ == DialogMode::settings) {
                             application_options = ApplicationDialogOptions{};
@@ -4979,6 +6022,7 @@ private:
             self = static_cast<OptionsDialog*>(create->lpCreateParams);
             self->window_ = window;
             SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(self));
+            set_dark_title(window, self->palette_.dark);
         } else {
             self = reinterpret_cast<OptionsDialog*>(GetWindowLongPtrW(window, GWLP_USERDATA));
         }
@@ -4992,6 +6036,7 @@ private:
     HINSTANCE instance_ = nullptr;
     UINT dpi_ = USER_DEFAULT_SCREEN_DPI;
     bool owner_was_enabled_ = false;
+    bool layered_reveal_pending_ = false;
     Palette palette_;
     HBRUSH window_brush_ = nullptr;
     HBRUSH edit_brush_ = nullptr;
@@ -5008,6 +6053,9 @@ private:
     int settings_page_ = 0;
     HWND create_tabs_ = nullptr;
     HWND settings_tabs_ = nullptr;
+    HWND settings_viewport_ = nullptr;
+    SIZE settings_layout_client_size_{};
+    std::array<int, kSettingsTabNames.size()> settings_scroll_offsets_{};
     std::vector<PageControl> page_controls_;
     std::vector<SettingControl> settings_controls_;
     DarkTableView toolbar_list_;

@@ -150,6 +150,7 @@ void DarkTableView::set_options(TableViewOptions options) {
 }
 
 void DarkTableView::clear() {
+    if (GetCapture() == hwnd_) ReleaseCapture();
     rows_.clear();
     virtual_row_count_ = 0;
     virtual_row_provider_ = {};
@@ -159,6 +160,13 @@ void DarkTableView::clear() {
     selected_.clear();
     selected_row_ = -1;
     selection_anchor_ = -1;
+    drag_candidate_ = false;
+    drag_started_ = false;
+    collapse_selection_on_click_ = -1;
+    drag_select_candidate_ = false;
+    drag_select_preserve_ = false;
+    marquee_selecting_ = false;
+    marquee_base_selection_.clear();
     scroll_y_ = 0;
     scroll_x_ = 0;
     invalidate();
@@ -243,6 +251,8 @@ void DarkTableView::set_rows(std::vector<std::vector<std::wstring>> rows,
     drag_candidate_ = false;
     drag_started_ = false;
     collapse_selection_on_click_ = -1;
+    drag_select_candidate_ = false;
+    drag_select_preserve_ = false;
     marquee_selecting_ = false;
     marquee_base_selection_.clear();
     typeahead_.clear();
@@ -274,6 +284,8 @@ void DarkTableView::set_virtual_rows(std::size_t count,
     drag_candidate_ = false;
     drag_started_ = false;
     collapse_selection_on_click_ = -1;
+    drag_select_candidate_ = false;
+    drag_select_preserve_ = false;
     marquee_selecting_ = false;
     marquee_base_selection_.clear();
     typeahead_.clear();
@@ -592,6 +604,17 @@ int DarkTableView::column_separator_at(POINT point, const RECT& client) const {
     return -1;
 }
 
+int DarkTableView::column_at_x(int point_x, const RECT& client) const {
+    const auto widths = column_widths(client);
+    int x = table_left(client) - scroll_x_;
+    for (int column = 0; column < static_cast<int>(widths.size()); ++column) {
+        const int next_x = x + widths[static_cast<std::size_t>(column)];
+        if (point_x >= x && point_x < next_x) return column;
+        x = next_x;
+    }
+    return -1;
+}
+
 RECT DarkTableView::scrollbar_track_rect(const RECT& client) const {
     return RECT{client.right - scrollbar_width() - scale(1),
                 client.top + header_height() + scale(1),
@@ -719,7 +742,8 @@ std::wstring_view DarkTableView::row_match_text(int row) const {
         return virtual_match_text_provider_(static_cast<std::size_t>(row));
     }
     const auto& row_values = rows_[static_cast<std::size_t>(row)];
-    return row_values.empty() ? std::wstring{} : row_values.front();
+    if (row_values.empty()) return {};
+    return row_values.front();
 }
 
 int DarkTableView::find_typeahead_match(std::wstring_view needle, bool cycle) const {
@@ -803,6 +827,28 @@ bool DarkTableView::point_can_select_row(POINT point, int row, const RECT& clien
     return point.x >= first_left && point.x < first_right;
 }
 
+bool DarkTableView::point_hits_primary_icon(POINT point, int row,
+                                            const RECT& client) const {
+    if (row < 0 || row >= static_cast<int>(row_count())) return false;
+    if (image_list_ == nullptr) return false;
+    const int icon_index = virtual_icon_provider_
+        ? virtual_icon_provider_(static_cast<std::size_t>(row))
+        : row < static_cast<int>(icon_indices_.size())
+            ? icon_indices_[static_cast<std::size_t>(row)] : -1;
+    if (icon_index < 0) return false;
+    const auto widths = column_widths(client);
+    if (widths.empty()) return false;
+    const int first_left = table_left(client) - scroll_x_;
+    int icon_width = 0;
+    int icon_height = 0;
+    if (!ImageList_GetIconSize(image_list_, &icon_width, &icon_height)) {
+        return false;
+    }
+    const int icon_left = first_left + scale(7);
+    return point.x >= icon_left - scale(3) &&
+           point.x < icon_left + icon_width + scale(3);
+}
+
 int DarkTableView::selectable_row_at_point(POINT point, const RECT& client) const {
     if (point.y < header_height() || point.y >= rows_bottom(client) ||
         point.x < table_left(client) || point.x >= table_right(client)) {
@@ -815,6 +861,10 @@ int DarkTableView::selectable_row_at_point(POINT point, const RECT& client) cons
 }
 
 void DarkTableView::begin_marquee_selection(POINT point, bool preserve_selection) {
+    const std::size_t count = row_count();
+    if (selected_.size() != count) {
+        selected_.resize(count, false);
+    }
     marquee_selecting_ = true;
     marquee_start_ = point;
     marquee_current_ = point;
@@ -825,15 +875,46 @@ void DarkTableView::begin_marquee_selection(POINT point, bool preserve_selection
     }
     selected_row_ = -1;
     selection_anchor_ = -1;
-    SetCapture(hwnd_);
+    // Item-space marquee selection already owns capture from the pending
+    // click/drag gesture. Re-acquiring it during that transition can produce
+    // WM_CAPTURECHANGED and cancel the marquee after its first update.
+    if (GetCapture() != hwnd_) {
+        SetCapture(hwnd_);
+    }
     notify_parent(kTableSelectionChangedMessage);
     invalidate();
 }
 
 void DarkTableView::update_marquee_selection(POINT point) {
-    marquee_current_ = point;
+    const std::size_t count = row_count();
+    if (selected_.size() != count) {
+        selected_.resize(count, false);
+    }
+    if (marquee_base_selection_.size() != count) {
+        // Directory population is incremental. Rows can be appended between
+        // the button-down and mouse-move messages that form a marquee
+        // gesture, so extend the immutable base snapshot before indexing it.
+        marquee_base_selection_.resize(count, false);
+    }
     RECT client{};
     GetClientRect(hwnd_, &client);
+    const int rows_top = header_height();
+    const int rows_end = rows_bottom(client);
+    const int previous_scroll = scroll_y_;
+    if (point.y < rows_top) {
+        const int distance = rows_top - point.y;
+        scroll_by(-std::max(row_height(), distance));
+    } else if (point.y >= rows_end) {
+        const int distance = point.y - rows_end + 1;
+        scroll_by(std::max(row_height(), distance));
+    }
+    const int scroll_delta = scroll_y_ - previous_scroll;
+    if (scroll_delta != 0) {
+        // Keep the selection origin attached to the same content row while
+        // the viewport auto-scrolls beneath the captured pointer.
+        marquee_start_.y -= scroll_delta;
+    }
+    marquee_current_ = point;
     const RECT rows_area{table_left(client), header_height(),
                          table_right(client), rows_bottom(client)};
     RECT marquee{
@@ -848,16 +929,19 @@ void DarkTableView::update_marquee_selection(POINT point) {
     int first_selected = -1;
     int last_selected = -1;
     if (visible) {
-        for (int row = 0; row < static_cast<int>(row_count()); ++row) {
-            const int top = header_height() + row * row_height() - scroll_y_;
+        for (std::size_t row = 0; row < count; ++row) {
+            const int row_index = static_cast<int>(row);
+            const int top =
+                header_height() + row_index * row_height() - scroll_y_;
             const RECT row_rect{rows_area.left, top, rows_area.right, top + row_height()};
             RECT overlap{};
             if (IntersectRect(&overlap, &row_rect, &clipped)) {
-                next[static_cast<std::size_t>(row)] =
-                    !marquee_base_selection_[static_cast<std::size_t>(row)];
-                if (next[static_cast<std::size_t>(row)]) {
-                    if (first_selected < 0) first_selected = row;
-                    last_selected = row;
+                next[row] = !marquee_base_selection_[row];
+                if (next[row]) {
+                    if (first_selected < 0) {
+                        first_selected = row_index;
+                    }
+                    last_selected = row_index;
                 }
             }
         }
@@ -931,6 +1015,24 @@ void DarkTableView::paint_content(HDC dc, const RECT& client) {
         x = next_x;
         if (x >= content_right) {
             break;
+        }
+    }
+    if (header_dragging_ && header_drag_target_ >= 0 &&
+        header_drag_target_ < static_cast<int>(widths.size())) {
+        int target_x = content_left - scroll_x_;
+        for (int index = 0; index < header_drag_target_; ++index) {
+            target_x += widths[static_cast<std::size_t>(index)];
+        }
+        const int target_right =
+            target_x + widths[static_cast<std::size_t>(header_drag_target_)];
+        RECT target{
+            std::max(content_left, target_x),
+            header.top + scale(1),
+            std::min(content_right, target_right),
+            header.bottom - scale(1),
+        };
+        if (target.right > target.left) {
+            frame_solid_rect(dc, target, theme_.accent);
         }
     }
     RestoreDC(dc, saved_header_dc);
@@ -1124,16 +1226,16 @@ LRESULT DarkTableView::handle_message(UINT message, WPARAM wparam, LPARAM lparam
                     return 0;
                 }
 
-                const auto widths = column_widths(client);
-                int boundary = table_left(client) - scroll_x_;
-                for (int column = 0; column < static_cast<int>(widths.size()); ++column) {
-                    const int left = boundary;
-                    boundary += widths[column];
-                    if (point.x >= left && point.x < boundary) {
-                        SendMessageW(GetParent(hwnd_), kTableSortMessage,
-                                     static_cast<WPARAM>(column), 0);
-                        break;
-                    }
+                const int column = column_at_x(point.x, client);
+                if (column >= 0 && options_.allow_column_reorder) {
+                    header_drag_candidate_ = column;
+                    header_drag_target_ = column;
+                    header_dragging_ = false;
+                    header_drag_start_ = point;
+                    SetCapture(hwnd_);
+                } else if (column >= 0) {
+                    SendMessageW(GetParent(hwnd_), kTableSortMessage,
+                                 static_cast<WPARAM>(column), 0);
                 }
                 return 0;
             }
@@ -1178,28 +1280,48 @@ LRESULT DarkTableView::handle_message(UINT message, WPARAM wparam, LPARAM lparam
             if (valid_row >= 0 && !point_can_select_row(point, valid_row, client)) {
                 valid_row = -1;
             }
+            const std::size_t current_count = row_count();
+            if (selected_.size() != current_count) {
+                selected_.resize(current_count, false);
+            }
             const bool extend = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
             const bool toggle = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
-            const bool preserve_selection = valid_row >= 0 && !extend && !toggle &&
+            const bool was_selected = valid_row >= 0 &&
                 selected_[static_cast<std::size_t>(valid_row)];
+            const bool preserve_selection = valid_row >= 0 && !extend && !toggle &&
+                was_selected;
             if (valid_row < 0) {
                 begin_marquee_selection(point, toggle);
                 return 0;
             }
             if (!preserve_selection) select_row(valid_row, extend, toggle);
-            drag_candidate_ = valid_row >= 0 &&
+            const bool icon_hit =
+                point_hits_primary_icon(point, valid_row, client);
+            const bool start_item_drag =
+                !extend && !toggle && (icon_hit || was_selected);
+            drag_candidate_ = start_item_drag &&
                 selected_[static_cast<std::size_t>(valid_row)];
             drag_started_ = false;
             drag_start_ = point;
             collapse_selection_on_click_ = preserve_selection ? valid_row : -1;
-            if (drag_candidate_) SetCapture(hwnd_);
+            drag_select_preserve_ = toggle;
+            drag_select_candidate_ = options_.drag_select_rows && !extend &&
+                !start_item_drag;
+            if (drag_candidate_ || drag_select_candidate_) SetCapture(hwnd_);
             return 0;
         }
         case WM_LBUTTONDBLCLK: {
             RECT client{};
             GetClientRect(hwnd_, &client);
             const POINT point{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
-            if (point.y < header_height() || point.y >= rows_bottom(client) ||
+            if (point.y < header_height()) {
+                header_drag_candidate_ = -1;
+                header_drag_target_ = -1;
+                header_dragging_ = false;
+                if (GetCapture() == hwnd_) ReleaseCapture();
+                return 0;
+            }
+            if (point.y >= rows_bottom(client) ||
                 point.x < table_left(client) || point.x >= table_right(client)) {
                 return 0;
             }
@@ -1244,18 +1366,59 @@ LRESULT DarkTableView::handle_message(UINT message, WPARAM wparam, LPARAM lparam
             return 0;
         }
         case WM_MOUSEMOVE:
+            if (header_drag_candidate_ >= 0 && (wparam & MK_LBUTTON) != 0) {
+                const POINT point{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
+                if (options_.fixed_first_column &&
+                    header_drag_candidate_ == 0) {
+                    return 0;
+                }
+                if (!header_dragging_) {
+                    const int threshold_x = GetSystemMetrics(SM_CXDRAG);
+                    const int threshold_y = GetSystemMetrics(SM_CYDRAG);
+                    header_dragging_ =
+                        std::abs(point.x - header_drag_start_.x) >= threshold_x ||
+                        std::abs(point.y - header_drag_start_.y) >= threshold_y;
+                }
+                if (header_dragging_) {
+                    RECT client{};
+                    GetClientRect(hwnd_, &client);
+                    int target = column_at_x(point.x, client);
+                    if (target < 0) {
+                        target = point.x < table_left(client)
+                            ? 0
+                            : static_cast<int>(columns_.size()) - 1;
+                    }
+                    if (options_.fixed_first_column) target = std::max(1, target);
+                    if (target != header_drag_target_) {
+                        header_drag_target_ = target;
+                        invalidate();
+                    }
+                    SetCursor(LoadCursorW(nullptr, IDC_SIZEALL));
+                }
+                return 0;
+            }
             if (marquee_selecting_ && (wparam & MK_LBUTTON) != 0) {
                 update_marquee_selection(
                     POINT{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)});
                 return 0;
             }
-            if (drag_candidate_ && !drag_started_ &&
+            if ((drag_candidate_ || drag_select_candidate_) && !drag_started_ &&
                 (wparam & MK_LBUTTON) != 0) {
                 const POINT point{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
                 const int threshold_x = GetSystemMetrics(SM_CXDRAG);
                 const int threshold_y = GetSystemMetrics(SM_CYDRAG);
-                if (std::abs(point.x - drag_start_.x) >= threshold_x ||
-                    std::abs(point.y - drag_start_.y) >= threshold_y) {
+                const int delta_x = std::abs(point.x - drag_start_.x);
+                const int delta_y = std::abs(point.y - drag_start_.y);
+                if (delta_x >= threshold_x || delta_y >= threshold_y) {
+                    if (drag_select_candidate_) {
+                        drag_candidate_ = false;
+                        drag_select_candidate_ = false;
+                        collapse_selection_on_click_ = -1;
+                        begin_marquee_selection(
+                            drag_start_, drag_select_preserve_);
+                        update_marquee_selection(point);
+                        return 0;
+                    }
                     drag_started_ = true;
                     collapse_selection_on_click_ = -1;
                     if (GetCapture() == hwnd_) ReleaseCapture();
@@ -1299,6 +1462,10 @@ LRESULT DarkTableView::handle_message(UINT message, WPARAM wparam, LPARAM lparam
                 ScreenToClient(hwnd_, &point);
                 RECT client{};
                 GetClientRect(hwnd_, &client);
+                if (header_dragging_) {
+                    SetCursor(LoadCursorW(nullptr, IDC_SIZEALL));
+                    return TRUE;
+                }
                 if (resizing_column_ >= 0 || column_separator_at(point, client) >= 0) {
                     SetCursor(LoadCursorW(nullptr, IDC_SIZEWE));
                     return TRUE;
@@ -1306,20 +1473,42 @@ LRESULT DarkTableView::handle_message(UINT message, WPARAM wparam, LPARAM lparam
             }
             break;
         case WM_LBUTTONUP:
+            if (header_drag_candidate_ >= 0) {
+                const int source = header_drag_candidate_;
+                const int target = header_drag_target_;
+                const bool reordered =
+                    header_dragging_ && target >= 0 && target != source;
+                header_drag_candidate_ = -1;
+                header_drag_target_ = -1;
+                header_dragging_ = false;
+                if (GetCapture() == hwnd_) ReleaseCapture();
+                invalidate();
+                if (reordered) {
+                    SendMessageW(GetParent(hwnd_), kTableColumnReorderMessage,
+                                 static_cast<WPARAM>(source),
+                                 static_cast<LPARAM>(target));
+                } else {
+                    SendMessageW(GetParent(hwnd_), kTableSortMessage,
+                                 static_cast<WPARAM>(source), 0);
+                }
+                return 0;
+            }
             if (marquee_selecting_) {
                 update_marquee_selection(
                     POINT{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)});
                 end_marquee_selection();
                 return 0;
             }
-            if (drag_candidate_) {
+            if (drag_candidate_ || drag_select_candidate_) {
                 drag_candidate_ = false;
+                drag_select_candidate_ = false;
                 if (GetCapture() == hwnd_) ReleaseCapture();
                 if (!drag_started_ && collapse_selection_on_click_ >= 0) {
                     select_row(collapse_selection_on_click_, false, false);
                 }
                 collapse_selection_on_click_ = -1;
                 drag_started_ = false;
+                drag_select_preserve_ = false;
                 return 0;
             }
             if (resizing_column_ >= 0) {
@@ -1399,22 +1588,32 @@ LRESULT DarkTableView::handle_message(UINT message, WPARAM wparam, LPARAM lparam
                 ReleaseCapture();
             }
             resizing_column_ = -1;
+            header_drag_candidate_ = -1;
+            header_drag_target_ = -1;
+            header_dragging_ = false;
             dragging_scrollbar_ = false;
             dragging_horizontal_scrollbar_ = false;
             drag_candidate_ = false;
             drag_started_ = false;
             collapse_selection_on_click_ = -1;
+            drag_select_candidate_ = false;
+            drag_select_preserve_ = false;
             marquee_selecting_ = false;
             marquee_base_selection_.clear();
             invalidate();
             return 0;
         case WM_CAPTURECHANGED:
             resizing_column_ = -1;
+            header_drag_candidate_ = -1;
+            header_drag_target_ = -1;
+            header_dragging_ = false;
             dragging_scrollbar_ = false;
             dragging_horizontal_scrollbar_ = false;
             drag_candidate_ = false;
             drag_started_ = false;
             collapse_selection_on_click_ = -1;
+            drag_select_candidate_ = false;
+            drag_select_preserve_ = false;
             marquee_selecting_ = false;
             marquee_base_selection_.clear();
             invalidate();

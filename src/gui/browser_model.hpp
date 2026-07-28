@@ -38,6 +38,8 @@ struct BrowserItem {
     std::wstring name;
     std::wstring type;
     std::wstring modified;
+    std::wstring created;
+    std::wstring accessed;
     std::wstring attributes;
     std::uint64_t size = 0;
     std::optional<std::uint64_t> packed_size;

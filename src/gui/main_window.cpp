@@ -322,9 +322,9 @@ void MainWindow::on_create() {
 
     menu_bar_.create(
         hwnd_, instance_,
-        {{kMenuFile, L"&File"}, {kMenuCommands, L"&Commands"},
-         {kMenuTools, L"&Tools"}, {kMenuOptions, L"&Options"},
-         {kMenuHelp, L"&Help"}},
+        {{kMenuFile, L"&File"}, {kMenuEdit, L"&Edit"},
+         {kMenuArchive, L"&Archive"}, {kMenuView, L"&View"},
+         {kMenuTools, L"&Tools"}, {kMenuHelp, L"&Help"}},
         [this](UINT menu_id) { return menu_items(menu_id); },
         [this](UINT command) {
             SendMessageW(hwnd_, WM_COMMAND, MAKEWPARAM(command, 0), 0);
@@ -378,22 +378,7 @@ void MainWindow::on_create() {
 
     table_.create(hwnd_, instance_, kList);
     list_ = table_.hwnd();
-    std::vector<TableColumn> columns{
-        {L"Name", 300},
-        {L"Size", 105},
-        {L"Packed", 105},
-        {L"Type", 140},
-        {L"Modified", 150},
-        {L"CRC-32", 90},
-        {L"Attributes", 90},
-    };
-    if (persisted_settings_.column_widths.size() == columns.size()) {
-        for (std::size_t index = 0; index < columns.size(); ++index) {
-            columns[index].logical_width =
-                std::clamp(persisted_settings_.column_widths[index], 48, 2000);
-        }
-    }
-    table_.set_columns(std::move(columns));
+    apply_file_list_columns();
     apply_table_options();
     rebuild_directory_tree();
 
@@ -701,7 +686,62 @@ void MainWindow::apply_table_options() {
         application_options_.show_grid_lines,
         application_options_.show_horizontal_scrollbar,
         application_options_.full_row_select,
+        true,
+        true,
+        true,
     });
+}
+
+void MainWindow::capture_file_list_column_widths() {
+    auto columns = normalize_file_list_columns(
+        application_options_.file_list_columns);
+    const auto widths = table_.logical_column_widths();
+    for (std::size_t index = 0;
+         index < widths.size() && index < visible_file_columns_.size(); ++index) {
+        const auto id = visible_file_columns_[index];
+        const auto setting = std::find_if(
+            columns.begin(), columns.end(),
+            [id](const auto& column) { return column.id == id; });
+        if (setting != columns.end()) {
+            setting->width = std::clamp(widths[index], 48, 2000);
+        }
+    }
+    application_options_.file_list_columns = std::move(columns);
+}
+
+int MainWindow::visible_sort_column_index() const {
+    const auto id = static_cast<FileListColumnId>(sort_column_);
+    const auto found = std::find(
+        visible_file_columns_.begin(), visible_file_columns_.end(), id);
+    return found == visible_file_columns_.end()
+        ? -1
+        : static_cast<int>(std::distance(visible_file_columns_.begin(), found));
+}
+
+void MainWindow::apply_file_list_columns() {
+    application_options_.file_list_columns = normalize_file_list_columns(
+        application_options_.file_list_columns);
+    visible_file_columns_.clear();
+    std::vector<TableColumn> columns;
+    for (const auto& setting : application_options_.file_list_columns) {
+        if (!setting.visible) continue;
+        const auto* info = file_list_column_info(setting.id);
+        if (info == nullptr) continue;
+        visible_file_columns_.push_back(setting.id);
+        columns.push_back({info->title, std::clamp(setting.width, 48, 2000)});
+    }
+    if (visible_file_columns_.empty()) {
+        visible_file_columns_.push_back(FileListColumnId::name);
+        columns.push_back({L"Name", 300});
+    }
+    if (std::find(visible_file_columns_.begin(), visible_file_columns_.end(),
+                  static_cast<FileListColumnId>(sort_column_)) ==
+        visible_file_columns_.end()) {
+        sort_column_ = static_cast<int>(FileListColumnId::name);
+        sort_ascending_ = true;
+    }
+    table_.set_columns(std::move(columns));
+    table_.set_sort_indicator(visible_sort_column_index(), sort_ascending_);
 }
 
 LRESULT MainWindow::handle_message(UINT message, WPARAM wparam, LPARAM lparam) {
@@ -905,6 +945,7 @@ LRESULT MainWindow::handle_message(UINT message, WPARAM wparam, LPARAM lparam) {
                 case kVerifyArchiveSignature: on_verify_archive_signature(); return 0;
                 case kCreateSfx: on_create_sfx(); return 0;
                 case kBenchmark: on_benchmark(); return 0;
+                case kClearTempFiles: on_clear_temp_files(); return 0;
                 case kSettings: on_settings(); return 0;
                 case kSelectAll: on_select_all(); return 0;
                 case kAbout: on_about(); return 0;
@@ -960,6 +1001,10 @@ LRESULT MainWindow::handle_message(UINT message, WPARAM wparam, LPARAM lparam) {
             return 0;
         case kTableSortMessage:
             on_table_sort(static_cast<int>(wparam));
+            return 0;
+        case kTableColumnReorderMessage:
+            on_table_column_reorder(static_cast<int>(wparam),
+                                    static_cast<int>(lparam));
             return 0;
         case kTableBeginDragMessage:
             on_table_begin_drag();
@@ -1077,7 +1122,8 @@ int run_axiom_gui(HINSTANCE instance,
         return 1;
     }
 
-    if (const auto sfx_result = run_embedded_sfx(instance, initial_path)) {
+    if (const auto sfx_result =
+            axiom::sfx::run_embedded(instance, initial_path)) {
         OleUninitialize();
         return *sfx_result;
     }

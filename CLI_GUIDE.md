@@ -696,25 +696,27 @@ if ($LASTEXITCODE -ne 0) {
 ## Self-extracting archives
 
 ```text
-axiomc sfx <archive.axar> <output.exe> [stub.exe]
+axiomc sfx <archive.axar-or-zip> <output.exe> [compatible-stub]
 ```
 
-By default, Axiom uses `Axiom.exe` beside `axiomc.exe` as the extraction stub:
+By default, `axiomc` uses the dedicated `AxiomSfx.bin` module beside it. The
+module is not an executable and is loaded only while creating an SFX:
 
 ```powershell
 axiomc sfx release.axar release-setup.exe
 ```
 
-Supply a specific compatible stub if necessary:
+Supplying a specific compatible PE image remains available for development and
+compatibility testing:
 
 ```powershell
-axiomc sfx release.axar release-setup.exe "D:\Axiom\Axiom.exe"
+axiomc sfx release.axar release-setup.exe "D:\Build\compatible-sfx.bin"
 ```
 
-The output is one standalone Windows executable. It contains the native Axiom GUI
-stub, the intact `.axar` or `.zip` payload, and an Axiom SFX trailer; the source archive is
-not referenced when the resulting `.exe` runs. Use the GUI and CLI executables
-from the same build.
+The output is one standalone Windows executable. It contains Axiom's compact
+read-only extraction runtime, the intact `.axar` or `.zip` payload, and an Axiom
+SFX trailer. It does not contain the full file-manager GUI, and the source
+archive is not referenced when the resulting `.exe` runs.
 
 When opened, the self-extractor shows a native extraction dialog with:
 

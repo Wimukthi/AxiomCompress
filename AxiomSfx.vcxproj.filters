@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <ClCompile Include="src\sfx\main.cpp" />
+    <ClCompile Include="src\sfx\runtime.cpp" />
+    <ClCompile Include="src\gui\sfx_dialog.cpp" />
+    <ClCompile Include="src\gui\archive_feature_dialogs.cpp" />
+    <ClCompile Include="src\gui\operation_progress_window.cpp" />
+    <ClCompile Include="src\gui\dialog_support.cpp" />
+    <ClCompile Include="src\gui\message_dialog.cpp" />
+    <ClCompile Include="src\gui\toolbar_icons.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="src\sfx\runtime.hpp" />
+    <ClInclude Include="src\sfx\resource.hpp" />
+    <ClInclude Include="src\gui\sfx_dialog.hpp" />
+    <ClInclude Include="src\gui\archive_feature_dialogs.hpp" />
+    <ClInclude Include="src\gui\operation_progress_window.hpp" />
+    <ClInclude Include="src\gui\dialog_support.hpp" />
+    <ClInclude Include="src\gui\message_dialog.hpp" />
+    <ClInclude Include="src\gui\toolbar_icons.hpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <ResourceCompile Include="src\sfx\sfx_stub.rc" />
+  </ItemGroup>
+  <ItemGroup>
+    <Image Include="Icons\axiom.ico" />
+  </ItemGroup>
+</Project>

@@ -981,13 +981,14 @@ void show_filesystem_information_dialog(
         state.instance, &state);
     if (dialog == nullptr) return;
     apply_axiom_window_icons(dialog, state.instance);
-    restore_named_window_placement(dialog, owner, L"CompressionEstimateDialog");
+    const int show_command =
+        restore_named_window_placement(dialog, owner, L"CompressionEstimateDialog");
     // Older builds persisted a much shorter estimate window. Never let that
     // placement cover the result rows or action buttons after the dialog grows.
     enforce_minimum_dialog_size(state);
     state.owner_was_enabled = disable_dialog_owner(owner, dialog);
     start_metadata_scan(state);
-    ShowWindow(dialog, SW_SHOW);
+    ShowWindow(dialog, show_command);
     UpdateWindow(dialog);
 
     MSG message{};

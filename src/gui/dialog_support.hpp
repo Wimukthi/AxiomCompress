@@ -68,7 +68,10 @@ void restore_dialog_owner(HWND owner, bool was_enabled);
 bool message_targets_window(HWND window, const MSG& message);
 bool window_placement_is_visible(const WINDOWPLACEMENT& placement);
 POINT centered_window_position(HWND owner, int width, int height);
-void restore_named_window_placement(HWND window, HWND owner, std::wstring_view name);
+// Restores geometry without making the window visible. The returned SW_*
+// command preserves a saved maximized state and must be passed to ShowWindow
+// after the caller has finished theming and constructing the first frame.
+int restore_named_window_placement(HWND window, HWND owner, std::wstring_view name);
 void save_named_window_placement(std::wstring_view name, HWND window);
 std::wstring last_error_text(DWORD error = GetLastError());
 

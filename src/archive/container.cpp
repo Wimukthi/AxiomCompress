@@ -3924,20 +3924,19 @@ ArchiveSignatureInfo verify_archive_signature(
 }
 
 void create_sfx_archive(const std::filesystem::path& archive_path,
-                        const std::filesystem::path& stub_executable,
+                        std::span<const std::uint8_t> stub_image,
                         const std::filesystem::path& output_executable,
                         const std::shared_ptr<OperationControl>& operation,
                         std::size_t io_buffer_size) {
     const auto normalized_output = fs::absolute(output_executable).lexically_normal();
-    if (fs::absolute(archive_path).lexically_normal() == normalized_output ||
-        fs::absolute(stub_executable).lexically_normal() == normalized_output) {
-        throw std::invalid_argument("SFX output must differ from its archive and stub");
+    if (fs::absolute(archive_path).lexically_normal() == normalized_output) {
+        throw std::invalid_argument("SFX output must differ from its archive");
     }
+    if (stub_image.empty()) throw std::invalid_argument("SFX stub image is empty");
     std::error_code error;
-    const std::uint64_t stub_size = fs::file_size(stub_executable, error);
-    if (error) throw std::runtime_error("cannot read SFX stub: " + error.message());
     const std::uint64_t archive_size = fs::file_size(archive_path, error);
     if (error) throw std::runtime_error("cannot read SFX archive: " + error.message());
+    const std::uint64_t stub_size = stub_image.size();
 
     fs::path temporary = output_executable;
     temporary += ".tmp";
@@ -3948,6 +3947,20 @@ void create_sfx_archive(const std::filesystem::path& archive_path,
     std::uint64_t completed = 0;
     const std::uint64_t total = stub_size + archive_size;
     const std::size_t io_chunk = effective_io_buffer_size(io_buffer_size);
+    for (std::size_t offset = 0; offset < stub_image.size();) {
+        operation_checkpoint(operation);
+        const std::size_t count =
+            std::min(io_chunk, stub_image.size() - offset);
+        output.write(
+            reinterpret_cast<const char*>(stub_image.data() + offset),
+            static_cast<std::streamsize>(count));
+        if (!output) throw std::runtime_error("failed while writing SFX output");
+        offset += count;
+        completed += count;
+        report_operation(operation, OperationStage::writing, completed, total,
+                         0, 2, "embedded SFX module");
+    }
+
     auto copy = [&](const fs::path& path) {
         std::ifstream input(path, std::ios::binary);
         if (!input) {
@@ -3956,8 +3969,7 @@ void create_sfx_archive(const std::filesystem::path& archive_path,
         }
         std::vector<char> chunk(io_chunk);
         while (input) {
-    reject_volume_mutation(archive_path);
-    operation_checkpoint(operation);
+            operation_checkpoint(operation);
             input.read(chunk.data(), static_cast<std::streamsize>(chunk.size()));
             const auto count = input.gcount();
             if (count <= 0) break;
@@ -3968,7 +3980,6 @@ void create_sfx_archive(const std::filesystem::path& archive_path,
                              core::path_to_utf8(path.filename()));
         }
     };
-    copy(stub_executable);
     copy(archive_path);
     output.write(reinterpret_cast<const char*>(kSfxMagic.data()),
                  static_cast<std::streamsize>(kSfxMagic.size()));
@@ -3985,6 +3996,36 @@ void create_sfx_archive(const std::filesystem::path& archive_path,
         if (error) throw std::runtime_error("cannot install SFX output: " + error.message());
     }
     guard.dismiss();
+}
+
+void create_sfx_archive(const std::filesystem::path& archive_path,
+                        const std::filesystem::path& stub_executable,
+                        const std::filesystem::path& output_executable,
+                        const std::shared_ptr<OperationControl>& operation,
+                        std::size_t io_buffer_size) {
+    const auto normalized_output =
+        fs::absolute(output_executable).lexically_normal();
+    if (fs::absolute(stub_executable).lexically_normal() == normalized_output) {
+        throw std::invalid_argument("SFX output must differ from its stub");
+    }
+    std::error_code error;
+    const std::uint64_t stub_size = fs::file_size(stub_executable, error);
+    if (error) {
+        throw std::runtime_error("cannot read SFX stub: " + error.message());
+    }
+    if (stub_size > std::numeric_limits<std::size_t>::max()) {
+        throw std::runtime_error("SFX stub is too large");
+    }
+    std::ifstream input(stub_executable, std::ios::binary);
+    if (!input) throw std::runtime_error("cannot read SFX stub");
+    ByteVector stub(static_cast<std::size_t>(stub_size));
+    if (!stub.empty() &&
+        !input.read(reinterpret_cast<char*>(stub.data()),
+                    static_cast<std::streamsize>(stub.size()))) {
+        throw std::runtime_error("cannot read SFX stub");
+    }
+    create_sfx_archive(archive_path, std::span<const std::uint8_t>(stub),
+                       output_executable, operation, io_buffer_size);
 }
 
 std::optional<std::uint64_t> estimate_solid_entry_packed_size(

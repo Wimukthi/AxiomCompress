@@ -303,9 +303,17 @@ void create_zip_volumes(const std::filesystem::path& archive_path,
                         const std::shared_ptr<OperationControl>& operation = nullptr);
 
 // Create a Windows self-extracting executable by appending an intact archive and
-// an Axiom SFX trailer to a native Axiom GUI stub.
+// an Axiom SFX trailer to a compatible native PE stub.
 void create_sfx_archive(const std::filesystem::path& archive_path,
                         const std::filesystem::path& stub_executable,
+                        const std::filesystem::path& output_executable,
+                        const std::shared_ptr<OperationControl>& operation = nullptr,
+                        std::size_t io_buffer_size = 0);
+// Package an embedded PE stub without materializing a separate stub executable.
+// The resulting file is still a normal Windows executable followed by the
+// intact archive and the fixed Axiom SFX trailer.
+void create_sfx_archive(const std::filesystem::path& archive_path,
+                        std::span<const std::uint8_t> stub_image,
                         const std::filesystem::path& output_executable,
                         const std::shared_ptr<OperationControl>& operation = nullptr,
                         std::size_t io_buffer_size = 0);

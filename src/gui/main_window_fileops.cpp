@@ -360,9 +360,10 @@ bool show_command_input_dialog(HWND owner,
         return false;
     }
     apply_axiom_window_icons(dialog, instance);
-    restore_named_window_placement(dialog, owner, state.placement_name);
+    const int show_command =
+        restore_named_window_placement(dialog, owner, state.placement_name);
     const bool owner_was_enabled = disable_dialog_owner(owner, dialog);
-    ShowWindow(dialog, SW_SHOW);
+    ShowWindow(dialog, show_command);
     UpdateWindow(dialog);
     MSG message{};
     while (IsWindow(dialog)) {
@@ -568,6 +569,152 @@ void add_virtual_archive_item(
     item.is_directory = is_directory;
     items.push_back(std::move(item));
     materialized_archive_paths.push_back(std::move(archive_path));
+}
+
+struct TempCleanupResult {
+    std::uint64_t bytes_removed = 0;
+    std::uintmax_t entries_removed = 0;
+    std::size_t artifacts_removed = 0;
+    std::size_t artifacts_failed = 0;
+    std::size_t artifacts_in_use = 0;
+};
+
+bool is_axiom_temp_artifact_name(std::wstring_view name) {
+    static constexpr std::array<std::wstring_view, 4> prefixes{
+        L"AxiomDrag-",
+        L"AxiomSfx-",
+        L"AxiomSystemArchive-",
+        L"AxiomArchiveSelection-",
+    };
+    return std::any_of(
+        prefixes.begin(), prefixes.end(),
+        [name](std::wstring_view prefix) {
+            return name.size() >= prefix.size() &&
+                   name.substr(0, prefix.size()) == prefix;
+        });
+}
+
+bool same_temp_path(const fs::path& left, const fs::path& right) {
+    std::error_code error;
+    if (fs::equivalent(left, right, error)) return true;
+
+    error.clear();
+    fs::path normalized_left = fs::absolute(left, error);
+    if (error) normalized_left = left;
+    error.clear();
+    fs::path normalized_right = fs::absolute(right, error);
+    if (error) normalized_right = right;
+    normalized_left = normalized_left.lexically_normal();
+    normalized_right = normalized_right.lexically_normal();
+    return CompareStringOrdinal(normalized_left.c_str(), -1,
+                                normalized_right.c_str(), -1, TRUE) ==
+           CSTR_EQUAL;
+}
+
+bool is_protected_temp_artifact(
+    const fs::path& candidate,
+    const std::vector<fs::path>& protected_paths) {
+    return std::any_of(
+        protected_paths.begin(), protected_paths.end(),
+        [&candidate](const fs::path& protected_path) {
+            return same_temp_path(candidate, protected_path);
+        });
+}
+
+std::uint64_t temp_artifact_size(const fs::path& path) {
+    std::error_code status_error;
+    if (fs::is_regular_file(path, status_error)) {
+        const auto size = fs::file_size(path, status_error);
+        return status_error ? 0 : static_cast<std::uint64_t>(size);
+    }
+    if (status_error || !fs::is_directory(path, status_error)) return 0;
+
+    std::uint64_t total = 0;
+    std::error_code iterate_error;
+    for (fs::recursive_directory_iterator it(
+             path, fs::directory_options::skip_permission_denied,
+             iterate_error), end;
+         !iterate_error && it != end; it.increment(iterate_error)) {
+        std::error_code item_error;
+        if (!it->is_regular_file(item_error) || item_error) continue;
+        const auto size = it->file_size(item_error);
+        if (!item_error) total += static_cast<std::uint64_t>(size);
+    }
+    return total;
+}
+
+void wipe_temp_artifact_best_effort(const fs::path& path) {
+    std::error_code status_error;
+    if (fs::is_regular_file(path, status_error)) {
+        wipe_file_best_effort(path);
+        return;
+    }
+    if (status_error || !fs::is_directory(path, status_error)) return;
+    std::error_code iterate_error;
+    for (fs::recursive_directory_iterator it(
+             path, fs::directory_options::skip_permission_denied,
+             iterate_error), end;
+         !iterate_error && it != end; it.increment(iterate_error)) {
+        std::error_code item_error;
+        if (it->is_regular_file(item_error) && !item_error) {
+            wipe_file_best_effort(it->path());
+        }
+    }
+}
+
+TempCleanupResult cleanup_axiom_temp_artifacts(
+    const std::vector<fs::path>& roots,
+    const std::vector<fs::path>& protected_paths,
+    bool wipe_files) {
+    TempCleanupResult result;
+    std::vector<fs::path> visited_roots;
+    for (const fs::path& root : roots) {
+        if (root.empty()) continue;
+        const bool duplicate = std::any_of(
+            visited_roots.begin(), visited_roots.end(),
+            [&root](const fs::path& existing) {
+                return same_temp_path(root, existing);
+            });
+        if (duplicate) continue;
+        visited_roots.push_back(root);
+
+        std::error_code iterate_error;
+        for (fs::directory_iterator it(
+                 root, fs::directory_options::skip_permission_denied,
+                 iterate_error), end;
+             !iterate_error && it != end; it.increment(iterate_error)) {
+            const fs::path artifact = it->path();
+            if (!is_axiom_temp_artifact_name(
+                    artifact.filename().wstring())) {
+                continue;
+            }
+            if (is_protected_temp_artifact(
+                    artifact, protected_paths)) {
+                ++result.artifacts_in_use;
+                continue;
+            }
+
+            const std::uint64_t bytes = temp_artifact_size(artifact);
+            if (wipe_files) wipe_temp_artifact_best_effort(artifact);
+            std::error_code remove_error;
+            const std::uintmax_t removed =
+                fs::remove_all(artifact, remove_error);
+            if (remove_error) {
+                ++result.artifacts_failed;
+                continue;
+            }
+            if (removed != 0) {
+                ++result.artifacts_removed;
+                result.entries_removed += removed;
+                result.bytes_removed += bytes;
+            }
+        }
+        if (iterate_error &&
+            iterate_error != std::errc::no_such_file_or_directory) {
+            ++result.artifacts_failed;
+        }
+    }
+    return result;
 }
 
 }  // namespace
@@ -787,16 +934,110 @@ void MainWindow::cleanup_old_temp_directories() {
                                    iterate_error), end;
          !iterate_error && it != end; it.increment(iterate_error)) {
         const auto name = it->path().filename().wstring();
-        if (name.rfind(L"AxiomDrag-", 0) != 0 && name.rfind(L"AxiomSfx-", 0) != 0) {
-            continue;
-        }
+        if (!is_axiom_temp_artifact_name(name)) continue;
         std::error_code time_error;
         const auto modified = fs::last_write_time(it->path(), time_error);
         if (time_error) continue;
         if (days == 0 || now - modified >= max_age) {
-            remove_temp_directory(it->path(), application_options_.wipe_encrypted_temp_files);
+            if (application_options_.wipe_encrypted_temp_files) {
+                wipe_temp_artifact_best_effort(it->path());
+            }
+            std::error_code remove_error;
+            fs::remove_all(it->path(), remove_error);
         }
     }
+}
+
+void MainWindow::on_clear_temp_files() {
+    if (busy_) return;
+    if (show_app_message(
+            L"Delete temporary files and staging folders created by Axiom?\n\n"
+            L"Temporary items still in use by this Axiom session will be "
+            L"left intact.",
+            axiom::gui::MessageDialogIcon::question,
+            L"Delete temporary files",
+            axiom::gui::MessageDialogButtons::yes_no,
+            IDNO) != IDYES) {
+        return;
+    }
+
+    std::vector<fs::path> roots;
+    std::error_code system_temp_error;
+    const fs::path system_temp =
+        fs::temp_directory_path(system_temp_error);
+    if (!system_temp_error) roots.push_back(system_temp);
+    if (const auto local = known_folder_path(FOLDERID_LocalAppData)) {
+        roots.push_back(*local / L"AxiomCompress" / L"Temp");
+    }
+    try {
+        roots.push_back(configured_temp_base());
+    } catch (...) {
+        // The standard roots can still be cleaned when a custom path became
+        // unavailable after it was configured.
+    }
+
+    std::vector<fs::path> protected_paths;
+    protected_paths.reserve(temp_directories_.size());
+    for (const auto& temp : temp_directories_) {
+        protected_paths.push_back(temp.path);
+    }
+    const bool wipe_files =
+        application_options_.wipe_encrypted_temp_files;
+
+    set_busy(true);
+    begin_background_ui_task(
+        L"Deleting Axiom temporary files...",
+        [this, roots = std::move(roots),
+         protected_paths = std::move(protected_paths),
+         wipe_files]() mutable {
+            const TempCleanupResult result =
+                cleanup_axiom_temp_artifacts(
+                    roots, protected_paths, wipe_files);
+            return [this, result] {
+                set_busy(false);
+                std::wstring message;
+                if (result.artifacts_removed == 0 &&
+                    result.artifacts_failed == 0) {
+                    message = L"No removable Axiom temporary files were found.";
+                } else {
+                    message =
+                        std::to_wstring(result.artifacts_removed) +
+                        (result.artifacts_removed == 1
+                             ? L" temporary artifact removed"
+                             : L" temporary artifacts removed") +
+                        L" (" + format_size(result.bytes_removed) + L").";
+                    if (result.entries_removed > result.artifacts_removed) {
+                        message += L"\n" +
+                            std::to_wstring(result.entries_removed) +
+                            L" files and folders were deleted.";
+                    }
+                }
+                if (result.artifacts_in_use != 0) {
+                    message += L"\n\n" +
+                        std::to_wstring(result.artifacts_in_use) +
+                        (result.artifacts_in_use == 1
+                             ? L" active temporary item was left intact."
+                             : L" active temporary items were left intact.");
+                }
+                if (result.artifacts_failed != 0) {
+                    message += L"\n\n" +
+                        std::to_wstring(result.artifacts_failed) +
+                        (result.artifacts_failed == 1
+                             ? L" item could not be removed."
+                             : L" items could not be removed.");
+                }
+                set_status(
+                    result.artifacts_failed == 0
+                        ? L"Temporary-file cleanup completed."
+                        : L"Temporary-file cleanup completed with warnings.");
+                show_app_message(
+                    message,
+                    result.artifacts_failed == 0
+                        ? axiom::gui::MessageDialogIcon::information
+                        : axiom::gui::MessageDialogIcon::warning,
+                    L"Delete temporary files");
+            };
+        });
 }
 
 fs::path MainWindow::create_drag_staging_directory(bool sensitive) {
@@ -2439,7 +2680,6 @@ void MainWindow::on_compress() {
             }
         }
     }
-    const fs::path sfx_stub = current_executable_path();
     axiom::ArchiveSigningKey signing_key;
     if (sign_after) {
         std::ifstream key_file(pending_archive_features_.signing_key, std::ios::binary);
@@ -2492,7 +2732,7 @@ void MainWindow::on_compress() {
     start_operation(std::move(running), std::move(success),
                     [inputs, archive, options, mode, comment, set_comment,
                      repack_after, lock_after, sign_after, signing_key,
-                     create_sfx_after, sfx_output, sfx_stub, split_after,
+                     create_sfx_after, sfx_output, split_after,
                      volume_size = *volume_size, recovery_volumes](
                         std::shared_ptr<axiom::OperationControl> operation) mutable {
                         auto run_options = options;
@@ -2556,9 +2796,9 @@ void MainWindow::on_compress() {
                                 axiom::create_zip_volumes(archive, volume_size, operation);
                             }
                             if (create_sfx_after) {
-                                axiom::create_sfx_archive(archive, sfx_stub, sfx_output,
-                                                          operation,
-                                                          options.io_buffer_size);
+                                axiom::sfx::create_from_module_file(
+                                    GetModuleHandleW(nullptr), archive, sfx_output,
+                                    operation, options.io_buffer_size);
                                 std::error_code remove_error;
                                 if (!fs::remove(archive, remove_error) && remove_error) {
                                     std::error_code cleanup_error;
@@ -2598,15 +2838,15 @@ void MainWindow::on_create_sfx() {
                          axiom::gui::MessageDialogButtons::yes_no, IDYES) != IDYES) {
         return;
     }
-    const fs::path stub = current_executable_path();
     const std::size_t io_buffer_size = configured_io_buffer_size(application_options_);
     operation_archive_output_.clear();
     start_operation(L"Creating self-extracting archive...",
                     L"Self-extracting archive created: " + output.wstring(),
-                    [archive = *archive, stub, output, io_buffer_size](
+                    [archive = *archive, output, io_buffer_size](
                         std::shared_ptr<axiom::OperationControl> operation) {
-                        axiom::create_sfx_archive(archive, stub, output, operation,
-                                                  io_buffer_size);
+                        axiom::sfx::create_from_module_file(
+                            GetModuleHandleW(nullptr), archive, output, operation,
+                            io_buffer_size);
                     });
 }
 

@@ -39,14 +39,20 @@ When a parent component changes, reset the components to its right. Examples:
 
 ## Automatic Build Increment
 
-`AxiomGui.vcxproj` runs `tools\Update-AxiomVersion.ps1` before the app project
-builds. The script increments only the fourth component and updates all resource
-fields together:
+The internal `AxiomSfx.vcxproj` prerequisite runs
+`tools\Update-AxiomVersion.ps1` before the product executables build. Running
+the step in this shared prerequisite guarantees that the embedded module, GUI,
+and CLI all see the new version during the same build. The script increments
+only the fourth component and updates all resource fields together:
 
 - `FILEVERSION`.
 - `PRODUCTVERSION`.
 - `FileVersion`.
 - `ProductVersion`.
+
+It mirrors the resulting version into the CLI and internal SFX-module resources
+so generated self-extractors report the same product version. The SFX module is
+still only a build dependency and is not shipped as a separate executable.
 
 This intentionally modifies `src\gui\axiom_gui.rc`, so a successful local GUI
 build leaves a version change in the working tree.

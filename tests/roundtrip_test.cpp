@@ -2793,7 +2793,7 @@ void test_archive_authenticity_and_sfx() {
     AXIOM_CHECK(!axiom::verify_archive_signature(archive).present);
 
     // SFX packaging preserves both the stub and the exact archive, then appends
-    // the fixed trailer used by the native GUI self-extractor.
+    // the fixed trailer used by the native self-extractor.
     const auto stub = root / "stub.exe";
     const auto sfx = root / "package.exe";
     const auto stub_bytes = bytes_from_string("MZ fake test stub");
@@ -2807,6 +2807,18 @@ void test_archive_authenticity_and_sfx() {
                            packaged.begin() + static_cast<std::ptrdiff_t>(stub_bytes.size())));
     const std::string marker = "AXIOMSFX";
     AXIOM_CHECK(std::equal(marker.begin(), marker.end(), packaged.end() - 16));
+
+    // Product builds package the PE image directly from an embedded resource,
+    // without installing or materializing a separate stub executable.
+    const auto embedded_sfx = root / "embedded-package.exe";
+    axiom::create_sfx_archive(
+        archive, std::span<const std::uint8_t>(stub_bytes), embedded_sfx);
+    AXIOM_CHECK(read_all(embedded_sfx) == packaged);
+    expect_throws([&] {
+        axiom::create_sfx_archive(
+            archive, std::span<const std::uint8_t>{},
+            root / "empty-stub.exe");
+    });
 
     std::error_code error;
     fs::remove_all(root, error);

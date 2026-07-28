@@ -128,9 +128,10 @@ public:
                                   L"Axiom Self-Extractor", style,
                                   x, y, width, height, owner, nullptr, instance, this);
         if (window_ == nullptr) return false;
-        restore_named_window_placement(window_, owner, L"SfxExtractDialog");
+        const int show_command =
+            restore_named_window_placement(window_, owner, L"SfxExtractDialog");
         const bool owner_was_enabled = disable_dialog_owner(owner, window_);
-        ShowWindow(window_, SW_SHOW);
+        ShowWindow(window_, show_command);
         UpdateWindow(window_);
 
         MSG message{};

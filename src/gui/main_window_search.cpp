@@ -140,9 +140,10 @@ FileSearchDialogResult FileSearchDialog::show(HWND owner) {
     if (hwnd_ == nullptr) return result_;
 
     axiom::gui::apply_axiom_window_icons(hwnd_, instance_);
-    axiom::gui::restore_named_window_placement(hwnd_, owner, L"FileSearchDialog");
+    const int show_command = axiom::gui::restore_named_window_placement(
+        hwnd_, owner, L"FileSearchDialog");
     const bool owner_was_enabled = axiom::gui::disable_dialog_owner(owner, hwnd_);
-    ShowWindow(hwnd_, SW_SHOW);
+    ShowWindow(hwnd_, show_command);
     UpdateWindow(hwnd_);
 
     MSG message{};

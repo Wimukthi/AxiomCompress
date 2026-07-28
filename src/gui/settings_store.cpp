@@ -152,6 +152,41 @@ std::vector<std::wstring_view> split_profile_fields(const std::wstring& value) {
     return fields;
 }
 
+std::vector<FileListColumnSetting> read_file_list_columns(HKEY key) {
+    std::vector<FileListColumnSetting> columns;
+    for (const std::wstring& encoded : read_string_list(key, L"FileListColumns")) {
+        const auto fields = split_profile_fields(encoded);
+        if (fields.size() != 3) continue;
+        const auto id = parse_unsigned_profile_field(fields[0]);
+        const auto visible = parse_unsigned_profile_field(fields[1]);
+        const auto width = parse_unsigned_profile_field(fields[2]);
+        if (!id || !visible || !width ||
+            *id >= kFileListColumnCatalog.size() || *visible > 1) {
+            continue;
+        }
+        columns.push_back({
+            static_cast<FileListColumnId>(*id),
+            *visible != 0,
+            static_cast<int>(std::clamp<std::uint64_t>(*width, 48, 2000)),
+        });
+    }
+    return normalize_file_list_columns(columns);
+}
+
+void write_file_list_columns(
+    HKEY key, const std::vector<FileListColumnSetting>& configured_columns) {
+    const auto columns = normalize_file_list_columns(configured_columns);
+    std::vector<std::wstring> encoded;
+    encoded.reserve(columns.size());
+    for (const auto& column : columns) {
+        encoded.push_back(
+            std::to_wstring(static_cast<int>(column.id)) + L'\t' +
+            (column.visible ? L"1" : L"0") + L'\t' +
+            std::to_wstring(std::clamp(column.width, 48, 2000)));
+    }
+    write_string_list(key, L"FileListColumns", encoded);
+}
+
 std::vector<CompressionProfile> read_compression_profiles(HKEY key) {
     std::vector<CompressionProfile> profiles;
     for (const std::wstring& encoded : read_string_list(key, L"CompressionProfiles")) {
@@ -271,6 +306,20 @@ PersistedGuiSettings load_gui_settings() {
     settings.application.show_horizontal_scrollbar =
         read_bool(key, L"ShowHorizontalScrollbar", true);
     settings.application.full_row_select = read_bool(key, L"FullRowSelect", true);
+    if (registry_value_exists(key, L"FileListColumns")) {
+        settings.application.file_list_columns = read_file_list_columns(key);
+    } else {
+        // Upgrade the original fixed seven-column layout without discarding
+        // widths the user already adjusted in the main file list.
+        const auto legacy_widths = read_int_list(key, L"ColumnWidths");
+        settings.application.file_list_columns = default_file_list_columns();
+        for (std::size_t index = 0;
+             index < legacy_widths.size() &&
+             index < settings.application.file_list_columns.size() && index < 7;
+             ++index) {
+            settings.application.file_list_columns[index].width = legacy_widths[index];
+        }
+    }
     settings.application.recent_location_count =
         read_clamped_int(key, L"RecentLocationCount", 12, 0, 50);
     settings.application.show_address_shell_locations =
@@ -303,7 +352,7 @@ PersistedGuiSettings load_gui_settings() {
     settings.application.context_add = read_bool(key, L"ContextAdd", false);
     settings.application.context_extract = read_bool(key, L"ContextExtract", false);
     settings.application.context_test = read_bool(key, L"ContextTest", false);
-    settings.application.automatic_update_checks = read_bool(key, L"CheckForUpdates", false);
+    settings.application.automatic_update_checks = read_bool(key, L"CheckForUpdates", true);
     settings.application.update_channel = read_clamped_int(key, L"UpdateChannel", 0, 0, 1);
     settings.application.update_url = read_string(key, L"UpdateUrl");
     settings.application.worker_priority = read_clamped_int(key, L"WorkerPriority", 0, 0, 2);
@@ -321,7 +370,9 @@ PersistedGuiSettings load_gui_settings() {
     }
     settings.application.shortcut_overrides =
         shortcut_overrides_from_strings(read_string_list(key, L"ShortcutOverrides"));
-    settings.sort_column = static_cast<int>(std::clamp<DWORD>(read_dword(key, L"SortColumn", 0), 0, 6));
+    settings.sort_column = static_cast<int>(std::clamp<DWORD>(
+        read_dword(key, L"SortColumn", 0), 0,
+        static_cast<DWORD>(kFileListColumnCatalog.size() - 1)));
     settings.sort_ascending = read_dword(key, L"SortAscending", 1) != 0;
     settings.tree_width =
         read_clamped_int(key, L"TreeWidth", 0, 0, 2000);
@@ -417,6 +468,7 @@ void save_gui_settings(const PersistedGuiSettings& settings) {
     write_dword(key, L"ShowHorizontalScrollbar",
                 settings.application.show_horizontal_scrollbar ? 1 : 0);
     write_dword(key, L"FullRowSelect", settings.application.full_row_select ? 1 : 0);
+    write_file_list_columns(key, settings.application.file_list_columns);
     write_dword(key, L"RecentLocationCount",
                 static_cast<DWORD>(std::clamp(settings.application.recent_location_count, 0, 50)));
     write_dword(key, L"ShowAddressShellLocations",

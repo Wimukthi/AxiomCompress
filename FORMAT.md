@@ -438,10 +438,12 @@ What the format and the current implementation do and do not handle:
   digest covers exact header/preamble/block bytes and canonical directory semantics.
   `test` rejects an invalid signature and any edit removes the stale signature.
   This primitive is not wire-compatible with standard SHA-512 Ed25519.
-- **SFX packaging:** an intact `.axar` or `.zip` is appended to `Axiom.exe`, followed
-  by `"AXIOMSFX"` and a u64 payload length. The stub identifies the embedded provider,
-  verifies where supported, and extracts the payload. This wrapper does not change
-  either archive format.
+- **SFX packaging:** an intact `.axar` or `.zip` is appended to Axiom's dedicated
+  read-only SFX PE image, followed by `"AXIOMSFX"` and a u64 payload length. The
+  image is installed as the non-executable `AxiomSfx.bin` module and read only
+  during SFX creation. The generated extractor identifies the embedded provider,
+  verifies where supported, and extracts the payload. This wrapper does not
+  change either archive format.
 - **Recovery records:** optional Reed-Solomon parity protects the archive through
   the end of its central directory and supports atomic repair.
 - **Split/recovery volumes:** exact archive bytes can be divided into checked data

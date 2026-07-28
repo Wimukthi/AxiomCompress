@@ -124,7 +124,8 @@ if ($IncrementBuild) {
     [System.IO.File]::WriteAllText($resolvedResourceFile, $updated, $utf8NoBom)
 
     $mirrorResourceFiles = @(
-        (Join-Path $PSScriptRoot "..\src\cli\axiom_cli.rc")
+        (Join-Path $PSScriptRoot "..\src\cli\axiom_cli.rc"),
+        (Join-Path $PSScriptRoot "..\src\sfx\sfx_stub.rc")
     )
     foreach ($mirrorResourceFile in $mirrorResourceFiles) {
         if (-not (Test-Path -LiteralPath $mirrorResourceFile)) {

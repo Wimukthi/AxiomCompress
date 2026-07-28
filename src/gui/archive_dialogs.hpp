@@ -18,6 +18,101 @@
 
 namespace axiom::gui {
 
+enum class FileListColumnId : int {
+    name = 0,
+    size = 1,
+    packed = 2,
+    type = 3,
+    modified = 4,
+    crc32 = 5,
+    attributes = 6,
+    ratio = 7,
+    extension = 8,
+    created = 9,
+    accessed = 10,
+    path = 11,
+};
+
+struct FileListColumnInfo {
+    FileListColumnId id;
+    const wchar_t* title;
+    int default_width;
+    bool default_visible;
+};
+
+inline constexpr std::array<FileListColumnInfo, 12> kFileListColumnCatalog{{
+    {FileListColumnId::name, L"Name", 300, true},
+    {FileListColumnId::size, L"Size", 105, true},
+    {FileListColumnId::packed, L"Packed", 105, true},
+    {FileListColumnId::type, L"Type", 140, true},
+    {FileListColumnId::modified, L"Modified", 150, true},
+    {FileListColumnId::crc32, L"CRC-32", 90, true},
+    {FileListColumnId::attributes, L"Attributes", 90, true},
+    {FileListColumnId::ratio, L"Ratio", 85, false},
+    {FileListColumnId::extension, L"Extension", 100, false},
+    {FileListColumnId::created, L"Created", 150, false},
+    {FileListColumnId::accessed, L"Accessed", 150, false},
+    {FileListColumnId::path, L"Path", 320, false},
+}};
+
+struct FileListColumnSetting {
+    FileListColumnId id = FileListColumnId::name;
+    bool visible = true;
+    int width = 100;
+
+    bool operator==(const FileListColumnSetting&) const = default;
+};
+
+inline const FileListColumnInfo* file_list_column_info(FileListColumnId id) {
+    const auto found = std::find_if(
+        kFileListColumnCatalog.begin(), kFileListColumnCatalog.end(),
+        [id](const FileListColumnInfo& info) { return info.id == id; });
+    return found == kFileListColumnCatalog.end() ? nullptr : &*found;
+}
+
+inline std::vector<FileListColumnSetting> default_file_list_columns() {
+    std::vector<FileListColumnSetting> result;
+    result.reserve(kFileListColumnCatalog.size());
+    for (const auto& info : kFileListColumnCatalog) {
+        result.push_back({info.id, info.default_visible, info.default_width});
+    }
+    return result;
+}
+
+inline std::vector<FileListColumnSetting> normalize_file_list_columns(
+    const std::vector<FileListColumnSetting>& columns) {
+    std::vector<FileListColumnSetting> result;
+    result.reserve(kFileListColumnCatalog.size());
+    for (const auto& column : columns) {
+        if (file_list_column_info(column.id) == nullptr ||
+            std::any_of(result.begin(), result.end(), [&](const auto& existing) {
+                return existing.id == column.id;
+            })) {
+            continue;
+        }
+        result.push_back({
+            column.id,
+            column.visible,
+            std::clamp(column.width, 48, 2000),
+        });
+    }
+    for (const auto& info : kFileListColumnCatalog) {
+        if (std::none_of(result.begin(), result.end(), [&](const auto& existing) {
+                return existing.id == info.id;
+            })) {
+            result.push_back({info.id, info.default_visible, info.default_width});
+        }
+    }
+    const auto name = std::find_if(result.begin(), result.end(), [](const auto& column) {
+        return column.id == FileListColumnId::name;
+    });
+    if (name != result.end()) {
+        name->visible = true;
+        std::rotate(result.begin(), name, name + 1);
+    }
+    return result;
+}
+
 struct ToolbarCommandInfo {
     const wchar_t* id;
     const wchar_t* label;
@@ -26,19 +121,18 @@ struct ToolbarCommandInfo {
     bool default_visible;
 };
 
-inline constexpr std::array<ToolbarCommandInfo, 34> kToolbarCommandCatalog{{
+inline constexpr std::array<ToolbarCommandInfo, 33> kToolbarCommandCatalog{{
     {L"commands.add", L"Add to archive", L"Add", ToolbarIcon::archive, true},
     {L"commands.extract", L"Extract", L"Extract", ToolbarIcon::extract, true},
     {L"commands.test", L"Test archive", L"Test", ToolbarIcon::test, true},
     {L"commands.view", L"View/open selection", L"View", ToolbarIcon::view, true},
     {L"commands.delete", L"Delete selection", L"Delete", ToolbarIcon::delete_item, true},
-    {L"tools.info", L"Archive information", L"Info", ToolbarIcon::info, true},
+    {L"tools.info", L"Information", L"Info", ToolbarIcon::info, true},
     {L"file.open_archive", L"Open archive", L"Open archive", ToolbarIcon::open, true},
     {L"options.settings", L"Settings", L"Settings", ToolbarIcon::settings, true},
     {L"commands.update", L"Update archive", L"Update", ToolbarIcon::update_archive, false},
     {L"commands.freshen", L"Freshen archive", L"Freshen", ToolbarIcon::freshen_archive, false},
     {L"commands.synchronize", L"Synchronize archive", L"Sync", ToolbarIcon::synchronize_archive, false},
-    {L"commands.delete_archive_entries", L"Delete archive entries", L"Remove", ToolbarIcon::delete_item, false},
     {L"commands.repack", L"Repack archive", L"Repack", ToolbarIcon::repack, false},
     {L"commands.split", L"Split archive into volumes", L"Split", ToolbarIcon::split, false},
     {L"commands.join", L"Join archive volumes", L"Join", ToolbarIcon::join, false},
@@ -174,6 +268,8 @@ struct ApplicationDialogOptions {
     bool show_grid_lines = true;
     bool show_horizontal_scrollbar = true;
     bool full_row_select = true;
+    std::vector<FileListColumnSetting> file_list_columns =
+        default_file_list_columns();
     int recent_location_count = 12;
     bool show_address_shell_locations = true;
     bool show_address_recent_locations = true;
@@ -199,7 +295,8 @@ struct ApplicationDialogOptions {
     bool context_add = false;
     bool context_extract = false;
     bool context_test = false;
-    bool automatic_update_checks = false;
+    // Enabled by default. Startup checks are silent, asynchronous, and throttled.
+    bool automatic_update_checks = true;
     int update_channel = 0;  // 0 = stable/custom URL, 1 = preview/custom URL.
     std::wstring update_url;
     int worker_priority = 0;  // 0 = normal, 1 = below normal, 2 = background.

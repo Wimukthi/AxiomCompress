@@ -23,6 +23,7 @@ Use this document when you need to know where a feature belongs:
 | `src/gui/main_window_*.cpp` | The other main-window method groups: browser/tree wiring, address bar, theming, dark-drawn views, find dialog, commands, file operations, helpers, quick-add/SFX startup |
 | `src/gui/main_window_internal.hpp` | Declarations shared between the main-window translation units |
 | `src/gui/dialog_support.cpp` | Axiom dialog palette/drawing plus the adapter to the shared `Wimukthi.Win32Theme` Windows integration |
+| `src/sfx` | Dedicated read-only AXAR/ZIP self-extractor runtime and lazy module-file packager |
 | `tests` | Round-trip, safety, and regression tests |
 
 The important design rule is simple: compression may spend more CPU to find a
@@ -192,8 +193,10 @@ The detailed format support roadmap lives in
 Archive-level services include:
 
 - signatures over exact stored block bytes and canonical directory semantics;
-- SFX output by appending an intact AXAR or ZIP archive plus a fixed trailer to the native GUI
-  stub;
+- SFX output by appending an intact AXAR or ZIP archive plus a fixed trailer to
+  a dedicated read-only native module. The module is installed as
+  `AxiomSfx.bin`, is never exposed as a separate executable, and is read only
+  when the user creates an SFX;
 - POSIX mode/uid/gid metadata through a skippable entry TLV;
 - recovery records backed by the portable Reed-Solomon core;
 - numbered data volumes and optional `.revNNN` recovery volumes.

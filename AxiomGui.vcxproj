@@ -118,6 +118,8 @@
     <ClCompile Include="src\gui\message_dialog.cpp" />
     <ClCompile Include="src\gui\about_dialog.cpp" />
     <ClCompile Include="src\gui\update_checker.cpp" />
+    <ClCompile Include="src\sfx\runtime.cpp" />
+    <ClCompile Include="src\sfx\module_file.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="src\gui\browser_model.hpp" />
@@ -142,6 +144,9 @@
     <ClInclude Include="src\gui\about_dialog.hpp" />
     <ClInclude Include="src\gui\update_checker.hpp" />
     <ClInclude Include="src\gui\resource.hpp" />
+    <ClInclude Include="src\sfx\runtime.hpp" />
+    <ClInclude Include="src\sfx\module_file.hpp" />
+    <ClInclude Include="src\sfx\resource.hpp" />
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="src\gui\axiom_gui.rc" />
@@ -163,13 +168,14 @@
     <ProjectReference Include="AxiomLib.vcxproj">
       <Project>{A16F0B4E-82B2-43BB-A779-0E9563F8EC11}</Project>
     </ProjectReference>
+    <ProjectReference Include="AxiomSfx.vcxproj">
+      <Project>{9D28131A-22D1-4D07-9865-C6E975454A61}</Project>
+      <LinkLibraryDependencies>false</LinkLibraryDependencies>
+    </ProjectReference>
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <Target Name="ValidateWimukthiWin32Theme" BeforeTargets="PrepareForBuild" Condition="!Exists('$(WimukthiWin32ThemeRoot)\Wimukthi.Win32Theme.props')">
     <Error Text="Wimukthi.Win32Theme was not found at '$(WimukthiWin32ThemeRoot)'. Clone it beside AxiomCompress or set WimukthiWin32ThemeRoot." />
-  </Target>
-  <Target Name="IncrementAxiomVersion" BeforeTargets="PrepareForBuild" Condition="'$(AutoIncrementVersion)' == 'true' and '$(DesignTimeBuild)' != 'true'">
-    <Exec Command="powershell.exe -NoProfile -ExecutionPolicy Bypass -File &quot;$(MSBuildProjectDirectory)\tools\Update-AxiomVersion.ps1&quot; -ResourceFile &quot;$(MSBuildProjectDirectory)\src\gui\axiom_gui.rc&quot; -IncrementBuild" />
   </Target>
   <ImportGroup Label="ExtensionTargets" />
 </Project>

@@ -139,6 +139,7 @@ $solution = Join-Path $script:RepoRoot "AxiomCompress.sln"
 $testExe = Join-Path $script:RepoRoot "out\$Configuration\axiom_roundtrip.exe"
 $appExe = Join-Path $script:RepoRoot "out\$Configuration\Axiom.exe"
 $cliExe = Join-Path $script:RepoRoot "out\$Configuration\axiomc.exe"
+$sfxModule = Join-Path $script:RepoRoot "out\$Configuration\AxiomSfx.bin"
 $issFile = Join-Path $script:RepoRoot "installer\Axiom.iss"
 $msbuild = Find-MSBuild
 $iscc = Find-InnoCompiler
@@ -169,6 +170,10 @@ if (-not (Test-Path -LiteralPath $appExe)) {
 
 if (-not (Test-Path -LiteralPath $cliExe)) {
     throw "CLI binary was not found: $cliExe"
+}
+
+if (-not (Test-Path -LiteralPath $sfxModule)) {
+    throw "SFX module was not found: $sfxModule"
 }
 
 $resourceVersion = Get-ResourceVersion
