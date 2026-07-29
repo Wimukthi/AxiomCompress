@@ -4948,10 +4948,15 @@ private:
             create_page_ == 0 && content_width >= scale(890);
         int compression_content_width = content_width;
         if (show_compression_preview) {
-            const int preview_width = std::clamp(
-                content_width * 36 / 100, scale(320), scale(420));
-            compression_content_width =
-                content_width - preview_width - preview_gap;
+            // Keep the settings form only as wide as its controls need. The
+            // prognosis chart benefits from horizontal room, while stretching
+            // short combo-box values leaves a visually empty middle column.
+            constexpr int kCompressionFormWidth = 548;
+            compression_content_width = std::min(
+                scale(kCompressionFormWidth),
+                content_width - preview_gap - scale(320));
+            const int preview_width =
+                content_width - compression_content_width - preview_gap;
             MoveWindow(
                 compression_preview_,
                 content_left + compression_content_width + preview_gap,
@@ -4988,7 +4993,7 @@ private:
                 MoveWindow(compression_profile_label_, content_left, y + scale(6),
                            label_width, row, TRUE);
                 {
-                    const int action_width = scale(72);
+                    const int action_width = scale(58);
                     const int action_gap = scale(8);
                     const int combo_width = std::max(
                         scale(180), compression_content_width - label_width -
@@ -5007,7 +5012,7 @@ private:
                     const auto compression_row = [&](
                                                      HWND label_window,
                                                      HWND value,
-                                                     int value_width = 310) {
+                                                     int value_width = 260) {
                         MoveWindow(
                             label_window, content_left, y + scale(6),
                             label_width, row, TRUE);
