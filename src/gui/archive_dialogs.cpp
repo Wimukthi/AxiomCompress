@@ -195,29 +195,28 @@ constexpr std::array<const wchar_t*, 2> kLzmaMatchFinderNames{
 
 const std::array<CompressionProfile, 5>& built_in_compression_profiles() {
     static const std::array<CompressionProfile, 5> profiles{{
-        // Repetitive UTF text and source benefit from long matches and the
-        // largest practical window. Swarm keeps the expensive level-9 parse
-        // scalable without splitting the 64 MiB context.
+        // Type presets are practical defaults, not maximum-ratio modes. Text
+        // still benefits from the tree matcher and a moderate window without
+        // paying for the level-9 optimal parse.
         {L"Text, logs and source code (built-in)",
-         9, 0, 64u << 20, 273, 64u << 20, 1},
+         7, 0, 16u << 20, 192, 16u << 20, 0},
         // Executable filtering is selected per file by the archive writer;
-        // level 8 gives the filtered byte stream a strong tree/DP parse without
-        // level 9's maximum search cost.
+        // a larger tree window preserves repeated code and library records,
+        // while level 7 avoids the much slower optimal-parser pass.
         {L"Executables and libraries (built-in)",
-         8, 0, 32u << 20, 192, 32u << 20, 1},
-        // Tables, database pages, CSV and numeric arrays often repeat across
-        // distant records, so retain the large level-9 dictionary while using
-        // a shorter early-stop length for record-sized matches.
+         7, 0, 32u << 20, 128, 32u << 20, 0},
+        // Tables, database pages, CSV, and numeric arrays retain enough context
+        // for repeated records, but stop at the level-7 tree Pareto point.
         {L"Databases and structured data (built-in)",
-         9, 0, 64u << 20, 192, 64u << 20, 1},
+         7, 0, 16u << 20, 128, 16u << 20, 0},
         // Most media payloads are already entropy-coded. Keep probes and blocks
         // small so incompressible data is recognized and stored quickly.
         {L"Photos, audio and video (built-in)",
          1, 0, 64u << 10, 32, 1u << 20, 0},
-        // A moderate window and independent blocks are a safer default for a
-        // heterogeneous folder where no single content model dominates.
+        // Heterogeneous folders favor the balanced hash parser: it is much
+        // faster than level 6 here for only a marginal size difference.
         {L"Mixed files and folders (built-in)",
-         6, 0, 8u << 20, 192, 16u << 20, 0},
+         5, 0, 8u << 20, 128, 16u << 20, 0},
     }};
     return profiles;
 }

@@ -242,8 +242,12 @@ These choices can be saved in compression profiles and as the application
 default.
 
 The five built-in profiles target text/source, executables, structured data,
-already-compressed media, and mixed folders. User profiles also preserve the
-selected method, native codec level, LZMA2 match finder, dictionary/word size,
+already-compressed media, and mixed folders. They are tuned as practical
+file-type defaults: tree-matched level 7 for text, structured data, and
+binaries; fast level 1 rejection for pre-compressed media; and balanced level
+5 for mixed folders. Maximum-ratio levels 8–9 remain explicit choices rather
+than being hidden inside a profile. User profiles also preserve the selected
+method, native codec level, LZMA2 match finder, dictionary/word size,
 solid-block size, thread count, and threading model.
 
 For AXAR and ZIP, the right side of the Compression tab shows a live
