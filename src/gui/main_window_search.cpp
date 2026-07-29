@@ -251,6 +251,20 @@ void FileSearchDialog::set_checkbox(int id, bool checked) {
 }
 
 void FileSearchDialog::toggle_checkbox(int id) {
+    if ((id == kIncludeFiles || id == kIncludeFolders ||
+         id == kIncludeArchives) &&
+        checkbox_checked(id)) {
+        const int enabled_types =
+            static_cast<int>(include_files_checked_) +
+            static_cast<int>(include_folders_checked_) +
+            static_cast<int>(include_archives_checked_);
+        if (enabled_types == 1) {
+            MessageBeep(MB_ICONINFORMATION);
+            set_text(result_count_,
+                     L"At least one result type must remain selected.");
+            return;
+        }
+    }
     set_checkbox(id, !checkbox_checked(id));
     if (search_started_) run_search();
 }
@@ -298,6 +312,14 @@ bool FileSearchDialog::text_matches(const FileSearchSourceItem& item, std::wstri
 }
 
 void FileSearchDialog::run_search() {
+    if (!include_files_checked_ && !include_folders_checked_ &&
+        !include_archives_checked_) {
+        MessageBeep(MB_ICONINFORMATION);
+        set_text(result_count_,
+                 L"Select at least one result type before searching.");
+        EnableWindow(go_to_button_, FALSE);
+        return;
+    }
     search_started_ = true;
     search_thread_.request_stop();
     if (search_thread_.joinable()) search_thread_.join();

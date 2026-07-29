@@ -87,8 +87,9 @@ Recommended contents:
 - `FORMAT.md`.
 - `LICENSE`.
 - `THIRD_PARTY_NOTICES.md`.
-- `licenses\`, including the Wimukthi.Win32Theme and Darkmodelib licenses and
-  complete corresponding Darkmodelib source.
+- `licenses\`, including Zstandard's BSD license, the LZMA SDK public-domain
+  notice, the Wimukthi.Win32Theme and Darkmodelib licenses, and complete
+  corresponding Darkmodelib source.
 - `docs\`.
 
 `AxiomSfx.bin` must remain beside `Axiom.exe` and `axiomc.exe`. It is read only
@@ -110,8 +111,9 @@ The installer writes:
 - `FORMAT.md`.
 - `LICENSE`.
 - `THIRD_PARTY_NOTICES.md`.
-- `licenses\`, including the Wimukthi.Win32Theme and Darkmodelib licenses and
-  complete corresponding Darkmodelib source.
+- `licenses\`, including Zstandard's BSD license, the LZMA SDK public-domain
+  notice, the Wimukthi.Win32Theme and Darkmodelib licenses, and complete
+  corresponding Darkmodelib source.
 - `docs\`.
 
 It also creates a Start Menu shortcut, offers an optional desktop shortcut, and

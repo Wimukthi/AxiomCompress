@@ -362,7 +362,34 @@ struct CompressionTransformRange {
     std::uint8_t parameter = 0;  // Delta byte stride; zero for x86 branch filtering.
 };
 
+// Compression method used inside each AXC solid-block stream. The AXAR
+// container remains codec-agnostic: encryption, recovery data, signatures,
+// volumes, and directory metadata wrap the completed AXC bytes unchanged.
+enum class CompressionMethod : std::uint8_t {
+    axiom = 0,
+    zstandard = 1,
+    lzma2 = 2,
+    deflate = 3,
+    store = 4,
+};
+
+inline constexpr int kAutomaticCodecLevel = -100;
+
 struct CompressionOptions {
+    CompressionMethod method = CompressionMethod::axiom;
+    // User-facing effort level. Axiom accepts 1..9; external methods map the
+    // same portable 1..9 scale to their native level unless codec_level is set.
+    int level = 5;
+    // Native method level, or kAutomaticCodecLevel to derive it from level. Valid explicit
+    // ranges: Zstandard -5..22, LZMA2 0..9, Deflate 0..9.
+    int codec_level = kAutomaticCodecLevel;
+    // LZMA2-specific match finder. true = BT4 (ratio), false = HC4 (speed).
+    bool lzma_binary_tree = true;
+    // LZMA2-specific dictionary and fast-bytes settings. Zero lets the codec
+    // derive its normal value from codec_level. The AXC external-codec envelope
+    // bounds the effective dictionary to its independently decoded solid chunk.
+    std::size_t lzma_dictionary_size = 0;
+    std::size_t lzma_fast_bytes = 0;
     std::size_t window_size = 1u << 20;
     std::size_t max_match = 273;
     // Balanced default (CLI level 5): a moderate chain plus lazy matching reaches
@@ -479,6 +506,7 @@ inline void apply_compression_level(CompressionOptions& options, int level) {
     } else if (level > 9) {
         level = 9;
     }
+    options.level = level;
 
     options.use_tree_matcher = false;
     options.use_fast_lz = false;

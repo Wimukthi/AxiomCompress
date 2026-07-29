@@ -11,7 +11,9 @@
 #include <dwmapi.h>
 #include <gdiplus.h>
 #include <new>
+#include <optional>
 #include <string>
+#include <system_error>
 #include <wimukthi/win32_theme.hpp>
 
 namespace axiom::gui {
@@ -133,6 +135,79 @@ bool input_character_allowed(DialogInputFilter filter, wchar_t character) {
             return character == L'#' || std::iswxdigit(character);
     }
     return false;
+}
+
+bool reserved_windows_filename(std::wstring_view filename) {
+    std::wstring stem(filename.substr(0, filename.find(L'.')));
+    while (!stem.empty() && (stem.back() == L' ' || stem.back() == L'.')) {
+        stem.pop_back();
+    }
+    std::transform(stem.begin(), stem.end(), stem.begin(), [](wchar_t ch) {
+        return static_cast<wchar_t>(std::towupper(ch));
+    });
+    if (stem == L"CON" || stem == L"PRN" || stem == L"AUX" ||
+        stem == L"NUL") {
+        return true;
+    }
+    if (stem.size() == 4 &&
+        (stem.rfind(L"COM", 0) == 0 || stem.rfind(L"LPT", 0) == 0) &&
+        stem[3] >= L'1' && stem[3] <= L'9') {
+        return true;
+    }
+    return false;
+}
+
+std::optional<std::wstring> invalid_windows_path_message(
+    const std::filesystem::path& path) {
+    const std::wstring raw = path.wstring();
+    // Extended paths deliberately opt into Win32's verbatim rules. Let the
+    // filesystem operation validate those rather than rejecting the prefix's
+    // question mark here.
+    if (raw.rfind(LR"(\\?\)", 0) == 0) return std::nullopt;
+
+    for (const auto& component_path : path.relative_path()) {
+        const std::wstring component = component_path.wstring();
+        if (component.empty() || component == L"." || component == L"..") {
+            continue;
+        }
+        if (component.back() == L' ' || component.back() == L'.') {
+            return L"Path components cannot end with a space or period.";
+        }
+        for (wchar_t ch : component) {
+            if (ch < L' ' || wcschr(L"<>:\"/\\|?*", ch) != nullptr) {
+                return L"The path contains a character Windows does not allow in a file or folder name.";
+            }
+        }
+        if (reserved_windows_filename(component)) {
+            return L"The path uses a reserved Windows device name such as CON, NUL, COM1, or LPT1.";
+        }
+    }
+    return std::nullopt;
+}
+
+std::filesystem::path nearest_existing_ancestor(
+    std::filesystem::path path, std::error_code& error) {
+    error.clear();
+    const bool relative = path.is_relative();
+    if (path.empty()) path = std::filesystem::current_path(error);
+    while (!path.empty()) {
+        if (std::filesystem::exists(path, error)) return error ? std::filesystem::path{} : path;
+        if (error && error != std::errc::no_such_file_or_directory) {
+            return {};
+        }
+        error.clear();
+        const auto parent = path.parent_path();
+        if (parent.empty() || parent == path) break;
+        path = parent;
+    }
+    if (relative) {
+        error.clear();
+        const auto current = std::filesystem::current_path(error);
+        if (!error && std::filesystem::is_directory(current, error) && !error) {
+            return current;
+        }
+    }
+    return {};
 }
 
 bool clipboard_matches_input_filter(HWND window, DialogInputFilter filter) {
@@ -1052,6 +1127,97 @@ void apply_dialog_input_filter(HWND control, DialogInputFilter filter,
     }
     SetWindowSubclass(edit, typed_input_subclass_proc, kTypedInputSubclass,
                       static_cast<DWORD_PTR>(filter));
+}
+
+std::wstring trim_dialog_input(std::wstring text) {
+    const auto first = std::find_if_not(text.begin(), text.end(), [](wchar_t ch) {
+        return std::iswspace(ch) != 0;
+    });
+    const auto last = std::find_if_not(text.rbegin(), text.rend(), [](wchar_t ch) {
+        return std::iswspace(ch) != 0;
+    }).base();
+    if (first >= last) return {};
+    return std::wstring(first, last);
+}
+
+DialogPathValidation validate_dialog_path(
+    std::wstring text, DialogPathKind kind) {
+    text = trim_dialog_input(std::move(text));
+    if (text.empty()) {
+        return {{}, L"Enter a path."};
+    }
+
+    std::filesystem::path path(text);
+    if (const auto invalid = invalid_windows_path_message(path)) {
+        return {std::move(path), *invalid};
+    }
+
+    std::error_code error;
+    const bool exists = std::filesystem::exists(path, error);
+    if (error && error != std::errc::no_such_file_or_directory) {
+        return {std::move(path),
+                L"Windows could not inspect this path. Check that the location is accessible."};
+    }
+    error.clear();
+
+    if (kind == DialogPathKind::existing_file) {
+        if (!exists || !std::filesystem::is_regular_file(path, error) || error) {
+            return {std::move(path), L"Choose an existing file."};
+        }
+        return {std::move(path), {}};
+    }
+    if (kind == DialogPathKind::existing_folder) {
+        if (!exists || !std::filesystem::is_directory(path, error) || error) {
+            return {std::move(path), L"Choose an existing folder."};
+        }
+        return {std::move(path), {}};
+    }
+
+    if (kind == DialogPathKind::output_file) {
+        if (path.filename().empty()) {
+            return {std::move(path),
+                    L"Enter a file name as well as a destination folder."};
+        }
+        if (exists && std::filesystem::is_directory(path, error)) {
+            return {std::move(path),
+                    L"The output path names an existing folder, not a file."};
+        }
+        if (error) {
+            return {std::move(path), L"Windows could not inspect the output path."};
+        }
+        if (exists) {
+            const DWORD attributes = GetFileAttributesW(path.c_str());
+            if (attributes != INVALID_FILE_ATTRIBUTES &&
+                (attributes & FILE_ATTRIBUTE_READONLY) != 0) {
+                return {std::move(path),
+                        L"The existing output file is read-only."};
+            }
+        }
+        std::filesystem::path parent = path.parent_path();
+        if (parent.empty()) parent = std::filesystem::current_path(error);
+        if (error || parent.empty() ||
+            !std::filesystem::is_directory(parent, error) || error) {
+            return {std::move(path),
+                    L"The output file's parent folder does not exist or cannot be accessed."};
+        }
+        return {std::move(path), {}};
+    }
+
+    if (exists) {
+        if (!std::filesystem::is_directory(path, error) || error) {
+            return {std::move(path),
+                    L"The destination path names a file, not a folder."};
+        }
+        return {std::move(path), {}};
+    }
+
+    const auto ancestor = nearest_existing_ancestor(path, error);
+    if (error || ancestor.empty() ||
+        !std::filesystem::is_directory(ancestor, error) || error) {
+        return {std::move(path),
+                L"No accessible parent folder exists for this destination."};
+    }
+    return {std::move(path), {}};
 }
 
 void draw_dialog_button(const DRAWITEMSTRUCT& draw, bool dark) {

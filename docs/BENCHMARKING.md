@@ -260,6 +260,22 @@ The GUI benchmark is available from:
 Tools > Benchmark...
 ```
 
-Use it for quick local feedback and user-facing throughput checks. Use
-`tools\bench_axiom_levels.ps1` for repeatable engineering comparisons, because
-it stores raw data and supports baseline comparisons.
+Generated inputs are produced directly in memory. A custom file is loaded once;
+a custom folder becomes a deterministic stream of sorted relative paths,
+lengths, and file contents. Preparation is outside the timed region. Every
+timed compression and extraction iteration uses resident buffers, and each
+restore is compared byte-for-byte before the pass is recorded.
+
+Choose a fixed pass count for a bounded run or **Continuous** to run until
+**Stop**. Short phases repeat enough times to reduce timer granularity. The
+report keeps bounded recent-pass details and lifetime totals, including wall
+throughput, effective CPU use, ratio, encoded size, rolling variation, and a
+stability indicator. Automatic corpus sizing leaves memory headroom for the
+source, encoded, restored, and codec working buffers; custom inputs that do not
+fit are rejected before timing.
+
+The GUI benchmark measures the native Axiom method at the selected portable
+level. Use `bench/bench_codecs.py` for comparisons with Zstandard, LZMA2,
+Deflate, or external tools, and use `tools/bench_axiom_levels.ps1` for
+repeatable engineering comparisons because it stores raw data and supports
+baseline builds.

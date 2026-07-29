@@ -333,13 +333,21 @@ bool read_sample_region(const EstimateFile& file,
 
 std::uint64_t compress_zip_probe(std::span<const std::uint8_t> input,
                                  const CompressionOptions& options) {
-    const int level = options.force_store ? MZ_NO_COMPRESSION
-        : (options.use_fast_lz || options.max_chain_depth <= 16 || options.fast_entropy)
-            ? MZ_BEST_SPEED
-        : (options.use_tree_matcher || options.max_chain_depth >= 256 ||
-           options.enable_optimal_parser)
-            ? MZ_BEST_COMPRESSION
-            : MZ_DEFAULT_COMPRESSION;
+    int level = MZ_DEFAULT_COMPRESSION;
+    if (options.force_store || options.method == CompressionMethod::store) {
+        level = MZ_NO_COMPRESSION;
+    } else if (options.method == CompressionMethod::deflate) {
+        level = std::clamp(
+            options.codec_level == kAutomaticCodecLevel
+                ? options.level : options.codec_level,
+            0, 9);
+    } else if (options.use_fast_lz || options.max_chain_depth <= 16 ||
+               options.fast_entropy) {
+        level = MZ_BEST_SPEED;
+    } else if (options.use_tree_matcher || options.max_chain_depth >= 256 ||
+               options.enable_optimal_parser) {
+        level = MZ_BEST_COMPRESSION;
+    }
     mz_ulong length = mz_compressBound(static_cast<mz_ulong>(input.size()));
     ByteVector compressed(static_cast<std::size_t>(length));
     const int status = mz_compress2(
@@ -422,6 +430,115 @@ CompressionEstimateSnapshot make_estimate_snapshot(
                        static_cast<double>(source_bytes));
     }
     return snapshot;
+}
+
+struct CurveCandidateState {
+    CompressionEstimateCurveCandidate candidate;
+    std::uint64_t packed_sample_bytes = 0;
+    double codec_seconds = 0.0;
+    std::vector<SampleObservation> observations;
+};
+
+void update_curve_point(
+    CompressionEstimateCurvePoint& point,
+    const CurveCandidateState& state,
+    std::uint64_t source_bytes,
+    std::uint64_t overhead,
+    unsigned recovery_percent,
+    bool warnings_present,
+    bool complete) {
+    point.level = state.candidate.level;
+    point.complete = complete;
+    point.completed_probes = state.observations.size();
+    point.sampled_bytes = 0;
+    for (const auto& observation : state.observations) {
+        point.sampled_bytes = saturated_add(point.sampled_bytes, observation.bytes);
+    }
+
+    if (source_bytes == 0) {
+        point.estimated_archive_bytes = overhead;
+        point.estimated_low_bytes = overhead;
+        point.estimated_high_bytes = overhead;
+        point.confidence = warnings_present
+            ? EstimateConfidence::low : EstimateConfidence::high;
+        return;
+    }
+    if (point.sampled_bytes == 0) {
+        point.estimated_archive_bytes = saturated_add(source_bytes, overhead);
+        point.estimated_low_bytes = overhead;
+        point.estimated_high_bytes = point.estimated_archive_bytes;
+        point.confidence = EstimateConfidence::low;
+        return;
+    }
+
+    const SampleStatistics statistics =
+        calculate_sample_statistics(state.observations);
+    const long double payload_ratio =
+        static_cast<long double>(state.packed_sample_bytes) /
+        point.sampled_bytes;
+    point.estimated_archive_bytes = saturated_add(
+        clamp_u64(payload_ratio * source_bytes), overhead);
+    if (recovery_percent != 0) {
+        const long double recovery =
+            static_cast<long double>(point.estimated_archive_bytes) *
+            recovery_percent / 100.0L;
+        point.estimated_archive_bytes = saturated_add(
+            point.estimated_archive_bytes, clamp_u64(recovery));
+    }
+
+    const double coverage = static_cast<double>(point.sampled_bytes) /
+                            static_cast<double>(source_bytes);
+    const bool fully_sampled = coverage >= 0.999;
+    point.confidence_margin_percent = fully_sampled
+        ? 0.0 : statistics.margin * 100.0;
+    double relative_margin = 0.08;
+    if (!fully_sampled) {
+        const long double payload_margin =
+            statistics.margin * static_cast<long double>(source_bytes);
+        relative_margin = point.estimated_archive_bytes == 0
+            ? 0.35
+            : static_cast<double>(
+                  payload_margin / point.estimated_archive_bytes);
+        relative_margin = std::clamp(relative_margin, 0.03, 0.35);
+    }
+    if (warnings_present) relative_margin = std::max(relative_margin, 0.25);
+    point.estimated_low_bytes = clamp_u64(
+        static_cast<long double>(point.estimated_archive_bytes) *
+        (1.0 - relative_margin));
+    point.estimated_high_bytes = clamp_u64(
+        static_cast<long double>(point.estimated_archive_bytes) *
+        (1.0 + relative_margin));
+
+    if (!warnings_present &&
+        (fully_sampled ||
+         (state.observations.size() >= kMinimumRepresentativeProbes &&
+          statistics.margin <= kHighConfidenceMargin))) {
+        point.confidence = EstimateConfidence::high;
+    } else if (state.observations.size() >= kAdaptiveBatchProbes &&
+               statistics.margin <= kMediumConfidenceMargin &&
+               !warnings_present) {
+        point.confidence = EstimateConfidence::medium;
+    } else {
+        point.confidence = EstimateConfidence::low;
+    }
+
+    if (point.estimated_archive_bytes != 0) {
+        point.estimated_ratio =
+            static_cast<double>(source_bytes) /
+            static_cast<double>(point.estimated_archive_bytes);
+        point.estimated_savings_percent =
+            100.0 *
+            (1.0 - static_cast<double>(point.estimated_archive_bytes) /
+                       static_cast<double>(source_bytes));
+    }
+    if (state.codec_seconds > 0.0) {
+        const long double projected_seconds =
+            state.codec_seconds *
+            static_cast<long double>(source_bytes) /
+            point.sampled_bytes;
+        point.estimated_seconds = std::max<std::uint64_t>(
+            1, clamp_u64(std::ceil(projected_seconds)));
+    }
 }
 
 }  // namespace
@@ -670,6 +787,228 @@ CompressionEstimateResult estimate_compression(
     report_estimate_progress(operation, OperationStage::estimating,
                              result.sampled_bytes, result.sampled_bytes,
                              observations.size(), observations.size());
+    return result;
+}
+
+CompressionEstimateCurveResult estimate_compression_curve(
+    const std::vector<std::filesystem::path>& inputs,
+    const CompressionEstimateOptions& options,
+    std::span<const CompressionEstimateCurveCandidate> candidates,
+    const std::function<void(const CompressionEstimateCurveResult&)>&
+        progress_callback) {
+    if (options.format != ArchiveFormat::axar &&
+        options.format != ArchiveFormat::zip) {
+        throw std::invalid_argument(
+            "compression estimate curves support AXAR and ZIP only");
+    }
+    if (inputs.empty()) {
+        throw std::invalid_argument("no inputs selected for estimation");
+    }
+    if (candidates.empty()) {
+        throw std::invalid_argument(
+            "no compression levels selected for estimation");
+    }
+    if (options.sample_budget == 0 || options.sample_chunk_size == 0) {
+        throw std::invalid_argument(
+            "compression estimate sample sizes must be positive");
+    }
+
+    CompressionEstimateCurveResult result;
+    result.format = options.format;
+    const auto operation = options.compression.operation;
+    report_estimate_progress(operation, OperationStage::scanning,
+                             0, 0, 0, inputs.size());
+
+    std::vector<EstimateFile> files;
+    std::set<fs::path> seen;
+    for (std::size_t index = 0; index < inputs.size(); ++index) {
+        scan_estimate_input(
+            inputs[index], files, seen, result.source_bytes,
+            result.item_count, result.warnings, operation);
+        report_estimate_progress(
+            operation, OperationStage::scanning,
+            0, 0, index + 1, inputs.size(),
+            core::path_to_utf8(inputs[index]));
+    }
+    std::sort(
+        files.begin(), files.end(),
+        [](const EstimateFile& left, const EstimateFile& right) {
+            return left.path.native() < right.path.native();
+        });
+    result.file_count = files.size();
+
+    const auto regions = plan_sample_regions(
+        files, result.source_bytes,
+        options.sample_budget, options.sample_chunk_size);
+    for (const auto& region : regions) {
+        result.planned_sample_bytes = saturated_add(
+            result.planned_sample_bytes, region.size);
+    }
+    result.total_evaluations = saturated_multiply(
+        regions.size(), candidates.size());
+    report_estimate_progress(
+        operation, OperationStage::estimating,
+        0, result.planned_sample_bytes, 0, result.total_evaluations);
+
+    std::vector<CurveCandidateState> states;
+    states.reserve(candidates.size());
+    std::vector<std::uint64_t> overheads;
+    overheads.reserve(candidates.size());
+    result.points.reserve(candidates.size());
+    for (const auto& candidate : candidates) {
+        CurveCandidateState state;
+        state.candidate = candidate;
+        state.observations.reserve(regions.size());
+        states.push_back(std::move(state));
+
+        auto candidate_options = options;
+        candidate_options.compression = candidate.compression;
+        overheads.push_back(estimate_container_overhead(
+            files, result.item_count, result.source_bytes,
+            candidate_options));
+
+        CompressionEstimateCurvePoint point;
+        point.level = candidate.level;
+        point.total_probes = regions.size();
+        result.points.push_back(point);
+    }
+
+    auto publish = [&](bool complete) {
+        result.complete = complete;
+        const bool warnings_present = !result.warnings.empty();
+        for (std::size_t index = 0; index < states.size(); ++index) {
+            update_curve_point(
+                result.points[index], states[index],
+                result.source_bytes, overheads[index],
+                states[index].candidate.compression.recovery_percent,
+                warnings_present, complete);
+            result.points[index].total_probes = regions.size();
+        }
+        if (progress_callback) progress_callback(result);
+    };
+
+    std::vector<codec::TransformHint> transform_hints(files.size());
+    std::vector<bool> transform_hint_known(files.size(), false);
+    std::set<std::size_t> warned_files;
+    const bool filters_requested =
+        options.format == ArchiveFormat::axar &&
+        std::any_of(
+            candidates.begin(), candidates.end(),
+            [](const CompressionEstimateCurveCandidate& candidate) {
+                return candidate.compression.enable_file_filters;
+            });
+    const auto sampling_started = std::chrono::steady_clock::now();
+
+    for (std::size_t region_index = 0;
+         region_index < regions.size(); ++region_index) {
+        if (operation) operation->checkpoint();
+        const auto& region = regions[region_index];
+        ByteVector probe;
+        if (!read_sample_region(
+                files[region.file_index], region,
+                options.compression.input_open_retries,
+                probe, operation)) {
+            if (warned_files.insert(region.file_index).second) {
+                add_estimate_warning(
+                    result.warnings, operation,
+                    files[region.file_index].path,
+                    "could not read sample data; estimate confidence reduced");
+            }
+            if (options.time_budget.count() > 0 &&
+                std::chrono::steady_clock::now() - sampling_started >=
+                    options.time_budget) {
+                break;
+            }
+            continue;
+        }
+
+        if (filters_requested &&
+            !transform_hint_known[region.file_index]) {
+            transform_hint_known[region.file_index] = true;
+            const SampleRegion prefix_region{
+                region.file_index, 0,
+                static_cast<std::size_t>(
+                    std::min<std::uint64_t>(
+                        files[region.file_index].size,
+                        std::size_t{64} << 10))};
+            ByteVector prefix;
+            if (read_sample_region(
+                    files[region.file_index], prefix_region,
+                    options.compression.input_open_retries,
+                    prefix, operation)) {
+                transform_hints[region.file_index] =
+                    codec::detect_transform_hint(prefix);
+            }
+        }
+        const auto hint = transform_hints[region.file_index];
+        result.sampled_bytes = saturated_add(
+            result.sampled_bytes, probe.size());
+
+        for (std::size_t candidate_index = 0;
+             candidate_index < states.size(); ++candidate_index) {
+            if (operation) operation->checkpoint();
+            auto& state = states[candidate_index];
+            auto region_options = state.candidate.compression;
+            region_options.operation = operation;
+            region_options.encode_progress = [operation](double) {
+                if (operation) operation->checkpoint();
+            };
+            region_options.encoded_bytes_progress = {};
+            region_options.transform_ranges.clear();
+            if (options.format == ArchiveFormat::axar &&
+                region_options.enable_file_filters &&
+                hint.transform != CompressionTransform::none) {
+                region_options.transform_ranges.push_back({
+                    hint.transform, 0,
+                    static_cast<std::uint64_t>(probe.size()),
+                    region.offset, hint.parameter});
+            }
+
+            const auto codec_started =
+                std::chrono::steady_clock::now();
+            const std::uint64_t packed =
+                options.format == ArchiveFormat::zip
+                    ? compress_zip_probe(probe, region_options)
+                    : compress_axar_probe(probe, region_options);
+            state.codec_seconds += std::chrono::duration<double>(
+                std::chrono::steady_clock::now() -
+                codec_started).count();
+            state.packed_sample_bytes = saturated_add(
+                state.packed_sample_bytes, packed);
+            if (!probe.empty()) {
+                state.observations.push_back({
+                    static_cast<double>(packed) / probe.size(),
+                    probe.size()});
+            }
+            ++result.completed_evaluations;
+
+            // Populate the first visible curve one point at a time. Later
+            // probes update the complete curve together, avoiding excessive
+            // cross-thread UI notifications.
+            if (region_index == 0 ||
+                candidate_index + 1 == states.size()) {
+                publish(false);
+            }
+        }
+
+        report_estimate_progress(
+            operation, OperationStage::estimating,
+            result.sampled_bytes, result.planned_sample_bytes,
+            result.completed_evaluations, result.total_evaluations,
+            files[region.file_index].display_path,
+            probe.size(), probe.size());
+        if (options.time_budget.count() > 0 &&
+            std::chrono::steady_clock::now() - sampling_started >=
+                options.time_budget) {
+            break;
+        }
+    }
+
+    publish(true);
+    report_estimate_progress(
+        operation, OperationStage::estimating,
+        result.sampled_bytes, result.sampled_bytes,
+        result.completed_evaluations, result.completed_evaluations);
     return result;
 }
 

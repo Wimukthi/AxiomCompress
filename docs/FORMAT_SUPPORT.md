@@ -8,7 +8,7 @@ commands that are safe for that format.
 
 | Format | Browse | Extract | Test | Create | Add/update/sync | Delete | Move/rename | Packed sizes | Notes |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---|
-| AXAR | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Estimated | Native format with encryption, recovery records, directly readable read-only split volumes, comments, locking, signatures, metadata, links, and SFX packaging. |
+| AXAR | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Estimated | Native container with selectable Axiom, Zstandard, LZMA2, Deflate, or Store block streams; encryption, recovery records, directly readable read-only split volumes, comments, locking, signatures, metadata, links, and SFX packaging. |
 | ZIP | Yes | Yes | Yes | Yes | Yes, plaintext only | Yes, plaintext only | Yes, plaintext only | Yes | Stored/Deflate ZIP archives, WinZip AES-256 creation, SFX, and standard split volumes. ZIP edits are atomic rewrites. Split sets are read-only. |
 | 7z | Windows | Windows | Windows | No | No | No | No | Yes | Read-only bundled `7z.dll` backend. Encrypted 7z archives prompt for a password; numbered split volumes are read as one logical stream. |
 | RAR/RAR5 | Windows | Windows | Windows | No | No | No | No | Yes | Read-only bundled `7z.dll` backend. RAR creation is intentionally unsupported. |
@@ -26,6 +26,12 @@ AES-256 entries, but are not edited in place. ZIP intentionally does not expose
 AXAR-only services: archive comments, locking, recovery records/recovery volumes,
 signatures, encrypted names, and Axiom metadata. SFX packaging is supported for
 single-file ZIP archives.
+
+AXAR codec selection changes only the independently decoded AXC payload inside
+each solid block. Container capabilities remain the same for every method.
+Native Axiom payloads use AXC v9; bundled Zstandard, LZMA2, and Deflate payloads
+use the bounded AXC v10 external-codec envelope. Store bypasses entropy coding.
+ZIP remains limited to the interoperable Store and Deflate methods.
 
 The Windows system provider is intentionally read-only. It loads the bundled
 `7z.dll` engine directly for 7z, RAR/RAR5, ISO/UDF, and CAB, and uses Windows
@@ -91,8 +97,9 @@ taking in the first pass.
 The Add to archive dialog should derive visible controls from the selected
 provider:
 
-- AXAR: all native options.
-- ZIP: compression level, update mode, and optional file-data password
+- AXAR: method-aware level and codec controls, live level-curve prognosis, and
+  all container options.
+- ZIP: Store/Deflate level prognosis, update mode, and optional file-data password
   encryption. Hide or disable AXAR-only features, including encrypted names.
 - TAR: metadata-focused options; no compression level for plain `.tar`.
 - Compressed TAR: show the outer compression codec and level; explain that edits

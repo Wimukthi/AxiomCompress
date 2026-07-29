@@ -83,6 +83,14 @@ Before producing a packaged release build:
 5. Build the matching portable zip asset if the release needs one.
 6. Tag the release with the exact resource version.
 
+Before pushing the tag, verify that `git status` contains only the intended
+release commit and that the resource version printed by
+`tools\Update-AxiomVersion.ps1 -PrintVersion` exactly matches the proposed tag.
+After publishing, verify the GitHub release is neither draft nor prerelease,
+both Windows assets are present, and their SHA-256 digests match the locally
+packaged files. CI should pass on Windows, Linux, and macOS for the tagged
+commit.
+
 For day-to-day Release builds, keeping the default auto-increment behavior is
 fine. For published releases, disabling it avoids accidentally turning a planned
 version such as `0.1.1.0` into `0.1.1.1` during packaging.

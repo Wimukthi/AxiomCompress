@@ -23,6 +23,10 @@ public:
 
         axiom::gui::CreateArchiveDialogOptions dialog_options;
         dialog_options.level = application_options_.default_level;
+        dialog_options.method = application_options_.default_method;
+        dialog_options.codec_level = application_options_.default_codec_level;
+        dialog_options.lzma_binary_tree =
+            application_options_.default_lzma_binary_tree;
         dialog_options.thread_count = application_options_.default_thread_count;
         dialog_options.dictionary_size = application_options_.default_dictionary_size;
         dialog_options.word_size = application_options_.default_word_size;
@@ -46,7 +50,7 @@ public:
         dialog_options.archive_format = axiom::ArchiveFormat::axar;
 
         const bool accepted = axiom::gui::show_create_archive_dialog(
-            hwnd_, inputs_.size(), dialog_options);
+            hwnd_, inputs_, dialog_options);
         if (dialog_options.compression_profiles_changed) {
             application_options_.compression_profiles = dialog_options.compression_profiles;
             persisted_settings_.application = application_options_;
@@ -257,6 +261,20 @@ private:
                                            const std::vector<fs::path>& paths) {
         for (const auto& path : paths) {
             if (same_filesystem_path(output, path)) return true;
+            std::error_code type_error;
+            if (!fs::is_directory(path, type_error) || type_error) continue;
+            std::error_code input_error;
+            std::error_code output_error;
+            const fs::path input_root = fs::weakly_canonical(path, input_error);
+            const fs::path normalized_output =
+                fs::weakly_canonical(output, output_error);
+            if (input_error || output_error) continue;
+            const fs::path relative =
+                normalized_output.lexically_relative(input_root);
+            if (!relative.empty() && relative.native() != L"." &&
+                *relative.begin() != L"..") {
+                return true;
+            }
         }
         return false;
     }
@@ -293,6 +311,9 @@ private:
         const axiom::gui::CreateArchiveDialogOptions& dialog_options) const {
         axiom::CompressionOptions options;
         axiom::apply_compression_level(options, dialog_options.level);
+        options.method = dialog_options.method;
+        options.codec_level = dialog_options.codec_level;
+        options.lzma_binary_tree = dialog_options.lzma_binary_tree;
         options.thread_count = dialog_options.thread_count;
         options.io_buffer_size = configured_io_buffer_size(application_options_);
         if (dialog_options.dictionary_size != 0) {
@@ -445,10 +466,20 @@ private:
             sfx_output = archive;
             sfx_output.replace_extension(L".exe");
         }
+        const fs::path final_output = create_sfx_after ? sfx_output : archive;
+        if (output_collides_with_input(final_output, inputs_)) {
+            show_message(
+                L"The output conflicts with the selected input:\n\n" +
+                    final_output.wstring() +
+                    L"\n\nThe output cannot replace a selected input or be placed inside a selected source folder. Choose a different name or folder.",
+                axiom::gui::MessageDialogIcon::warning,
+                L"Archive output");
+            return false;
+        }
         if (application_options_.confirm_overwrite &&
             mode == axiom::gui::ArchiveUpdateMode::create_new) {
             std::error_code exists_error;
-            const fs::path output_path = create_sfx_after ? sfx_output : archive;
+            const fs::path output_path = final_output;
             if (!output_path.empty() && fs::exists(output_path, exists_error)) {
                 if (show_message(
                         L"Replace the existing output file?\n\n" + output_path.wstring(),
@@ -556,14 +587,27 @@ private:
                     }
                     if (provider->info().native && split_after) {
                         const std::uint64_t archive_bytes = fs::file_size(archive);
+                        if (volume_size >= archive_bytes) {
+                            throw std::invalid_argument(
+                                "split volume size must be smaller than the completed archive (" +
+                                std::to_string(archive_bytes) + " bytes)");
+                        }
                         const std::uint64_t data_volumes = std::max<std::uint64_t>(
-                            1, (archive_bytes + volume_size - 1) / volume_size);
+                            1, 1 + (archive_bytes - 1) / volume_size);
+                        if (data_volumes > 254) {
+                            throw std::invalid_argument(
+                                "split volume size would create more than 254 data volumes");
+                        }
                         const unsigned recovery_count = recovery_volumes
                             ? static_cast<unsigned>(std::max<std::uint64_t>(
                                 1, (data_volumes *
                                     std::max<unsigned>(options.recovery_percent, 10) +
                                     99) / 100))
                             : 0;
+                        if (recovery_count > 255 - data_volumes) {
+                            throw std::invalid_argument(
+                                "recovery volume count would exceed the 255-volume set limit");
+                        }
                         axiom::create_archive_volumes(
                             archive, volume_size, recovery_count, operation);
                         std::error_code remove_error;
@@ -574,6 +618,12 @@ private:
                         }
                     } else if (provider->info().format == axiom::ArchiveFormat::zip &&
                                split_after) {
+                        const std::uint64_t archive_bytes = fs::file_size(archive);
+                        if (volume_size >= archive_bytes) {
+                            throw std::invalid_argument(
+                                "split volume size must be smaller than the completed archive (" +
+                                std::to_string(archive_bytes) + " bytes)");
+                        }
                         axiom::create_zip_volumes(archive, volume_size, operation);
                     }
                     if (create_sfx_after) {

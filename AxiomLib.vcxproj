@@ -72,6 +72,7 @@
     <ClInclude Include="include\axiom\axiom.hpp" />
     <ClInclude Include="include\axiom\archive.hpp" />
     <ClInclude Include="src\codec\block.hpp" />
+    <ClInclude Include="src\codec\external_codecs.hpp" />
     <ClInclude Include="src\codec\fast_lz.hpp" />
     <ClInclude Include="src\codec\incompressible.hpp" />
     <ClInclude Include="src\codec\lz77.hpp" />
@@ -117,6 +118,11 @@
     <ClInclude Include="src\third_party\minizip-ng\mz_zip.h" />
     <ClInclude Include="src\third_party\minizip-ng\mz_zip_rw.h" />
     <ClInclude Include="src\third_party\monocypher\monocypher.h" />
+    <ClInclude Include="src\third_party\zstd\lib\*.h" />
+    <ClInclude Include="src\third_party\zstd\lib\common\*.h" />
+    <ClInclude Include="src\third_party\zstd\lib\compress\*.h" />
+    <ClInclude Include="src\third_party\zstd\lib\decompress\*.h" />
+    <ClInclude Include="src\third_party\lzma-sdk\*.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="src\archive\container.cpp" />
@@ -125,6 +131,7 @@
     <ClCompile Include="src\archive\seven_zip_library.cpp" />
     <ClCompile Include="src\archive\system_provider.cpp" />
     <ClCompile Include="src\codec\block.cpp" />
+    <ClCompile Include="src\codec\external_codecs.cpp" />
     <ClCompile Include="src\codec\fast_lz.cpp" />
     <ClCompile Include="src\codec\lz77.cpp" />
     <ClCompile Include="src\codec\lz77_split.cpp" />
@@ -185,6 +192,26 @@
     <ClCompile Include="src\third_party\miniz\miniz_zip.c">
       <CompileAs>CompileAsC</CompileAs>
       <WarningLevel>TurnOffAllWarnings</WarningLevel>
+    </ClCompile>
+    <ClCompile Include="src\third_party\zstd\lib\common\*.c">
+      <CompileAs>CompileAsC</CompileAs>
+      <WarningLevel>TurnOffAllWarnings</WarningLevel>
+      <PreprocessorDefinitions>ZSTD_DISABLE_ASM;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+    <ClCompile Include="src\third_party\zstd\lib\compress\*.c">
+      <CompileAs>CompileAsC</CompileAs>
+      <WarningLevel>TurnOffAllWarnings</WarningLevel>
+      <PreprocessorDefinitions>ZSTD_DISABLE_ASM;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+    <ClCompile Include="src\third_party\zstd\lib\decompress\*.c">
+      <CompileAs>CompileAsC</CompileAs>
+      <WarningLevel>TurnOffAllWarnings</WarningLevel>
+      <PreprocessorDefinitions>ZSTD_DISABLE_ASM;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+    <ClCompile Include="src\third_party\lzma-sdk\*.c">
+      <CompileAs>CompileAsC</CompileAs>
+      <WarningLevel>TurnOffAllWarnings</WarningLevel>
+      <PreprocessorDefinitions>Z7_ST;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
     <ClCompile Include="src\archive\zip_split_backend.cpp" />
     <ClCompile Include="src\third_party\minizip-ng\mz_crypt.c"><PreprocessorDefinitions>MZ_ZIP_NO_CRYPTO;_CRT_SECURE_NO_DEPRECATE;_CRT_NONSTDC_NO_DEPRECATE;%(PreprocessorDefinitions)</PreprocessorDefinitions><DisableSpecificWarnings>4100;4244;4267;4706;%(DisableSpecificWarnings)</DisableSpecificWarnings></ClCompile>

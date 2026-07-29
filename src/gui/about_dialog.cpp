@@ -41,6 +41,7 @@ struct AboutDialogState {
     HFONT font{};
     HFONT title_font{};
     HBRUSH background_brush{};
+    HBRUSH control_brush{};
     UINT dpi{USER_DEFAULT_SCREEN_DPI};
     UINT check_updates_command{};
     bool dark{};
@@ -124,7 +125,9 @@ void layout(AboutDialogState* state) {
                client.right - margin * 2, scale_for_dialog_dpi(22, state->dpi), TRUE);
     MoveWindow(state->third_party, margin,
                third_party_top + scale_for_dialog_dpi(26, state->dpi),
-               client.right - margin * 2, scale_for_dialog_dpi(110, state->dpi), TRUE);
+               client.right - margin * 2,
+               button_top - third_party_top - scale_for_dialog_dpi(42, state->dpi),
+               TRUE);
     MoveWindow(state->auto_update, margin, button_top + scale_for_dialog_dpi(4, state->dpi),
                scale_for_dialog_dpi(190, state->dpi), scale_for_dialog_dpi(22, state->dpi), TRUE);
     MoveWindow(state->check_updates,
@@ -142,11 +145,16 @@ void apply_theme(AboutDialogState* state) {
     }
 }
 
-LRESULT control_color(AboutDialogState* state, WPARAM wparam) {
+LRESULT control_color(AboutDialogState* state, WPARAM wparam, LPARAM lparam) {
     if (state == nullptr) return 0;
     const DialogColors colors = dialog_colors(state->dark);
     HDC dc = reinterpret_cast<HDC>(wparam);
     SetTextColor(dc, colors.text);
+    if (reinterpret_cast<HWND>(lparam) == state->third_party) {
+        SetBkColor(dc, colors.control_background);
+        SetBkMode(dc, OPAQUE);
+        return reinterpret_cast<LRESULT>(state->control_brush);
+    }
     SetBkColor(dc, colors.background);
     SetBkMode(dc, TRANSPARENT);
     return reinterpret_cast<LRESULT>(state->background_brush);
@@ -180,7 +188,9 @@ LRESULT CALLBACK about_dialog_proc(HWND hwnd, UINT message, WPARAM wparam, LPARA
     }
     switch (message) {
         case WM_CREATE: {
-            state->background_brush = CreateSolidBrush(dialog_colors(state->dark).background);
+            const DialogColors colors = dialog_colors(state->dark);
+            state->background_brush = CreateSolidBrush(colors.background);
+            state->control_brush = CreateSolidBrush(colors.control_background);
             state->font = create_dialog_font(state->dpi);
             state->title_font = create_title_font(state->font, state->dpi);
             state->icon = CreateWindowExW(
@@ -217,15 +227,23 @@ LRESULT CALLBACK about_dialog_proc(HWND hwnd, UINT message, WPARAM wparam, LPARA
                 WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | SS_NOPREFIX,
                 0, 0, 0, 0, hwnd, nullptr, state->instance, nullptr);
             state->third_party = CreateWindowExW(
-                0, L"STATIC",
-                L"miniz - ZIP read/write support - MIT license\r\n"
+                0, L"EDIT",
+                L"miniz - ZIP and AXAR Deflate support - MIT license\r\n"
                 L"minizip-ng - standard split-ZIP support - zlib license\r\n"
+                L"Zstandard - AXAR codec - BSD license\r\n"
+                L"LZMA SDK - AXAR LZMA2 codec - public domain\r\n"
                 L"7-Zip - read-only archive backend - LGPL/BSD/unRAR restriction\r\n"
                 L"Monocypher - cryptographic primitives - BSD 2-Clause license\r\n"
                 L"BLAKE3 - hashing/integrity primitives - CC0/Apache-2.0 license\r\n"
                 L"Fluent UI System Icons - toolbar and dialog icons - MIT license",
-                WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | SS_NOPREFIX,
+                WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | WS_TABSTOP |
+                    WS_BORDER | WS_VSCROLL | ES_MULTILINE | ES_READONLY |
+                    ES_AUTOVSCROLL,
                 0, 0, 0, 0, hwnd, nullptr, state->instance, nullptr);
+            SendMessageW(state->third_party, EM_SETMARGINS,
+                         EC_LEFTMARGIN | EC_RIGHTMARGIN,
+                         MAKELPARAM(scale_for_dialog_dpi(6, state->dpi),
+                                   scale_for_dialog_dpi(6, state->dpi)));
             state->auto_update = CreateWindowExW(
                 0, L"BUTTON", L"Check automatically",
                 WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | WS_TABSTOP | BS_OWNERDRAW,
@@ -276,6 +294,10 @@ LRESULT CALLBACK about_dialog_proc(HWND hwnd, UINT message, WPARAM wparam, LPARA
                          reinterpret_cast<WPARAM>(load_axiom_icon(
                              state->instance, scale_for_dialog_dpi(64, state->dpi),
                              scale_for_dialog_dpi(64, state->dpi))), 0);
+            SendMessageW(state->third_party, EM_SETMARGINS,
+                         EC_LEFTMARGIN | EC_RIGHTMARGIN,
+                         MAKELPARAM(scale_for_dialog_dpi(6, state->dpi),
+                                   scale_for_dialog_dpi(6, state->dpi)));
             layout(state);
             return 0;
         }
@@ -305,8 +327,9 @@ LRESULT CALLBACK about_dialog_proc(HWND hwnd, UINT message, WPARAM wparam, LPARA
             }
             break;
         case WM_CTLCOLORSTATIC:
+        case WM_CTLCOLOREDIT:
         case WM_CTLCOLORBTN:
-            return control_color(state, wparam);
+            return control_color(state, wparam, lparam);
         case WM_DRAWITEM:
             if (lparam != 0) {
                 const auto& draw = *reinterpret_cast<DRAWITEMSTRUCT*>(lparam);
@@ -333,6 +356,7 @@ LRESULT CALLBACK about_dialog_proc(HWND hwnd, UINT message, WPARAM wparam, LPARA
                 delete_dialog_font(state->font);
                 if (state->title_font != nullptr) DeleteObject(state->title_font);
                 if (state->background_brush != nullptr) DeleteObject(state->background_brush);
+                if (state->control_brush != nullptr) DeleteObject(state->control_brush);
                 state->hwnd = nullptr;
             }
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);

@@ -67,6 +67,8 @@ jobs:
           $licenses = Join-Path $stage "licenses"
           $source = Join-Path $licenses "source"
           New-Item -ItemType Directory -Path $source -Force | Out-Null
+          Copy-Item -LiteralPath ".\src\third_party\zstd\LICENSE" -Destination (Join-Path $licenses "Zstandard-BSD.txt")
+          Copy-Item -LiteralPath ".\src\third_party\lzma-sdk\LICENSE.txt" -Destination (Join-Path $licenses "LZMA-SDK-Public-Domain.txt")
           Copy-Item -LiteralPath ".\Wimukthi.Win32Theme\LICENSE" -Destination (Join-Path $licenses "Wimukthi.Win32Theme-LICENSE.txt")
           Copy-Item -LiteralPath ".\Wimukthi.Win32Theme\THIRD_PARTY_NOTICES.md" -Destination (Join-Path $licenses "Wimukthi.Win32Theme-NOTICES.md")
           Copy-Item -LiteralPath ".\Wimukthi.Win32Theme\third_party\darkmodelib\LICENSE.md" -Destination (Join-Path $licenses "Darkmodelib-MPL-2.0.txt")

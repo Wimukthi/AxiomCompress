@@ -1223,6 +1223,9 @@ void MainWindow::apply_application_options(
     application_options_ = updated_options;
 
     selected_level_ = application_options_.default_level;
+    selected_method_ = application_options_.default_method;
+    selected_codec_level_ = application_options_.default_codec_level;
+    selected_lzma_binary_tree_ = application_options_.default_lzma_binary_tree;
     selected_thread_count_ = application_options_.default_thread_count;
     selected_dictionary_size_ = application_options_.default_dictionary_size;
     selected_word_size_ = application_options_.default_word_size;

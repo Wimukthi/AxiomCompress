@@ -82,13 +82,16 @@ void print_usage() {
         "  --encrypt-names     AXAR only: also encrypt the directory (ZIP names stay visible)\n"
         "\n"
         "Compression options (a, c):\n"
+        "  --method NAME       axiom (default), zstd, lzma2, deflate, or store\n"
         "  --level N           1=fastest .. 9=max ratio (default 5)\n"
+        "  --codec-level N     native level: zstd -5..22; lzma2/deflate 0..9\n"
         "  --fast (=1)         --max (=9)\n"
         "  --threads N        --block-size SIZE   --parallel\n"
-        "  --chain-depth N    --nice N            (match-finder speed/ratio)\n"
+        "  --chain-depth N    --nice N            (Axiom search / LZMA2 fast bytes)\n"
         "  --lazy / --no-lazy  --fast-entropy     (override level knobs)\n"
         "  --fast-lz          --no-filters        (byte-token profile / disable file filters)\n"
-        "  --window SIZE                          (match window; bounds --bt memory)\n"
+        "  --window SIZE                          (Axiom window / LZMA2 dictionary, max 512 MiB)\n"
+        "  --lzma-mf MODE                         LZMA2 match finder: bt4 or hc4\n"
         "  --swarm                                (levels 1-6, 8-9: cores cooperate\n"
         "                                          inside large blocks; level 7 ignores it)\n"
         "  --recovery N                           add 1..100% Reed-Solomon recovery data\n"
@@ -576,7 +579,34 @@ bool take_compression_flags(std::vector<std::string>& args, axiom::CompressionOp
             return args[++i];
         };
 
-        if (arg == "--level") {
+        if (arg == "--method") {
+            const auto method = next("--method");
+            if (method == "axiom") {
+                options.method = axiom::CompressionMethod::axiom;
+            } else if (method == "zstd" || method == "zstandard") {
+                options.method = axiom::CompressionMethod::zstandard;
+            } else if (method == "lzma2") {
+                options.method = axiom::CompressionMethod::lzma2;
+            } else if (method == "deflate") {
+                options.method = axiom::CompressionMethod::deflate;
+            } else if (method == "store") {
+                options.method = axiom::CompressionMethod::store;
+            } else {
+                throw std::runtime_error(
+                    "--method must be axiom, zstd, lzma2, deflate, or store");
+            }
+        } else if (arg == "--codec-level") {
+            const auto value = next("--codec-level");
+            std::size_t consumed = 0;
+            try {
+                options.codec_level = std::stoi(value, &consumed);
+            } catch (const std::exception&) {
+                throw std::runtime_error("--codec-level must be an integer");
+            }
+            if (consumed != value.size()) {
+                throw std::runtime_error("--codec-level must be an integer");
+            }
+        } else if (arg == "--level") {
             (void)next("--level");  // already applied in the first pass
         } else if (arg == "--fast" || arg == "--max") {
             // already applied in the first pass
@@ -610,8 +640,19 @@ bool take_compression_flags(std::vector<std::string>& args, axiom::CompressionOp
             options.max_chain_depth = parse_size(next("--chain-depth"));
         } else if (arg == "--nice") {
             options.nice_length = parse_size(next("--nice"));
+            options.lzma_fast_bytes = options.nice_length;
         } else if (arg == "--window") {
             options.window_size = parse_size(next("--window"));
+            options.lzma_dictionary_size = options.window_size;
+        } else if (arg == "--lzma-mf") {
+            const auto mode = next("--lzma-mf");
+            if (mode == "bt4") {
+                options.lzma_binary_tree = true;
+            } else if (mode == "hc4") {
+                options.lzma_binary_tree = false;
+            } else {
+                throw std::runtime_error("--lzma-mf must be bt4 or hc4");
+            }
         } else if (arg == "--bt") {
             options.use_tree_matcher = true;
         } else if (arg == "--swarm") {
@@ -631,6 +672,18 @@ bool take_compression_flags(std::vector<std::string>& args, axiom::CompressionOp
             return false;
         } else {
             positionals.push_back(arg);
+        }
+    }
+    if (options.codec_level != axiom::kAutomaticCodecLevel) {
+        const bool valid =
+            (options.method == axiom::CompressionMethod::zstandard &&
+             options.codec_level >= -5 && options.codec_level <= 22) ||
+            ((options.method == axiom::CompressionMethod::lzma2 ||
+              options.method == axiom::CompressionMethod::deflate) &&
+             options.codec_level >= 0 && options.codec_level <= 9);
+        if (!valid) {
+            throw std::runtime_error(
+                "--codec-level requires zstd (-5..22), lzma2 (0..9), or deflate (0..9)");
         }
     }
     args = std::move(positionals);

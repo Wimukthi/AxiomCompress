@@ -356,6 +356,45 @@ where required.
 Directory-encrypted archive editing remains restricted. Create a new archive if
 an edit command reports that this mode cannot be updated safely.
 
+## Compression methods
+
+AXAR and single-stream AXC creation support five methods:
+
+| Method | CLI value | Method-specific controls |
+|---|---|---|
+| Axiom adaptive (default) | `axiom` | level 1..9, window, nice length, split/swarm |
+| Zstandard | `zstd` | native level -5..22 |
+| LZMA2 | `lzma2` | native level 0..9, 4 KiB..512 MiB dictionary, 5..273 fast bytes, HC4/BT4 |
+| Deflate | `deflate` | native level 0..9; fixed 32 KiB window and 258-byte maximum match |
+| Store | `store` | none |
+
+```powershell
+axiomc a --method zstd --codec-level 12 archive.axar Data
+axiomc a --method lzma2 --codec-level 7 --window 128M --block-size 128M --nice 128 --lzma-mf bt4 archive.axar Data
+axiomc a --method deflate --codec-level 6 archive.axar Data
+axiomc a --method store archive.axar already-compressed-media
+```
+
+Without `--codec-level`, the portable `--level 1..9` value maps to a suitable
+native level. Zstandard maps portable levels 1..9 to native levels
+1, 2, 3, 5, 7, 10, 14, 18, and 22 respectively; LZMA2 and Deflate use the
+portable value directly. `--codec-level` accepts Zstandard -5..22 and
+LZMA2/Deflate 0..9.
+`--window` and `--nice` become the LZMA2 dictionary and fast-bytes settings.
+The LZMA2 dictionary is clamped to the independently decoded AXC chunk (the
+selected `--block-size`) and cannot exceed 512 MiB. Large dictionaries can use
+several times their size in encoder memory. `--lzma-mf hc4` favors speed;
+`--lzma-mf bt4` favors ratio.
+
+ZIP creation supports only `--method deflate` and `--method store`. Omitting
+`--method` preserves the established ZIP Deflate behavior.
+
+Every external AXC payload is split into independently bounded chunks. Pause,
+cancel, and progress checkpoints occur between chunks, and an incompressible
+chunk is stored rather than expanded. Encryption, recovery, signing, metadata,
+volumes, and SFX remain AXAR container services and do not change with the
+selected method.
+
 ## Compression levels
 
 Use `--level N`, where `N` is 1 through 9. The default is 5. `--fast` selects
@@ -447,9 +486,11 @@ axiomc c --level 9 --no-filters app.exe app-unfiltered.axc
 axiomc a --level 9 --no-filters archive.axar Data
 ```
 
-New streams use AXC version 9. The reader remains compatible with AXC versions
-4 through 8, but older Axiom builds do not understand version-9 parser
-checkpoints when that block candidate wins.
+Native Axiom streams use AXC version 9. External Zstandard, LZMA2, and Deflate
+streams use AXC version 10. The current reader accepts AXC versions 4 through
+10. Older Axiom builds do not understand version-9 parser checkpoints or
+version-10 external codec IDs, so archives created with an external method
+require this release or newer.
 
 ### Dictionary size: `--window SIZE`
 

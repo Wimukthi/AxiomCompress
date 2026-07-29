@@ -13,6 +13,9 @@ enum class CodecId : std::uint8_t {
     greedy_lz77_split_slots = 5,
     lz77_sequences = 6,
     lz77_contextual_slots = 7,
+    zstandard = 8,
+    lzma2 = 9,
+    deflate = 10,
 };
 
 struct ArchiveHeader {

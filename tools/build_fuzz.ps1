@@ -38,6 +38,7 @@ $libSources = @(
     "src\archive\system_provider.cpp",
     "src\archive\zip_split_backend.cpp",
     "src\codec\block.cpp",
+    "src\codec\external_codecs.cpp",
     "src\codec\fast_lz.cpp",
     "src\codec\lz77.cpp",
     "src\codec\lz77_split.cpp",
@@ -68,8 +69,25 @@ $libSources = @(
     "src\third_party\minizip-ng\mz_strm_split.c",
     "src\third_party\minizip-ng\mz_zip.c",
     "src\third_party\minizip-ng\mz_zip_rw.c",
-    "src\third_party\monocypher\monocypher.c"
-) | ForEach-Object { "`"$Root\$_`"" }
+    "src\third_party\monocypher\monocypher.c",
+    "src\third_party\lzma-sdk\CpuArch.c",
+    "src\third_party\lzma-sdk\LzFind.c",
+    "src\third_party\lzma-sdk\LzFindOpt.c",
+    "src\third_party\lzma-sdk\LzmaEnc.c",
+    "src\third_party\lzma-sdk\LzmaDec.c",
+    "src\third_party\lzma-sdk\Lzma2Enc.c",
+    "src\third_party\lzma-sdk\Lzma2Dec.c"
+)
+$libSources += Get-ChildItem (Join-Path $Root "src\third_party\zstd\lib\common") -Filter *.c |
+    ForEach-Object FullName
+$libSources += Get-ChildItem (Join-Path $Root "src\third_party\zstd\lib\compress") -Filter *.c |
+    ForEach-Object FullName
+$libSources += Get-ChildItem (Join-Path $Root "src\third_party\zstd\lib\decompress") -Filter *.c |
+    ForEach-Object FullName
+$libSources = $libSources | ForEach-Object {
+    $path = if ([IO.Path]::IsPathRooted($_)) { $_ } else { Join-Path $Root $_ }
+    "`"$path`""
+}
 
 # Vendored BLAKE3: portable build (SIMD backends disabled).
 $blake3Defs = "/DBLAKE3_NO_AVX512 /DBLAKE3_NO_AVX2 /DBLAKE3_NO_SSE41 /DBLAKE3_NO_SSE2"
@@ -80,7 +98,7 @@ foreach ($t in $targets) {
     $objDir = Join-Path $outDir "$t-obj"
     New-Item -ItemType Directory -Force -Path $objDir | Out-Null
     $pdb = Join-Path $objDir "$t.pdb"
-    $flags = "/nologo /std:c++20 /O1 /Zi /FS /Fd:`"$pdb`" /EHsc /MD /fsanitize=fuzzer /fsanitize=address /DMZ_ZIP_NO_CRYPTO /D_CRT_SECURE_NO_DEPRECATE /D_CRT_NONSTDC_NO_DEPRECATE $blake3Defs"
+    $flags = "/nologo /std:c++20 /O1 /Zi /FS /Fd:`"$pdb`" /EHsc /MD /fsanitize=fuzzer /fsanitize=address /DMZ_ZIP_NO_CRYPTO /DZ7_ST /DZSTD_DISABLE_ASM /D_CRT_SECURE_NO_DEPRECATE /D_CRT_NONSTDC_NO_DEPRECATE $blake3Defs"
     $includes = "/I `"$Root\include`" /I `"$Root\src`""
     $inputs = ($libSources -join ' ') + " `"$Root\fuzz\$t.cpp`""
     $systemLibraries = "Ole32.lib OleAut32.lib"

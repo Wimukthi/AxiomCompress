@@ -8,6 +8,7 @@
 #include "codec/transform.hpp"
 #include "core/checksum.hpp"
 #include "core/benchmark_corpus.hpp"
+#include "core/archive.hpp"
 #include "core/cpu.hpp"
 #include "core/hash.hpp"
 #include "core/file_replace.hpp"
@@ -409,6 +410,65 @@ void expect_optimal_lz77_roundtrip(const std::vector<std::uint8_t>& input) {
     const auto lz77 = axiom::codec::encode_lz77_optimal(input, options);
     const auto restored = axiom::codec::decode_lz77(lz77, input.size());
     AXIOM_CHECK(restored == input);
+}
+
+void expect_external_codec_roundtrip(const std::vector<std::uint8_t>& input) {
+    constexpr std::array methods{
+        axiom::CompressionMethod::zstandard,
+        axiom::CompressionMethod::lzma2,
+        axiom::CompressionMethod::deflate,
+    };
+    for (const auto method : methods) {
+        axiom::CompressionOptions options;
+        options.method = method;
+        options.block_size = 256u << 10;
+        axiom::apply_compression_level(options, 5);
+        const auto archive = axiom::compress(input, options);
+        AXIOM_CHECK(archive.size() > 12);
+        AXIOM_CHECK(archive[8] == 10 && archive[9] == 0);
+        AXIOM_CHECK(archive[10] >= 8 && archive[10] <= 10);
+        AXIOM_CHECK(axiom::decompress(archive) == input);
+        if (method == axiom::CompressionMethod::lzma2) {
+            auto oversized_dictionary = archive;
+            const auto header =
+                axiom::core::read_archive_header(oversized_dictionary);
+            oversized_dictionary[header.payload_offset + 16] = 40;
+            bool bounded = false;
+            try {
+                (void)axiom::decompress(oversized_dictionary);
+            } catch (const std::exception&) {
+                bounded = true;
+            }
+            AXIOM_CHECK(bounded);
+        }
+
+        auto truncated = archive;
+        truncated.pop_back();
+        bool rejected = false;
+        try {
+            (void)axiom::decompress(truncated);
+        } catch (const std::exception&) {
+            rejected = true;
+        }
+        AXIOM_CHECK(rejected);
+    }
+}
+
+void expect_lzma_multichunk_settings_roundtrip() {
+    std::vector<std::uint8_t> input(300u << 10);
+    for (std::size_t index = 0; index < input.size(); ++index) {
+        input[index] = static_cast<std::uint8_t>(
+            "Axiom-LZMA2-parameter-boundary"[index % 30]);
+    }
+    axiom::CompressionOptions options;
+    options.method = axiom::CompressionMethod::lzma2;
+    options.codec_level = 9;
+    options.block_size = 256u << 10;
+    options.lzma_dictionary_size = 256u << 10;
+    options.lzma_fast_bytes = 273;
+    options.lzma_binary_tree = true;
+    const auto archive = axiom::compress(input, options);
+    AXIOM_CHECK(axiom::decompress(archive) == input);
 }
 
 void test_swarm_extended_levels() {
@@ -1198,6 +1258,37 @@ void test_archive_roundtrip() {
     AXIOM_CHECK(fs::exists(dest / "src" / "empty.dat"));
     AXIOM_CHECK(fs::file_size(dest / "src" / "empty.dat") == 0);
     AXIOM_CHECK(fs::is_directory(dest / "src" / "emptydir"));
+
+    std::error_code ec;
+    fs::remove_all(root, ec);
+}
+
+void test_external_codec_axar_roundtrip() {
+    const auto root = make_temp_dir();
+    const auto source = root / "codec.txt";
+    const auto original = bytes_from_string(
+        std::string(1u << 20, 'A') + std::string(1u << 20, 'B'));
+    write_all(source, original);
+
+    constexpr std::array methods{
+        axiom::CompressionMethod::zstandard,
+        axiom::CompressionMethod::lzma2,
+        axiom::CompressionMethod::deflate,
+    };
+    for (std::size_t index = 0; index < methods.size(); ++index) {
+        axiom::CompressionOptions options;
+        options.method = methods[index];
+        options.block_size = 256u << 10;
+        options.thread_count = 1;
+        const auto archive =
+            root / ("external-" + std::to_string(index) + ".axar");
+        axiom::create_archive({source}, archive, options);
+        axiom::test_archive(archive);
+        const auto destination =
+            root / ("out-" + std::to_string(index));
+        axiom::extract_archive(archive, destination, {});
+        AXIOM_CHECK(read_all(destination / source.filename()) == original);
+    }
 
     std::error_code ec;
     fs::remove_all(root, ec);
@@ -3329,6 +3420,70 @@ void test_compression_estimator() {
     AXIOM_CHECK(second.estimated_low_bytes == estimate.estimated_low_bytes);
     AXIOM_CHECK(second.estimated_high_bytes == estimate.estimated_high_bytes);
 
+    std::vector<axiom::CompressionEstimateCurveCandidate> curve_candidates;
+    for (const int level : {5, 1, 9}) {
+        axiom::CompressionOptions compression;
+        axiom::apply_compression_level(compression, level);
+        curve_candidates.push_back({level, std::move(compression)});
+    }
+    std::size_t curve_snapshot_count = 0;
+    std::uint64_t last_curve_evaluations = 0;
+    bool curve_progress_monotonic = true;
+    const auto curve = axiom::estimate_compression_curve(
+        {src}, repeated, curve_candidates,
+        [&](const axiom::CompressionEstimateCurveResult& snapshot) {
+            curve_progress_monotonic =
+                curve_progress_monotonic &&
+                snapshot.completed_evaluations >=
+                    last_curve_evaluations;
+            last_curve_evaluations =
+                snapshot.completed_evaluations;
+            ++curve_snapshot_count;
+        });
+    AXIOM_CHECK(curve.complete);
+    AXIOM_CHECK(curve.source_bytes == estimate.source_bytes);
+    AXIOM_CHECK(curve.sampled_bytes == estimate.source_bytes);
+    AXIOM_CHECK(curve.points.size() == curve_candidates.size());
+    AXIOM_CHECK(curve.completed_evaluations ==
+                curve.total_evaluations);
+    AXIOM_CHECK(curve_snapshot_count > curve.points.size());
+    AXIOM_CHECK(curve_progress_monotonic);
+    for (std::size_t index = 0; index < curve.points.size(); ++index) {
+        const auto& point = curve.points[index];
+        AXIOM_CHECK(point.level == curve_candidates[index].level);
+        AXIOM_CHECK(point.complete);
+        AXIOM_CHECK(point.sampled_bytes == curve.sampled_bytes);
+        AXIOM_CHECK(point.completed_probes == point.total_probes);
+        AXIOM_CHECK(point.estimated_archive_bytes > 0);
+        AXIOM_CHECK(point.estimated_low_bytes <=
+                    point.estimated_archive_bytes);
+        AXIOM_CHECK(point.estimated_high_bytes >=
+                    point.estimated_archive_bytes);
+    }
+    const auto level_one = std::find_if(
+        curve.points.begin(), curve.points.end(),
+        [](const auto& point) { return point.level == 1; });
+    const auto level_nine = std::find_if(
+        curve.points.begin(), curve.points.end(),
+        [](const auto& point) { return point.level == 9; });
+    AXIOM_CHECK(level_one != curve.points.end());
+    AXIOM_CHECK(level_nine != curve.points.end());
+    AXIOM_CHECK(level_nine->estimated_archive_bytes <=
+                level_one->estimated_archive_bytes);
+
+    auto cancelled_curve_options = repeated;
+    cancelled_curve_options.compression.operation =
+        std::make_shared<axiom::OperationControl>();
+    expect_throws([&] {
+        (void)axiom::estimate_compression_curve(
+            {src}, cancelled_curve_options, curve_candidates,
+            [operation =
+                 cancelled_curve_options.compression.operation](
+                const axiom::CompressionEstimateCurveResult&) {
+                operation->request_cancel();
+            });
+    });
+
     const auto uniform = root / "adaptive-uniform.bin";
     write_all(uniform, std::vector<std::uint8_t>(16u << 20, 0x5a));
     axiom::CompressionEstimateOptions adaptive;
@@ -3745,6 +3900,8 @@ int main() {
         repeated += "function compressBlock(input, context) { return input + context; }\n";
     }
     expect_roundtrip(bytes_from_string(repeated));
+    expect_external_codec_roundtrip(bytes_from_string(repeated));
+    expect_lzma_multichunk_settings_roundtrip();
     expect_huffman_roundtrip(bytes_from_string(repeated));
     expect_order1_roundtrip(bytes_from_string(repeated));
     expect_rans_roundtrip(bytes_from_string(repeated));
@@ -3864,6 +4021,7 @@ int main() {
     test_rans_edges();
     test_rans_contextual_edges();
     test_archive_roundtrip();
+    test_external_codec_axar_roundtrip();
     test_archive_provider_layer();
     test_zip_provider_layer();
     test_safe_file_replacement();

@@ -346,19 +346,18 @@ private:
     }
 
     void accept() {
-        std::wstring destination = window_text(destination_edit_);
-        const auto first = destination.find_first_not_of(L" \t\r\n");
-        const auto last = destination.find_last_not_of(L" \t\r\n");
-        if (first == std::wstring::npos) destination.clear();
-        else destination = destination.substr(first, last - first + 1);
-        if (destination.empty()) {
+        const auto destination = validate_dialog_path(
+            window_text(destination_edit_), DialogPathKind::destination_folder);
+        if (!destination) {
             show_message_dialog(window_, instance_, dpi_, dark_, L"Axiom Self-Extractor",
-                                L"Choose a destination folder before extracting.",
+                                destination.error,
                                 MessageDialogIcon::warning);
             SetFocus(destination_edit_);
+            SendMessageW(destination_edit_, EM_SETSEL, 0, -1);
             return;
         }
-        options_.destination = destination;
+        SetWindowTextW(destination_edit_, destination.path.c_str());
+        options_.destination = destination.path;
         const int overwrite = static_cast<int>(SendMessageW(overwrite_combo_, CB_GETCURSEL, 0, 0));
         options_.overwrite = overwrite == 1 ? ExtractOptions::Overwrite::skip
             : overwrite == 2 ? ExtractOptions::Overwrite::fail

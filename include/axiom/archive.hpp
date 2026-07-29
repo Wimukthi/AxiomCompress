@@ -96,6 +96,44 @@ struct CompressionEstimateResult {
     std::vector<OperationWarning> warnings;
 };
 
+// One point in a compression-level prognosis. Every point in a curve is
+// evaluated against the same source regions, so differences between adjacent
+// levels come from the codec rather than from sampling different bytes.
+struct CompressionEstimateCurveCandidate {
+    int level = 0;
+    CompressionOptions compression;
+};
+
+struct CompressionEstimateCurvePoint {
+    int level = 0;
+    EstimateConfidence confidence = EstimateConfidence::low;
+    std::uint64_t sampled_bytes = 0;
+    std::uint64_t estimated_archive_bytes = 0;
+    std::uint64_t estimated_low_bytes = 0;
+    std::uint64_t estimated_high_bytes = 0;
+    std::uint64_t estimated_seconds = 0;
+    std::uint64_t completed_probes = 0;
+    std::uint64_t total_probes = 0;
+    double estimated_ratio = 0.0;
+    double estimated_savings_percent = 0.0;
+    double confidence_margin_percent = 0.0;
+    bool complete = false;
+};
+
+struct CompressionEstimateCurveResult {
+    ArchiveFormat format = ArchiveFormat::axar;
+    std::uint64_t source_bytes = 0;
+    std::uint64_t sampled_bytes = 0;
+    std::uint64_t planned_sample_bytes = 0;
+    std::uint64_t file_count = 0;
+    std::uint64_t item_count = 0;
+    std::uint64_t completed_evaluations = 0;
+    std::uint64_t total_evaluations = 0;
+    bool complete = false;
+    std::vector<CompressionEstimateCurvePoint> points;
+    std::vector<OperationWarning> warnings;
+};
+
 struct ArchiveFormatInfo {
     ArchiveFormat format = ArchiveFormat::axar;
     std::string_view id;
@@ -328,6 +366,13 @@ void create_archive(const std::vector<std::filesystem::path>& inputs,
 CompressionEstimateResult estimate_compression(
     const std::vector<std::filesystem::path>& inputs,
     const CompressionEstimateOptions& options = {});
+
+CompressionEstimateCurveResult estimate_compression_curve(
+    const std::vector<std::filesystem::path>& inputs,
+    const CompressionEstimateOptions& options,
+    std::span<const CompressionEstimateCurveCandidate> candidates,
+    const std::function<void(const CompressionEstimateCurveResult&)>&
+        progress_callback = {});
 
 // Add files/directories to an existing archive. Existing files are not
 // recompressed — their solid blocks are copied verbatim and new files become new

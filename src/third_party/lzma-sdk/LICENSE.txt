@@ -1,0 +1,6 @@
+The LZMA SDK C source files bundled in this directory are public domain.
+
+Upstream: https://www.7-zip.org/sdk.html
+Snapshot: 26.02
+
+Each upstream source file also carries its own public-domain notice.

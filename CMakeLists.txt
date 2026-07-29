@@ -40,6 +40,23 @@ set(MINIZ_SOURCES
     src/third_party/miniz/miniz_tinfl.c
     src/third_party/miniz/miniz_zip.c)
 
+# Bundled AXC codec backends. Zstandard 1.5.7 is built from its official C
+# sources with assembly disabled for portable Release/CI builds. The public
+# domain LZMA SDK is intentionally built single-threaded inside each chunk;
+# Axiom owns the operation-wide worker budget and parallelism.
+file(GLOB ZSTD_SOURCES CONFIGURE_DEPENDS
+    src/third_party/zstd/lib/common/*.c
+    src/third_party/zstd/lib/compress/*.c
+    src/third_party/zstd/lib/decompress/*.c)
+set(LZMA_SDK_SOURCES
+    src/third_party/lzma-sdk/CpuArch.c
+    src/third_party/lzma-sdk/LzFind.c
+    src/third_party/lzma-sdk/LzFindOpt.c
+    src/third_party/lzma-sdk/LzmaEnc.c
+    src/third_party/lzma-sdk/LzmaDec.c
+    src/third_party/lzma-sdk/Lzma2Enc.c
+    src/third_party/lzma-sdk/Lzma2Dec.c)
+
 # minizip-ng's raw container/split-stream core. Axiom uses this narrow backend
 # to preserve completed ZIP entries while producing or joining standard split
 # sets; normal ZIP Deflate remains on the established miniz provider path.
@@ -70,6 +87,7 @@ add_library(axiom STATIC
     src/archive/zip_split_backend.cpp
     src/archive/system_provider.cpp
     src/codec/block.cpp
+    src/codec/external_codecs.cpp
     src/codec/fast_lz.cpp
     src/codec/lz77.cpp
     src/codec/lz77_split.cpp
@@ -88,8 +106,14 @@ add_library(axiom STATIC
     ${BLAKE3_SOURCES}
     ${MONOCYPHER_SOURCES}
     ${MINIZ_SOURCES}
+    ${ZSTD_SOURCES}
+    ${LZMA_SDK_SOURCES}
     ${MINIZIP_NG_SOURCES})
 
+set_source_files_properties(${ZSTD_SOURCES} PROPERTIES
+    COMPILE_DEFINITIONS "ZSTD_DISABLE_ASM")
+set_source_files_properties(${LZMA_SDK_SOURCES} PROPERTIES
+    COMPILE_DEFINITIONS "Z7_ST")
 set_source_files_properties(${MINIZIP_NG_SOURCES} PROPERTIES
     COMPILE_DEFINITIONS "MZ_ZIP_NO_CRYPTO;_CRT_SECURE_NO_DEPRECATE;_CRT_NONSTDC_NO_DEPRECATE")
 
@@ -107,14 +131,14 @@ endif()
 
 if(MSVC)
     target_compile_options(axiom PRIVATE /W4 /permissive-)
-    set_source_files_properties(${BLAKE3_SOURCES} ${MONOCYPHER_SOURCES} ${MINIZ_SOURCES} ${MINIZIP_NG_SOURCES} PROPERTIES COMPILE_OPTIONS /w)
+    set_source_files_properties(${BLAKE3_SOURCES} ${MONOCYPHER_SOURCES} ${MINIZ_SOURCES} ${ZSTD_SOURCES} ${LZMA_SDK_SOURCES} ${MINIZIP_NG_SOURCES} PROPERTIES COMPILE_OPTIONS /w)
     if(AXIOM_X86)
         set_source_files_properties(src/third_party/blake3/blake3_avx2.c PROPERTIES COMPILE_OPTIONS "/w;/arch:AVX2")
         set_source_files_properties(src/third_party/blake3/blake3_avx512.c PROPERTIES COMPILE_OPTIONS "/w;/arch:AVX512")
     endif()
 else()
     target_compile_options(axiom PRIVATE -Wall -Wextra -Wpedantic)
-    set_source_files_properties(${BLAKE3_SOURCES} ${MONOCYPHER_SOURCES} ${MINIZ_SOURCES} ${MINIZIP_NG_SOURCES} PROPERTIES COMPILE_OPTIONS -w)
+    set_source_files_properties(${BLAKE3_SOURCES} ${MONOCYPHER_SOURCES} ${MINIZ_SOURCES} ${ZSTD_SOURCES} ${LZMA_SDK_SOURCES} ${MINIZIP_NG_SOURCES} PROPERTIES COMPILE_OPTIONS -w)
     if(AXIOM_X86)
         set_source_files_properties(src/core/checksum_clmul.cpp PROPERTIES COMPILE_OPTIONS "-msse4.1;-mpclmul")
         set_source_files_properties(src/third_party/blake3/blake3_sse2.c PROPERTIES COMPILE_OPTIONS "-w;-msse2")

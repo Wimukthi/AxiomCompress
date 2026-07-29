@@ -1,6 +1,7 @@
 #include "core/archive.hpp"
 
 #include "codec/block.hpp"
+#include "codec/external_codecs.hpp"
 #include "codec/incompressible.hpp"
 #include "codec/lz77.hpp"
 #include "codec/lz77_split.hpp"
@@ -37,6 +38,7 @@ constexpr std::uint16_t kSequenceVersion = 6;
 constexpr std::uint16_t kContextSplitVersion = 7;
 constexpr std::uint16_t kContextualFooterVersion = 8;
 constexpr std::uint16_t kVersion = 9;
+constexpr std::uint16_t kExternalCodecVersion = 10;
 constexpr std::size_t kLegacyHeaderSize = 32;
 constexpr std::size_t kHeaderSize = 36;
 constexpr std::uint8_t kFlagTransforms = 1u << 0;
@@ -211,7 +213,14 @@ ByteVector write_archive(std::span<const std::uint8_t> payload,
     output.reserve(kHeaderSize + transform_metadata.size() + payload.size());
 
     output.insert(output.end(), kMagic.begin(), kMagic.end());
-    write_u16(output, kVersion);
+    const bool external_codec =
+        header.codec == CodecId::zstandard ||
+        header.codec == CodecId::lzma2 ||
+        header.codec == CodecId::deflate;
+    const auto version = header.format_version != 0
+        ? header.format_version
+        : external_codec ? kExternalCodecVersion : kVersion;
+    write_u16(output, version);
     output.push_back(static_cast<std::uint8_t>(header.codec));
     output.push_back(header.transform_ranges.empty() ? 0 : kFlagTransforms);
     write_u64(output, header.original_size);
@@ -237,7 +246,8 @@ ArchiveHeader read_archive_header(std::span<const std::uint8_t> archive) {
     const auto version = read_u16(archive, cursor);
     if (version != kLegacyVersion && version != kTransformVersion &&
         version != kSequenceVersion && version != kContextSplitVersion &&
-        version != kContextualFooterVersion && version != kVersion) {
+        version != kContextualFooterVersion && version != kVersion &&
+        version != kExternalCodecVersion) {
         throw FormatError("unsupported archive version");
     }
 
@@ -264,6 +274,15 @@ ArchiveHeader read_archive_header(std::span<const std::uint8_t> archive) {
     } else if (codec_byte == static_cast<std::uint8_t>(CodecId::lz77_contextual_slots) &&
                version >= kContextualFooterVersion) {
         header.codec = CodecId::lz77_contextual_slots;
+    } else if (codec_byte == static_cast<std::uint8_t>(CodecId::zstandard) &&
+               version >= kExternalCodecVersion) {
+        header.codec = CodecId::zstandard;
+    } else if (codec_byte == static_cast<std::uint8_t>(CodecId::lzma2) &&
+               version >= kExternalCodecVersion) {
+        header.codec = CodecId::lzma2;
+    } else if (codec_byte == static_cast<std::uint8_t>(CodecId::deflate) &&
+               version >= kExternalCodecVersion) {
+        header.codec = CodecId::deflate;
     } else {
         throw FormatError("unsupported codec id");
     }
@@ -331,7 +350,8 @@ ByteVector compress(std::span<const std::uint8_t> input,
     const auto original_input = input;
     ByteVector transformed_input;
     std::vector<CompressionTransformRange> active_transforms;
-    if (options.enable_file_filters && !options.force_store && !input.empty()) {
+    if (options.enable_file_filters && !options.force_store &&
+        options.method != CompressionMethod::store && !input.empty()) {
         std::vector<CompressionTransformRange> requested = options.transform_ranges;
         if (requested.empty()) {
             requested = codec::detect_transform_ranges(input);
@@ -379,7 +399,25 @@ ByteVector compress(std::span<const std::uint8_t> input,
     std::size_t best_size = input.size();
     std::optional<std::uint32_t> payload_crc;
 
-    if (options.force_store) {
+    if (options.method == CompressionMethod::zstandard ||
+        options.method == CompressionMethod::lzma2 ||
+        options.method == CompressionMethod::deflate) {
+        payload = codec::encode_external_codec(input, options.method, options);
+        if (payload.size() >= input.size()) {
+            payload.clear();
+            return finish_archive(std::move(payload), core::CodecId::store);
+        }
+        if (options.method == CompressionMethod::zstandard) {
+            codec = core::CodecId::zstandard;
+        } else if (options.method == CompressionMethod::lzma2) {
+            codec = core::CodecId::lzma2;
+        } else {
+            codec = core::CodecId::deflate;
+        }
+        return finish_archive(std::move(payload), codec);
+    }
+
+    if (options.force_store || options.method == CompressionMethod::store) {
     } else if (!options.force_parallel_blocks && codec::likely_incompressible(input)) {
     } else {
         auto parallel_options = options;
@@ -719,6 +757,18 @@ ByteVector decompress(std::span<const std::uint8_t> archive,
             header.format_version >= core::kContextualFooterVersion,
             header.format_version >= core::kVersion);
         restored_crc = combined_crc;
+    } else if (header.codec == core::CodecId::zstandard) {
+        restored = codec::decode_external_codec(
+            payload, CompressionMethod::zstandard,
+            core::checked_size(header.original_size, "original size"), options);
+    } else if (header.codec == core::CodecId::lzma2) {
+        restored = codec::decode_external_codec(
+            payload, CompressionMethod::lzma2,
+            core::checked_size(header.original_size, "original size"), options);
+    } else if (header.codec == core::CodecId::deflate) {
+        restored = codec::decode_external_codec(
+            payload, CompressionMethod::deflate,
+            core::checked_size(header.original_size, "original size"), options);
     } else {
         throw FormatError("unsupported codec id");
     }

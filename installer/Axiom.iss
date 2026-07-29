@@ -67,6 +67,8 @@ Source: "{#SourceRoot}\ARCHITECTURE.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceRoot}\FORMAT.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceRoot}\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceRoot}\THIRD_PARTY_NOTICES.md"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#SourceRoot}\src\third_party\zstd\LICENSE"; DestDir: "{app}\licenses"; DestName: "Zstandard-BSD.txt"; Flags: ignoreversion
+Source: "{#SourceRoot}\src\third_party\lzma-sdk\LICENSE.txt"; DestDir: "{app}\licenses"; DestName: "LZMA-SDK-Public-Domain.txt"; Flags: ignoreversion
 Source: "{#SourceRoot}\docs\*"; DestDir: "{app}\docs"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "{#ThemeRoot}\LICENSE"; DestDir: "{app}\licenses"; DestName: "Wimukthi.Win32Theme-LICENSE.txt"; Flags: ignoreversion
 Source: "{#ThemeRoot}\THIRD_PARTY_NOTICES.md"; DestDir: "{app}\licenses"; DestName: "Wimukthi.Win32Theme-NOTICES.md"; Flags: ignoreversion

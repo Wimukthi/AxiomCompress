@@ -56,7 +56,7 @@ jobs:
           cxx_srcs="src/archive/container.cpp src/archive/container_formats.cpp \
                     src/archive/container_zip.cpp src/archive/system_provider.cpp \
                     src/archive/zip_split_backend.cpp \
-                    src/codec/block.cpp src/codec/fast_lz.cpp \
+                    src/codec/block.cpp src/codec/external_codecs.cpp src/codec/fast_lz.cpp \
                     src/codec/lz77.cpp src/codec/lz77_split.cpp src/codec/transform.cpp \
                     src/core/archive.cpp \
                     src/core/checksum.cpp src/core/cpu.cpp src/core/crypto.cpp \
@@ -66,6 +66,16 @@ jobs:
                   src/third_party/blake3/blake3_portable.c \
                   src/third_party/miniz/miniz.c src/third_party/miniz/miniz_tdef.c \
                   src/third_party/miniz/miniz_tinfl.c src/third_party/miniz/miniz_zip.c \
+                  src/third_party/zstd/lib/common/*.c \
+                  src/third_party/zstd/lib/compress/*.c \
+                  src/third_party/zstd/lib/decompress/*.c \
+                  src/third_party/lzma-sdk/CpuArch.c \
+                  src/third_party/lzma-sdk/LzFind.c \
+                  src/third_party/lzma-sdk/LzFindOpt.c \
+                  src/third_party/lzma-sdk/LzmaEnc.c \
+                  src/third_party/lzma-sdk/LzmaDec.c \
+                  src/third_party/lzma-sdk/Lzma2Enc.c \
+                  src/third_party/lzma-sdk/Lzma2Dec.c \
                   src/third_party/minizip-ng/mz_crypt.c \
                   src/third_party/minizip-ng/mz_os.c \
                   src/third_party/minizip-ng/mz_os_posix.c \
@@ -88,6 +98,7 @@ jobs:
             clang -std=c17 -O1 -g -fsanitize=address \
               -D_POSIX_C_SOURCE=200809L -D_FILE_OFFSET_BITS=64 \
               -DMZ_ZIP_NO_CRYPTO \
+              -DZ7_ST -DZSTD_DISABLE_ASM \
               -DBLAKE3_NO_AVX512 -DBLAKE3_NO_AVX2 -DBLAKE3_NO_SSE41 -DBLAKE3_NO_SSE2 \
               -Iinclude -Isrc -c "$src" -o "$obj"
             c_objs+=("$obj")

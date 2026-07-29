@@ -8,7 +8,8 @@ Use this document when you need to know where a feature belongs:
 
 | Area | Owns |
 |---|---|
-| `src/codec` | Single-block compression and decompression |
+| `src/codec` | Single-block compression/decompression, including bounded external-codec adapters |
+| `src/codec/external_codecs.cpp` | Chunk envelope and bundled Zstandard, LZMA2, and Deflate adapters |
 | `src/archive` | `.axar` container, metadata, encryption, recovery, volumes, signing, SFX |
 | `src/archive/container.cpp` | The AXAR engine: directory parsing, solid blocks, encryption, recovery, volumes, signing, SFX |
 | `src/archive/container_zip.cpp` | ZIP read/write: miniz wrappers, ZipCrypto/AES-256 entries, the ZIP provider |
@@ -98,6 +99,20 @@ The container embeds one `axiom::compress` `.axc` stream per solid block, so the
 single-stream codec and the archive share exactly the same encode/decode path.
 The decoder is deliberately simple and bounded (see "Decoder Rule"); all the
 complexity lives in the encoder.
+
+`CompressionOptions::method` selects Axiom adaptive, Zstandard, LZMA2, Deflate,
+or Store. Axiom remains the default and continues to emit AXC v9. The three
+external codecs emit AXC v10 with a small `AXEC` payload envelope. That envelope
+splits input into independently decodable chunks, records exact raw and encoded
+sizes, and permits a stored fallback per chunk. The decoder validates the
+geometry and total restored size before invoking a backend, allocates only the
+header-declared bounded output, requires exact input consumption, and rejects
+trailing data. Operation checkpoints between chunks preserve pause/cancel and
+keep progress reporting independent of backend callback frequency.
+
+The codec selection is below the AXAR service boundary. Encryption, signatures,
+recovery records, split volumes, metadata, directory layout, and SFX packaging
+wrap the completed AXC bytes and therefore require no codec-specific branches.
 
 ### Archive API shape
 
@@ -431,6 +446,23 @@ sorted stream of relative UTF-8 paths, lengths, and file contents. Timed passes
 call the in-memory AXC `compress()` and `decompress()` APIs, retain source,
 archive, and restored buffers in RAM, and compare the result byte-for-byte after
 each pass. Disk reads during custom-input preparation are never part of timing.
+
+### Compression prognosis
+
+`estimate_compression_curve()` is the shared multi-level estimator used by the
+Add-to-archive dialog. It scans the selected inputs once, plans one set of
+representative regions, reads and transforms each region once, then evaluates
+every requested codec level against those identical bytes. Each point carries
+projected archive bytes, ratio, saving, confidence interval, sample coverage,
+and completion counters. A point is never compared with another point sampled
+from a different part of the input.
+
+The estimator is cooperative rather than GUI-aware. It reports immutable curve
+snapshots through a callback and checks `OperationControl` between bounded
+probes. The Win32 dialog owns debounce, cancellation, session caching, and
+painting: settings that change the codec restart the worker after a short quiet
+period, while a level-only change moves the selected marker immediately. No
+estimation worker reads HWND state or paints directly.
 
 ## Decoder Rule
 

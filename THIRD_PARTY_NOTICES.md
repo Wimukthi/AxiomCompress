@@ -31,3 +31,8 @@ vendored source under `licenses/source/darkmodelib`.
 The remaining bundled components keep their notices in `src/third_party`,
 `third_party`, and the installed `backends` directory. See the list in
 `README.md` for their roles and licenses.
+
+AXAR's optional codec backends include Zstandard 1.5.7 under its BSD license
+(`src/third_party/zstd/LICENSE`) and the public-domain LZMA SDK 26.02
+(`src/third_party/lzma-sdk/LICENSE.txt`). Deflate uses the already bundled
+MIT-licensed miniz implementation.

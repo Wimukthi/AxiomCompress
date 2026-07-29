@@ -1626,8 +1626,14 @@ BenchmarkParams collect_params(BenchmarkDialogState* state) {
             throw std::runtime_error("choose a custom benchmark file or folder, or clear the custom input checkbox");
         }
         std::error_code ec;
-        if (!fs::exists(path, ec)) {
-            throw std::runtime_error("custom benchmark input does not exist");
+        const fs::file_status status = fs::status(path, ec);
+        if (ec) {
+            throw std::runtime_error(
+                "custom benchmark input cannot be accessed; check the path and permissions");
+        }
+        if (!fs::is_regular_file(status) && !fs::is_directory(status)) {
+            throw std::runtime_error(
+                "custom benchmark input must be a regular file or folder");
         }
         params.custom_input = fs::path(path);
     }
@@ -1664,6 +1670,10 @@ void start_benchmark(BenchmarkDialogState* state) {
                             L"Axiom Benchmark",
                             std::wstring(ex.what(), ex.what() + std::strlen(ex.what())),
                             MessageDialogIcon::warning);
+        if (state->custom_input_checked) {
+            SetFocus(state->custom_path);
+            SendMessageW(state->custom_path, EM_SETSEL, 0, -1);
+        }
         return;
     }
     state->operation = std::make_shared<axiom::OperationControl>();

@@ -42,6 +42,8 @@ Most users need one of these paths:
   streams, symlinks, hardlinks, comments, locking, and archive editing.
 - Solid blocks for cross-file compression while keeping each block independently
   decodable for selective extraction.
+- Selectable AXAR block codecs: Axiom adaptive (default), Zstandard, LZMA2,
+  Deflate, and Store. The archive services above the codec remain identical.
 - Automatic file-type grouping plus reversible x86 branch and PCM/raster delta
   filters. A fast trial keeps a filter only when it predicts a net size win.
 - Per-block CRC checks, per-file CRC-32, and per-file BLAKE3-256 hashes.
@@ -221,15 +223,37 @@ Archive creation uses one resizable tabbed dialog:
 
 | Tab | Contains |
 |---|---|
-| Compression | Level, dictionary size, word size, solid block size, threads |
+| Compression | Format-aware method, method level, dictionary/word settings, solid block size, threads |
 | General | Update mode, archive comment, metadata notes |
 | Security | Password, filename encryption, show-password toggle |
 | Recovery & volumes | Recovery record, split volume size, recovery volumes |
 | SFX & signing | Self-extracting output and archive signing |
 
-The output path and effective-output preview stay visible across tabs. If SFX is
-enabled, the final output is the merged `.exe`; Axiom does not leave a separate
-archive next to it.
+The output path stays visible across tabs. If SFX is enabled, that field becomes
+the final merged `.exe` path; Axiom does not leave a separate archive next to
+it.
+
+For AXAR, the Method list offers Axiom adaptive, Zstandard, LZMA2, Deflate, and
+Store. The dialog rebuilds the level list for that codec and enables only
+meaningful controls: Axiom exposes its threading model, LZMA2 exposes
+dictionary/word size plus HC4/BT4, and Zstandard/Deflate keep their native
+levels. ZIP creation is intentionally limited to standard Deflate or Store.
+These choices can be saved in compression profiles and as the application
+default.
+
+The five built-in profiles target text/source, executables, structured data,
+already-compressed media, and mixed folders. User profiles also preserve the
+selected method, native codec level, LZMA2 match finder, dictionary/word size,
+solid-block size, thread count, and threading model.
+
+For AXAR and ZIP, the right side of the Compression tab shows a live
+compression prognosis across every level supported by the selected method.
+All points use the same sampled source regions, so the curve compares codecs
+rather than sampling noise. Blue represents the predicted compressed bytes,
+green represents the predicted saving, and the neutral band is the uncertainty
+range. Select a point to choose that level. Changing source-affecting settings
+cancels and debounces the old estimate; changing only the selected level moves
+the highlight without rescanning the files.
 
 ### Dark mode and DPI
 
@@ -311,6 +335,8 @@ Common archive commands:
 
 ```powershell
 axiomc a --level 9 archive.axar mydir
+axiomc a --method zstd --codec-level 12 archive.axar mydir
+axiomc a --method lzma2 --codec-level 7 --window 128M --block-size 128M --lzma-mf bt4 archive.axar mydir
 axiomc a -p "password" archive.axar private-dir
 axiomc a -p "password" --encrypt-names hidden.axar private-dir
 axiomc a archive.zip mydir
@@ -553,8 +579,9 @@ Build and run fuzz targets:
 .\tools\run_fuzz.ps1 -Seconds 60 -Target all
 ```
 
-CI builds and tests on Windows and Linux, then runs both fuzz targets on every
-push.
+CI builds and tests on Windows, Linux, and macOS. Linux and Windows also build
+and run both decode-surface fuzz targets on every push; the scheduled workflow
+uses longer fuzz durations.
 
 ## Packaging
 
@@ -574,8 +601,8 @@ installer\output\AxiomSetup-<version>-win-x64.exe
 GitHub releases also carry a portable zip asset named
 `Axiom-<version>-win-x64.zip` containing `Axiom.exe`, `axiomc.exe`,
 `AxiomSfx.bin`, the bundled
-read-only archive backend, licenses and corresponding Darkmodelib source, and
-the user/developer docs.
+read-only archive backend, bundled Zstandard/LZMA2 license files, licenses and
+corresponding Darkmodelib source, and the user/developer docs.
 
 Details: [docs/INSTALLER.md](docs/INSTALLER.md).
 
@@ -590,6 +617,8 @@ Vendored third-party components keep their license notices under
 third-party components include:
 
 - miniz 3.1.1 for ZIP read/write support, under the MIT license.
+- Zstandard 1.5.7 for the optional AXAR Zstandard codec, under the BSD license.
+- LZMA SDK 26.02 for the optional AXAR LZMA2 codec, in the public domain.
 - minizip-ng 4.2.2 container/split-stream core, privately namespaced for
   standard split-ZIP support, under the zlib license.
 - 7-Zip engine DLL for read-only 7z/RAR/ISO/CAB support, under LGPL/BSD

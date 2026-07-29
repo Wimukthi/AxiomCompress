@@ -1324,8 +1324,13 @@ bool zip_plan_selected(const ZipEntryPlan& plan, const std::vector<std::string>&
 }
 
 int zip_compression_level(const CompressionOptions& options) {
-    if (options.force_store) {
+    if (options.force_store || options.method == CompressionMethod::store) {
         return MZ_NO_COMPRESSION;
+    }
+    if (options.method == CompressionMethod::deflate) {
+        return options.codec_level == kAutomaticCodecLevel
+            ? std::clamp(options.level, 0, 9)
+            : std::clamp(options.codec_level, 0, 9);
     }
     if (options.use_fast_lz || options.max_chain_depth <= 16 || options.fast_entropy) {
         return MZ_BEST_SPEED;
@@ -1338,6 +1343,11 @@ int zip_compression_level(const CompressionOptions& options) {
 }
 
 void reject_zip_write_options(const CompressionOptions& options) {
+    if (options.method == CompressionMethod::zstandard ||
+        options.method == CompressionMethod::lzma2) {
+        throw std::runtime_error(
+            "ZIP creation supports Deflate or Store; choose AXAR for this compression method");
+    }
     if (options.encrypt_header) {
         throw std::runtime_error(
             "ZIP AES-256 encrypts file data only; use AXAR for encrypted file names");

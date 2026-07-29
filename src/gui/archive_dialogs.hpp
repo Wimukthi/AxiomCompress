@@ -198,6 +198,9 @@ struct CompressionProfile {
     std::size_t word_size = 0;
     std::size_t solid_block_size = 0;
     int thread_model = 0;
+    axiom::CompressionMethod method = axiom::CompressionMethod::axiom;
+    int codec_level = axiom::kAutomaticCodecLevel;
+    bool lzma_binary_tree = true;
 
     bool operator==(const CompressionProfile&) const = default;
 };
@@ -207,6 +210,9 @@ struct CreateArchiveDialogOptions {
     axiom::ArchiveFormat archive_format = axiom::ArchiveFormat::axar;
     bool fixed_archive_format = false;
     int level = 5;
+    axiom::CompressionMethod method = axiom::CompressionMethod::axiom;
+    int codec_level = axiom::kAutomaticCodecLevel;
+    bool lzma_binary_tree = true;
     std::size_t thread_count = 0;
     // Zero keeps the selected compression level's preset.
     std::size_t dictionary_size = 0;
@@ -233,6 +239,9 @@ struct ExtractArchiveDialogOptions {
 
 struct ApplicationDialogOptions {
     int default_level = 5;
+    axiom::CompressionMethod default_method = axiom::CompressionMethod::axiom;
+    int default_codec_level = axiom::kAutomaticCodecLevel;
+    bool default_lzma_binary_tree = true;
     std::size_t default_thread_count = 0;
     std::size_t default_dictionary_size = 0;
     std::size_t default_word_size = 0;
@@ -314,7 +323,7 @@ struct ApplicationDialogOptions {
 };
 
 bool show_create_archive_dialog(HWND owner,
-                                std::size_t input_count,
+                                const std::vector<std::filesystem::path>& inputs,
                                 CreateArchiveDialogOptions& options);
 bool show_extract_archive_dialog(HWND owner,
                                  const std::filesystem::path& archive_path,

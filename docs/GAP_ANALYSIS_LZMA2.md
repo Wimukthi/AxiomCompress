@@ -8,6 +8,12 @@ work can continue on any machine. Raw data lives in
 that produced it are [`bench/gap_analysis.py`](../bench/gap_analysis.py) and
 [`bench/axc_inspect.py`](../bench/axc_inspect.py).
 
+Scope note: these measurements and byte targets are specifically for the native
+**Axiom adaptive** AXC v9 method. AXC v10 can now wrap bundled Zstandard,
+LZMA2, or Deflate streams, but selecting LZMA2 as an archive method is not an
+answer to this research goal; the goal remains improving Axiom's own bounded,
+table-driven decoder and encoder-chosen representation.
+
 ## Goal and targets
 
 Beat LZMA2 on silesia.tar compression ratio while keeping roughly 2x its

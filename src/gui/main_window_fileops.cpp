@@ -28,6 +28,14 @@ struct CommandInputField {
     std::wstring validation_message;
 };
 
+struct CommandInputValidationError {
+    std::size_t field_index = 0;
+    std::wstring message;
+};
+
+using CommandInputValidator = std::function<std::optional<CommandInputValidationError>(
+    const std::vector<CommandInputField>&)>;
+
 struct CommandInputDialogState {
     HWND window{};
     HWND owner{};
@@ -48,6 +56,7 @@ struct CommandInputDialogState {
     std::wstring heading_text;
     std::wstring placement_name;
     std::vector<CommandInputField>* fields{};
+    CommandInputValidator validator;
 };
 
 std::optional<unsigned> parse_unsigned_field(std::wstring text, unsigned maximum);
@@ -249,6 +258,20 @@ LRESULT CALLBACK command_input_dialog_proc(HWND hwnd, UINT message,
                         }
                         field.value = value;
                     }
+                    if (state->validator) {
+                        if (const auto error = state->validator(*state->fields)) {
+                            show_message_dialog(
+                                hwnd, state->instance, state->dpi, state->dark,
+                                state->title, error->message,
+                                MessageDialogIcon::warning);
+                            if (error->field_index < state->edits.size()) {
+                                SetFocus(state->edits[error->field_index]);
+                                SendMessageW(state->edits[error->field_index],
+                                             EM_SETSEL, 0, -1);
+                            }
+                            return 0;
+                        }
+                    }
                 }
                 state->accepted = true;
                 save_named_window_placement(state->placement_name, hwnd);
@@ -316,7 +339,8 @@ bool show_command_input_dialog(HWND owner,
                                std::wstring title,
                                std::wstring heading,
                                std::vector<CommandInputField>& fields,
-                               std::wstring placement_name) {
+                               std::wstring placement_name,
+                               CommandInputValidator validator = {}) {
     if (instance == nullptr) instance = GetModuleHandleW(nullptr);
     const UINT dpi = owner != nullptr ? GetDpiForWindow(owner) : GetDpiForSystem();
     CommandInputDialogState state{};
@@ -328,6 +352,7 @@ bool show_command_input_dialog(HWND owner,
     state.heading_text = std::move(heading);
     state.placement_name = std::move(placement_name);
     state.fields = &fields;
+    state.validator = std::move(validator);
 
     WNDCLASSEXW window_class{};
     window_class.cbSize = sizeof(window_class);
@@ -814,9 +839,22 @@ std::wstring MainWindow::suggested_archive_stem_for_inputs(
 }
 
 bool MainWindow::output_collides_with_input(const fs::path& output,
-                                       const std::vector<fs::path>& paths) {
+                                        const std::vector<fs::path>& paths) {
     for (const auto& path : paths) {
         if (same_filesystem_path(output, path)) return true;
+        std::error_code type_error;
+        if (!fs::is_directory(path, type_error) || type_error) continue;
+        std::error_code input_error;
+        std::error_code output_error;
+        const fs::path input_root = fs::weakly_canonical(path, input_error);
+        const fs::path normalized_output =
+            fs::weakly_canonical(output, output_error);
+        if (input_error || output_error) continue;
+        const fs::path relative = normalized_output.lexically_relative(input_root);
+        if (!relative.empty() && relative.native() != L"." &&
+            *relative.begin() != L"..") {
+            return true;
+        }
     }
     return false;
 }
@@ -1707,6 +1745,10 @@ void MainWindow::create_archive_from_paths(
 
     axiom::gui::CreateArchiveDialogOptions dialog_options;
     dialog_options.level = application_options_.default_level;
+    dialog_options.method = application_options_.default_method;
+    dialog_options.codec_level = application_options_.default_codec_level;
+    dialog_options.lzma_binary_tree =
+        application_options_.default_lzma_binary_tree;
     dialog_options.thread_count = application_options_.default_thread_count;
     dialog_options.dictionary_size = selected_dictionary_size_ != 0
         ? selected_dictionary_size_
@@ -1806,7 +1848,7 @@ void MainWindow::create_archive_from_paths(
         }
     }
     const bool accepted = axiom::gui::show_create_archive_dialog(
-        hwnd_, paths.size(), dialog_options);
+        hwnd_, paths, dialog_options);
     if (dialog_options.compression_profiles_changed) {
         application_options_.compression_profiles = dialog_options.compression_profiles;
         save_current_settings();
@@ -1815,6 +1857,9 @@ void MainWindow::create_archive_from_paths(
 
     inputs_ = std::move(paths);
     selected_level_ = dialog_options.level;
+    selected_method_ = dialog_options.method;
+    selected_codec_level_ = dialog_options.codec_level;
+    selected_lzma_binary_tree_ = dialog_options.lzma_binary_tree;
     selected_thread_count_ = dialog_options.thread_count;
     selected_dictionary_size_ = dialog_options.dictionary_size;
     selected_word_size_ = dialog_options.word_size;
@@ -2177,6 +2222,17 @@ void MainWindow::on_split_archive() {
         return;
     }
     if (busy_) return;
+    std::error_code archive_size_error;
+    const std::uint64_t archive_size = fs::file_size(archive, archive_size_error);
+    if (archive_size_error || archive_size < 2) {
+        show_app_message(
+            archive_size_error
+                ? L"Axiom could not read the selected archive's size."
+                : L"The archive is too small to split into multiple volumes.",
+            axiom::gui::MessageDialogIcon::warning,
+            L"Split archive");
+        return;
+    }
     const auto active = active_archive_path();
     const bool is_active = active && same_filesystem_path(*active, archive);
     const auto* provider = is_active
@@ -2201,6 +2257,11 @@ void MainWindow::on_split_archive() {
         ? L"700M"
         : application_options_.default_volume_size +
               kUnitSuffixes[std::clamp(application_options_.default_volume_unit, 0, 3)];
+    const auto configured_volume = parse_size_setting(default_volume);
+    if (!configured_volume || *configured_volume >= archive_size) {
+        const std::uint64_t suggested = std::max<std::uint64_t>(1, archive_size / 2);
+        default_volume = std::to_wstring(suggested) + L" B";
+    }
     const bool zip = provider->info().format == axiom::ArchiveFormat::zip;
     std::vector<CommandInputField> fields{{
         L"Volume size (byte size)", std::move(default_volume), ES_AUTOHSCROLL,
@@ -2217,14 +2278,52 @@ void MainWindow::on_split_archive() {
             L"Unsigned integer count from 0 through 100000.",
             L"Recovery volume count must be an integer from 0 through 100000."});
     }
+    const std::wstring archive_size_text = format_size(archive_size);
     if (!show_command_input_dialog(
             hwnd_, instance_, L"Split archive",
             zip
                 ? L"Create a standard .z01, .z02, ..., .zip set beside the source archive.\n\n"
-                  L"Use K, M, G, or T suffixes for volume size. Split ZIP sets are read-only."
+                  L"Archive size: " + archive_size_text +
+                      L". The volume size must be smaller than the archive. Split ZIP sets are read-only."
                 : L"Create numbered Axiom volumes beside the source archive.\n\n"
-                  L"Use K, M, G, or T suffixes for volume size. Recovery volumes are optional.",
-            fields, L"Dialog.SplitArchive")) {
+                  L"Archive size: " + archive_size_text +
+                      L". The volume size must be smaller than the archive; recovery volumes are optional.",
+            fields, L"Dialog.SplitArchive",
+            [archive_size, zip](const std::vector<CommandInputField>& values)
+                -> std::optional<CommandInputValidationError> {
+                const auto volume_size = parse_size_setting(values[0].value);
+                if (!volume_size || *volume_size == 0) return std::nullopt;
+                if (*volume_size >= archive_size) {
+                    return CommandInputValidationError{
+                        0,
+                        L"Volume size must be smaller than the " +
+                            format_size(archive_size) +
+                            L" archive. Use a smaller size so at least two volumes are created."};
+                }
+                if (zip) return std::nullopt;
+                const std::uint64_t data_count =
+                    1 + (archive_size - 1) / *volume_size;
+                if (data_count > 254) {
+                    const std::uint64_t minimum =
+                        (archive_size + 253) / 254;
+                    return CommandInputValidationError{
+                        0,
+                        L"This size would create more than Axiom's 254 data-volume limit. "
+                        L"Use at least " + format_size(minimum) + L"."};
+                }
+                const auto recovery_count =
+                    parse_unsigned_field(values[1].value, 100000);
+                if (recovery_count &&
+                    *recovery_count > 255 - data_count) {
+                    return CommandInputValidationError{
+                        1,
+                        L"With " + std::to_wstring(data_count) +
+                            L" data volumes, at most " +
+                            std::to_wstring(255 - data_count) +
+                            L" recovery volumes can be created."};
+                }
+                return std::nullopt;
+            })) {
         return;
     }
     const auto volume_size = parse_size_setting(fields[0].value);
@@ -2235,6 +2334,20 @@ void MainWindow::on_split_archive() {
         show_app_message(L"Enter a positive volume size and a recovery volume count from 0 to 100000.",
                          axiom::gui::MessageDialogIcon::warning,
                          L"Split archive");
+        return;
+    }
+    std::error_code current_size_error;
+    const std::uint64_t current_size = fs::file_size(archive, current_size_error);
+    if (current_size_error || current_size != archive_size ||
+        *volume_size >= current_size) {
+        show_app_message(
+            current_size_error
+                ? L"Axiom could not recheck the archive size."
+                : current_size != archive_size
+                    ? L"The archive changed while the dialog was open. Review the split size and try again."
+                    : L"Volume size must be smaller than the archive.",
+            axiom::gui::MessageDialogIcon::warning,
+            L"Split archive");
         return;
     }
     operation_archive_output_ = archive;
@@ -2356,6 +2469,14 @@ void MainWindow::on_sign_archive() {
     const auto secret = pick_single_file(hwnd_, L"Choose the secret signing key",
                                          filters, static_cast<UINT>(std::size(filters)));
     if (!secret) return;
+    std::error_code key_size_error;
+    if (fs::file_size(*secret, key_size_error) != 64 || key_size_error) {
+        show_app_message(
+            L"Choose a valid 64-byte Axiom secret signing key. Public keys are 32 bytes and cannot sign archives.",
+            axiom::gui::MessageDialogIcon::warning,
+            L"Sign archive");
+        return;
+    }
     auto password = password_for_archive_edit(*archive);
     if (!password) return;
     auto options = compression_options();
@@ -2665,10 +2786,20 @@ void MainWindow::on_compress() {
         sfx_output = archive;
         sfx_output.replace_extension(L".exe");
     }
+    const fs::path final_output = create_sfx_after ? sfx_output : archive;
+    if (output_collides_with_input(final_output, inputs)) {
+        show_app_message(
+            L"The output conflicts with the selected input:\n\n" +
+                final_output.wstring() +
+                L"\n\nThe output cannot replace a selected input or be placed inside a selected source folder. Choose a different name or folder.",
+            axiom::gui::MessageDialogIcon::warning,
+            L"Archive output");
+        return;
+    }
     if (application_options_.confirm_overwrite &&
         mode == axiom::gui::ArchiveUpdateMode::create_new) {
         std::error_code exists_error;
-        const fs::path output_path = create_sfx_after ? sfx_output : archive;
+        const fs::path output_path = final_output;
         if (!output_path.empty() && fs::exists(output_path, exists_error)) {
             if (show_app_message(
                     L"Replace the existing output file?\n\n" + output_path.wstring(),
@@ -2775,14 +2906,27 @@ void MainWindow::on_compress() {
                             }
                             if (provider->info().native && split_after) {
                                 const std::uint64_t archive_bytes = fs::file_size(archive);
+                                if (volume_size >= archive_bytes) {
+                                    throw std::invalid_argument(
+                                        "split volume size must be smaller than the completed archive (" +
+                                        std::to_string(archive_bytes) + " bytes)");
+                                }
                                 const std::uint64_t data_volumes = std::max<std::uint64_t>(
-                                    1, (archive_bytes + volume_size - 1) / volume_size);
+                                    1, 1 + (archive_bytes - 1) / volume_size);
+                                if (data_volumes > 254) {
+                                    throw std::invalid_argument(
+                                        "split volume size would create more than 254 data volumes");
+                                }
                                 const unsigned recovery_count = recovery_volumes
                                     ? static_cast<unsigned>(std::max<std::uint64_t>(
                                         1, (data_volumes *
                                             std::max<unsigned>(options.recovery_percent, 10) +
                                             99) / 100))
                                     : 0;
+                                if (recovery_count > 255 - data_volumes) {
+                                    throw std::invalid_argument(
+                                        "recovery volume count would exceed the 255-volume set limit");
+                                }
                                 axiom::create_archive_volumes(
                                     archive, volume_size, recovery_count, operation);
                                 std::error_code remove_error;
@@ -2793,6 +2937,12 @@ void MainWindow::on_compress() {
                                 }
                             } else if (provider->info().format ==
                                            axiom::ArchiveFormat::zip && split_after) {
+                                const std::uint64_t archive_bytes = fs::file_size(archive);
+                                if (volume_size >= archive_bytes) {
+                                    throw std::invalid_argument(
+                                        "split volume size must be smaller than the completed archive (" +
+                                        std::to_string(archive_bytes) + " bytes)");
+                                }
                                 axiom::create_zip_volumes(archive, volume_size, operation);
                             }
                             if (create_sfx_after) {

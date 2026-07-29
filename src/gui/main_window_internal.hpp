@@ -1331,6 +1331,9 @@ private:
     UINT dpi_ = USER_DEFAULT_SCREEN_DPI;
 
     int selected_level_ = 5;
+    axiom::CompressionMethod selected_method_ = axiom::CompressionMethod::axiom;
+    int selected_codec_level_ = axiom::kAutomaticCodecLevel;
+    bool selected_lzma_binary_tree_ = true;
 
     bool busy_ = false;
 

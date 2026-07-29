@@ -253,7 +253,15 @@ void MainWindow::update_navigation_buttons() {
 }
 
 void MainWindow::on_address_go() {
-    std::wstring text = get_text(address_edit_);
+    std::wstring text = trim_dialog_input(get_text(address_edit_));
+    if (text.empty()) {
+        show_app_message(L"Enter a folder or supported archive path.",
+                         axiom::gui::MessageDialogIcon::information,
+                         L"Open location");
+        set_text(address_edit_, history_.current().display_name());
+        return;
+    }
+    set_text(address_edit_, text);
     if (_wcsicmp(text.c_str(), L"This PC") == 0) {
         navigate_to(axiom::gui::BrowserLocation::computer());
         return;

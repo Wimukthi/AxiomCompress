@@ -36,6 +36,9 @@ bool MainWindow::create(HINSTANCE instance,
     recent_archives_ = persisted_settings_.recent_archives;
     favorite_locations_ = persisted_settings_.favorite_locations;
     selected_level_ = application_options_.default_level;
+    selected_method_ = application_options_.default_method;
+    selected_codec_level_ = application_options_.default_codec_level;
+    selected_lzma_binary_tree_ = application_options_.default_lzma_binary_tree;
     selected_thread_count_ = application_options_.default_thread_count;
     selected_dictionary_size_ = application_options_.default_dictionary_size;
     selected_word_size_ = application_options_.default_word_size;
@@ -653,12 +656,20 @@ int MainWindow::selected_level() const {
 axiom::CompressionOptions MainWindow::compression_options() const {
     axiom::CompressionOptions options;
     axiom::apply_compression_level(options, selected_level());
+    options.method = selected_method_;
+    options.codec_level = selected_codec_level_;
+    options.lzma_binary_tree = selected_lzma_binary_tree_;
     options.thread_count = selected_thread_count_;
     options.io_buffer_size = configured_io_buffer_size(application_options_);
-    if (selected_dictionary_size_ != 0) {
+    if (selected_method_ == axiom::CompressionMethod::lzma2) {
+        options.lzma_dictionary_size = selected_dictionary_size_;
+        options.lzma_fast_bytes = selected_word_size_;
+    } else if (selected_method_ == axiom::CompressionMethod::axiom &&
+               selected_dictionary_size_ != 0) {
         options.window_size = selected_dictionary_size_;
     }
-    if (selected_word_size_ != 0) {
+    if (selected_method_ == axiom::CompressionMethod::axiom &&
+        selected_word_size_ != 0) {
         options.nice_length = selected_word_size_;
     }
     if (selected_solid_block_size_ != 0) {
@@ -674,6 +685,21 @@ axiom::CompressionOptions MainWindow::compression_options() const {
                 *limit, std::numeric_limits<std::size_t>::max()));
             const std::size_t practical_cap = std::max<std::size_t>(capped, 64u << 10);
             options.window_size = std::min(options.window_size, practical_cap);
+            if (options.method == axiom::CompressionMethod::lzma2) {
+                const int lzma_level = options.codec_level ==
+                        axiom::kAutomaticCodecLevel
+                    ? std::clamp(options.level, 0, 9)
+                    : std::clamp(options.codec_level, 0, 9);
+                const std::size_t default_dictionary = lzma_level <= 4
+                    ? std::size_t{1} << (lzma_level * 2 + 16)
+                    : std::size_t{1} << std::min(lzma_level + 20, 29);
+                const std::size_t requested =
+                    options.lzma_dictionary_size == 0
+                        ? std::min(default_dictionary, options.block_size)
+                        : options.lzma_dictionary_size;
+                options.lzma_dictionary_size =
+                    std::min(requested, practical_cap);
+            }
             options.block_size = std::min(options.block_size, practical_cap);
             options.auto_block_size_for_threads = false;
         }

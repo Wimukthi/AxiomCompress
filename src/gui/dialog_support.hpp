@@ -2,6 +2,7 @@
 
 #include <windows.h>
 
+#include <filesystem>
 #include <string>
 #include <string_view>
 
@@ -32,6 +33,20 @@ enum class DialogInputFilter {
     hexadecimal_color,
 };
 
+enum class DialogPathKind {
+    existing_file,
+    existing_folder,
+    output_file,
+    destination_folder,
+};
+
+struct DialogPathValidation {
+    std::filesystem::path path;
+    std::wstring error;
+
+    explicit operator bool() const { return error.empty(); }
+};
+
 int scale_for_dialog_dpi(int value, UINT dpi);
 SIZE dialog_window_size_for_client(int logical_width, int logical_height,
                                    DWORD style, DWORD extended_style, UINT dpi);
@@ -59,6 +74,9 @@ HWND create_dialog_tooltip(HWND owner);
 void add_dialog_tooltip(HWND tooltip, HWND control, const wchar_t* text);
 void apply_dialog_input_filter(HWND control, DialogInputFilter filter,
                                UINT maximum_characters = 0);
+std::wstring trim_dialog_input(std::wstring text);
+DialogPathValidation validate_dialog_path(
+    std::wstring text, DialogPathKind kind);
 void draw_dialog_button(const DRAWITEMSTRUCT& draw, bool dark);
 void draw_dialog_checkbox(const DRAWITEMSTRUCT& draw, bool dark, bool checked);
 void draw_dialog_radio_button(const DRAWITEMSTRUCT& draw, bool dark, bool checked);

@@ -74,7 +74,8 @@ than `block_size` spans several blocks.
 Each block's bytes are compressed with `axiom::compress`, producing a
 self-contained `.axc` payload (with its own header and CRC-32 — this is the
 per-block integrity check). Blocks are written back-to-back after the header. The
-`.axc` stream is its own versioned format (currently version `9`) and is described
+`.axc` stream is its own versioned format (native Axiom streams use version `9`;
+external-codec streams use version `10`) and is described
 in [ARCHITECTURE.md](ARCHITECTURE.md); the container does not interpret a block's
 internals beyond its declared size and checksum.
 
@@ -82,15 +83,15 @@ Before building solid blocks, current writers group regular files by broad type
 and then by extension. This writer policy improves cross-file matching without
 changing AXAR directory semantics. Directories and links retain their scan order.
 
-#### Embedded AXC version 5/6/7/8/9 header and transforms
+#### Embedded AXC version 5/6/7/8/9/10 header and transforms
 
-Versions 5 through 9 keep the original fixed AXC fields and add a bounded transform
+Versions 5 through 10 keep the original fixed AXC fields and add a bounded transform
 metadata area before the codec payload:
 
 | field | type | notes |
 |---|---|---|
 | magic | u8[8] | `"AXIOMC1\0"` |
-| version | u16 | `5`, `6`, `7`, `8`, or `9` |
+| version | u16 | `5`, `6`, `7`, `8`, `9`, or `10` |
 | codec | u8 | inner store/LZ/parallel codec identifier |
 | flags | u8 | bit `0x01` means transform metadata is present |
 | original_size | u64 | restored byte count |
@@ -146,6 +147,34 @@ remain exact. Matches retain the full block window but may not cross the static
 encoder-selected checkpoint boundaries. The complete version-9 payload,
 including every reset descriptor, competes against all older block candidates
 and is emitted only when strictly smaller.
+
+Version 10 adds outer AXC codec ids `8` (Zstandard), `9` (LZMA2), and `10`
+(Deflate). These ids use a common bounded external-codec payload:
+
+| field | type | notes |
+|---|---|---|
+| magic | u8[4] | `"AXEC"` |
+| payload_version | u8 | `1` |
+| property_size | u8 | `0` for Zstandard/Deflate; `1` for LZMA2 |
+| reserved | u16 | must be zero |
+| chunk_size | u32 | 256 KiB through 4 MiB for Zstandard/Deflate; through 512 MiB for LZMA2 |
+| chunk_count | u32 | exactly `ceil(original_size / chunk_size)` |
+| properties | u8[] | LZMA2 dictionary property byte when present; the decoded dictionary size must not exceed `chunk_size` |
+| chunks | record[] | exactly `chunk_count` records |
+
+Each chunk record is `raw_size:u32`, `encoded_size:u32`, `flags:u8`, three
+zero reserved bytes, then `encoded_size` bytes. Flag bit 0 means the chunk is
+stored verbatim; all other bits are invalid. `raw_size` must equal the remaining
+bounded chunk geometry, stored chunks require `encoded_size == raw_size`, and
+the sum of raw sizes must equal the outer AXC `original_size`.
+
+Compressed chunks are independent Zstandard frames, LZMA2 streams, or zlib
+Deflate streams. A reader allocates exactly the validated raw chunk size,
+requires the backend to produce that exact size and consume the complete
+encoded chunk, and rejects trailing bytes. Writers store a chunk when the
+selected codec would expand it. The chunk boundary is also the cooperative
+pause/cancel and progress boundary. Transform metadata, CRC-32, encryption,
+recovery, signing, and all AXAR directory semantics are unchanged.
 
 ### Central directory (at `directory_offset`)
 

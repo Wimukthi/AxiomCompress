@@ -6,17 +6,24 @@
 #include "gui/message_dialog.hpp"
 
 #include <dwmapi.h>
+#include <gdiplus.h>
 #include <shobjidl.h>
+#include <winhttp.h>
 #include <windowsx.h>
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cerrno>
 #include <cmath>
 #include <cwchar>
 #include <cwctype>
+#include <iomanip>
 #include <limits>
+#include <memory>
+#include <mutex>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <utility>
@@ -28,6 +35,7 @@ namespace {
 constexpr int kPathEdit = 2001;
 constexpr int kBrowse = 2002;
 constexpr int kLevel = 2003;
+constexpr int kCompressionMethod = 2004;
 constexpr int kThreads = 2006;
 constexpr int kOverwrite = 2007;
 constexpr int kRestoreTime = 2008;
@@ -41,6 +49,7 @@ constexpr int kThreadModel = 2016;
 constexpr int kCompressionProfile = 2017;
 constexpr int kSaveCompressionProfile = 2018;
 constexpr int kDeleteCompressionProfile = 2019;
+constexpr int kCompressionPreview = 2020;
 constexpr int kCreateTabs = 2099;
 constexpr int kCreateTabBase = 2100;
 constexpr int kUpdateMode = 2110;
@@ -150,17 +159,24 @@ constexpr int kAccept = IDOK;
 constexpr int kCancel = IDCANCEL;
 constexpr std::uint64_t kMinIoBufferSize = 64ull << 10;
 constexpr std::uint64_t kMaxIoBufferSize = 64ull << 20;
+constexpr std::uint64_t kMinMemoryLimitSize = 64ull << 10;
+constexpr std::uint64_t kSigningSecretKeySize = 64;
+constexpr UINT kCompressionCurveUpdated = WM_APP + 91;
+constexpr UINT kCompressionCurveFinished = WM_APP + 92;
+constexpr UINT_PTR kCompressionCurveDebounceTimer = 0xA711;
 
 constexpr std::array<const wchar_t*, 9> kLevelNames{
     L"1 - Fastest", L"2 - Very fast", L"3 - Fast", L"4 - Normal",
     L"5 - Balanced", L"6 - Strong", L"7 - High", L"8 - Very high",
     L"9 - Maximum"};
-constexpr std::array<const wchar_t*, 11> kDictionaryNames{
-    L"Default for level", L"64 KiB", L"256 KiB", L"1 MiB", L"4 MiB",
-    L"8 MiB", L"16 MiB", L"32 MiB", L"64 MiB", L"256 MiB", L"512 MiB"};
-constexpr std::array<std::size_t, 11> kDictionaryValues{
-    0, 64u << 10, 256u << 10, 1u << 20, 4u << 20, 8u << 20,
-    16u << 20, 32u << 20, 64u << 20, 256u << 20, 512u << 20};
+constexpr std::array<const wchar_t*, 13> kDictionaryNames{
+    L"Default for level", L"64 KiB", L"256 KiB", L"1 MiB", L"2 MiB",
+    L"4 MiB", L"8 MiB", L"16 MiB", L"32 MiB", L"64 MiB",
+    L"128 MiB", L"256 MiB", L"512 MiB"};
+constexpr std::array<std::size_t, 13> kDictionaryValues{
+    0, 64u << 10, 256u << 10, 1u << 20, 2u << 20, 4u << 20,
+    8u << 20, 16u << 20, 32u << 20, 64u << 20, 128u << 20,
+    256u << 20, 512u << 20};
 constexpr std::array<const wchar_t*, 6> kWordSizeNames{
     L"Default for level", L"32", L"64", L"128", L"192", L"273"};
 constexpr std::array<std::size_t, 6> kWordSizeValues{0, 32, 64, 128, 192, 273};
@@ -172,6 +188,10 @@ constexpr std::array<std::size_t, 10> kSolidBlockValues{
     64u << 20, 128u << 20, 256u << 20, 512u << 20};
 constexpr std::array<const wchar_t*, 2> kThreadModelNames{
     L"Split blocks (default)", L"Swarm (cores share each block)"};
+constexpr std::array<const wchar_t*, 5> kCompressionMethodNames{
+    L"Axiom adaptive", L"Zstandard", L"LZMA2", L"Deflate", L"Store"};
+constexpr std::array<const wchar_t*, 2> kLzmaMatchFinderNames{
+    L"HC4 (faster)", L"BT4 (better ratio)"};
 
 const std::array<CompressionProfile, 5>& built_in_compression_profiles() {
     static const std::array<CompressionProfile, 5> profiles{{
@@ -260,6 +280,86 @@ int value_index(const std::array<std::size_t, Size>& values, std::size_t value) 
 
 std::wstring widen_ascii(std::string_view value) {
     return std::wstring(value.begin(), value.end());
+}
+
+class CompressionGraphGdiplusSession {
+public:
+    CompressionGraphGdiplusSession() {
+        Gdiplus::GdiplusStartupInput input;
+        ready_ =
+            Gdiplus::GdiplusStartup(&token_, &input, nullptr) == Gdiplus::Ok;
+    }
+
+    ~CompressionGraphGdiplusSession() {
+        if (ready_) Gdiplus::GdiplusShutdown(token_);
+    }
+
+    bool ready() const { return ready_; }
+
+private:
+    ULONG_PTR token_ = 0;
+    bool ready_ = false;
+};
+
+bool compression_graph_gdiplus_ready() {
+    static CompressionGraphGdiplusSession session;
+    return session.ready();
+}
+
+Gdiplus::Color graph_color(COLORREF color, BYTE alpha = 255) {
+    return Gdiplus::Color(
+        alpha, GetRValue(color), GetGValue(color), GetBValue(color));
+}
+
+COLORREF compression_graph_saved_color(COLORREF accent) {
+    constexpr COLORREF green = RGB(38, 166, 91);
+    constexpr COLORREF amber = RGB(232, 153, 34);
+    const auto distance = [accent](COLORREF candidate) {
+        const int red =
+            static_cast<int>(GetRValue(accent)) -
+            static_cast<int>(GetRValue(candidate));
+        const int green_delta =
+            static_cast<int>(GetGValue(accent)) -
+            static_cast<int>(GetGValue(candidate));
+        const int blue =
+            static_cast<int>(GetBValue(accent)) -
+            static_cast<int>(GetBValue(candidate));
+        return red * red + green_delta * green_delta + blue * blue;
+    };
+    // Green communicates savings well for the normal blue, red, purple, and
+    // amber accents. Switch to amber only when the active accent is already
+    // close enough to green that the two areas would become indistinguishable.
+    return distance(green) < 6000 ? amber : green;
+}
+
+std::wstring format_preview_bytes(std::uint64_t bytes) {
+    static constexpr std::array<const wchar_t*, 6> units{
+        L"B", L"KiB", L"MiB", L"GiB", L"TiB", L"PiB"};
+    long double value = static_cast<long double>(bytes);
+    std::size_t unit = 0;
+    while (value >= 1024.0L && unit + 1 < units.size()) {
+        value /= 1024.0L;
+        ++unit;
+    }
+    std::wostringstream output;
+    output << std::fixed << std::setprecision(unit == 0 ? 0 : 1)
+           << static_cast<double>(value) << L' ' << units[unit];
+    return output.str();
+}
+
+std::wstring format_preview_percent(double value) {
+    std::wostringstream output;
+    output << std::fixed << std::setprecision(1) << value << L'%';
+    return output.str();
+}
+
+const wchar_t* estimate_confidence_name(EstimateConfidence confidence) {
+    switch (confidence) {
+        case EstimateConfidence::high: return L"high confidence";
+        case EstimateConfidence::medium: return L"medium confidence";
+        case EstimateConfidence::low: return L"low confidence";
+    }
+    return L"low confidence";
 }
 
 int archive_format_index(axiom::ArchiveFormat format) {
@@ -502,6 +602,39 @@ std::optional<std::uint64_t> parse_size_text(std::wstring text) {
         return std::nullopt;
     }
     return value * multiplier;
+}
+
+std::optional<std::uint64_t> parse_integer_size_with_unit(
+    std::wstring text, int unit) {
+    text = trim_color_text(std::move(text));
+    if (text.empty() || unit < 0 ||
+        unit >= static_cast<int>(kVolumeUnitNames.size())) {
+        return std::nullopt;
+    }
+    return parse_size_text(
+        text + L" " + kVolumeUnitNames[static_cast<std::size_t>(unit)]);
+}
+
+bool valid_signing_secret_key(const fs::path& path) {
+    std::error_code error;
+    if (!fs::is_regular_file(path, error) || error) return false;
+    return fs::file_size(path, error) == kSigningSecretKeySize && !error;
+}
+
+bool valid_https_url(std::wstring_view url) {
+    if (url.empty() || url.size() > std::numeric_limits<DWORD>::max()) {
+        return false;
+    }
+    URL_COMPONENTS components{};
+    components.dwStructSize = sizeof(components);
+    components.dwSchemeLength = static_cast<DWORD>(-1);
+    components.dwHostNameLength = static_cast<DWORD>(-1);
+    components.dwUrlPathLength = static_cast<DWORD>(-1);
+    components.dwExtraInfoLength = static_cast<DWORD>(-1);
+    return WinHttpCrackUrl(url.data(), static_cast<DWORD>(url.size()), 0,
+                           &components) != FALSE &&
+           components.nScheme == INTERNET_SCHEME_HTTPS &&
+           components.dwHostNameLength != 0;
 }
 
 std::optional<fs::path> browse_save_archive(HWND owner,
@@ -2283,6 +2416,7 @@ class OptionsDialog {
 public:
     explicit OptionsDialog(DialogMode mode) : mode_(mode) {}
     ~OptionsDialog() {
+        stop_compression_curve_worker();
         if (font_) DeleteObject(font_);
         if (window_brush_) DeleteObject(window_brush_);
         if (edit_brush_) DeleteObject(edit_brush_);
@@ -2310,9 +2444,11 @@ public:
             (mode_ == DialogMode::extract_archive ? WS_EX_DLGMODALFRAME : 0);
         const SIZE initial_size = dialog_window_size_for_client(
             mode_ == DialogMode::create_archive
-                ? 840 : mode_ == DialogMode::settings ? 920 : 540,
+                ? kCreateInitialClientWidth
+                : mode_ == DialogMode::settings ? 920 : 540,
             mode_ == DialogMode::create_archive
-                ? 690 : mode_ == DialogMode::settings ? 650 : 290,
+                ? kCreateInitialClientHeight
+                : mode_ == DialogMode::settings ? 650 : 290,
             window_style, extended_style, dpi_);
         int width = initial_size.cx;
         int height = initial_size.cy;
@@ -2341,6 +2477,7 @@ public:
             SetLayeredWindowAttributes(window_, 0, 0, LWA_ALPHA) != FALSE;
         const int show_command =
             restore_named_window_placement(window_, owner, layout_name());
+        enforce_minimum_window_size();
         owner_was_enabled_ = disable_dialog_owner(owner, window_);
 
         ShowWindow(window_, show_command);
@@ -2423,11 +2560,16 @@ public:
     ApplicationDialogOptions application_options;
     std::function<void(const ApplicationDialogOptions&)> settings_apply_callback;
     std::size_t input_count = 0;
+    std::vector<fs::path> estimate_inputs;
     fs::path archive_path;
 
 private:
     static const wchar_t* class_name() { return L"AxiomDarkOptionsDialog"; }
     static constexpr UINT_PTR kCompositorRevealTimer = 0xA710;
+    static constexpr int kCreateInitialClientWidth = 1180;
+    static constexpr int kCreateInitialClientHeight = 690;
+    static constexpr int kCreateMinimumClientWidth = 970;
+    static constexpr int kCreateMinimumClientHeight = 660;
 
     const wchar_t* layout_name() const {
         switch (mode_) {
@@ -2459,6 +2601,71 @@ private:
 
     int scale(int value) const {
         return MulDiv(value, static_cast<int>(dpi_), USER_DEFAULT_SCREEN_DPI);
+    }
+
+    SIZE minimum_track_size() const {
+        const DWORD style = static_cast<DWORD>(
+            GetWindowLongPtrW(window_, GWL_STYLE));
+        const DWORD ex_style = static_cast<DWORD>(
+            GetWindowLongPtrW(window_, GWL_EXSTYLE));
+        SIZE minimum = dialog_window_size_for_client(
+            mode_ == DialogMode::settings
+                ? 780 : kCreateMinimumClientWidth,
+            mode_ == DialogMode::settings
+                ? 520 : kCreateMinimumClientHeight,
+            style, ex_style, dpi_);
+        MONITORINFO monitor{sizeof(monitor)};
+        if (GetMonitorInfoW(
+                MonitorFromWindow(window_, MONITOR_DEFAULTTONEAREST),
+                &monitor)) {
+            minimum.cx = std::min(
+                minimum.cx, monitor.rcWork.right - monitor.rcWork.left);
+            minimum.cy = std::min(
+                minimum.cy, monitor.rcWork.bottom - monitor.rcWork.top);
+        }
+        return minimum;
+    }
+
+    void enforce_minimum_window_size() {
+        if (mode_ != DialogMode::create_archive) return;
+        RECT bounds{};
+        if (!GetWindowRect(window_, &bounds)) return;
+        const SIZE minimum = minimum_track_size();
+        const int width = std::max(
+            static_cast<int>(bounds.right - bounds.left),
+            static_cast<int>(minimum.cx));
+        const int height = std::max(
+            static_cast<int>(bounds.bottom - bounds.top),
+            static_cast<int>(minimum.cy));
+        if (width == bounds.right - bounds.left &&
+            height == bounds.bottom - bounds.top) {
+            return;
+        }
+
+        MONITORINFO monitor{sizeof(monitor)};
+        if (!GetMonitorInfoW(
+                MonitorFromWindow(window_, MONITOR_DEFAULTTONEAREST),
+                &monitor)) {
+            SetWindowPos(
+                window_, nullptr, 0, 0, width, height,
+                SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+            return;
+        }
+        const int x = std::clamp(
+            static_cast<int>(bounds.left),
+            static_cast<int>(monitor.rcWork.left),
+            std::max(
+                static_cast<int>(monitor.rcWork.left),
+                static_cast<int>(monitor.rcWork.right) - width));
+        const int y = std::clamp(
+            static_cast<int>(bounds.top),
+            static_cast<int>(monitor.rcWork.top),
+            std::max(
+                static_cast<int>(monitor.rcWork.top),
+                static_cast<int>(monitor.rcWork.bottom) - height));
+        SetWindowPos(
+            window_, nullptr, x, y, width, height,
+            SWP_NOZORDER | SWP_NOACTIVATE);
     }
 
     HWND control(const wchar_t* type, const wchar_t* text, DWORD style, int id) {
@@ -2936,36 +3143,38 @@ private:
                       288, 436, 430, 38, true);
 
         setting_label(1, L"Default Add-to-archive options", 0, 0, 660);
-        setting_label(1, L"Compression level", 0, 42, 170);
-        setting_combo(1, kLevel, kLevelNames, 180, 36, 260);
-        setting_label(1, L"Dictionary size", 0, 84, 170);
-        setting_combo(1, kDictionarySize, kDictionaryNames, 180, 78, 260);
-        setting_label(1, L"Word size", 0, 126, 170);
-        setting_combo(1, kWordSize, kWordSizeNames, 180, 120, 260);
-        setting_label(1, L"Solid block size", 0, 168, 170);
-        setting_combo(1, kSolidBlockSize, kSolidBlockNames, 180, 162, 260);
-        setting_label(1, L"Threading model", 0, 210, 170);
-        setting_combo(1, kThreadModel, kThreadModelNames, 180, 204, 260);
-        setting_label(1, L"CPU threads (integer)", 0, 252, 170);
-        setting_thread_combo(1, 180, 246, 190);
-        setting_label(1, L"Update mode", 0, 294, 170);
-        setting_combo(1, kDefaultUpdateMode, kUpdateModeNames, 180, 288, 330);
-        setting_label(1, L"Volume size (integer)", 0, 336, 170);
-        setting_edit(1, kDefaultVolumeSize, 180, 330, 160,
+        setting_label(1, L"Compression method", 0, 42, 170);
+        setting_combo(1, kCompressionMethod, kCompressionMethodNames, 180, 36, 260);
+        setting_label(1, L"Method level", 0, 84, 170);
+        setting_combo(1, kLevel, kLevelNames, 180, 78, 260);
+        setting_label(1, L"Dictionary size", 0, 126, 170);
+        setting_combo(1, kDictionarySize, kDictionaryNames, 180, 120, 260);
+        setting_label(1, L"Word size", 0, 168, 170);
+        setting_combo(1, kWordSize, kWordSizeNames, 180, 162, 260);
+        setting_label(1, L"Solid block size", 0, 210, 170);
+        setting_combo(1, kSolidBlockSize, kSolidBlockNames, 180, 204, 260);
+        setting_label(1, L"Method option", 0, 252, 170);
+        setting_combo(1, kThreadModel, kThreadModelNames, 180, 246, 260);
+        setting_label(1, L"CPU threads (integer)", 0, 294, 170);
+        setting_thread_combo(1, 180, 288, 190);
+        setting_label(1, L"Update mode", 0, 336, 170);
+        setting_combo(1, kDefaultUpdateMode, kUpdateModeNames, 180, 330, 330);
+        setting_label(1, L"Volume size (integer)", 0, 378, 170);
+        setting_edit(1, kDefaultVolumeSize, 180, 372, 160,
                      ES_NUMBER | ES_AUTOHSCROLL);
-        setting_combo(1, kDefaultVolumeUnit, kVolumeUnitNames, 350, 330, 105);
-        setting_label(1, L"Recovery (integer 0-100)", 0, 378, 170);
-        setting_edit(1, kDefaultRecoveryPercent, 180, 372, 80, ES_NUMBER | ES_AUTOHSCROLL);
-        setting_label(1, L"%", 268, 378, 24);
+        setting_combo(1, kDefaultVolumeUnit, kVolumeUnitNames, 350, 372, 105);
+        setting_label(1, L"Recovery (integer 0-100)", 0, 420, 170);
+        setting_edit(1, kDefaultRecoveryPercent, 180, 414, 80, ES_NUMBER | ES_AUTOHSCROLL);
+        setting_label(1, L"%", 268, 420, 24);
         setting_checkbox(1, kDefaultRecoveryVolumes,
-                         L"Create recovery volumes when split volumes are enabled", 180, 414);
+                         L"Create recovery volumes when split volumes are enabled", 180, 456);
         setting_checkbox(1, kDefaultCreateSfx,
-                         L"Create self-extracting .exe by default", 180, 448);
+                         L"Create self-extracting .exe by default", 180, 490);
         setting_checkbox(1, kDefaultSignArchive,
-                         L"Sign archives by default", 180, 482);
-        setting_label(1, L"Signing key file path", 0, 524, 170);
-        setting_edit(1, kDefaultSigningKey, 180, 518, 470);
-        setting_browse(1, kBrowseDefaultSigningKey, 660, 518);
+                         L"Sign archives by default", 180, 524);
+        setting_label(1, L"Signing key file path", 0, 566, 170);
+        setting_edit(1, kDefaultSigningKey, 180, 560, 470);
+        setting_browse(1, kBrowseDefaultSigningKey, 660, 560);
 
         setting_label(2, L"Default folders", 0, 0, 660);
         setting_label(2, L"Archive output", 0, 42, 170);
@@ -3170,7 +3379,7 @@ private:
         add_dialog_tooltip(tooltip_, item(kThreads),
                            L"Unsigned integer from 0 through the available logical processor count. Zero uses all processors.");
         add_dialog_tooltip(tooltip_, item(kDefaultVolumeSize),
-                           L"Positive integer. Select KiB, MiB, GiB, or TiB in the adjacent unit list; leave empty for one archive file.");
+                           L"Maximum size of each output part. Select KiB, MiB, GiB, or TiB; leave empty for one archive file. Splitting only succeeds when the completed archive is larger than this value.");
         add_dialog_tooltip(tooltip_, item(kDefaultRecoveryPercent),
                            L"Unsigned integer percentage from 0 through 100.");
         add_dialog_tooltip(tooltip_, item(kDefaultSigningKey),
@@ -3266,7 +3475,9 @@ private:
         delete_compression_profile_ = page_control(
             0, L"BUTTON", L"Delete", WS_TABSTOP | BS_OWNERDRAW,
             kDeleteCompressionProfile);
-        level_label_ = page_label(0, L"Compression level");
+        method_label_ = page_label(0, L"Compression method");
+        method_combo_ = page_combo(0, kCompressionMethod, kCompressionMethodNames);
+        level_label_ = page_label(0, L"Method level");
         level_combo_ = page_combo(0, kLevel, kLevelNames);
         dictionary_label_ = page_label(0, L"Dictionary size");
         dictionary_combo_ = page_combo(0, kDictionarySize, kDictionaryNames);
@@ -3282,6 +3493,9 @@ private:
             0,
             L"Default values follow the selected compression level. Larger dictionaries and "
             L"solid blocks can improve ratio but increase memory use.", true);
+        compression_preview_ = control(
+            L"STATIC", L"", SS_OWNERDRAW | SS_NOTIFY,
+            kCompressionPreview);
 
         encrypt_data_ = page_checkbox(2, kEncryptData, L"Encrypt file data");
         encrypt_names_ = page_checkbox(2, kEncryptNames,
@@ -3309,8 +3523,9 @@ private:
             L"Create .rev recovery volumes for missing-volume reconstruction");
         recovery_info_ = page_label(
             3,
-            L"Leave the split size empty for one .axar file. A recovery record repairs bounded "
-            L"damage inside an archive; .rev volumes reconstruct missing or corrupt parts.", true);
+            L"Split size is the maximum part size and must be smaller than the completed archive; "
+            L"Axiom verifies this after compression. A recovery record repairs bounded damage "
+            L"inside an archive; .rev volumes reconstruct missing or corrupt parts.", true);
 
         sign_archive_ = page_checkbox(4, kSignArchive,
                                       L"Sign the completed archive");
@@ -3325,8 +3540,6 @@ private:
             L"When SFX is enabled, the Output field becomes an .exe path. The completed archive "
             L"is merged into that executable and no separate archive is retained.", true);
 
-        output_preview_ = control(L"STATIC", L"",
-                                  SS_LEFT | SS_NOPREFIX | SS_PATHELLIPSIS, 0);
         SendMessageW(path_edit_, EM_SETLIMITTEXT, 32767, 0);
         SendMessageW(comment_edit_, EM_SETLIMITTEXT, 65535, 0);
         SendMessageW(password_edit_, EM_SETLIMITTEXT, 1024, 0);
@@ -3351,8 +3564,14 @@ private:
                            L"Save the current compression-tab settings under the typed profile name.");
         add_dialog_tooltip(tooltip_, delete_compression_profile_,
                            L"Delete the selected user profile. Built-in profiles cannot be deleted.");
+        add_dialog_tooltip(
+            tooltip_, method_combo_,
+            L"Select the codec stored in AXAR solid blocks. ZIP supports Deflate or Store.");
         add_dialog_tooltip(tooltip_, level_combo_,
-                           L"Compression level from 1 (fastest) through 9 (maximum ratio).");
+                           L"Method-specific compression level. Available values change with the selected codec.");
+        add_dialog_tooltip(
+            tooltip_, compression_preview_,
+            L"Live compression prognosis. Select a point to choose that codec level; the shaded band shows estimate uncertainty.");
         add_dialog_tooltip(tooltip_, threads_combo_,
                            L"Unsigned integer from 0 through the available logical processor count. Zero uses all processors.");
         add_dialog_tooltip(tooltip_, comment_edit_,
@@ -3362,7 +3581,7 @@ private:
         add_dialog_tooltip(tooltip_, confirm_password_edit_,
                            L"Repeat the password exactly; both text fields must match.");
         add_dialog_tooltip(tooltip_, volume_size_edit_,
-                           L"Positive integer. Select KiB, MiB, GiB, or TiB beside it; leave empty to disable splitting.");
+                           L"Maximum size of each output part. Select KiB, MiB, GiB, or TiB; leave empty to disable splitting. The completed archive must be larger than this value.");
         add_dialog_tooltip(tooltip_, volume_unit_combo_,
                            L"Binary unit applied to the positive integer volume size.");
         add_dialog_tooltip(tooltip_, recovery_percent_edit_,
@@ -3378,7 +3597,7 @@ private:
         load_create_values();
         select_create_page(0);
         update_create_dependencies();
-        update_output_preview();
+        schedule_compression_curve();
     }
 
     void create_controls() {
@@ -3486,10 +3705,9 @@ private:
         SendMessageW(level_combo_, CB_SETCURSEL, static_cast<WPARAM>(level_ - 1), 0);
         set_thread_count(threads_combo_, threads);
         if (mode_ == DialogMode::create_archive) {
-            SendMessageW(dictionary_combo_, CB_SETCURSEL,
-                         value_index(kDictionaryValues, create_options.dictionary_size), 0);
-            SendMessageW(word_size_combo_, CB_SETCURSEL,
-                         value_index(kWordSizeValues, create_options.word_size), 0);
+            rebuild_codec_parameter_controls(
+                dictionary_combo_, word_size_combo_, create_options.method,
+                create_options.dictionary_size, create_options.word_size);
             SendMessageW(solid_block_combo_, CB_SETCURSEL,
                          value_index(kSolidBlockValues, create_options.solid_block_size), 0);
         }
@@ -3666,16 +3884,25 @@ private:
         std::wstring name) const {
         const auto threads = thread_count_from(threads_combo_);
         if (!threads) return std::nullopt;
-        const LRESULT level = SendMessageW(level_combo_, CB_GETCURSEL, 0, 0);
+        const auto method = method_from_combo(method_combo_);
+        const int method_level = level_from_combo(level_combo_, 5);
+        const int option = static_cast<int>(std::clamp<LRESULT>(
+            SendMessageW(thread_model_combo_, CB_GETCURSEL, 0, 0), 0, 1));
         return CompressionProfile{
             std::move(name),
-            level == CB_ERR ? 5 : std::clamp(static_cast<int>(level) + 1, 1, 9),
+            method == axiom::CompressionMethod::axiom
+                ? std::clamp(method_level, 1, 9)
+                : std::clamp(create_options.level, 1, 9),
             *threads,
-            selected_combo_value(dictionary_combo_, kDictionaryValues),
-            selected_combo_value(word_size_combo_, kWordSizeValues),
+            value_from_combo(dictionary_combo_),
+            value_from_combo(word_size_combo_),
             selected_combo_value(solid_block_combo_, kSolidBlockValues),
-            static_cast<int>(std::clamp<LRESULT>(
-                SendMessageW(thread_model_combo_, CB_GETCURSEL, 0, 0), 0, 1)),
+            method == axiom::CompressionMethod::axiom ? option : 0,
+            method,
+            method == axiom::CompressionMethod::axiom
+                ? axiom::kAutomaticCodecLevel
+                : method_level,
+            method == axiom::CompressionMethod::lzma2 ? option == 1 : true,
         };
     }
 
@@ -3686,7 +3913,10 @@ private:
                left.dictionary_size == right.dictionary_size &&
                left.word_size == right.word_size &&
                left.solid_block_size == right.solid_block_size &&
-               left.thread_model == right.thread_model;
+               left.thread_model == right.thread_model &&
+               left.method == right.method &&
+               left.codec_level == right.codec_level &&
+               left.lzma_binary_tree == right.lzma_binary_tree;
     }
 
     void update_compression_profile_actions() {
@@ -3771,19 +4001,19 @@ private:
         if (profile == nullptr) return;
 
         applying_compression_profile_ = true;
-        SendMessageW(level_combo_, CB_SETCURSEL,
-                     static_cast<WPARAM>(std::clamp(profile->level, 1, 9) - 1), 0);
+        rebuild_method_combo(method_combo_, selected_format_is_native(),
+                             profile->method);
+        create_options.method = method_from_combo(method_combo_);
+        rebuild_method_controls(
+            level_combo_, thread_model_combo_, create_options.method,
+            profile->level, profile->codec_level, profile->thread_model,
+            profile->lzma_binary_tree);
+        rebuild_codec_parameter_controls(
+            dictionary_combo_, word_size_combo_, create_options.method,
+            profile->dictionary_size, profile->word_size);
         set_thread_count(threads_combo_, profile->thread_count);
-        SendMessageW(dictionary_combo_, CB_SETCURSEL,
-                     value_index(kDictionaryValues, profile->dictionary_size), 0);
-        SendMessageW(word_size_combo_, CB_SETCURSEL,
-                     value_index(kWordSizeValues, profile->word_size), 0);
         SendMessageW(solid_block_combo_, CB_SETCURSEL,
                      value_index(kSolidBlockValues, profile->solid_block_size), 0);
-        const int thread_model = profile->level == 7
-            ? 0 : std::clamp(profile->thread_model, 0, 1);
-        SendMessageW(thread_model_combo_, CB_SETCURSEL,
-                     static_cast<WPARAM>(thread_model), 0);
         applying_compression_profile_ = false;
         update_create_dependencies();
         update_compression_profile_actions();
@@ -3903,18 +4133,22 @@ private:
         set_window_text(item(kRecentLocationCount),
                         std::to_wstring(application_options.recent_location_count));
 
-        set_selected_index(kLevel, std::clamp(application_options.default_level, 1, 9) - 1);
-        SendMessageW(item(kDictionarySize), CB_SETCURSEL,
-                     value_index(kDictionaryValues,
-                                 application_options.default_dictionary_size), 0);
-        SendMessageW(item(kWordSize), CB_SETCURSEL,
-                     value_index(kWordSizeValues,
-                                 application_options.default_word_size), 0);
+        rebuild_method_combo(item(kCompressionMethod), true,
+                             application_options.default_method);
+        rebuild_method_controls(
+            item(kLevel), item(kThreadModel), application_options.default_method,
+            application_options.default_level,
+            application_options.default_codec_level,
+            application_options.default_thread_model,
+            application_options.default_lzma_binary_tree);
+        rebuild_codec_parameter_controls(
+            item(kDictionarySize), item(kWordSize),
+            application_options.default_method,
+            application_options.default_dictionary_size,
+            application_options.default_word_size);
         SendMessageW(item(kSolidBlockSize), CB_SETCURSEL,
                      value_index(kSolidBlockValues,
                                  application_options.default_solid_block_size), 0);
-        set_selected_index(kThreadModel,
-                           std::clamp(application_options.default_thread_model, 0, 1));
         set_thread_count(item(kThreads), application_options.default_thread_count);
         set_selected_index(kDefaultUpdateMode,
                            std::clamp(application_options.default_update_mode, 0, 4));
@@ -3972,6 +4206,16 @@ private:
 
     void update_settings_dependencies() {
         if (mode_ != DialogMode::settings) return;
+        const auto method = method_from_combo(item(kCompressionMethod));
+        const bool dictionary =
+            method == axiom::CompressionMethod::axiom ||
+            method == axiom::CompressionMethod::lzma2;
+        EnableWindow(item(kLevel), method != axiom::CompressionMethod::store);
+        EnableWindow(item(kDictionarySize), dictionary);
+        EnableWindow(item(kWordSize), dictionary);
+        EnableWindow(item(kThreadModel),
+                     method == axiom::CompressionMethod::axiom ||
+                     method == axiom::CompressionMethod::lzma2);
         EnableWindow(item(kCustomAccentColor),
                      selected_index(kAccentColorMode, 0) == 6);
         EnableWindow(item(kPickAccentColor),
@@ -3996,6 +4240,22 @@ private:
                      checkbox_checked(kDefaultSignArchive));
         EnableWindow(item(kBrowseDefaultSigningKey),
                      checkbox_checked(kDefaultSignArchive));
+        const std::wstring default_volume =
+            trim_dialog_input(window_text(item(kDefaultVolumeSize)));
+        const bool default_sfx = checkbox_checked(kDefaultCreateSfx);
+        EnableWindow(item(kDefaultVolumeSize), !default_sfx);
+        EnableWindow(item(kDefaultVolumeUnit), !default_sfx);
+        const bool default_split_enabled =
+            !default_volume.empty() &&
+            !default_sfx;
+        if (!default_split_enabled &&
+            application_options.default_recovery_volumes) {
+            application_options.default_recovery_volumes = false;
+            InvalidateRect(item(kDefaultRecoveryVolumes), nullptr, FALSE);
+        }
+        EnableWindow(item(kDefaultRecoveryVolumes), default_split_enabled);
+        EnableWindow(item(kLogFolder), checkbox_checked(kVerboseLogging));
+        EnableWindow(item(kBrowseLogFolder), checkbox_checked(kVerboseLogging));
         EnableWindow(item(kIoBufferSize), selected_index(kIoBufferMode, 0) == 1);
         EnableWindow(item(kMemoryLimit), selected_index(kMemoryLimitMode, 0) == 1);
         layout_settings();
@@ -4003,9 +4263,12 @@ private:
 
     bool apply_settings_values() {
         if (!commit_shortcut_edit(true)) return false;
-        const auto reject_field = [&](int page, int id, const wchar_t* message) {
+        const auto reject_field = [&](int page, int id, const std::wstring& message) {
             select_settings_page(page);
-            if (HWND control = item(id)) SetFocus(control);
+            if (HWND control = item(id)) {
+                SetFocus(control);
+                SendMessageW(control, EM_SETSEL, 0, -1);
+            }
             show_message_dialog(window_, instance_, dpi_, palette_.dark,
                                 L"Axiom settings", message,
                                 MessageDialogIcon::warning);
@@ -4022,11 +4285,19 @@ private:
                 1, kThreads,
                 L"CPU threads must be an integer from 0 through the available logical processor count.");
         }
-        const std::wstring default_volume = window_text(item(kDefaultVolumeSize));
-        if (!default_volume.empty() && !parse_size_text(default_volume)) {
+        const std::wstring default_volume =
+            trim_dialog_input(window_text(item(kDefaultVolumeSize)));
+        const int default_volume_unit = selected_index(kDefaultVolumeUnit, 2);
+        if (!default_volume.empty() &&
+            !parse_integer_size_with_unit(default_volume, default_volume_unit)) {
             return reject_field(
                 1, kDefaultVolumeSize,
                 L"Split volume size must be a positive integer. Select its unit in the adjacent list.");
+        }
+        if (checkbox_checked(kDefaultRecoveryVolumes) && default_volume.empty()) {
+            return reject_field(
+                1, kDefaultVolumeSize,
+                L"Recovery volumes require a split volume size. Enter a maximum volume size first.");
         }
         const auto recovery_percent = edit_int(kDefaultRecoveryPercent, 0, 100);
         if (!recovery_percent) {
@@ -4038,7 +4309,8 @@ private:
             return reject_field(2, kTempCleanupDays,
                                 L"Cleanup days must be an integer from 0 through 365.");
         }
-        const std::wstring io_buffer = window_text(item(kIoBufferSize));
+        const std::wstring io_buffer =
+            trim_dialog_input(window_text(item(kIoBufferSize)));
         if (selected_index(kIoBufferMode, 0) == 1) {
             const auto size = parse_size_text(io_buffer);
             if (!size || *size < kMinIoBufferSize || *size > kMaxIoBufferSize) {
@@ -4047,110 +4319,190 @@ private:
                     L"Custom I/O buffer size must be between 64 KiB and 64 MiB. Examples: 1 MiB, 4 MiB, 8388608.");
             }
         }
-        const std::wstring memory_limit = window_text(item(kMemoryLimit));
-        if (selected_index(kMemoryLimitMode, 0) == 1 &&
-            !parse_size_text(memory_limit)) {
-            return reject_field(
-                10, kMemoryLimit,
-                L"Custom memory limit must be a positive byte size, for example 512 MiB or 4 GiB.");
-        }
-        const std::wstring update_url = window_text(item(kUpdateUrl));
-        if (!update_url.empty()) {
-            std::wstring lower = update_url;
-            std::transform(lower.begin(), lower.end(), lower.begin(), [](wchar_t ch) {
-                return static_cast<wchar_t>(std::towlower(ch));
-            });
-            if (lower.rfind(L"https://", 0) != 0 ||
-                lower.find_first_of(L" \t\r\n") != std::wstring::npos) {
+        const std::wstring memory_limit =
+            trim_dialog_input(window_text(item(kMemoryLimit)));
+        if (selected_index(kMemoryLimitMode, 0) == 1) {
+            const auto size = parse_size_text(memory_limit);
+            if (!size || *size < kMinMemoryLimitSize ||
+                *size > static_cast<std::uint64_t>(
+                            std::numeric_limits<std::size_t>::max())) {
                 return reject_field(
-                    7, kUpdateUrl,
-                    L"Update URL must be an absolute HTTPS URL, or empty to use Axiom's official release feed.");
+                    10, kMemoryLimit,
+                    L"Custom memory limit must be at least 64 KiB and fit this build's address space. Examples: 512 MiB or 4 GiB.");
             }
+        }
+        const std::wstring update_url =
+            trim_dialog_input(window_text(item(kUpdateUrl)));
+        if (!update_url.empty() && !valid_https_url(update_url)) {
+            return reject_field(
+                7, kUpdateUrl,
+                L"Update URL must be a complete absolute HTTPS URL with a host name, or empty to use Axiom's official release feed.");
         }
         const auto existing_folder = [&](int mode_id, int custom_index,
                                          int path_id, int page,
-                                         const wchar_t* message) {
+                                         const wchar_t* label) {
             if (selected_index(mode_id, 0) != custom_index) return true;
-            const fs::path path = window_text(item(path_id));
-            std::error_code error;
-            if (!path.empty() && fs::is_directory(path, error)) return true;
-            return reject_field(page, path_id, message);
+            const auto result = validate_dialog_path(
+                window_text(item(path_id)), DialogPathKind::existing_folder);
+            if (result) {
+                set_window_text(item(path_id), result.path.wstring());
+                return true;
+            }
+            return reject_field(
+                page, path_id,
+                std::wstring(label) + L":\n\n" + result.error);
         };
         if (!existing_folder(kStartupMode, 3, kStartupCustomPath, 0,
-                             L"Custom startup folder must be an existing Windows folder path.") ||
+                             L"Custom startup folder is not valid") ||
             !existing_folder(kArchiveOutputMode, 2, kArchiveOutputFolder, 2,
-                             L"Custom archive folder must be an existing Windows folder path.") ||
+                             L"Custom archive output folder is not valid") ||
             !existing_folder(kExtractDestinationMode, 2, kExtractDestinationFolder, 2,
-                             L"Custom extraction folder must be an existing Windows folder path.") ||
+                             L"Custom extraction folder is not valid") ||
             !existing_folder(kTempFolderMode, 2, kTempFolder, 2,
-                             L"Custom temporary folder must be an existing Windows folder path.")) {
+                             L"Custom temporary folder is not valid")) {
             return false;
         }
         if (checkbox_checked(kDefaultSignArchive)) {
-            const fs::path key = window_text(item(kDefaultSigningKey));
-            std::error_code error;
-            if (key.empty() || !fs::is_regular_file(key, error)) {
+            const auto result = validate_dialog_path(
+                window_text(item(kDefaultSigningKey)),
+                DialogPathKind::existing_file);
+            if (!result || !valid_signing_secret_key(result.path)) {
                 return reject_field(
                     1, kDefaultSigningKey,
-                    L"Default signing key must be an existing Axiom key file path when archive signing is enabled.");
+                    !result
+                        ? L"Default signing key is not valid:\n\n" + result.error
+                        : L"Default signing key must be a 64-byte Axiom secret key. Public keys and unrelated files cannot sign archives.");
             }
+            set_window_text(item(kDefaultSigningKey), result.path.wstring());
+        }
+        const auto optional_file = [&](int path_id, int page,
+                                       const wchar_t* label) {
+            const std::wstring text =
+                trim_dialog_input(window_text(item(path_id)));
+            if (text.empty()) return true;
+            const auto result =
+                validate_dialog_path(text, DialogPathKind::existing_file);
+            if (!result) {
+                return reject_field(
+                    page, path_id,
+                    std::wstring(label) + L":\n\n" + result.error);
+            }
+            set_window_text(item(path_id), result.path.wstring());
+            return true;
+        };
+        const auto optional_folder = [&](int path_id, int page,
+                                         const wchar_t* label,
+                                         DialogPathKind kind) {
+            const std::wstring text =
+                trim_dialog_input(window_text(item(path_id)));
+            if (text.empty()) return true;
+            const auto result = validate_dialog_path(text, kind);
+            if (!result) {
+                return reject_field(
+                    page, path_id,
+                    std::wstring(label) + L":\n\n" + result.error);
+            }
+            set_window_text(item(path_id), result.path.wstring());
+            return true;
+        };
+        if (!optional_file(kExternalViewer, 4,
+                           L"External viewer is not a valid executable or file") ||
+            !optional_file(kExternalEditor, 4,
+                           L"External editor is not a valid executable or file") ||
+            !optional_folder(kTrustedKeysFolder, 5,
+                             L"Trusted keys folder is not valid",
+                             DialogPathKind::existing_folder) ||
+            (checkbox_checked(kVerboseLogging) &&
+             !optional_folder(kLogFolder, 10,
+                              L"Log folder is not valid",
+                              DialogPathKind::destination_folder))) {
+            return false;
         }
         application_options.theme_mode = selected_index(kThemeMode, 0);
         application_options.accent_color_mode = selected_index(kAccentColorMode, 0);
         if (const auto color = color_from_hex(window_text(item(kCustomAccentColor)))) {
             application_options.custom_accent_color = *color;
             set_window_text(item(kCustomAccentColor), color_to_hex(*color));
+        } else if (application_options.accent_color_mode == 6) {
+            return reject_field(
+                0, kCustomAccentColor,
+                L"Custom accent color must use #RRGGBB, for example #FFB93C.");
         } else {
-            show_message_dialog(window_, instance_, dpi_, palette_.dark,
-                                L"Axiom settings",
-                                L"Custom accent color must use #RRGGBB, for example #FFB93C.",
-                                MessageDialogIcon::warning);
-            return false;
+            set_window_text(item(kCustomAccentColor),
+                            color_to_hex(application_options.custom_accent_color));
         }
         application_options.toolbar_icon_style = selected_index(kToolbarIconStyle, 0);
         application_options.toolbar_commands =
             normalize_toolbar_commands(application_options.toolbar_commands);
         application_options.startup_location_mode = selected_index(kStartupMode, 0);
-        application_options.startup_custom_path = window_text(item(kStartupCustomPath));
+        application_options.startup_custom_path =
+            trim_dialog_input(window_text(item(kStartupCustomPath)));
         application_options.recent_location_count = *recent_count;
 
-        application_options.default_level = selected_index(kLevel, 4) + 1;
+        application_options.default_method =
+            method_from_combo(item(kCompressionMethod));
+        const int selected_method_level =
+            level_from_combo(item(kLevel), 5);
+        if (application_options.default_method ==
+            axiom::CompressionMethod::axiom) {
+            application_options.default_level =
+                std::clamp(selected_method_level, 1, 9);
+            application_options.default_codec_level =
+                axiom::kAutomaticCodecLevel;
+        } else {
+            application_options.default_codec_level = selected_method_level;
+        }
         application_options.default_dictionary_size =
-            selected_combo_value(item(kDictionarySize), kDictionaryValues);
+            value_from_combo(item(kDictionarySize));
         application_options.default_word_size =
-            selected_combo_value(item(kWordSize), kWordSizeValues);
+            value_from_combo(item(kWordSize));
         application_options.default_solid_block_size =
             selected_combo_value(item(kSolidBlockSize), kSolidBlockValues);
-        application_options.default_thread_model = selected_index(kThreadModel, 0);
+        if (application_options.default_method ==
+            axiom::CompressionMethod::axiom) {
+            application_options.default_thread_model =
+                selected_index(kThreadModel, 0);
+        } else if (application_options.default_method ==
+                   axiom::CompressionMethod::lzma2) {
+            application_options.default_lzma_binary_tree =
+                selected_index(kThreadModel, 1) == 1;
+        }
         application_options.default_thread_count = *default_threads;
         application_options.default_update_mode = selected_index(kDefaultUpdateMode, 0);
         application_options.default_volume_size = default_volume;
-        application_options.default_volume_unit = selected_index(kDefaultVolumeUnit, 2);
+        application_options.default_volume_unit = default_volume_unit;
         application_options.default_recovery_percent = *recovery_percent;
-        application_options.default_signing_key = window_text(item(kDefaultSigningKey));
+        application_options.default_signing_key =
+            trim_dialog_input(window_text(item(kDefaultSigningKey)));
 
         application_options.archive_output_mode = selected_index(kArchiveOutputMode, 0);
-        application_options.archive_output_folder = window_text(item(kArchiveOutputFolder));
+        application_options.archive_output_folder =
+            trim_dialog_input(window_text(item(kArchiveOutputFolder)));
         application_options.extract_destination_mode =
             selected_index(kExtractDestinationMode, 0);
         application_options.extract_destination_folder =
-            window_text(item(kExtractDestinationFolder));
+            trim_dialog_input(window_text(item(kExtractDestinationFolder)));
         application_options.temp_folder_mode = selected_index(kTempFolderMode, 0);
-        application_options.temp_folder = window_text(item(kTempFolder));
+        application_options.temp_folder =
+            trim_dialog_input(window_text(item(kTempFolder)));
         application_options.temp_cleanup_days = *cleanup_days;
 
         application_options.file_open_mode = selected_index(kFileOpenMode, 0);
-        application_options.external_viewer = window_text(item(kExternalViewer));
-        application_options.external_editor = window_text(item(kExternalEditor));
+        application_options.external_viewer =
+            trim_dialog_input(window_text(item(kExternalViewer)));
+        application_options.external_editor =
+            trim_dialog_input(window_text(item(kExternalEditor)));
 
         application_options.password_prompt_mode = selected_index(kPasswordPromptMode, 0);
-        application_options.trusted_keys_folder = window_text(item(kTrustedKeysFolder));
+        application_options.trusted_keys_folder =
+            trim_dialog_input(window_text(item(kTrustedKeysFolder)));
 
         application_options.update_channel = selected_index(kUpdateChannel, 0);
         application_options.update_url = update_url;
 
         application_options.worker_priority = selected_index(kWorkerPriority, 0);
-        application_options.log_folder = window_text(item(kLogFolder));
+        application_options.log_folder =
+            trim_dialog_input(window_text(item(kLogFolder)));
         application_options.io_buffer_mode = selected_index(kIoBufferMode, 0);
         application_options.io_buffer_size = io_buffer;
         application_options.memory_limit_mode = selected_index(kMemoryLimitMode, 0);
@@ -4575,10 +4927,7 @@ private:
                    scale(36), TRUE);
         const int page_top = y + scale(50);
         const int button_y = client.bottom - margin - row;
-        const int preview_y = button_y - scale(39);
-        MoveWindow(output_preview_, margin, preview_y,
-                   std::max(scale(200), static_cast<int>(client.right) - margin * 2),
-                   scale(28), TRUE);
+        const int page_bottom = button_y - scale(12);
         const int button_width = scale(86);
         MoveWindow(cancel_, client.right - margin - button_width, button_y,
                    button_width, row, TRUE);
@@ -4595,12 +4944,32 @@ private:
             y += row + scale(12);
         };
 
+        const int preview_gap = scale(20);
+        const bool show_compression_preview =
+            create_page_ == 0 && content_width >= scale(890);
+        int compression_content_width = content_width;
+        if (show_compression_preview) {
+            const int preview_width = std::clamp(
+                content_width * 36 / 100, scale(320), scale(420));
+            compression_content_width =
+                content_width - preview_width - preview_gap;
+            MoveWindow(
+                compression_preview_,
+                content_left + compression_content_width + preview_gap,
+                page_top, preview_width,
+                std::max(scale(260), page_bottom - page_top),
+                TRUE);
+            ShowWindow(compression_preview_, SW_SHOWNA);
+        } else if (compression_preview_ != nullptr) {
+            ShowWindow(compression_preview_, SW_HIDE);
+        }
+
         switch (create_page_) {
             case 1: {
                 row_pair(update_mode_label_, update_mode_combo_, 340);
                 MoveWindow(comment_label_, content_left, y + scale(5), label_width, row, TRUE);
                 const int comment_height = std::clamp(
-                    preview_y - y - scale(160), scale(58), scale(105));
+                    page_bottom - y - scale(160), scale(58), scale(105));
                 MoveWindow(comment_edit_, content_left + label_width, y,
                            content_width - label_width, comment_height, TRUE);
                 y += comment_height + scale(12);
@@ -4623,7 +4992,7 @@ private:
                     const int action_width = scale(72);
                     const int action_gap = scale(8);
                     const int combo_width = std::max(
-                        scale(180), content_width - label_width -
+                        scale(180), compression_content_width - label_width -
                                         action_width * 2 - action_gap * 2);
                     const int value_x = content_left + label_width;
                     MoveWindow(compression_profile_combo_, value_x, y,
@@ -4635,14 +5004,34 @@ private:
                                y, action_width, row, TRUE);
                 }
                 y += row + scale(12);
-                row_pair(level_label_, level_combo_);
-                row_pair(dictionary_label_, dictionary_combo_);
-                row_pair(word_size_label_, word_size_combo_);
-                row_pair(solid_block_label_, solid_block_combo_);
-                row_pair(threads_label_, threads_combo_, 230);
-                row_pair(thread_model_label_, thread_model_combo_);
+                {
+                    const auto compression_row = [&](
+                                                     HWND label_window,
+                                                     HWND value,
+                                                     int value_width = 310) {
+                        MoveWindow(
+                            label_window, content_left, y + scale(6),
+                            label_width, row, TRUE);
+                        MoveWindow(
+                            value, content_left + label_width, y,
+                            std::min(
+                                scale(value_width),
+                                compression_content_width - label_width),
+                            scale(240), TRUE);
+                        y += row + scale(12);
+                    };
+                    compression_row(method_label_, method_combo_);
+                    compression_row(level_label_, level_combo_);
+                    compression_row(dictionary_label_, dictionary_combo_);
+                    compression_row(word_size_label_, word_size_combo_);
+                    compression_row(solid_block_label_, solid_block_combo_);
+                    compression_row(threads_label_, threads_combo_, 230);
+                    compression_row(thread_model_label_, thread_model_combo_);
+                }
                 y += scale(8);
-                move_wrapped(compression_info_, content_left, y, content_width, 54);
+                move_wrapped(
+                    compression_info_, content_left, y,
+                    compression_content_width, 54);
                 break;
             case 2:
                 MoveWindow(encrypt_data_, content_left, y, content_width, row, TRUE);
@@ -4710,7 +5099,6 @@ private:
                 clear_options_unsupported_by_selected_format();
                 update_create_dependencies();
             }
-            update_output_preview();
         }
     }
 
@@ -4791,22 +5179,254 @@ private:
         return thread_count_from(threads_combo_);
     }
 
+    static axiom::CompressionMethod method_from_combo(
+        HWND combo,
+        axiom::CompressionMethod fallback = axiom::CompressionMethod::axiom) {
+        if (combo == nullptr) return fallback;
+        const LRESULT selection = SendMessageW(combo, CB_GETCURSEL, 0, 0);
+        if (selection == CB_ERR) return fallback;
+        const LRESULT value = SendMessageW(
+            combo, CB_GETITEMDATA, static_cast<WPARAM>(selection), 0);
+        return value >= 0 && value <= 4
+            ? static_cast<axiom::CompressionMethod>(value)
+            : fallback;
+    }
+
+    static int level_from_combo(HWND combo, int fallback) {
+        if (combo == nullptr) return fallback;
+        const LRESULT selection = SendMessageW(combo, CB_GETCURSEL, 0, 0);
+        if (selection == CB_ERR) return fallback;
+        const LRESULT value = SendMessageW(
+            combo, CB_GETITEMDATA, static_cast<WPARAM>(selection), 0);
+        return static_cast<int>(value);
+    }
+
+    static std::size_t value_from_combo(HWND combo) {
+        if (combo == nullptr) return 0;
+        const LRESULT selection = SendMessageW(combo, CB_GETCURSEL, 0, 0);
+        if (selection == CB_ERR) return 0;
+        const LRESULT value = SendMessageW(
+            combo, CB_GETITEMDATA, static_cast<WPARAM>(selection), 0);
+        return value == CB_ERR || value < 0 ? 0 : static_cast<std::size_t>(value);
+    }
+
+    static void select_combo_value(HWND combo, std::size_t wanted) {
+        if (combo == nullptr) return;
+        LRESULT selected = 0;
+        const LRESULT count = SendMessageW(combo, CB_GETCOUNT, 0, 0);
+        for (LRESULT index = 0; index < count; ++index) {
+            if (SendMessageW(combo, CB_GETITEMDATA,
+                             static_cast<WPARAM>(index), 0) ==
+                static_cast<LRESULT>(wanted)) {
+                selected = index;
+                break;
+            }
+        }
+        SendMessageW(combo, CB_SETCURSEL, static_cast<WPARAM>(selected), 0);
+    }
+
+    void rebuild_method_combo(HWND combo, bool native,
+                              axiom::CompressionMethod selected) const {
+        if (combo == nullptr) return;
+        SendMessageW(combo, WM_SETREDRAW, FALSE, 0);
+        SendMessageW(combo, CB_RESETCONTENT, 0, 0);
+        const auto add = [&](axiom::CompressionMethod method) {
+            const auto index = SendMessageW(
+                combo, CB_ADDSTRING, 0,
+                reinterpret_cast<LPARAM>(
+                    kCompressionMethodNames[static_cast<std::size_t>(method)]));
+            SendMessageW(combo, CB_SETITEMDATA, static_cast<WPARAM>(index),
+                         static_cast<LPARAM>(method));
+            return index;
+        };
+        if (native) {
+            for (int value = 0; value <= 4; ++value) {
+                add(static_cast<axiom::CompressionMethod>(value));
+            }
+        } else {
+            add(axiom::CompressionMethod::deflate);
+            add(axiom::CompressionMethod::store);
+            if (selected != axiom::CompressionMethod::deflate &&
+                selected != axiom::CompressionMethod::store) {
+                selected = axiom::CompressionMethod::deflate;
+            }
+        }
+        for (LRESULT index = 0;
+             index < SendMessageW(combo, CB_GETCOUNT, 0, 0); ++index) {
+            if (SendMessageW(combo, CB_GETITEMDATA,
+                             static_cast<WPARAM>(index), 0) ==
+                static_cast<LRESULT>(selected)) {
+                SendMessageW(combo, CB_SETCURSEL, static_cast<WPARAM>(index), 0);
+                break;
+            }
+        }
+        SendMessageW(combo, WM_SETREDRAW, TRUE, 0);
+        InvalidateRect(combo, nullptr, TRUE);
+    }
+
+    void rebuild_method_controls(HWND level_combo, HWND option_combo,
+                                 axiom::CompressionMethod method,
+                                 int portable_level, int codec_level,
+                                 int thread_model, bool lzma_binary_tree) const {
+        SendMessageW(level_combo, WM_SETREDRAW, FALSE, 0);
+        SendMessageW(level_combo, CB_RESETCONTENT, 0, 0);
+        const auto add_level = [&](const std::wstring& text, int value) {
+            const auto index = SendMessageW(
+                level_combo, CB_ADDSTRING, 0,
+                reinterpret_cast<LPARAM>(text.c_str()));
+            SendMessageW(level_combo, CB_SETITEMDATA,
+                         static_cast<WPARAM>(index), value);
+            return index;
+        };
+
+        int wanted = codec_level;
+        if (method == axiom::CompressionMethod::axiom) {
+            wanted = std::clamp(portable_level, 1, 9);
+            for (int level = 1; level <= 9; ++level) {
+                add_level(kLevelNames[static_cast<std::size_t>(level - 1)], level);
+            }
+        } else if (method == axiom::CompressionMethod::zstandard) {
+            if (wanted == axiom::kAutomaticCodecLevel) wanted = 3;
+            wanted = std::clamp(wanted, -5, 22);
+            for (int level = -5; level <= 22; ++level) {
+                add_level(L"Level " + std::to_wstring(level), level);
+            }
+        } else if (method == axiom::CompressionMethod::lzma2 ||
+                   method == axiom::CompressionMethod::deflate) {
+            if (wanted == axiom::kAutomaticCodecLevel) wanted = 5;
+            wanted = std::clamp(wanted, 0, 9);
+            for (int level = 0; level <= 9; ++level) {
+                add_level(L"Level " + std::to_wstring(level), level);
+            }
+        } else {
+            wanted = 0;
+            add_level(L"No compression", 0);
+        }
+        for (LRESULT index = 0;
+             index < SendMessageW(level_combo, CB_GETCOUNT, 0, 0); ++index) {
+            if (SendMessageW(level_combo, CB_GETITEMDATA,
+                             static_cast<WPARAM>(index), 0) == wanted) {
+                SendMessageW(level_combo, CB_SETCURSEL,
+                             static_cast<WPARAM>(index), 0);
+                break;
+            }
+        }
+        SendMessageW(level_combo, WM_SETREDRAW, TRUE, 0);
+        InvalidateRect(level_combo, nullptr, TRUE);
+
+        SendMessageW(option_combo, WM_SETREDRAW, FALSE, 0);
+        SendMessageW(option_combo, CB_RESETCONTENT, 0, 0);
+        if (method == axiom::CompressionMethod::axiom) {
+            for (const auto* name : kThreadModelNames) {
+                SendMessageW(option_combo, CB_ADDSTRING, 0,
+                             reinterpret_cast<LPARAM>(name));
+            }
+            SendMessageW(option_combo, CB_SETCURSEL,
+                         static_cast<WPARAM>(std::clamp(thread_model, 0, 1)), 0);
+        } else if (method == axiom::CompressionMethod::lzma2) {
+            for (const auto* name : kLzmaMatchFinderNames) {
+                SendMessageW(option_combo, CB_ADDSTRING, 0,
+                             reinterpret_cast<LPARAM>(name));
+            }
+            SendMessageW(option_combo, CB_SETCURSEL,
+                         lzma_binary_tree ? 1 : 0, 0);
+        } else {
+            SendMessageW(option_combo, CB_ADDSTRING, 0,
+                         reinterpret_cast<LPARAM>(L"Not applicable"));
+            SendMessageW(option_combo, CB_SETCURSEL, 0, 0);
+        }
+        SendMessageW(option_combo, WM_SETREDRAW, TRUE, 0);
+        InvalidateRect(option_combo, nullptr, TRUE);
+    }
+
+    void rebuild_codec_parameter_controls(
+        HWND dictionary_combo, HWND word_combo,
+        axiom::CompressionMethod method,
+        std::size_t selected_dictionary,
+        std::size_t selected_word) const {
+        if (dictionary_combo == nullptr || word_combo == nullptr) return;
+        SendMessageW(dictionary_combo, WM_SETREDRAW, FALSE, 0);
+        SendMessageW(word_combo, WM_SETREDRAW, FALSE, 0);
+        SendMessageW(dictionary_combo, CB_RESETCONTENT, 0, 0);
+        SendMessageW(word_combo, CB_RESETCONTENT, 0, 0);
+
+        const auto add = [](HWND combo, const wchar_t* text, std::size_t value) {
+            const LRESULT index = SendMessageW(
+                combo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(text));
+            if (index != CB_ERR && index != CB_ERRSPACE) {
+                SendMessageW(combo, CB_SETITEMDATA,
+                             static_cast<WPARAM>(index),
+                             static_cast<LPARAM>(value));
+            }
+        };
+
+        if (method == axiom::CompressionMethod::axiom) {
+            for (std::size_t index = 0; index < kDictionaryNames.size(); ++index) {
+                add(dictionary_combo, kDictionaryNames[index],
+                    kDictionaryValues[index]);
+            }
+            for (std::size_t index = 0; index < kWordSizeNames.size(); ++index) {
+                add(word_combo, kWordSizeNames[index], kWordSizeValues[index]);
+            }
+        } else if (method == axiom::CompressionMethod::lzma2) {
+            constexpr std::array<const wchar_t*, 15> names{
+                L"Default for LZMA2 level", L"4 KiB", L"16 KiB", L"64 KiB",
+                L"256 KiB", L"1 MiB", L"2 MiB", L"4 MiB", L"8 MiB",
+                L"16 MiB", L"32 MiB", L"64 MiB", L"128 MiB", L"256 MiB",
+                L"512 MiB"};
+            constexpr std::array<std::size_t, 15> values{
+                0, 4u << 10, 16u << 10, 64u << 10, 256u << 10,
+                1u << 20, 2u << 20, 4u << 20, 8u << 20, 16u << 20,
+                32u << 20, 64u << 20, 128u << 20, 256u << 20, 512u << 20};
+            constexpr std::array<const wchar_t*, 8> fast_names{
+                L"Default for LZMA2 level", L"5", L"16", L"32",
+                L"64", L"128", L"192", L"273"};
+            constexpr std::array<std::size_t, 8> fast_values{
+                0, 5, 16, 32, 64, 128, 192, 273};
+            for (std::size_t index = 0; index < names.size(); ++index) {
+                add(dictionary_combo, names[index], values[index]);
+            }
+            for (std::size_t index = 0; index < fast_names.size(); ++index) {
+                add(word_combo, fast_names[index], fast_values[index]);
+            }
+        } else if (method == axiom::CompressionMethod::deflate) {
+            add(dictionary_combo, L"Fixed 32 KiB window", 0);
+            add(word_combo, L"Fixed 258-byte maximum match", 0);
+        } else if (method == axiom::CompressionMethod::zstandard) {
+            add(dictionary_combo, L"Managed by Zstandard", 0);
+            add(word_combo, L"Managed by Zstandard", 0);
+        } else {
+            add(dictionary_combo, L"Not used", 0);
+            add(word_combo, L"Not used", 0);
+        }
+
+        select_combo_value(dictionary_combo, selected_dictionary);
+        select_combo_value(word_combo, selected_word);
+        SendMessageW(dictionary_combo, WM_SETREDRAW, TRUE, 0);
+        SendMessageW(word_combo, WM_SETREDRAW, TRUE, 0);
+        InvalidateRect(dictionary_combo, nullptr, TRUE);
+        InvalidateRect(word_combo, nullptr, TRUE);
+    }
+
     void load_create_values() {
         create_options.archive_format =
             archive_format_from_path(create_options.archive_path, create_options.archive_format);
         SendMessageW(format_combo_, CB_SETCURSEL,
                      static_cast<WPARAM>(creatable_archive_format_index(
                          create_options.archive_format)), 0);
+        rebuild_method_combo(method_combo_, selected_format_is_native(),
+                             create_options.method);
+        create_options.method = method_from_combo(method_combo_);
         level_ = std::clamp(create_options.level, 1, 9);
-        SendMessageW(level_combo_, CB_SETCURSEL, static_cast<WPARAM>(level_ - 1), 0);
-        SendMessageW(dictionary_combo_, CB_SETCURSEL,
-                     value_index(kDictionaryValues, create_options.dictionary_size), 0);
-        SendMessageW(word_size_combo_, CB_SETCURSEL,
-                     value_index(kWordSizeValues, create_options.word_size), 0);
+        rebuild_method_controls(
+            level_combo_, thread_model_combo_, create_options.method,
+            level_, create_options.codec_level, create_options.thread_model,
+            create_options.lzma_binary_tree);
+        rebuild_codec_parameter_controls(
+            dictionary_combo_, word_size_combo_, create_options.method,
+            create_options.dictionary_size, create_options.word_size);
         SendMessageW(solid_block_combo_, CB_SETCURSEL,
                      value_index(kSolidBlockValues, create_options.solid_block_size), 0);
-        SendMessageW(thread_model_combo_, CB_SETCURSEL,
-                     static_cast<WPARAM>(std::clamp(create_options.thread_model, 0, 1)), 0);
         set_thread_count(threads_combo_, create_options.thread_count);
         SendMessageW(update_mode_combo_, CB_SETCURSEL,
                      static_cast<WPARAM>(create_options.features.update_mode), 0);
@@ -5003,10 +5623,18 @@ private:
 
     void on_archive_format_changed() {
         create_options.archive_format = selected_archive_format();
+        rebuild_method_combo(method_combo_, selected_format_is_native(),
+                             create_options.method);
+        create_options.method = method_from_combo(method_combo_);
+        rebuild_method_controls(
+            level_combo_, thread_model_combo_, create_options.method,
+            create_options.level, create_options.codec_level,
+            create_options.thread_model, create_options.lzma_binary_tree);
+        rebuild_codec_parameter_controls(
+            dictionary_combo_, word_size_combo_, create_options.method, 0, 0);
         clear_options_unsupported_by_selected_format();
         apply_selected_format_extension(true);
         update_create_dependencies();
-        update_output_preview();
     }
 
     void sync_archive_format_from_path() {
@@ -5020,8 +5648,20 @@ private:
                 SendMessageW(format_combo_, CB_SETCURSEL,
                              static_cast<WPARAM>(creatable_archive_format_index(
                                  create_options.archive_format)), 0);
+                rebuild_method_combo(method_combo_, selected_format_is_native(),
+                                     create_options.method);
+                create_options.method = method_from_combo(method_combo_);
+                rebuild_method_controls(
+                    level_combo_, thread_model_combo_, create_options.method,
+                    create_options.level, create_options.codec_level,
+                    create_options.thread_model,
+                    create_options.lzma_binary_tree);
+                rebuild_codec_parameter_controls(
+                    dictionary_combo_, word_size_combo_,
+                    create_options.method, 0, 0);
                 clear_options_unsupported_by_selected_format();
                 update_create_dependencies();
+                schedule_compression_curve();
             }
         }
     }
@@ -5030,23 +5670,59 @@ private:
         const auto available = selected_format_availability();
         const bool updating = create_options.features.update_mode != ArchiveUpdateMode::create_new;
         const bool native = selected_format_is_native();
+        const auto method = method_from_combo(
+            method_combo_, native ? axiom::CompressionMethod::axiom
+                                  : axiom::CompressionMethod::deflate);
+        const bool axiom_method = method == axiom::CompressionMethod::axiom;
+        const bool lzma_method = method == axiom::CompressionMethod::lzma2;
         EnableWindow(format_combo_, !create_options.fixed_archive_format);
-        EnableWindow(level_combo_, TRUE);
-        EnableWindow(dictionary_combo_, native);
-        EnableWindow(word_size_combo_, native);
+        EnableWindow(method_combo_, TRUE);
+        EnableWindow(level_combo_, method != axiom::CompressionMethod::store);
+        EnableWindow(dictionary_combo_, native && (axiom_method || lzma_method));
+        EnableWindow(word_size_combo_, native && (axiom_method || lzma_method));
         EnableWindow(solid_block_combo_, native);
+        set_window_text(
+            dictionary_label_,
+            method == axiom::CompressionMethod::deflate
+                ? L"Window size"
+                : L"Dictionary size");
+        set_window_text(
+            word_size_label_,
+            lzma_method
+                ? L"Fast bytes"
+                : method == axiom::CompressionMethod::deflate
+                    ? L"Maximum match"
+                    : L"Word size");
         // Level 7's path-dependent lazy tree parse is the one preset that has no
         // safe segmented form. Keep the control available everywhere else.
-        const int selected_level =
-            static_cast<int>(SendMessageW(level_combo_, CB_GETCURSEL, 0, 0)) + 1;
-        const bool swarm_applicable = native && selected_level != 7;
-        EnableWindow(thread_model_label_, swarm_applicable);
-        EnableWindow(thread_model_combo_, swarm_applicable);
+        const int selected_level = level_from_combo(level_combo_, 5);
+        const bool swarm_applicable =
+            native && axiom_method && selected_level != 7;
+        set_window_text(thread_model_label_,
+                        axiom_method ? L"Threading model"
+                                     : lzma_method ? L"Match finder"
+                                                   : L"Method option");
+        EnableWindow(thread_model_label_, swarm_applicable || lzma_method);
+        EnableWindow(thread_model_combo_, swarm_applicable || lzma_method);
         set_window_text(
             compression_info_,
             !native
-                ? L"ZIP uses Deflate compression. The compression level and thread count apply; "
-                  L"Axiom dictionary, word, and solid-block controls are disabled for this format."
+                ? L"ZIP supports standard Deflate or Store. Axiom-only dictionary, word, "
+                  L"solid-block, recovery, and encrypted-name controls do not apply."
+            : method == axiom::CompressionMethod::zstandard
+                ? L"Zstandard levels -5 through 22 trade speed for ratio. AXAR chunks remain "
+                  L"bounded and independently cancellable; dictionary and word size do not apply."
+            : lzma_method
+                ? L"LZMA2 uses a 4 KiB to 512 MiB dictionary, 5 to 273 fast bytes, and the "
+                  L"HC4/BT4 match finder. The effective dictionary cannot exceed the selected "
+                  L"solid-block size. Large dictionaries can require several times their size "
+                  L"in encoder memory; BT4 favors ratio and HC4 favors speed."
+            : method == axiom::CompressionMethod::deflate
+                ? L"Deflate levels 0 through 9 use the format-defined 32 KiB window and "
+                  L"258-byte maximum match. Those fixed values are shown but cannot be changed."
+            : method == axiom::CompressionMethod::store
+                ? L"Store writes data without compression. Archive encryption, recovery, "
+                  L"signing, metadata, and volume features remain available."
             : selected_level == 1
                 ? L"Swarm replaces level 1's fastest byte-token parser with a cooperative "
                   L"full-window hash parse. It improves ratio, but is intentionally slower."
@@ -5083,7 +5759,20 @@ private:
         EnableWindow(volume_size_edit_, split_enabled);
         EnableWindow(volume_unit_combo_, split_enabled);
         EnableWindow(recovery_percent_edit_, available.recovery);
-        EnableWindow(recovery_volumes_, available.recovery && split_enabled);
+        const std::wstring volume_text =
+            trim_dialog_input(window_text(volume_size_edit_));
+        const int volume_unit = static_cast<int>(
+            SendMessageW(volume_unit_combo_, CB_GETCURSEL, 0, 0));
+        const bool valid_split_size =
+            split_enabled && parse_integer_size_with_unit(
+                                 volume_text, volume_unit).has_value();
+        if (!valid_split_size &&
+            create_options.features.create_recovery_volumes) {
+            create_options.features.create_recovery_volumes = false;
+            InvalidateRect(recovery_volumes_, nullptr, FALSE);
+        }
+        EnableWindow(recovery_volumes_,
+                     available.recovery && valid_split_size);
 
         EnableWindow(sign_archive_, available.authenticity);
         const bool key_enabled = available.authenticity && create_options.features.sign_archive;
@@ -5093,32 +5782,752 @@ private:
         InvalidateRect(window_, nullptr, TRUE);
     }
 
-    void update_output_preview() {
-        if (path_edit_ == nullptr || output_preview_ == nullptr) return;
-        fs::path output = window_text(path_edit_);
-        std::wstring prefix = L"Output: ";
-        if (create_options.features.create_sfx) {
-            if (!output.empty() && lstrcmpiW(output.extension().c_str(), L".exe") != 0) {
-                output.replace_extension(L".exe");
-            }
-            prefix = L"Self-extractor: ";
-        } else if (volume_size_edit_ != nullptr && !window_text(volume_size_edit_).empty()) {
-            if (selected_archive_format() == ArchiveFormat::zip) {
-                output.replace_extension(L".z01");
-            } else {
-                fs::path root = output;
-                if (lstrcmpiW(root.extension().c_str(), L".axar") == 0) {
-                    root.replace_extension();
-                }
-                output = fs::path(root.wstring() + L".part001.axar");
-            }
-            prefix = L"First volume: ";
-        } else if (!output.empty() &&
-                   (output.extension().empty() || is_known_archive_extension(output))) {
-            output.replace_extension(
-                widen_ascii(archive_format_info(selected_archive_format()).default_extension));
+    std::wstring compression_curve_key() const {
+        if (method_combo_ == nullptr) return {};
+        const auto method = method_from_combo(method_combo_);
+        const auto threads = thread_count().value_or(0);
+        const auto dictionary = value_from_combo(dictionary_combo_);
+        const auto word_size = value_from_combo(word_size_combo_);
+        const auto solid_block = selected_combo_value(
+            solid_block_combo_, kSolidBlockValues);
+        const int method_option = static_cast<int>(
+            std::clamp<LRESULT>(
+                SendMessageW(thread_model_combo_, CB_GETCURSEL, 0, 0),
+                0, 1));
+        std::wostringstream key;
+        key << static_cast<int>(selected_archive_format()) << L':'
+            << static_cast<int>(method) << L':'
+            << threads << L':' << dictionary << L':' << word_size << L':'
+            << solid_block << L':' << method_option;
+        return key.str();
+    }
+
+    CompressionOptions compression_curve_options(
+        CompressionMethod method, int level) const {
+        CompressionOptions options;
+        if (method == CompressionMethod::axiom) {
+            apply_compression_level(options, std::clamp(level, 1, 9));
+            options.codec_level = kAutomaticCodecLevel;
+        } else {
+            // External codecs still use the portable preset for chunk geometry;
+            // their native effort is carried independently in codec_level.
+            apply_compression_level(
+                options, std::clamp(create_options.level, 1, 9));
+            options.codec_level = level;
         }
-        set_window_text(output_preview_, prefix + output.wstring());
+        options.method = method;
+        options.thread_count = thread_count().value_or(0);
+
+        const std::size_t dictionary =
+            value_from_combo(dictionary_combo_);
+        const std::size_t word_size =
+            value_from_combo(word_size_combo_);
+        if (method == CompressionMethod::lzma2) {
+            options.lzma_dictionary_size = dictionary;
+            options.lzma_fast_bytes = word_size;
+        } else if (method == CompressionMethod::axiom) {
+            if (dictionary != 0) options.window_size = dictionary;
+            if (word_size != 0) options.nice_length = word_size;
+        }
+        const std::size_t solid_block = selected_combo_value(
+            solid_block_combo_, kSolidBlockValues);
+        if (solid_block != 0) {
+            options.block_size = solid_block;
+            options.auto_block_size_for_threads = false;
+        }
+        const int method_option = static_cast<int>(
+            std::clamp<LRESULT>(
+                SendMessageW(thread_model_combo_, CB_GETCURSEL, 0, 0),
+                0, 1));
+        options.swarm_parse =
+            method == CompressionMethod::axiom && method_option == 1;
+        options.lzma_binary_tree =
+            method != CompressionMethod::lzma2 || method_option == 1;
+        options.recovery_percent = 0;
+        return options;
+    }
+
+    std::vector<CompressionEstimateCurveCandidate>
+    compression_curve_candidates() const {
+        const auto method = method_from_combo(method_combo_);
+        const int selected = level_from_combo(
+            level_combo_, method == CompressionMethod::axiom ? 5 : 0);
+        std::vector<int> levels;
+        if (method == CompressionMethod::axiom) {
+            for (int level = 1; level <= 9; ++level) {
+                levels.push_back(level);
+            }
+        } else if (method == CompressionMethod::zstandard) {
+            for (int level = -5; level <= 22; ++level) {
+                levels.push_back(level);
+            }
+        } else if (method == CompressionMethod::lzma2 ||
+                   method == CompressionMethod::deflate) {
+            for (int level = 0; level <= 9; ++level) {
+                levels.push_back(level);
+            }
+        } else {
+            levels.push_back(0);
+        }
+
+        // The worker publishes candidates in this order. Put the selected
+        // result and the curve's bounds first so useful context appears before
+        // the remaining points are filled in.
+        std::vector<int> ordered;
+        const auto add = [&](int level) {
+            if (std::find(levels.begin(), levels.end(), level) != levels.end() &&
+                std::find(ordered.begin(), ordered.end(), level) ==
+                    ordered.end()) {
+                ordered.push_back(level);
+            }
+        };
+        add(selected);
+        add(levels.front());
+        add(levels.back());
+        for (int level : levels) add(level);
+
+        std::vector<CompressionEstimateCurveCandidate> candidates;
+        candidates.reserve(ordered.size());
+        for (int level : ordered) {
+            candidates.push_back({
+                level, compression_curve_options(method, level)});
+        }
+        return candidates;
+    }
+
+    void schedule_compression_curve() {
+        if (mode_ != DialogMode::create_archive ||
+            window_ == nullptr || estimate_inputs.empty()) {
+            return;
+        }
+        KillTimer(window_, kCompressionCurveDebounceTimer);
+        SetTimer(window_, kCompressionCurveDebounceTimer, 400, nullptr);
+    }
+
+    void stop_compression_curve_worker() {
+        if (window_ != nullptr && IsWindow(window_)) {
+            KillTimer(window_, kCompressionCurveDebounceTimer);
+        }
+        if (compression_curve_operation_) {
+            compression_curve_operation_->request_cancel();
+        }
+        if (compression_curve_worker_.joinable()) {
+            compression_curve_worker_.join();
+        }
+        compression_curve_operation_.reset();
+        compression_curve_running_ = false;
+    }
+
+    void start_compression_curve() {
+        if (mode_ != DialogMode::create_archive ||
+            estimate_inputs.empty() || window_ == nullptr) {
+            return;
+        }
+        const ArchiveFormat format = selected_archive_format();
+        if (format != ArchiveFormat::axar &&
+            format != ArchiveFormat::zip) {
+            std::lock_guard lock(compression_curve_mutex_);
+            compression_curve_result_.reset();
+            compression_curve_error_ =
+                L"Compression preview is unavailable for this archive format.";
+            compression_curve_status_ = compression_curve_error_;
+            InvalidateRect(compression_preview_, nullptr, FALSE);
+            return;
+        }
+
+        const std::wstring key = compression_curve_key();
+        {
+            std::lock_guard lock(compression_curve_mutex_);
+            if (compression_curve_result_ &&
+                compression_curve_result_->complete &&
+                compression_curve_result_key_ == key) {
+                InvalidateRect(compression_preview_, nullptr, FALSE);
+                return;
+            }
+        }
+        if (compression_curve_running_) {
+            if (compression_curve_active_key_ == key) return;
+            compression_curve_restart_pending_ = true;
+            if (compression_curve_operation_) {
+                compression_curve_operation_->request_cancel();
+            }
+            {
+                std::lock_guard lock(compression_curve_mutex_);
+                compression_curve_status_ = L"Updating compression preview...";
+            }
+            InvalidateRect(compression_preview_, nullptr, FALSE);
+            return;
+        }
+        if (compression_curve_worker_.joinable()) {
+            compression_curve_worker_.join();
+        }
+
+        auto estimate_options = CompressionEstimateOptions{};
+        estimate_options.format = format;
+        estimate_options.sample_budget = 4u << 20;
+        estimate_options.sample_chunk_size = 256u << 10;
+        estimate_options.time_budget = std::chrono::milliseconds(7000);
+        compression_curve_operation_ =
+            std::make_shared<OperationControl>();
+        estimate_options.compression.operation =
+            compression_curve_operation_;
+        const auto candidates = compression_curve_candidates();
+        const auto inputs = estimate_inputs;
+        const HWND target = window_;
+        compression_curve_active_key_ = key;
+        compression_curve_restart_pending_ = false;
+        compression_curve_running_ = true;
+        compression_curve_update_posted_.store(
+            false, std::memory_order_release);
+        {
+            std::lock_guard lock(compression_curve_mutex_);
+            compression_curve_result_.reset();
+            compression_curve_error_.clear();
+            compression_curve_status_ = L"Scanning selected files...";
+        }
+        InvalidateRect(compression_preview_, nullptr, FALSE);
+
+        compression_curve_worker_ = std::jthread(
+            [this, target, inputs, estimate_options, candidates, key] {
+                try {
+                    auto result = estimate_compression_curve(
+                        inputs, estimate_options, candidates,
+                        [this, target, &key](
+                            const CompressionEstimateCurveResult& value) {
+                            {
+                                std::lock_guard lock(
+                                    compression_curve_mutex_);
+                                compression_curve_result_ = value;
+                                compression_curve_result_key_ = key;
+                                compression_curve_status_ =
+                                    value.complete
+                                        ? L"Compression preview complete"
+                                        : L"Estimating codec levels...";
+                            }
+                            if (!compression_curve_update_posted_.exchange(
+                                    true, std::memory_order_acq_rel)) {
+                                PostMessageW(
+                                    target, kCompressionCurveUpdated, 0, 0);
+                            }
+                        });
+                    {
+                        std::lock_guard lock(compression_curve_mutex_);
+                        compression_curve_result_ = std::move(result);
+                        compression_curve_result_key_ = key;
+                        compression_curve_status_ =
+                            L"Compression preview complete";
+                    }
+                } catch (const OperationCancelled&) {
+                    // A settings change or dialog close superseded this curve.
+                } catch (const std::exception& exception) {
+                    std::lock_guard lock(compression_curve_mutex_);
+                    compression_curve_error_ =
+                        widen_ascii(exception.what());
+                    compression_curve_status_ =
+                        L"Compression preview unavailable";
+                } catch (...) {
+                    std::lock_guard lock(compression_curve_mutex_);
+                    compression_curve_error_ =
+                        L"Unknown compression estimation failure.";
+                    compression_curve_status_ =
+                        L"Compression preview unavailable";
+                }
+                PostMessageW(
+                    target, kCompressionCurveFinished, 0, 0);
+            });
+    }
+
+    void finish_compression_curve() {
+        if (compression_curve_worker_.joinable()) {
+            compression_curve_worker_.join();
+        }
+        compression_curve_running_ = false;
+        compression_curve_operation_.reset();
+        compression_curve_update_posted_.store(
+            false, std::memory_order_release);
+        InvalidateRect(compression_preview_, nullptr, FALSE);
+        if (compression_curve_restart_pending_) {
+            compression_curve_restart_pending_ = false;
+            start_compression_curve();
+        }
+    }
+
+    void draw_compression_curve(const DRAWITEMSTRUCT& draw) const {
+        RECT bounds = draw.rcItem;
+        const int width = bounds.right - bounds.left;
+        const int height = bounds.bottom - bounds.top;
+        if (width <= 0 || height <= 0) return;
+
+        HDC memory = CreateCompatibleDC(draw.hDC);
+        HBITMAP bitmap = CreateCompatibleBitmap(draw.hDC, width, height);
+        HGDIOBJ old_bitmap = SelectObject(memory, bitmap);
+        RECT local{0, 0, width, height};
+        HBRUSH background = CreateSolidBrush(palette_.button);
+        FillRect(memory, &local, background);
+        DeleteObject(background);
+        HPEN border_pen = CreatePen(PS_SOLID, 1, palette_.border);
+        HGDIOBJ old_pen = SelectObject(memory, border_pen);
+        HGDIOBJ old_brush = SelectObject(
+            memory, GetStockObject(HOLLOW_BRUSH));
+        Rectangle(memory, 0, 0, width, height);
+        SelectObject(memory, old_brush);
+        SelectObject(memory, old_pen);
+        DeleteObject(border_pen);
+
+        std::optional<CompressionEstimateCurveResult> result;
+        std::wstring status;
+        std::wstring error;
+        {
+            std::lock_guard lock(compression_curve_mutex_);
+            result = compression_curve_result_;
+            status = compression_curve_status_;
+            error = compression_curve_error_;
+        }
+
+        HFONT old_font = reinterpret_cast<HFONT>(
+            SelectObject(memory, font_));
+        SetBkMode(memory, TRANSPARENT);
+        SetTextColor(memory, palette_.text);
+        const int inset = scale(16);
+        RECT title_rect{inset, scale(12), width - inset, scale(36)};
+        const auto method = method_from_combo(method_combo_);
+        std::wstring title =
+            std::wstring(
+                kCompressionMethodNames[
+                    static_cast<std::size_t>(method)]) +
+            L" compression preview";
+        DrawTextW(
+            memory, title.c_str(), -1, &title_rect,
+            DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+
+        std::vector<CompressionEstimateCurvePoint> points;
+        if (result) {
+            for (const auto& point : result->points) {
+                if (point.completed_probes != 0 ||
+                    result->source_bytes == 0) {
+                    points.push_back(point);
+                }
+            }
+            std::sort(
+                points.begin(), points.end(),
+                [](const auto& left, const auto& right) {
+                    return left.level < right.level;
+                });
+        }
+        const int selected_level = level_from_combo(
+            level_combo_, method == CompressionMethod::axiom ? 5 : 0);
+        const auto selected = std::find_if(
+            points.begin(), points.end(),
+            [selected_level](const auto& point) {
+                return point.level == selected_level;
+            });
+
+        SetTextColor(memory, palette_.muted);
+        RECT summary_rect{
+            inset, scale(38), width - inset, scale(66)};
+        std::wstring summary = status;
+        if (selected != points.end() && result &&
+            result->source_bytes != 0) {
+            const double compressed_percent =
+                100.0 *
+                static_cast<double>(
+                    selected->estimated_archive_bytes) /
+                static_cast<double>(result->source_bytes);
+            summary =
+                L"Level " + std::to_wstring(selected->level) +
+                L"  \u2022  " +
+                format_preview_bytes(
+                    selected->estimated_archive_bytes) +
+                L"  \u2022  " +
+                format_preview_percent(compressed_percent) +
+                L" of original  \u2022  " +
+                format_preview_percent(
+                    selected->estimated_savings_percent) +
+                L" saved";
+        }
+        DrawTextW(
+            memory, summary.c_str(), -1, &summary_rect,
+            DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+
+        RECT detail_rect{
+            inset, scale(62), width - inset, scale(86)};
+        std::wstring detail;
+        if (selected != points.end() && result) {
+            detail =
+                estimate_confidence_name(selected->confidence) +
+                std::wstring(L"  \u2022  sampled ") +
+                format_preview_bytes(result->sampled_bytes);
+            if (!result->complete &&
+                result->planned_sample_bytes != 0) {
+                detail += L" of " +
+                    format_preview_bytes(
+                        result->planned_sample_bytes);
+            }
+            if (!result->warnings.empty()) {
+                detail += L"  \u2022  " +
+                    std::to_wstring(result->warnings.size()) +
+                    L" warning";
+                if (result->warnings.size() != 1) detail += L"s";
+            }
+        } else if (!error.empty()) {
+            detail = error;
+        } else {
+            detail =
+                L"Each point uses the same sampled source regions.";
+        }
+        DrawTextW(
+            memory, detail.c_str(), -1, &detail_rect,
+            DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+
+        const RECT chart{
+            scale(48), scale(96),
+            width - scale(18), height - scale(42)};
+        if (points.empty() || !result ||
+            result->source_bytes == 0 ||
+            chart.right <= chart.left ||
+            chart.bottom <= chart.top) {
+            RECT empty_rect{
+                inset, scale(105), width - inset,
+                height - scale(20)};
+            SetTextColor(memory, palette_.muted);
+            const std::wstring empty_text =
+                !error.empty() ? error
+                               : status.empty()
+                                   ? L"Preparing compression preview..."
+                                   : status;
+            DrawTextW(
+                memory, empty_text.c_str(), -1, &empty_rect,
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE |
+                    DT_END_ELLIPSIS);
+            SelectObject(memory, old_font);
+            BitBlt(
+                draw.hDC, bounds.left, bounds.top, width, height,
+                memory, 0, 0, SRCCOPY);
+            SelectObject(memory, old_bitmap);
+            DeleteObject(bitmap);
+            DeleteDC(memory);
+            return;
+        }
+
+        double maximum_percent = 100.0;
+        for (const auto& point : points) {
+            maximum_percent = std::max(
+                maximum_percent,
+                100.0 *
+                    static_cast<double>(
+                        point.estimated_high_bytes) /
+                    static_cast<double>(result->source_bytes));
+        }
+        maximum_percent =
+            std::max(100.0, std::ceil(maximum_percent / 10.0) * 10.0);
+        const auto x_for = [&](std::size_t index) {
+            if (points.size() <= 1) {
+                return (chart.left + chart.right) / 2;
+            }
+            return chart.left +
+                static_cast<int>(
+                    static_cast<long long>(
+                        chart.right - chart.left) *
+                    index /
+                    static_cast<long long>(points.size() - 1));
+        };
+        const auto y_for = [&](double percent) {
+            return chart.bottom -
+                static_cast<int>(
+                    std::clamp(
+                        percent / maximum_percent, 0.0, 1.0) *
+                    (chart.bottom - chart.top));
+        };
+
+        HPEN grid_pen = CreatePen(
+            PS_SOLID, 1, blend_color(
+                palette_.button, palette_.border, 70));
+        old_pen = SelectObject(memory, grid_pen);
+        SetTextColor(memory, palette_.muted);
+        for (int tick = 0; tick <= 2; ++tick) {
+            const double value =
+                maximum_percent * tick / 2.0;
+            const int y = y_for(value);
+            MoveToEx(memory, chart.left, y, nullptr);
+            LineTo(memory, chart.right, y);
+            RECT label{
+                scale(3), y - scale(10),
+                chart.left - scale(5), y + scale(10)};
+            const std::wstring text =
+                format_preview_percent(value);
+            DrawTextW(
+                memory, text.c_str(), -1, &label,
+                DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
+        }
+        SelectObject(memory, old_pen);
+        DeleteObject(grid_pen);
+
+        std::vector<Gdiplus::PointF> curve;
+        std::vector<Gdiplus::PointF> band;
+        curve.reserve(points.size());
+        band.reserve(points.size() * 2);
+        for (std::size_t index = 0; index < points.size(); ++index) {
+            const double percent =
+                100.0 *
+                static_cast<double>(
+                    points[index].estimated_archive_bytes) /
+                static_cast<double>(result->source_bytes);
+            curve.push_back({
+                static_cast<Gdiplus::REAL>(x_for(index)),
+                static_cast<Gdiplus::REAL>(y_for(percent))});
+            const double high =
+                100.0 *
+                static_cast<double>(
+                    points[index].estimated_high_bytes) /
+                static_cast<double>(result->source_bytes);
+            band.push_back({
+                static_cast<Gdiplus::REAL>(x_for(index)),
+                static_cast<Gdiplus::REAL>(y_for(high))});
+        }
+        for (std::size_t reverse = points.size(); reverse-- > 0;) {
+            const double low =
+                100.0 *
+                static_cast<double>(
+                    points[reverse].estimated_low_bytes) /
+                static_cast<double>(result->source_bytes);
+            band.push_back({
+                static_cast<Gdiplus::REAL>(x_for(reverse)),
+                static_cast<Gdiplus::REAL>(y_for(low))});
+        }
+
+        if (compression_graph_gdiplus_ready()) {
+            Gdiplus::Graphics graphics(memory);
+            graphics.SetSmoothingMode(
+                Gdiplus::SmoothingModeAntiAlias);
+            graphics.SetPixelOffsetMode(
+                Gdiplus::PixelOffsetModeHighQuality);
+            graphics.SetCompositingQuality(
+                Gdiplus::CompositingQualityGammaCorrected);
+            if (curve.size() >= 2) {
+                const Gdiplus::REAL original_baseline =
+                    static_cast<Gdiplus::REAL>(y_for(100.0));
+                const Gdiplus::REAL zero_baseline =
+                    static_cast<Gdiplus::REAL>(y_for(0.0));
+
+                std::vector<Gdiplus::PointF> compressed_area =
+                    curve;
+                compressed_area.push_back({
+                    static_cast<Gdiplus::REAL>(
+                        chart.right),
+                    zero_baseline});
+                compressed_area.push_back({
+                    static_cast<Gdiplus::REAL>(
+                        chart.left),
+                    zero_baseline});
+                Gdiplus::SolidBrush compressed(
+                    graph_color(palette_.accent, 92));
+                graphics.FillPolygon(
+                    &compressed, compressed_area.data(),
+                    static_cast<INT>(
+                        compressed_area.size()));
+
+                std::vector<Gdiplus::PointF> saved_area = curve;
+                saved_area.push_back({
+                    static_cast<Gdiplus::REAL>(
+                        chart.right),
+                    original_baseline});
+                saved_area.push_back({
+                    static_cast<Gdiplus::REAL>(
+                        chart.left),
+                    original_baseline});
+                Gdiplus::SolidBrush saved(
+                    graph_color(
+                        compression_graph_saved_color(
+                            palette_.accent),
+                        105));
+                graphics.FillPolygon(
+                    &saved, saved_area.data(),
+                    static_cast<INT>(saved_area.size()));
+
+                if (band.size() >= 3) {
+                    Gdiplus::SolidBrush uncertainty(
+                        graph_color(palette_.text, 28));
+                    graphics.FillPolygon(
+                        &uncertainty, band.data(),
+                        static_cast<INT>(band.size()));
+                }
+                Gdiplus::Pen line(
+                    graph_color(palette_.accent), 2.0f);
+                line.SetLineJoin(Gdiplus::LineJoinRound);
+                graphics.DrawLines(
+                    &line, curve.data(),
+                    static_cast<INT>(curve.size()));
+            }
+            for (std::size_t index = 0;
+                 index < points.size(); ++index) {
+                const bool selected_point =
+                    points[index].level == selected_level;
+                const Gdiplus::REAL radius =
+                    selected_point ? 5.0f : 2.5f;
+                Gdiplus::SolidBrush fill(
+                    selected_point
+                        ? graph_color(palette_.selection_text)
+                        : graph_color(palette_.accent));
+                Gdiplus::Pen outline(
+                    graph_color(palette_.accent),
+                    selected_point ? 3.0f : 1.0f);
+                graphics.FillEllipse(
+                    &fill,
+                    curve[index].X - radius,
+                    curve[index].Y - radius,
+                    radius * 2, radius * 2);
+                graphics.DrawEllipse(
+                    &outline,
+                    curve[index].X - radius,
+                    curve[index].Y - radius,
+                    radius * 2, radius * 2);
+            }
+        } else if (curve.size() >= 2) {
+            std::vector<POINT> line;
+            line.reserve(curve.size());
+            for (const auto& point : curve) {
+                line.push_back({
+                    static_cast<LONG>(point.X),
+                    static_cast<LONG>(point.Y)});
+            }
+            HPEN curve_pen = CreatePen(
+                PS_SOLID, scale(2), palette_.accent);
+            old_pen = SelectObject(memory, curve_pen);
+            Polyline(
+                memory, line.data(),
+                static_cast<int>(line.size()));
+            SelectObject(memory, old_pen);
+            DeleteObject(curve_pen);
+        }
+
+        const int legend_y = chart.top + scale(8);
+        int legend_x = std::max(
+            chart.left + scale(8), chart.right - scale(172));
+        RECT legend_box{
+            legend_x, legend_y,
+            legend_x + scale(9), legend_y + scale(9)};
+        HBRUSH legend_brush = CreateSolidBrush(palette_.accent);
+        FillRect(memory, &legend_box, legend_brush);
+        DeleteObject(legend_brush);
+        SetTextColor(memory, palette_.text);
+        RECT legend_text{
+            legend_box.right + scale(5), legend_y - scale(5),
+            legend_box.right + scale(80), legend_y + scale(15)};
+        DrawTextW(
+            memory, L"Compressed", -1, &legend_text,
+            DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+        legend_x += scale(91);
+        legend_box = {
+            legend_x, legend_y,
+            legend_x + scale(9), legend_y + scale(9)};
+        legend_brush = CreateSolidBrush(
+            compression_graph_saved_color(palette_.accent));
+        FillRect(memory, &legend_box, legend_brush);
+        DeleteObject(legend_brush);
+        legend_text = {
+            legend_box.right + scale(5), legend_y - scale(5),
+            chart.right, legend_y + scale(15)};
+        DrawTextW(
+            memory, L"Saved", -1, &legend_text,
+            DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+
+        const std::size_t tick_stride = std::max<std::size_t>(
+            1, (points.size() + 6) / 7);
+        SetTextColor(memory, palette_.muted);
+        for (std::size_t index = 0;
+             index < points.size(); ++index) {
+            if (index != 0 &&
+                index + 1 != points.size() &&
+                points[index].level != selected_level &&
+                index % tick_stride != 0) {
+                continue;
+            }
+            RECT tick{
+                x_for(index) - scale(24),
+                chart.bottom + scale(7),
+                x_for(index) + scale(24),
+                chart.bottom + scale(29)};
+            const std::wstring label =
+                std::to_wstring(points[index].level);
+            DrawTextW(
+                memory, label.c_str(), -1, &tick,
+                DT_CENTER | DT_SINGLELINE | DT_TOP);
+        }
+
+        SelectObject(memory, old_font);
+        BitBlt(
+            draw.hDC, bounds.left, bounds.top, width, height,
+            memory, 0, 0, SRCCOPY);
+        SelectObject(memory, old_bitmap);
+        DeleteObject(bitmap);
+        DeleteDC(memory);
+    }
+
+    void select_compression_curve_level() {
+        std::optional<CompressionEstimateCurveResult> result;
+        {
+            std::lock_guard lock(compression_curve_mutex_);
+            result = compression_curve_result_;
+        }
+        if (!result || result->source_bytes == 0) return;
+        std::vector<CompressionEstimateCurvePoint> points;
+        for (const auto& point : result->points) {
+            if (point.completed_probes != 0) points.push_back(point);
+        }
+        std::sort(
+            points.begin(), points.end(),
+            [](const auto& left, const auto& right) {
+                return left.level < right.level;
+            });
+        if (points.empty()) return;
+
+        POINT cursor{};
+        GetCursorPos(&cursor);
+        ScreenToClient(compression_preview_, &cursor);
+        RECT client{};
+        GetClientRect(compression_preview_, &client);
+        const int left = scale(48);
+        const int right = client.right - scale(18);
+        if (cursor.x < left || cursor.x > right ||
+            cursor.y < scale(88) ||
+            cursor.y > client.bottom - scale(20)) {
+            return;
+        }
+        std::size_t nearest = 0;
+        int nearest_distance = std::numeric_limits<int>::max();
+        for (std::size_t index = 0;
+             index < points.size(); ++index) {
+            const int x = points.size() <= 1
+                ? (left + right) / 2
+                : left +
+                    static_cast<int>(
+                        static_cast<long long>(right - left) *
+                        index /
+                        static_cast<long long>(
+                            points.size() - 1));
+            const int distance = std::abs(cursor.x - x);
+            if (distance < nearest_distance) {
+                nearest = index;
+                nearest_distance = distance;
+            }
+        }
+        const LRESULT count =
+            SendMessageW(level_combo_, CB_GETCOUNT, 0, 0);
+        for (LRESULT index = 0; index < count; ++index) {
+            if (SendMessageW(
+                    level_combo_, CB_GETITEMDATA,
+                    static_cast<WPARAM>(index), 0) ==
+                points[nearest].level) {
+                SendMessageW(
+                    level_combo_, CB_SETCURSEL,
+                    static_cast<WPARAM>(index), 0);
+                mark_compression_profile_custom();
+                update_create_dependencies();
+                InvalidateRect(
+                    compression_preview_, nullptr, FALSE);
+                break;
+            }
+        }
     }
 
     void convert_output_mode(bool sfx) {
@@ -5153,11 +6562,19 @@ private:
             apply_settings_live(true);
             return;
         }
-        if (mode_ != DialogMode::settings && window_text(path_edit_).empty()) {
-            show_message_dialog(window_, instance_, dpi_, palette_.dark,
-                                L"Axiom", L"Choose a path first.",
-                                MessageDialogIcon::information);
-            return;
+        if (mode_ == DialogMode::extract_archive) {
+            const auto result = validate_dialog_path(
+                window_text(path_edit_), DialogPathKind::destination_folder);
+            if (!result) {
+                show_message_dialog(
+                    window_, instance_, dpi_, palette_.dark,
+                    L"Extraction destination", result.error,
+                    MessageDialogIcon::warning);
+                SetFocus(path_edit_);
+                SendMessageW(path_edit_, EM_SETSEL, 0, -1);
+                return;
+            }
+            set_window_text(path_edit_, result.path.wstring());
         }
         const auto threads = thread_count();
         if (!threads) {
@@ -5174,10 +6591,8 @@ private:
             create_options.archive_path = window_text(path_edit_);
             create_options.level = level_;
             create_options.thread_count = *threads;
-            create_options.dictionary_size = selected_combo_value(
-                dictionary_combo_, kDictionaryValues);
-            create_options.word_size = selected_combo_value(
-                word_size_combo_, kWordSizeValues);
+            create_options.dictionary_size = value_from_combo(dictionary_combo_);
+            create_options.word_size = value_from_combo(word_size_combo_);
             create_options.solid_block_size = selected_combo_value(
                 solid_block_combo_, kSolidBlockValues);
         } else if (mode_ == DialogMode::extract_archive) {
@@ -5196,17 +6611,40 @@ private:
     }
 
     void accept_create() {
-        fs::path displayed_output = window_text(path_edit_);
-        if (displayed_output.empty()) {
+        fs::path requested_output =
+            trim_dialog_input(window_text(path_edit_));
+        if (!requested_output.empty()) {
+            if (create_options.features.create_sfx) {
+                requested_output.replace_extension(L".exe");
+            } else if (requested_output.extension().empty() ||
+                       is_known_archive_extension(requested_output)) {
+                requested_output.replace_extension(
+                    widen_ascii(archive_format_info(selected_archive_format())
+                                    .default_extension));
+            }
+        }
+        const auto output_result = validate_dialog_path(
+            requested_output.wstring(), DialogPathKind::output_file);
+        if (!output_result) {
             show_message_dialog(window_, instance_, dpi_, palette_.dark,
-                                L"Axiom", L"Choose an output path first.",
-                                MessageDialogIcon::information);
+                                L"Archive output", output_result.error,
+                                MessageDialogIcon::warning);
+            SetFocus(path_edit_);
+            SendMessageW(path_edit_, EM_SETSEL, 0, -1);
             return;
         }
+        fs::path displayed_output = output_result.path;
+        set_window_text(path_edit_, displayed_output.wstring());
 
-        const LRESULT level_selection = SendMessageW(level_combo_, CB_GETCURSEL, 0, 0);
-        if (level_selection != CB_ERR) level_ = static_cast<int>(level_selection) + 1;
-        create_options.level = level_;
+        create_options.method = method_from_combo(method_combo_);
+        const int method_level = level_from_combo(level_combo_, 5);
+        if (create_options.method == axiom::CompressionMethod::axiom) {
+            level_ = std::clamp(method_level, 1, 9);
+            create_options.level = level_;
+            create_options.codec_level = axiom::kAutomaticCodecLevel;
+        } else {
+            create_options.codec_level = method_level;
+        }
         const auto threads = thread_count();
         if (!threads) {
             select_create_page(0);
@@ -5217,33 +6655,19 @@ private:
             SetFocus(threads_combo_);
             return;
         }
-        if (displayed_output.filename().empty()) {
-            show_message_dialog(window_, instance_, dpi_, palette_.dark,
-                                L"Axiom", L"Output must be a Windows file path, not only a folder path.",
-                                MessageDialogIcon::warning);
-            SetFocus(path_edit_);
-            return;
-        }
-        if (!displayed_output.parent_path().empty()) {
-            std::error_code error;
-            if (!fs::is_directory(displayed_output.parent_path(), error)) {
-                show_message_dialog(
-                    window_, instance_, dpi_, palette_.dark, L"Axiom",
-                    L"The output file's parent folder does not exist.",
-                    MessageDialogIcon::warning);
-                SetFocus(path_edit_);
-                return;
-            }
-        }
         create_options.thread_count = *threads;
-        create_options.dictionary_size = selected_combo_value(
-            dictionary_combo_, kDictionaryValues);
-        create_options.word_size = selected_combo_value(
-            word_size_combo_, kWordSizeValues);
+        create_options.dictionary_size = value_from_combo(dictionary_combo_);
+        create_options.word_size = value_from_combo(word_size_combo_);
         create_options.solid_block_size = selected_combo_value(
             solid_block_combo_, kSolidBlockValues);
-        create_options.thread_model = static_cast<int>(
-            std::max<LRESULT>(0, SendMessageW(thread_model_combo_, CB_GETCURSEL, 0, 0)));
+        const int method_option = static_cast<int>(
+            std::clamp<LRESULT>(
+                SendMessageW(thread_model_combo_, CB_GETCURSEL, 0, 0), 0, 1));
+        if (create_options.method == axiom::CompressionMethod::axiom) {
+            create_options.thread_model = method_option;
+        } else if (create_options.method == axiom::CompressionMethod::lzma2) {
+            create_options.lzma_binary_tree = method_option == 1;
+        }
         create_options.archive_format = selected_archive_format();
         clear_options_unsupported_by_selected_format();
 
@@ -5252,9 +6676,17 @@ private:
             create_options.features.update_mode = static_cast<ArchiveUpdateMode>(selection);
         }
         create_options.features.comment = window_text(comment_edit_);
-        create_options.features.volume_size = window_text(volume_size_edit_);
+        create_options.features.volume_size =
+            trim_dialog_input(window_text(volume_size_edit_));
+        if (const LRESULT selection =
+                SendMessageW(volume_unit_combo_, CB_GETCURSEL, 0, 0);
+            selection != CB_ERR) {
+            create_options.features.volume_unit = static_cast<int>(selection);
+        }
         if (!create_options.features.volume_size.empty() &&
-            !parse_size_text(create_options.features.volume_size)) {
+            !parse_integer_size_with_unit(
+                create_options.features.volume_size,
+                create_options.features.volume_unit)) {
             select_create_page(3);
             show_message_dialog(
                 window_, instance_, dpi_, palette_.dark,
@@ -5262,11 +6694,19 @@ private:
                 L"Volume size must be a positive integer. Select KiB, MiB, GiB, or TiB in the adjacent list.",
                 MessageDialogIcon::warning);
             SetFocus(volume_size_edit_);
+            SendMessageW(volume_size_edit_, EM_SETSEL, 0, -1);
             return;
         }
-        if (const LRESULT selection = SendMessageW(volume_unit_combo_, CB_GETCURSEL, 0, 0);
-            selection != CB_ERR) {
-            create_options.features.volume_unit = static_cast<int>(selection);
+        if (create_options.features.create_recovery_volumes &&
+            create_options.features.volume_size.empty()) {
+            select_create_page(3);
+            show_message_dialog(
+                window_, instance_, dpi_, palette_.dark,
+                L"Recovery and volumes",
+                L"Recovery volumes require a split volume size. Enter a maximum volume size first.",
+                MessageDialogIcon::warning);
+            SetFocus(volume_size_edit_);
+            return;
         }
         try {
             const std::wstring recovery = window_text(recovery_percent_edit_);
@@ -5317,7 +6757,8 @@ private:
             create_options.features.password.clear();
         }
 
-        create_options.features.signing_key = window_text(signing_key_edit_);
+        create_options.features.signing_key =
+            trim_dialog_input(window_text(signing_key_edit_));
         if (create_options.features.sign_archive &&
             create_options.features.signing_key.empty()) {
             select_create_page(4);
@@ -5326,14 +6767,12 @@ private:
                                 MessageDialogIcon::warning);
             return;
         }
-        std::error_code signing_key_error;
         if (create_options.features.sign_archive &&
-            !fs::is_regular_file(create_options.features.signing_key,
-                                 signing_key_error)) {
+            !valid_signing_secret_key(create_options.features.signing_key)) {
             select_create_page(4);
             show_message_dialog(window_, instance_, dpi_, palette_.dark,
                                 L"Archive signing",
-                                L"Signing key must be an existing key file path.",
+                                L"Signing key must be an existing 64-byte Axiom secret key. Public keys and unrelated files cannot sign archives.",
                                 MessageDialogIcon::warning);
             SetFocus(signing_key_edit_);
             return;
@@ -5469,6 +6908,11 @@ private:
                 break;
             case kDefaultCreateSfx:
                 application_options.default_create_sfx = !application_options.default_create_sfx;
+                if (application_options.default_create_sfx) {
+                    application_options.default_recovery_volumes = false;
+                    application_options.default_volume_size.clear();
+                    SetWindowTextW(item(kDefaultVolumeSize), L"");
+                }
                 break;
             case kDefaultSignArchive:
                 application_options.default_sign_archive =
@@ -5600,7 +7044,6 @@ private:
         InvalidateRect(checkbox, nullptr, TRUE);
         if (mode_ == DialogMode::create_archive) {
             update_create_dependencies();
-            update_output_preview();
         } else if (mode_ == DialogMode::settings) {
             update_settings_dependencies();
         }
@@ -5736,7 +7179,25 @@ private:
                     layered_reveal_pending_ = false;
                     return 0;
                 }
+                if (wparam == kCompressionCurveDebounceTimer &&
+                    mode_ == DialogMode::create_archive) {
+                    KillTimer(
+                        window_, kCompressionCurveDebounceTimer);
+                    start_compression_curve();
+                    return 0;
+                }
                 break;
+            case kCompressionCurveUpdated:
+                compression_curve_update_posted_.store(
+                    false, std::memory_order_release);
+                if (compression_preview_ != nullptr) {
+                    InvalidateRect(
+                        compression_preview_, nullptr, FALSE);
+                }
+                return 0;
+            case kCompressionCurveFinished:
+                finish_compression_curve();
+                return 0;
             case WM_SIZE: layout(); return 0;
             case kSettingsViewportOffsetChanged:
                 if (mode_ == DialogMode::settings) {
@@ -5772,28 +7233,8 @@ private:
             case WM_GETMINMAXINFO:
                 if (mode_ == DialogMode::create_archive || mode_ == DialogMode::settings) {
                     auto* limits = reinterpret_cast<MINMAXINFO*>(lparam);
-                    const DWORD style = static_cast<DWORD>(
-                        GetWindowLongPtrW(window_, GWL_STYLE));
-                    const DWORD ex_style = static_cast<DWORD>(
-                        GetWindowLongPtrW(window_, GWL_EXSTYLE));
-                    const SIZE minimum = dialog_window_size_for_client(
-                        mode_ == DialogMode::settings ? 780 : 650,
-                        mode_ == DialogMode::settings ? 520 : 520,
-                        style, ex_style, dpi_);
-                    int minimum_width = minimum.cx;
-                    int minimum_height = minimum.cy;
-                    MONITORINFO monitor{sizeof(monitor)};
-                    if (GetMonitorInfoW(
-                            MonitorFromWindow(window_, MONITOR_DEFAULTTONEAREST),
-                            &monitor)) {
-                        minimum_width = std::min(
-                            minimum_width, static_cast<int>(monitor.rcWork.right -
-                                                             monitor.rcWork.left));
-                        minimum_height = std::min(
-                            minimum_height, static_cast<int>(monitor.rcWork.bottom -
-                                                              monitor.rcWork.top));
-                    }
-                    limits->ptMinTrackSize = {minimum_width, minimum_height};
+                    const SIZE minimum = minimum_track_size();
+                    limits->ptMinTrackSize = {minimum.cx, minimum.cy};
                     return 0;
                 }
                 break;
@@ -5827,7 +7268,9 @@ private:
                 return reinterpret_cast<LRESULT>(edit_brush_);
             case WM_DRAWITEM: {
                 const auto& draw = *reinterpret_cast<DRAWITEMSTRUCT*>(lparam);
-                if (draw.CtlType == ODT_COMBOBOX) {
+                if (draw.hwndItem == compression_preview_) {
+                    draw_compression_curve(draw);
+                } else if (draw.CtlType == ODT_COMBOBOX) {
                     draw_dialog_combo_item(draw, palette_.dark);
                 } else {
                     draw_button(draw);
@@ -5848,11 +7291,25 @@ private:
                 }
                 if (mode_ == DialogMode::settings &&
                     (id == kAccentColorMode || id == kStartupMode ||
+                     id == kCompressionMethod ||
                      id == kArchiveOutputMode ||
                      id == kExtractDestinationMode ||
                      id == kTempFolderMode ||
                      id == kIoBufferMode || id == kMemoryLimitMode) &&
                     HIWORD(wparam) == CBN_SELCHANGE) {
+                    if (id == kCompressionMethod) {
+                        const auto method =
+                            method_from_combo(item(kCompressionMethod));
+                        rebuild_method_controls(
+                            item(kLevel), item(kThreadModel), method,
+                            application_options.default_level,
+                            axiom::kAutomaticCodecLevel,
+                            application_options.default_thread_model,
+                            application_options.default_lzma_binary_tree);
+                        rebuild_codec_parameter_controls(
+                            item(kDictionarySize), item(kWordSize),
+                            method, 0, 0);
+                    }
                     update_settings_dependencies();
                     return 0;
                 }
@@ -5884,11 +7341,36 @@ private:
                 if (mode_ == DialogMode::create_archive &&
                     id == kArchiveFormat && HIWORD(wparam) == CBN_SELCHANGE) {
                     on_archive_format_changed();
+                    schedule_compression_curve();
+                    return 0;
+                }
+                if (mode_ == DialogMode::create_archive &&
+                    id == kCompressionMethod &&
+                    HIWORD(wparam) == CBN_SELCHANGE) {
+                    create_options.method = method_from_combo(method_combo_);
+                    create_options.codec_level = axiom::kAutomaticCodecLevel;
+                    rebuild_method_controls(
+                        level_combo_, thread_model_combo_, create_options.method,
+                        create_options.level, create_options.codec_level,
+                        create_options.thread_model,
+                        create_options.lzma_binary_tree);
+                    rebuild_codec_parameter_controls(
+                        dictionary_combo_, word_size_combo_,
+                        create_options.method, 0, 0);
+                    mark_compression_profile_custom();
+                    update_create_dependencies();
+                    schedule_compression_curve();
                     return 0;
                 }
                 if (mode_ == DialogMode::create_archive &&
                     id == kCompressionProfile && HIWORD(wparam) == CBN_SELCHANGE) {
                     apply_selected_compression_profile();
+                    schedule_compression_curve();
+                    return 0;
+                }
+                if (mode_ == DialogMode::settings &&
+                    id == kDefaultVolumeSize && HIWORD(wparam) == EN_CHANGE) {
+                    update_settings_dependencies();
                     return 0;
                 }
                 if (mode_ == DialogMode::create_archive &&
@@ -5905,6 +7387,12 @@ private:
                     if (id == kLevel || id == kThreadModel) {
                         update_create_dependencies();
                     }
+                    if (id == kLevel) {
+                        InvalidateRect(
+                            compression_preview_, nullptr, FALSE);
+                    } else {
+                        schedule_compression_curve();
+                    }
                     return 0;
                 }
                 if (mode_ == DialogMode::create_archive &&
@@ -5913,10 +7401,23 @@ private:
                     if (id == kPathEdit) {
                         sync_archive_format_from_path();
                     }
-                    update_output_preview();
+                    if (id == kVolumeSize) {
+                        update_create_dependencies();
+                    }
+                    return 0;
+                }
+                if (mode_ == DialogMode::create_archive &&
+                    id == kVolumeUnit && HIWORD(wparam) == CBN_SELCHANGE) {
+                    update_create_dependencies();
                     return 0;
                 }
                 switch (id) {
+                    case kCompressionPreview:
+                        if (mode_ == DialogMode::create_archive &&
+                            HIWORD(wparam) == STN_CLICKED) {
+                            select_compression_curve_level();
+                        }
+                        return 0;
                     case kBrowse: browse(); return 0;
                     case kPickAccentColor:
                         if (mode_ == DialogMode::settings) {
@@ -6071,6 +7572,8 @@ private:
     HWND compression_profile_combo_ = nullptr;
     HWND save_compression_profile_ = nullptr;
     HWND delete_compression_profile_ = nullptr;
+    HWND method_label_ = nullptr;
+    HWND method_combo_ = nullptr;
     HWND update_mode_label_ = nullptr;
     HWND update_mode_combo_ = nullptr;
     HWND comment_label_ = nullptr;
@@ -6092,6 +7595,7 @@ private:
     HWND thread_model_label_ = nullptr;
     HWND thread_model_combo_ = nullptr;
     HWND compression_info_ = nullptr;
+    HWND compression_preview_ = nullptr;
     HWND encrypt_data_ = nullptr;
     HWND encrypt_names_ = nullptr;
     HWND password_label_ = nullptr;
@@ -6114,7 +7618,6 @@ private:
     HWND browse_signing_key_ = nullptr;
     HWND create_sfx_ = nullptr;
     HWND sfx_info_ = nullptr;
-    HWND output_preview_ = nullptr;
     HWND overwrite_ = nullptr;
     HWND restore_time_ = nullptr;
     HWND confirm_delete_ = nullptr;
@@ -6125,16 +7628,30 @@ private:
     HWND defaults_ = nullptr;
     HWND settings_shortcut_default_label_ = nullptr;
     bool applying_compression_profile_ = false;
+    mutable std::mutex compression_curve_mutex_;
+    std::optional<CompressionEstimateCurveResult>
+        compression_curve_result_;
+    std::wstring compression_curve_result_key_;
+    std::wstring compression_curve_active_key_;
+    std::wstring compression_curve_status_;
+    std::wstring compression_curve_error_;
+    std::shared_ptr<OperationControl>
+        compression_curve_operation_;
+    std::jthread compression_curve_worker_;
+    std::atomic_bool compression_curve_update_posted_{false};
+    bool compression_curve_running_ = false;
+    bool compression_curve_restart_pending_ = false;
 };
 
 }  // namespace
 
 bool show_create_archive_dialog(HWND owner,
-                                std::size_t input_count,
+                                const std::vector<fs::path>& inputs,
                                 CreateArchiveDialogOptions& options) {
     OptionsDialog dialog(DialogMode::create_archive);
     dialog.create_options = options;
-    dialog.input_count = input_count;
+    dialog.input_count = inputs.size();
+    dialog.estimate_inputs = inputs;
     const bool accepted = dialog.show(owner);
     if (!accepted) {
         options.compression_profiles =

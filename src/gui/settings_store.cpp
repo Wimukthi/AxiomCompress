@@ -192,7 +192,8 @@ std::vector<CompressionProfile> read_compression_profiles(HKEY key) {
     for (const std::wstring& encoded : read_string_list(key, L"CompressionProfiles")) {
         if (profiles.size() >= 32) break;
         const auto fields = split_profile_fields(encoded);
-        if (fields.size() != 7 || fields[0].empty() || fields[0].size() > 64 ||
+        if ((fields.size() != 7 && fields.size() != 10) ||
+            fields[0].empty() || fields[0].size() > 64 ||
             std::any_of(fields[0].begin(), fields[0].end(), [](wchar_t character) {
                 return character < L' ' || character == L'\t';
             })) {
@@ -204,8 +205,19 @@ std::vector<CompressionProfile> read_compression_profiles(HKEY key) {
         const auto word = parse_unsigned_profile_field(fields[4]);
         const auto solid = parse_unsigned_profile_field(fields[5]);
         const auto thread_model = parse_unsigned_profile_field(fields[6]);
+        const auto method = fields.size() == 10
+            ? parse_unsigned_profile_field(fields[7])
+            : std::optional<std::uint64_t>{0};
+        const auto codec_level_encoded = fields.size() == 10
+            ? parse_unsigned_profile_field(fields[8])
+            : std::optional<std::uint64_t>{0};
+        const auto lzma_binary_tree = fields.size() == 10
+            ? parse_unsigned_profile_field(fields[9])
+            : std::optional<std::uint64_t>{1};
         if (!level || !threads || !dictionary || !word || !solid || !thread_model ||
-            *level < 1 || *level > 9 || *thread_model > 1 ||
+            !method || !codec_level_encoded || !lzma_binary_tree ||
+            *level < 1 || *level > 9 || *thread_model > 1 || *method > 4 ||
+            *codec_level_encoded > 28 || *lzma_binary_tree > 1 ||
             *threads > std::numeric_limits<std::size_t>::max() ||
             *dictionary > std::numeric_limits<std::size_t>::max() ||
             *word > std::numeric_limits<std::size_t>::max() ||
@@ -222,6 +234,11 @@ std::vector<CompressionProfile> read_compression_profiles(HKEY key) {
             static_cast<std::size_t>(*threads), static_cast<std::size_t>(*dictionary),
             static_cast<std::size_t>(*word), static_cast<std::size_t>(*solid),
             static_cast<int>(*thread_model),
+            static_cast<axiom::CompressionMethod>(*method),
+            *codec_level_encoded == 0
+                ? axiom::kAutomaticCodecLevel
+                : static_cast<int>(*codec_level_encoded) - 6,
+            *lzma_binary_tree != 0,
         });
     }
     return profiles;
@@ -244,7 +261,14 @@ void write_compression_profiles(HKEY key,
             L'\t' + std::to_wstring(profile.dictionary_size) +
             L'\t' + std::to_wstring(profile.word_size) +
             L'\t' + std::to_wstring(profile.solid_block_size) +
-            L'\t' + std::to_wstring(std::clamp(profile.thread_model, 0, 1)));
+            L'\t' + std::to_wstring(std::clamp(profile.thread_model, 0, 1)) +
+            L'\t' + std::to_wstring(std::clamp(
+                static_cast<int>(profile.method), 0, 4)) +
+            L'\t' + std::to_wstring(
+                profile.codec_level == axiom::kAutomaticCodecLevel
+                    ? 0
+                    : std::clamp(profile.codec_level, -5, 22) + 6) +
+            L'\t' + std::to_wstring(profile.lzma_binary_tree ? 1 : 0));
     }
     write_string_list(key, L"CompressionProfiles", encoded);
 }
@@ -259,6 +283,17 @@ PersistedGuiSettings load_gui_settings() {
     }
     settings.application.default_level = static_cast<int>(
         std::clamp<DWORD>(read_dword(key, L"CompressionLevel", 5), 1, 9));
+    settings.application.default_method = static_cast<axiom::CompressionMethod>(
+        read_clamped_int(key, L"CompressionMethod", 0, 0, 4));
+    {
+        const DWORD encoded = std::clamp<DWORD>(
+            read_dword(key, L"CodecLevel", 0), 0, 28);
+        settings.application.default_codec_level = encoded == 0
+            ? axiom::kAutomaticCodecLevel
+            : static_cast<int>(encoded) - 6;
+    }
+    settings.application.default_lzma_binary_tree =
+        read_bool(key, L"LzmaBinaryTree", true);
     settings.application.default_thread_count = read_dword(key, L"ThreadCount", 0);
     settings.application.default_dictionary_size = read_dword(key, L"DictionarySize", 0);
     settings.application.default_word_size = read_dword(key, L"WordSize", 0);
@@ -409,6 +444,16 @@ void save_gui_settings(const PersistedGuiSettings& settings) {
         return;
     }
     write_dword(key, L"CompressionLevel", static_cast<DWORD>(settings.application.default_level));
+    write_dword(key, L"CompressionMethod", static_cast<DWORD>(std::clamp(
+        static_cast<int>(settings.application.default_method), 0, 4)));
+    write_dword(
+        key, L"CodecLevel",
+        settings.application.default_codec_level == axiom::kAutomaticCodecLevel
+            ? 0u
+            : static_cast<DWORD>(
+                  std::clamp(settings.application.default_codec_level, -5, 22) + 6));
+    write_dword(key, L"LzmaBinaryTree",
+                settings.application.default_lzma_binary_tree ? 1 : 0);
     write_dword(key, L"ThreadCount", static_cast<DWORD>(std::min<std::size_t>(
         settings.application.default_thread_count, MAXDWORD)));
     write_dword(key, L"DictionarySize", static_cast<DWORD>(std::min<std::size_t>(
