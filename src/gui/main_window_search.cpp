@@ -155,7 +155,7 @@ FileSearchDialogResult FileSearchDialog::show(HWND owner) {
         }
         if (axiom::gui::message_targets_window(hwnd_, message) &&
             message.message == WM_KEYDOWN && message.wParam == VK_ESCAPE) {
-            DestroyWindow(hwnd_);
+            destroy_modal_dialog(hwnd_);
             continue;
         }
         if (!IsDialogMessageW(hwnd_, &message)) {
@@ -556,7 +556,7 @@ void FileSearchDialog::accept_selected() {
     if (row < 0 || row >= static_cast<int>(result_targets_.size())) return;
     result_ = result_targets_[static_cast<std::size_t>(row)];
     result_.accepted = true;
-    DestroyWindow(hwnd_);
+    destroy_modal_dialog(hwnd_);
 }
 
 void FileSearchDialog::layout() {
@@ -879,7 +879,7 @@ LRESULT FileSearchDialog::handle_message(UINT message, WPARAM wparam, LPARAM lpa
                     accept_selected();
                     return 0;
                 case IDCANCEL:
-                    DestroyWindow(hwnd_);
+                    destroy_modal_dialog(hwnd_);
                     return 0;
                 default:
                     break;
@@ -958,7 +958,7 @@ LRESULT FileSearchDialog::handle_message(UINT message, WPARAM wparam, LPARAM lpa
             return 1;
         }
         case WM_CLOSE:
-            DestroyWindow(hwnd_);
+            destroy_modal_dialog(hwnd_);
             return 0;
         case WM_NCDESTROY: {
             KillTimer(hwnd_, kSearchDebounceTimer);

@@ -241,13 +241,13 @@ LRESULT CALLBACK simple_password_dialog_proc(HWND hwnd, UINT message,
                 state->accepted = true;
                 SetWindowTextW(state->edit, L"");
                 save_named_window_placement(L"ArchivePasswordPrompt", hwnd);
-                DestroyWindow(hwnd);
+                destroy_modal_dialog(hwnd);
                 return 0;
             }
             if (LOWORD(wparam) == IDCANCEL) {
                 SetWindowTextW(state->edit, L"");
                 save_named_window_placement(L"ArchivePasswordPrompt", hwnd);
-                DestroyWindow(hwnd);
+                destroy_modal_dialog(hwnd);
                 return 0;
             }
             break;
@@ -288,7 +288,7 @@ LRESULT CALLBACK simple_password_dialog_proc(HWND hwnd, UINT message,
         case WM_CLOSE:
             SetWindowTextW(state->edit, L"");
             save_named_window_placement(L"ArchivePasswordPrompt", hwnd);
-            DestroyWindow(hwnd);
+            destroy_modal_dialog(hwnd);
             return 0;
         case WM_NCDESTROY:
             if (state != nullptr) {
@@ -453,12 +453,12 @@ LRESULT CALLBACK simple_comment_dialog_proc(HWND hwnd, UINT message,
                 state->comment = control_text(state->edit);
                 state->accepted = true;
                 save_named_window_placement(L"ArchiveCommentEditor", hwnd);
-                DestroyWindow(hwnd);
+                destroy_modal_dialog(hwnd);
                 return 0;
             }
             if (LOWORD(wparam) == IDCANCEL) {
                 save_named_window_placement(L"ArchiveCommentEditor", hwnd);
-                DestroyWindow(hwnd);
+                destroy_modal_dialog(hwnd);
                 return 0;
             }
             break;
@@ -491,7 +491,7 @@ LRESULT CALLBACK simple_comment_dialog_proc(HWND hwnd, UINT message,
         }
         case WM_CLOSE:
             save_named_window_placement(L"ArchiveCommentEditor", hwnd);
-            DestroyWindow(hwnd);
+            destroy_modal_dialog(hwnd);
             return 0;
         case WM_NCDESTROY:
             if (state != nullptr) {
@@ -564,7 +564,7 @@ bool run_simple_password_dialog(HWND owner, std::wstring& password) {
         if (message_targets_window(dialog, message) &&
             message.message == WM_KEYDOWN && message.wParam == VK_ESCAPE) {
             save_named_window_placement(L"ArchivePasswordPrompt", dialog);
-            DestroyWindow(dialog);
+            destroy_modal_dialog(dialog);
             continue;
         }
         if (!IsDialogMessageW(dialog, &message)) {
@@ -637,7 +637,7 @@ bool run_simple_comment_dialog(HWND owner, std::wstring& comment) {
         if (message_targets_window(dialog, message) &&
             message.message == WM_KEYDOWN && message.wParam == VK_ESCAPE) {
             save_named_window_placement(L"ArchiveCommentEditor", dialog);
-            DestroyWindow(dialog);
+            destroy_modal_dialog(dialog);
             continue;
         }
         if (!IsDialogMessageW(dialog, &message)) {
@@ -1329,7 +1329,7 @@ LRESULT CALLBACK archive_summary_proc(HWND hwnd, UINT message, WPARAM wparam, LP
             }
             if (LOWORD(wparam) == IDOK || LOWORD(wparam) == IDCANCEL) {
                 save_named_window_placement(L"ArchiveSummaryDialog", hwnd);
-                DestroyWindow(hwnd);
+                destroy_modal_dialog(hwnd);
                 return 0;
             }
             break;
@@ -1350,7 +1350,7 @@ LRESULT CALLBACK archive_summary_proc(HWND hwnd, UINT message, WPARAM wparam, LP
         }
         case WM_CLOSE:
             save_named_window_placement(L"ArchiveSummaryDialog", hwnd);
-            DestroyWindow(hwnd);
+            destroy_modal_dialog(hwnd);
             return 0;
         case WM_NCDESTROY:
             if (state != nullptr) {
@@ -1481,7 +1481,7 @@ void show_archive_summary_dialog(HWND owner, ArchiveSummaryDialogData data) {
         if (message_targets_window(dialog, message) &&
             message.message == WM_KEYDOWN && message.wParam == VK_ESCAPE) {
             save_named_window_placement(L"ArchiveSummaryDialog", dialog);
-            DestroyWindow(dialog);
+            destroy_modal_dialog(dialog);
             continue;
         }
         if (!IsDialogMessageW(dialog, &message)) {

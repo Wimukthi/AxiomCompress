@@ -1806,13 +1806,13 @@ private:
         }
         color_ = *parsed;
         accepted_ = true;
-        DestroyWindow(window_);
+        destroy_modal_dialog(window_);
         window_ = nullptr;
     }
 
     void cancel() {
         accepted_ = false;
-        DestroyWindow(window_);
+        destroy_modal_dialog(window_);
         window_ = nullptr;
     }
 
@@ -2283,7 +2283,9 @@ private:
         HWND owner = owner_;
         const bool owner_was_enabled = owner_was_enabled_;
         owner_was_enabled_ = false;
-        if (window_ != nullptr && IsWindow(window_)) DestroyWindow(window_);
+        if (window_ != nullptr && IsWindow(window_)) {
+            destroy_modal_dialog(window_);
+        }
         restore_dialog_owner(owner, owner_was_enabled);
     }
 
@@ -6813,7 +6815,7 @@ private:
         const bool owner_was_enabled = owner_was_enabled_;
         owner_was_enabled_ = false;
         if (window_ != nullptr && IsWindow(window_)) {
-            DestroyWindow(window_);
+            destroy_modal_dialog(window_);
         }
         restore_dialog_owner(owner, owner_was_enabled);
     }

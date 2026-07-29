@@ -625,7 +625,7 @@ void finish_worker(EstimateDialogState& state) {
     state.operation.reset();
     if (state.closing && !state.metadata_running) {
         save_named_window_placement(L"CompressionEstimateDialog", state.hwnd);
-        DestroyWindow(state.hwnd);
+        destroy_modal_dialog(state.hwnd);
         return;
     }
     if (!state.closing) {
@@ -642,7 +642,7 @@ void finish_metadata_worker(EstimateDialogState& state) {
     state.metadata_operation.reset();
     if (state.closing && !state.running) {
         save_named_window_placement(L"CompressionEstimateDialog", state.hwnd);
-        DestroyWindow(state.hwnd);
+        destroy_modal_dialog(state.hwnd);
         return;
     }
     if (!state.closing) {
@@ -752,7 +752,7 @@ void start_estimate(EstimateDialogState& state) {
 void request_close(EstimateDialogState& state) {
     if (!state.running && !state.metadata_running) {
         save_named_window_placement(L"CompressionEstimateDialog", state.hwnd);
-        DestroyWindow(state.hwnd);
+        destroy_modal_dialog(state.hwnd);
         return;
     }
     state.closing = true;
@@ -999,7 +999,7 @@ void show_filesystem_information_dialog(
             if (state.metadata_operation) state.metadata_operation->request_cancel();
             if (state.worker.joinable()) state.worker.join();
             if (state.metadata_worker.joinable()) state.metadata_worker.join();
-            if (IsWindow(dialog)) DestroyWindow(dialog);
+            if (IsWindow(dialog)) destroy_modal_dialog(dialog);
             if (status == 0) PostQuitMessage(static_cast<int>(message.wParam));
             break;
         }

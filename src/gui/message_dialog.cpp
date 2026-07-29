@@ -134,7 +134,7 @@ RECT owner_or_monitor_rect(HWND owner) {
 void complete_dialog(MessageDialogState* state, int result) {
     if (state != nullptr && state->hwnd != nullptr) {
         state->result = result;
-        DestroyWindow(state->hwnd);
+        destroy_modal_dialog(state->hwnd);
     }
 }
 

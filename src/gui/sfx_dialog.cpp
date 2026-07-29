@@ -371,7 +371,9 @@ private:
 
     void close_dialog() {
         save_named_window_placement(L"SfxExtractDialog", window_);
-        if (window_ != nullptr && IsWindow(window_)) DestroyWindow(window_);
+        if (window_ != nullptr && IsWindow(window_)) {
+            destroy_modal_dialog(window_);
+        }
     }
 
     LRESULT handle_message(UINT message, WPARAM wparam, LPARAM lparam) {

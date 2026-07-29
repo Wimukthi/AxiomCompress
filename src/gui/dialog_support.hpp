@@ -82,6 +82,10 @@ void draw_dialog_checkbox(const DRAWITEMSTRUCT& draw, bool dark, bool checked);
 void draw_dialog_radio_button(const DRAWITEMSTRUCT& draw, bool dark, bool checked);
 void draw_dialog_combo_item(const DRAWITEMSTRUCT& draw, bool dark);
 bool disable_dialog_owner(HWND owner, HWND dialog);
+// Close a window registered by disable_dialog_owner. Restoring its owner
+// immediately before destruction lets USER32 transfer activation directly
+// within Axiom instead of briefly raising the application underneath it.
+void destroy_modal_dialog(HWND dialog);
 void restore_dialog_owner(HWND owner, bool was_enabled);
 bool message_targets_window(HWND window, const MSG& message);
 bool window_placement_is_visible(const WINDOWPLACEMENT& placement);

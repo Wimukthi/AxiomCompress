@@ -26,6 +26,8 @@ constexpr const wchar_t* kSavedComboStyleProperty = L"AxiomSavedComboStyle";
 constexpr const wchar_t* kSavedComboExStyleProperty = L"AxiomSavedComboExStyle";
 constexpr const wchar_t* kDarkComboHotProperty = L"AxiomDarkComboHot";
 constexpr const wchar_t* kDarkComboTrackingProperty = L"AxiomDarkComboTracking";
+constexpr const wchar_t* kRestoreModalActivationProperty =
+    L"AxiomRestoreModalActivation";
 constexpr const wchar_t* kWindowLayoutsRegistryPath =
     L"Software\\AxiomCompress\\GUI\\WindowLayouts";
 
@@ -252,18 +254,46 @@ LRESULT CALLBACK typed_input_subclass_proc(HWND window, UINT message,
 struct ModalOwnerState {
     HWND owner = nullptr;
     bool restored = false;
+    bool activation_owned = false;
+    bool close_requested = false;
+    bool command_dispatch = false;
 };
 
-void activate_restored_owner(HWND owner) {
+bool modal_owner_has_foreground(HWND owner, HWND dialog) {
+    const HWND foreground = GetForegroundWindow();
+    if (foreground == nullptr) {
+        const HWND active = GetActiveWindow();
+        return active == owner || (dialog != nullptr && active == dialog);
+    }
+    if (foreground == owner || foreground == dialog) return true;
+
+    // Nested Axiom dialogs share the same root owner. Preserve activation when
+    // one of them closes, but do not pull Axiom in front of an application the
+    // user switched to while the modal window was open.
+    const HWND owner_root = GetAncestor(owner, GA_ROOTOWNER);
+    const HWND foreground_root = GetAncestor(foreground, GA_ROOTOWNER);
+    return owner_root != nullptr && foreground_root == owner_root;
+}
+
+bool window_belongs_to_modal_chain(HWND owner, HWND window) {
+    if (owner == nullptr || window == nullptr) return false;
+    if (window == owner) return true;
+    const HWND owner_root = GetAncestor(owner, GA_ROOTOWNER);
+    return owner_root != nullptr &&
+           GetAncestor(window, GA_ROOTOWNER) == owner_root;
+}
+
+void enable_modal_owner_for_close(HWND owner, bool restore_activation) {
     if (owner == nullptr || !IsWindow(owner)) return;
     EnableWindow(owner, TRUE);
-    if (!IsWindowVisible(owner) || IsIconic(owner)) return;
-
-    // SetActiveWindow alone cannot recover after Windows has already selected
-    // another application's window. Calling this while the modal child is still
-    // being destroyed keeps the foreground transition within Axiom.
-    if (GetActiveWindow() != owner) SetActiveWindow(owner);
-    if (GetForegroundWindow() != owner) SetForegroundWindow(owner);
+    if (restore_activation) {
+        // The public restore call runs after DestroyWindow has completely
+        // returned. Remember that activation belonged to this modal chain so
+        // the owner can be activated then, without repainting it underneath a
+        // half-destroyed child.
+        SetPropW(owner, kRestoreModalActivationProperty,
+                 reinterpret_cast<HANDLE>(1));
+    }
 }
 
 LRESULT CALLBACK modal_owner_subclass_proc(HWND window, UINT message,
@@ -271,19 +301,75 @@ LRESULT CALLBACK modal_owner_subclass_proc(HWND window, UINT message,
                                             UINT_PTR subclass_id,
                                             DWORD_PTR reference_data) {
     auto* state = reinterpret_cast<ModalOwnerState*>(reference_data);
+    const bool command_can_destroy =
+        state != nullptr && message == WM_COMMAND;
+    if (state != nullptr &&
+        (message == WM_CLOSE ||
+         (message == WM_SYSCOMMAND &&
+          (wparam & 0xFFF0u) == SC_CLOSE))) {
+        // Record the user's close request before DefSubclassProc enters the
+        // dialog procedure. USER32 can nominate an unrelated window (often
+        // Explorer beneath Axiom) during the nested DestroyWindow call.
+        state->close_requested = true;
+        state->activation_owned =
+            state->activation_owned ||
+            modal_owner_has_foreground(state->owner, window) ||
+            GetActiveWindow() == window;
+    }
+    if (command_can_destroy) {
+        // Most custom dialog buttons destroy their window synchronously from
+        // WM_COMMAND. This flag is cleared after dispatch when the command was
+        // non-closing, but protects activation throughout a nested destruction.
+        state->command_dispatch = true;
+        // A control notification carries its sender in lParam and therefore
+        // represents interaction with this dialog before any close-time
+        // activation messages have fired. Capture that stronger signal.
+        if (lparam != 0 || GetActiveWindow() == window ||
+            modal_owner_has_foreground(state->owner, window)) {
+            state->activation_owned = true;
+        }
+    }
+    if (state != nullptr && message == WM_ACTIVATE) {
+        if (LOWORD(wparam) != WA_INACTIVE) {
+            state->activation_owned = true;
+        } else {
+            const HWND next_active = reinterpret_cast<HWND>(lparam);
+            // A close can deactivate the child directly to its owner (or
+            // briefly report no successor). Preserve the recorded state in
+            // those cases. A real switch to another top-level window clears it.
+            if (!state->close_requested && !state->command_dispatch &&
+                next_active != nullptr &&
+                !window_belongs_to_modal_chain(state->owner, next_active)) {
+                state->activation_owned = false;
+            }
+        }
+    } else if (state != nullptr && message == WM_ACTIVATEAPP && wparam == FALSE &&
+               !state->close_requested && !state->command_dispatch) {
+        state->activation_owned = false;
+    }
     if (message == WM_DESTROY && state != nullptr && !state->restored) {
         state->restored = true;
-        activate_restored_owner(state->owner);
+        enable_modal_owner_for_close(state->owner, state->activation_owned);
     }
     if (message == WM_NCDESTROY) {
         if (state != nullptr && !state->restored) {
             state->restored = true;
-            activate_restored_owner(state->owner);
+            enable_modal_owner_for_close(state->owner, state->activation_owned);
         }
         RemoveWindowSubclass(window, modal_owner_subclass_proc, subclass_id);
         delete state;
     }
-    return DefSubclassProc(window, message, wparam, lparam);
+    const LRESULT result = DefSubclassProc(window, message, wparam, lparam);
+    if (command_can_destroy && IsWindow(window)) {
+        DWORD_PTR current_reference = 0;
+        if (GetWindowSubclass(window, modal_owner_subclass_proc, subclass_id,
+                              &current_reference) &&
+            current_reference == reference_data) {
+            reinterpret_cast<ModalOwnerState*>(current_reference)
+                ->command_dispatch = false;
+        }
+    }
+    return result;
 }
 
 bool high_contrast_enabled() {
@@ -1474,9 +1560,12 @@ bool disable_dialog_owner(HWND owner, HWND dialog) {
     if (owner == nullptr || !IsWindow(owner)) return false;
     const bool was_enabled = IsWindowEnabled(owner) != FALSE;
     if (!was_enabled) return false;
+    const bool activation_owned = modal_owner_has_foreground(owner, dialog);
+    RemovePropW(owner, kRestoreModalActivationProperty);
     EnableWindow(owner, FALSE);
     if (dialog != nullptr && IsWindow(dialog)) {
-        auto* state = new (std::nothrow) ModalOwnerState{owner, false};
+        auto* state = new (std::nothrow) ModalOwnerState{
+            owner, false, activation_owned, false, false};
         if (state != nullptr &&
             !SetWindowSubclass(dialog, modal_owner_subclass_proc,
                                kModalOwnerSubclass,
@@ -1487,14 +1576,60 @@ bool disable_dialog_owner(HWND owner, HWND dialog) {
     return true;
 }
 
+void destroy_modal_dialog(HWND dialog) {
+    if (dialog == nullptr || !IsWindow(dialog)) return;
+
+    DWORD_PTR reference_data = 0;
+    if (GetWindowSubclass(dialog, modal_owner_subclass_proc,
+                          kModalOwnerSubclass, &reference_data) &&
+        reference_data != 0) {
+        auto* state = reinterpret_cast<ModalOwnerState*>(reference_data);
+        state->close_requested = true;
+        state->activation_owned =
+            state->activation_owned ||
+            modal_owner_has_foreground(state->owner, dialog) ||
+            GetActiveWindow() == dialog;
+        if (!state->restored) {
+            state->restored = true;
+            // Do this while the active owned popup still exists. USER32 can
+            // then hand activation straight to its owner during DestroyWindow
+            // instead of selecting (and painting) an unrelated window first.
+            enable_modal_owner_for_close(state->owner,
+                                         state->activation_owned);
+        }
+    }
+    DestroyWindow(dialog);
+}
+
 void restore_dialog_owner(HWND owner, bool was_enabled) {
     if (!was_enabled || owner == nullptr || !IsWindow(owner)) return;
+    bool restore_activation =
+        RemovePropW(owner, kRestoreModalActivationProperty) != nullptr;
     // The modal-child subclass normally restores the owner during WM_DESTROY,
-    // before Windows can activate an unrelated window beneath Axiom. Most
-    // callers also invoke this function after DestroyWindow as a fallback.
-    // Do not activate the owner a second time: that redundant foreground
-    // transition causes a visible flash and can briefly disturb the z-order.
-    if (!IsWindowEnabled(owner)) activate_restored_owner(owner);
+    // before Windows can activate an unrelated window beneath Axiom. If the
+    // subclass could not be installed, perform that enable here as a fallback.
+    if (!IsWindowEnabled(owner)) {
+        restore_activation = modal_owner_has_foreground(owner, nullptr);
+        EnableWindow(owner, TRUE);
+    }
+    if (!restore_activation || !IsWindowVisible(owner) || IsIconic(owner)) return;
+
+    // Activation is intentionally deferred until the modal child is completely
+    // gone. Usually USER32 has already selected the enabled owner, so these
+    // calls are no-ops. The fallback only repairs a transient focus handoff; a
+    // dialog closed after the user switched applications never requests it.
+    HWND foreground = GetForegroundWindow();
+    const HWND owner_root = GetAncestor(owner, GA_ROOTOWNER);
+    if (foreground != nullptr && foreground != owner &&
+        GetAncestor(foreground, GA_ROOTOWNER) == owner_root) {
+        return;
+    }
+    if (GetActiveWindow() != owner) SetActiveWindow(owner);
+    foreground = GetForegroundWindow();
+    if (foreground != owner) {
+        BringWindowToTop(owner);
+        SetForegroundWindow(owner);
+    }
 }
 
 bool message_targets_window(HWND window, const MSG& message) {

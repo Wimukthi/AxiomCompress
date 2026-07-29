@@ -317,12 +317,12 @@ LRESULT CALLBACK about_dialog_proc(HWND hwnd, UINT message, WPARAM wparam, LPARA
                 PostMessageW(state->owner, WM_COMMAND,
                              MAKEWPARAM(state->check_updates_command, 0), 0);
                 save_named_window_placement(L"AboutDialog", hwnd);
-                DestroyWindow(hwnd);
+                destroy_modal_dialog(hwnd);
                 return 0;
             }
             if (LOWORD(wparam) == IDOK || LOWORD(wparam) == IDCANCEL) {
                 save_named_window_placement(L"AboutDialog", hwnd);
-                DestroyWindow(hwnd);
+                destroy_modal_dialog(hwnd);
                 return 0;
             }
             break;
@@ -349,7 +349,7 @@ LRESULT CALLBACK about_dialog_proc(HWND hwnd, UINT message, WPARAM wparam, LPARA
         }
         case WM_CLOSE:
             save_named_window_placement(L"AboutDialog", hwnd);
-            DestroyWindow(hwnd);
+            destroy_modal_dialog(hwnd);
             return 0;
         case WM_NCDESTROY:
             if (state != nullptr) {
@@ -435,7 +435,7 @@ void show_about_dialog(HWND owner, HINSTANCE instance, UINT dpi, bool dark,
         if (message_targets_window(dialog, message) &&
             message.message == WM_KEYDOWN && message.wParam == VK_ESCAPE) {
             save_named_window_placement(L"AboutDialog", dialog);
-            DestroyWindow(dialog);
+            destroy_modal_dialog(dialog);
             continue;
         }
         if (!IsDialogMessageW(dialog, &message)) {

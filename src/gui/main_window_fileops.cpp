@@ -275,12 +275,12 @@ LRESULT CALLBACK command_input_dialog_proc(HWND hwnd, UINT message,
                 }
                 state->accepted = true;
                 save_named_window_placement(state->placement_name, hwnd);
-                DestroyWindow(hwnd);
+                destroy_modal_dialog(hwnd);
                 return 0;
             }
             if (LOWORD(wparam) == IDCANCEL) {
                 save_named_window_placement(state->placement_name, hwnd);
-                DestroyWindow(hwnd);
+                destroy_modal_dialog(hwnd);
                 return 0;
             }
             break;
@@ -319,7 +319,7 @@ LRESULT CALLBACK command_input_dialog_proc(HWND hwnd, UINT message,
         }
         case WM_CLOSE:
             save_named_window_placement(state->placement_name, hwnd);
-            DestroyWindow(hwnd);
+            destroy_modal_dialog(hwnd);
             return 0;
         case WM_NCDESTROY:
             delete_dialog_font(state->font);
@@ -400,7 +400,7 @@ bool show_command_input_dialog(HWND owner,
         if (message_targets_window(dialog, message) &&
             message.message == WM_KEYDOWN && message.wParam == VK_ESCAPE) {
             save_named_window_placement(state.placement_name, dialog);
-            DestroyWindow(dialog);
+            destroy_modal_dialog(dialog);
             continue;
         }
         if (!IsDialogMessageW(dialog, &message)) {

@@ -1736,7 +1736,7 @@ void close_benchmark_dialog(BenchmarkDialogState* state) {
     const bool owner_was_enabled = state->owner_was_enabled;
     state->owner_was_enabled = false;
     if (state->hwnd != nullptr && IsWindow(state->hwnd)) {
-        DestroyWindow(state->hwnd);
+        destroy_modal_dialog(state->hwnd);
     }
     restore_dialog_owner(owner, owner_was_enabled);
 }
