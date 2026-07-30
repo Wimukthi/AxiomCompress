@@ -44,6 +44,7 @@
 #include <memory>
 #include <optional>
 #include <random>
+#include <source_location>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -782,12 +783,18 @@ fs::path make_temp_dir() {
 }
 
 template <typename Fn>
-void expect_throws(Fn&& fn) {
+void expect_throws(
+    Fn&& fn,
+    const std::source_location& where = std::source_location::current()) {
     bool threw = false;
     try {
         fn();
     } catch (const std::exception&) {
         threw = true;
+    }
+    if (!threw) {
+        std::cerr << "Expected exception at " << where.file_name() << ':'
+                  << where.line() << '\n';
     }
     AXIOM_CHECK(threw);
 }
@@ -2704,6 +2711,154 @@ void test_archive_update_sync() {
     AXIOM_CHECK(has("src/c.txt"));
     AXIOM_CHECK(!has("src/b.txt"));
 
+    // A file chosen directly in the GUI must retain its full existing archive
+    // path instead of being added again at the archive root.
+    write_all(src / "a.txt", bytes_from_string("A MAPPED UPDATE"));
+    const auto mapped_stamp = fs::last_write_time(src / "a.txt", ec);
+    fs::last_write_time(src / "a.txt", mapped_stamp + std::chrono::seconds(240), ec);
+    axiom::update_archive(
+        std::vector<axiom::ArchiveInput>{{src / "a.txt", "src/a.txt"}},
+        archive, {}, /*fresh_only=*/false);
+    AXIOM_CHECK(!has("a.txt"));
+    {
+        const auto dest = root / "mapped-file-out";
+        axiom::extract_archive(archive, dest, {});
+        AXIOM_CHECK(read_all(dest / "src" / "a.txt") ==
+                    bytes_from_string("A MAPPED UPDATE"));
+    }
+
+    // A folder selected as "contents at archive root" can be synchronized
+    // without inventing an extra parent directory.
+    const auto loose = root / "loose";
+    fs::create_directories(loose);
+    write_all(loose / "one.txt", bytes_from_string("one"));
+    write_all(loose / "two.txt", bytes_from_string("two"));
+    const auto root_archive = root / "root-content.axar";
+    axiom::create_archive({loose / "one.txt", loose / "two.txt"}, root_archive, {});
+    fs::remove(loose / "two.txt", ec);
+    write_all(loose / "three.txt", bytes_from_string("three"));
+    axiom::sync_archive(
+        std::vector<axiom::ArchiveInput>{
+            {loose / "one.txt", "one.txt"},
+            {loose / "three.txt", "three.txt"}},
+        root_archive, {});
+    const auto root_entries = axiom::list_archive(root_archive);
+    AXIOM_CHECK(std::any_of(root_entries.begin(), root_entries.end(),
+                            [](const auto& entry) { return entry.path == "one.txt"; }));
+    AXIOM_CHECK(std::any_of(root_entries.begin(), root_entries.end(),
+                            [](const auto& entry) { return entry.path == "three.txt"; }));
+    AXIOM_CHECK(std::none_of(root_entries.begin(), root_entries.end(),
+                             [](const auto& entry) { return entry.path == "two.txt"; }));
+
+    // The writable ZIP provider exposes the same mapped update/sync contract
+    // used by the GUI.
+    write_all(loose / "two.txt", bytes_from_string("two"));
+    const auto root_zip = root / "root-content.zip";
+    const auto* zip_provider = axiom::archive_provider_for_path(root_zip);
+    AXIOM_CHECK(zip_provider != nullptr);
+    zip_provider->create({loose / "one.txt", loose / "two.txt"}, root_zip, {});
+    fs::remove(loose / "two.txt", ec);
+    zip_provider->sync_mapped(
+        std::vector<axiom::ArchiveInput>{
+            {loose / "one.txt", "one.txt"},
+            {loose / "three.txt", "three.txt"}},
+        root_zip, {});
+    const auto zip_entries = zip_provider->list(root_zip);
+    AXIOM_CHECK(std::any_of(zip_entries.begin(), zip_entries.end(),
+                            [](const auto& entry) { return entry.path == "one.txt"; }));
+    AXIOM_CHECK(std::any_of(zip_entries.begin(), zip_entries.end(),
+                            [](const auto& entry) { return entry.path == "three.txt"; }));
+    AXIOM_CHECK(std::none_of(zip_entries.begin(), zip_entries.end(),
+                             [](const auto& entry) { return entry.path == "two.txt"; }));
+
+    fs::remove_all(root, ec);
+}
+
+void test_archive_single_pass_sync_transaction() {
+    const auto root = make_temp_dir();
+    const auto source = root / "transaction-source";
+    fs::create_directories(source);
+    write_all(source / "keep.txt", bytes_from_string("keep version one"));
+    write_all(source / "remove.txt", bytes_from_string("remove me"));
+
+    const auto archive = root / "transaction.axar";
+    axiom::CompressionOptions create_options;
+    create_options.recovery_percent = 10;
+    axiom::create_archive({source}, archive, create_options);
+
+    write_all(source / "keep.txt", bytes_from_string("keep version two"));
+    std::error_code ec;
+    const auto stamp = fs::last_write_time(source / "keep.txt", ec);
+    fs::last_write_time(
+        source / "keep.txt", stamp + std::chrono::seconds(240), ec);
+    fs::remove(source / "remove.txt", ec);
+    write_all(source / "added.txt", bytes_from_string("new payload"));
+
+    auto operation = std::make_shared<axiom::OperationControl>();
+    std::mutex progress_mutex;
+    axiom::OperationStage previous_stage = axiom::OperationStage::scanning;
+    unsigned recovery_transitions = 0;
+    bool saw_comparing = false;
+    bool saw_copying = false;
+    bool saw_commit = false;
+    bool saw_overall_phases = false;
+    bool saw_sync_plan = false;
+    operation->set_progress_callback([&](const axiom::OperationProgress& progress) {
+        std::lock_guard lock(progress_mutex);
+        if (progress.stage == axiom::OperationStage::recovering &&
+            previous_stage != axiom::OperationStage::recovering) {
+            ++recovery_transitions;
+        }
+        previous_stage = progress.stage;
+        saw_comparing = saw_comparing ||
+            progress.stage == axiom::OperationStage::comparing;
+        saw_copying = saw_copying ||
+            progress.stage == axiom::OperationStage::copying;
+        saw_commit = saw_commit ||
+            progress.stage == axiom::OperationStage::committing;
+        saw_overall_phases = saw_overall_phases ||
+            (progress.phase_count == 6 && progress.phase_index < 6);
+        saw_sync_plan = saw_sync_plan ||
+            (progress.planned_added_items == 1 &&
+             progress.planned_updated_items == 1 &&
+             progress.planned_removed_items == 1 &&
+             progress.planned_unchanged_items >= 1);
+    });
+
+    auto options = create_options;
+    options.operation = operation;
+    const auto key = axiom::generate_archive_signing_key();
+    axiom::ArchiveSyncFinalization finalization;
+    finalization.comment = "single transaction";
+    finalization.lock_archive = true;
+    finalization.signing_key = &key;
+    axiom::sync_archive({source}, archive, options, finalization);
+
+    const auto entries = axiom::list_archive(archive);
+    const auto has = [&](std::string_view path) {
+        return std::any_of(entries.begin(), entries.end(), [path](const auto& entry) {
+            return entry.path == path;
+        });
+    };
+    AXIOM_CHECK(has("transaction-source/keep.txt"));
+    AXIOM_CHECK(has("transaction-source/added.txt"));
+    AXIOM_CHECK(!has("transaction-source/remove.txt"));
+    AXIOM_CHECK(axiom::archive_comment(archive) == "single transaction");
+    AXIOM_CHECK(axiom::archive_is_locked(archive));
+    const auto signature = axiom::verify_archive_signature(archive);
+    AXIOM_CHECK(signature.present && signature.valid);
+    AXIOM_CHECK(axiom::archive_recovery_info(archive).present);
+    axiom::test_archive(archive);
+
+    {
+        std::lock_guard lock(progress_mutex);
+        AXIOM_CHECK(recovery_transitions == 1);
+        AXIOM_CHECK(saw_comparing);
+        AXIOM_CHECK(saw_copying);
+        AXIOM_CHECK(saw_commit);
+        AXIOM_CHECK(saw_overall_phases);
+        AXIOM_CHECK(saw_sync_plan);
+    }
     fs::remove_all(root, ec);
 }
 
@@ -4041,6 +4196,7 @@ int main() {
     test_archive_file_manager_apis();
     test_archive_delete_repack();
     test_archive_update_sync();
+    test_archive_single_pass_sync_transaction();
     test_archive_comment_lock();
     test_archive_recovery_and_volumes();
     test_archive_authenticity_and_sfx();

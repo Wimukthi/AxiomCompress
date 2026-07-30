@@ -272,7 +272,8 @@ ShellIconRef shell_icon_for_item(const axiom::gui::BrowserItem& item);
 std::optional<fs::path> shell_item_path(IShellItem* item);
 void set_axar_filter(IFileDialog* dialog);
 std::optional<fs::path> joined_archive_path_for_volume(const fs::path& volume);
-std::vector<fs::path> pick_files(HWND owner);
+std::vector<fs::path> pick_files(HWND owner, std::wstring_view title = {});
+std::optional<fs::path> pick_folder(HWND owner, std::wstring_view title = {});
 std::optional<fs::path> pick_open_archive(HWND owner);
 struct ThemePalette {
     bool dark = false;
@@ -1205,7 +1206,8 @@ private:
         std::vector<fs::path> paths,
         std::optional<fs::path> target_archive = std::nullopt,
         axiom::gui::ArchiveUpdateMode update_mode =
-            axiom::gui::ArchiveUpdateMode::create_new);
+            axiom::gui::ArchiveUpdateMode::create_new,
+        std::vector<axiom::ArchiveInput> mapped_inputs = {});
     void on_add_to_archive();
     void on_update_archive(axiom::gui::ArchiveUpdateMode mode);
     bool active_archive_is_editable();
@@ -1414,6 +1416,7 @@ private:
     std::vector<std::wstring> favorite_locations_;
 
     std::vector<fs::path> inputs_;
+    std::vector<axiom::ArchiveInput> mapped_inputs_;
 
     axiom::gui::NavigationHistory history_;
     std::vector<std::optional<BrowserViewState>> browser_history_states_;

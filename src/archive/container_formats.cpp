@@ -278,9 +278,22 @@ public:
         update_archive(inputs, archive_path, options, fresh_only);
     }
 
+    void update_mapped(const std::vector<ArchiveInput>& inputs,
+                       const std::filesystem::path& archive_path,
+                       const CompressionOptions& options,
+                       bool fresh_only) const override {
+        update_archive(inputs, archive_path, options, fresh_only);
+    }
+
     void sync(const std::vector<std::filesystem::path>& inputs,
               const std::filesystem::path& archive_path,
               const CompressionOptions& options) const override {
+        sync_archive(inputs, archive_path, options);
+    }
+
+    void sync_mapped(const std::vector<ArchiveInput>& inputs,
+                     const std::filesystem::path& archive_path,
+                     const CompressionOptions& options) const override {
         sync_archive(inputs, archive_path, options);
     }
 

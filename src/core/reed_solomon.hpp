@@ -31,6 +31,15 @@ public:
                 const std::vector<std::span<std::uint8_t>>& parity,
                 const EncodeProgressCallback& progress = {}) const;
 
+    // Encode one parity row independently. Recovery writers use this to schedule
+    // rows on their operation-wide worker pool without nesting thread pools or
+    // changing the recovery-record layout.
+    void encode_parity_shard(
+        int parity_index,
+        const std::vector<std::span<const std::uint8_t>>& data,
+        std::span<std::uint8_t> parity,
+        const EncodeProgressCallback& progress = {}) const;
+
     // Reconstruct missing shards in place. `shards` holds all total_shards() shards
     // (equal length); `present[i]` is false for a missing/corrupt shard, whose buffer
     // is overwritten with the recovered bytes. Returns false if fewer than

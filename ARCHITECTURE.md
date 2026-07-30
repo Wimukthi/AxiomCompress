@@ -221,6 +221,21 @@ repair damaged shards atomically. Volume joining validates the reconstructed
 archive with BLAKE3 before installing it. Long recovery and volume operations
 honor `OperationControl`.
 
+AXAR synchronization is a planned, single archive transaction. The source is
+scanned once and compared with one loaded catalogue; unchanged compressed blocks
+are copied verbatim, changed/new entries are compressed once, and stale entries
+are omitted from the final directory. Comment, lock, and signature metadata can
+be folded into that directory before recovery is generated. The completed
+temporary archive receives one recovery record and is then atomically installed.
+No-change synchronization returns without touching the archive.
+
+Recovery creation for a staged archive is stripe-bounded. It reads 64-KiB slices
+across the data shards, encodes independent parity rows on the operation worker
+pool, and spools parity until its per-shard CRCs are known. This avoids retaining
+the complete protected archive in memory and avoids copying the completed archive
+to a second recovery temporary file. The bytes remain recovery-service version 1
+compatible.
+
 Complete AXAR data-volume sets are exposed through a segmented random-access
 source, so list/test/extract operate on the numbered files without creating a
 joined archive. The provider marks this logical archive read-only. Missing data
@@ -496,8 +511,12 @@ limits so native control storage cannot become an accidental unbounded input.
 
 `OperationControl` is also the single source of progress truth. Producers publish
 a coherent snapshot containing stage bytes, item counts, current path, per-file
-bytes, a dedicated throughput counter, and archive-output/source-byte counters
-for the live archive size and ratio. Archive creation advances throughput while
+bytes, an optional operation-wide phase index/count, a dedicated throughput
+counter, and archive-output/source-byte counters for the live archive size and
+ratio. The phase coordinates let the GUI render one non-resetting overall bar
+across source scanning, comparison, unchanged-block copying, compression,
+recovery, and atomic commit while retaining exact phase-local counters. Archive
+creation advances throughput while
 reading small files into its first solid block, then switches it to codec
 progress, so speed never falsely remains at zero while useful work is advancing.
 Reading, compression, and ordered writing share one monotonic byte epoch: reports

@@ -33,12 +33,16 @@ public:
 enum class OperationStage {
     scanning,
     estimating,
+    comparing,
     reading,
+    copying,
     compressing,
     writing,
     testing,
     extracting,
     transferring,
+    recovering,
+    committing,
     finalizing,
 };
 
@@ -69,6 +73,16 @@ struct OperationProgress {
     // Producers leave this at zero; frontends use it to distinguish a fresh
     // atomic snapshot from a heartbeat repaint.
     std::uint64_t sequence = 0;
+    // Optional operation-wide phase information. phase_index is zero-based.
+    // Frontends can combine this with the current stage fraction to render an
+    // overall bar that never resets between scanning, copying, recovery, and
+    // commit work.
+    std::uint32_t phase_index = 0;
+    std::uint32_t phase_count = 0;
+    std::uint64_t planned_added_items = 0;
+    std::uint64_t planned_updated_items = 0;
+    std::uint64_t planned_removed_items = 0;
+    std::uint64_t planned_unchanged_items = 0;
 };
 
 struct OperationWarning {
@@ -92,6 +106,26 @@ public:
         progress_callback_present_.store(present, std::memory_order_release);
     }
 
+    void set_progress_phase(std::uint32_t index, std::uint32_t count) {
+        if (count == 0) {
+            progress_phase_index_context_.store(0, std::memory_order_release);
+            progress_phase_count_context_.store(0, std::memory_order_release);
+            return;
+        }
+        progress_phase_index_context_.store(
+            std::min(index, count - 1), std::memory_order_release);
+        progress_phase_count_context_.store(count, std::memory_order_release);
+    }
+
+    void set_sync_plan(std::uint64_t added, std::uint64_t updated,
+                       std::uint64_t removed, std::uint64_t unchanged) {
+        progress_plan_added_context_.store(added, std::memory_order_release);
+        progress_plan_updated_context_.store(updated, std::memory_order_release);
+        progress_plan_removed_context_.store(removed, std::memory_order_release);
+        progress_plan_unchanged_context_.store(
+            unchanged, std::memory_order_release);
+    }
+
     void report(const OperationProgress& progress) const {
         checkpoint();
         constexpr std::uint64_t kPublishQuantum = 1u << 20;
@@ -109,8 +143,31 @@ public:
         }
 
         OperationProgress published = progress;
+        if (published.phase_count == 0) {
+            published.phase_index =
+                progress_phase_index_context_.load(std::memory_order_acquire);
+            published.phase_count =
+                progress_phase_count_context_.load(std::memory_order_acquire);
+        }
+        if (published.planned_added_items == 0 &&
+            published.planned_updated_items == 0 &&
+            published.planned_removed_items == 0 &&
+            published.planned_unchanged_items == 0) {
+            published.planned_added_items =
+                progress_plan_added_context_.load(std::memory_order_acquire);
+            published.planned_updated_items =
+                progress_plan_updated_context_.load(std::memory_order_acquire);
+            published.planned_removed_items =
+                progress_plan_removed_context_.load(std::memory_order_acquire);
+            published.planned_unchanged_items =
+                progress_plan_unchanged_context_.load(std::memory_order_acquire);
+        }
         const auto previous_stage = static_cast<OperationStage>(
             progress_stage_.load(std::memory_order_relaxed));
+        const auto previous_phase_index =
+            progress_phase_index_.load(std::memory_order_relaxed);
+        const auto previous_phase_count =
+            progress_phase_count_.load(std::memory_order_relaxed);
         const auto previous_bytes =
             progress_completed_bytes_.load(std::memory_order_relaxed);
         const auto previous_total = progress_total_bytes_.load(std::memory_order_relaxed);
@@ -163,6 +220,8 @@ public:
         }
 
         const bool boundary = first || published.stage != previous_stage ||
+            published.phase_index != previous_phase_index ||
+            published.phase_count != previous_phase_count ||
             published.total_bytes != previous_total ||
             published.total_items != previous_item_total ||
             published.completed_items != previous_items ||
@@ -189,6 +248,18 @@ public:
         progress_version_.fetch_add(1, std::memory_order_acq_rel); // writer active
         progress_stage_.store(static_cast<unsigned>(published.stage),
                               std::memory_order_relaxed);
+        progress_phase_index_.store(published.phase_index,
+                                    std::memory_order_relaxed);
+        progress_phase_count_.store(published.phase_count,
+                                    std::memory_order_relaxed);
+        progress_plan_added_.store(published.planned_added_items,
+                                   std::memory_order_relaxed);
+        progress_plan_updated_.store(published.planned_updated_items,
+                                     std::memory_order_relaxed);
+        progress_plan_removed_.store(published.planned_removed_items,
+                                     std::memory_order_relaxed);
+        progress_plan_unchanged_.store(published.planned_unchanged_items,
+                                       std::memory_order_relaxed);
         progress_completed_bytes_.store(published.completed_bytes,
                                         std::memory_order_relaxed);
         progress_total_bytes_.store(published.total_bytes, std::memory_order_relaxed);
@@ -238,6 +309,18 @@ public:
             OperationProgress result;
             result.stage = static_cast<OperationStage>(
                 progress_stage_.load(std::memory_order_relaxed));
+            result.phase_index =
+                progress_phase_index_.load(std::memory_order_relaxed);
+            result.phase_count =
+                progress_phase_count_.load(std::memory_order_relaxed);
+            result.planned_added_items =
+                progress_plan_added_.load(std::memory_order_relaxed);
+            result.planned_updated_items =
+                progress_plan_updated_.load(std::memory_order_relaxed);
+            result.planned_removed_items =
+                progress_plan_removed_.load(std::memory_order_relaxed);
+            result.planned_unchanged_items =
+                progress_plan_unchanged_.load(std::memory_order_relaxed);
             result.completed_bytes =
                 progress_completed_bytes_.load(std::memory_order_relaxed);
             result.total_bytes = progress_total_bytes_.load(std::memory_order_relaxed);
@@ -329,6 +412,18 @@ private:
     mutable std::atomic_uint64_t progress_version_{0};
     mutable std::atomic_uint progress_stage_{
         static_cast<unsigned>(OperationStage::reading)};
+    mutable std::atomic_uint progress_phase_index_{0};
+    mutable std::atomic_uint progress_phase_count_{0};
+    mutable std::atomic_uint64_t progress_plan_added_{0};
+    mutable std::atomic_uint64_t progress_plan_updated_{0};
+    mutable std::atomic_uint64_t progress_plan_removed_{0};
+    mutable std::atomic_uint64_t progress_plan_unchanged_{0};
+    std::atomic_uint progress_phase_index_context_{0};
+    std::atomic_uint progress_phase_count_context_{0};
+    std::atomic_uint64_t progress_plan_added_context_{0};
+    std::atomic_uint64_t progress_plan_updated_context_{0};
+    std::atomic_uint64_t progress_plan_removed_context_{0};
+    std::atomic_uint64_t progress_plan_unchanged_context_{0};
     mutable std::atomic_uint64_t progress_completed_bytes_{0};
     mutable std::atomic_uint64_t progress_total_bytes_{0};
     mutable std::atomic_uint64_t progress_completed_items_{0};

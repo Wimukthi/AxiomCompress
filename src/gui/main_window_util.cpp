@@ -463,7 +463,7 @@ if (cut == std::wstring::npos) return std::nullopt;
 return volume.parent_path() / fs::path(name.substr(0, cut) + L".axar");
 }
 
-std::vector<fs::path> pick_files(HWND owner) {
+std::vector<fs::path> pick_files(HWND owner, std::wstring_view title) {
 ComPtr<IFileOpenDialog> dialog;
 if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER,
                             IID_PPV_ARGS(dialog.put())))) {
@@ -473,6 +473,10 @@ if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER,
 DWORD options = 0;
 dialog->GetOptions(&options);
 dialog->SetOptions(options | FOS_ALLOWMULTISELECT | FOS_FORCEFILESYSTEM | FOS_FILEMUSTEXIST);
+if (!title.empty()) {
+    const std::wstring dialog_title(title);
+    dialog->SetTitle(dialog_title.c_str());
+}
 
 if (FAILED(dialog->Show(owner))) {
     return {};
@@ -496,6 +500,32 @@ for (DWORD i = 0; i < count; ++i) {
     }
 }
 return paths;
+}
+
+std::optional<fs::path> pick_folder(HWND owner, std::wstring_view title) {
+ComPtr<IFileOpenDialog> dialog;
+if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER,
+                            IID_PPV_ARGS(dialog.put())))) {
+    return std::nullopt;
+}
+
+DWORD options = 0;
+dialog->GetOptions(&options);
+dialog->SetOptions(options | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST);
+if (!title.empty()) {
+    const std::wstring dialog_title(title);
+    dialog->SetTitle(dialog_title.c_str());
+}
+
+if (FAILED(dialog->Show(owner))) {
+    return std::nullopt;
+}
+
+ComPtr<IShellItem> item;
+if (FAILED(dialog->GetResult(item.put()))) {
+    return std::nullopt;
+}
+return shell_item_path(item.get());
 }
 
 std::optional<fs::path> pick_open_archive(HWND owner) {

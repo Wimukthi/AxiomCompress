@@ -18,6 +18,204 @@ constexpr DWORD kCommandInputDialogStyle =
 constexpr DWORD kCommandInputDialogExStyle =
     WS_EX_WINDOWEDGE | WS_EX_CONTROLPARENT;
 
+struct UpdateSourceMapping {
+    std::vector<fs::path> paths;
+    std::vector<axiom::ArchiveInput> mapped_inputs;
+    std::wstring filesystem_source;
+    std::wstring archive_destination;
+    std::wstring error;
+    std::size_t unmatched_files = 0;
+    std::size_t entries_outside_source_roots = 0;
+    bool matched_archive = false;
+};
+
+bool archive_text_equal(std::string_view left, std::string_view right) {
+    const std::wstring wide_left = widen(left);
+    const std::wstring wide_right = widen(right);
+    return CompareStringOrdinal(
+               wide_left.data(), static_cast<int>(wide_left.size()),
+               wide_right.data(), static_cast<int>(wide_right.size()), TRUE) == CSTR_EQUAL;
+}
+
+std::string archive_root(std::string_view path) {
+    const auto slash = path.find('/');
+    return std::string(path.substr(0, slash));
+}
+
+bool archive_contains_root(const std::vector<axiom::ArchiveEntry>& entries,
+                           std::string_view root) {
+    return std::any_of(entries.begin(), entries.end(), [root](const auto& entry) {
+        return archive_text_equal(archive_root(entry.path), root);
+    });
+}
+
+bool filesystem_path_ends_with_archive_path(const fs::path& source,
+                                            std::string_view archive_path) {
+    std::wstring filesystem = source.lexically_normal().wstring();
+    std::wstring archived = widen(archive_path);
+    std::replace(filesystem.begin(), filesystem.end(), L'/', L'\\');
+    std::replace(archived.begin(), archived.end(), L'/', L'\\');
+    if (archived.empty() || archived.size() > filesystem.size()) return false;
+    const std::size_t offset = filesystem.size() - archived.size();
+    if (offset != 0 && filesystem[offset - 1] != L'\\') return false;
+    return CompareStringOrdinal(
+               filesystem.data() + offset, static_cast<int>(archived.size()),
+               archived.data(), static_cast<int>(archived.size()), TRUE) == CSTR_EQUAL;
+}
+
+std::vector<fs::path> immediate_folder_children(const fs::path& folder,
+                                                std::error_code& error) {
+    std::vector<fs::path> children;
+    for (fs::directory_iterator it(folder, fs::directory_options::skip_permission_denied,
+                                   error), end;
+         !error && it != end; it.increment(error)) {
+        children.push_back(it->path());
+    }
+    std::sort(children.begin(), children.end(), [](const fs::path& left,
+                                                   const fs::path& right) {
+        return CompareStringOrdinal(left.c_str(), -1, right.c_str(), -1, TRUE) == CSTR_LESS_THAN;
+    });
+    return children;
+}
+
+std::size_t count_entries_outside_mapped_roots(
+    const std::vector<axiom::ArchiveEntry>& entries,
+    const std::vector<axiom::ArchiveInput>& inputs) {
+    std::vector<std::string> roots;
+    roots.reserve(inputs.size());
+    for (const auto& input : inputs) {
+        const std::string root = archive_root(input.destination_path);
+        if (std::none_of(roots.begin(), roots.end(), [&root](const std::string& existing) {
+                return archive_text_equal(existing, root);
+            })) {
+            roots.push_back(root);
+        }
+    }
+    return static_cast<std::size_t>(std::count_if(
+        entries.begin(), entries.end(), [&roots](const auto& entry) {
+            const std::string root = archive_root(entry.path);
+            return std::none_of(roots.begin(), roots.end(),
+                                [&root](const std::string& selected) {
+                                    return archive_text_equal(selected, root);
+                                });
+        }));
+}
+
+UpdateSourceMapping map_update_folder(
+    const fs::path& folder, const std::vector<axiom::ArchiveEntry>& entries,
+    axiom::gui::ArchiveUpdateMode mode) {
+    UpdateSourceMapping result;
+    result.filesystem_source = folder.wstring();
+    std::error_code status_error;
+    if (!fs::is_directory(folder, status_error) || status_error) {
+        result.error = L"Choose an accessible source folder.";
+        return result;
+    }
+
+    fs::path leaf = folder.lexically_normal().filename();
+    const std::string folder_name = utf8(leaf.wstring());
+    const bool direct_match =
+        !folder_name.empty() && archive_contains_root(entries, folder_name);
+
+    std::error_code iterate_error;
+    auto children = immediate_folder_children(folder, iterate_error);
+    if (iterate_error) {
+        result.error = L"Axiom could not enumerate the selected source folder:\n\n" +
+                       folder.wstring() + L"\n\n" + widen(iterate_error.message());
+        return result;
+    }
+    const std::size_t child_root_matches = static_cast<std::size_t>(std::count_if(
+        children.begin(), children.end(), [&entries](const fs::path& child) {
+            return archive_contains_root(entries, utf8(child.filename().wstring()));
+        }));
+
+    const bool map_contents = !direct_match && child_root_matches != 0;
+    if (!direct_match && !map_contents &&
+        (mode == axiom::gui::ArchiveUpdateMode::fresh_existing ||
+         mode == axiom::gui::ArchiveUpdateMode::synchronize)) {
+        result.error =
+            L"The selected folder does not match this archive's stored root paths.\n\n"
+            L"Choose the original source folder, or its parent when the archive was "
+            L"created from the folder's contents. No archive changes were made.";
+        return result;
+    }
+
+    if (map_contents || folder_name.empty()) {
+        if (children.empty()) {
+            result.error =
+                L"The selected folder is empty. Axiom will not use an empty or "
+                L"unmatched folder as a synchronization source.";
+            return result;
+        }
+        result.paths = children;
+        result.mapped_inputs.reserve(children.size());
+        for (const auto& child : children) {
+            result.mapped_inputs.push_back(
+                {child, utf8(child.filename().wstring())});
+        }
+        result.archive_destination = L"the archive root";
+        result.matched_archive = child_root_matches != 0;
+    } else {
+        result.paths.push_back(folder);
+        result.mapped_inputs.push_back({folder, folder_name});
+        result.archive_destination = widen(folder_name) + L"\\...";
+        result.matched_archive = direct_match;
+    }
+    result.entries_outside_source_roots =
+        count_entries_outside_mapped_roots(entries, result.mapped_inputs);
+    return result;
+}
+
+UpdateSourceMapping map_update_files(
+    std::vector<fs::path> files, const std::vector<axiom::ArchiveEntry>& entries) {
+    UpdateSourceMapping result;
+    result.paths = std::move(files);
+    result.mapped_inputs.reserve(result.paths.size());
+    std::vector<std::string> destinations;
+    destinations.reserve(result.paths.size());
+
+    for (const auto& source : result.paths) {
+        const axiom::ArchiveEntry* best = nullptr;
+        for (const auto& entry : entries) {
+            if (entry.is_directory ||
+                !filesystem_path_ends_with_archive_path(source, entry.path)) {
+                continue;
+            }
+            if (best == nullptr || entry.path.size() > best->path.size()) {
+                best = &entry;
+            }
+        }
+
+        std::string destination;
+        if (best != nullptr) {
+            destination = best->path;
+            result.matched_archive = true;
+        } else {
+            destination = utf8(source.filename().wstring());
+            ++result.unmatched_files;
+        }
+        if (destination.empty()) {
+            result.error = L"A selected file does not have a usable file name:\n\n" +
+                           source.wstring();
+            return result;
+        }
+        if (std::any_of(destinations.begin(), destinations.end(),
+                        [&destination](const std::string& existing) {
+                            return archive_text_equal(existing, destination);
+                        })) {
+            result.error =
+                L"Two selected files map to the same archive path:\n\n" +
+                widen(destination) +
+                L"\n\nChoose the containing folder so Axiom can preserve their paths.";
+            return result;
+        }
+        destinations.push_back(destination);
+        result.mapped_inputs.push_back({source, std::move(destination)});
+    }
+    result.archive_destination = L"their matching archive paths";
+    return result;
+}
+
 struct CommandInputField {
     std::wstring label;
     std::wstring value;
@@ -1708,7 +1906,8 @@ bool MainWindow::signature_key_is_trusted(const axiom::ArchiveSignatureInfo& inf
 void MainWindow::create_archive_from_paths(
     std::vector<fs::path> paths,
     std::optional<fs::path> target_archive,
-    axiom::gui::ArchiveUpdateMode update_mode) {
+    axiom::gui::ArchiveUpdateMode update_mode,
+    std::vector<axiom::ArchiveInput> mapped_inputs) {
     if (paths.empty()) return;
 
     if (target_archive) {
@@ -1725,10 +1924,12 @@ void MainWindow::create_archive_from_paths(
             begin_background_ui_task(
                 L"Reading archive settings...",
                 [this, path, paths = std::move(paths), update_mode,
+                 mapped_inputs = std::move(mapped_inputs),
                  password = std::move(*password)]() mutable {
                     const auto mode = axiom::archive_encryption_mode(path);
                     std::wstring comment = widen(axiom::archive_comment(path, password));
                     return [this, path, paths = std::move(paths), update_mode, mode,
+                            mapped_inputs = std::move(mapped_inputs),
                             comment = std::move(comment),
                             password = std::move(password)]() mutable {
                         archive_dialog_metadata_path_ = path;
@@ -1736,7 +1937,8 @@ void MainWindow::create_archive_from_paths(
                         archive_dialog_comment_ = std::move(comment);
                         archive_dialog_password_ = std::move(password);
                         archive_dialog_metadata_valid_ = true;
-                        create_archive_from_paths(std::move(paths), path, update_mode);
+                        create_archive_from_paths(std::move(paths), path, update_mode,
+                                                  std::move(mapped_inputs));
                     };
                 });
             return;
@@ -1856,6 +2058,7 @@ void MainWindow::create_archive_from_paths(
     if (!accepted) return;
 
     inputs_ = std::move(paths);
+    mapped_inputs_ = std::move(mapped_inputs);
     selected_level_ = dialog_options.level;
     selected_method_ = dialog_options.method;
     selected_codec_level_ = dialog_options.codec_level;
@@ -1918,16 +2121,140 @@ void MainWindow::on_update_archive(axiom::gui::ArchiveUpdateMode mode) {
                          axiom::gui::MessageDialogIcon::information);
         return;
     }
-    if (mode == axiom::gui::ArchiveUpdateMode::synchronize &&
+    if (!archive_catalog_ ||
+        !same_filesystem_path(archive_catalog_->path(), *archive)) {
         show_app_message(
-            L"Synchronize will mirror the selected source into the archive.\n\n"
-            L"Archived entries missing from the source will be permanently removed. Continue?",
-            axiom::gui::MessageDialogIcon::warning, L"Synchronize archive",
-            axiom::gui::MessageDialogButtons::yes_no, IDNO) != IDYES) {
+            L"The archive catalog is still loading. Wait for the archive contents "
+            L"to appear, then try again.",
+            axiom::gui::MessageDialogIcon::information);
         return;
     }
-    auto paths = pick_files(hwnd_);
-    if (!paths.empty()) create_archive_from_paths(std::move(paths), *archive, mode);
+
+    const auto& entries = archive_catalog_->entries();
+    UpdateSourceMapping source;
+    if (mode == axiom::gui::ArchiveUpdateMode::synchronize) {
+        const auto folder = pick_folder(
+            hwnd_, L"Choose the complete source folder to synchronize");
+        if (!folder) return;
+        source = map_update_folder(*folder, entries, mode);
+    } else {
+        const wchar_t* operation_name =
+            mode == axiom::gui::ArchiveUpdateMode::fresh_existing
+                ? L"Freshen" : L"Update";
+        const std::wstring prompt =
+            std::wstring(operation_name) + L" this archive:\n\n" +
+            archive->wstring() +
+            L"\n\nChoose the original source folder to preserve its archive paths. "
+            L"You can also choose individual files; Axiom will match them to existing "
+            L"archive entries when possible.";
+        const int selection = show_app_message(
+            prompt, axiom::gui::MessageDialogIcon::question,
+            std::wstring(operation_name) + L" archive",
+            axiom::gui::MessageDialogButtons::folder_files_cancel, IDYES);
+        if (selection == IDYES) {
+            const auto folder = pick_folder(
+                hwnd_, std::wstring(L"Choose the source folder to ") +
+                           (mode == axiom::gui::ArchiveUpdateMode::fresh_existing
+                                ? L"freshen" : L"update"));
+            if (!folder) return;
+            source = map_update_folder(*folder, entries, mode);
+        } else if (selection == IDNO) {
+            auto files = pick_files(
+                hwnd_, std::wstring(L"Choose source files to ") +
+                           (mode == axiom::gui::ArchiveUpdateMode::fresh_existing
+                                ? L"freshen" : L"update"));
+            if (files.empty()) return;
+            source = map_update_files(std::move(files), entries);
+        } else {
+            return;
+        }
+    }
+
+    if (!source.error.empty()) {
+        show_app_message(source.error, axiom::gui::MessageDialogIcon::warning,
+                         L"Archive source");
+        return;
+    }
+    if (source.paths.empty() || source.mapped_inputs.empty()) return;
+
+    if (mode == axiom::gui::ArchiveUpdateMode::update_newer &&
+        !source.filesystem_source.empty() && !source.matched_archive) {
+        const std::wstring prompt =
+            L"The selected folder does not match an existing archive root.\n\n"
+            L"Source:\n" + source.filesystem_source +
+            L"\n\nUpdate will add it as a new tree at " +
+            source.archive_destination + L". Continue?";
+        if (show_app_message(prompt, axiom::gui::MessageDialogIcon::question,
+                             L"Update archive",
+                             axiom::gui::MessageDialogButtons::yes_no,
+                             IDNO) != IDYES) {
+            return;
+        }
+    } else if (mode == axiom::gui::ArchiveUpdateMode::fresh_existing &&
+        source.unmatched_files != 0) {
+        if (!source.matched_archive) {
+            show_app_message(
+                L"None of the selected files match an existing archive path. "
+                L"Freshen only replaces existing entries, so no changes would be made.",
+                axiom::gui::MessageDialogIcon::information, L"Freshen archive");
+            return;
+        }
+        const std::wstring prompt =
+            std::to_wstring(source.unmatched_files) +
+            (source.unmatched_files == 1
+                 ? L" selected file does not match an existing archive path"
+                 : L" selected files do not match existing archive paths") +
+            L" and will be ignored by Freshen. Continue with the matched files?";
+        if (show_app_message(prompt, axiom::gui::MessageDialogIcon::warning,
+                             L"Freshen archive",
+                             axiom::gui::MessageDialogButtons::yes_no,
+                             IDNO) != IDYES) {
+            return;
+        }
+    } else if (mode == axiom::gui::ArchiveUpdateMode::update_newer &&
+               source.unmatched_files != 0) {
+        const std::wstring prompt =
+            std::to_wstring(source.unmatched_files) +
+            (source.unmatched_files == 1
+                 ? L" selected file does not match an existing archive path"
+                 : L" selected files do not match existing archive paths") +
+            L". Update will add " +
+            (source.unmatched_files == 1 ? std::wstring(L"it")
+                                         : std::wstring(L"them")) +
+            L" at the archive root. Continue?";
+        if (show_app_message(prompt, axiom::gui::MessageDialogIcon::question,
+                             L"Update archive",
+                             axiom::gui::MessageDialogButtons::yes_no,
+                             IDYES) != IDYES) {
+            return;
+        }
+    }
+
+    if (mode == axiom::gui::ArchiveUpdateMode::synchronize) {
+        std::wstring prompt =
+            L"Source:\n" + source.filesystem_source +
+            L"\n\nArchive:\n" + archive->wstring() +
+            L"\n\nArchive mapping: " + source.archive_destination +
+            L"\n\nSynchronize will add missing files, replace newer files, and "
+            L"permanently remove every archived entry missing from this complete source.";
+        if (source.entries_outside_source_roots != 0) {
+            prompt += L"\n\n" +
+                std::to_wstring(source.entries_outside_source_roots) +
+                (source.entries_outside_source_roots == 1
+                     ? L" archived entry is outside the selected source roots and will be removed."
+                     : L" archived entries are outside the selected source roots and will be removed.");
+        }
+        prompt += L"\n\nContinue?";
+        if (show_app_message(prompt, axiom::gui::MessageDialogIcon::warning,
+                             L"Synchronize archive",
+                             axiom::gui::MessageDialogButtons::yes_no,
+                             IDNO) != IDYES) {
+            return;
+        }
+    }
+
+    create_archive_from_paths(std::move(source.paths), *archive, mode,
+                              std::move(source.mapped_inputs));
 }
 
 bool MainWindow::active_archive_is_editable() {
@@ -2719,6 +3046,7 @@ void MainWindow::on_compress() {
     }
 
     const auto inputs = inputs_;
+    const auto mapped_inputs = mapped_inputs_;
     auto options = compression_options();
     const auto mode = pending_archive_features_.update_mode;
     options.skip_unreadable_files =
@@ -2861,7 +3189,7 @@ void MainWindow::on_compress() {
     }
     operation_archive_output_ = archive;
     start_operation(std::move(running), std::move(success),
-                    [inputs, archive, options, mode, comment, set_comment,
+                    [inputs, mapped_inputs, archive, options, mode, comment, set_comment,
                      repack_after, lock_after, sign_after, signing_key,
                      create_sfx_after, sfx_output, split_after,
                      volume_size = *volume_size, recovery_volumes](
@@ -2873,36 +3201,77 @@ void MainWindow::on_compress() {
                             throw std::runtime_error("unsupported archive format");
                         }
                         try {
+                            bool native_sync_finalized = false;
                             switch (mode) {
                                 case axiom::gui::ArchiveUpdateMode::add_or_replace:
-                                    provider->add(inputs, archive, run_options);
+                                    if (mapped_inputs.empty()) {
+                                        provider->add(inputs, archive, run_options);
+                                    } else {
+                                        provider->add_mapped(mapped_inputs, archive, run_options);
+                                    }
                                     break;
                                 case axiom::gui::ArchiveUpdateMode::update_newer:
-                                    provider->update(inputs, archive, run_options, false);
+                                    if (mapped_inputs.empty()) {
+                                        provider->update(inputs, archive, run_options, false);
+                                    } else {
+                                        provider->update_mapped(
+                                            mapped_inputs, archive, run_options, false);
+                                    }
                                     break;
                                 case axiom::gui::ArchiveUpdateMode::fresh_existing:
-                                    provider->update(inputs, archive, run_options, true);
+                                    if (mapped_inputs.empty()) {
+                                        provider->update(inputs, archive, run_options, true);
+                                    } else {
+                                        provider->update_mapped(
+                                            mapped_inputs, archive, run_options, true);
+                                    }
                                     break;
                                 case axiom::gui::ArchiveUpdateMode::synchronize:
-                                    provider->sync(inputs, archive, run_options);
+                                    if (provider->info().native && !repack_after) {
+                                        axiom::ArchiveSyncFinalization finalization;
+                                        if (set_comment) finalization.comment = comment;
+                                        finalization.lock_archive = lock_after;
+                                        finalization.signing_key =
+                                            sign_after ? &signing_key : nullptr;
+                                        if (mapped_inputs.empty()) {
+                                            axiom::sync_archive(
+                                                inputs, archive, run_options, finalization);
+                                        } else {
+                                            axiom::sync_archive(
+                                                mapped_inputs, archive, run_options,
+                                                finalization);
+                                        }
+                                        native_sync_finalized = true;
+                                    } else {
+                                        if (mapped_inputs.empty()) {
+                                            provider->sync(inputs, archive, run_options);
+                                        } else {
+                                            provider->sync_mapped(
+                                                mapped_inputs, archive, run_options);
+                                        }
+                                    }
                                     break;
                                 default:
                                     provider->create(inputs, archive, run_options);
                                     break;
                             }
-                            if (provider->info().native && set_comment) {
-                                axiom::set_archive_comment(archive, comment, run_options);
-                            }
                             if (provider->info().native && repack_after) {
                                 axiom::repack_archive(archive, run_options);
                             }
+                            if (provider->info().native &&
+                                !native_sync_finalized &&
+                                (set_comment || sign_after || lock_after)) {
+                                axiom::ArchiveSyncFinalization finalization;
+                                if (set_comment) finalization.comment = comment;
+                                finalization.lock_archive = lock_after;
+                                finalization.signing_key =
+                                    sign_after ? &signing_key : nullptr;
+                                axiom::finalize_archive_metadata(
+                                    archive, finalization, run_options);
+                            }
                             if (provider->info().native && sign_after) {
-                                axiom::sign_archive(archive, signing_key, run_options);
                                 SecureZeroMemory(signing_key.secret_key.data(),
                                                  signing_key.secret_key.size());
-                            }
-                            if (provider->info().native && lock_after) {
-                                axiom::lock_archive(archive, run_options);
                             }
                             if (provider->info().native && split_after) {
                                 const std::uint64_t archive_bytes = fs::file_size(archive);
@@ -2959,6 +3328,10 @@ void MainWindow::on_compress() {
                                 }
                             }
                         } catch (...) {
+                            if (sign_after) {
+                                SecureZeroMemory(signing_key.secret_key.data(),
+                                                 signing_key.secret_key.size());
+                            }
                             if (create_sfx_after &&
                                 mode == axiom::gui::ArchiveUpdateMode::create_new) {
                                 std::error_code cleanup_error;

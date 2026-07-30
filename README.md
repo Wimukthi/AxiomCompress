@@ -55,6 +55,9 @@ Most users need one of these paths:
 - Native Windows SFX output for AXAR and ZIP as a single merged `.exe`.
 - Cooperative progress, pause, resume, and cancel through shared worker-thread
   operation control.
+- Single-transaction AXAR synchronization: unchanged compressed blocks are
+  reused, changed files are encoded once, recovery is rebuilt once, and
+  no-change synchronization does not rewrite the archive.
 - Coverage-guided fuzz targets and Release-mode round-trip tests.
 
 ## Build

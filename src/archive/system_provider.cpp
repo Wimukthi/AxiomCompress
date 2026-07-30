@@ -1129,8 +1129,16 @@ public:
                 const CompressionOptions&, bool) const override {
         throw std::runtime_error("archive format is read-only");
     }
+    void update_mapped(const std::vector<ArchiveInput>&, const fs::path&,
+                       const CompressionOptions&, bool) const override {
+        throw std::runtime_error("archive format is read-only");
+    }
     void sync(const std::vector<fs::path>&, const fs::path&,
               const CompressionOptions&) const override {
+        throw std::runtime_error("archive format is read-only");
+    }
+    void sync_mapped(const std::vector<ArchiveInput>&, const fs::path&,
+                     const CompressionOptions&) const override {
         throw std::runtime_error("archive format is read-only");
     }
     void delete_entries(const fs::path&, const std::vector<std::string>&,

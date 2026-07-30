@@ -50,6 +50,8 @@ std::vector<ButtonSpec> button_specs_for(MessageDialogButtons buttons) {
             return {{IDYES, L"Yes"}, {IDNO, L"No"}};
         case MessageDialogButtons::yes_no_cancel:
             return {{IDYES, L"Yes"}, {IDNO, L"No"}, {IDCANCEL, L"Cancel"}};
+        case MessageDialogButtons::folder_files_cancel:
+            return {{IDYES, L"Folder..."}, {IDNO, L"Files..."}, {IDCANCEL, L"Cancel"}};
         case MessageDialogButtons::ok:
         default:
             return {{IDOK, L"OK"}};
@@ -62,6 +64,7 @@ int close_result_for(MessageDialogButtons buttons) {
             return IDOK;
         case MessageDialogButtons::ok_cancel:
         case MessageDialogButtons::yes_no_cancel:
+        case MessageDialogButtons::folder_files_cancel:
             return IDCANCEL;
         case MessageDialogButtons::yes_no:
         default:

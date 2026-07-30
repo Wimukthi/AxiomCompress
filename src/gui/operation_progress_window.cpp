@@ -60,15 +60,43 @@ std::wstring stage_text(OperationStage stage) {
     switch (stage) {
         case OperationStage::scanning: return L"Scanning";
         case OperationStage::estimating: return L"Estimating compression";
+        case OperationStage::comparing: return L"Comparing";
         case OperationStage::reading: return L"Reading";
+        case OperationStage::copying: return L"Copying unchanged data";
         case OperationStage::compressing: return L"Compressing";
         case OperationStage::writing: return L"Writing";
         case OperationStage::testing: return L"Testing";
         case OperationStage::extracting: return L"Extracting";
         case OperationStage::transferring: return L"Transferring";
+        case OperationStage::recovering: return L"Building recovery data";
+        case OperationStage::committing: return L"Committing";
         case OperationStage::finalizing: return L"Finalizing";
     }
     return L"Working";
+}
+
+std::pair<std::uint64_t, std::uint64_t> overall_progress(
+    const OperationProgress& progress) {
+    const std::uint64_t completed = progress.total_bytes > 0
+        ? progress.completed_bytes : progress.completed_items;
+    const std::uint64_t total = progress.total_bytes > 0
+        ? progress.total_bytes : progress.total_items;
+    if (progress.phase_count == 0) return {completed, total};
+
+    constexpr std::uint64_t kPhaseScale = 1'000'000;
+    const std::uint64_t bounded_phase =
+        std::min<std::uint64_t>(progress.phase_index, progress.phase_count - 1);
+    const std::uint64_t phase_fraction = total == 0
+        ? 0
+        : std::min<std::uint64_t>(
+              kPhaseScale,
+              static_cast<std::uint64_t>(
+                  static_cast<long double>(std::min(completed, total)) *
+                  kPhaseScale / total));
+    return {
+        bounded_phase * kPhaseScale + phase_fraction,
+        static_cast<std::uint64_t>(progress.phase_count) * kPhaseScale,
+    };
 }
 
 void fill_rect(HDC dc, const RECT& rect, COLORREF color) {
@@ -343,9 +371,15 @@ void OperationProgressWindow::update_telemetry_fields() {
         return stream.str();
     };
 
-    set_field_text(TelemetryField::stage,
-                   L"Stage: " + (has_progress_ ? stage_text(progress_.stage)
-                                                 : std::wstring{L"Preparing"}));
+    std::wstring stage = has_progress_ ? stage_text(progress_.stage)
+                                       : std::wstring{L"Preparing"};
+    if (has_progress_ && progress_.phase_count != 0) {
+        stage = L"Stage " + std::to_wstring(progress_.phase_index + 1) +
+                L" of " + std::to_wstring(progress_.phase_count) + L": " + stage;
+    } else {
+        stage = L"Stage: " + stage;
+    }
+    set_field_text(TelemetryField::stage, stage);
     set_field_text(TelemetryField::current_path,
                    L"Current item: " +
                        (has_progress_ && !progress_.current_path.empty()
@@ -358,19 +392,21 @@ void OperationProgressWindow::update_telemetry_fields() {
 
     const bool byte_total = has_progress_ && progress_.total_bytes > 0;
     const bool item_total = has_progress_ && progress_.total_items > 0;
+    const auto [overall_completed, overall_total] =
+        has_progress_ ? overall_progress(progress_)
+                      : std::pair<std::uint64_t, std::uint64_t>{0, 0};
     set_field_text(TelemetryField::overall_percent,
                    L"Overall progress: " +
-                       (byte_total ? percentage(progress_.completed_bytes,
-                                                progress_.total_bytes)
-                                   : item_total
-                                         ? percentage(progress_.completed_items,
-                                                      progress_.total_items)
-                                         : percentage(0, 0)));
+                       percentage(overall_completed, overall_total));
     set_field_text(TelemetryField::overall_completed,
-                   L"Completed bytes: " + format_size(
+                   (progress_.phase_count != 0
+                        ? L"Phase completed: " : L"Completed bytes: ") +
+                       format_size(
                        has_progress_ ? progress_.completed_bytes : 0));
     set_field_text(TelemetryField::overall_total,
-                   L"Total bytes: " + format_size(
+                   (progress_.phase_count != 0
+                        ? L"Phase total: " : L"Total bytes: ") +
+                       format_size(
                        byte_total ? progress_.total_bytes : 0));
     set_field_text(TelemetryField::items_completed,
                    L"Completed items: " + std::to_wstring(
@@ -381,19 +417,37 @@ void OperationProgressWindow::update_telemetry_fields() {
     set_field_text(TelemetryField::speed,
                    L"Speed: " + format_size(static_cast<std::uint64_t>(
                        std::max(0.0, current_rate_))) + L"/s");
-    set_field_text(TelemetryField::compressed_size,
-                   L"Compressed size: " + format_size(
-                       has_progress_ ? progress_.compressed_bytes : 0));
-    std::wstringstream ratio;
-    ratio.setf(std::ios::fixed);
-    ratio.precision(2);
-    ratio << (has_progress_ && progress_.compressed_bytes != 0
-                  ? static_cast<double>(progress_.compressed_source_bytes) /
-                        static_cast<double>(progress_.compressed_bytes)
-                  : 0.0)
-          << L'x';
-    set_field_text(TelemetryField::compression_ratio,
-                   L"Compression ratio: " + ratio.str());
+    const bool has_sync_plan = has_progress_ &&
+        (progress_.planned_added_items != 0 ||
+         progress_.planned_updated_items != 0 ||
+         progress_.planned_removed_items != 0 ||
+         progress_.planned_unchanged_items != 0);
+    if (has_sync_plan) {
+        set_field_text(
+            TelemetryField::compressed_size,
+            L"Added: " + std::to_wstring(progress_.planned_added_items) +
+                L"   Updated: " +
+                std::to_wstring(progress_.planned_updated_items));
+        set_field_text(
+            TelemetryField::compression_ratio,
+            L"Removed: " + std::to_wstring(progress_.planned_removed_items) +
+                L"   Unchanged: " +
+                std::to_wstring(progress_.planned_unchanged_items));
+    } else {
+        set_field_text(TelemetryField::compressed_size,
+                       L"Compressed size: " + format_size(
+                           has_progress_ ? progress_.compressed_bytes : 0));
+        std::wstringstream ratio;
+        ratio.setf(std::ios::fixed);
+        ratio.precision(2);
+        ratio << (has_progress_ && progress_.compressed_bytes != 0
+                      ? static_cast<double>(progress_.compressed_source_bytes) /
+                            static_cast<double>(progress_.compressed_bytes)
+                      : 0.0)
+              << L'x';
+        set_field_text(TelemetryField::compression_ratio,
+                       L"Compression ratio: " + ratio.str());
+    }
 
     const auto [file_completed, file_total_bytes] = displayed_file_progress();
     const bool file_total = file_total_bytes > 0;
@@ -641,12 +695,9 @@ void OperationProgressWindow::paint() {
         if (IntersectRect(&clipped, &inner, &block)) fill_rect(dc, clipped, theme_.progress_fill);
     };
 
-    const std::uint64_t stage_completed = has_progress_
-        ? (progress_.total_bytes > 0 ? progress_.completed_bytes
-                                     : progress_.completed_items) : 0;
-    const std::uint64_t stage_total = has_progress_
-        ? (progress_.total_bytes > 0 ? progress_.total_bytes
-                                     : progress_.total_items) : 0;
+    const auto [stage_completed, stage_total] =
+        has_progress_ ? overall_progress(progress_)
+                      : std::pair<std::uint64_t, std::uint64_t>{0, 0};
     draw_progress_bar({margin, scale(89), client.right - margin, scale(111)},
                       stage_completed, stage_total);
     const auto [file_completed, file_total] = displayed_file_progress();

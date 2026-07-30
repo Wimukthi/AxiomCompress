@@ -19,6 +19,7 @@ enum class MessageDialogButtons {
     ok_cancel,
     yes_no,
     yes_no_cancel,
+    folder_files_cancel,
 };
 
 int show_message_dialog(

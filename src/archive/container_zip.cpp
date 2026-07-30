@@ -2260,6 +2260,82 @@ void extract_zip_entry(ZipReader& reader,
     }
 }
 
+void update_zip_items(const std::vector<ScanItem>& items,
+                      const fs::path& archive_path,
+                      const CompressionOptions& options,
+                      bool fresh_only) {
+    std::unordered_map<std::string, std::int64_t> existing_mtime;
+    {
+        ZipReader reader(archive_path);
+        auto plans = read_zip_entry_plans(reader);
+        reject_unwritable_zip_entries(plans);
+        for (const auto& plan : plans) {
+            existing_mtime.emplace(plan.entry.path, plan.entry.mtime);
+        }
+    }
+
+    std::vector<ScanItem> selected;
+    for (const auto& item : items) {
+        operation_checkpoint(options.operation);
+        const auto found = existing_mtime.find(item.archive_path);
+        const bool in_archive = found != existing_mtime.end();
+        if (item.is_directory || item.is_symlink) {
+            if (!in_archive && !fresh_only) {
+                selected.push_back(item);
+            }
+            continue;
+        }
+        const std::int64_t disk_mtime = scan_item_mtime(item);
+        if (in_archive) {
+            if (disk_mtime > found->second) {
+                selected.push_back(item);
+            }
+        } else if (!fresh_only) {
+            selected.push_back(item);
+        }
+    }
+    if (selected.empty()) {
+        return;
+    }
+    rebuild_zip_archive(archive_path, selected, options,
+                        [](const ZipEntryPlan&) { return true; });
+}
+
+void sync_zip_items(const std::vector<ScanItem>& items,
+                    const fs::path& archive_path,
+                    const CompressionOptions& options) {
+    std::unordered_map<std::string, std::int64_t> existing_mtime;
+    {
+        ZipReader reader(archive_path);
+        auto plans = read_zip_entry_plans(reader);
+        reject_unwritable_zip_entries(plans);
+        for (const auto& plan : plans) {
+            existing_mtime.emplace(plan.entry.path, plan.entry.mtime);
+        }
+    }
+
+    std::unordered_set<std::string> wanted;
+    wanted.reserve(items.size());
+    std::vector<ScanItem> selected;
+    for (const auto& item : items) {
+        operation_checkpoint(options.operation);
+        wanted.insert(item.archive_path);
+        const auto found = existing_mtime.find(item.archive_path);
+        if (found == existing_mtime.end()) {
+            selected.push_back(item);
+            continue;
+        }
+        if (!item.is_directory && !item.is_symlink &&
+            scan_item_mtime(item) > found->second) {
+            selected.push_back(item);
+        }
+    }
+    rebuild_zip_archive(archive_path, selected, options,
+                        [&wanted](const ZipEntryPlan& plan) {
+                            return wanted.find(plan.entry.path) != wanted.end();
+                        });
+}
+
 class ZipArchiveProvider final : public ArchiveProvider {
 public:
     const ArchiveFormatInfo& info() const override {
@@ -2429,42 +2505,20 @@ public:
             }
             return;
         }
+        update_zip_items(items, archive_path, options, fresh_only);
+    }
 
-        std::unordered_map<std::string, std::int64_t> existing_mtime;
-        {
-            ZipReader reader(archive_path);
-            auto plans = read_zip_entry_plans(reader);
-            reject_unwritable_zip_entries(plans);
-            for (const auto& plan : plans) {
-                existing_mtime.emplace(plan.entry.path, plan.entry.mtime);
-            }
+    void update_mapped(const std::vector<ArchiveInput>& inputs,
+                       const std::filesystem::path& archive_path,
+                       const CompressionOptions& options,
+                       bool fresh_only) const override {
+        reject_split_zip_edit(archive_path);
+        auto items = scan_zip_inputs(inputs, options.operation);
+        if (!fs::exists(archive_path)) {
+            if (fresh_only) return;
+            throw std::runtime_error("path-aware ZIP update requires an existing archive");
         }
-
-        std::vector<ScanItem> selected;
-        for (const auto& item : items) {
-            operation_checkpoint(options.operation);
-            const auto found = existing_mtime.find(item.archive_path);
-            const bool in_archive = found != existing_mtime.end();
-            if (item.is_directory || item.is_symlink) {
-                if (!in_archive && !fresh_only) {
-                    selected.push_back(item);
-                }
-                continue;
-            }
-            const std::int64_t disk_mtime = scan_item_mtime(item);
-            if (in_archive) {
-                if (disk_mtime > found->second) {
-                    selected.push_back(item);
-                }
-            } else if (!fresh_only) {
-                selected.push_back(item);
-            }
-        }
-        if (selected.empty()) {
-            return;
-        }
-        rebuild_zip_archive(archive_path, selected, options,
-                            [](const ZipEntryPlan&) { return true; });
+        update_zip_items(items, archive_path, options, fresh_only);
     }
 
     void sync(const std::vector<std::filesystem::path>& inputs,
@@ -2478,37 +2532,19 @@ public:
                                 false);
             return;
         }
+        sync_zip_items(items, archive_path, options);
+    }
 
-        std::unordered_map<std::string, std::int64_t> existing_mtime;
-        {
-            ZipReader reader(archive_path);
-            auto plans = read_zip_entry_plans(reader);
-            reject_unwritable_zip_entries(plans);
-            for (const auto& plan : plans) {
-                existing_mtime.emplace(plan.entry.path, plan.entry.mtime);
-            }
+    void sync_mapped(const std::vector<ArchiveInput>& inputs,
+                     const std::filesystem::path& archive_path,
+                     const CompressionOptions& options) const override {
+        reject_split_zip_edit(archive_path);
+        auto items = scan_zip_inputs(inputs, options.operation);
+        if (!fs::exists(archive_path)) {
+            throw std::runtime_error(
+                "path-aware ZIP synchronization requires an existing archive");
         }
-
-        std::unordered_set<std::string> wanted;
-        wanted.reserve(items.size());
-        std::vector<ScanItem> selected;
-        for (const auto& item : items) {
-            operation_checkpoint(options.operation);
-            wanted.insert(item.archive_path);
-            const auto found = existing_mtime.find(item.archive_path);
-            if (found == existing_mtime.end()) {
-                selected.push_back(item);
-                continue;
-            }
-            if (!item.is_directory && !item.is_symlink &&
-                scan_item_mtime(item) > found->second) {
-                selected.push_back(item);
-            }
-        }
-        rebuild_zip_archive(archive_path, selected, options,
-                            [&wanted](const ZipEntryPlan& plan) {
-                                return wanted.find(plan.entry.path) != wanted.end();
-                            });
+        sync_zip_items(items, archive_path, options);
     }
 
     void delete_entries(const std::filesystem::path& archive_path,

@@ -607,12 +607,16 @@ std::wstring stage_text(axiom::OperationStage stage) {
     switch (stage) {
         case axiom::OperationStage::scanning: return L"Scanning";
         case axiom::OperationStage::estimating: return L"Estimating";
+        case axiom::OperationStage::comparing: return L"Comparing";
         case axiom::OperationStage::reading: return L"Reading";
+        case axiom::OperationStage::copying: return L"Copying";
         case axiom::OperationStage::compressing: return L"Compressing";
         case axiom::OperationStage::writing: return L"Writing";
         case axiom::OperationStage::testing: return L"Testing";
         case axiom::OperationStage::extracting: return L"Extracting";
         case axiom::OperationStage::transferring: return L"Transferring";
+        case axiom::OperationStage::recovering: return L"Recovery";
+        case axiom::OperationStage::committing: return L"Committing";
         case axiom::OperationStage::finalizing: return L"Finalizing";
     }
     return L"Working";

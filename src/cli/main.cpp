@@ -151,12 +151,16 @@ const char* stage_name(axiom::OperationStage stage) {
     switch (stage) {
         case axiom::OperationStage::scanning: return "Scanning";
         case axiom::OperationStage::estimating: return "Estimating";
+        case axiom::OperationStage::comparing: return "Comparing";
         case axiom::OperationStage::reading: return "Reading";
+        case axiom::OperationStage::copying: return "Copying";
         case axiom::OperationStage::compressing: return "Compressing";
         case axiom::OperationStage::writing: return "Writing";
         case axiom::OperationStage::testing: return "Testing";
         case axiom::OperationStage::extracting: return "Extracting";
         case axiom::OperationStage::transferring: return "Transferring";
+        case axiom::OperationStage::recovering: return "Recovery";
+        case axiom::OperationStage::committing: return "Committing";
         case axiom::OperationStage::finalizing: return "Finalizing";
     }
     return "Working";

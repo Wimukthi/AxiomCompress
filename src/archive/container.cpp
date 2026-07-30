@@ -595,6 +595,8 @@ void scan_input_at(const ArchiveInput& input, std::vector<ScanItem>& items,
     }
 
     items.push_back({input.source, destination, true});
+    report_operation(operation, OperationStage::scanning, 0, 0,
+                     items.size(), 0, destination);
     for (fs::recursive_directory_iterator it(
              input.source, fs::directory_options::skip_permission_denied, ec),
          end;
@@ -612,11 +614,19 @@ void scan_input_at(const ArchiveInput& input, std::vector<ScanItem>& items,
         } else if (fs::is_regular_file(entry_status)) {
             items.push_back({entry.path(), archive_path_for(entry.path()), false});
         }
+        if ((items.size() & 255u) == 0) {
+            report_operation(
+                operation, OperationStage::scanning, 0, 0, items.size(), 0,
+                core::path_to_utf8(entry.path()));
+        }
     }
     if (ec) {
         throw std::runtime_error("failed while scanning input: " +
                                  core::path_to_utf8(input.source));
     }
+    report_operation(operation, OperationStage::scanning, 0, 0,
+                     items.size(), items.size(),
+                     "Source scan complete");
 }
 
 namespace {
@@ -1061,10 +1071,10 @@ EncodedRecoveryService encode_recovery_service(
             std::copy(bytes.begin(), bytes.end(), data[static_cast<std::size_t>(i)].begin());
             completed += count;
         }
-        report_operation(operation, OperationStage::finalizing, completed, total_work,
+        report_operation(operation, OperationStage::recovering, completed, total_work,
                          static_cast<std::uint64_t>(i + 1),
                          static_cast<std::uint64_t>(data_count + parity_count),
-                         "Building recovery record");
+                         "Reading protected archive data");
     }
 
     std::vector<std::vector<std::uint8_t>> parity(
@@ -1087,11 +1097,13 @@ EncodedRecoveryService encode_recovery_service(
             const std::uint64_t completed_work = recovery_progress_add(
                 protected_size, recovery_progress_add(encoded_before, encoded_current));
             const bool parity_done = parity_completed >= parity_total;
-            report_operation(operation, OperationStage::finalizing, completed_work, total_work,
+            report_operation(operation, OperationStage::recovering, completed_work, total_work,
                              static_cast<std::uint64_t>(
                                  data_count + parity_index + (parity_done ? 1 : 0)),
                              static_cast<std::uint64_t>(data_count + parity_count),
-                             "Encoding recovery parity");
+                             "Encoding recovery parity shard " +
+                                 std::to_string(parity_index + 1) + " of " +
+                                 std::to_string(parity_count));
         });
 
     ByteVector body;
@@ -1175,6 +1187,232 @@ void rewrite_recovery_service(const fs::path& archive_path, unsigned percent,
     input.close();
     replace_archive_file(temporary, archive_path);
     guard.dismiss();
+}
+
+// A freshly written transaction file already consists of the protected archive
+// bytes followed by its ordinary footer. Replace that footer in place with the
+// recovery service and a new footer before the transaction is committed. This
+// avoids the second full-file copy performed by rewrite_recovery_service while
+// retaining atomic replacement of the destination archive.
+void append_recovery_to_staged_archive(
+    const fs::path& staged_path, unsigned percent,
+    const std::shared_ptr<OperationControl>& operation,
+    std::size_t requested_threads = 0) {
+    if (percent == 0) return;
+    if (percent > 100) {
+        throw std::invalid_argument("recovery percentage must be between 1 and 100");
+    }
+
+    std::uint64_t file_size = 0;
+    auto input = open_archive(staged_path, file_size);
+    const ByteSource source(input, file_size);
+    const ArchiveLayout layout = read_layout(source);
+    const std::uint64_t protected_size = layout.directory_offset + layout.directory_size;
+    constexpr std::uint64_t target_shard_size = 1u << 20;
+    const std::uint64_t desired_data = std::max<std::uint64_t>(
+        1, (protected_size + target_shard_size - 1) / target_shard_size);
+    const std::uint64_t max_data = std::max<std::uint64_t>(
+        1, (255u * 100u) / (100u + percent));
+    const int data_count = static_cast<int>(std::min(desired_data, max_data));
+    const int parity_count = static_cast<int>(std::max<std::uint64_t>(
+        1, std::min<std::uint64_t>(
+               255 - data_count,
+               (static_cast<std::uint64_t>(data_count) * percent + 99) / 100)));
+    const std::uint64_t shard_size =
+        std::max<std::uint64_t>(1, (protected_size + data_count - 1) / data_count);
+    const std::uint64_t parity_bytes = recovery_progress_multiply(
+        static_cast<std::uint64_t>(parity_count), shard_size);
+    const std::uint64_t total_work = recovery_progress_add(
+        protected_size, recovery_progress_add(parity_bytes, parity_bytes));
+
+    // Encode one stripe across every shard at a time. The previous implementation
+    // retained the complete protected archive plus all parity shards in memory.
+    // A 64-KiB stripe bounds working memory to roughly
+    // (data_shards + parity_shards) * 64 KiB without changing a single recovery
+    // byte on disk.
+    constexpr std::size_t stripe_capacity = 64u << 10;
+    std::vector<std::uint32_t> data_crc(
+        static_cast<std::size_t>(data_count), core::crc32_init());
+    std::vector<std::uint32_t> parity_crc(
+        static_cast<std::size_t>(parity_count), core::crc32_init());
+
+    fs::path parity_path = staged_path;
+    parity_path += L".parity.tmp";
+    TempFileGuard parity_guard(parity_path);
+    std::fstream parity_file(
+        parity_path, std::ios::binary | std::ios::in |
+                         std::ios::out | std::ios::trunc);
+    if (!parity_file) throw std::runtime_error("cannot create recovery parity spool");
+
+    core::ReedSolomon encoder(data_count, parity_count);
+    const std::size_t recovery_threads = parity_bytes < (8u << 20)
+        ? 1
+        : std::max<std::size_t>(
+              1, std::min<std::size_t>(
+                     selected_thread_count(requested_threads),
+                     static_cast<std::size_t>(parity_count)));
+    core::TaskExecutor recovery_executor(recovery_threads);
+    std::uint64_t read_completed = 0;
+    for (std::uint64_t stripe_offset = 0; stripe_offset < shard_size;
+         stripe_offset += stripe_capacity) {
+        operation_checkpoint(operation);
+        const auto stripe_size = static_cast<std::size_t>(
+            std::min<std::uint64_t>(stripe_capacity, shard_size - stripe_offset));
+        std::vector<std::vector<std::uint8_t>> data(
+            static_cast<std::size_t>(data_count),
+            std::vector<std::uint8_t>(stripe_size, 0));
+        for (int data_index = 0; data_index < data_count; ++data_index) {
+            operation_checkpoint(operation);
+            const std::uint64_t archive_offset =
+                static_cast<std::uint64_t>(data_index) * shard_size + stripe_offset;
+            const std::uint64_t count = archive_offset < protected_size
+                ? std::min<std::uint64_t>(stripe_size,
+                                          protected_size - archive_offset)
+                : 0;
+            if (count != 0) {
+                const auto bytes = source.read(archive_offset, count);
+                std::copy(bytes.begin(), bytes.end(),
+                          data[static_cast<std::size_t>(data_index)].begin());
+                read_completed += count;
+            }
+            data_crc[static_cast<std::size_t>(data_index)] = core::crc32_update(
+                data_crc[static_cast<std::size_t>(data_index)],
+                data[static_cast<std::size_t>(data_index)]);
+            report_operation(
+                operation, OperationStage::recovering, read_completed, total_work,
+                static_cast<std::uint64_t>(data_index + 1),
+                static_cast<std::uint64_t>(data_count + parity_count),
+                "Reading protected archive data");
+        }
+
+        std::vector<std::vector<std::uint8_t>> parity(
+            static_cast<std::size_t>(parity_count),
+            std::vector<std::uint8_t>(stripe_size, 0));
+        std::vector<std::span<const std::uint8_t>> data_spans;
+        std::vector<std::span<std::uint8_t>> parity_spans;
+        data_spans.reserve(data.size());
+        parity_spans.reserve(parity.size());
+        for (const auto& shard : data) data_spans.emplace_back(shard);
+        for (auto& shard : parity) parity_spans.emplace_back(shard);
+        std::atomic<std::uint64_t> encoded_in_stripe{0};
+        const auto report_parity =
+            [&](int parity_index, std::size_t completed, std::size_t) {
+                operation_checkpoint(operation);
+                const std::uint64_t stripe_base = recovery_progress_multiply(
+                    stripe_offset, static_cast<std::uint64_t>(parity_count));
+                const std::uint64_t stripe_completed =
+                    encoded_in_stripe.fetch_add(
+                        completed, std::memory_order_relaxed) + completed;
+                report_operation(
+                    operation, OperationStage::recovering,
+                    recovery_progress_add(
+                        protected_size,
+                        recovery_progress_add(stripe_base, stripe_completed)),
+                    total_work,
+                    static_cast<std::uint64_t>(data_count + parity_index),
+                    static_cast<std::uint64_t>(data_count + parity_count),
+                    "Encoding recovery parity shard " +
+                        std::to_string(parity_index + 1) + " of " +
+                        std::to_string(parity_count));
+            };
+        std::vector<std::future<void>> parity_tasks;
+        parity_tasks.reserve(static_cast<std::size_t>(parity_count));
+        for (int parity_index = 0; parity_index < parity_count; ++parity_index) {
+            parity_tasks.push_back(recovery_executor.submit(
+                [&, parity_index] {
+                    encoder.encode_parity_shard(
+                        parity_index, data_spans,
+                        parity_spans[static_cast<std::size_t>(parity_index)],
+                        report_parity);
+                }));
+        }
+        for (auto& task : parity_tasks) recovery_executor.wait(task);
+        for (int parity_index = 0; parity_index < parity_count; ++parity_index) {
+            auto& shard = parity[static_cast<std::size_t>(parity_index)];
+            parity_crc[static_cast<std::size_t>(parity_index)] = core::crc32_update(
+                parity_crc[static_cast<std::size_t>(parity_index)], shard);
+            const std::uint64_t spool_offset =
+                static_cast<std::uint64_t>(parity_index) * shard_size + stripe_offset;
+            parity_file.seekp(static_cast<std::streamoff>(spool_offset));
+            parity_file.write(reinterpret_cast<const char*>(shard.data()),
+                              static_cast<std::streamsize>(shard.size()));
+            if (!parity_file) {
+                throw std::runtime_error("failed while spooling recovery parity");
+            }
+        }
+    }
+    parity_file.close();
+    if (!parity_file) throw std::runtime_error("failed to finalize recovery parity spool");
+    input.close();
+
+    ByteVector recovery_header;
+    recovery_header.insert(
+        recovery_header.end(), kRecoveryMagic.begin(), kRecoveryMagic.end());
+    put_u16(recovery_header, kRecoveryVersion);
+    put_u16(recovery_header, static_cast<std::uint16_t>(percent));
+    put_u16(recovery_header, static_cast<std::uint16_t>(data_count));
+    put_u16(recovery_header, static_cast<std::uint16_t>(parity_count));
+    put_u64(recovery_header, shard_size);
+    put_u64(recovery_header, protected_size);
+    put_u64(recovery_header, layout.directory_offset);
+    put_u64(recovery_header, layout.directory_size);
+    for (auto crc : data_crc) put_u32(recovery_header, core::crc32_final(crc));
+    for (auto crc : parity_crc) put_u32(recovery_header, core::crc32_final(crc));
+
+    const std::uint64_t recovery_body_size =
+        recovery_progress_add(recovery_header.size(), parity_bytes);
+    ByteVector recovery_tail;
+    put_u64(recovery_tail, protected_size);
+    put_u64(recovery_tail, recovery_body_size);
+    recovery_tail.insert(
+        recovery_tail.end(), kRecoveryMagic.begin(), kRecoveryMagic.end());
+    const auto footer = archive_footer_bytes(layout.directory_offset, layout.directory_size);
+
+    operation_checkpoint(operation);
+    std::fstream output(staged_path, std::ios::binary | std::ios::in | std::ios::out);
+    if (!output) throw std::runtime_error("cannot reopen staged archive for recovery data");
+    output.seekp(static_cast<std::streamoff>(protected_size));
+    output.write(reinterpret_cast<const char*>(recovery_header.data()),
+                 static_cast<std::streamsize>(recovery_header.size()));
+    std::ifstream parity_input(parity_path, std::ios::binary);
+    if (!parity_input) throw std::runtime_error("cannot reopen recovery parity spool");
+    std::vector<char> copy_buffer(1u << 20);
+    std::uint64_t parity_copied = 0;
+    while (parity_copied < parity_bytes) {
+        operation_checkpoint(operation);
+        const auto count = static_cast<std::streamsize>(
+            std::min<std::uint64_t>(copy_buffer.size(), parity_bytes - parity_copied));
+        parity_input.read(copy_buffer.data(), count);
+        if (parity_input.gcount() != count) {
+            throw std::runtime_error("recovery parity spool is truncated");
+        }
+        output.write(copy_buffer.data(), count);
+        if (!output) throw std::runtime_error("failed while writing recovery data");
+        parity_copied += static_cast<std::uint64_t>(count);
+        report_operation(
+            operation, OperationStage::recovering,
+            recovery_progress_add(
+                protected_size,
+                recovery_progress_add(parity_bytes, parity_copied)),
+            total_work, static_cast<std::uint64_t>(data_count + parity_count),
+            static_cast<std::uint64_t>(data_count + parity_count),
+            "Writing recovery data");
+    }
+    parity_input.close();
+    output.write(reinterpret_cast<const char*>(recovery_tail.data()),
+                 static_cast<std::streamsize>(recovery_tail.size()));
+    output.write(reinterpret_cast<const char*>(footer.data()),
+                 static_cast<std::streamsize>(footer.size()));
+    const std::uint64_t final_size =
+        protected_size + recovery_body_size + recovery_tail.size() + footer.size();
+    output.close();
+    if (!output) throw std::runtime_error("failed to append recovery data");
+    std::error_code resize_error;
+    fs::resize_file(staged_path, final_size, resize_error);
+    if (resize_error) {
+        throw fs::filesystem_error(
+            "failed to finalize staged recovery data", staged_path, resize_error);
+    }
 }
 
 // Parse the plaintext encryption parameters carried in the header preamble.
@@ -2579,16 +2817,6 @@ void rebuild_archive_keeping(const fs::path& archive_path,
                      completed_items, total_items);
     write_directory_and_footer(out, written, new_blocks, new_entries, index.meta);
 
-    std::error_code ec;
-    fs::rename(temp_path, archive_path, ec);
-    if (ec) {
-        fs::remove(archive_path, ec);
-        fs::rename(temp_path, archive_path, ec);
-        if (ec) {
-            throw std::runtime_error("failed to move archive into place: " + ec.message());
-        }
-    }
-    temp_guard.dismiss();
     if (key) {
         core::secure_wipe(*key);
     }
@@ -2596,9 +2824,15 @@ void rebuild_archive_keeping(const fs::path& archive_path,
         ? options.recovery_percent
         : (existing_recovery ? existing_recovery->percent : 0);
     if (recovery_percent != 0) {
-        rewrite_recovery_service(archive_path, recovery_percent, operation,
-                                 options.io_buffer_size);
+        append_recovery_to_staged_archive(
+            temp_path, recovery_percent, operation, options.thread_count);
     }
+    report_operation(operation, OperationStage::committing, 0, 1, 0, 1,
+                     "Replacing original archive");
+    replace_archive_file(temp_path, archive_path);
+    temp_guard.dismiss();
+    report_operation(operation, OperationStage::committing, 1, 1, 1, 1,
+                     "Archive committed");
     report_operation(operation, OperationStage::finalizing, total_bytes, total_bytes,
                      total_items, total_items);
 }
@@ -2608,25 +2842,16 @@ void rebuild_archive_keeping(const fs::path& archive_path,
 // the existing entry. Shared by add/update/sync. `meta_override`, when non-null,
 // replaces the archive metadata (used to set the comment / lock flag); otherwise the
 // existing metadata is preserved.
-void append_items_to_archive(const fs::path& archive_path, const std::vector<ScanItem>& items,
-                             const CompressionOptions& options,
-                             const ArchiveMeta* meta_override = nullptr) {
+void append_items_to_archive_indexed(
+    const fs::path& archive_path, const std::vector<ScanItem>& items,
+    const CompressionOptions& options, ArchiveIndex existing,
+    unsigned existing_recovery_percent,
+    const ArchiveMeta* meta_override = nullptr,
+    const std::unordered_set<std::string>* desired_paths = nullptr,
+    bool phased_update = false,
+    const ArchiveSyncFinalization* finalization = nullptr) {
     reject_volume_mutation(archive_path);
     const auto operation = options.operation;
-
-    // Read the existing archive's directory; new solid blocks are appended after its
-    // block region, so existing block indices (and entry references) stay valid.
-    ArchiveIndex existing;
-    unsigned existing_recovery_percent = 0;
-    {
-        std::uint64_t file_size = 0;
-        auto in = open_archive(archive_path, file_size);
-        const ByteSource source(in, file_size);
-        if (const auto recovery = read_recovery_service(source)) {
-            existing_recovery_percent = recovery->percent;
-        }
-        existing = read_index(source);
-    }
     if (existing.meta.locked) {
         throw std::runtime_error("archive is locked (read-only)");
     }
@@ -2640,6 +2865,10 @@ void append_items_to_archive(const fs::path& archive_path, const std::vector<Sca
     const core::CryptoKey* key_ptr = key ? &*key : nullptr;
     ArchiveMeta result_meta = meta_override ? *meta_override : existing.meta;
     result_meta.has_signature = false;
+    if (finalization != nullptr) {
+        if (finalization->comment) result_meta.comment = *finalization->comment;
+        if (finalization->lock_archive) result_meta.locked = true;
+    }
     std::uint64_t block_region_end = kHeaderSize;
     if (!existing.blocks.empty()) {
         const auto& last = existing.blocks.back();
@@ -2655,9 +2884,21 @@ void append_items_to_archive(const fs::path& archive_path, const std::vector<Sca
     std::vector<EntryRec> entries;
     entries.reserve(existing.entries.size() + items.size());
     for (auto& existing_entry : existing.entries) {
-        if (new_paths.find(existing_entry.path) == new_paths.end()) {
+        const bool desired = desired_paths == nullptr ||
+            desired_paths->find(existing_entry.path) != desired_paths->end();
+        if (desired && new_paths.find(existing_entry.path) == new_paths.end()) {
             entries.push_back(std::move(existing_entry));
         }
+    }
+    if (desired_paths != nullptr) {
+        std::unordered_set<std::string> retained_paths;
+        retained_paths.reserve(entries.size() + items.size());
+        for (const auto& entry : entries) retained_paths.insert(entry.path);
+        for (const auto& item : items) retained_paths.insert(item.archive_path);
+        std::erase_if(entries, [&retained_paths](const EntryRec& entry) {
+            return entry.type == kEntryHardlink &&
+                   retained_paths.find(entry.link_target) == retained_paths.end();
+        });
     }
     std::vector<BlockRec> blocks = std::move(existing.blocks);
 
@@ -2687,8 +2928,12 @@ void append_items_to_archive(const fs::path& archive_path, const std::vector<Sca
             throw std::runtime_error("cannot open archive: " +
                                      core::path_to_utf8(archive_path));
         }
+        std::uint64_t copied = 0;
         std::uint64_t remaining = block_region_end;
         std::vector<char> chunk(effective_io_buffer_size(options.io_buffer_size));
+        if (phased_update && operation) operation->set_progress_phase(2, 6);
+        report_operation(operation, OperationStage::copying, 0, block_region_end,
+                         0, blocks.size(), "Copying unchanged compressed blocks");
         while (remaining > 0) {
             operation_checkpoint(operation);
             const auto want = static_cast<std::streamsize>(
@@ -2700,10 +2945,14 @@ void append_items_to_archive(const fs::path& archive_path, const std::vector<Sca
             }
             out.write(chunk.data(), got);
             remaining -= static_cast<std::uint64_t>(got);
+            copied += static_cast<std::uint64_t>(got);
+            report_operation(operation, OperationStage::copying, copied, block_region_end,
+                             0, blocks.size(), "Copying unchanged compressed blocks");
         }
     }
     std::uint64_t written = block_region_end;
 
+    if (phased_update && operation) operation->set_progress_phase(3, 6);
     compress_items_into(out, written, blocks, entries, items, options, block_size, operation,
                         total_bytes, total_items, completed_bytes, completed_items, false,
                         key_ptr);
@@ -2716,22 +2965,64 @@ void append_items_to_archive(const fs::path& archive_path, const std::vector<Sca
                      written, completed_bytes);
     write_directory_and_footer(out, written, blocks, entries, result_meta);
 
-    std::error_code ec;
-    fs::rename(temp_path, archive_path, ec);
-    if (ec) {
-        fs::remove(archive_path, ec);
-        fs::rename(temp_path, archive_path, ec);
-        if (ec) {
-            throw std::runtime_error("failed to move archive into place: " + ec.message());
+    if (finalization != nullptr && finalization->signing_key != nullptr) {
+        if (result_meta.encryption.encrypt_directory) {
+            throw std::runtime_error(
+                "signing an archive with an encrypted directory is not supported");
         }
+        std::uint64_t staged_size = 0;
+        auto staged_input = open_archive(temp_path, staged_size);
+        const ByteSource staged_source(staged_input, staged_size);
+        const ArchiveLayout staged_layout = read_layout(staged_source);
+        ArchiveIndex signing_index{blocks, entries, result_meta};
+        const auto digest =
+            archive_signature_digest(staged_source, staged_layout, signing_index);
+        const auto signature = core::sign_message(
+            finalization->signing_key->secret_key, digest);
+        if (!core::verify_message(
+                finalization->signing_key->public_key, signature, digest)) {
+            throw std::invalid_argument(
+                "signing key public and secret components do not match");
+        }
+        staged_input.close();
+        result_meta.has_signature = true;
+        result_meta.signature_public_key =
+            finalization->signing_key->public_key;
+        result_meta.signature = signature;
+
+        std::error_code truncate_error;
+        fs::resize_file(temp_path, written, truncate_error);
+        if (truncate_error) {
+            throw fs::filesystem_error(
+                "failed to stage archive signature", temp_path, truncate_error);
+        }
+        std::ofstream signed_output(
+            temp_path, std::ios::binary | std::ios::app);
+        if (!signed_output) {
+            throw std::runtime_error(
+                "cannot reopen staged archive for signing");
+        }
+        write_directory_and_footer(
+            signed_output, written, blocks, entries, result_meta);
     }
-    temp_guard.dismiss();
+
     const unsigned recovery_percent = options.recovery_percent != 0
         ? options.recovery_percent : existing_recovery_percent;
+    if (phased_update && operation) operation->set_progress_phase(4, 6);
     if (recovery_percent != 0) {
-        rewrite_recovery_service(archive_path, recovery_percent, operation,
-                                 options.io_buffer_size);
+        append_recovery_to_staged_archive(
+            temp_path, recovery_percent, operation, options.thread_count);
+    } else {
+        report_operation(operation, OperationStage::finalizing, 1, 1, 1, 1,
+                         "No recovery record requested");
     }
+    if (phased_update && operation) operation->set_progress_phase(5, 6);
+    report_operation(operation, OperationStage::committing, 0, 1, 0, 1,
+                     "Replacing original archive");
+    replace_archive_file(temp_path, archive_path);
+    temp_guard.dismiss();
+    report_operation(operation, OperationStage::committing, 1, 1, 1, 1,
+                     "Archive committed");
     std::uint64_t logical_archive_bytes = 0;
     for (const auto& entry : entries) {
         if (entry.type == kEntryFile) logical_archive_bytes += entry.size;
@@ -2740,6 +3031,28 @@ void append_items_to_archive(const fs::path& archive_path, const std::vector<Sca
                      total_items, total_items, {}, 0, 0, total_bytes,
                      static_cast<std::uint64_t>(fs::file_size(archive_path)),
                      logical_archive_bytes);
+}
+
+void append_items_to_archive(const fs::path& archive_path,
+                             const std::vector<ScanItem>& items,
+                             const CompressionOptions& options,
+                             const ArchiveMeta* meta_override = nullptr) {
+    // Read the existing archive's directory once. New solid blocks are appended
+    // after its block region, so existing block indices stay valid.
+    ArchiveIndex existing;
+    unsigned existing_recovery_percent = 0;
+    {
+        std::uint64_t file_size = 0;
+        auto in = open_archive(archive_path, file_size);
+        const ByteSource source(in, file_size);
+        if (const auto recovery = read_recovery_service(source)) {
+            existing_recovery_percent = recovery->percent;
+        }
+        existing = read_index(source);
+    }
+    append_items_to_archive_indexed(
+        archive_path, items, options, std::move(existing),
+        existing_recovery_percent, meta_override, nullptr, false, nullptr);
 }
 
 void rewrite_archive_directory(const fs::path& archive_path, ArchiveIndex index,
@@ -2800,23 +3113,19 @@ void rewrite_archive_directory(const fs::path& archive_path, ArchiveIndex index,
                      total_items, total_items);
     write_directory_and_footer(out, block_region_end, index.blocks, index.entries, index.meta);
 
-    std::error_code ec;
-    fs::rename(temp_path, archive_path, ec);
-    if (ec) {
-        fs::remove(archive_path, ec);
-        fs::rename(temp_path, archive_path, ec);
-        if (ec) {
-            throw std::runtime_error("failed to move archive into place: " + ec.message());
-        }
-    }
-    temp_guard.dismiss();
     const unsigned recovery_percent = options.recovery_percent != 0
         ? options.recovery_percent
         : (existing_recovery ? existing_recovery->percent : 0);
     if (recovery_percent != 0) {
-        rewrite_recovery_service(archive_path, recovery_percent, operation,
-                                 options.io_buffer_size);
+        append_recovery_to_staged_archive(
+            temp_path, recovery_percent, operation, options.thread_count);
     }
+    report_operation(operation, OperationStage::committing, 0, 1, 0, 1,
+                     "Replacing original archive");
+    replace_archive_file(temp_path, archive_path);
+    temp_guard.dismiss();
+    report_operation(operation, OperationStage::committing, 1, 1, 1, 1,
+                     "Archive committed");
     report_operation(operation, OperationStage::finalizing, block_region_end, block_region_end,
                      total_items, total_items);
 }
@@ -2896,20 +3205,16 @@ void create_archive(const std::vector<std::filesystem::path>& inputs,
                                encrypt_dir ? key_ptr : nullptr);
     core::secure_wipe(key);
 
-    std::error_code ec;
-    fs::rename(temp_path, archive_path, ec);
-    if (ec) {
-        fs::remove(archive_path, ec);
-        fs::rename(temp_path, archive_path, ec);
-        if (ec) {
-            throw std::runtime_error("failed to move archive into place: " + ec.message());
-        }
-    }
-    temp_guard.dismiss();
     if (options.recovery_percent != 0) {
-        rewrite_recovery_service(archive_path, options.recovery_percent, operation,
-                                 options.io_buffer_size);
+        append_recovery_to_staged_archive(
+            temp_path, options.recovery_percent, operation, options.thread_count);
     }
+    report_operation(operation, OperationStage::committing, 0, 1, 0, 1,
+                     "Committing archive");
+    replace_archive_file(temp_path, archive_path);
+    temp_guard.dismiss();
+    report_operation(operation, OperationStage::committing, 1, 1, 1, 1,
+                     "Archive committed");
     report_operation(operation, OperationStage::finalizing, total_bytes, total_bytes,
                      total_items, total_items, {}, 0, 0, total_bytes,
                      static_cast<std::uint64_t>(fs::file_size(archive_path)),
@@ -2991,10 +3296,176 @@ void repack_archive(const std::filesystem::path& archive_path,
     rebuild_archive_keeping(archive_path, [](const EntryRec&) { return true; }, options);
 }
 
+namespace {
+
+struct LoadedMutationState {
+    ArchiveIndex index;
+    unsigned recovery_percent = 0;
+};
+
+LoadedMutationState load_mutation_state(const fs::path& archive_path) {
+    std::uint64_t file_size = 0;
+    auto input = open_archive(archive_path, file_size);
+    const ByteSource source(input, file_size);
+    LoadedMutationState state;
+    if (const auto recovery = read_recovery_service(source)) {
+        state.recovery_percent = recovery->percent;
+    }
+    state.index = read_index(source);
+    return state;
+}
+
+std::vector<ScanItem> select_update_items(
+    const std::vector<ScanItem>& items, const ArchiveIndex& existing,
+    bool fresh_only, const std::shared_ptr<OperationControl>& operation) {
+    if (operation) operation->set_progress_phase(1, 6);
+    std::unordered_map<std::string, std::int64_t> existing_mtime;
+    existing_mtime.reserve(existing.entries.size());
+    for (const auto& entry : existing.entries) {
+        existing_mtime.emplace(entry.path, entry.mtime);
+    }
+
+    std::vector<ScanItem> selected;
+    selected.reserve(items.size());
+    std::error_code ec;
+    std::uint64_t compared = 0;
+    report_operation(operation, OperationStage::comparing, 0, items.size(),
+                     0, items.size(), "Comparing source with archive");
+    for (const auto& item : items) {
+        operation_checkpoint(operation);
+        const auto found = existing_mtime.find(item.archive_path);
+        const bool in_archive = found != existing_mtime.end();
+        if (item.is_directory || item.is_symlink) {
+            if (!in_archive && !fresh_only) selected.push_back(item);
+        } else {
+            ec.clear();
+            std::int64_t disk_mtime = 0;
+            const auto stamp = fs::last_write_time(item.absolute, ec);
+            if (!ec) {
+                try {
+                    disk_mtime = to_unix_seconds(stamp);
+                } catch (...) {
+                    disk_mtime = 0;
+                }
+            }
+            if (in_archive) {
+                if (disk_mtime > found->second) selected.push_back(item);
+            } else if (!fresh_only) {
+                selected.push_back(item);
+            }
+        }
+        ++compared;
+        report_operation(operation, OperationStage::comparing, compared, items.size(),
+                         compared, items.size(), item.archive_path);
+    }
+    return selected;
+}
+
+void update_archive_items(const std::vector<ScanItem>& items,
+                          const std::filesystem::path& archive_path,
+                          const CompressionOptions& options,
+                          bool fresh_only, bool validate_mapping) {
+    auto state = load_mutation_state(archive_path);
+    if (validate_mapping) {
+        validate_mapped_items(items, state.index, options.operation);
+    }
+    auto selected = select_update_items(
+        items, state.index, fresh_only, options.operation);
+    if (selected.empty()) {
+        if (options.recovery_percent != 0 &&
+            options.recovery_percent != state.recovery_percent) {
+            if (options.operation) options.operation->set_progress_phase(4, 6);
+            rewrite_recovery_service(
+                archive_path, options.recovery_percent, options.operation,
+                options.io_buffer_size);
+        }
+        if (options.operation) options.operation->set_progress_phase(5, 6);
+        report_operation(options.operation, OperationStage::committing,
+                         1, 1, 1, 1, "Archive already up to date");
+        return;
+    }
+    append_items_to_archive_indexed(
+        archive_path, selected, options, std::move(state.index),
+        state.recovery_percent, nullptr, nullptr, true);
+}
+
+void sync_archive_items(const std::vector<ScanItem>& items,
+                        const std::filesystem::path& archive_path,
+                        const CompressionOptions& options,
+                        bool validate_mapping,
+                        const ArchiveSyncFinalization& finalization) {
+    auto state = load_mutation_state(archive_path);
+    if (validate_mapping) {
+        validate_mapped_items(items, state.index, options.operation);
+    }
+    auto selected = select_update_items(
+        items, state.index, /*fresh_only=*/false, options.operation);
+
+    std::unordered_set<std::string> wanted;
+    wanted.reserve(items.size());
+    for (const auto& item : items) {
+        wanted.insert(item.archive_path);
+    }
+
+    std::unordered_set<std::string> existing_paths;
+    existing_paths.reserve(state.index.entries.size());
+    for (const auto& entry : state.index.entries) {
+        existing_paths.insert(entry.path);
+    }
+    const auto added_count = static_cast<std::size_t>(std::count_if(
+        selected.begin(), selected.end(), [&existing_paths](const ScanItem& item) {
+            return existing_paths.find(item.archive_path) == existing_paths.end();
+        }));
+    const auto updated_count = selected.size() - added_count;
+    const auto stale_count = static_cast<std::size_t>(std::count_if(
+        state.index.entries.begin(), state.index.entries.end(),
+        [&wanted](const EntryRec& entry) {
+            return wanted.find(entry.path) == wanted.end();
+        }));
+    const std::size_t unchanged_count =
+        items.size() > selected.size() ? items.size() - selected.size() : 0;
+    if (options.operation) {
+        options.operation->set_sync_plan(
+            added_count, updated_count, stale_count, unchanged_count);
+    }
+    report_operation(
+        options.operation, OperationStage::comparing, items.size(), items.size(),
+        items.size(), items.size(),
+        "Plan: add " + std::to_string(added_count) +
+            ", update " + std::to_string(updated_count) +
+            ", remove " + std::to_string(stale_count) +
+            ", unchanged " + std::to_string(unchanged_count));
+    const bool metadata_change =
+        (finalization.comment &&
+         *finalization.comment != state.index.meta.comment) ||
+        (finalization.lock_archive && !state.index.meta.locked) ||
+        finalization.signing_key != nullptr;
+    if (selected.empty() && stale_count == 0 && !metadata_change) {
+        if (options.recovery_percent != 0 &&
+            options.recovery_percent != state.recovery_percent) {
+            if (options.operation) options.operation->set_progress_phase(4, 6);
+            rewrite_recovery_service(
+                archive_path, options.recovery_percent, options.operation,
+                options.io_buffer_size);
+        }
+        if (options.operation) options.operation->set_progress_phase(5, 6);
+        report_operation(options.operation, OperationStage::committing,
+                         1, 1, 1, 1, "Archive already synchronized");
+        return;
+    }
+
+    append_items_to_archive_indexed(
+        archive_path, selected, options, std::move(state.index),
+        state.recovery_percent, nullptr, &wanted, true, &finalization);
+}
+
+}  // namespace
+
 void update_archive(const std::vector<std::filesystem::path>& inputs,
                     const std::filesystem::path& archive_path, const CompressionOptions& options,
                     bool fresh_only) {
     const auto operation = options.operation;
+    if (operation) operation->set_progress_phase(0, 6);
     report_operation(operation, OperationStage::scanning, 0, 0, 0, inputs.size());
 
     std::vector<ScanItem> items;
@@ -3006,88 +3477,85 @@ void update_archive(const std::vector<std::filesystem::path>& inputs,
     if (!fs::exists(archive_path)) {
         // Nothing to refresh against. `update` seeds a new archive; `fresh` is a no-op.
         if (!fresh_only) {
+            if (operation) operation->set_progress_phase(0, 0);
             create_archive(inputs, archive_path, options);
         }
         return;
     }
+    update_archive_items(items, archive_path, options, fresh_only, false);
+}
 
-    // Map each existing entry's path to its stored mtime so we can compare ages.
-    std::unordered_map<std::string, std::int64_t> existing_mtime;
-    {
-        std::uint64_t file_size = 0;
-        auto in = open_archive(archive_path, file_size);
-        const ByteSource source(in, file_size);
-        const auto index = read_index(source);
-        for (const auto& entry : index.entries) {
-            existing_mtime.emplace(entry.path, entry.mtime);
-        }
+void update_archive(const std::vector<ArchiveInput>& inputs,
+                    const std::filesystem::path& archive_path,
+                    const CompressionOptions& options, bool fresh_only) {
+    const auto operation = options.operation;
+    if (operation) operation->set_progress_phase(0, 6);
+    report_operation(operation, OperationStage::scanning, 0, 0, 0, inputs.size());
+
+    std::vector<ScanItem> items;
+    for (const auto& input : inputs) {
+        operation_checkpoint(operation);
+        scan_input_at(input, items, operation);
     }
-
-    // Keep only the items that should be written: a file when it is newer than the
-    // archived copy (or, for `update`, brand new); a directory/symlink only when it
-    // is new (and `update`, not `fresh`).
-    std::vector<ScanItem> selected;
-    std::error_code ec;
-    for (const auto& item : items) {
-        const auto found = existing_mtime.find(item.archive_path);
-        const bool in_archive = found != existing_mtime.end();
-        if (item.is_directory || item.is_symlink) {
-            if (!in_archive && !fresh_only) {
-                selected.push_back(item);
-            }
-            continue;
-        }
-        std::int64_t disk_mtime = 0;
-        const auto stamp = fs::last_write_time(item.absolute, ec);
-        if (!ec) {
-            try {
-                disk_mtime = to_unix_seconds(stamp);
-            } catch (...) {
-                disk_mtime = 0;
-            }
-        }
-        if (in_archive) {
-            if (disk_mtime > found->second) {
-                selected.push_back(item);  // newer on disk → replace
-            }
-        } else if (!fresh_only) {
-            selected.push_back(item);  // new file → add (update only)
-        }
+    if (!fs::exists(archive_path)) {
+        if (fresh_only) return;
+        throw std::runtime_error("path-aware update requires an existing archive");
     }
-
-    append_items_to_archive(archive_path, selected, options);
+    update_archive_items(items, archive_path, options, fresh_only, true);
 }
 
 void sync_archive(const std::vector<std::filesystem::path>& inputs,
-                  const std::filesystem::path& archive_path, const CompressionOptions& options) {
-    // First bring in new and newer files (creating the archive if it is missing).
-    update_archive(inputs, archive_path, options, /*fresh_only=*/false);
-
-    // Then mirror deletions: drop any archived path no longer present in the inputs.
+                  const std::filesystem::path& archive_path,
+                  const CompressionOptions& options,
+                  const ArchiveSyncFinalization& finalization) {
+    const auto operation = options.operation;
+    if (operation) operation->set_progress_phase(0, 6);
+    report_operation(operation, OperationStage::scanning, 0, 0, 0, inputs.size());
     std::vector<ScanItem> items;
     for (const auto& input : inputs) {
+        operation_checkpoint(operation);
         scan_input(input, items);
     }
-    std::unordered_set<std::string> wanted;
-    for (const auto& item : items) {
-        wanted.insert(item.archive_path);
+    if (!fs::exists(archive_path)) {
+        if (operation) operation->set_progress_phase(0, 0);
+        create_archive(inputs, archive_path, options);
+        return;
     }
+    sync_archive_items(items, archive_path, options, false, finalization);
+}
 
-    std::vector<std::string> stale;
-    {
-        std::uint64_t file_size = 0;
-        auto in = open_archive(archive_path, file_size);
-        const ByteSource source(in, file_size);
-        const auto index = read_index(source);
-        for (const auto& entry : index.entries) {
-            if (wanted.find(entry.path) == wanted.end()) {
-                stale.push_back(entry.path);
-            }
-        }
+void sync_archive(const std::vector<ArchiveInput>& inputs,
+                  const std::filesystem::path& archive_path,
+                  const CompressionOptions& options,
+                  const ArchiveSyncFinalization& finalization) {
+    const auto operation = options.operation;
+    if (operation) operation->set_progress_phase(0, 6);
+    report_operation(operation, OperationStage::scanning, 0, 0, 0, inputs.size());
+    std::vector<ScanItem> items;
+    for (const auto& input : inputs) {
+        operation_checkpoint(operation);
+        scan_input_at(input, items, operation);
     }
-    if (!stale.empty()) {
-        delete_from_archive(archive_path, stale, options);
+    if (!fs::exists(archive_path)) {
+        throw std::runtime_error("path-aware synchronization requires an existing archive");
     }
+    sync_archive_items(items, archive_path, options, true, finalization);
+}
+
+void finalize_archive_metadata(
+    const std::filesystem::path& archive_path,
+    const ArchiveSyncFinalization& finalization,
+    const CompressionOptions& options) {
+    auto state = load_mutation_state(archive_path);
+    const bool changed =
+        (finalization.comment &&
+         *finalization.comment != state.index.meta.comment) ||
+        (finalization.lock_archive && !state.index.meta.locked) ||
+        finalization.signing_key != nullptr;
+    if (!changed) return;
+    append_items_to_archive_indexed(
+        archive_path, {}, options, std::move(state.index),
+        state.recovery_percent, nullptr, nullptr, false, &finalization);
 }
 
 void move_archive_entries(const std::filesystem::path& archive_path,
@@ -3248,6 +3716,10 @@ void set_archive_comment(const std::filesystem::path& archive_path, const std::s
         const ByteSource source(in, file_size);
         meta = read_index(source).meta;
     }
+    if (meta.locked) {
+        throw std::runtime_error("archive is locked (read-only)");
+    }
+    if (meta.comment == comment) return;
     meta.comment = comment;
     meta.has_signature = false;
     append_items_to_archive(archive_path, {}, options, &meta);

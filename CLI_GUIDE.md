@@ -201,6 +201,13 @@ axiomc s [compression-options] <archive.axar> <input>...
 Synchronize mirrors the supplied inputs: it adds missing files, replaces newer
 files, and removes archived entries no longer in the source set.
 
+AXAR synchronization uses one planned transaction. Unchanged compressed blocks
+are copied without decompression, changed files are compressed once, stale
+entries are removed from the final directory, and an existing recovery record is
+rebuilt once against the completed result. A no-change synchronization exits
+without rewriting the archive. Interactive progress shows the scan, comparison,
+copy, compression, recovery, and commit phases separately.
+
 ```powershell
 axiomc s mirror.axar "D:\Current project"
 ```

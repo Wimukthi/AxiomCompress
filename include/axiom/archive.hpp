@@ -238,9 +238,16 @@ public:
                         const std::filesystem::path& archive_path,
                         const CompressionOptions& options = {},
                         bool fresh_only = false) const = 0;
+    virtual void update_mapped(const std::vector<ArchiveInput>& inputs,
+                               const std::filesystem::path& archive_path,
+                               const CompressionOptions& options = {},
+                               bool fresh_only = false) const = 0;
     virtual void sync(const std::vector<std::filesystem::path>& inputs,
                       const std::filesystem::path& archive_path,
                       const CompressionOptions& options = {}) const = 0;
+    virtual void sync_mapped(const std::vector<ArchiveInput>& inputs,
+                             const std::filesystem::path& archive_path,
+                             const CompressionOptions& options = {}) const = 0;
     virtual void delete_entries(const std::filesystem::path& archive_path,
                                 const std::vector<std::string>& paths,
                                 const CompressionOptions& options = {}) const = 0;
@@ -273,6 +280,15 @@ enum class ArchiveEncryptionMode {
 struct ArchiveSigningKey {
     std::array<std::uint8_t, 64> secret_key{};
     std::array<std::uint8_t, 32> public_key{};
+};
+
+// Archive-wide metadata that can be folded into a synchronization transaction.
+// The signing key is borrowed only for the duration of the call and is never
+// retained by the library.
+struct ArchiveSyncFinalization {
+    std::optional<std::string> comment;
+    bool lock_archive = false;
+    const ArchiveSigningKey* signing_key = nullptr;
 };
 
 struct ArchiveSignatureInfo {
@@ -411,11 +427,32 @@ void update_archive(const std::vector<std::filesystem::path>& inputs,
                     const std::filesystem::path& archive_path,
                     const CompressionOptions& options = {}, bool fresh_only = false);
 
+// Path-aware update used when a file manager has matched filesystem objects to
+// their existing archive paths.
+void update_archive(const std::vector<ArchiveInput>& inputs,
+                    const std::filesystem::path& archive_path,
+                    const CompressionOptions& options = {}, bool fresh_only = false);
+
 // Mirror the inputs into the archive: add new and newer files (by mtime), then
 // remove any archived entry no longer present in the inputs. Written atomically.
 void sync_archive(const std::vector<std::filesystem::path>& inputs,
                   const std::filesystem::path& archive_path,
-                  const CompressionOptions& options = {});
+                  const CompressionOptions& options = {},
+                  const ArchiveSyncFinalization& finalization = {});
+
+// Path-aware mirror. Every archived entry outside the mapped input trees is
+// removed, so callers must supply the complete desired source set.
+void sync_archive(const std::vector<ArchiveInput>& inputs,
+                  const std::filesystem::path& archive_path,
+                  const CompressionOptions& options = {},
+                  const ArchiveSyncFinalization& finalization = {});
+
+// Apply comment/lock/signature metadata in one archive-directory transaction,
+// preserving or rebuilding recovery data exactly once.
+void finalize_archive_metadata(
+    const std::filesystem::path& archive_path,
+    const ArchiveSyncFinalization& finalization,
+    const CompressionOptions& options = {});
 
 // Rename or move entries without recompressing file data. Moving a directory moves
 // its complete subtree and updates internal hard-link targets.
