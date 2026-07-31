@@ -114,21 +114,20 @@ Measured on the **Silesia corpus** as a single 211.9 MB tar, so every codec sees
 identical input. AMD Ryzen 9 5950X (16C/32T), warm cache, Release build, every
 row round-trip verified.
 
-> These figures are the **0.4.0.0** measurement snapshot. Later releases changed
-> presets and added methods; the numbers have not been re-measured since.
+> These figures are the **0.8.0.0** measurement snapshot, taken 2026-07-31.
 
 | Codec / level | Compressed | Ratio | Compress | Decompress |
 |---|---:|---:|---:|---:|
-| zstd -3 | 66.2 MB | 3.20x | 0.13 s | 0.17 s |
-| **Axiom -5** (default) | 56.5 MB | 3.75x | 3.17 s | 0.24 s |
-| WinRAR -m5 128M | 53.2 MB | 3.99x | 3.54 s | 0.50 s |
-| zstd -19 | 52.8 MB | 4.01x | 20.38 s | 0.18 s |
-| **Axiom -9** | 51.4 MB | 4.12x | 21.31 s | 0.24 s |
-| LZMA2 -mx9 | 48.7 MB | 4.35x | 40.03 s | 1.26 s |
+| zstd -3 | 66.2 MB | 3.20x | 0.12 s | 0.17 s |
+| **Axiom -5** (default) | 56.5 MB | 3.75x | 2.91 s | 0.24 s |
+| WinRAR -m5 128M | 53.2 MB | 3.99x | 3.23 s | 0.45 s |
+| zstd -19 | 52.8 MB | 4.01x | 16.78 s | 0.17 s |
+| **Axiom -9** | 51.4 MB | 4.12x | 16.02 s | 0.24 s |
+| LZMA2 -mx9 | 48.7 MB | 4.35x | 35.02 s | 1.21 s |
 
 Axiom -9 lands between zstd's high-ratio profiles and LZMA2: 2.8% smaller than
-zstd -19 at similar encode time, and 5.5% larger than LZMA2 -mx9 while encoding
-1.9x and decoding 5.3x faster.
+zstd -19 at comparable encode time, and 5.6% larger than LZMA2 -mx9 while
+encoding 2.2x and decoding 5.1x faster.
 
 Complete tables, charts, and the enwik8 results: [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
 To measure on your own hardware: [docs/BENCHMARKING.md](docs/BENCHMARKING.md).

@@ -14,10 +14,10 @@ ROOT = Path(__file__).resolve().parents[1]
 OUTPUT_DIR = ROOT / "docs" / "images"
 BENCHMARKS = (
     ("silesia", "Silesia",
-     ROOT / "bench" / "results" / "silesia-0.4.0.0.csv",
+     ROOT / "bench" / "results" / "silesia-0.8.0.0.csv",
      "211.9 MB mixed-data tar"),
     ("enwik8", "enwik8",
-     ROOT / "bench" / "results" / "enwik8-0.4.0.0.csv",
+     ROOT / "bench" / "results" / "enwik8-0.8.0.0.csv",
      "100 MB English Wikipedia text"),
 )
 

@@ -38,12 +38,19 @@ overhead and file grouping cannot skew the comparison:
 
 ```powershell
 cd D:\Silesia
-tar --force-local --format=ustar -b 1 -cf D:\tests\axiom-perf\silesia.tar `
+tar --format=ustar -b 1 -cf D:\tests\axiom-perf\silesia.tar `
   dickens mozilla mr nci ooffice osdb reymont samba sao webster x-ray xml
 ```
 
 Alphabetical order with blocking factor 1 produces exactly 211,948,032 bytes,
-matching the published input.
+matching the published input. **Check the byte count, not a hash.** Tar
+implementations write different uid/gid/uname/gname header fields, so two
+correct Silesia tars can differ by a few hundred bytes after compression while
+both being exactly 211,948,032 bytes long. That is the only portable check.
+
+The `tar` on `PATH` in Windows PowerShell is bsdtar, which is what the command
+above assumes. GNU tar additionally needs `--force-local`, or it reads the `D:`
+in the output path as a remote host name; bsdtar rejects that flag outright.
 
 For local engineering work, keep a directory covering four shapes:
 
@@ -96,6 +103,13 @@ row by round-trip before reporting a ratio.
 .\tools\bench_enwik8.ps1 -Quick
 .\tools\bench_enwik8.ps1 -Axiomc out\Release\axiomc.exe
 ```
+
+Leave `-Scratch` at its default unless you know the replacement is equally
+fast. This sweep writes the full decoded corpus once per row and times it, so
+pointing it at a hard disk halves the reported decompression throughput while
+leaving every ratio untouched. To skip the download, drop a known-good `enwik8`
+into `%LOCALAPPDATA%\axiom-bench\corpus\` instead of relocating the scratch
+directory.
 
 ## Comparing two builds
 

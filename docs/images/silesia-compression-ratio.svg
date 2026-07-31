@@ -25,14 +25,14 @@
   <rect class="lzma2" x="180" y="85" width="712.0" height="19" rx="3"><title>LZMA2 -mx9: 4.35x, 48.7 MB</title></rect>
   <text class="value fg" x="900.0" y="99">4.35&#215;</text>
   <text class="fg" x="168" y="127" text-anchor="end">LZMA2 -mx5</text>
-  <rect class="lzma2" x="180" y="114" width="698.7" height="19" rx="3"><title>LZMA2 -mx5: 4.27x, 49.6 MB</title></rect>
-  <text class="value fg" x="886.7" y="128">4.27&#215;</text>
+  <rect class="lzma2" x="180" y="114" width="698.8" height="19" rx="3"><title>LZMA2 -mx5: 4.27x, 49.6 MB</title></rect>
+  <text class="value fg" x="886.8" y="128">4.27&#215;</text>
   <text class="fg" x="168" y="156" text-anchor="end" font-weight="500">Axiom -9</text>
   <rect class="axiom best" x="180" y="143" width="674.6" height="19" rx="3"><title>Axiom -9: 4.12x, 51.4 MB</title></rect>
   <text class="value fg" x="862.6" y="157">4.12&#215;</text>
   <text class="fg" x="168" y="185" text-anchor="end">zstd -22 --ultra</text>
-  <rect class="zstd" x="180" y="172" width="662.9" height="19" rx="3"><title>zstd -22 --ultra: 4.05x, 52.3 MB</title></rect>
-  <text class="value fg" x="850.9" y="186">4.05&#215;</text>
+  <rect class="zstd" x="180" y="172" width="663.0" height="19" rx="3"><title>zstd -22 --ultra: 4.05x, 52.3 MB</title></rect>
+  <text class="value fg" x="851.0" y="186">4.05&#215;</text>
   <text class="fg" x="168" y="214" text-anchor="end">Axiom -8</text>
   <rect class="axiom" x="180" y="201" width="661.4" height="19" rx="3"><title>Axiom -8: 4.04x, 52.4 MB</title></rect>
   <text class="value fg" x="849.4" y="215">4.04&#215;</text>
@@ -43,8 +43,8 @@
   <rect class="winrar" x="180" y="259" width="652.2" height="19" rx="3"><title>WinRAR -m5 128M: 3.99x, 53.2 MB</title></rect>
   <text class="value fg" x="840.2" y="273">3.99&#215;</text>
   <text class="fg" x="168" y="301" text-anchor="end">bzip2 -9</text>
-  <rect class="other" x="180" y="288" width="639.3" height="19" rx="3"><title>bzip2 -9: 3.91x, 54.2 MB</title></rect>
-  <text class="value fg" x="827.3" y="302">3.91&#215;</text>
+  <rect class="other" x="180" y="288" width="639.4" height="19" rx="3"><title>bzip2 -9: 3.91x, 54.2 MB</title></rect>
+  <text class="value fg" x="827.4" y="302">3.91&#215;</text>
   <text class="fg" x="168" y="330" text-anchor="end">WinRAR -m3</text>
   <rect class="winrar" x="180" y="317" width="639.2" height="19" rx="3"><title>WinRAR -m3: 3.91x, 54.2 MB</title></rect>
   <text class="value fg" x="827.2" y="331">3.91&#215;</text>
