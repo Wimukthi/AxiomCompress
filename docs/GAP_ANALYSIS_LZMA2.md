@@ -1,18 +1,24 @@
-# Beating LZMA2 on Silesia: measured gap analysis and plan
+# Closing the LZMA2 ratio gap on Silesia
 
-Status: Phase 0 complete; items 1-3, 6, and 7 landed, item 4 rejected, and item
-5 measured as neutral on this corpus, 2026-07-16.
-This document records the research and each measured implementation step so
-work can continue on any machine. Raw data lives in
-[`bench/results/gap-2026-07-16/`](../bench/results/gap-2026-07-16/); the tools
-that produced it are [`bench/gap_analysis.py`](../bench/gap_analysis.py) and
-[`bench/axc_inspect.py`](../bench/axc_inspect.py).
+> **Research log, not a specification.** This records the measured analysis and
+> each implementation step so the work can continue on any machine. It is a
+> point-in-time record — numbers here are not the published benchmark results,
+> which live in [PERFORMANCE.md](PERFORMANCE.md).
 
-Scope note: these measurements and byte targets are specifically for the native
-**Axiom adaptive** AXC v9 method. AXC v10 can now wrap bundled Zstandard,
-LZMA2, or Deflate streams, but selecting LZMA2 as an archive method is not an
-answer to this research goal; the goal remains improving Axiom's own bounded,
-table-driven decoder and encoder-chosen representation.
+**Status as of 2026-07-18:** Phase 0 complete. Items 1–3, 6, and 7 landed;
+item 4 was measured and rejected; item 5 was corrected and measured neutral on
+this corpus. Level-9 DP checkpoints and the enwik9 scaling trace followed.
+
+| | |
+|---|---|
+| Raw data | [`bench/results/gap-2026-07-16/`](../bench/results/gap-2026-07-16/) |
+| Tools | [`bench/gap_analysis.py`](../bench/gap_analysis.py), [`bench/axc_inspect.py`](../bench/axc_inspect.py) |
+| Scope | The native **Axiom adaptive** AXC v9 method only |
+
+Scope matters here. AXC v10 can wrap bundled Zstandard, LZMA2, or Deflate
+streams, but *selecting* LZMA2 as an archive method is not an answer to this
+research goal. The goal is improving Axiom's own bounded, table-driven decoder
+and its encoder-chosen representation.
 
 ## Goal and targets
 

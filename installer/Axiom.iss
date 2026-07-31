@@ -62,6 +62,7 @@ Source: "{#SourceRoot}\out\{#Configuration}\axiomc.exe"; DestDir: "{app}"; Flags
 Source: "{#SourceRoot}\out\{#Configuration}\AxiomSfx.bin"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceRoot}\out\{#Configuration}\backends\7zip\*"; DestDir: "{app}\backends\7zip"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "{#SourceRoot}\README.md"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#SourceRoot}\CHANGELOG.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceRoot}\CLI_GUIDE.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceRoot}\ARCHITECTURE.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceRoot}\FORMAT.md"; DestDir: "{app}"; Flags: ignoreversion

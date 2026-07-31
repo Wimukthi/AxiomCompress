@@ -1,96 +1,90 @@
 # Versioning
 
-Axiom uses the same four-part version format as NativePad:
+Axiom uses a four-part version:
 
 ```text
 major.minor.patch.build
 ```
 
-The executable resource in `src\gui\axiom_gui.rc` is the source of truth. The
-About dialog reads the file version from that resource at runtime, and the
+The executable resource in `src\gui\axiom_gui.rc` is the **source of truth**.
+The About dialog reads the file version from that resource at runtime, and the
 installer reads the same value when naming release artifacts.
 
-## Short version
+## Rules
 
-- Change `major`, `minor`, or `patch` manually when preparing a release that
-  deserves it.
-- Let the Visual Studio GUI build increment `build`.
-- Use the exact resulting version for the installer name and GitHub release tag.
-- For a tagged packaged release, pin the desired exact version and build with
-  `/p:AutoIncrementVersion=false`.
-- Use `/p:AutoIncrementVersion=false` for diagnostic builds that must leave the
-  working tree unchanged.
+| Component | Increment when |
+|---|---|
+| `major` | Compatibility-breaking behavior or a major architecture change |
+| `minor` | User-visible features that preserve existing behavior |
+| `patch` | Bug fixes, polish, reliability, and performance work |
+| `build` | Every Visual Studio GUI build — MSBuild does this automatically |
 
-## Increment Rules
+When a component changes, reset everything to its right:
 
-- Increment `major` for compatibility-breaking behavior or major architecture
-  changes.
-- Increment `minor` for user-visible features that preserve existing behavior.
-- Increment `patch` for bug fixes, polish, reliability work, and performance
-  improvements.
-- Increment `build` for every Visual Studio GUI build. MSBuild does this
-  automatically for `AxiomGui.vcxproj`.
+- `0.1.0.14` → `0.1.1.0` for a patch release
+- `0.1.1.8` → `0.2.0.0` for a minor feature release
+- `0.9.4.3` → `1.0.0.0` for a major release
 
-When a parent component changes, reset the components to its right. Examples:
+## Automatic build increment
 
-- `0.1.0.14` -> `0.1.1.0` for a patch release.
-- `0.1.1.8` -> `0.2.0.0` for a minor feature release.
-- `0.9.4.3` -> `1.0.0.0` for a major release.
+The `AxiomSfx.vcxproj` prerequisite runs `tools\Update-AxiomVersion.ps1` before
+the product executables build. Running it in that shared prerequisite
+guarantees the embedded SFX module, GUI, and CLI all see the same version in
+one build.
 
-## Automatic Build Increment
+The script increments only the fourth component and updates every resource
+field together — `FILEVERSION`, `PRODUCTVERSION`, `FileVersion`, and
+`ProductVersion` — then mirrors the result into the CLI and SFX-module
+resources, so generated self-extractors report the same product version.
 
-The internal `AxiomSfx.vcxproj` prerequisite runs
-`tools\Update-AxiomVersion.ps1` before the product executables build. Running
-the step in this shared prerequisite guarantees that the embedded module, GUI,
-and CLI all see the new version during the same build. The script increments
-only the fourth component and updates all resource fields together:
-
-- `FILEVERSION`.
-- `PRODUCTVERSION`.
-- `FileVersion`.
-- `ProductVersion`.
-
-It mirrors the resulting version into the CLI and internal SFX-module resources
-so generated self-extractors report the same product version. The SFX module is
-still only a build dependency and is not shipped as a separate executable.
-
-This intentionally modifies `src\gui\axiom_gui.rc`, so a successful local GUI
+This deliberately modifies `src\gui\axiom_gui.rc`, so a successful local GUI
 build leaves a version change in the working tree.
 
-To run a diagnostic build without changing the version:
+To build without touching the version:
+
+```powershell
+.\tools\build_msvc.ps1 -Configuration Release -AutoIncrementVersion:$false
+```
+
+or, driving MSBuild directly:
 
 ```powershell
 MSBuild.exe .\AxiomCompress.sln /p:Configuration=Release /p:Platform=x64 /p:AutoIncrementVersion=false /m
 ```
 
-Before producing a packaged release build:
+Keeping auto-increment on is fine for day-to-day builds. Disabling it for
+releases avoids turning a planned `0.1.1.0` into `0.1.1.1` during packaging.
 
-1. Manually update `major`, `minor`, or `patch` in `src\gui\axiom_gui.rc` if the
-   release requires it.
-2. Set the full four-part resource version to the exact tag you intend to ship.
-3. Build Release x64 with auto-increment disabled:
+## Release procedure
+
+1. Update `major`, `minor`, or `patch` in `src\gui\axiom_gui.rc` if the release
+   warrants it, and set the full four-part version to the exact tag you intend
+   to ship.
+2. Update [`CHANGELOG.md`](../CHANGELOG.md) with the release entry.
+3. Build and test with auto-increment disabled:
 
    ```powershell
    .\tools\test_msvc.ps1 -Configuration Release -AutoIncrementVersion:$false
    ```
 
-4. Build the Inno Setup installer from that already-built binary:
+4. Package from the already-built binaries:
 
    ```powershell
    .\installer\build-installer.ps1 -SkipBuild -SkipTests -Version <version>
    ```
 
-5. Build the matching portable zip asset if the release needs one.
+5. Build the matching portable zip asset.
 6. Tag the release with the exact resource version.
 
-Before pushing the tag, verify that `git status` contains only the intended
-release commit and that the resource version printed by
-`tools\Update-AxiomVersion.ps1 -PrintVersion` exactly matches the proposed tag.
-After publishing, verify the GitHub release is neither draft nor prerelease,
-both Windows assets are present, and their SHA-256 digests match the locally
-packaged files. CI should pass on Windows, Linux, and macOS for the tagged
-commit.
+### Before pushing the tag
 
-For day-to-day Release builds, keeping the default auto-increment behavior is
-fine. For published releases, disabling it avoids accidentally turning a planned
-version such as `0.1.1.0` into `0.1.1.1` during packaging.
+- `git status` contains only the intended release commit.
+- `tools\Update-AxiomVersion.ps1 -PrintVersion` exactly matches the proposed
+  tag.
+- CI passes on Windows, Linux, and macOS for the tagged commit.
+
+### After publishing
+
+- The GitHub release is neither draft nor prerelease.
+- Both Windows assets are present.
+- Their SHA-256 digests match the locally packaged files.

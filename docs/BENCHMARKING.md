@@ -1,61 +1,67 @@
-# Benchmarking Axiom
+# Benchmarking
 
-Use this guide when changing compression speed, decompression speed, memory use,
-or compression-ratio presets. The benchmark scripts do not change the archive
-format; they run codecs, verify round-trips, and write CSV results.
+How to measure Axiom when changing compression speed, decompression speed,
+memory use, or presets. The benchmark tooling never changes the archive format
+— it runs codecs, verifies round-trips, and writes CSV.
 
-## Build first
+Published results live in [PERFORMANCE.md](PERFORMANCE.md).
 
-Benchmark only Release builds. Debug builds distort both throughput and memory
-behavior.
+## Rules
+
+1. **Release builds only.** Debug distorts both throughput and memory.
+2. **Verify every row.** All harnesses here round-trip and compare before
+   recording a result. Never publish an unverified number.
+3. **More than one corpus.** A single file can make a change look far better
+   than it is.
+4. **Medians over repeats.** Use at least three repeats for any real
+   comparison.
 
 ```powershell
 .\tools\build_msvc.ps1 -Configuration Release -AutoIncrementVersion:$false
-.\tools\test_msvc.ps1 -Configuration Release -AutoIncrementVersion:$false
+.\tools\test_msvc.ps1  -Configuration Release -AutoIncrementVersion:$false
 ```
 
-The CLI executable should be:
+The CLI lands at `out\Release\axiomc.exe`.
 
-```text
-out\Release\axiomc.exe
+## Corpora
+
+Standing corpora for published comparisons:
+
+| Corpus | Size | Use |
+|---|---|---|
+| [enwik8](https://mattmahoney.net/dc/textdata.html) | 100 MB | Text ratio; the de-facto LZMA-class benchmark |
+| [Silesia](https://sun.aei.polsl.pl/~sdeor/index.php?page=silesia) | ~212 MB | Mixed text, binary, medical, and database data |
+
+Silesia is benchmarked as **one uncompressed tar**, which is what zstd and most
+modern codecs report against. Feed that same tar to every codec so container
+overhead and file grouping cannot skew the comparison:
+
+```powershell
+cd D:\Silesia
+tar --force-local --format=ustar -b 1 -cf D:\tests\axiom-perf\silesia.tar `
+  dickens mozilla mr nci ooffice osdb reymont samba sao webster x-ray xml
 ```
 
-## Corpus selection
+Alphabetical order with blocking factor 1 produces exactly 211,948,032 bytes,
+matching the published input.
 
-Use more than one corpus. A single file can make a change look better than it
-really is.
-
-Recommended local layout:
+For local engineering work, keep a directory covering four shapes:
 
 ```text
 D:\tests\axiom-perf\
   corpora\
-    text-or-source-file
-    mixed-folder-or-file
-    already-compressed-file
-    long-distance-repetition-file
+    text-or-source-file             dictionary and parser quality
+    mixed-folder-or-file            metadata and file boundaries
+    already-compressed-file         the compressor should fail cheaply
+    long-distance-repetition-file   large windows and solid blocks
   results\
 ```
 
-Include these categories:
+## Cross-codec comparison
 
-- Text or source code, where dictionary and parser quality matter.
-- Mixed real-world files, where metadata and file boundaries matter.
-- Already-compressed or random data, where the compressor should fail cheaply.
-- Long-distance repetition, where large windows and solid blocks are useful.
-
-For cross-codec comparisons, the standing corpus is the **Silesia corpus**
-(https://sun.aei.polsl.pl/~sdeor/index.php?page=silesia, ~212 MB of mixed
-text/binary data): pack the twelve files into one uncompressed tar and feed
-that same tar to every codec (`axiomc c`, `zstd`, `7z`, ...) so container
-overhead and file grouping do not skew the comparison. Verify every row by
-round-trip. The README's performance section is measured this way.
-
-## Cross-codec suite
-
-Use the codec-neutral harness for the published comparison. It runs Axiom levels
-1–9 and any available LZ4, zstd, Deflate, bzip2, LZMA2, and WinRAR RAR5
-profiles against the same byte stream:
+`bench/bench_codecs.py` is the codec-neutral harness behind the published
+tables. It runs Axiom levels 1–9 plus any available LZ4, zstd, Deflate, bzip2,
+LZMA2, and WinRAR RAR5 profiles against the same byte stream.
 
 ```powershell
 python .\bench\bench_codecs.py `
@@ -65,60 +71,35 @@ python .\bench\bench_codecs.py `
   --output D:\tests\axiom-perf\results\silesia-codecs.csv
 ```
 
-The harness auto-detects tools on `PATH` and common Windows install locations.
-Use `--lz4`, `--zstd`, `--sevenzip`, or `--winrar` for explicit executable paths. Missing
-reference tools are reported and skipped; Axiom is always required. The default
-protocol is best-of-two compression and best-of-three decompression, with every
-restore compared byte-for-byte. `--quick` selects a short smoke-test profile.
-WinRAR profiles use RAR5 normal (`-m3`) and best with a fixed 128 MiB dictionary
-(`-m5 -md128m`). The CSV is rewritten after every verified row so completed
-measurements survive a later external-tool failure.
+- Reference tools are auto-detected on `PATH` and in common Windows install
+  locations. Override with `--lz4`, `--zstd`, `--sevenzip`, `--winrar`.
+- Missing reference tools are reported and skipped. Axiom is always required.
+- Default protocol is best-of-two compression and best-of-three decompression,
+  with every restore compared byte-for-byte.
+- `--quick` selects a short smoke-test profile.
+- WinRAR profiles are RAR5 normal (`-m3`) and best with a fixed 128 MiB
+  dictionary (`-m5 -md128m`).
+- The CSV is rewritten after every verified row, so a late external-tool
+  failure does not discard completed measurements.
 
-The published 0.4.0.0 snapshot used WinRAR 7.23, 7-Zip 26.02, zstd 1.5.7,
-and LZ4 1.10.0 on a Ryzen 9 5950X. On Silesia, Axiom level 9 measured
-4.12x in 21.31 s; WinRAR best measured 3.99x in 3.54 s. On enwik8, Axiom
-level 9 measured 3.51x in 7.05 s and WinRAR best measured 3.71x in 2.35 s.
-See the README graphs for both complete 22-profile ratio/throughput
-comparisons.
+For folders, the harness builds a deterministic byte stream of relative paths
+and file bytes and feeds that identical stream to every codec.
 
-The exact published rows are versioned in
-`bench/results/silesia-0.4.0.0.csv` and
-`bench/results/enwik8-0.4.0.0.csv`. Keep these artifacts aligned with the
-README tables whenever the snapshot is refreshed. The chart generator reads
-the verified CSVs directly and rejects missing, unknown, or unverified rows:
+### enwik8 sweep
+
+`tools\bench_enwik8.ps1` downloads enwik8 on first run, sweeps Axiom's match
+finders and window sizes from 1 MiB through the full input, and verifies every
+row by round-trip before reporting a ratio.
 
 ```powershell
-python .\tools\generate_readme_charts.py
+.\tools\bench_enwik8.ps1
+.\tools\bench_enwik8.ps1 -Quick
+.\tools\bench_enwik8.ps1 -Axiomc out\Release\axiomc.exe
 ```
 
-The dedicated `tools\bench_enwik8.ps1` sweep additionally validates every
-Axiom level and binary-tree windows from 1 MiB through the full 128 MiB input.
-The 0.4.0.0 full-window diagnostic reached 3.57x at 1.9 MB/s; the normal
-level-9 preset reached 3.51x at 13.5 MB/s, so the full-window row remains a
-diagnostic rather than a default. Exact diagnostic rows are retained in
-`bench/results/enwik8-level-window-0.4.0.0.csv`.
+## Comparing two builds
 
-For the ongoing LZMA2 ratio-gap work, see
-[`GAP_ANALYSIS_LZMA2.md`](GAP_ANALYSIS_LZMA2.md): per-member deltas, stream
-accounting (`bench/axc_inspect.py`), the measured plan, and how to re-run the
-sweep (`bench/gap_analysis.py`).
-
-If you only need a smoke test, let the script create deterministic sample files:
-
-```powershell
-.\tools\bench_axiom_levels.ps1 `
-  -CurrentAxiomc .\out\Release\axiomc.exe `
-  -CorpusDir D:\tests\axiom-perf\sample-corpora `
-  -OutputDir D:\tests\axiom-perf\sample-results `
-  -GenerateSampleCorpora `
-  -SampleSizeMiB 8 `
-  -Repeats 1
-```
-
-## Compare two builds across levels
-
-Keep a known-good `axiomc.exe` somewhere outside the build output, then compare
-it with the current Release build:
+Keep a known-good `axiomc.exe` outside the build output, then compare:
 
 ```powershell
 .\tools\bench_axiom_levels.ps1 `
@@ -130,13 +111,14 @@ it with the current Release build:
   -Repeats 3
 ```
 
-Use at least three repeats for real comparisons. The summary uses medians, which
-reduces noise from background CPU and disk activity.
+Omit `-BaselineAxiomc` to run the current build only — useful for a quick sweep
+before a full baseline comparison. Add `-GenerateSampleCorpora -SampleSizeMiB 8`
+to let the script create deterministic sample files for a smoke test.
 
-## Compare custom tuning profiles
+### Custom profiles
 
-Use `-Profiles` when testing non-default arguments or candidate presets. Each
-profile is written as `name=arguments`.
+Use `-Profiles` to test non-default arguments or candidate presets, written as
+`name=arguments`:
 
 ```powershell
 .\tools\bench_axiom_levels.ps1 `
@@ -153,48 +135,26 @@ profile is written as `name=arguments`.
   -Repeats 3
 ```
 
-If `-BaselineAxiomc` is omitted, the script runs the current build only. That is
-useful for a quick profile sweep before doing a full baseline comparison.
+### Output
 
-```powershell
-.\tools\bench_axiom_levels.ps1 `
-  -CurrentAxiomc .\out\Release\axiomc.exe `
-  -CorpusDir D:\tests\axiom-perf\corpora `
-  -OutputDir D:\tests\axiom-perf\results\current-only `
-  -Profiles @(
-    "level9=--level 9",
-    "level9_96m=--level 9 --block-size 96M --window 96M"
-  ) `
-  -Repeats 3
-```
-
-## Output files
-
-The level comparator writes three CSV files:
-
-| File | Purpose |
+| File | Contents |
 |---|---|
 | `axiom-levels-raw.csv` | One row per run, corpus, profile, tool, and repeat |
-| `axiom-levels-summary.csv` | Median archive size, ratio, compress speed, and decompress speed |
-| `axiom-levels-delta.csv` | Current-vs-baseline deltas when a baseline is provided |
+| `axiom-levels-summary.csv` | Median archive size, ratio, compress speed, decompress speed |
+| `axiom-levels-delta.csv` | Current-vs-baseline deltas, when a baseline is given |
 
-Delta interpretation:
+Positive deltas always mean the current build is better: `RatioDeltaPct`
+positive means a smaller archive, `CompressDeltaPct` and `DecompressDeltaPct`
+positive mean faster. Negative values are regressions.
 
-- Positive `RatioDeltaPct` means the current build produced a smaller archive.
-- Positive `CompressDeltaPct` means the current build compressed faster.
-- Positive `DecompressDeltaPct` means the current build decompressed faster.
-- Negative values are regressions for that metric.
+Decompressed output is verified with SHA-256 before any result is recorded.
 
-The script verifies decompressed output with SHA-256 before recording a result.
+## CPU scaling
 
-## Check CPU scaling explicitly
-
-Throughput changes must be tested with the default automatic thread count and
-with at least one fixed high thread count. This catches two common regressions:
-too few blocks to feed the CPU, and serial work such as whole-buffer CRC or input
-I/O dominating the threaded codec.
-
-Recommended checks:
+Test throughput changes with the default automatic thread count **and** at
+least one fixed high thread count. This catches the two recurring regressions:
+too few blocks to feed the CPU, and serial work — whole-buffer CRC, input I/O —
+dominating the threaded codec.
 
 ```powershell
 .\tools\bench_axiom_levels.ps1 `
@@ -211,33 +171,21 @@ Recommended checks:
   -Repeats 3
 ```
 
-Do not pass `--block-size` for the default scaling check. An explicit block size
-turns off automatic block sizing and can hide whether the normal CLI/GUI path is
-feeding enough work to all available cores.
+**Do not pass `--block-size` for the default scaling check.** An explicit block
+size disables automatic block sizing and hides whether the normal CLI and GUI
+path is feeding enough work to all available cores.
 
-The 0.1.1.0 release candidate used the D:\tests tuning corpus and showed these
-median improvements with archive size unchanged:
+Low CPU utilization is not automatically a regression. Level 1 can become
+limited by memory bandwidth and archive I/O on easy corpora, and ordered match
+discovery at levels 8–9 means one busy thread per physical core is sometimes
+the fastest schedule. Treat low utilization as a regression only when
+throughput *also* fails to scale on larger or harder corpora.
 
-| Corpus / profile | Compress before | Compress after | Decode-to-NUL after | Compression CPU cores after |
-|---|---:|---:|---:|---:|
-| mixed-64m, level 1 auto | 211.9 MiB/s | 907.2 MiB/s | 2204.0 MiB/s | 1.1 |
-| mixed-64m, level 8 auto | 126.2 MiB/s | 255.0 MiB/s | 2059.3 MiB/s | 21.7 |
-| long-distance-112m, level 1 auto | 127.4 MiB/s | 217.3 MiB/s | 1048.8 MiB/s | 1.6 |
-| long-distance-112m, level 8 auto | 84.3 MiB/s | 127.9 MiB/s | 894.4 MiB/s | 1.8 |
-| mixed-512m, level 1 auto | 229.8 MiB/s | 1098.1 MiB/s | 3853.7 MiB/s | 3.2 |
-| mixed-512m, level 8 auto | 127.3 MiB/s | 246.3 MiB/s | 2729.8 MiB/s | 21.6 |
+## Preset changes
 
-Level 1 still reports fewer compression CPU cores on easy corpora because it can
-become limited by memory bandwidth and archive I/O after the block-splitting
-fix. Treat low CPU utilization as a regression only when throughput also fails
-to scale on larger or harder corpora.
-
-## Current preset notes
-
-Level 9 currently uses a 64 MiB block/window maximum. Larger 96 MiB and 128 MiB
-tests can help pathological long-distance corpora, but they cost more memory and
-time and were not kept as the default maximum preset. Keep that tradeoff visible
-when testing new candidates:
+Level 9 currently uses a 64 MiB block and window maximum. Larger 96 MiB and
+128 MiB configurations help pathological long-distance corpora but cost more
+memory and time, which is why they are not the default:
 
 ```powershell
 "level9_64m=--level 9 --block-size 64M --window 64M"
@@ -245,37 +193,47 @@ when testing new candidates:
 "level9_128m=--level 9 --block-size 128M --window 128M"
 ```
 
-Only promote a profile to a default preset when it improves the overall corpus
-set, not just one synthetic case.
+Two rules for preset work:
 
-When comparing explicit block-size profiles, keep a matching no-`--block-size`
-profile in the same run. The no-override row is the user-facing default and is
-the only one that exercises automatic CPU-aware block sizing.
+- Only promote a profile when it improves the **overall corpus set**, not one
+  synthetic case.
+- When comparing explicit block-size profiles, keep a matching
+  no-`--block-size` profile in the same run. The no-override row is the
+  user-facing default and the only one that exercises automatic CPU-aware block
+  sizing.
+
+## Stream accounting
+
+To see where compressed bytes actually go inside an archive:
+
+```powershell
+py bench\axc_inspect.py path\to\archive.axc
+```
+
+It reports per-stream raw and coded sizes, bits per raw byte, share of the
+payload, and the selected coder. `bench/gap_analysis.py` drives the full
+per-member sweep used for ratio research. The measured analysis of the LZMA2
+ratio gap is in [GAP_ANALYSIS_LZMA2.md](GAP_ANALYSIS_LZMA2.md).
 
 ## GUI benchmark
 
-The GUI benchmark is available from:
+`Tools > Benchmark…` measures the native Axiom method at a selected portable
+level, entirely in memory. It is the right tool for a quick throughput check on
+a specific machine; it is not a substitute for the harnesses above, which store
+raw data and support baseline builds. See
+[GUI_GUIDE.md](GUI_GUIDE.md#benchmark).
 
-```text
-Tools > Benchmark...
-```
+## Publishing results
 
-Generated inputs are produced directly in memory. A custom file is loaded once;
-a custom folder becomes a deterministic stream of sorted relative paths,
-lengths, and file contents. Preparation is outside the timed region. Every
-timed compression and extraction iteration uses resident buffers, and each
-restore is compared byte-for-byte before the pass is recorded.
+When refreshing the published snapshot:
 
-Choose a fixed pass count for a bounded run or **Continuous** to run until
-**Stop**. Short phases repeat enough times to reduce timer granularity. The
-report keeps bounded recent-pass details and lifetime totals, including wall
-throughput, effective CPU use, ratio, encoded size, rolling variation, and a
-stability indicator. Automatic corpus sizing leaves memory headroom for the
-source, encoded, restored, and codec working buffers; custom inputs that do not
-fit are rejected before timing.
+1. Run the cross-codec harness on both standing corpora.
+2. Commit the verified CSVs under `bench/results/` with the version in the
+   filename.
+3. Regenerate the charts: `python tools\generate_readme_charts.py`.
+4. Update the tables in [PERFORMANCE.md](PERFORMANCE.md) and the headline table
+   in the README from those same CSVs.
 
-The GUI benchmark measures the native Axiom method at the selected portable
-level. Use `bench/bench_codecs.py` for comparisons with Zstandard, LZMA2,
-Deflate, or external tools, and use `tools/bench_axiom_levels.ps1` for
-repeatable engineering comparisons because it stores raw data and supports
-baseline builds.
+Keep all four in sync. The chart generator reads the CSVs directly and rejects
+missing, unknown, or unverified rows, so the charts and the raw data cannot
+drift — but the prose tables can, and only discipline prevents it.

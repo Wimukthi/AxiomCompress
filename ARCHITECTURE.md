@@ -1,648 +1,517 @@
 # Architecture
 
-The project is structured so the encoder can become much more complex without making the decoder expensive or unpredictable.
+The project is organized around one rule:
 
-## Quick map
+> **The encoder may be expensive. The decoder may not.**
+>
+> Compression can spend arbitrary CPU searching for a better representation.
+> Decompression must stay deterministic, bounded, and cheap to validate.
 
-Use this document when you need to know where a feature belongs:
+Everything below follows from that. New encoder work is welcome as long as it
+lands as *static, encoder-chosen structure* that the decoder can replay with
+table lookups.
 
-| Area | Owns |
+## Contents
+
+- [Source map](#source-map)
+- [Pipeline](#pipeline)
+- [Codec](#codec)
+- [Container](#container)
+- [Threading](#threading)
+- [GUI boundary](#gui-boundary)
+- [Benchmarking infrastructure](#benchmarking-infrastructure)
+- [Decoder rule](#decoder-rule)
+
+## Source map
+
+| Path | Owns |
 |---|---|
-| `src/codec` | Single-block compression/decompression, including bounded external-codec adapters |
-| `src/codec/external_codecs.cpp` | Chunk envelope and bundled Zstandard, LZMA2, and Deflate adapters |
-| `src/archive` | `.axar` container, metadata, encryption, recovery, volumes, signing, SFX |
-| `src/archive/container.cpp` | The AXAR engine: directory parsing, solid blocks, encryption, recovery, volumes, signing, SFX |
-| `src/archive/container_zip.cpp` | ZIP read/write: miniz wrappers, ZipCrypto/AES-256 entries, the ZIP provider |
-| `src/archive/container_formats.cpp` | Format detection (magic/extension sniffing) and the provider registry |
-| `src/archive/system_provider.cpp` | Read-only provider policy, native ISO bridge browsing, and Windows `tar.exe` integration |
-| `src/archive/seven_zip_library.cpp` | Direct `7z.dll` adapter for structured listing, testing, extraction, encryption, volumes, progress, pause, and cancellation |
-| `src/archive/container_internal.hpp` | Internal helpers shared between the archive translation units |
-| `src/core` | Shared utilities: checksums, crypto, filesystem metadata, Reed-Solomon |
-| `src/cli` | `axiomc` command parsing and CLI workflows |
-| `src/gui` | Native Win32 GUI over the public archive APIs |
-| `src/gui/main_window.cpp` | Main window creation, layout, message dispatch, and the `run_axiom_gui` entry point |
-| `src/gui/main_window_*.cpp` | The other main-window method groups: browser/tree wiring, address bar, theming, dark-drawn views, find dialog, commands, file operations, helpers, quick-add/SFX startup |
-| `src/gui/main_window_internal.hpp` | Declarations shared between the main-window translation units |
-| `src/gui/dialog_support.cpp` | Axiom dialog palette/drawing plus the adapter to the shared `Wimukthi.Win32Theme` Windows integration |
-| `src/sfx` | Dedicated read-only AXAR/ZIP self-extractor runtime and lazy module-file packager |
-| `tests` | Round-trip, safety, and regression tests |
+| `src/codec/` | Single-block compression and decompression |
+| `src/codec/external_codecs.cpp` | Chunk envelope and the Zstandard, LZMA2, and Deflate adapters |
+| `src/entropy/` | Huffman and rANS coders |
+| `src/archive/container.cpp` | The AXAR engine: directory, solid blocks, encryption, recovery, volumes, signing, SFX |
+| `src/archive/container_zip.cpp` | ZIP read/write: miniz wrappers, AES-256 entries, the ZIP provider |
+| `src/archive/container_formats.cpp` | Format detection and the provider registry |
+| `src/archive/system_provider.cpp` | Read-only provider policy, native ISO reader, Windows `tar.exe` |
+| `src/archive/seven_zip_library.cpp` | Direct `7z.dll` adapter |
+| `src/archive/zip_split_backend.cpp` | minizip-ng split-set creation and reading |
+| `src/core/` | Checksums, crypto, filesystem metadata, Reed-Solomon, task executor |
+| `src/cli/` | `axiomc` parsing and workflows |
+| `src/gui/` | Native Win32 GUI over the public archive API |
+| `src/gui/main_window.cpp` | Window creation, layout, message dispatch, `run_axiom_gui` entry point |
+| `src/gui/main_window_*.cpp` | Method groups: browser, address bar, theming, views, search, commands, file ops, quick-add |
+| `src/gui/dialog_support.cpp` | Axiom dialog palette and the `Wimukthi.Win32Theme` adapter |
+| `src/sfx/` | Read-only self-extractor runtime and the module packager |
+| `tests/` | Round-trip, safety, and regression tests |
 
-The important design rule is simple: compression may spend more CPU to find a
-better representation, but decompression must stay deterministic, bounded, and
-easy to validate.
+GUI edits belong in the topical `main_window_*.cpp` translation unit, not back
+in `main_window.cpp`. Shared helpers are declared in
+`main_window_internal.hpp`.
+
+## Pipeline
 
 ```text
-archive input
-  -> classifier
-  -> solid block builder
-  -> reversible transforms
-  -> match finder
-  -> parser
-  -> entropy coder
-  -> container writer
+encode:  input → classifier → solid block builder → reversible transforms
+              → match finder → parser → entropy coder → container writer
 
-container reader
-  -> entropy decoder
-  -> token decoder
-  -> inverse transforms
-  -> restored output
+decode:  container reader → entropy decoder → token decoder
+              → inverse transforms → output
 ```
 
-## Implementation
+The container embeds one `axiom::compress` `.axc` stream per solid block, so
+the single-stream codec and the archive share exactly the same encode and
+decode path.
 
-The codec currently implements:
-
-- Three match finders selected by effort: a **fast 2-way row-hash matcher**
-  (`fast_lz`, level 1), a **price-aware lazy hash-chain matcher** (levels 2–6:
-  the lazy step defers on token-cost comparison and on repeat-offsets available
-  one position ahead, not just on "strictly longer"), and an LZMA-style
-  **cyclic-window binary-tree matcher** (`--bt`, levels 7–9). Level 7 applies
-  the same cost-aware one-byte lookahead through a non-mutating tree search;
-  levels 8–9 use the optimal parser instead.
-- A bounded **optimal (DP) parser** whose candidates come from the binary tree
-  (LZMA-style `GetMatches`: the descent yields several distinct lengths, each
-  at its nearest distance). Levels 8 and 9 use one measured-cost pass seeded by
-  the greedy parse; level 9 searches deeper, uses a 64 MiB window, and permits
-  4 KiB matches. The older two-pass shape remains available to explicit
-  `--optimal` configurations.
-- Repeat-offset (rep0–rep3) matches and split LZ77 streams, with an optional
-  position-slot distance representation.
-- Entropy via byte-level canonical Huffman, a **4-lane interleaved order-0
-  rANS**, and a **clustered static order-1 rANS** (previous-byte contexts
-  grouped into at most 16 transmitted frequency tables; decodes at table-lookup
-  speed). At the thorough levels the order-1 coder competes for the literal,
-  command, length, and distance-slot streams and is kept only when strictly
-  smaller. (A Fenwick-backed adaptive order-1 range coder remains decodable for
-  older archives but is no longer emitted — it decoded ~30x slower for a
-  fraction of a percent; an earlier bit-serial order-0 arithmetic coder was
-  removed entirely once rANS superseded it.)
-- SIMD where it measurably pays: BLAKE3 hashing (SSE2→AVX-512, runtime
-  dispatched), PCLMULQDQ-folded CRC-32, and SWAR match comparison. Integrity
-  hashing and CRC are the vectorized hot spots; the matchers are scalar by
-  measurement, not omission.
-- A threaded independent-block codec, and a multi-file `.axar` container of solid
-  blocks with a central directory (see [FORMAT.md](FORMAT.md)). The default
-  writer now sizes both archive solid blocks and internal codec blocks from the
-  selected hardware-thread count so `--threads 0` feeds all detected workers.
-- Two front-ends — a CLI (`axiomc`) and a Windows GUI (`Axiom.exe`) — over the
-  same library. Long operations report progress and honor cooperative
-  pause/cancel through an `OperationControl` passed in the option structs;
-  cancellation throws `OperationCancelled` and leaves no partial output (writes
-  are atomic).
-
-The Windows GUI delegates system light/dark detection, High Contrast behavior,
-native title bars, control theme classes, and setting-change invalidation to
-the sibling `Wimukthi.Win32Theme` framework. Axiom continues to own its accent
-selection, semantic colors, custom menus, and owner-drawn archive controls.
-
-The container embeds one `axiom::compress` `.axc` stream per solid block, so the
-single-stream codec and the archive share exactly the same encode/decode path.
-The decoder is deliberately simple and bounded (see "Decoder Rule"); all the
-complexity lives in the encoder.
-
-`CompressionOptions::method` selects Axiom adaptive, Zstandard, LZMA2, Deflate,
-or Store. Axiom remains the default and continues to emit AXC v9. The three
-external codecs emit AXC v10 with a small `AXEC` payload envelope. That envelope
-splits input into independently decodable chunks, records exact raw and encoded
-sizes, and permits a stored fallback per chunk. The decoder validates the
-geometry and total restored size before invoking a backend, allocates only the
-header-declared bounded output, requires exact input consumption, and rejects
-trailing data. Operation checkpoints between chunks preserve pause/cancel and
-keep progress reporting independent of backend callback frequency.
-
-The codec selection is below the AXAR service boundary. Encryption, signatures,
+Codec selection sits *below* the AXAR service boundary. Encryption, signatures,
 recovery records, split volumes, metadata, directory layout, and SFX packaging
-wrap the completed AXC bytes and therefore require no codec-specific branches.
+all wrap completed AXC bytes, so none of them need codec-specific branches.
 
-### Archive API shape
+## Codec
 
-The `.axar` public API deliberately separates archive storage from file-manager
-presentation. Besides create/list/test/extract, it exposes:
+### Match finders
 
-- destination-aware insertion through `ArchiveInput`;
-- selective extraction;
-- metadata-only entry moves through `ArchiveMove`;
-- add, update, freshen, sync, delete, and repack;
-- comments and locking;
-- archive encryption mode queries.
+Three, selected by effort:
 
-All mutating operations use a temporary archive and replacement rename. They
-honor `OperationControl` and reject locked archives. Data-only encrypted archives
-are editable with the password; encrypted-directory archives currently remain
-read-only.
+| Finder | Levels | Notes |
+|---|---|---|
+| Fast 2-way row hash (`fast_lz`) | 1 | Fixed-probe, byte-token output |
+| Price-aware lazy hash chain | 2–6 | Chain depth and lazy matching rise with level |
+| Cyclic-window binary tree | 7–9 | LZMA-style; `--bt` selects it explicitly |
 
-### Archive providers
+The lazy step is genuinely price-aware: it defers on token-cost comparison and
+on repeat-offsets available one position ahead, not merely on "strictly
+longer". Level 7 applies the same cost-aware one-byte lookahead through a
+non-mutating tree search.
 
-Archive browsing now goes through a built-in provider layer. The registered
-providers are:
+Binary-tree slots are indexed by `position % min(window, input_size)`, a
+descent stops when a candidate falls outside the window, and memory stays
+proportional to `--window` rather than to the whole input.
 
-- `axar`: the native full read/write provider, adapting the existing archive API
-  without changing the format or behavior;
-- `zip`: a miniz-backed provider for browsing, testing, extracting, creating,
-  adding, updating, synchronizing, deleting, and moving entries in normal ZIP
-  archives. New encrypted ZIPs use WinZip AES-256 file-data encryption.
-  Existing encrypted ZIPs can be listed, tested, and extracted with a password,
-  but are not edited in place yet. Existing unchanged plaintext entries are
-  preserved by cloning them into an atomically rewritten ZIP. AXAR and ZIP can
-  both be packaged behind the native self-extractor stub.
-- `system-readonly`: a Windows-only read-only provider. It loads Axiom's bundled
-  `7z.dll` engine directly for 7z, RAR/RAR5, hybrid ISO/UDF, and CAB, and uses
-  Windows `tar.exe` for TAR-family archives. It never advertises create,
-  update, delete, or move.
+Match-length comparison reads eight bytes at a time (SWAR).
 
-The GUI asks the provider for:
+### Parsers
 
-- format identity and file type text;
-- capability flags such as list, extract, test, update, comments, encryption,
-  recovery, signatures, and SFX;
-- directory entries for the browser;
-- test, extraction, and write operations.
-
-This is intentionally **plug-in-shaped but not externally pluggable** yet. New
-formats should land as compiled-in providers first so the capability model,
-password prompts, drag/drop behavior, and command enabling can stabilize without
-committing to a public C ABI, DLL loading policy, sandboxing story, or third-party
-parser trust model.
-
-The intended support split is:
-
-- full native support remains `.axar`;
-- ZIP has practical read/write support for plaintext archives, exact
-  central-directory packed sizes, and AES-256 file-data encryption for new ZIPs.
-  Existing encrypted ZIPs are read/test/extract only; comments, encrypted names,
-  rich attributes, and AXAR-specific services remain unsupported;
-- AXAR exposes per-file Packed values as estimates because files share solid
-  blocks; archive-level size and ratio remain exact in the information dialog;
-- AXAR and ZIP are the only creation targets in the GUI. The Add-to-archive
-  dialog filters out read-only providers even though the Open dialog can browse
-  them;
-- 7z/RAR/CAB support is view/extract/test through the bundled `7z.dll` engine.
-  Pure ISO9660/Joliet browsing uses Axiom's native directory reader for
-  immediate display; hybrid media use the authoritative UDF catalog from the
-  DLL. TAR-family support remains view/extract/test through Windows `tar.exe`.
-  The DLL adapter consumes structured properties and callbacks rather than
-  launching a helper process or parsing console text.
-
-For ZIP specifically, Axiom currently vendors miniz 3.1.1 because it provides a
-small, build-system-friendly ZIP container reader/writer and Deflate/Inflate
-implementation. zlib-ng remains a reasonable future Deflate/Inflate backend
-candidate if profiling shows that miniz's codec path is the bottleneck, but it
-is not a ZIP container layer. ZIP support owns central-directory rewrites in the
-provider layer, including the WinZip AES extra-field and payload rewrite used
-for AES-256 encrypted ZIP creation. Future work is mainly richer metadata,
-comments, editable encrypted ZIPs, and possibly swapping the Deflate backend if
-profiling justifies it.
-
-A privately namespaced minizip-ng 4.2.2 container/split-stream core creates and
-directly reads standard `.z01`, `.z02`, ..., `.zip` sets. Axiom raw-copies completed
-entries, preserving Deflate data, metadata, CRCs, and WinZip AES ciphertext. Its
-vendored split writer carries a documented local-header boundary fix verified
-against bundled 7-Zip. Split sets are browse/test/extract only after creation;
-editing requires recreating the set.
-
-The detailed format support roadmap lives in
-[`docs/FORMAT_SUPPORT.md`](docs/FORMAT_SUPPORT.md).
-
-### Archive services
-
-Archive-level services include:
-
-- signatures over exact stored block bytes and canonical directory semantics;
-- SFX output by appending an intact AXAR or ZIP archive plus a fixed trailer to
-  a dedicated read-only native module. The module is installed as
-  `AxiomSfx.bin`, is never exposed as a separate executable, and is read only
-  when the user creates an SFX;
-- POSIX mode/uid/gid metadata through a skippable entry TLV;
-- recovery records backed by the portable Reed-Solomon core;
-- numbered data volumes and optional `.revNNN` recovery volumes.
-
-Recovery protects the archive through the end of the central directory and can
-repair damaged shards atomically. Volume joining validates the reconstructed
-archive with BLAKE3 before installing it. Long recovery and volume operations
-honor `OperationControl`.
-
-AXAR synchronization is a planned, single archive transaction. The source is
-scanned once and compared with one loaded catalogue; unchanged compressed blocks
-are copied verbatim, changed/new entries are compressed once, and stale entries
-are omitted from the final directory. Comment, lock, and signature metadata can
-be folded into that directory before recovery is generated. The completed
-temporary archive receives one recovery record and is then atomically installed.
-No-change synchronization returns without touching the archive.
-
-Recovery creation for a staged archive is stripe-bounded. It reads 64-KiB slices
-across the data shards, encodes independent parity rows on the operation worker
-pool, and spools parity until its per-shard CRCs are known. This avoids retaining
-the complete protected archive in memory and avoids copying the completed archive
-to a second recovery temporary file. The bytes remain recovery-service version 1
-compatible.
-
-Complete AXAR data-volume sets are exposed through a segmented random-access
-source, so list/test/extract operate on the numbered files without creating a
-joined archive. The provider marks this logical archive read-only. Missing data
-parts retain the existing Reed-Solomon join/reconstruction path.
-
-### GUI drag/drop boundary
-
-The Win32 file list implements `IDataObject`, `IDropSource`, and `IDropTarget`.
-Drag-out materializes selected archive entries only when a shell target requests
-`CF_HDROP`, which avoids doing extraction work before Explorer actually needs the
-files.
-
-## Single-stream container
-
-The archive header stores:
-
-- Magic and version.
-- Codec identifier.
-- Version-5-and-later transform-present flags and a bounded transform-range section.
-- Original size.
-- Payload size.
-- CRC-32 of the uncompressed data.
-
-The current transform layer supports independently reset x86/x64 relative-branch
-conversion, byte-delta ranges, and a 16-bit numeric transform that combines a
-left/2D predictor, signed-residual zigzag, and byte-plane shuffling. PE, x86 ELF,
-PCM WAV, and uncompressed BMP signatures provide candidate hints. Direct AXC
-compression also validates POSIX tar headers, inspects x86 ELF payloads inside
-one nested tar, and entropy-screens both raw inputs and individual tar members
-for the numeric transform. A fast trial encode enables the resulting ranges only
-when they beat the unfiltered representation. AXAR supplies per-file ranges and
-disables block-wide auto-detection when none of its files qualify, preventing a
-predictor from crossing solid-block file boundaries. The final AXC CRC always
-authenticates original bytes.
-
-AXC version 6 can represent LZ77 output as separate sequence-code, packed-extra,
-and literal-context streams. Recent-distance codes avoid repeatedly storing common
-offsets, while previous-byte literal lanes and an optional rep0-XOR residual mode
-improve entropy modeling without serial adaptive decoding. The encoder retains the
-older split layouts as candidates and writes v6 only when it is smaller. Both
-order-0 and clustered order-1 rANS encoders use precomputed reciprocal symbols in
-their hot loops instead of per-symbol integer division.
-
-AXC version 7 adds a hybrid block codec: commands, literal lengths, match lengths,
-distance slots, and footer bits retain the best legacy split representation,
-while literals use the v6 previous-byte lanes and optional rep0-XOR residual.
-This avoids making stronger literal modeling contingent on the sequence code
-layout; each block still selects the smallest complete candidate.
-
-AXC version 8 adds static slot-context coding for distance footers. Short
-footers are coded completely; longer distances keep their high bits packed and
-code the low four alignment bits with four-lane rANS tables selected by the
-distance slot. The decoder derives the context sequence from the already
-decoded slots, so it remains bounded and search-free. Both flat-literal and
-context-split block forms compete against their v7 raw-footer equivalents, and
-the v8 representation is emitted only when the complete payload is strictly
-smaller. Version 8 also adds a static match-byte literal mode: the first literal
-after a match is XORed with its rep0 byte and placed in one of eight lanes chosen
-by that byte, while ordinary literals remain in the previous-byte lanes. Its
-complete sixteen-lane suffix competes with the prior eight-lane representation.
-A full-previous-byte mode can instead map each of the 256 preceding-byte values
-to at most 16 encoder-chosen clusters, with one static literal stream per
-cluster. Decoding is one map lookup and one bounded stream read per literal; it
-does not learn or search. The complete cluster map, stream tables, payloads, and
-framing must be strictly smaller than every prior literal suffix before this
-mode is emitted. Earlier version-8 representations and versions 4 through 7
-remain decodable.
-
-AXC version 9 adds a parser-checkpoint context-split block candidate for the
-level-9 swarm. Fixed approximately 2 MiB parser tiles retain the full block
-match window but end at token boundaries, so their optimal DPs are independent.
-The greedy parse supplies four static recent-distance seeds per boundary. Each
-seed either references one of the decoder's current four distances or carries
-an explicit slotted distance; a zero-output checkpoint command installs all four
-before the next tile. Candidate discovery remains encoder-side and tiles run as
-ordinary work-stealable tasks. Decode performs four bounded descriptor reads and
-table assignments—no search, learning, or data-dependent allocation. The global
-DP and every older entropy representation remain in the block bake-off; codec 10
-is written only when its complete payload is strictly smaller. AXC versions 4
-through 8 remain decodable.
-
-Level-9 automatic block planning recognizes validated POSIX ustar members and
-uses their boundaries as static match-window and entropy-table reset points.
-Large members are split below the normal thread-derived block budget and small
-adjacent members are coalesced, preserving parallel throughput. The parallel
-block table has always carried each block's original length, so these variable
-boundaries require no new decoder representation; explicit block sizes remain
-uniform.
-
-Fast-entropy presets share one token-analysis pass between the legacy and v6
-layouts. A sampled conditional-entropy estimate skips the legacy entropy bake-off
-only when the completed v6 payload already beats that estimate; thorough presets
-retain their exhaustive independent candidates. Small blocks build both literal
-residual modes in one cache-hot pass, while larger blocks retain compact run
-metadata and materialize only the selected mode to bound peak memory.
-
-The inverse gate is conservative as well: before entropy-coding a sequence
-candidate, its stream estimate is compared with the best exact legacy size. A
-candidate that cannot plausibly win is rejected after analysis, avoiding the
-costliest redundant work without changing the selected archive representation.
-
-Future block headers should add:
-
-- Dictionary identifier.
-- Codec parameters.
-- Per-block checksums.
-- Optional seek index.
-
-## Codec Direction
-
-The long-term codec should be a hybrid:
-
-- LZ77-family local matching for fast repeated substrings.
-- Long-distance references across solid groups.
-- Optional trained dictionaries.
-- Transform tokens for structured formats.
-- Optimal parsing driven by estimated entropy cost.
-- rANS or range coding for the practical high-ratio mode.
-- Context-mixed literal coding for max-ratio research mode.
-
-## Fast Profile Constraint
-
-Level 1 is intentionally not an LZMA clone. Its hot path is a fixed-probe row
-hash parser over independent blocks, plus repeat-offset sequence tokens and
-Axiom split streams. It must not depend on the LZMA-style binary-tree matcher,
-optimal parser, or probability/range model to hit its speed target. Those remain
-higher-effort ratio tools for levels that explicitly trade speed away.
-
-## Parser modes
-
-A single `--level 1..9` knob selects the speed/ratio operating point (default 5).
-Levels 1–6 drive the hash-chain matcher, raising chain depth and turning on lazy
-matching and the full entropy bake-off as the level rises; level 7 switches to
-a cost-aware lazy binary tree, and levels 8–9 use growing tree windows plus a
-measured-cost single-pass optimal parser. Individual flags (`--chain-depth`,
-`--nice`, `--lazy`/`--no-lazy`, `--fast-entropy`, `--bt`, `--window`,
-`--optimal…`) override the preset, so a level is just a starting point. The
-decoder is identical at every level.
-
-### Normal hash-chain parsing
-
-Normal mode is greedy with optional **price-aware lazy matching**:
-
-1. Find a match at position `p`.
-2. Peek at `p + 1`.
-3. Defer (emit one literal) when the deferred path is cheaper per byte under
-   the token cost model — strictly longer matches still defer, and so do
-   similar-length matches that land a much nearer distance — or when any
-   repeat-offset at `p + 1` reaches the current match's length (reps code no
-   distance at all).
-
-This gives shallow chains much of the ratio of deeper chains without making the
-fast levels too slow. Match-length comparison reads eight bytes at a time.
-
-### Entropy selection
-
-After parsing, Axiom splits the LZ77 data into separate streams (commands,
-literal lengths, match lengths, distances or distance slots + footer bits, and
-literals). The entropy stage then either:
-
-- trial-encodes every available coder per stream and keeps the smallest result
-  on higher levels — including the clustered order-1 rANS for the literal and
-  sequence streams, which carry strong previous-symbol structure — or
-- uses a one-pass order-0 estimate on levels 1-3.
-
-All selected coders decode at table-lookup speed; decode time is flat across
-levels by design.
-
-### Binary-tree mode
-
-`--bt` swaps the hash chain for an LZMA-style binary-tree match finder over a
-cyclic window.
-
-- Tree slots are indexed by `position % min(window, input_size)`.
-- A descent stops when a candidate falls outside the configured window.
-- Memory stays proportional to `--window`, not to the whole input.
-- Set `--window` as large as the block to search the full block.
-- Level 7 searches `p + 1` without inserting it and defers the current match
-  when the next path is cheaper per byte or exposes an equal-length rep match.
-
-### Optimal parser
-
-`--optimal` (and levels 8–9 by preset) enables bounded dynamic-programming
-parsing. It scores literals, useful match lengths, and repeat-offset matches,
-then reconstructs the lowest-cost token sequence. On the tree levels the DP's
-candidates come from the cyclic binary tree itself: advancing a position both
-inserts it and yields each improving (length, distance) pair met during the
-descent, so a bounded search surfaces several distinct lengths at their nearest
-distances — substantially better parses than hash-chain candidates for the
-same work.
+Levels 1–7 parse greedily with optional lazy deferral. Levels 8–9 run a bounded
+dynamic-programming optimal parser whose candidates come from the binary tree
+itself: advancing a position both inserts it and yields each improving
+`(length, distance)` pair met during the descent, so one bounded search
+surfaces several distinct lengths at their nearest distances.
 
 Two effort shapes exist:
 
-- **Single-pass** (levels 8–9): measure the cost model from the greedy parse the
-  block encoder already computed, then run the DP once. Level 9 raises the tree
+- **Single-pass** (levels 8–9): take the cost model from the greedy parse the
+  block encoder already computed, then run the DP once. Level 9 raises tree
   depth, window, block, and maximum-match limits.
-- **Two-pass** (explicit `--optimal` on presets that do not override it): parse
-  with fixed weights, measure the output streams, re-parse with measured entropy
-  costs, and keep whichever fully encoded result is smaller.
+- **Two-pass** (explicit `--optimal`): parse with fixed weights, measure the
+  output streams, re-parse with measured entropy costs, and keep whichever
+  fully encoded result is smaller.
 
-Use `--optimal-depth` and `--optimal-candidates` only when benchmarking or
-deliberately trading runtime for ratio (deeper descents keep helping slightly).
+Level 1 is deliberately not an LZMA clone. Its hot path is a fixed-probe row
+hash parser over independent blocks plus repeat-offset tokens; it must not
+depend on the tree matcher, optimal parser, or a probability model to hit its
+speed target.
 
-## Benchmarking
+### Entropy coding
 
-The standing corpora are **enwik8** (100 MB of English Wikipedia text, the
-de-facto LZMA-class ratio benchmark) and the **Silesia corpus** (~212 MB of
-mixed text/binary/medical/database data, benchmarked as a single tar, which is
-what zstd and most modern codecs report against). `tools\bench_enwik8.ps1`
-downloads enwik8 on first run, sweeps Axiom's match finders and window sizes,
-and verifies every row by round-trip before reporting a ratio.
+After parsing, LZ77 data is split into separate streams — commands, literal
+lengths, match lengths, distances or distance slots plus footer bits, and
+literals. Each stream is then coded by:
 
-The cross-codec harness (`bench/bench_codecs.py`) compares Axiom levels against
-available LZ4, zstd, Deflate, bzip2, LZMA2, and WinRAR RAR5 profiles. For folders
-it builds a deterministic byte stream of relative paths and file bytes, then
-feeds that same stream to every codec. Each reported row is restored and compared
-byte-for-byte, keeping multi-file container differences out of codec measurements.
+- byte-level canonical **Huffman**;
+- a **4-lane interleaved order-0 rANS**; or
+- a **clustered static order-1 rANS** — previous-byte contexts grouped into at
+  most 16 transmitted frequency tables plus a context map, decoding with the
+  same interleaved table-lookup loop as order-0.
 
-The native GUI benchmark follows the same codec-focused rule without creating a
-temporary workspace. Generated corpora are filled directly into a resident byte
-vector. A custom file is preloaded once; custom folders become a deterministic,
-sorted stream of relative UTF-8 paths, lengths, and file contents. Timed passes
-call the in-memory AXC `compress()` and `decompress()` APIs, retain source,
-archive, and restored buffers in RAM, and compare the result byte-for-byte after
-each pass. Disk reads during custom-input preparation are never part of timing.
+On the speed levels streams go straight to order-0 rANS. On the ratio levels
+every coder competes per substream and the smallest wins. Both rANS encoders
+use precomputed reciprocals in their hot loops instead of per-symbol division.
+
+A Fenwick-backed adaptive order-1 range coder remains *decodable* for older
+archives but is no longer emitted — it decoded roughly 30x slower for a
+fraction of a percent. An earlier bit-serial order-0 arithmetic coder was
+removed outright once rANS superseded it.
+
+Before entropy-coding a sequence candidate, its stream estimate is compared
+with the best exact legacy size; a candidate that cannot plausibly win is
+rejected after analysis. Fast-entropy presets share one token-analysis pass
+between layouts and skip the legacy bake-off only when the completed payload
+already beats a sampled conditional-entropy estimate.
+
+### Reversible transforms
+
+The transform layer supports independently reset:
+
+| ID | Transform |
+|---:|---|
+| 1 | x86/x64 relative-branch conversion |
+| 2 | Byte-delta over a stride |
+| 3 | 16-bit numeric: left/2D predictor, signed-residual zigzag, byte-plane shuffle |
+
+PE, x86 ELF, PCM WAV, and uncompressed BMP signatures provide candidate hints.
+Direct AXC compression also validates POSIX tar headers, inspects x86 ELF
+payloads inside one nested tar, and entropy-screens both raw inputs and
+individual tar members for the numeric transform.
+
+A fast trial encode enables the resulting ranges only when they beat the
+unfiltered representation. AXAR supplies per-file ranges and disables
+block-wide auto-detection when none of its files qualify, which stops a
+predictor from crossing solid-block file boundaries. The final AXC CRC always
+authenticates the original bytes.
+
+### Block format history
+
+Each block independently picks store, raw LZ77, Huffman-coded LZ77, the level-1
+`fast_lz` format, or split-stream LZ77. Every representation below competes in
+the same per-block bake-off, and a newer one ships **only when its complete
+payload is strictly smaller**.
+
+| AXC | Adds | Still decodable |
+|---:|---|---|
+| 4 | Canonical fixed 32-byte header | ✓ |
+| 5 | Bounded transform-metadata section | ✓ |
+| 6 | Sequence-oriented payload: logarithmic length codes, recent-distance slots, previous-byte literal lanes, optional rep0-XOR residual | ✓ |
+| 7 | Hybrid: legacy split command/length/distance streams with v6 literal lanes; transform id 3 | ✓ |
+| 8 | Slot-context distance-footer coding; static match-byte and full-previous-byte literal modes | ✓ |
+| 9 | Parser-checkpoint context-split blocks (current native output) | ✓ |
+| 10 | External-codec envelope for Zstandard, LZMA2, and Deflate | ✓ |
+
+Notable details:
+
+- **v8 footers.** Short distance footers are coded completely; longer distances
+  keep high bits packed and code the low four alignment bits with four-lane
+  rANS tables selected by the distance slot. The decoder derives the context
+  sequence from already-decoded slots, so it stays bounded and search-free.
+- **v8 literals.** Match-byte mode XORs the first literal after a match with
+  its rep0 byte into one of eight lanes chosen by that byte. Full-previous mode
+  instead maps all 256 preceding-byte values to at most 16 encoder-chosen
+  clusters, one static stream each. Decoding is one map lookup and one bounded
+  stream read per literal — nothing learns, nothing searches.
+- **v9 checkpoints.** Roughly 2 MiB parser tiles retain the full block match
+  window but end at token boundaries, so their optimal DPs are independent. A
+  zero-output checkpoint command carries four descriptors that install the
+  recent-distance table before the next tile. Decode performs four bounded
+  descriptor reads and table assignments.
+- **v10 envelope.** Splits input into independently decodable chunks, records
+  exact raw and encoded sizes, and permits a stored fallback per chunk. The
+  decoder validates geometry and total restored size before invoking a backend,
+  allocates only the header-declared bounded output, requires exact input
+  consumption, and rejects trailing data. Chunk boundaries are also the
+  pause/cancel and progress checkpoints, keeping progress independent of
+  backend callback frequency.
+
+Level-9 automatic block planning recognizes validated POSIX ustar members and
+uses their boundaries as static match-window and entropy-table reset points.
+Large members are split below the normal thread-derived budget and small
+adjacent members are coalesced. The parallel block table has always carried
+each block's original length, so variable boundaries need no new decoder
+representation.
+
+### SIMD
+
+Vectorized where it measurably pays: BLAKE3 hashing (SSE2 through AVX-512,
+runtime dispatched by CPUID), PCLMULQDQ-folded CRC-32, and SWAR match
+comparison. Integrity hashing and CRC are the vectorized hot spots. The
+matchers are scalar by measurement, not by omission.
+
+### Long-term direction
+
+The intended shape of the codec is a hybrid: LZ77-family local matching, long
+distance references across solid groups, optional trained dictionaries,
+transform tokens for structured formats, optimal parsing driven by estimated
+entropy cost, rANS for the practical high-ratio mode, and context-mixed literal
+coding reserved for a max-ratio research mode.
+
+Future block headers should add a dictionary identifier, codec parameters,
+per-block checksums, and an optional seek index.
+
+## Container
+
+The binary layout is specified in [FORMAT.md](FORMAT.md). This section covers
+the code structure above it.
+
+### Archive API
+
+The `.axar` API deliberately separates archive storage from file-manager
+presentation. Beyond create, list, test, and extract it exposes
+destination-aware insertion (`ArchiveInput`), selective extraction,
+metadata-only entry moves (`ArchiveMove`), add/update/freshen/sync/delete/
+repack, comments and locking, and encryption-mode queries.
+
+All mutating operations write a temporary archive and replace by rename. They
+honor `OperationControl` and reject locked archives. Block-encrypted archives
+are editable with the password; directory-encrypted archives are read-only.
+
+### Providers
+
+Archive browsing goes through a built-in provider layer:
+
+| Provider | Capability |
+|---|---|
+| `axar` | Full read/write; adapts the archive API without changing format or behavior |
+| `zip` | miniz-backed browse, test, extract, create, add, update, sync, delete, move. New encrypted ZIPs use WinZip AES-256. Existing encrypted ZIPs are read-only. Unchanged plaintext entries are cloned into an atomically rewritten ZIP |
+| `system-readonly` | Windows only. Loads `7z.dll` directly for 7z, RAR/RAR5, hybrid ISO/UDF, and CAB; uses `tar.exe` for the TAR family. Never advertises create, update, delete, or move |
+
+The GUI asks a provider for format identity and file-type text, capability
+flags (list, extract, test, update, comments, encryption, recovery,
+signatures, SFX), directory entries, and the test/extract/write operations.
+Commands are enabled from those flags rather than failing late.
+
+This layer is **plug-in-shaped but not externally pluggable**. New formats
+should land as compiled-in providers first, so the capability model, password
+prompts, drag/drop behavior, and command enabling can stabilize before
+committing to a public C ABI, DLL loading policy, sandboxing story, and
+third-party parser trust model.
+
+Pure ISO9660/Joliet browsing uses Axiom's native directory reader for immediate
+display; hybrid media use the authoritative UDF catalog from the DLL. The DLL
+adapter consumes structured properties and callbacks rather than launching a
+helper process or parsing console text.
+
+ZIP vendors miniz 3.1.1 for a small, build-system-friendly container
+reader/writer and Deflate implementation. zlib-ng is a reasonable future
+Deflate backend candidate if profiling shows miniz's codec path is the
+bottleneck, but it is not a ZIP container layer. A privately namespaced
+minizip-ng 4.2.2 core creates and reads standard `.z01`, `.z02`, …, `.zip`
+sets, raw-copying completed entries so Deflate data, metadata, CRCs, and AES
+ciphertext survive intact.
+
+The per-format roadmap is in
+[docs/FORMAT_SUPPORT.md](docs/FORMAT_SUPPORT.md).
+
+### Services
+
+- **Signatures** cover exact stored block bytes and canonical directory
+  semantics.
+- **SFX** appends an intact AXAR or ZIP plus a fixed trailer to a dedicated
+  read-only native module. The module ships as `AxiomSfx.bin`, is never exposed
+  as a separate executable, and is read only during SFX creation.
+- **POSIX metadata** rides in a skippable entry TLV.
+- **Recovery records** use the portable Reed-Solomon core and protect the
+  archive through the end of the central directory. Repair is atomic.
+- **Volumes** are numbered data parts plus optional `.revNNN` parity volumes.
+  Joining validates the reconstruction with BLAKE3 before installing it.
+
+Recovery creation for a staged archive is stripe-bounded: it reads 64 KiB
+slices across the data shards, encodes independent parity rows on the operation
+worker pool, and spools parity until per-shard CRCs are known. This avoids
+holding the complete protected archive in memory and avoids copying it to a
+second temporary file, while keeping the bytes recovery-service version 1
+compatible.
+
+Complete AXAR data-volume sets are exposed through a segmented random-access
+source, so list, test, and extract work on the numbered files without creating
+a joined archive. Missing data parts fall back to Reed-Solomon reconstruction.
+
+Synchronization is one archive transaction: the source is scanned once and
+compared with one loaded catalogue, unchanged compressed blocks are copied
+verbatim, changed and new entries are compressed once, and stale entries are
+omitted from the final directory. Comment, lock, and signature metadata fold
+into that directory before recovery is generated. The completed temporary
+archive receives one recovery record and is atomically installed. A no-change
+sync returns without touching the archive.
+
+## Threading
+
+### Worker model
+
+`thread_count == 0` means "use the machine": both compression and decode expose
+every logical processor to the shared work-stealing executor. Compression block
+geometry is a separate decision that targets the *physical* core count, so
+adding SMT helpers does not silently halve blocks and weaken ratio. Explicit
+thread counts are honored as given.
+
+The codec caps long-running outer block jobs to the block count while spare
+workers steal nested parser, candidate-layout, Huffman, split-layout, and
+entropy tasks. Tiny single-block inputs stay serial to avoid thread startup
+cost. The pool is sized with `size_t` and OS topology discovery rather than a
+fixed 32-thread mask, so the model covers AMD SMT, Intel hybrid parts, and
+machines with more than 32 processors across multiple processor groups.
+
+### Block sizing
+
+Two layers:
+
+- Archive **solid blocks** group file bytes for cross-file compression and
+  selective extraction.
+- The single-stream codec can split a solid block into independently compressed
+  **sub-blocks**.
+
+By default the archive layer raises the target solid-block size to at least
+`hardware_threads × 1 MiB` when multiple workers are available, and the codec
+layer then shrinks the internal block size as needed, down to a 1 MiB minimum
+of useful work. One large solid block can therefore still feed many workers.
+An explicit `--block-size` disables this for repeatable tuning runs.
+
+Parallel blocks are independent by design, which sacrifices cross-block
+matches. The archive selector still keeps the smallest single-stream result
+where ratio beats block-level parallelism; fast levels prefer the parallel
+result for large multi-block inputs, because the serial whole-input parse is
+otherwise the dominant bottleneck.
+
+Parallel encode and decode compute per-block CRCs on the worker threads and
+combine them, avoiding a serial full-buffer CRC pass after the payload is
+already available.
+
+### Swarm
+
+The opt-in swarm model segments a greedy parse at fixed, thread-count-
+independent boundaries. It builds immutable per-segment indexes, searches
+completed earlier segments for full-window reach, emits explicit distances, and
+serially restores repeat-offset tokens.
+
+Levels 2–6 use the cooperative hash-chain path directly. Level 1 can trade its
+byte-token fast path for that better-ratio parser. Levels 8–9 use a local
+binary tree plus prior-segment hash indexes for the preliminary greedy
+candidate while keeping the global optimal DP intact. Level 7's path-dependent
+lazy tree parse is not segmented.
+
+### Level-9 pipeline
+
+At level 9, global tree discovery and path selection form an exact bounded
+pipeline automatically, independent of `--swarm`. The ordered tree publishes
+the same candidate sequence as the direct parser in fixed 256 KiB tiles while
+the DP consumes the preceding tile. Each tile is a task on the shared executor;
+if all helpers are busy, the waiting consumer cooperatively executes its own
+next tile. Only the current and next reservoirs are live, and the resulting
+tokens are byte-identical across schedules and thread counts.
+
+Level 8 retains the direct parser because its depth-16 tree is too cheap to
+amortize tile materialization; custom optimal depths of at least 32 opt in.
+
+The level-9 DP keeps only a `max_match + 1` ring of 64-bit frontier costs, and
+its reconstruction state uses 32-bit distances with an explicitly 8-byte
+decision record. These are encoder-memory changes only — the same costs,
+decisions, tokens, and archive bytes are selected. On enwik9 they reduced peak
+commit from 65.66 GiB to 39.55 GiB and improved compression from 130.79 s to
+117.85 s on a 16-core/32-thread Ryzen 9 5950X.
+
+The high-level DP remains ordered because its frontier and repeat-offset state
+depend on the chosen prior path. A per-segment DP was attempted and rejected —
+it lost both ratio and throughput. The AXC v9 checkpoint candidate relaxes that
+dependency without hiding it: each fixed tile receives encoder-chosen static
+rep state and forbids tokens from crossing its end, making tile DPs independent
+and scalable. Because the ordinary global DP is still encoded and compared,
+checkpoint framing can never worsen a written block.
+
+### Progress and cancellation
+
+`OperationControl` is the single source of progress truth. Producers publish a
+coherent snapshot containing stage bytes, item counts, current path, per-file
+bytes, an optional operation-wide phase index and count, a dedicated throughput
+counter, and archive-output and source-byte counters for live size and ratio.
+The phase coordinates let the GUI render one non-resetting overall bar across
+scanning, comparison, unchanged-block copying, compression, recovery, and
+atomic commit while keeping exact phase-local counters.
+
+Reading, compression, and ordered writing share one monotonic byte epoch:
+reports are normalized under the snapshot writer lock, so a delayed producer
+cannot move the overall bar backwards. Numeric fields use a sequence-guarded
+atomic snapshot; paths are replaced atomically only when they change. Reports
+coalesce at 1 MiB unless a stage, item, total, file, or completion boundary
+changes, so telemetry never becomes an inner-loop bottleneck.
+
+Progress stays continuous inside multi-second encodes. The parse loops tick a
+fractional `encode_progress` hook every 256 KiB of scanned input,
+`compress_block` maps each pass into a share of its block's wall time, the
+parallel block codec sums per-worker in-flight fractions, and the archive
+writer sums per-solid-block contributions across concurrent jobs rather than
+using a shared high-water mark. On a level-9 Silesia archive the worst gap
+between advances is about 0.6 s with steps under 2 MB, where a whole solid
+block previously arrived at once.
+
+Cancellation throws `OperationCancelled` and leaves no partial output — writes
+are atomic. The unpaused checkpoint path is an atomic fast path.
+
+## GUI boundary
+
+The Win32 thread owns windows, menus, dialogs, input routing, and presentation
+only. Archive identification, provider capability probes, catalog loading,
+comments, recovery metadata, signature verification, SFX and split-volume
+inspection, and every archive operation run on workers. Results return as
+owned, typed messages; closing the main window invalidates the shared lifetime
+token and drains queued payloads.
+
+Operation threads never paint, format status text, query HWNDs, inspect a
+growing output file, or enqueue progress messages. The GUI samples the
+`OperationControl` snapshot at its own cadence, computes rate and ETA from a
+rolling phase-local window, and repaints a liveness heartbeat even when an
+external backend is between checkpoints. The `7z.dll` adapter publishes
+structured progress and per-file write callbacks into the same atomic snapshot.
+
+Editable controls declare their expected type or unit in the visible label and
+share a tooltip contract for ranges, examples, and side effects. Integer,
+byte-size, and hexadecimal controls share character and paste filters, but
+submission validation remains authoritative — it checks full syntax, numeric
+ranges, processor limits, required existing paths, and HTTP/HTTPS URLs before
+any setting or operation is accepted. Text and path controls have explicit
+length limits so native control storage cannot become an unbounded input.
+
+The GUI delegates system light/dark detection, High Contrast behavior, native
+title bars, control theme classes, and setting-change invalidation to the
+sibling `Wimukthi.Win32Theme` framework, while owning its accent selection,
+semantic colors, custom menus, and owner-drawn archive controls.
+
+### Drag and drop
+
+The file list implements `IDataObject`, `IDropSource`, and `IDropTarget`.
+Drag-out materializes selected entries only when a shell target actually
+requests `CF_HDROP`, avoiding extraction work before Explorer needs the files.
+
+Drag-out has two telemetry phases. The provider first extracts entries into
+Axiom's private staging directory. After the drop is accepted, the OLE
+`CFSTR_FILECONTENTS` streams are wrapped by a read-only counting `IStream` that
+reports bytes actually consumed by the shell, the current relative path, and
+completed-file counts, publishing at 1 MiB or file boundaries without
+rescanning or recopying. Transfer cancellation is checked on every stream read.
+Pause is intentionally unavailable here, because an OLE stream call may be
+dispatched on the source STA and blocking it would also block the Resume UI.
+
+## Benchmarking infrastructure
+
+The standing corpora are **enwik8** and the **Silesia corpus**, benchmarked as
+a single tar the way zstd and most modern codecs report.
+
+`bench/bench_codecs.py` compares Axiom levels against available LZ4, zstd,
+Deflate, bzip2, LZMA2, and WinRAR RAR5 profiles. For folders it builds a
+deterministic byte stream of relative paths and file bytes, then feeds that
+same stream to every codec, so multi-file container differences stay out of
+codec measurements. Every reported row is restored and compared byte-for-byte.
+
+The GUI benchmark follows the same codec-focused rule without a temporary
+workspace: generated corpora fill a resident byte vector, a custom file is
+preloaded once, and custom folders become a deterministic sorted stream of
+relative UTF-8 paths, lengths, and contents. Timed passes call the in-memory
+`compress()` and `decompress()` APIs and compare byte-for-byte after each pass.
+
+Usage is documented in [docs/BENCHMARKING.md](docs/BENCHMARKING.md); published
+results are in [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
 
 ### Compression prognosis
 
-`estimate_compression_curve()` is the shared multi-level estimator used by the
-Add-to-archive dialog. It scans the selected inputs once, plans one set of
+`estimate_compression_curve()` is the shared multi-level estimator behind the
+Add-to-archive preview. It scans the selected inputs once, plans one set of
 representative regions, reads and transforms each region once, then evaluates
 every requested codec level against those identical bytes. Each point carries
 projected archive bytes, ratio, saving, confidence interval, sample coverage,
 and completion counters. A point is never compared with another point sampled
 from a different part of the input.
 
-The estimator is cooperative rather than GUI-aware. It reports immutable curve
+The estimator is cooperative rather than GUI-aware: it reports immutable curve
 snapshots through a callback and checks `OperationControl` between bounded
-probes. The Win32 dialog owns debounce, cancellation, session caching, and
-painting: settings that change the codec restart the worker after a short quiet
-period, while a level-only change moves the selected marker immediately. No
-estimation worker reads HWND state or paints directly.
+probes. The dialog owns debounce, cancellation, session caching, and painting.
+No estimation worker reads HWND state or paints directly.
 
-## Decoder Rule
-
-The encoder is allowed to be expensive. The decoder is not.
+## Decoder rule
 
 Any new feature must keep decompression deterministic and bounded:
 
-- No search during decompression.
-- No machine-learning inference during decompression.
-- Clear maximum memory from the block header.
-- Reject malformed distances, sizes, and checksums.
+- **No search** during decompression.
+- **No machine-learning inference** during decompression.
+- **Clear maximum memory**, derivable from the block header.
+- **Reject** malformed distances, sizes, and checksums.
 
-## Threading
-
-### GUI responsiveness and progress telemetry
-
-The Win32 thread owns windows, menus, dialogs, input routing, and presentation
-only. Archive identification, provider capability probes, catalog loading,
-comments, recovery metadata, signature verification, SFX/split-volume
-inspection, and all archive operations run on workers. Results return as owned,
-typed messages; closing the main window invalidates the shared lifetime token and
-drains any already-queued payloads.
-
-Editable Win32 controls declare their expected type or unit in the visible label
-and use a shared tooltip contract for ranges, examples, and side effects. Integer,
-byte-size, and hexadecimal controls also use shared character/paste filters, but
-submission validation remains authoritative: it checks full syntax, numeric
-ranges, processor limits, required existing paths, and HTTP/HTTPS URLs before any
-setting or operation is accepted. Text and path controls have explicit length
-limits so native control storage cannot become an accidental unbounded input.
-
-`OperationControl` is also the single source of progress truth. Producers publish
-a coherent snapshot containing stage bytes, item counts, current path, per-file
-bytes, an optional operation-wide phase index/count, a dedicated throughput
-counter, and archive-output/source-byte counters for the live archive size and
-ratio. The phase coordinates let the GUI render one non-resetting overall bar
-across source scanning, comparison, unchanged-block copying, compression,
-recovery, and atomic commit while retaining exact phase-local counters. Archive
-creation advances throughput while
-reading small files into its first solid block, then switches it to codec
-progress, so speed never falsely remains at zero while useful work is advancing.
-Reading, compression, and ordered writing share one monotonic byte epoch: reports
-are normalized under the snapshot writer lock so a delayed producer cannot move
-the overall bar backwards, while a new path may still reset the per-file bar.
-Numeric fields use a sequence-guarded atomic snapshot and paths are replaced
-atomically only when they change. Reports are coalesced at 1 MiB unless a stage,
-item, total, file, or completion boundary changes, so telemetry cannot become an
-inner-loop throughput bottleneck.
-
-Progress stays continuous even inside multi-second encodes: the parse loops
-(greedy chains, tree matcher, and both optimal-parser passes) tick a fractional
-`encode_progress` hook every 256 KiB of scanned input, `compress_block` maps
-each pass into a rough share of its block's wall time, the parallel block codec
-sums per-worker in-flight fractions into the byte-progress channel, and the
-archive writer sums per-solid-block contributions across its concurrent jobs
-(never a shared high-water mark, which would collapse concurrent blocks into
-block-sized jumps). Measured on a level-9 Silesia archive: the worst gap
-between progress advances is ~0.6 s and steps stay under 2 MB, where a whole
-solid block previously arrived at once.
-
-GUI progress windows and the interactive CLI poll this snapshot; operation
-threads never paint, format status text, query HWNDs, inspect a growing output
-file, or enqueue progress messages. The GUI samples at its own cadence, computes
-rate and ETA from a rolling phase-local window, displays compressed size and
-source-to-archive ratio as independent fields, and repaints a liveness heartbeat
-even when an external backend is between measurable checkpoints. The bundled
-`7z.dll` adapter publishes structured progress and per-file write callbacks
-directly into the same atomic snapshot. Pause and cancellation retain their
-cooperative `OperationControl` checkpoints; the unpaused checkpoint path is an
-atomic fast path.
-
-Archive drag-out has two explicit telemetry phases. The provider first extracts
-selected entries into Axiom's private staging directory. After the drop is
-accepted, the OLE `CFSTR_FILECONTENTS` streams are wrapped by a read-only
-counting `IStream`; this reports bytes actually consumed by the shell, the
-current relative path, and completed-file counts while Explorer writes the drop
-destination. The wrapper does not rescan or recopy data and publishes at 1 MiB
-or file boundaries. Transfer cancellation is checked on every stream read;
-pause is intentionally unavailable for this phase because an OLE stream call
-may be dispatched on the source STA and blocking it would also block Resume UI.
-
-`thread_count == 0` means "use the machine": both compression and decode expose
-all logical processors to the shared executor. Compression block geometry is a
-separate decision and targets the physical-core count, so adding SMT helpers
-does not silently halve blocks and weaken ratio. Explicit thread counts are
-honored as given. The codec caps long-running outer block jobs to the block
-count, while spare workers can steal nested parser, candidate-layout, Huffman,
-split-layout, and entropy tasks. Tiny single-block inputs stay serial to avoid
-paying thread startup cost. The pool is sized with `size_t` and operating-system
-topology discovery rather than a fixed 32-thread mask, so the model applies to
-AMD SMT, Intel SMT/hybrid systems, and machines with more than 32 processors.
-
-There are two block-sizing layers:
-
-- Archive solid blocks group file bytes for cross-file compression and selective
-  extraction.
-- The single-stream codec can split a solid block into independently compressed
-  sub-blocks.
-
-By default, the archive layer raises the target solid-block size to at least
-`hardware_threads * 1 MiB` when multiple workers are available. The codec layer
-then shrinks the internal block size as needed, down to 1 MiB minimum useful
-work, so one large solid block can still feed many compression workers. Supplying
-an explicit `--block-size` disables this automatic sizing for repeatable tuning
-runs.
-
-This removes the old one-block/one-thread ceiling for entropy work without
-changing block boundaries or candidate selection. The opt-in swarm model also
-segments a greedy parse at fixed, thread-count-independent boundaries. It builds
-immutable per-segment indexes, searches completed earlier segments for
-full-window reach, emits explicit distances, and serially restores repeat-offset
-tokens. Levels 2-6 use the cooperative hash-chain path directly; level 1 can
-explicitly trade its byte-token fast path for that better-ratio parser. Levels
-8-9 use a local binary tree plus prior-segment hash indexes for their preliminary
-greedy candidate, but keep the global optimal DP intact. Level 7's path-dependent
-lazy tree parse is not segmented.
-
-At level 9, global tree discovery and path selection form an exact bounded
-pipeline automatically. The ordered tree publishes the same candidate sequence
-as the direct parser in fixed 256 KiB tiles while the DP consumes the preceding
-tile. Each tile is a separate task on the shared work-stealing executor; if all
-helpers are busy with other blocks, the waiting consumer cooperatively executes
-its own next tile.
-Only the current and next candidate reservoirs are live, bounding extra memory,
-and the resulting tokens are byte-identical across schedules and thread counts.
-Level 8 retains the direct parser because its depth-16 tree is too cheap to
-amortize tile materialization; custom optimal depths of at least 32 opt in.
-
-The level-9 DP also keeps only a `max_match + 1` ring of 64-bit frontier costs.
-Its full-input reconstruction state uses 32-bit distances and an explicitly
-8-byte decision record. These are encoder-memory changes only: the same costs,
-decisions, tokens, and archive bytes are selected. On enwik9 this reduced peak
-commit from 65.66 GiB to 39.55 GiB and improved compression from 130.79 s to
-117.85 s on a 16-core/32-thread Ryzen 9 5950X.
-
-The high-level DP remains ordered because its frontier and repeat-offset state
-depend on the chosen prior path. An attempted per-segment DP lost both ratio and
-throughput and was rejected. The exact pipeline overlaps the independent tree
-stage without pretending the DP itself is parallel; scaling that final stage
-further still requires a path-equivalent parallel formulation.
-
-The version-9 checkpoint candidate relaxes that last dependency without hiding
-it: each fixed tile receives encoder-chosen static rep state and forbids tokens
-from crossing its end, making the tile DPs independent and scalable through the
-shared executor. Global literal and distance entropy streams are retained after
-the tile tokens are concatenated. Because the ordinary global DP is still
-encoded and compared, checkpoint framing can never worsen a written block.
-
-Parallel blocks are independent by design: each block picks store, raw LZ77,
-Huffman-coded LZ77, the level-1 `fast_lz` format, or split-stream LZ77 whose
-substreams can use store, Huffman, **order-0 rANS**, or the **clustered static
-order-1 rANS** (previous-byte contexts grouped into at most 16 transmitted
-tables plus a context map; decodes with the same interleaved table-lookup loop
-as order-0). On the speed levels streams go straight to order-0 rANS; on the
-ratio levels every coder competes per substream and the smallest wins. The
-legacy adaptive order-1 range coder remains decodable but is never emitted.
-
-The container-level block payload records enough sizes for deterministic
-reconstruction. Parallel-block encode and decode also compute per-block CRCs on
-the worker threads and combine them, avoiding a serial full-buffer CRC pass after
-the selected payload is already available. This keeps the format identical while
-removing a CPU-scaling bottleneck.
-
-This sacrifices cross-block matches when the parallel codec is selected, so the
-archive selector still keeps the smallest single-stream result for cases where
-ratio wins over block-level parallelism. Fast non-thorough levels prefer the
-parallel result for large multi-block inputs because the serial whole-input parse
-is otherwise the dominant bottleneck.
+In practice this means new ratio work ships as encoder-chosen static structure
+— cluster maps, slot contexts, checkpoint descriptors — that the decoder
+replays with table lookups. Every such representation must also win the exact
+complete-payload bake-off against the incumbent before it is ever written.

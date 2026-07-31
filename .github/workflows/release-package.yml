@@ -58,6 +58,7 @@ jobs:
           Copy-Item -LiteralPath ".\out\Release\AxiomSfx.bin" -Destination $stage
           Copy-Item -LiteralPath ".\out\Release\backends" -Destination (Join-Path $stage "backends") -Recurse
           Copy-Item -LiteralPath ".\README.md" -Destination $stage
+          Copy-Item -LiteralPath ".\CHANGELOG.md" -Destination $stage
           Copy-Item -LiteralPath ".\CLI_GUIDE.md" -Destination $stage
           Copy-Item -LiteralPath ".\ARCHITECTURE.md" -Destination $stage
           Copy-Item -LiteralPath ".\FORMAT.md" -Destination $stage

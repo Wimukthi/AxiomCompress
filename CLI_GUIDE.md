@@ -1,800 +1,290 @@
-# Axiom Command-Line Guide
+# axiomc — command-line guide
 
-`axiomc` is Axiom's command-line archiver. It works with `.axar` multi-file
-archives and `.axc` single-stream compressed files. This guide documents the
-commands implemented by the current CLI. See [FORMAT.md](FORMAT.md) for the binary
-format.
+`axiomc` is Axiom's command-line archiver. It handles `.axar` multi-file
+archives and `.axc` single-stream files, and it drives the same engine as the
+[Windows GUI](docs/GUI_GUIDE.md).
 
-## How to use this guide
+```text
+axiomc <command> [options] <archive> [paths...]
+```
 
-If you only need the normal archive workflow, read these sections first:
+Options may appear before or after positional paths.
 
-1. [Getting started](#getting-started)
-2. [Create or add files](#create-or-add-files-a-add)
-3. [List, test, and extract](#list-test-and-extract)
-4. [Compression options](#compression-options)
+> **Paths after an archive name are paths *inside* the archive**, not
+> filesystem paths, and they use forward slashes. Run `axiomc l <archive>` to
+> see the exact stored paths before deleting, moving, or selectively extracting.
 
-The later sections cover maintenance features such as comments, locking,
-recovery records, split volumes, signing, SFX creation, and the lower-level
-single-stream `.axc` commands.
+## Contents
 
-Important rule: paths after an archive name are usually paths **inside the
-archive**, not Windows filesystem paths. Use `axiomc l archive.axar` to see the
-exact archive paths before deleting, moving, or selectively extracting entries.
+- [Getting started](#getting-started)
+- [Interactive shell](#interactive-shell)
+- [Command reference](#command-reference)
+  - [Creating and updating](#creating-and-updating)
+  - [Reading](#reading)
+  - [Maintenance](#maintenance)
+  - [Recovery and volumes](#recovery-and-volumes)
+  - [Signing](#signing)
+  - [Self-extracting archives](#self-extracting-archives)
+  - [Single-stream files](#single-stream-files)
+- [Compression options](#compression-options)
+- [Encryption](#encryption)
+- [Exit codes](#exit-codes)
+- [Recipes](#recipes)
 
 ## Getting started
 
-After a Visual C++ Release build, the executable is
-`out\Release\axiomc.exe`. From the repository root in PowerShell:
+After a Release build the executable is `out\Release\axiomc.exe`.
 
 ```powershell
-$axiom = ".\out\Release\axiomc.exe"
-& $axiom a backup.axar Documents
-& $axiom l backup.axar
-& $axiom t backup.axar
-& $axiom x backup.axar restored
+axiomc a backup.axar Documents    # create
+axiomc l backup.axar              # list
+axiomc t backup.axar              # test
+axiomc x backup.axar restored     # extract
 ```
 
-If `axiomc.exe` is on `PATH`, use `axiomc` directly. Quote paths containing
-spaces:
+Quote paths containing spaces:
 
 ```powershell
 axiomc a "D:\Backups\Work files.axar" "D:\Work files"
 ```
 
-Options may appear before or after positional paths, although putting options
-first is easier to read.
+Input directories are added recursively. An input is stored relative to its
+parent, so adding `D:\Data\Reports` creates a top-level `Reports/` entry.
 
 ## Interactive shell
 
-Launching `axiomc` without arguments opens an interactive prompt instead of
-printing usage and closing:
-
-```powershell
-axiomc
-```
-
-The prompt shows the Axiom ASCII logo, then accepts the same commands documented
-below without the leading `axiomc`:
+Running `axiomc` with no arguments opens a prompt instead of printing usage and
+exiting. `axiomc shell` and `axiomc --interactive` do the same thing
+explicitly.
 
 ```text
 axiom> a backup.axar "D:\Work files"
 axiom> l backup.axar
-axiom> t backup.axar
-axiom> x backup.axar restored
 axiom> exit
 ```
 
-You can also enter the prompt explicitly with `axiomc shell` or
-`axiomc --interactive`. Command-line mode remains script-friendly: when arguments
-are supplied, Axiom runs the command and exits normally without the splash.
+Commands are typed without the leading `axiomc`. Built-ins:
 
-Prompt helpers:
+| Command | Effect |
+|---|---|
+| `help` | Print the full command help |
+| `pwd` | Print the working directory |
+| `cd <dir>` | Change the working directory |
+| `clear`, `cls` | Clear the console |
+| `exit`, `quit` | Close the prompt |
 
-- `help` prints the full command help.
-- `pwd` prints the current working directory.
-- `cd <dir>` changes the working directory.
-- `clear` clears the console.
-- `exit` or `quit` closes the prompt.
+With arguments supplied, `axiomc` stays script-friendly: it runs the command,
+prints no splash, and exits.
 
-## Command overview
+## Command reference
 
 | Command | Purpose |
 |---|---|
-| `a`, `add` | Create an archive, or add/replace entries |
-| `u`, `update` | Add new entries and replace newer entries |
-| `f`, `fresh` | Replace newer existing entries without adding new ones |
-| `s`, `sync` | Mirror source inputs, including deletion |
+| `a`, `add` | Create an archive, or add and replace entries |
+| `u`, `update` | Add new entries and replace older ones |
+| `f`, `fresh` | Replace existing entries only, never add |
+| `s`, `sync` | Mirror the inputs, including deletions |
 | `delete`, `rm` | Delete entries or directory subtrees |
-| `repack` | Rebuild an archive and reclaim dead space |
-| `comment` | Display, set, or clear the archive comment |
+| `repack` | Rebuild and reclaim dead space |
+| `comment` | Show, set, or clear the archive comment |
 | `lock` | Permanently mark an archive read-only |
-| `recovery`, `rr` | Display, add, replace, or remove a recovery record |
-| `repair` | Repair protected archive damage |
-| `split` | Create numbered data and optional recovery volumes |
+| `recovery`, `rr` | Show, add, replace, or remove a recovery record |
+| `repair` | Repair damage using the recovery record |
+| `split` | Create numbered data and recovery volumes |
 | `join` | Join or reconstruct a volume set |
-| `x`, `extract` | Extract an archive |
-| `l`, `list` | List archive contents and state |
-| `t`, `test` | Decode and verify archive integrity |
+| `x`, `extract` | Extract |
+| `l`, `list` | List contents and archive state |
+| `t`, `test` | Decode and verify integrity |
 | `keygen` | Generate a signing key pair |
 | `sign` | Sign an archive |
 | `verify` | Verify an archive signature |
 | `sfx` | Build a self-extracting Windows executable |
 | `c`, `compress` | Compress one stream to `.axc` |
 | `d`, `decompress` | Decompress one `.axc` stream |
+| `help`, `-h`, `--help`, `/?` | Print help |
 
-## Common workflows
-
-### Create, verify, and extract a backup
-
-```powershell
-axiomc a backup.axar "D:\Work"
-axiomc t backup.axar
-axiomc x backup.axar "D:\Restore-test"
-```
-
-### Create an encrypted archive
-
-```powershell
-axiomc a -p "correct horse battery staple" private.axar "D:\Private"
-```
-
-Add `--encrypt-names` when filenames, sizes, and directory metadata should also
-be hidden:
-
-```powershell
-axiomc a -p "correct horse battery staple" --encrypt-names private-hidden.axar "D:\Private"
-```
-
-### Add recovery data before storing an important archive
-
-```powershell
-axiomc a important.axar "D:\Important"
-axiomc recovery important.axar 10
-axiomc t important.axar
-```
-
-### Split an archive for transfer
-
-```powershell
-axiomc split important.axar 100M 3
-axiomc join important.part001.axar restored.axar
-```
-
-## Create or add files: `a`, `add`
+### Creating and updating
 
 ```text
-axiomc a [compression-options] <archive.axar> <input>...
-axiomc add [compression-options] <archive.axar> <input>...
+axiomc a [options] <archive.axar> <input>...
+axiomc u [options] <archive.axar> <input>...
+axiomc f [options] <archive.axar> <input>...
+axiomc s [options] <archive.axar> <input>...
 ```
 
-If the archive does not exist, Axiom creates it. If it exists, Axiom adds new
-entries and replaces entries with the same archive path.
+| Command | Adds new | Replaces existing | Deletes missing |
+|---|:--:|:--:|:--:|
+| `a` (add) | ✓ | always | — |
+| `u` (update) | ✓ | if source is newer | — |
+| `f` (fresh) | — | if source is newer | — |
+| `s` (sync) | ✓ | if source is newer | ✓ |
 
 ```powershell
-# Create an archive from a directory.
 axiomc a photos.axar "D:\Photos"
-
-# Create one from several files and directories.
 axiomc a project.axar README.md src include assets
-
-# Add another file later.
-axiomc a project.axar CHANGELOG.md
-```
-
-Input directories are recursive. An input is stored relative to its parent, so
-adding `D:\Data\Reports` creates a top-level `Reports/` entry.
-
-## Update existing archives
-
-### Update: `u`, `update`
-
-```text
-axiomc u [compression-options] <archive.axar> <input>...
-```
-
-Update adds files not already present and replaces archived files only when the
-source modification time is newer.
-
-```powershell
 axiomc u project.axar src assets README.md
-```
-
-### Freshen: `f`, `fresh`
-
-```text
-axiomc f [compression-options] <archive.axar> <input>...
-```
-
-Freshen replaces newer files already in the archive. It never adds new files.
-
-```powershell
-axiomc f project.axar src
-```
-
-### Synchronize: `s`, `sync`
-
-```text
-axiomc s [compression-options] <archive.axar> <input>...
-```
-
-Synchronize mirrors the supplied inputs: it adds missing files, replaces newer
-files, and removes archived entries no longer in the source set.
-
-AXAR synchronization uses one planned transaction. Unchanged compressed blocks
-are copied without decompression, changed files are compressed once, stale
-entries are removed from the final directory, and an existing recovery record is
-rebuilt once against the completed result. A no-change synchronization exits
-without rewriting the archive. Interactive progress shows the scan, comparison,
-copy, compression, recovery, and commit phases separately.
-
-```powershell
 axiomc s mirror.axar "D:\Current project"
 ```
 
-`sync` is destructive. List and test the result before deleting an older backup.
+`sync` is destructive — list and test the result before deleting an older
+backup.
 
-## Delete entries and reclaim space
+Update, freshen, and synchronize run as one planned transaction: unchanged
+compressed blocks are copied without decompression, changed files are
+compressed once, stale entries are dropped from the final directory, and any
+existing recovery record is rebuilt once against the result. A no-change
+synchronize exits without rewriting the archive.
 
-### Delete: `delete`, `rm`
-
-```text
-axiomc delete [compression-options] <archive.axar> <archive-path>...
-axiomc rm [compression-options] <archive.axar> <archive-path>...
-```
-
-The paths after the archive name are paths inside the archive, not filesystem
-paths. Use `list` to obtain them. Archive paths use forward slashes.
-
-```powershell
-axiomc l project.axar
-axiomc delete project.axar "project/build.log" "project/cache"
-```
-
-Deleting a directory removes its complete subtree. The archive is rebuilt and
-live data is recompressed.
-
-### Repack: `repack`
-
-```text
-axiomc repack [compression-options] <archive.axar>
-```
-
-Repack rebuilds all live entries and reclaims dead space left by earlier
-replacements.
-
-```powershell
-axiomc repack --level 7 project.axar
-```
-
-## Comments and locking
-
-```powershell
-# Show the comment.
-axiomc comment project.axar
-
-# Set or replace it.
-axiomc comment project.axar "Nightly backup before migration"
-
-# Clear it with an empty text argument.
-axiomc comment project.axar ""
-
-# Permanently mark the archive read-only.
-axiomc lock project.axar
-```
-
-Locking is one-way in the current format. A locked archive can still be listed,
-tested, extracted, and verified, but cannot be edited, repacked, re-signed, or
-have its comment changed. There is no unlock command.
-
-## List, test, and extract
-
-### List: `l`, `list`
+### Reading
 
 ```text
 axiomc l [-p <password>] <archive.axar>
-```
-
-```powershell
-axiomc l project.axar
-axiomc l -p "correct horse battery staple" private.axar
-```
-
-The listing identifies directories, symbolic links, hard links, comments, lock
-and encryption state, entry count, and total uncompressed bytes.
-
-### Test: `t`, `test`
-
-```text
 axiomc t [--threads N] [-p <password>] <archive.axar>
-```
-
-Test decodes data and verifies integrity without writing extracted files.
-
-```powershell
-axiomc t --threads 0 project.axar
-axiomc t -p "correct horse battery staple" private.axar
-```
-
-### Extract: `x`, `extract`
-
-```text
 axiomc x [options] <archive.axar> [destination]
 ```
 
-The destination defaults to the current directory.
+Listing identifies directories, symbolic links, hard links, comments, lock and
+encryption state, entry count, and total uncompressed bytes. `test` decodes and
+verifies integrity without writing anything.
+
+The extraction destination defaults to the current directory. Overwrite
+behavior is explicit:
 
 ```powershell
-axiomc x project.axar restored
-axiomc x project.axar
+axiomc x --overwrite fail project.axar restored   # stop on conflict (default)
+axiomc x --overwrite skip project.axar restored   # keep existing files
+axiomc x --overwrite all  project.axar restored   # replace existing files
 ```
 
-Overwrite behavior is explicit:
+Extracted paths are contained within the destination; unsafe traversal and
+reparse-point ancestors are rejected.
+
+### Maintenance
 
 ```powershell
-# Stop if a destination exists. This is the default.
-axiomc x --overwrite fail project.axar restored
-
-# Keep existing files and extract the others.
-axiomc x --overwrite skip project.axar restored
-
-# Replace existing files.
-axiomc x --overwrite all project.axar restored
+axiomc delete project.axar "project/build.log" "project/cache"
+axiomc repack --level 7 project.axar
+axiomc comment project.axar                       # show
+axiomc comment project.axar "Nightly backup"      # set
+axiomc comment project.axar ""                    # clear
+axiomc lock project.axar
 ```
 
-For encrypted archives:
+Deleting a directory removes its whole subtree, and the archive is rebuilt so
+the space is physically reclaimed. `repack` keeps every entry and only reclaims
+dead space left by earlier replacements.
 
-```powershell
-axiomc x -p "correct horse battery staple" private.axar restored
-```
+Locking is one-way — there is no unlock command. A locked archive can still be
+listed, tested, extracted, and verified, but not edited, repacked, re-signed,
+or re-commented.
 
-Axiom contains extracted paths within the destination and rejects unsafe path
-traversal and reparse-point ancestors.
+### Recovery and volumes
 
-## Encryption
-
-Encrypt archive data blocks:
-
-```powershell
-axiomc a -p "correct horse battery staple" private.axar SecretFiles
-```
-
-Encrypt the central directory too, hiding filenames, sizes, and hashes:
-
-```powershell
-axiomc a -p "correct horse battery staple" --encrypt-names hidden.axar SecretFiles
-```
-
-`--encrypt-header` is an alias for `--encrypt-names`. Supply the password to
-commands that read protected content:
-
-```powershell
-axiomc l -p "correct horse battery staple" hidden.axar
-axiomc t -p "correct horse battery staple" hidden.axar
-axiomc x -p "correct horse battery staple" hidden.axar restored
-axiomc verify -p "correct horse battery staple" hidden.axar public.key
-```
-
-Encryption uses Argon2id and XChaCha20-Poly1305. Command-line passwords may be
-visible in shell history and process inspection. The current CLI has no
-interactive password prompt; use a controlled account and clear sensitive history
-where required.
-
-Directory-encrypted archive editing remains restricted. Create a new archive if
-an edit command reports that this mode cannot be updated safely.
-
-## Compression methods
-
-AXAR and single-stream AXC creation support five methods:
-
-| Method | CLI value | Method-specific controls |
-|---|---|---|
-| Axiom adaptive (default) | `axiom` | level 1..9, window, nice length, split/swarm |
-| Zstandard | `zstd` | native level -5..22 |
-| LZMA2 | `lzma2` | native level 0..9, 4 KiB..512 MiB dictionary, 5..273 fast bytes, HC4/BT4 |
-| Deflate | `deflate` | native level 0..9; fixed 32 KiB window and 258-byte maximum match |
-| Store | `store` | none |
-
-```powershell
-axiomc a --method zstd --codec-level 12 archive.axar Data
-axiomc a --method lzma2 --codec-level 7 --window 128M --block-size 128M --nice 128 --lzma-mf bt4 archive.axar Data
-axiomc a --method deflate --codec-level 6 archive.axar Data
-axiomc a --method store archive.axar already-compressed-media
-```
-
-Without `--codec-level`, the portable `--level 1..9` value maps to a suitable
-native level. Zstandard maps portable levels 1..9 to native levels
-1, 2, 3, 5, 7, 10, 14, 18, and 22 respectively; LZMA2 and Deflate use the
-portable value directly. `--codec-level` accepts Zstandard -5..22 and
-LZMA2/Deflate 0..9.
-`--window` and `--nice` become the LZMA2 dictionary and fast-bytes settings.
-The LZMA2 dictionary is clamped to the independently decoded AXC chunk (the
-selected `--block-size`) and cannot exceed 512 MiB. Large dictionaries can use
-several times their size in encoder memory. `--lzma-mf hc4` favors speed;
-`--lzma-mf bt4` favors ratio.
-
-ZIP creation supports only `--method deflate` and `--method store`. Omitting
-`--method` preserves the established ZIP Deflate behavior.
-
-Every external AXC payload is split into independently bounded chunks. Pause,
-cancel, and progress checkpoints occur between chunks, and an incompressible
-chunk is stored rather than expanded. Encryption, recovery, signing, metadata,
-volumes, and SFX remain AXAR container services and do not change with the
-selected method.
-
-## Compression levels
-
-Use `--level N`, where `N` is 1 through 9. The default is 5. `--fast` selects
-level 1 and `--max` selects level 9.
-
-```powershell
-axiomc a --level 3 fast-backup.axar Data
-axiomc a --level 7 high-ratio.axar Data
-axiomc a --max maximum-ratio.axar Data
-```
-
-| Level | Main profile | Typical use |
-|---:|---|---|
-| 1 | Dedicated fast LZ path | Minimum CPU time |
-| 2-3 | Shallow hash-chain search, price-aware lazy | Fast backups |
-| 4-5 | Balanced hash-chain search, price-aware lazy | General use |
-| 6 | Deep hash-chain search | Better ratio without tree memory |
-| 7 | Binary tree + cost-aware lazy lookahead, 8 MiB window | Long-range redundancy without optimal-parse cost |
-| 8 | Binary tree + single-pass optimal parse, 32 MiB window | Very high ratio at moderate time |
-| 9 | Deep binary tree + measured-cost optimal parse, 64 MiB window, 4 KiB matches | Maximum preset |
-
-Levels 8 and 9 run the dynamic-programming optimal parser (candidates come from
-the binary tree); on generic data they compress substantially smaller than
-levels 6-7. Level 7 uses a cheaper one-byte, token-cost-aware lookahead on the
-tree matcher. It can defer an expensive match for a better match or repeat
-offset at the next position without paying for a full DP parse.
-
-Explicit tuning options override the level regardless of argument order.
-
-Preset block sizes are starting points. Unless `--block-size` is supplied,
-Axiom may adjust the effective archive and codec block sizes at runtime to keep
-the selected worker count busy.
-
-## Advanced compression options
-
-These options apply to commands that create or recompress data: `add`, `update`,
-`fresh`, `sync`, `delete`, `repack`, `sign`, and single-stream `compress`.
-
-### Threads: `--threads N`
-
-`0` is the default and means "use the machine": compression, decompression,
-testing, and extraction expose all logical processors to their executor. For
-compression, automatic block sizing still targets physical cores; this keeps
-the ratio-friendly geometry stable while SMT siblings take nested parser and
-entropy tasks. An explicit `N` is honored as given. Axiom caps long-running
-outer block jobs to the number of blocks, but the shared work-stealing executor
-retains the full logical-worker budget. Tiny inputs stay serial. Match discovery
-within a level 8-9 block remains ordered, so Task Manager need not show 100%:
-on memory-bound phases, one busy thread per physical core can be the fastest
-schedule even though all logical workers are available.
-
-```powershell
-axiomc a --threads 8 archive.axar Data
-axiomc a --threads 0 archive.axar Data
-```
-
-### Solid block size: `--block-size SIZE`
-
-For `.axar`, this is the target solid-block size. Larger blocks can find
-redundancy across more files, but increase memory use and selective-extraction
-work.
-
-When this option is omitted, Axiom uses automatic block sizing. With multiple
-threads, the archive layer keeps the solid block large enough for ratio, then the
-codec layer splits it into enough independent internal blocks to feed the
-workers. Supplying `--block-size` disables that auto sizing and is best reserved
-for repeatable benchmarks or deliberate memory/ratio tuning.
-
-```powershell
-axiomc a --block-size 32M archive.axar Data
-```
-
-### File-aware filters: automatic, `--no-filters` to disable
-
-AXAR creation groups similar file types before filling solid blocks. PE x86/x64
-executables can use a reversible relative-branch filter, while PCM WAV and
-uncompressed BMP data can use a reversible delta filter. Direct AXC compression
-also validates POSIX tar headers and can filter regular-file members in place;
-smooth 16-bit numeric members may use a predictor, signed-residual zigzag, and
-byte-plane shuffle. Detection checks content rather than trusting extensions,
-and a fast trial keeps transforms only when they predict a net reduction after
-metadata.
-
-Filters are enabled by default for AXAR and single-stream AXC compression. Use
-`--no-filters` for an unfiltered comparison or compatibility benchmark:
-
-```powershell
-axiomc c --level 9 --no-filters app.exe app-unfiltered.axc
-axiomc a --level 9 --no-filters archive.axar Data
-```
-
-Native Axiom streams use AXC version 9. External Zstandard, LZMA2, and Deflate
-streams use AXC version 10. The current reader accepts AXC versions 4 through
-10. Older Axiom builds do not understand version-9 parser checkpoints or
-version-10 external codec IDs, so archives created with an external method
-require this release or newer.
-
-### Dictionary size: `--window SIZE`
-
-This is Axiom's dictionary/match window. Larger windows find more distant
-repetition and require more memory, especially with `--bt`.
-
-```powershell
-axiomc a --bt --window 64M --block-size 64M archive.axar Data
-```
-
-The binary-tree matcher uses approximately `2 x min(window, block) x 4` bytes for
-tree links, in addition to input, output, and other codec memory.
-
-### Word size equivalent: `--nice N`
-
-`--nice` is the closest Axiom equivalent to 7-Zip's word-size/fast-bytes setting.
-The matcher stops deep searching after finding a match of this length. Larger
-values can improve ratio but spend more time searching. The current maximum match
-length is 273 bytes.
-
-```powershell
-axiomc a --nice 192 archive.axar Data
-```
-
-### Search depth: `--chain-depth N`
-
-Controls how many previous candidates the matcher examines. Larger values trade
-speed for ratio.
-
-```powershell
-axiomc a --chain-depth 256 archive.axar Data
-```
-
-### Matcher and parser selection
-
-| Option | Effect |
-|---|---|
-| `--fast-lz` | Select the byte-token fast profile; disable tree/optimal modes |
-| `--bt` | Select the cyclic binary-tree matcher |
-| `--optimal` | Enable the dynamic-programming parser |
-| `--optimal-depth N` | Set optimal search depth and enable it |
-| `--optimal-candidates N` | Set parser candidates and enable it |
-| `--lazy` | Check whether delaying a match produces a better match |
-| `--no-lazy` | Disable that extra match check |
-| `--fast-entropy` | Use cheaper entropy-coder selection |
-| `--parallel` | Force the independent parallel-block path |
-| `--swarm` | Levels 1-6 and 8-9: cooperate inside each block (see below) |
-
-The optimal parser has significant per-byte CPU and memory cost. Give it a
-bounded block size:
-
-```powershell
-axiomc a --level 7 --optimal --block-size 16M archive.axar Data
-```
-
-### Threading model: `--swarm`
-
-Axiom's default threading model splits the input into independent blocks and
-compresses one per worker. This is the fastest general-purpose option, but the
-ratio eases slightly as more cores drive the automatic block size smaller, and a
-large `--block-size` chosen for ratio leaves most cores idle during the parse.
-
-At levels 2-6, `--swarm` parses each block cooperatively: segments are indexed
-and parsed in parallel against the full block window, then merged into one token
-stream. It is most useful with a large solid block, where it recovers the
-single-block ratio without the single-thread cost:
-
-```powershell
-axiomc a --level 6 --block-size 128M --window 128M --swarm archive.axar Data
-```
-
-Level 1 normally uses Axiom's fastest byte-token parser. Swarm intentionally
-replaces that parser with the cooperative hash-chain path: expect a better ratio
-but lower throughput, so this is a ratio-oriented override rather than a faster
-level 1.
-
-At levels 8-9, swarm parallelizes the preliminary binary-tree candidate. The
-global optimal parser remains intact, and the normal representation bake-off
-keeps a candidate only when it is smaller. The effect is consequently modest;
-supplemental prior-segment searches use the preset's bounded optimal-search
-depth. It does not turn the path-dependent optimal pass into independent
-segment DPs.
-
-Level 9 automatically separates exact global-tree discovery from path selection,
-independently of `--swarm`.
-The tree publishes fixed 256 KiB candidate tiles one task ahead while the DP
-consumes the current tile. These tasks use the shared work-stealing executor, so
-a consumer can produce its own next tile when other workers are occupied. Only
-the current and next tile are retained, and the result is byte-identical to the
-serial global-tree DP. Level 8 keeps the direct parser because its shallower tree
-does not amortize the pipeline framing.
-
-With `--swarm`, blocks of at least 4 MiB also trial AXC v9 parser checkpoints.
-Approximately 2 MiB token-aligned tiles receive static recent-distance seeds and
-run independent optimal DPs through the same work-stealing executor. Matches can
-still reference the full preceding block window. The encoder entropy-codes the
-concatenated stream globally and writes the checkpoint representation only when
-its complete payload is strictly smaller than the ordinary global-DP winner.
-Level 7's lazy tree parser is not safely segmentable and ignores `--swarm`.
-
-Swarm's levels 1-8 paths are encoder-only choices. Level 9 may write the AXC v9
-checkpoint block codec when it wins the exact bake-off; current readers retain
-compatibility with AXC versions 4 through 8. Fixed geometry keeps output
-independent of thread scheduling.
-
-### Size syntax
-
-Size options accept integer bytes or a binary suffix:
-
-| Input | Meaning |
-|---|---:|
-| `65536` | 65,536 bytes |
-| `64K` | 64 KiB |
-| `16M` | 16 MiB |
-| `1G` | 1 GiB |
-
-Suffixes are case-insensitive. Fractional values such as `1.5G` are not accepted.
-
-## Recovery records and volumes
-
-Create an archive with recovery data sized as a percentage of its protected
-contents:
+Reed-Solomon recovery data can be added at creation time or later:
 
 ```powershell
 axiomc a --recovery 10 backup.axar "D:\Work"
+axiomc recovery backup.axar      # show the current record
+axiomc recovery backup.axar 15   # rebuild at 15%
+axiomc recovery backup.axar 0    # remove
 ```
 
-Inspect, add, replace, or remove the recovery record later:
+Valid percentages are `1..100`; `0` removes. Normal edits preserve the existing
+percentage and regenerate parity afterwards.
 
-```text
-axiomc recovery <archive.axar> [percent]
-axiomc rr <archive.axar> [percent]
-```
-
-```powershell
-axiomc recovery backup.axar       # show the current record
-axiomc recovery backup.axar 15    # rebuild it at 15%
-axiomc recovery backup.axar 0     # remove it
-```
-
-The valid percentage is `1..100`; `0` means remove. Normal archive edits preserve
-an existing recovery percentage and regenerate its parity after the edit.
-
-If `test` reports damage and the recovery locator is still readable, repair the
-archive atomically and test again:
+If `test` reports damage and the recovery locator is readable:
 
 ```powershell
 axiomc repair backup.axar
 axiomc t backup.axar
 ```
 
-`repair` returns exit code 3 when the archive has no recovery record. Damage that
-exceeds the parity-shard count cannot be repaired, so a recovery record is not a
-substitute for a second independent backup.
+`repair` returns exit code 3 when there is no recovery record. Damage beyond
+the parity-shard count cannot be repaired — a recovery record is not a
+substitute for a second backup.
 
-Split a completed archive into fixed-size transport volumes:
+Split a completed archive into transport volumes:
 
 ```text
 axiomc split <archive.axar> <size> [recovery-volume-count]
-```
-
-```powershell
-axiomc split backup.axar 100M
-axiomc split backup.axar 100M 3
-```
-
-The second example produces `backup.part001.axar`, … plus `backup.rev001`,
-`backup.rev002`, and `backup.rev003`. The source `backup.axar` is preserved by
-the CLI. At most 255 data and recovery volumes may exist in one set.
-
-Join a complete set, or reconstruct missing/corrupt data volumes when enough
-`.rev` members survive:
-
-```text
 axiomc join <any-volume> <output.axar>
 ```
 
 ```powershell
+axiomc split backup.axar 100M 3      # backup.part001.axar… + backup.rev001…003
 axiomc join backup.part001.axar restored.axar
-axiomc t restored.axar
 ```
 
-Any surviving data or recovery volume may identify the set. Joining checks each
-payload CRC and the BLAKE3 digest of the complete reconstructed archive.
+The source archive is preserved. A set is limited to 255 total volumes. Any
+surviving data or recovery volume identifies the set, and joining checks every
+payload CRC plus the BLAKE3 digest of the reconstructed archive.
 
-When every data volume is present, ordinary read commands can use any numbered
-volume directly without first running `join`; the set is exposed read-only.
+When every data volume is present, ordinary read commands work directly on any
+numbered volume — no `join` needed. The set is exposed read-only.
 
-## Signing and verification
-
-Generate a key pair:
+### Signing
 
 ```text
 axiomc keygen <secret.key> <public.key>
+axiomc sign   [options] <archive.axar> <secret.key>
+axiomc verify [options] <archive.axar> [public.key]
 ```
 
 ```powershell
 axiomc keygen release-secret.key release-public.key
-```
-
-The secret key is 64 bytes and must be protected. The public key is 32 bytes and
-can be distributed.
-
-Sign an archive:
-
-```text
-axiomc sign [compression-options] <archive.axar> <secret.key>
-```
-
-```powershell
 axiomc sign release.axar release-secret.key
-axiomc sign -p "correct horse battery staple" private.axar release-secret.key
-```
-
-Verify cryptographic validity using the key embedded in the signature:
-
-```powershell
-axiomc verify release.axar
-```
-
-Require a particular trusted public key:
-
-```powershell
 axiomc verify release.axar release-public.key
 ```
 
-`verify` uses distinct exit codes:
+The secret key is 64 bytes and must be protected; the public key is 32 bytes
+and can be distributed. Verifying without a key checks cryptographic validity
+using the key embedded in the signature. Supplying a key additionally requires
+that specific key. See [exit codes](#exit-codes) for the distinct results.
 
-| Exit code | Meaning |
-|---:|---|
-| 0 | Valid; if a key was supplied, it is trusted |
-| 1 | Invalid signature or another runtime error |
-| 2 | Invalid command-line usage |
-| 3 | Archive is not signed |
-| 4 | Valid signature, but a different key |
-
-```powershell
-axiomc verify release.axar release-public.key
-if ($LASTEXITCODE -ne 0) {
-    throw "Signature verification failed: $LASTEXITCODE"
-}
-```
-
-## Self-extracting archives
+### Self-extracting archives
 
 ```text
 axiomc sfx <archive.axar-or-zip> <output.exe> [compatible-stub]
 ```
 
-By default, `axiomc` uses the dedicated `AxiomSfx.bin` module beside it. The
-module is not an executable and is loaded only while creating an SFX:
-
 ```powershell
 axiomc sfx release.axar release-setup.exe
 ```
 
-Supplying a specific compatible PE image remains available for development and
-compatibility testing:
+By default this uses the `AxiomSfx.bin` module beside `axiomc.exe`. That module
+is not an executable and is read only while creating an SFX. Supplying an
+explicit compatible PE image is available for development and compatibility
+testing.
 
-```powershell
-axiomc sfx release.axar release-setup.exe "D:\Build\compatible-sfx.bin"
-```
+The output is one standalone Windows executable containing Axiom's read-only
+extraction runtime, the intact `.axar` or `.zip` payload, and an Axiom SFX
+trailer. It does not contain the file-manager GUI, and the source archive is
+not referenced when the `.exe` runs.
 
-The output is one standalone Windows executable. It contains Axiom's compact
-read-only extraction runtime, the intact `.axar` or `.zip` payload, and an Axiom
-SFX trailer. It does not contain the full file-manager GUI, and the source
-archive is not referenced when the resulting `.exe` runs.
+The generated extractor shows a native dialog with an editable destination and
+folder browser; file and folder counts, unpacked size, encryption state, and
+signature state; replace/skip/stop conflict policies; automatic or explicit
+thread count; optional modification-time restore and destination-folder
+opening; and progress with pause, resume, and cancel.
 
-When opened, the self-extractor shows a native extraction dialog with:
+Encrypted payloads ask for their password before revealing metadata. Signed
+payloads are verified first, and an invalid signature blocks extraction.
 
-- an editable destination and folder browser;
-- file/folder counts, unpacked size, encryption state, and signature state;
-- replace, skip, or stop-on-conflict policies;
-- automatic or explicit extraction thread count;
-- optional modification-time restoration and destination-folder opening; and
-- worker-thread progress with Pause/Resume and Cancel.
-
-Encrypted payloads request their password before exposing archive metadata.
-Signed payloads are verified before extraction; an invalid signature blocks the
-operation. File integrity is checked by the normal extraction path.
-
-When **Create a self-extracting Windows executable** is enabled in the GUI's
-archive-creation options, the `.axar` path is an intermediate build artifact. It
-is removed after the merged `.exe` succeeds, so only the executable remains. The
-standalone `axiomc sfx` command preserves its input archive because that command
-converts an existing archive supplied by the caller.
-
-You can also supply a destination on the command line, which pre-fills the dialog:
+A destination can be pre-filled from the command line:
 
 ```powershell
 .\release-setup.exe "D:\Applications\Release"
 ```
 
-## Single-stream `.axc` files
+`axiomc sfx` preserves its input archive, because it converts an archive the
+caller already has. The GUI's **Create a self-extracting Windows executable**
+option instead treats the intermediate `.axar` as a build artifact and removes
+it once the merged `.exe` succeeds.
+
+### Single-stream files
 
 ```text
-axiomc c [compression-options] <input> <output.axc>
+axiomc c [options] <input> <output.axc>
 axiomc d [--threads N] [-p <password>] <input.axc> <output>
 ```
 
@@ -803,10 +293,240 @@ axiomc c --level 5 database.bin database.axc
 axiomc d database.axc restored-database.bin
 ```
 
-`.axc` is one compressed stream. It does not contain the multi-file directory,
-comments, file metadata, or editing features of `.axar`.
+`.axc` is one compressed stream. It has no multi-file directory, comments, file
+metadata, or editing features.
 
-## Practical recipes
+## Compression options
+
+These apply to commands that create or recompress data: `add`, `update`,
+`fresh`, `sync`, `delete`, `repack`, `sign`, and `compress`.
+
+### Methods
+
+| Method | `--method` | Method-specific controls |
+|---|---|---|
+| Axiom adaptive (default) | `axiom` | `--level 1..9`, window, nice length, threading model |
+| Zstandard | `zstd` | native level `-5..22` |
+| LZMA2 | `lzma2` | native level `0..9`, 4 KiB–512 MiB dictionary, 5–273 fast bytes, HC4/BT4 |
+| Deflate | `deflate` | native level `0..9`; fixed 32 KiB window, 258-byte max match |
+| Store | `store` | none |
+
+```powershell
+axiomc a --method zstd --codec-level 12 archive.axar Data
+axiomc a --method lzma2 --codec-level 7 --window 128M --block-size 128M --lzma-mf bt4 archive.axar Data
+axiomc a --method store archive.axar already-compressed-media
+```
+
+Without `--codec-level`, the portable `--level 1..9` maps to a suitable native
+level. Zstandard maps levels 1–9 to native 1, 2, 3, 5, 7, 10, 14, 18, 22;
+LZMA2 and Deflate use the portable value directly.
+
+For LZMA2, `--window` and `--nice` become the dictionary and fast-bytes
+settings. The dictionary is clamped to the independently decoded AXC chunk
+(the effective `--block-size`) and cannot exceed 512 MiB — large dictionaries
+can use several times their size in encoder memory. `--lzma-mf hc4` favors
+speed, `bt4` favors ratio.
+
+ZIP creation supports only `deflate` and `store`. Omitting `--method` keeps the
+established ZIP Deflate behavior.
+
+Every external-codec payload is split into independently bounded chunks. Pause,
+cancel, and progress checkpoints happen between chunks, and an incompressible
+chunk is stored rather than expanded. Encryption, recovery, signing, metadata,
+volumes, and SFX are container services and do not vary with the method.
+
+### Levels
+
+`--level N` where N is 1–9, default 5. `--fast` is level 1 and `--max` is
+level 9.
+
+| Level | Matcher and parser | Typical use |
+|---:|---|---|
+| 1 | Dedicated fast LZ path | Minimum CPU time |
+| 2–3 | Shallow hash chain, price-aware lazy | Fast backups |
+| 4–5 | Balanced hash chain, price-aware lazy | General use |
+| 6 | Deep hash chain | Better ratio, no tree memory |
+| 7 | Binary tree + cost-aware lazy lookahead, 8 MiB window | Long-range redundancy without optimal-parse cost |
+| 8 | Binary tree + single-pass optimal parse, 32 MiB window | High ratio at moderate cost |
+| 9 | Deep binary tree + measured-cost optimal parse, 64 MiB window, 4 KiB matches | Maximum ratio |
+
+Levels 8 and 9 run the dynamic-programming optimal parser with candidates from
+the binary tree; on generic data they compress substantially smaller than 6–7.
+Level 7 uses a cheaper one-byte, token-cost-aware lookahead — it can defer an
+expensive match for a better match or repeat offset at the next position
+without paying for a full DP parse.
+
+Explicit tuning options override the level regardless of argument order.
+
+### Tuning
+
+| Option | Effect |
+|---|---|
+| `--threads N` | Worker count; `0` (default) uses all hardware threads |
+| `--block-size SIZE` | Target solid-block size; disables automatic sizing |
+| `--window SIZE` | Match window (LZMA2: dictionary size) |
+| `--nice N` | Stop deep search at this match length; max match is 273 |
+| `--chain-depth N` | How many previous candidates the matcher examines |
+| `--lazy` / `--no-lazy` | Force the deferred-match check on or off |
+| `--fast-entropy` | Cheaper entropy-coder selection |
+| `--fast-lz` | Byte-token fast profile; disables tree and optimal modes |
+| `--bt` | Cyclic binary-tree match finder |
+| `--optimal` | Dynamic-programming parser |
+| `--optimal-depth N` | Set optimal search depth, and enable it |
+| `--optimal-candidates N` | Set parser candidates, and enable it |
+| `--parallel` | Force the independent parallel-block path |
+| `--swarm` | Cores cooperate inside each block (levels 1–6 and 8–9) |
+| `--no-filters` | Disable the automatic file-aware transforms |
+| `--recovery N` | Add `1..100`% Reed-Solomon recovery data |
+
+#### Threads
+
+`--threads 0` means "use the machine": compression, decompression, testing, and
+extraction all expose every logical processor. Automatic block sizing still
+targets physical cores, keeping the ratio-friendly geometry stable while SMT
+siblings pick up nested parser and entropy tasks. Explicit counts are honored
+as given, and tiny inputs stay serial.
+
+Match discovery inside a level 8–9 block remains ordered, so Task Manager need
+not show 100% — on memory-bound phases one busy thread per physical core can be
+the fastest schedule.
+
+#### Block size
+
+For `.axar` this is the target solid-block size. Larger blocks find redundancy
+across more files but cost memory and make selective extraction do more work.
+
+Omitting it enables automatic sizing: the archive layer keeps the solid block
+large enough for ratio, and the codec layer splits it into enough internal
+blocks to feed the workers. Supplying `--block-size` disables that, which is
+what you want for repeatable benchmarks and deliberate memory tuning.
+
+#### Window
+
+`--window` is the dictionary/match window. Larger windows reach more distant
+repetition and cost memory, especially with `--bt`: the binary-tree matcher
+uses roughly `2 × min(window, block) × 4` bytes for tree links, on top of
+input, output, and other codec memory.
+
+#### Threading model
+
+The default model splits input into independent blocks and compresses one per
+worker. This is fastest in general, but ratio eases as more cores drive the
+automatic block size smaller, and a large block chosen for ratio leaves most
+cores idle during the parse.
+
+`--swarm` instead makes cores cooperate inside each block:
+
+- **Levels 2–6** parse each block cooperatively — segments are indexed and
+  parsed in parallel against the full block window, then merged into one token
+  stream. Most useful with a large solid block, where it recovers single-block
+  ratio without single-thread cost.
+- **Level 1** trades its byte-token fast path for the cooperative hash parser.
+  Expect better ratio and lower throughput — a ratio override, not a faster
+  level 1.
+- **Levels 8–9** parallelize the preliminary binary-tree candidate. The global
+  optimal parser stays intact and the bake-off keeps a candidate only when it
+  is smaller, so the effect is modest.
+- **Level 7** ignores it — its lazy tree parse is path-dependent and not safely
+  segmentable.
+
+```powershell
+axiomc a --level 6 --block-size 128M --window 128M --swarm archive.axar Data
+```
+
+Output is deterministic for a given input regardless of worker scheduling.
+
+#### File-aware filters
+
+AXAR creation groups similar file types before filling solid blocks. PE x86/x64
+executables can use a reversible relative-branch filter; PCM WAV and
+uncompressed BMP data can use a reversible delta filter. Direct `.axc`
+compression also validates POSIX tar headers and can filter regular-file
+members in place, and smooth 16-bit numeric data may use a predictor,
+signed-residual zigzag, and byte-plane shuffle.
+
+Detection inspects content rather than trusting extensions, and a fast trial
+keeps a transform only when it predicts a net reduction after metadata. Use
+`--no-filters` for an unfiltered comparison:
+
+```powershell
+axiomc c --level 9 --no-filters app.exe app-unfiltered.axc
+```
+
+### Size syntax
+
+| Input | Meaning |
+|---|---|
+| `65536` | 65,536 bytes |
+| `64K` | 64 KiB |
+| `16M` | 16 MiB |
+| `1G` | 1 GiB |
+
+Suffixes are case-insensitive. Fractional values such as `1.5G` are not
+accepted.
+
+### Stream versions
+
+Native Axiom streams are AXC version 9; Zstandard, LZMA2, and Deflate streams
+are version 10. The current reader accepts versions 4 through 10. Archives
+written with an external method therefore require Axiom 0.7.0.0 or newer.
+
+## Encryption
+
+```powershell
+axiomc a -p "correct horse battery staple" private.axar SecretFiles
+axiomc a -p "correct horse battery staple" --encrypt-names hidden.axar SecretFiles
+```
+
+`-p` encrypts archive data blocks. `--encrypt-names` (alias
+`--encrypt-header`) additionally seals the central directory, hiding filenames,
+sizes, and hashes — listing then requires the password.
+
+AXAR uses Argon2id key derivation with XChaCha20-Poly1305. For `.zip` output,
+`-p` creates WinZip AES-256 file-data encrypted entries, but ZIP filenames stay
+visible — use `.axar --encrypt-names` when names must be hidden too.
+
+Supply the password to any command that reads protected content:
+
+```powershell
+axiomc l -p "correct horse battery staple" hidden.axar
+axiomc x -p "correct horse battery staple" hidden.axar restored
+```
+
+Two limitations to know:
+
+- Command-line passwords can appear in shell history and process listings.
+  There is no interactive prompt yet.
+- Block-encrypted archives can be edited with the password. Archives created
+  with `--encrypt-names` are read-only; create a new archive instead.
+
+## Exit codes
+
+| Code | Meaning |
+|---:|---|
+| 0 | Success |
+| 1 | Runtime failure; an `axiomc:` message is printed to stderr |
+| 2 | Invalid command line |
+| 3 | `verify`: archive is not signed. `repair`: no recovery record |
+| 4 | `verify`: valid signature, but a different key than the one supplied |
+
+```powershell
+axiomc t backup.axar
+if ($LASTEXITCODE -ne 0) { throw "Backup integrity verification failed" }
+```
+
+For archives that matter:
+
+1. Write to a new path rather than overwriting the last known-good backup.
+2. Run `axiomc t` on the new archive.
+3. If signed, run `axiomc verify` with the trusted public key.
+4. Test-extract for critical restore workflows.
+5. Only then rotate the older backup.
+
+Recovery records and recovery volumes tolerate bounded corruption, but they are
+not a replacement for independent copies on separate storage.
+
+## Recipes
 
 Fast daily backup:
 
@@ -815,7 +535,7 @@ axiomc a --level 3 --threads 0 daily.axar "D:\Work"
 axiomc t daily.axar
 ```
 
-Balanced encrypted backup with hidden names:
+Encrypted backup with hidden names:
 
 ```powershell
 axiomc a --level 5 -p "correct horse battery staple" --encrypt-names `
@@ -830,7 +550,7 @@ axiomc a --level 7 --bt --window 64M --block-size 64M --nice 192 `
     high-ratio.axar "D:\Dataset"
 ```
 
-Create a signed self-extractor:
+Signed self-extractor:
 
 ```powershell
 axiomc keygen release-secret.key release-public.key
@@ -840,26 +560,10 @@ axiomc verify release.axar release-public.key
 axiomc sfx release.axar release.exe
 ```
 
-## Errors and safe automation
-
-Successful commands return 0. Invalid syntax or unknown options return 2. Runtime
-failures return 1 and print an `axiomc:` message to standard error. `verify` also
-uses exit codes 3 and 4 as documented above.
+Archive protected for long-term storage:
 
 ```powershell
-axiomc t backup.axar
-if ($LASTEXITCODE -ne 0) {
-    throw "Backup integrity verification failed"
-}
+axiomc a --level 7 --recovery 10 archive.axar "D:\Important"
+axiomc split archive.axar 100M 3
+axiomc t archive.part001.axar
 ```
-
-For important archives:
-
-1. Write a new path instead of overwriting the previous known-good backup.
-2. Run `axiomc t` on the new archive.
-3. If signed, run `axiomc verify` with the trusted public key.
-4. Perform a test extraction for critical restore workflows.
-5. Only then rotate the older backup.
-
-Recovery records and recovery volumes tolerate bounded corruption or loss, but
-keep independent archive copies on separate storage for important data.
