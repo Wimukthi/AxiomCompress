@@ -291,3 +291,22 @@ Both current runs remained 2,888,466 bytes with SHA-256
 `5BD317E7B2864CB03DE9E4385123180CF1FC6A6D77030257687E28E52205EE6F`. This is
 a directional single-host measurement; repeat the profile before making
 general throughput claims.
+
+## 2026-08-02 optimal-DP ring-mask checkpoint
+
+The optimal parser's live-cost ring now uses the next power-of-two size above
+the maximum transition distance. Frontier clearing keeps the same
+`max_transition` safety invariant, while literal and match edges use a mask
+instead of a compare-and-wrap branch. The larger ring is only a few KiB and
+does not alter DP reachability or decisions.
+
+On the same Release x64 host and Dickens profile, the two-run averages were:
+
+| Phase | Fused-cost baseline | Current | Delta |
+|---|---:|---:|---:|
+| Optimal LZ77 | 3.636 s | 3.480 s | -4.3% |
+| Sum of profiled phases | 7.308 s | 7.143 s | -2.3% |
+
+Both current runs remained 2,888,466 bytes with SHA-256
+`5BD317E7B2864CB03DE9E4385123180CF1FC6A6D77030257687E28E52205EE6F`. The
+timings are directional and host-specific.

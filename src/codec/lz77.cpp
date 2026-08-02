@@ -1972,7 +1972,9 @@ ByteVector optimal_parse_with_costs(std::span<const std::uint8_t> input,
     // whole-input so path reconstruction is unchanged. At level 9 this turns
     // another 8 bytes/input-byte allocation into a few KiB ring.
     const auto max_transition = std::min(max_match, input.size());
-    costs.assign(max_transition + 1, kInf);
+    const auto cost_ring_size = std::bit_ceil(max_transition + 1);
+    const auto cost_ring_mask = cost_ring_size - 1;
+    costs.assign(cost_ring_size, kInf);
     decisions.assign(input.size() + 1, ParseDecision{});
     // The recent-distance list depends on the path taken, so each position keeps
     // the rep state of the lowest-cost path that reaches it. Because costs[pos]
@@ -1997,7 +1999,6 @@ ByteVector optimal_parse_with_costs(std::span<const std::uint8_t> input,
 
     MatchList matches;
     ParseProgressTicker progress(options.encode_progress, input.size());
-    const auto cost_ring_size = costs.size();
     std::size_t position_slot = 0;
     for (std::size_t position = 0; position < input.size(); ++position) {
         if (position_slot == cost_ring_size) {
@@ -2008,10 +2009,8 @@ ByteVector optimal_parse_with_costs(std::span<const std::uint8_t> input,
         // reach the newly exposed far edge, so clear it before relaxing edges
         // from the current position.
         if (position + max_transition <= input.size()) {
-            auto clear_slot = position_slot + max_transition;
-            if (clear_slot >= cost_ring_size) {
-                clear_slot -= cost_ring_size;
-            }
+            const auto clear_slot =
+                (position_slot + max_transition) & cost_ring_mask;
             costs[clear_slot] = kInf;
         }
         const auto current_cost = costs[position_slot];
@@ -2051,10 +2050,7 @@ ByteVector optimal_parse_with_costs(std::span<const std::uint8_t> input,
         }
 
         const auto literal_next = current_cost + cost_literal_model(model, input[position]);
-        auto literal_slot = position_slot + 1;
-        if (literal_slot == cost_ring_size) {
-            literal_slot = 0;
-        }
+        const auto literal_slot = (position_slot + 1) & cost_ring_mask;
         auto& literal_target = costs[literal_slot];
         if (literal_next < literal_target) {
             literal_target = literal_next;
@@ -2092,10 +2088,7 @@ ByteVector optimal_parse_with_costs(std::span<const std::uint8_t> input,
                 const auto target = position + length;
                 const auto candidate_cost = candidate_cost_base + transition_costs.length[length];
 
-                auto target_slot = position_slot + length;
-                if (target_slot >= cost_ring_size) {
-                    target_slot -= cost_ring_size;
-                }
+                const auto target_slot = (position_slot + length) & cost_ring_mask;
                 auto& target_cost = costs[target_slot];
                 if (candidate_cost < target_cost) {
                     target_cost = candidate_cost;
@@ -2129,10 +2122,7 @@ ByteVector optimal_parse_with_costs(std::span<const std::uint8_t> input,
                 const auto target = position + length;
                 const auto candidate_cost = candidate_cost_base + transition_costs.length[length];
 
-                auto target_slot = position_slot + length;
-                if (target_slot >= cost_ring_size) {
-                    target_slot -= cost_ring_size;
-                }
+                const auto target_slot = (position_slot + length) & cost_ring_mask;
                 auto& target_cost = costs[target_slot];
                 if (candidate_cost < target_cost) {
                     target_cost = candidate_cost;
