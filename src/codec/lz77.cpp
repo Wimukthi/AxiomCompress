@@ -1671,7 +1671,7 @@ private:
         });
     }
 
-    static constexpr std::size_t kTileSize = std::size_t{256} << 10;
+    static constexpr std::size_t kTileSize = std::size_t{1} << 20;
 
     std::span<const std::uint8_t> input_;
     std::size_t max_match_;

@@ -226,3 +226,25 @@ all 18 corpus/level pairs:
 Raw, summary, and delta CSVs are in
 `D:\tests\axiom-perf\results\scaling-cap-all-levels-2026-08-02`. The original
 orientation sweep is in `D:\tests\axiom-perf\results\scaling-next-phase-2026-08-02`.
+
+## 2026-08-02 candidate-pipeline tile checkpoint
+
+The tree matcher's producer/consumer candidate pipeline now batches 1 MiB of
+positions per tile instead of 256 KiB. Tile production still advances the
+match tree in the same order, so this is a scheduling change only: it does not
+change match decisions, AXC bytes, or the archive format.
+
+On the same Release x64 host, level 9 with 32 threads and one 64 MiB block for
+the 10,192,446-byte Silesia `dickens` file, the reference 256 KiB profile and
+the 1 MiB two-run average were:
+
+| Tile size | Greedy LZ77 | Optimal LZ77 | Candidate encoding | Entropy encoding | Archive bytes |
+|---:|---:|---:|---:|---:|---:|
+| 256 KiB | 3.940 s | 4.301 s | 0.316 s | 0.090 s | 2,888,466 |
+| 1 MiB | 3.723 s | 4.383 s | 0.322 s | 0.091 s | 2,888,466 |
+
+The summed profiled phases improved by about 1.5% in this directional
+measurement. Both 1 MiB runs produced SHA-256
+`5BD317E7B2864CB03DE9E4385123180CF1FC6A6D77030257687E28E52205EE6F`, matching
+the 256 KiB output exactly. Repeat the profiling workflow before making
+cross-machine throughput claims.
