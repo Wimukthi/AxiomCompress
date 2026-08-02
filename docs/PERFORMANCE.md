@@ -186,6 +186,27 @@ The level-7 figures use the three-repeat targeted sweep. Raw, summary, and delta
 CSVs are in `D:\tests\axiom-perf\results\final-all-level-compare-2026-08-02`
 and `D:\tests\axiom-perf\results\tree-modulo-compare-2026-08-02`.
 
+## 2026-08-02 optimal-DP indexing checkpoint
+
+The level-9 optimal parser's bounded cost frontier now advances ring slots with
+explicit wrap checks instead of recalculating a runtime modulo for every parser
+edge. This is an internal scheduling/indexing change: it preserves the DP
+decisions, AXC bytes, decoder behavior, and archive format.
+
+On the same Release x64 host, profiling 100 MiB enwik8 changed the measured
+phases as follows:
+
+| Phase | Previous pass | Current pass | Delta |
+|---|---:|---:|---:|
+| Block total | 104.373 s | 101.157 s | -3.08% |
+| Optimal parsing | 60.790 s | 57.782 s | -4.95% |
+
+The enwik8 AXC remained exactly 28,477,916 bytes with the same SHA-256. A
+Silesia-directory archive remained 54,362,481 bytes; all 12 extracted files
+matched the previous archive byte-for-byte, and the new archive passed
+`axiomc t`. The measurements are single-run directional results; repeat the profiling
+workflow before publishing cross-machine throughput claims.
+
 ## 2026-08-02 CPU-scaling checkpoint
 
 The first scaling sweep found that explicit SMT geometry was over-splitting

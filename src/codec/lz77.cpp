@@ -1998,15 +1998,24 @@ ByteVector optimal_parse_with_costs(std::span<const std::uint8_t> input,
 
     MatchList matches;
     ParseProgressTicker progress(options.encode_progress, input.size());
+    const auto cost_ring_size = costs.size();
+    std::size_t position_slot = 0;
     for (std::size_t position = 0; position < input.size(); ++position) {
+        if (position_slot == cost_ring_size) {
+            position_slot = 0;
+        }
         progress.tick(position);
         // This slot last represented position - 1. No earlier position can
         // reach the newly exposed far edge, so clear it before relaxing edges
         // from the current position.
         if (position + max_transition <= input.size()) {
-            costs[(position + max_transition) % costs.size()] = kInf;
+            auto clear_slot = position_slot + max_transition;
+            if (clear_slot >= cost_ring_size) {
+                clear_slot -= cost_ring_size;
+            }
+            costs[clear_slot] = kInf;
         }
-        const auto current_cost = costs[position % costs.size()];
+        const auto current_cost = costs[position_slot];
         std::span<const Match> match_candidates;
         if (candidate_pipeline) {
             match_candidates = candidate_pipeline->next(position);
@@ -2020,6 +2029,7 @@ ByteVector optimal_parse_with_costs(std::span<const std::uint8_t> input,
                     insert_position(position);
                 }
             }
+            ++position_slot;
             continue;
         }
 
@@ -2042,7 +2052,11 @@ ByteVector optimal_parse_with_costs(std::span<const std::uint8_t> input,
         }
 
         const auto literal_next = current_cost + cost_literal_model(model, input[position]);
-        auto& literal_target = costs[(position + 1) % costs.size()];
+        auto literal_slot = position_slot + 1;
+        if (literal_slot == cost_ring_size) {
+            literal_slot = 0;
+        }
+        auto& literal_target = costs[literal_slot];
         if (literal_next < literal_target) {
             literal_target = literal_next;
             decisions[position + 1] = ParseDecision{1, 0, ParseKind::literal, 0};
@@ -2079,7 +2093,11 @@ ByteVector optimal_parse_with_costs(std::span<const std::uint8_t> input,
                 const auto target = position + length;
                 const auto candidate_cost = candidate_cost_base + transition_costs.length[length];
 
-                auto& target_cost = costs[target % costs.size()];
+                auto target_slot = position_slot + length;
+                if (target_slot >= cost_ring_size) {
+                    target_slot -= cost_ring_size;
+                }
+                auto& target_cost = costs[target_slot];
                 if (candidate_cost < target_cost) {
                     target_cost = candidate_cost;
                     decisions[target] = ParseDecision{
@@ -2112,7 +2130,11 @@ ByteVector optimal_parse_with_costs(std::span<const std::uint8_t> input,
                 const auto target = position + length;
                 const auto candidate_cost = candidate_cost_base + transition_costs.length[length];
 
-                auto& target_cost = costs[target % costs.size()];
+                auto target_slot = position_slot + length;
+                if (target_slot >= cost_ring_size) {
+                    target_slot -= cost_ring_size;
+                }
+                auto& target_cost = costs[target_slot];
                 if (candidate_cost < target_cost) {
                     target_cost = candidate_cost;
                     decisions[target] = ParseDecision{
@@ -2128,6 +2150,7 @@ ByteVector optimal_parse_with_costs(std::span<const std::uint8_t> input,
         if (!use_tree) {
             insert_position(position);  // tree->advance already indexed it
         }
+        ++position_slot;
     }
 
     if (candidate_pipeline) {
@@ -2352,11 +2375,20 @@ ByteVector parse_checkpoint_tile(std::span<const std::uint8_t> input,
                    });
 
     std::size_t match_cursor = 0;
+    const auto cost_ring_size = costs.size();
+    std::size_t local_slot = 0;
     for (std::size_t local = 0; local < length; ++local) {
-        if (local + max_transition <= length) {
-            costs[(local + max_transition) % costs.size()] = kInf;
+        if (local_slot == cost_ring_size) {
+            local_slot = 0;
         }
-        const auto current_cost = costs[local % costs.size()];
+        if (local + max_transition <= length) {
+            auto clear_slot = local_slot + max_transition;
+            if (clear_slot >= cost_ring_size) {
+                clear_slot -= cost_ring_size;
+            }
+            costs[clear_slot] = kInf;
+        }
+        const auto current_cost = costs[local_slot];
         if (local != 0) {
             const auto& decision = decisions[local];
             if (decision.length == 0 || decision.length > local) {
@@ -2378,7 +2410,11 @@ ByteVector parse_checkpoint_tile(std::span<const std::uint8_t> input,
         const auto position = candidates.begin + local;
         const auto literal_cost_value =
             current_cost + cost_literal_model(model, input[position]);
-        auto& literal_target = costs[(local + 1) % costs.size()];
+        auto literal_slot = local_slot + 1;
+        if (literal_slot == cost_ring_size) {
+            literal_slot = 0;
+        }
+        auto& literal_target = costs[literal_slot];
         if (literal_cost_value < literal_target) {
             literal_target = literal_cost_value;
             decisions[local + 1] = {1, 0, ParseKind::literal, 0};
@@ -2407,7 +2443,11 @@ ByteVector parse_checkpoint_tile(std::span<const std::uint8_t> input,
                 const auto target = local + match_length;
                 const auto candidate_cost =
                     candidate_cost_base + transition_costs.length[match_length];
-                auto& target_cost = costs[target % costs.size()];
+                auto target_slot = local_slot + match_length;
+                if (target_slot >= cost_ring_size) {
+                    target_slot -= cost_ring_size;
+                }
+                auto& target_cost = costs[target_slot];
                 if (candidate_cost < target_cost) {
                     target_cost = candidate_cost;
                     decisions[target] = {
@@ -2435,7 +2475,11 @@ ByteVector parse_checkpoint_tile(std::span<const std::uint8_t> input,
                 const auto target = local + match_length;
                 const auto candidate_cost =
                     candidate_cost_base + transition_costs.length[match_length];
-                auto& target_cost = costs[target % costs.size()];
+                auto target_slot = local_slot + match_length;
+                if (target_slot >= cost_ring_size) {
+                    target_slot -= cost_ring_size;
+                }
+                auto& target_cost = costs[target_slot];
                 if (candidate_cost < target_cost) {
                     target_cost = candidate_cost;
                     decisions[target] = {
@@ -2444,6 +2488,7 @@ ByteVector parse_checkpoint_tile(std::span<const std::uint8_t> input,
                 }
             }
         }
+        ++local_slot;
     }
     if (match_cursor != candidates.matches.size()) {
         throw FormatError("checkpoint candidates were not consumed exactly");
