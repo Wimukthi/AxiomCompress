@@ -272,3 +272,22 @@ The current two runs both produced 2,888,466 bytes with SHA-256
 `5BD317E7B2864CB03DE9E4385123180CF1FC6A6D77030257687E28E52205EE6F`, identical
 to the initialized reference. The timings remain host-specific and
 directional.
+
+## 2026-08-02 measured distance-cost checkpoint
+
+Measured DP match transitions previously derived the distance slot and the
+distance footer width through two helpers, recalculating the same bit width.
+The parser now derives both values from one distance-width calculation. The
+unmeasured cost model and the coded token stream are unchanged.
+
+On the same Release x64 host and Dickens profile, the two-run averages were:
+
+| Phase | Candidate-list baseline | Current | Delta |
+|---|---:|---:|---:|
+| Optimal LZ77 | 3.737 s | 3.636 s | -2.7% |
+| Sum of profiled phases | 7.512 s | 7.308 s | -2.7% |
+
+Both current runs remained 2,888,466 bytes with SHA-256
+`5BD317E7B2864CB03DE9E4385123180CF1FC6A6D77030257687E28E52205EE6F`. This is
+a directional single-host measurement; repeat the profile before making
+general throughput claims.

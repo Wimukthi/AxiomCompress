@@ -267,17 +267,6 @@ std::uint32_t rep_cost(std::size_t length) {
     return 12 + (varuint_cost(length) * 5);
 }
 
-// Number of footer (low) bits a distance contributes under the position-slot
-// scheme used by the slot split codec; this is the part that scales with the
-// distance magnitude and dominates its real coded cost.
-std::uint32_t distance_footer_bits(std::size_t distance) {
-    const auto p = distance - 1;
-    if (p < 4) {
-        return 0;
-    }
-    return static_cast<std::uint32_t>(std::bit_width(p)) - 2;
-}
-
 std::uint32_t distance_slot(std::size_t distance) {
     const auto p = distance - 1;
     if (p < 4) {
@@ -337,8 +326,15 @@ struct ParseTransitionCosts {
         if (!model.measured) {
             return static_cast<std::uint64_t>(varuint_cost(distance)) * 7;
         }
-        return model.command[kMatchToken] + model.slot[distance_slot(distance)] +
-               static_cast<std::uint64_t>(distance_footer_bits(distance)) * kCostScale;
+        const auto p = distance - 1;
+        if (p < 4) {
+            return model.command[kMatchToken] + model.slot[p];
+        }
+        const auto num_bits = static_cast<std::uint32_t>(std::bit_width(p)) - 1;
+        const auto slot = (num_bits << 1) |
+                          static_cast<std::uint32_t>((p >> (num_bits - 1)) & 1u);
+        return model.command[kMatchToken] + model.slot[slot] +
+               static_cast<std::uint64_t>(num_bits - 1) * kCostScale;
     }
 
     std::uint64_t rep_base(const ParseCosts& model, std::size_t rep_index) const {
