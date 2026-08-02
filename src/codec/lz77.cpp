@@ -312,25 +312,35 @@ std::uint64_t cost_varuint_model(const std::array<std::uint64_t, 256>& byte_cost
     return cost + byte_costs[value];
 }
 
-std::uint64_t cost_match_model(const ParseCosts& model, std::size_t length, std::size_t distance) {
-    if (!model.measured) {
-        return match_cost(length, distance);
-    }
-    return model.command[kMatchToken] +
-           cost_varuint_model(model.match_length, length) +
-           model.slot[distance_slot(distance)] +
-           static_cast<std::uint64_t>(distance_footer_bits(distance)) * kCostScale;
-}
+// The DP evaluates the same length prefixes against many distances and recent
+// offsets. Cache the length-only part once, leaving only the distance/command
+// base to be added per candidate. The unmeasured branch deliberately mirrors
+// match_cost()/rep_cost() byte-for-byte; the measured branch mirrors the
+// entropy-aligned model used by the existing parser.
+struct ParseTransitionCosts {
+    std::vector<std::uint64_t> length;
 
-std::uint64_t cost_rep_model(const ParseCosts& model,
-                             std::size_t length,
-                             std::size_t rep_index) {
-    if (!model.measured) {
-        return rep_cost(length);
+    ParseTransitionCosts(const ParseCosts& model, std::size_t max_length)
+        : length(max_length + 1) {
+        for (std::size_t value = 0; value <= max_length; ++value) {
+            length[value] = model.measured
+                ? cost_varuint_model(model.match_length, value)
+                : static_cast<std::uint64_t>(12 + varuint_cost(value) * 5);
+        }
     }
-    return model.command[kRepTokenBase + rep_index] +
-           cost_varuint_model(model.match_length, length);
-}
+
+    std::uint64_t match_base(const ParseCosts& model, std::size_t distance) const {
+        if (!model.measured) {
+            return static_cast<std::uint64_t>(varuint_cost(distance)) * 7;
+        }
+        return model.command[kMatchToken] + model.slot[distance_slot(distance)] +
+               static_cast<std::uint64_t>(distance_footer_bits(distance)) * kCostScale;
+    }
+
+    std::uint64_t rep_base(const ParseCosts& model, std::size_t rep_index) const {
+        return model.measured ? model.command[kRepTokenBase + rep_index] : 0;
+    }
+};
 
 void add_match_candidate(MatchList& matches,
                          std::size_t length,
@@ -473,7 +483,8 @@ void add_length_choice(std::array<std::uint16_t, 16>& lengths,
     lengths[count++] = narrowed;
 }
 
-std::array<std::uint16_t, 16> useful_lengths(std::size_t max_length, std::size_t& count) {
+std::array<std::uint16_t, 16> build_useful_lengths(std::size_t max_length,
+                                                   std::size_t& count) {
     std::array<std::uint16_t, 16> lengths{};
     count = 0;
 
@@ -488,6 +499,46 @@ std::array<std::uint16_t, 16> useful_lengths(std::size_t max_length, std::size_t
     add_length_choice(lengths, count, max_length, max_length);
     std::sort(lengths.begin(), lengths.begin() + static_cast<std::ptrdiff_t>(count));
     return lengths;
+}
+
+// The optimal parser asks for the same bounded set of length prefixes at every
+// input position. Building and sorting that set for every match used to add a
+// surprising amount of scalar work to the DP hot loop. Keep the exact legacy
+// choices in a per-worker table; the table is grown only to the largest match
+// length this worker has actually seen.
+struct UsefulLengthCache {
+    std::vector<std::array<std::uint16_t, 16>> values;
+    std::vector<std::uint8_t> counts;
+
+    void ensure(std::size_t maximum) {
+        if (!values.empty() && maximum < values.size()) {
+            return;
+        }
+
+        const auto old_size = values.size();
+        values.resize(maximum + 1);
+        counts.resize(maximum + 1);
+        const auto first = old_size == 0 ? std::size_t{1} : old_size;
+        for (std::size_t length = first; length <= maximum; ++length) {
+            std::size_t count = 0;
+            values[length] = build_useful_lengths(length, count);
+            counts[length] = static_cast<std::uint8_t>(count);
+        }
+    }
+};
+
+std::array<std::uint16_t, 16> useful_lengths(std::size_t max_length, std::size_t& count) {
+    // Match and decision lengths are uint16_t, so values above this limit can
+    // never become a DP edge. Preserve the old behavior for custom callers
+    // that request a larger match limit: the oversized endpoint is omitted.
+    if (max_length > std::numeric_limits<std::uint16_t>::max()) {
+        return build_useful_lengths(max_length, count);
+    }
+
+    static thread_local UsefulLengthCache cache;
+    cache.ensure(max_length);
+    count = cache.counts[max_length];
+    return cache.values[max_length];
 }
 
 }  // namespace
@@ -505,12 +556,13 @@ ByteVector encode_lz77_impl(std::span<const std::uint8_t> input,
 
     // Pool workers encode blocks back to back; reusing the multi-megabyte
     // match-finder arrays per thread avoids reallocating and re-faulting them
-    // for every block. assign() keeps capacity while writing the reset values
-    // the old fresh allocations held.
+    // for every block. The hash heads must be reset, but every `previous`
+    // element is written by insert_position before it can be followed, so a
+    // resize is sufficient and avoids touching several megabytes per block.
     static thread_local std::vector<Index> hash_heads;
     static thread_local std::vector<Index> previous;
     hash_heads.assign(kHashSize, kNoPos);
-    previous.assign(input.size(), kNoPos);
+    previous.resize(input.size());
 
     const auto window_size = std::max<std::size_t>(kMinMatch, options.window_size);
     const auto max_match = std::max<std::size_t>(kMinMatch, options.max_match);
@@ -1872,6 +1924,11 @@ ByteVector optimal_parse_with_costs(std::span<const std::uint8_t> input,
     const auto max_chain_depth = std::max<std::size_t>(1, options.optimal_chain_depth);
     const auto max_candidates =
         std::clamp<std::size_t>(options.max_parser_candidates, 1, kParserCandidateLimit);
+    const auto transition_length_limit = std::min({
+        max_match,
+        input.size(),
+        static_cast<std::size_t>(std::numeric_limits<std::uint16_t>::max())});
+    const ParseTransitionCosts transition_costs(model, transition_length_limit);
 
     using Index = std::uint32_t;
     constexpr Index kNoPos = std::numeric_limits<Index>::max();
@@ -1904,7 +1961,7 @@ ByteVector optimal_parse_with_costs(std::span<const std::uint8_t> input,
     static thread_local std::vector<ParseDecision> decisions;
     if (!use_tree) {
         hash_heads.assign(kHashSize, kNoPos);
-        previous.assign(input.size(), kNoPos);
+        previous.resize(input.size());
     }
     // No edge reaches farther than max_match, and a settled position's cost is
     // never read again. Retain only that live frontier; decisions remain
@@ -2009,12 +2066,13 @@ ByteVector optimal_parse_with_costs(std::span<const std::uint8_t> input,
         for (const auto& match : match_candidates) {
             std::size_t length_count = 0;
             const auto lengths = useful_lengths(match.length, length_count);
+            const auto candidate_cost_base =
+                current_cost + transition_costs.match_base(model, match.distance);
 
             for (std::size_t i = 0; i < length_count; ++i) {
                 const auto length = static_cast<std::size_t>(lengths[i]);
                 const auto target = position + length;
-                const auto candidate_cost =
-                    current_cost + cost_match_model(model, length, match.distance);
+                const auto candidate_cost = candidate_cost_base + transition_costs.length[length];
 
                 auto& target_cost = costs[target % costs.size()];
                 if (candidate_cost < target_cost) {
@@ -2042,11 +2100,12 @@ ByteVector optimal_parse_with_costs(std::span<const std::uint8_t> input,
 
             std::size_t length_count = 0;
             const auto lengths = useful_lengths(rep_length, length_count);
+            const auto candidate_cost_base =
+                current_cost + transition_costs.rep_base(model, i);
             for (std::size_t k = 0; k < length_count; ++k) {
                 const auto length = static_cast<std::size_t>(lengths[k]);
                 const auto target = position + length;
-                const auto candidate_cost =
-                    current_cost + cost_rep_model(model, length, i);
+                const auto candidate_cost = candidate_cost_base + transition_costs.length[length];
 
                 auto& target_cost = costs[target % costs.size()];
                 if (candidate_cost < target_cost) {
@@ -2270,6 +2329,11 @@ ByteVector parse_checkpoint_tile(std::span<const std::uint8_t> input,
     constexpr std::uint64_t kInf = std::numeric_limits<std::uint64_t>::max() / 4;
     const auto length = candidates.end - candidates.begin;
     const auto max_match = std::max<std::size_t>(kMinMatch, options.max_match);
+    const auto transition_length_limit = std::min({
+        max_match,
+        length,
+        static_cast<std::size_t>(std::numeric_limits<std::uint16_t>::max())});
+    const ParseTransitionCosts transition_costs(model, transition_length_limit);
 
     const auto max_transition = std::min(max_match, length);
     std::vector<std::uint64_t> costs(max_transition + 1, kInf);
@@ -2331,11 +2395,13 @@ ByteVector parse_checkpoint_tile(std::span<const std::uint8_t> input,
             }
             std::size_t useful_count = 0;
             const auto useful = useful_lengths(capped_length, useful_count);
+            const auto candidate_cost_base =
+                current_cost + transition_costs.match_base(model, match.distance);
             for (std::size_t i = 0; i < useful_count; ++i) {
                 const auto match_length = static_cast<std::size_t>(useful[i]);
                 const auto target = local + match_length;
-                const auto candidate_cost = current_cost +
-                    cost_match_model(model, match_length, match.distance);
+                const auto candidate_cost =
+                    candidate_cost_base + transition_costs.length[match_length];
                 auto& target_cost = costs[target % costs.size()];
                 if (candidate_cost < target_cost) {
                     target_cost = candidate_cost;
@@ -2357,11 +2423,13 @@ ByteVector parse_checkpoint_tile(std::span<const std::uint8_t> input,
             }
             std::size_t useful_count = 0;
             const auto useful = useful_lengths(rep_length, useful_count);
+            const auto candidate_cost_base =
+                current_cost + transition_costs.rep_base(model, index);
             for (std::size_t i = 0; i < useful_count; ++i) {
                 const auto match_length = static_cast<std::size_t>(useful[i]);
                 const auto target = local + match_length;
                 const auto candidate_cost =
-                    current_cost + cost_rep_model(model, match_length, index);
+                    candidate_cost_base + transition_costs.length[match_length];
                 auto& target_cost = costs[target % costs.size()];
                 if (candidate_cost < target_cost) {
                     target_cost = candidate_cost;

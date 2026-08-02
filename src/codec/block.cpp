@@ -143,14 +143,6 @@ std::vector<BlockRange> adaptive_block_plan(
     return blocks;
 }
 
-struct LegacyPayloads {
-    ByteVector split;
-    std::optional<ByteVector> slots;
-    std::optional<ByteVector> contextual_slots;
-    std::optional<ByteVector> context_split;
-    std::optional<ByteVector> contextual_context_split;
-};
-
 BlockCodec read_block_codec(std::uint8_t value) {
     if (value == static_cast<std::uint8_t>(BlockCodec::store)) {
         return BlockCodec::store;
@@ -318,71 +310,44 @@ BlockResult compress_block(std::span<const std::uint8_t> input,
             sequence_payload = std::move(candidates.sequence);
         } else if (executor != nullptr && !options.fast_entropy &&
                    lz_payload.size() >= (std::size_t{256} << 10)) {
-            // Huffman, legacy split layouts, and the v6 sequence layout only
-            // read the token stream. Run those independent trials through the
-            // encode-wide executor; deterministic selection still happens in
-            // the original order below.
+            // The expensive candidates share one token analysis. Keep the
+            // whole-stream Huffman trial independent, while the combined LZ77
+            // bake-off reuses its split/sequence/context metadata.
             auto huffman_task = executor->submit([&lz_payload] {
                 return entropy::encode_huffman(lz_payload);
             });
-            auto legacy_task = executor->submit([&input, &lz_payload, &options,
-                                                  try_sequence, executor] {
-                auto pair = encode_lz77_split_payloads(lz_payload, options.fast_entropy,
-                                                       executor);
-                LegacyPayloads result{std::move(pair.split), std::move(pair.slots),
-                                      std::move(pair.contextual_slots), std::nullopt,
-                                      std::nullopt};
-                if (try_sequence && result.slots) {
-                    const auto contextual = result.contextual_slots
-                        ? std::span<const std::uint8_t>(*result.contextual_slots)
-                        : std::span<const std::uint8_t>{};
-                    auto context_split = encode_lz77_context_split_streams(
-                        input, lz_payload, *result.slots, contextual, executor);
-                    result.context_split = std::move(context_split.slots);
-                    result.contextual_context_split =
-                        std::move(context_split.contextual_slots);
-                }
-                return result;
-            });
+            const auto useful_size = std::min(best_size, lz_payload.size());
+            auto candidates_task = executor->submit(
+                [&input, &lz_payload, try_sequence, useful_size, executor] {
+                    return encode_lz77_payload_candidates_exhaustive(
+                        input, lz_payload, try_sequence, useful_size, executor);
+                });
 
-            std::optional<std::future<std::optional<ByteVector>>> sequence_task;
-            if (try_sequence) {
-                const auto useful_size = std::min(best_size, lz_payload.size());
-                sequence_task.emplace(executor->submit(
-                    [&input, &lz_payload, &options, useful_size, executor] {
-                        return encode_lz77_sequence_streams(
-                            input, lz_payload, options.fast_entropy, useful_size, executor);
-                    }));
-            }
-
+            std::optional<Lz77PayloadCandidates> candidates;
             std::exception_ptr task_error;
-            std::optional<LegacyPayloads> legacy;
-            auto collect = [&](auto& task, auto& destination) {
-                try {
-                    destination = executor->wait(task);
-                } catch (...) {
-                    if (!task_error) {
-                        task_error = std::current_exception();
-                    }
+            try {
+                candidates = executor->wait(candidates_task);
+            } catch (...) {
+                task_error = std::current_exception();
+            }
+            try {
+                entropy_payload = executor->wait(huffman_task);
+            } catch (...) {
+                if (!task_error) {
+                    task_error = std::current_exception();
                 }
-            };
-            // Drain every sibling before references captured by those tasks go
-            // out of scope, even if allocation or a coder fails in one trial.
-            collect(huffman_task, entropy_payload);
-            collect(legacy_task, legacy);
-            if (sequence_task) {
-                collect(*sequence_task, sequence_payload);
             }
             if (task_error) {
                 std::rethrow_exception(task_error);
             }
-            if (legacy) {
-                split_payload = std::move(legacy->split);
-                slot_payload = std::move(legacy->slots);
-                contextual_slot_payload = std::move(legacy->contextual_slots);
-                context_split_payload = std::move(legacy->context_split);
+            if (candidates) {
+                split_payload = std::move(candidates->split);
+                slot_payload = std::move(candidates->slots);
+                contextual_slot_payload = std::move(candidates->contextual_slots);
+                sequence_payload = std::move(candidates->sequence);
+                context_split_payload = std::move(candidates->context_split);
                 contextual_context_split_payload =
-                    std::move(legacy->contextual_context_split);
+                    std::move(candidates->contextual_context_split);
             }
         } else {
             // The whole-stream Huffman candidate almost never beats split
@@ -390,31 +355,16 @@ BlockResult compress_block(std::span<const std::uint8_t> input,
             if (!options.fast_entropy) {
                 entropy_payload = entropy::encode_huffman(lz_payload);
             }
-            auto legacy =
-                encode_lz77_split_payloads(lz_payload, options.fast_entropy, executor);
-            split_payload = std::move(legacy.split);
-            slot_payload = std::move(legacy.slots);
-            contextual_slot_payload = std::move(legacy.contextual_slots);
-            if (try_sequence) {
-                // Candidate policy must not depend on whether an executor is
-                // present. The parallel path starts this trial before legacy
-                // split sizes are known, so use the same stable upper bound in
-                // serial mode; thread count then cannot change archive bytes.
-                const auto useful_size = std::min(best_size, lz_payload.size());
-                sequence_payload =
-                    encode_lz77_sequence_streams(input, lz_payload, options.fast_entropy,
-                                                 useful_size, executor);
-                if (slot_payload) {
-                    const auto contextual = contextual_slot_payload
-                        ? std::span<const std::uint8_t>(*contextual_slot_payload)
-                        : std::span<const std::uint8_t>{};
-                    auto context_split = encode_lz77_context_split_streams(
-                        input, lz_payload, *slot_payload, contextual, executor);
-                    context_split_payload = std::move(context_split.slots);
-                    contextual_context_split_payload =
-                        std::move(context_split.contextual_slots);
-                }
-            }
+            const auto useful_size = std::min(best_size, lz_payload.size());
+            auto candidates = encode_lz77_payload_candidates_exhaustive(
+                input, lz_payload, try_sequence, useful_size, executor);
+            split_payload = std::move(candidates.split);
+            slot_payload = std::move(candidates.slots);
+            contextual_slot_payload = std::move(candidates.contextual_slots);
+            sequence_payload = std::move(candidates.sequence);
+            context_split_payload = std::move(candidates.context_split);
+            contextual_context_split_payload =
+                std::move(candidates.contextual_context_split);
         }
         if (entropy_payload && entropy_payload->size() < best_size) {
             accept_encoded_payload(BlockCodec::greedy_lz77_huffman,

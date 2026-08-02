@@ -34,6 +34,8 @@ struct Lz77PayloadCandidates {
     std::optional<ByteVector> slots;
     std::optional<ByteVector> contextual_slots;
     std::optional<ByteVector> sequence;
+    std::optional<ByteVector> context_split;
+    std::optional<ByteVector> contextual_context_split;
 };
 
 struct Lz77SplitPayloads {
@@ -127,6 +129,18 @@ Lz77PayloadCandidates encode_lz77_payload_candidates(
     std::span<const std::uint8_t> input,
     std::span<const std::uint8_t> lz77_payload,
     bool fast = false,
+    core::TaskExecutor* executor = nullptr);
+
+// Exhaustive non-fast candidate bake-off. It parses the token stream once and
+// reuses that analysis for split, sequence, and context-split layouts. The
+// maximum useful size keeps the sequence rejection gate identical to the
+// ordinary block candidate path; all returned layouts remain independently
+// selectable by the caller.
+Lz77PayloadCandidates encode_lz77_payload_candidates_exhaustive(
+    std::span<const std::uint8_t> input,
+    std::span<const std::uint8_t> lz77_payload,
+    bool try_sequence = true,
+    std::size_t maximum_useful_size = std::numeric_limits<std::size_t>::max(),
     core::TaskExecutor* executor = nullptr);
 
 ByteVector decode_lz77_sequence_streams(std::span<const std::uint8_t> encoded,

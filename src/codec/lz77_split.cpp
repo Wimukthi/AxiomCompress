@@ -376,6 +376,14 @@ public:
         return std::move(bytes_);
     }
 
+    ByteVector copy_finish() const {
+        ByteVector result = bytes_;
+        if (filled_ > 0) {
+            result.push_back(static_cast<std::uint8_t>(accumulator_ & 0xFFu));
+        }
+        return result;
+    }
+
 private:
     ByteVector bytes_;
     std::uint64_t accumulator_ = 0;
@@ -1002,7 +1010,7 @@ std::optional<FullPreviousLiteralStreams> cluster_full_previous_literals(
 
 void write_context_literal_streams(ByteVector& result,
                                    std::span<const std::uint8_t> input,
-                                   Lz77SequenceAnalysis& analysis,
+                                   const Lz77SequenceAnalysis& analysis,
                                    core::TaskExecutor* executor) {
     auto estimate_literal_mode = [](const auto& histograms) {
         double bits = 0.0;
@@ -1031,23 +1039,32 @@ void write_context_literal_streams(ByteVector& result,
     const auto selected_score = std::min(raw_score, residual_score);
     const bool try_match = match_score < selected_score;
 
-    std::array<ByteVector, kLiteralContextLanes> selected_literals;
-    std::array<ByteVector, kLiteralContextLanes> match_base_literals;
-    std::array<ByteVector, kLiteralContextLanes> match_literals;
+    std::array<const ByteVector*, kLiteralContextLanes> selected_literals{};
+    std::array<const ByteVector*, kLiteralContextLanes> match_base_literals{};
+    std::array<const ByteVector*, kLiteralContextLanes> match_literals{};
+    std::array<ByteVector, kLiteralContextLanes> generated_selected_literals;
+    std::array<ByteVector, kLiteralContextLanes> generated_match_base_literals;
+    std::array<ByteVector, kLiteralContextLanes> generated_match_literals;
     if (analysis.literals_materialized) {
-        selected_literals = use_residual ? std::move(analysis.residual_literals)
-                                         : std::move(analysis.raw_literals);
+        const auto& selected = use_residual ? analysis.residual_literals
+                                            : analysis.raw_literals;
+        for (std::size_t lane = 0; lane < kLiteralContextLanes; ++lane) {
+            selected_literals[lane] = &selected[lane];
+        }
         if (try_match) {
-            match_base_literals = std::move(analysis.match_base_literals);
-            match_literals = std::move(analysis.match_literals);
+            for (std::size_t lane = 0; lane < kLiteralContextLanes; ++lane) {
+                match_base_literals[lane] = &analysis.match_base_literals[lane];
+                match_literals[lane] = &analysis.match_literals[lane];
+            }
         }
     } else {
         for (std::size_t lane = 0; lane < kLiteralContextLanes; ++lane) {
-            selected_literals[lane].reserve(histogram_size(selected_histograms[lane]));
+            generated_selected_literals[lane].reserve(
+                histogram_size(selected_histograms[lane]));
             if (try_match) {
-                match_base_literals[lane].reserve(
+                generated_match_base_literals[lane].reserve(
                     histogram_size(analysis.match_base_histograms[lane]));
-                match_literals[lane].reserve(
+                generated_match_literals[lane].reserve(
                     histogram_size(analysis.match_histograms[lane]));
             }
         }
@@ -1060,10 +1077,10 @@ void write_context_literal_streams(ByteVector& result,
                     const auto predicted = run.rep0 <= position
                                                ? input[position - run.rep0]
                                                : std::uint8_t{0};
-                    selected_literals[lane].push_back(
+                    generated_selected_literals[lane].push_back(
                         static_cast<std::uint8_t>(literal ^ predicted));
                 } else {
-                    selected_literals[lane].push_back(literal);
+                    generated_selected_literals[lane].push_back(literal);
                 }
 
                 if (try_match) {
@@ -1075,25 +1092,32 @@ void write_context_literal_streams(ByteVector& result,
                     if (use_match_context) {
                         const auto match_lane =
                             static_cast<std::size_t>(predicted >> 5);
-                        match_literals[match_lane].push_back(
+                        generated_match_literals[match_lane].push_back(
                             static_cast<std::uint8_t>(literal ^ predicted));
                     } else {
-                        match_base_literals[lane].push_back(literal);
+                        generated_match_base_literals[lane].push_back(literal);
                     }
                 }
+            }
+        }
+        for (std::size_t lane = 0; lane < kLiteralContextLanes; ++lane) {
+            selected_literals[lane] = &generated_selected_literals[lane];
+            if (try_match) {
+                match_base_literals[lane] = &generated_match_base_literals[lane];
+                match_literals[lane] = &generated_match_literals[lane];
             }
         }
     }
 
     auto encode_lane = [&](std::size_t candidate, std::size_t lane) {
         ByteVector encoded;
-        const ByteVector* literals = &selected_literals[lane];
+        const ByteVector* literals = selected_literals[lane];
         const Lz77SplitStreams::Histogram* histogram = &selected_histograms[lane];
         if (candidate == 1) {
-            literals = &match_base_literals[lane];
+            literals = match_base_literals[lane];
             histogram = &analysis.match_base_histograms[lane];
         } else if (candidate == 2) {
-            literals = &match_literals[lane];
+            literals = match_literals[lane];
             histogram = &analysis.match_histograms[lane];
         }
         write_stream(encoded, *literals, /*try_order1=*/true,
@@ -1107,7 +1131,9 @@ void write_context_literal_streams(ByteVector& result,
     std::array<ByteVector, kLiteralContextLanes> encoded_match_lanes;
     const auto selected_literal_count = std::accumulate(
         selected_literals.begin(), selected_literals.end(), std::size_t{0},
-        [](std::size_t total, const ByteVector& lane) { return total + lane.size(); });
+        [](std::size_t total, const ByteVector* lane) {
+            return total + lane->size();
+        });
     constexpr std::size_t kParallelLaneThreshold = std::size_t{256} << 10;
     if (executor != nullptr && selected_literal_count >= kParallelLaneThreshold) {
         std::array<std::future<ByteVector>, kLiteralContextLanes * 3> tasks;
@@ -1228,7 +1254,7 @@ void write_context_literal_streams(ByteVector& result,
 }
 
 ByteVector encode_sequence_analysis(std::span<const std::uint8_t> input,
-                                    Lz77SequenceAnalysis analysis,
+                                    const Lz77SequenceAnalysis& analysis,
                                     core::TaskExecutor* executor) {
     ByteVector common;
     write_varuint(common, analysis.sequence_count);
@@ -1236,9 +1262,9 @@ ByteVector encode_sequence_analysis(std::span<const std::uint8_t> input,
     write_sequence_code_stream(common, analysis.literal_length_codes);
     write_sequence_code_stream(common, analysis.match_length_codes);
     write_sequence_code_stream(common, analysis.offset_codes);
-    write_raw_blob(common, analysis.literal_length_extra.finish());
-    write_raw_blob(common, analysis.match_length_extra.finish());
-    write_raw_blob(common, analysis.offset_extra.finish());
+    write_raw_blob(common, analysis.literal_length_extra.copy_finish());
+    write_raw_blob(common, analysis.match_length_extra.copy_finish());
+    write_raw_blob(common, analysis.offset_extra.copy_finish());
 
     ByteVector result = std::move(common);
     write_context_literal_streams(result, input, analysis, executor);
@@ -1885,23 +1911,18 @@ Lz77SplitPayloads encode_lz77_split_payloads(
     return encode_lz77_split_payloads(split_lz77_payload(lz77_payload), fast, executor);
 }
 
-Lz77ContextSplitPayloads encode_lz77_context_split_streams(
+Lz77ContextSplitPayloads encode_lz77_context_split_analysis(
     std::span<const std::uint8_t> input,
-    std::span<const std::uint8_t> lz77_payload,
+    const Lz77SequenceAnalysis& analysis,
     std::span<const std::uint8_t> slot_payload,
     std::span<const std::uint8_t> contextual_slot_payload,
     core::TaskExecutor* executor) {
-    auto analysis = analyze_lz77_payload(input, lz77_payload, /*build_sequence=*/true,
-                                         /*build_split=*/false);
-    if (!analysis.sequence) {
-        return {};
-    }
     if (slot_payload.empty()) {
         return {};
     }
 
     ByteVector literal_suffix;
-    write_context_literal_streams(literal_suffix, input, *analysis.sequence, executor);
+    write_context_literal_streams(literal_suffix, input, analysis, executor);
 
     auto replace_literals = [&](std::span<const std::uint8_t> payload,
                                 bool contextual_footer) -> std::optional<ByteVector> {
@@ -1937,6 +1958,21 @@ Lz77ContextSplitPayloads encode_lz77_context_split_streams(
     return {replace_literals(slot_payload, /*contextual_footer=*/false),
             replace_literals(contextual_slot_payload,
                              /*contextual_footer=*/true)};
+}
+
+Lz77ContextSplitPayloads encode_lz77_context_split_streams(
+    std::span<const std::uint8_t> input,
+    std::span<const std::uint8_t> lz77_payload,
+    std::span<const std::uint8_t> slot_payload,
+    std::span<const std::uint8_t> contextual_slot_payload,
+    core::TaskExecutor* executor) {
+    auto analysis = analyze_lz77_payload(input, lz77_payload, /*build_sequence=*/true,
+                                         /*build_split=*/false);
+    if (!analysis.sequence) {
+        return {};
+    }
+    return encode_lz77_context_split_analysis(
+        input, *analysis.sequence, slot_payload, contextual_slot_payload, executor);
 }
 
 std::optional<ByteVector> encode_lz77_checkpoint_context_streams(
@@ -1990,7 +2026,7 @@ std::optional<ByteVector> encode_lz77_sequence_streams(
             static_cast<double>(maximum_useful_size) * kSequenceRejectionMargin) {
         return std::nullopt;
     }
-    return encode_sequence_analysis(input, std::move(*analysis.sequence), executor);
+    return encode_sequence_analysis(input, *analysis.sequence, executor);
 }
 
 Lz77PayloadCandidates encode_lz77_payload_candidates(
@@ -2008,7 +2044,7 @@ Lz77PayloadCandidates encode_lz77_payload_candidates(
         constexpr double kSequenceEstimateTolerance = 1.07;
         if (estimate_sequence_size(*analysis.sequence) <
             estimated_legacy_size * kSequenceEstimateTolerance) {
-            sequence = encode_sequence_analysis(input, std::move(*analysis.sequence), executor);
+            sequence = encode_sequence_analysis(input, *analysis.sequence, executor);
         }
     }
     std::optional<ByteVector> split;
@@ -2022,6 +2058,85 @@ Lz77PayloadCandidates encode_lz77_payload_candidates(
     }
     return {std::move(split), std::move(slots),
             std::move(contextual_slots), std::move(sequence)};
+}
+
+Lz77PayloadCandidates encode_lz77_payload_candidates_exhaustive(
+    std::span<const std::uint8_t> input,
+    std::span<const std::uint8_t> lz77_payload,
+    bool try_sequence,
+    std::size_t maximum_useful_size,
+    core::TaskExecutor* executor) {
+    auto analysis = analyze_lz77_payload(input, lz77_payload, try_sequence,
+                                         /*build_split=*/true);
+
+    constexpr double kSequenceRejectionMargin = 1.02;
+    const bool sequence_eligible =
+        try_sequence && analysis.sequence && !analysis.sequence->has_checkpoints &&
+        estimate_sequence_size(*analysis.sequence) <
+            static_cast<double>(maximum_useful_size) * kSequenceRejectionMargin;
+
+    std::optional<std::future<Lz77SplitPayloads>> split_task;
+    std::optional<std::future<ByteVector>> sequence_task;
+    constexpr std::size_t kParallelAnalysisThreshold = std::size_t{256} << 10;
+    if (executor != nullptr && lz77_payload.size() >= kParallelAnalysisThreshold) {
+        split_task.emplace(executor->submit([&analysis, executor] {
+            return encode_lz77_split_payloads(analysis.split, /*fast=*/false, executor);
+        }));
+        if (sequence_eligible) {
+            sequence_task.emplace(executor->submit([&analysis, &input, executor] {
+                return encode_sequence_analysis(input, *analysis.sequence, executor);
+            }));
+        }
+    }
+
+    Lz77SplitPayloads legacy;
+    std::optional<ByteVector> sequence;
+    std::exception_ptr task_error;
+    if (split_task) {
+        try {
+            legacy = executor->wait(*split_task);
+        } catch (...) {
+            task_error = std::current_exception();
+        }
+    } else {
+        legacy = encode_lz77_split_payloads(analysis.split, /*fast=*/false, executor);
+    }
+    if (sequence_task) {
+        try {
+            sequence = executor->wait(*sequence_task);
+        } catch (...) {
+            if (!task_error) {
+                task_error = std::current_exception();
+            }
+        }
+    } else if (sequence_eligible) {
+        try {
+            sequence = encode_sequence_analysis(input, *analysis.sequence, executor);
+        } catch (...) {
+            if (!task_error) {
+                task_error = std::current_exception();
+            }
+        }
+    }
+    if (task_error) {
+        std::rethrow_exception(task_error);
+    }
+
+    std::optional<ByteVector> context_split;
+    std::optional<ByteVector> contextual_context_split;
+    if (try_sequence && analysis.sequence && legacy.slots) {
+        const auto contextual = legacy.contextual_slots
+            ? std::span<const std::uint8_t>(*legacy.contextual_slots)
+            : std::span<const std::uint8_t>{};
+        auto context = encode_lz77_context_split_analysis(
+            input, *analysis.sequence, *legacy.slots, contextual, executor);
+        context_split = std::move(context.slots);
+        contextual_context_split = std::move(context.contextual_slots);
+    }
+
+    return {std::move(legacy.split), std::move(legacy.slots),
+            std::move(legacy.contextual_slots), std::move(sequence),
+            std::move(context_split), std::move(contextual_context_split)};
 }
 
 void decode_lz77_sequence_streams_into(std::span<const std::uint8_t> encoded,

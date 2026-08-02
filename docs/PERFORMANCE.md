@@ -146,3 +146,19 @@ Throughput depends on CPU, memory bandwidth, storage, corpus shape, and build
 settings. Ratios are far more portable between machines than timings. If you
 need numbers for your own hardware, run the harnesses described in
 [BENCHMARKING.md](BENCHMARKING.md) rather than scaling these.
+
+## 2026-08-02 ratio-neutral optimization checkpoint
+
+This controlled A/B checkpoint compares the current Release x64 build with
+`HEAD` (`37dd9906`) on the same host, using the two-repetition harness and
+round-trip verification for every row. It is an engineering measurement, not a
+replacement for the published cross-codec snapshot above.
+
+| Corpus | Levels | Archive ratio delta | Compression-speed delta | Decompression-speed delta |
+|---|---:|---:|---:|---:|
+| enwik8 | 1–9 | 0.00% at every level | −3.4% to +12.3% | −14.2% to +12.4% |
+| Silesia tar | 1–9 | 0.00% at every level | −0.6% to +22.4% | −8.2% to +7.6% |
+
+The run used `tools\bench_axiom_levels.ps1` with the corpus under
+`D:\tests\axiom-perf`. Raw, summary, and delta CSVs are written to
+`D:\tests\axiom-perf\results\speed-baseline-compare-all-2026-08-02`.
