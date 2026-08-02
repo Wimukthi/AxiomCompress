@@ -5,10 +5,10 @@
 #include "core/cpu.hpp"
 #include "core/path_text.hpp"
 #include "core/windows_time.hpp"
-#ifdef _WIN32
 #include "archive/sfx_image.hpp"
-#include "sfx/module_file.hpp"
 #include "sfx/sfx_config.hpp"
+#ifdef _WIN32
+#include "sfx/module_file.hpp"
 #endif
 
 #include <array>
