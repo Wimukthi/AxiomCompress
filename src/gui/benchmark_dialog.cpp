@@ -542,7 +542,11 @@ std::uint64_t effective_solid_block_size(const axiom::CompressionOptions& option
                                          std::size_t threads) {
     std::uint64_t block = static_cast<std::uint64_t>(std::max<std::size_t>(1, options.block_size));
     if (options.auto_block_size_for_threads && threads > 1) {
-        block = std::max<std::uint64_t>(block, static_cast<std::uint64_t>(threads) << 20);
+        const auto physical_threads = std::max<std::size_t>(
+            1, axiom::core::physical_core_count());
+        const auto geometry_threads = std::min(threads, physical_threads);
+        block = std::max<std::uint64_t>(
+            block, static_cast<std::uint64_t>(geometry_threads) << 20);
     }
     return block;
 }

@@ -389,8 +389,26 @@ void test_compression_level_presets() {
     AXIOM_CHECK(wide_tree.block_size == (32u << 20));
     AXIOM_CHECK(wide_tree.window_size == (32u << 20));
     wide_tree.thread_count = 16;
+    const auto physical_threads = std::max<std::size_t>(
+        1, axiom::core::physical_core_count());
+    const auto geometry_threads = std::min<std::size_t>(16, physical_threads);
+    const auto expected_auto_block = std::min<std::size_t>(
+        wide_tree.block_size,
+        std::max<std::size_t>(1u << 20,
+                              ((64u << 20) + geometry_threads - 1) / geometry_threads));
     AXIOM_CHECK(axiom::codec::effective_parallel_block_size(64u << 20, wide_tree) ==
-                (4u << 20));
+                expected_auto_block);
+
+    const auto logical_threads = axiom::core::logical_processor_count();
+    if (logical_threads > physical_threads) {
+        auto smt_request = wide_tree;
+        smt_request.thread_count = logical_threads;
+        auto physical_request = wide_tree;
+        physical_request.thread_count = physical_threads;
+        AXIOM_CHECK(axiom::codec::effective_parallel_block_size(64u << 20, smt_request) ==
+                    axiom::codec::effective_parallel_block_size(64u << 20,
+                                                                physical_request));
+    }
 
     axiom::CompressionOptions maximum;
     axiom::apply_compression_level(maximum, 99);

@@ -185,3 +185,23 @@ The all-level sweep used one repeat per build; its timings are directional only.
 The level-7 figures use the three-repeat targeted sweep. Raw, summary, and delta
 CSVs are in `D:\tests\axiom-perf\results\final-all-level-compare-2026-08-02`
 and `D:\tests\axiom-perf\results\tree-modulo-compare-2026-08-02`.
+
+## 2026-08-02 CPU-scaling checkpoint
+
+The first scaling sweep found that explicit SMT geometry was over-splitting
+solid input: on the 16-core/32-thread test machine, `--threads 32` created
+smaller independent blocks and lost ratio at the stronger levels. Block and
+archive geometry now caps its planning count at physical cores; the executor
+can still use the requested logical-thread budget for nested work.
+
+The fixed-32 all-level sweep restored the automatic profile's archive bytes at
+all 18 corpus/level pairs:
+
+| Corpus | Levels | Archive-byte delta versus automatic | Round trips |
+|---|---:|---:|---:|
+| enwik8 | 1–9 | 0 bytes at every level | all passed |
+| Silesia tar | 1–9 | 0 bytes at every level | all passed |
+
+Raw, summary, and delta CSVs are in
+`D:\tests\axiom-perf\results\scaling-cap-all-levels-2026-08-02`. The original
+orientation sweep is in `D:\tests\axiom-perf\results\scaling-next-phase-2026-08-02`.

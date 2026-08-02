@@ -219,6 +219,12 @@ discovery at levels 8–9 means one busy thread per physical core is sometimes
 the fastest schedule. Treat low utilization as a regression only when
 throughput *also* fails to scale on larger or harder corpora.
 
+Automatic block geometry follows physical cores even when `--threads` requests
+more logical SMT workers. This keeps independent blocks large enough to retain
+match history; the requested thread budget remains available to nested codec
+work and independent archive operations. Validate oversubscribed runs against
+the automatic or physical-core profile for both archive bytes and throughput.
+
 ## Preset changes
 
 Level 9 currently uses a 64 MiB block and window maximum. Larger 96 MiB and

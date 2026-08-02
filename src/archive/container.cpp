@@ -179,9 +179,13 @@ std::size_t selected_thread_count(std::size_t requested_threads) {
 }
 
 std::size_t selected_geometry_thread_count(std::size_t requested_threads) {
-    // Automatic geometry follows physical cores so SMT helpers do not create
-    // smaller match windows. Explicit requests continue to control both.
-    return requested_threads == 0 ? core::physical_core_count() : requested_threads;
+    // Block geometry follows physical cores so SMT helpers do not create
+    // smaller match windows. The executor still receives the explicit logical
+    // thread request for nested work and independent archive operations.
+    const auto physical_threads = std::max<std::size_t>(1, core::physical_core_count());
+    return requested_threads == 0
+        ? physical_threads
+        : std::min(requested_threads, physical_threads);
 }
 
 std::size_t effective_solid_block_size(const CompressionOptions& options) {

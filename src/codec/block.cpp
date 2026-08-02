@@ -722,9 +722,14 @@ std::size_t effective_parallel_block_size(std::size_t input_size,
         return block_size;
     }
 
+    const auto physical_threads = std::max<std::size_t>(1, core::physical_core_count());
     auto target_threads = options.thread_count;
     if (target_threads == 0) {
-        target_threads = core::physical_core_count();
+        target_threads = physical_threads;
+    } else {
+        // SMT workers may still help nested codec tasks, but making more
+        // independent blocks than physical cores throws away match history.
+        target_threads = std::min(target_threads, physical_threads);
     }
     if (target_threads <= 1) {
         return block_size;
