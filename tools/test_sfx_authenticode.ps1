@@ -33,13 +33,6 @@ function Find-SignTool {
     return $candidate.FullName
 }
 
-function Find-CertUtil {
-    $fromPath = Get-Command certutil.exe -ErrorAction SilentlyContinue |
-        Select-Object -First 1 -ExpandProperty Source
-    if (-not $fromPath) { throw "Windows certutil.exe was not found" }
-    return $fromPath
-}
-
 function Invoke-Checked {
     param(
         [Parameter(Mandatory)]
@@ -55,8 +48,53 @@ function Invoke-Checked {
     }
 }
 
+function Add-CurrentUserCertificate {
+    param(
+        [Parameter(Mandatory)]
+        [System.Security.Cryptography.X509Certificates.X509Certificate2]$Certificate,
+
+        [Parameter(Mandatory)]
+        [System.Security.Cryptography.X509Certificates.StoreName]$StoreName
+    )
+
+    $store = [System.Security.Cryptography.X509Certificates.X509Store]::new(
+        $StoreName,
+        [System.Security.Cryptography.X509Certificates.StoreLocation]::CurrentUser)
+    try {
+        $store.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite)
+        $store.Add($Certificate)
+    } finally {
+        $store.Close()
+    }
+}
+
+function Remove-CurrentUserCertificate {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Thumbprint,
+
+        [Parameter(Mandatory)]
+        [System.Security.Cryptography.X509Certificates.StoreName]$StoreName
+    )
+
+    $store = [System.Security.Cryptography.X509Certificates.X509Store]::new(
+        $StoreName,
+        [System.Security.Cryptography.X509Certificates.StoreLocation]::CurrentUser)
+    try {
+        $store.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite)
+        $matches = $store.Certificates.Find(
+            [System.Security.Cryptography.X509Certificates.X509FindType]::FindByThumbprint,
+            $Thumbprint,
+            $false)
+        foreach ($match in $matches) {
+            $store.Remove($match)
+        }
+    } finally {
+        $store.Close()
+    }
+}
+
 $signTool = Find-SignTool
-$certUtil = Find-CertUtil
 $tempRoot = if ([string]::IsNullOrWhiteSpace($env:RUNNER_TEMP)) {
     [IO.Path]::GetTempPath()
 } else {
@@ -95,10 +133,10 @@ try {
     $password = ConvertTo-SecureString $passwordText -AsPlainText -Force
     Export-PfxCertificate -Cert $certificate -FilePath $pfx -Password $password | Out-Null
     Export-Certificate -Cert $certificate -FilePath $cer | Out-Null
-    # Import-Certificate can display a trust prompt on some developer images.
-    # certutil's user-store path is deterministic and does not require UI input.
-    Invoke-Checked $certUtil @("-user", "-addstore", "-f", "Root", $cer)
-    Invoke-Checked $certUtil @("-user", "-addstore", "-f", "TrustedPublisher", $cer)
+    # Mutate the CurrentUser stores directly. This is non-interactive and avoids
+    # certutil's Root-store update path hanging on some hosted Windows images.
+    Add-CurrentUserCertificate $certificate ([System.Security.Cryptography.X509Certificates.StoreName]::Root)
+    Add-CurrentUserCertificate $certificate ([System.Security.Cryptography.X509Certificates.StoreName]::TrustedPublisher)
 
     Copy-Item -LiteralPath $unsigned -Destination $signed
     Invoke-Checked $signTool @(
@@ -129,11 +167,15 @@ try {
 finally {
     if ($thumbprint) {
         foreach ($store in @(
-            "My",
-            "Root",
-            "TrustedPublisher"
+            [System.Security.Cryptography.X509Certificates.StoreName]::My,
+            [System.Security.Cryptography.X509Certificates.StoreName]::Root,
+            [System.Security.Cryptography.X509Certificates.StoreName]::TrustedPublisher
         )) {
-            & $certUtil "-user" "-delstore" $store $thumbprint *> $null
+            try {
+                Remove-CurrentUserCertificate -Thumbprint $thumbprint -StoreName $store
+            } catch {
+                Write-Verbose "Could not remove test certificate from ${store}: $($_.Exception.Message)"
+            }
         }
     }
     if (Test-Path -LiteralPath $temp) {
