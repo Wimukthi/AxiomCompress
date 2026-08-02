@@ -310,3 +310,26 @@ On the same Release x64 host and Dickens profile, the two-run averages were:
 Both current runs remained 2,888,466 bytes with SHA-256
 `5BD317E7B2864CB03DE9E4385123180CF1FC6A6D77030257687E28E52205EE6F`. The
 timings are directional and host-specific.
+
+## 2026-08-03 level-9 greedy-depth checkpoint
+
+The level-9 preset's greedy tree search depth is now 384 instead of 512. This
+only shortens the greedy cost-model pass; the optimal parser still uses its
+existing depth and the AXC format and decoder are unchanged.
+
+On the same Release x64 host, with 32 threads and one 64 MiB block, the final
+five-corpus run produced these archive sizes:
+
+| Corpus | Depth 512 control | Depth 384 default | Delta |
+|---|---:|---:|---:|
+| dickens | 2,888,466 | 2,888,466 | 0 |
+| nci | 1,533,618 | 1,533,618 | 0 |
+| mozilla | 15,405,821 | 15,405,795 | -26 |
+| samba | 4,088,518 | 4,088,359 | -159 |
+| webster | 8,538,616 | 8,538,595 | -21 |
+
+The greedy phase was faster in each final profile; measured depth-384 greedy
+times were 2.397 s, 6.528 s, 12.334 s, 4.597 s, and 11.385 s respectively.
+All five compressed streams were decompressed and matched their source
+SHA-256 exactly. The timings are host-specific and directional; repeat the
+controlled profile workflow before making cross-machine claims.

@@ -776,7 +776,9 @@ inline void apply_compression_level(CompressionOptions& options, int level) {
             // DP pass proved both smaller and faster once v7 numeric transforms
             // exposed longer runs; multi-block inputs still parse in parallel.
             options.use_tree_matcher = true;
-            options.max_chain_depth = 512;
+            // 384 probes retain the maximum-effort ratio while avoiding
+            // redundant deep tree walks in the greedy cost-model pass.
+            options.max_chain_depth = 384;
             options.max_match = 4096;
             options.block_size = 64u << 20;
             options.window_size = 64u << 20;

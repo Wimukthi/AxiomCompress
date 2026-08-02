@@ -414,7 +414,7 @@ void test_compression_level_presets() {
     axiom::apply_compression_level(maximum, 99);
     AXIOM_CHECK(maximum.use_tree_matcher);
     AXIOM_CHECK(!maximum.use_fast_lz);
-    AXIOM_CHECK(maximum.max_chain_depth == 512);
+    AXIOM_CHECK(maximum.max_chain_depth == 384);
     AXIOM_CHECK(maximum.max_match == 4096);
     AXIOM_CHECK(maximum.block_size == (64u << 20));
     AXIOM_CHECK(maximum.window_size == (64u << 20));
