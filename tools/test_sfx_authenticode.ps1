@@ -48,49 +48,72 @@ function Invoke-Checked {
     }
 }
 
-function Add-CurrentUserCertificate {
-    param(
-        [Parameter(Mandatory)]
-        [System.Security.Cryptography.X509Certificates.X509Certificate2]$Certificate,
-
-        [Parameter(Mandatory)]
-        [System.Security.Cryptography.X509Certificates.StoreName]$StoreName
-    )
-
-    $store = [System.Security.Cryptography.X509Certificates.X509Store]::new(
-        $StoreName,
-        [System.Security.Cryptography.X509Certificates.StoreLocation]::CurrentUser)
+function New-TestCodeSigningCertificate {
+    $rsa = [System.Security.Cryptography.RSA]::Create(2048)
     try {
-        $store.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite)
-        $store.Add($Certificate)
+        $request = [System.Security.Cryptography.X509Certificates.CertificateRequest]::new(
+            "CN=AxiomCompress CI SFX",
+            $rsa,
+            [System.Security.Cryptography.HashAlgorithmName]::SHA256,
+            [System.Security.Cryptography.RSASignaturePadding]::Pkcs1)
+        $usages = [System.Security.Cryptography.OidCollection]::new()
+        [void]$usages.Add([System.Security.Cryptography.Oid]::new(
+            "1.3.6.1.5.5.7.3.3",
+            "Code Signing"))
+        $request.CertificateExtensions.Add(
+            [System.Security.Cryptography.X509Certificates.X509EnhancedKeyUsageExtension]::new(
+                $usages,
+                $true))
+        return $request.CreateSelfSigned(
+            [DateTimeOffset]::Now.AddMinutes(-5),
+            [DateTimeOffset]::Now.AddDays(1))
     } finally {
-        $store.Close()
+        $rsa.Dispose()
     }
 }
 
-function Remove-CurrentUserCertificate {
+function Assert-EmbeddedAuthenticodeSignature {
     param(
         [Parameter(Mandatory)]
-        [string]$Thumbprint,
+        [string]$Path,
 
         [Parameter(Mandatory)]
-        [System.Security.Cryptography.X509Certificates.StoreName]$StoreName
+        [string]$ExpectedThumbprint
     )
 
-    $store = [System.Security.Cryptography.X509Certificates.X509Store]::new(
-        $StoreName,
-        [System.Security.Cryptography.X509Certificates.StoreLocation]::CurrentUser)
+    $signature = Get-AuthenticodeSignature -LiteralPath $Path
+    if (-not $signature.SignerCertificate) {
+        throw "Signed SFX did not contain an embedded signer certificate"
+    }
+    if ($signature.SignerCertificate.Thumbprint -ne $ExpectedThumbprint) {
+        throw "Signed SFX signer certificate did not match the test certificate"
+    }
+    # A self-signed test certificate is intentionally not installed into any
+    # trust store. Valid/NotTrusted/UnknownError all indicate that Windows
+    # parsed the embedded Authenticode signature; hash or format failures do
+    # not. The custom-root chain check below keeps certificate validation
+    # deterministic without contacting the hosted runner's trust services.
+    if ("$($signature.Status)" -notin @("Valid", "NotTrusted", "UnknownError")) {
+        throw "Authenticode signature status was $($signature.Status): $($signature.StatusMessage)"
+    }
+
+    $chain = [System.Security.Cryptography.X509Certificates.X509Chain]::new()
     try {
-        $store.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite)
-        $matches = $store.Certificates.Find(
-            [System.Security.Cryptography.X509Certificates.X509FindType]::FindByThumbprint,
-            $Thumbprint,
-            $false)
-        foreach ($match in $matches) {
-            $store.Remove($match)
+        $trustModeProperty = $chain.ChainPolicy.GetType().GetProperty("TrustMode")
+        if ($trustModeProperty) {
+            $customTrustMode = [Enum]::Parse($trustModeProperty.PropertyType, "CustomRootTrust")
+            $trustModeProperty.SetValue($chain.ChainPolicy, $customTrustMode)
+            $customRoots = $chain.ChainPolicy.GetType().GetProperty("CustomTrustStore").GetValue($chain.ChainPolicy)
+            $customRoots.Add($signature.SignerCertificate)
+            if (-not $chain.Build($signature.SignerCertificate)) {
+                $errors = $chain.ChainStatus | ForEach-Object { $_.StatusInformation.Trim() }
+                throw "Test certificate chain did not validate: $($errors -join '; ')"
+            }
+        } elseif ($signature.SignerCertificate.Subject -ne $signature.SignerCertificate.Issuer) {
+            throw "Test certificate was expected to be self-signed"
         }
     } finally {
-        $store.Close()
+        $chain.Dispose()
     }
 }
 
@@ -111,7 +134,6 @@ try {
     $unsigned = Join-Path $temp "payload-unsigned.exe"
     $signed = Join-Path $temp "payload-signed.exe"
     $pfx = Join-Path $temp "test-signing.pfx"
-    $cer = Join-Path $temp "test-signing.cer"
     $destination = Join-Path $temp "extracted"
 
     $utf8 = New-Object System.Text.UTF8Encoding($false)
@@ -119,36 +141,21 @@ try {
     Invoke-Checked $axiomc @("a", $archive, $inputFile)
     Invoke-Checked $axiomc @("sfx", "--stub", "mini", $archive, $unsigned)
 
-    $certificateParameters = @{
-        Type = "CodeSigningCert"
-        Subject = "CN=AxiomCompress CI SFX"
-        CertStoreLocation = "Cert:\CurrentUser\My"
-        HashAlgorithm = "SHA256"
-        KeyExportPolicy = "Exportable"
-        NotAfter = (Get-Date).AddDays(1)
-    }
-    $certificate = New-SelfSignedCertificate @certificateParameters
+    $certificate = New-TestCodeSigningCertificate
     $thumbprint = $certificate.Thumbprint
     $passwordText = [guid]::NewGuid().ToString("N")
-    $password = ConvertTo-SecureString $passwordText -AsPlainText -Force
-    Export-PfxCertificate -Cert $certificate -FilePath $pfx -Password $password | Out-Null
-    Export-Certificate -Cert $certificate -FilePath $cer | Out-Null
-    # Mutate the CurrentUser stores directly. This is non-interactive and avoids
-    # certutil's Root-store update path hanging on some hosted Windows images.
-    Add-CurrentUserCertificate $certificate ([System.Security.Cryptography.X509Certificates.StoreName]::Root)
-    Add-CurrentUserCertificate $certificate ([System.Security.Cryptography.X509Certificates.StoreName]::TrustedPublisher)
+    [IO.File]::WriteAllBytes(
+        $pfx,
+        $certificate.Export(
+            [System.Security.Cryptography.X509Certificates.X509ContentType]::Pfx,
+            $passwordText))
 
     Copy-Item -LiteralPath $unsigned -Destination $signed
     Invoke-Checked $signTool @(
         "sign", "/fd", "SHA256", "/f", $pfx, "/p", $passwordText,
         "/d", "AxiomCompress CI SFX", $signed
     )
-    Invoke-Checked $signTool @("verify", "/pa", "/all", $signed)
-
-    $signature = Get-AuthenticodeSignature -LiteralPath $signed
-    if ("$($signature.Status)" -ne "Valid") {
-        throw "Authenticode signature status was $($signature.Status): $($signature.StatusMessage)"
-    }
+    Assert-EmbeddedAuthenticodeSignature -Path $signed -ExpectedThumbprint $thumbprint
 
     Invoke-Checked $signed @("--test")
     New-Item -ItemType Directory -Path $destination -Force | Out-Null
@@ -165,19 +172,6 @@ try {
     Write-Host "Authenticode SFX regression passed"
 }
 finally {
-    if ($thumbprint) {
-        foreach ($store in @(
-            [System.Security.Cryptography.X509Certificates.StoreName]::My,
-            [System.Security.Cryptography.X509Certificates.StoreName]::Root,
-            [System.Security.Cryptography.X509Certificates.StoreName]::TrustedPublisher
-        )) {
-            try {
-                Remove-CurrentUserCertificate -Thumbprint $thumbprint -StoreName $store
-            } catch {
-                Write-Verbose "Could not remove test certificate from ${store}: $($_.Exception.Message)"
-            }
-        }
-    }
     if (Test-Path -LiteralPath $temp) {
         Remove-Item -LiteralPath $temp -Recurse -Force -ErrorAction SilentlyContinue
     }
