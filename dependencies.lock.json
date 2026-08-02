@@ -1,6 +1,7 @@
 {
   "schema": 1,
   "generated": "2026-08-02",
+  "artifact_hash_mode": "canonical-text-lf",
   "dependencies": {
     "blake3": {
       "repository": "https://github.com/BLAKE3-team/BLAKE3.git",
@@ -68,7 +69,7 @@
       "commit": "7b2387161c542fa9f427352dcdef76097d0d692b",
       "path": "src/third_party/minizip-ng",
       "artifacts": {
-        "mz.h": "E5394B698D2C45DF221BDC037A9DBB6C7D6848B284B381BDD2533546FE4F0C10"
+        "mz.h": "4A6EDA89F5DC0533DC93B9C4F98278DC052C5F1E27C39DFEAF59672549F1C1A8"
       },
       "local_patches": [
         "Prevent a local file header from straddling split ZIP disks."
@@ -123,7 +124,7 @@
       "path": "assets/icons/fluent",
       "profile": "Pinned SVG subset used to generate toolbar alpha masks",
       "artifacts": {
-        "README.md": "8758FF71459758A042D31854AC845935DEE4E53368BDFE51624230A56372C8B1"
+        "README.md": "4238B0D7AA3569126BFE99C5996B1D2051375C42329C8A5295864DAAF6DB0AF0"
       },
       "local_patches": [
         "Rename the selected SVG files for Axiom's command vocabulary."

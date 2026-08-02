@@ -69,7 +69,8 @@ jobs:
         run: |
           set -euo pipefail
           cxx_srcs="src/archive/container.cpp src/archive/container_formats.cpp \
-                    src/archive/container_zip.cpp src/archive/system_provider.cpp \
+                    src/archive/container_zip.cpp src/archive/sfx_image.cpp \
+                    src/archive/system_provider.cpp \
                     src/archive/zip_split_backend.cpp \
                     src/codec/block.cpp src/codec/external_codecs.cpp src/codec/fast_lz.cpp \
                     src/codec/lz77.cpp src/codec/lz77_split.cpp src/codec/transform.cpp \

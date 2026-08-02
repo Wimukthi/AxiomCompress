@@ -17,6 +17,45 @@ if ($lock.schema -ne 1) {
 
 $failures = [System.Collections.Generic.List[string]]::new()
 $checked = 0
+$hashMode = "$($lock.artifact_hash_mode)"
+if ($hashMode -ne "canonical-text-lf") {
+    throw "Unsupported dependency artifact hash mode: $hashMode"
+}
+
+# Text files are normalized to LF before hashing so the lock remains stable
+# when actions/checkout uses different line-ending defaults on each runner OS.
+$binaryExtensions = @(
+    ".a", ".bmp", ".dylib", ".dll", ".exe", ".gif", ".ico", ".jpeg", ".jpg",
+    ".lib", ".o", ".obj", ".png", ".so", ".zip", ".7z"
+)
+
+function Get-ArtifactHash {
+    param([Parameter(Mandatory)][string]$Path)
+
+    $bytes = [System.IO.File]::ReadAllBytes($Path)
+    $extension = [System.IO.Path]::GetExtension($Path).ToLowerInvariant()
+    if ($binaryExtensions -notcontains $extension) {
+        $canonical = [System.Collections.Generic.List[byte]]::new()
+        for ($index = 0; $index -lt $bytes.Length; $index++) {
+            if ($bytes[$index] -eq 13) {
+                if ($index + 1 -lt $bytes.Length -and $bytes[$index + 1] -eq 10) {
+                    $index++
+                }
+                $canonical.Add([byte]10)
+            } else {
+                $canonical.Add($bytes[$index])
+            }
+        }
+        $bytes = $canonical.ToArray()
+    }
+
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        return (($sha256.ComputeHash($bytes) | ForEach-Object { $_.ToString("X2") }) -join "")
+    } finally {
+        $sha256.Dispose()
+    }
+}
 
 foreach ($dependencyProperty in $lock.dependencies.psobject.Properties) {
     $name = $dependencyProperty.Name
@@ -56,7 +95,7 @@ foreach ($dependencyProperty in $lock.dependencies.psobject.Properties) {
             continue
         }
 
-        $actualHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $artifactPath).Hash.ToUpperInvariant()
+        $actualHash = Get-ArtifactHash -Path $artifactPath
         $checked++
         if ($actualHash -ne $expectedHash) {
             $failures.Add("${name}/${relativePath}: expected $expectedHash, found $actualHash")
