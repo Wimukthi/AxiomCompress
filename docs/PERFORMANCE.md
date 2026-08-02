@@ -248,3 +248,27 @@ measurement. Both 1 MiB runs produced SHA-256
 `5BD317E7B2864CB03DE9E4385123180CF1FC6A6D77030257687E28E52205EE6F`, matching
 the 256 KiB output exactly. Repeat the profiling workflow before making
 cross-machine throughput claims.
+
+## 2026-08-02 candidate-list initialization checkpoint
+
+`MatchList` keeps a fixed 64-entry backing array, but only its `count` entries
+are ever read. The backing `Match` records therefore no longer carry default
+initializers, avoiding a 512-byte clear for every position in the pipelined
+tree matcher. Every inserted record is still fully assigned before it can be
+observed.
+
+On the same Release x64 host and Dickens profile as above, the two-run averages
+were:
+
+| Phase | Initialized reference | Current | Delta |
+|---|---:|---:|---:|
+| Greedy LZ77 | 3.723 s | 3.373 s | -9.4% |
+| Optimal LZ77 | 4.383 s | 3.737 s | -14.7% |
+| Candidate encoding | 0.322 s | 0.316 s | -1.9% |
+| Entropy encoding | 0.091 s | 0.086 s | -5.5% |
+| Sum of profiled phases | 8.519 s | 7.512 s | -11.8% |
+
+The current two runs both produced 2,888,466 bytes with SHA-256
+`5BD317E7B2864CB03DE9E4385123180CF1FC6A6D77030257687E28E52205EE6F`, identical
+to the initialized reference. The timings remain host-specific and
+directional.

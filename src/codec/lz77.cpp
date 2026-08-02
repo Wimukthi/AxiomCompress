@@ -94,8 +94,8 @@ constexpr std::size_t kHashSize = 1u << kHashBits;
 constexpr std::size_t kParserCandidateLimit = 64;
 
 struct Match {
-    std::uint16_t length = 0;
-    std::uint32_t distance = 0;
+    std::uint16_t length;
+    std::uint32_t distance;
 };
 
 // The optimal parser asks the matcher for candidates at every input position.
@@ -104,7 +104,10 @@ struct Match {
 // is a codec invariant, so a compact fixed list is both faster and easier to
 // keep in the matcher hot path.
 struct MatchList {
-    std::array<Match, kParserCandidateLimit> values{};
+    // Entries below count are always written before they are read. Leaving the
+    // backing array uninitialized avoids clearing 64 candidates per position
+    // in the pipelined tree matcher; count remains explicitly initialized.
+    std::array<Match, kParserCandidateLimit> values;
     std::size_t count = 0;
 
     void clear() {
