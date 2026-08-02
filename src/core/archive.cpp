@@ -418,7 +418,9 @@ ByteVector compress(std::span<const std::uint8_t> input,
     }
 
     if (options.force_store || options.method == CompressionMethod::store) {
-    } else if (!options.force_parallel_blocks && codec::likely_incompressible(input)) {
+    } else if (!options.force_parallel_blocks &&
+               !options.bypass_incompressible_heuristic &&
+               codec::likely_incompressible(input)) {
     } else {
         auto parallel_options = options;
         parallel_options.content_adaptive_blocks =

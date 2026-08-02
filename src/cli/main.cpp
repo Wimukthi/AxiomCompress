@@ -1,11 +1,14 @@
 #include "axiom/archive.hpp"
 #include "axiom/axiom.hpp"
+#include "axiom/archive.hpp"
 #include "axiom/version.hpp"
 #include "core/cpu.hpp"
 #include "core/path_text.hpp"
 #include "core/windows_time.hpp"
 #ifdef _WIN32
+#include "archive/sfx_image.hpp"
 #include "sfx/module_file.hpp"
+#include "sfx/sfx_config.hpp"
 #endif
 
 #include <array>
@@ -36,6 +39,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <fcntl.h>
 #include <io.h>
 #else
 #include <unistd.h>
@@ -52,25 +56,38 @@ void print_usage() {
         "axiomc - Axiom archiver\n"
         "\n"
         "Archive commands:\n"
-        "  axiomc a [options] <archive.axar> <input>...   create, or add/replace into an existing archive\n"
+        "  axiomc a [options] <archive.axar|-> <input>... create, or add/replace into an existing archive\n"
+        "                                                  '-' writes a sequential AXAR stream to stdout\n"
         "  axiomc u [options] <archive.axar> <input>...   update: add new + replace newer (by mtime)\n"
         "  axiomc f [options] <archive.axar> <input>...   fresh: replace newer only, never add new\n"
         "  axiomc s [options] <archive.axar> <input>...   sync: mirror inputs (add/replace + delete missing)\n"
         "  axiomc delete [options] <archive.axar> <path>...  remove entries (dir removes its subtree)\n"
         "  axiomc repack [options] <archive.axar>          rebuild, reclaiming replaced/deleted space\n"
-        "  axiomc comment <archive.axar> [text]            show, or set, the archive comment\n"
-        "  axiomc lock <archive.axar>                      mark the archive read-only (no unlock)\n"
+        "  axiomc snapshot create [options] <archive> <name> <input>...  create a deduplicated snapshot repository\n"
+        "  axiomc snapshot add [options] <archive> <name> <input>...     append a snapshot\n"
+        "  axiomc snapshot list [-p <password>] <archive>               list snapshots\n"
+        "  axiomc snapshot diff [-p <password>] <archive> <from> <to>  compare snapshots\n"
+        "  axiomc snapshot restore [options] <archive> <name> <dest>   restore a snapshot\n"
+        "  axiomc snapshot prune [options] <archive> <name>...         remove old snapshots\n"
+        "  axiomc comment [-p <password>] <archive.axar> [text]\n"
+        "                                                  show, or set, the archive comment\n"
+        "  axiomc lock [-p <password>] <archive.axar>     mark the archive read-only (no unlock)\n"
+        "  axiomc password-add [-p <current>] <archive> <new>\n"
+        "  axiomc password-remove [-p <current>] <archive> <remove>\n"
+        "  axiomc password-change [-p <current>] <archive> <new>\n"
         "  axiomc recovery <archive.axar> [percent]        show/set recovery redundancy (0 removes)\n"
         "  axiomc repair <archive.axar>                    repair damage using its recovery record\n"
         "  axiomc split <archive.axar> <size> [rev-count]  create numbered/recovery volumes\n"
         "  axiomc join <any-volume> <archive.axar>         join or reconstruct a volume set\n"
         "  axiomc x [options] <archive.axar> [dest-dir]   extract (default: current dir)\n"
         "  axiomc l <archive.axar>                         list contents\n"
+        "  axiomc capture-report [-p <password>] <archive.axar>  show source-capture warnings\n"
         "  axiomc t [options] <archive.axar>               test integrity\n"
         "  axiomc keygen <secret.key> <public.key>          generate an archive signing key\n"
         "  axiomc sign [options] <archive.axar> <secret.key> sign an archive\n"
         "  axiomc verify [options] <archive.axar> [public.key] verify authenticity\n"
-        "  axiomc sfx <archive> <output.exe> [compatible-stub] create a self-extractor\n"
+        "  axiomc sfx [--config <file>] [--stub full|mini] <archive> <output.exe>\n"
+        "                                              create a self-extractor\n"
         "\n"
         "Single-stream commands:\n"
         "  axiomc c [options] <input> <output.axc>         compress one stream\n"
@@ -95,12 +112,19 @@ void print_usage() {
         "  --swarm                                (levels 1-6, 8-9: cores cooperate\n"
         "                                          inside large blocks; level 7 ignores it)\n"
         "  --recovery N                           add 1..100% Reed-Solomon recovery data\n"
+        "  --keyed-chunks / --plain-chunks        snapshot IDs keyed by the archive password (default: keyed)\n"
+        "  --chunk-min SIZE --chunk-average SIZE  --chunk-max SIZE\n"
+        "                                          snapshot content-defined chunk geometry\n"
+        "  --no-sparse                             do not capture sparse allocation maps\n"
+        "  --strict-metadata                       fail if source metadata cannot be captured\n"
         "  --bt                                   (binary-tree match finder)\n"
         "  --optimal          --optimal-depth N   --optimal-candidates N\n"
         "\n"
         "Decompression options (d, x, t):\n"
         "  --threads N        default 0 = all hardware threads\n"
-        "  --overwrite MODE   extract only: fail (default), skip, all\n";
+        "  --overwrite MODE   extract only: fail (default), skip, all\n"
+        "  --include PATH     extract only: select an archive path (repeatable)\n"
+        "  --strict-metadata  extract only: fail if sparse fidelity or capture report is incomplete\n";
 }
 
 bool stream_is_terminal(FILE* stream) {
@@ -311,6 +335,20 @@ private:
         } else if (progress.completed_items > 0) {
             if (has_byte_total || progress.completed_bytes > 0) line << "  ";
             line << progress.completed_items << " items";
+        }
+
+        if (progress.reused_items > 0) {
+            line << color(kColorMuted) << "  reused "
+                 << format_bytes(progress.reused_bytes) << " ("
+                 << progress.reused_items << " items)" << color(kColorReset);
+        }
+
+        if (progress.archive_bytes_read > 0 &&
+            (progress.stage == axiom::OperationStage::testing ||
+             progress.stage == axiom::OperationStage::extracting)) {
+            line << color(kColorMuted) << "  archive read "
+                 << format_bytes(progress.archive_bytes_read)
+                 << color(kColorReset);
         }
 
         if (progress.current_file_total_bytes > 0) {
@@ -640,6 +678,20 @@ bool take_compression_flags(std::vector<std::string>& args, axiom::CompressionOp
             if (options.recovery_percent > 100) {
                 throw std::runtime_error("--recovery must be between 0 and 100");
             }
+        } else if (arg == "--keyed-chunks") {
+            options.keyed_chunk_ids = true;
+        } else if (arg == "--plain-chunks") {
+            options.keyed_chunk_ids = false;
+        } else if (arg == "--chunk-min") {
+            options.snapshot_min_chunk_size = parse_size(next("--chunk-min"));
+        } else if (arg == "--chunk-average") {
+            options.snapshot_average_chunk_size = parse_size(next("--chunk-average"));
+        } else if (arg == "--chunk-max") {
+            options.snapshot_max_chunk_size = parse_size(next("--chunk-max"));
+        } else if (arg == "--no-sparse") {
+            options.preserve_sparse_files = false;
+        } else if (arg == "--strict-metadata") {
+            options.strict_metadata = true;
         } else if (arg == "--chain-depth") {
             options.max_chain_depth = parse_size(next("--chain-depth"));
         } else if (arg == "--nice") {
@@ -755,6 +807,20 @@ int run_add(std::vector<std::string> args) {
 
     const fs::path archive = args.front();
     std::vector<fs::path> inputs(args.begin() + 1, args.end());
+    if (archive == fs::path("-")) {
+        if (stream_is_terminal(stdout)) {
+            throw std::invalid_argument(
+                "archive stdout must be redirected to a file or pipe");
+        }
+#ifdef _WIN32
+        if (_setmode(_fileno(stdout), _O_BINARY) == -1) {
+            throw std::runtime_error("cannot switch stdout to binary mode");
+        }
+#endif
+        axiom::create_archive_to_stream(std::cout, inputs, options);
+        std::cout.flush();
+        return 0;
+    }
     ScopedInteractiveProgress progress(fs::exists(archive) ? "updating archive"
                                                            : "creating archive");
     options.operation = progress.operation();
@@ -806,13 +872,29 @@ int run_sync(std::vector<std::string> args) {
 }
 
 int run_comment(std::vector<std::string> args) {
-    if (args.empty() || args.size() > 2) {
+    std::string password;
+    std::vector<std::string> positionals;
+    for (std::size_t i = 0; i < args.size(); ++i) {
+        if (args[i] == "-p" || args[i] == "--password") {
+            if (i + 1 >= args.size()) {
+                print_usage();
+                return 2;
+            }
+            password = args[++i];
+        } else if (args[i].rfind("--", 0) == 0) {
+            std::cerr << "axiomc: unknown option " << args[i] << '\n';
+            return 2;
+        } else {
+            positionals.push_back(args[i]);
+        }
+    }
+    if (positionals.empty() || positionals.size() > 2) {
         print_usage();
         return 2;
     }
-    const fs::path archive = args.front();
-    if (args.size() == 1) {
-        const std::string comment = axiom::archive_comment(archive);
+    const fs::path archive = positionals.front();
+    if (positionals.size() == 1) {
+        const std::string comment = axiom::archive_comment(archive, password);
         if (comment.empty()) {
             std::cout << "(no comment)\n";
         } else {
@@ -821,23 +903,87 @@ int run_comment(std::vector<std::string> args) {
         return 0;
     }
     axiom::CompressionOptions options;
+    options.password = password;
     ScopedInteractiveProgress progress("updating archive comment");
     options.operation = progress.operation();
-    axiom::set_archive_comment(archive, args[1], options);
+    axiom::set_archive_comment(archive, positionals[1], options);
     progress.complete();
     return 0;
 }
 
 int run_lock(std::vector<std::string> args) {
-    if (args.size() != 1) {
+    std::string password;
+    std::vector<std::string> positionals;
+    for (std::size_t i = 0; i < args.size(); ++i) {
+        if (args[i] == "-p" || args[i] == "--password") {
+            if (i + 1 >= args.size()) {
+                print_usage();
+                return 2;
+            }
+            password = args[++i];
+        } else if (args[i].rfind("--", 0) == 0) {
+            std::cerr << "axiomc: unknown option " << args[i] << '\n';
+            return 2;
+        } else {
+            positionals.push_back(args[i]);
+        }
+    }
+    if (positionals.size() != 1) {
         print_usage();
         return 2;
     }
     axiom::CompressionOptions options;
+    options.password = password;
     ScopedInteractiveProgress progress("locking archive");
     options.operation = progress.operation();
-    axiom::lock_archive(args.front(), options);
+    axiom::lock_archive(positionals.front(), options);
     progress.complete();
+    return 0;
+}
+
+enum class PasswordCommand {
+    add,
+    remove,
+    change,
+};
+
+int run_password_command(std::vector<std::string> args, PasswordCommand command) {
+    std::string current_password;
+    std::vector<std::string> positionals;
+    for (std::size_t i = 0; i < args.size(); ++i) {
+        if (args[i] == "-p" || args[i] == "--password") {
+            if (i + 1 >= args.size()) {
+                print_usage();
+                return 2;
+            }
+            current_password = args[++i];
+        } else if (args[i].rfind("--", 0) == 0) {
+            std::cerr << "axiomc: unknown option " << args[i] << '\n';
+            return 2;
+        } else {
+            positionals.push_back(args[i]);
+        }
+    }
+    if (positionals.size() != 2) {
+        print_usage();
+        return 2;
+    }
+
+    axiom::CompressionOptions options;
+    options.password = current_password;
+    ScopedInteractiveProgress progress("updating archive password slots");
+    options.operation = progress.operation();
+    if (command == PasswordCommand::add) {
+        axiom::add_archive_password(positionals[0], current_password, positionals[1], options);
+    } else if (command == PasswordCommand::remove) {
+        axiom::remove_archive_password(
+            positionals[0], current_password, positionals[1], options);
+    } else {
+        axiom::change_archive_password(
+            positionals[0], current_password, positionals[1], options);
+    }
+    progress.complete();
+    std::cout << "archive password slots updated\n";
     return 0;
 }
 
@@ -878,6 +1024,7 @@ int run_repack(std::vector<std::string> args) {
 int run_extract(std::vector<std::string> args) {
     axiom::ExtractOptions extract;
     axiom::DecompressionOptions decompression;
+    std::vector<std::string> selected_entries;
     std::vector<std::string> positionals;
     for (std::size_t i = 0; i < args.size(); ++i) {
         if (args[i] == "--overwrite") {
@@ -896,6 +1043,14 @@ int run_extract(std::vector<std::string> args) {
                 std::cerr << "axiomc: unknown overwrite mode " << mode << '\n';
                 return 2;
             }
+        } else if (args[i] == "--strict-metadata") {
+            extract.strict_metadata = true;
+        } else if (args[i] == "--include") {
+            if (i + 1 >= args.size() || args[i + 1].empty()) {
+                print_usage();
+                return 2;
+            }
+            selected_entries.push_back(args[++i]);
         } else if (args[i] == "--threads") {
             if (i + 1 >= args.size()) {
                 print_usage();
@@ -930,7 +1085,11 @@ int run_extract(std::vector<std::string> args) {
     }
     ScopedInteractiveProgress progress("extracting archive");
     extract.operation = progress.operation();
-    provider->extract_all(archive, dest, extract);
+    if (selected_entries.empty()) {
+        provider->extract_all(archive, dest, extract);
+    } else {
+        provider->extract_selected(archive, selected_entries, dest, extract);
+    }
     progress.complete();
     return 0;
 }
@@ -996,6 +1155,154 @@ int run_list(const std::vector<std::string>& args) {
     return 0;
 }
 
+int run_snapshot(std::vector<std::string> args) {
+    if (args.empty()) {
+        print_usage();
+        return 2;
+    }
+    const std::string subcommand = std::move(args.front());
+    args.erase(args.begin());
+
+    if (subcommand == "create" || subcommand == "add") {
+        axiom::CompressionOptions options;
+        if (!take_compression_flags(args, options)) return 2;
+        if (args.size() < 3) {
+            print_usage();
+            return 2;
+        }
+        const fs::path archive = args[0];
+        const std::string snapshot_name = args[1];
+        std::vector<fs::path> inputs;
+        inputs.reserve(args.size() - 2);
+        for (std::size_t i = 2; i < args.size(); ++i) inputs.emplace_back(args[i]);
+        ScopedInteractiveProgress progress(
+            subcommand == "create" ? "creating snapshot repository" : "adding snapshot");
+        options.operation = progress.operation();
+        if (subcommand == "create") {
+            axiom::create_snapshot_archive(inputs, archive, snapshot_name, options);
+        } else {
+            axiom::add_archive_snapshot(inputs, archive, snapshot_name, options);
+        }
+        progress.complete();
+        return 0;
+    }
+
+    if (subcommand == "list") {
+        axiom::DecompressionOptions options;
+        if (!take_decompression_flags(args, options)) return 2;
+        if (args.size() != 1) {
+            print_usage();
+            return 2;
+        }
+        const auto snapshots = axiom::list_archive_snapshots(args[0], options.password);
+        for (const auto& snapshot : snapshots) {
+            std::cout << (snapshot.current ? "* " : "  ") << snapshot.name
+                      << "  generation " << snapshot.generation
+                      << "  " << format_time(snapshot.created)
+                      << "  " << snapshot.entry_count << " entries"
+                      << "  " << snapshot.file_bytes << " bytes\n";
+        }
+        return 0;
+    }
+
+    if (subcommand == "diff") {
+        axiom::DecompressionOptions options;
+        if (!take_decompression_flags(args, options)) return 2;
+        if (args.size() != 3) {
+            print_usage();
+            return 2;
+        }
+        const auto changes = axiom::diff_archive_snapshots(
+            args[0], args[1], args[2], options.password);
+        const auto kind_name = [](axiom::ArchiveSnapshotChangeKind kind) {
+            switch (kind) {
+                case axiom::ArchiveSnapshotChangeKind::added: return "added";
+                case axiom::ArchiveSnapshotChangeKind::removed: return "removed";
+                case axiom::ArchiveSnapshotChangeKind::modified: return "modified";
+            }
+            return "changed";
+        };
+        for (const auto& change : changes) {
+            std::cout << kind_name(change.kind) << "  " << change.path
+                      << "  " << change.old_size << " -> " << change.new_size << " bytes\n";
+        }
+        if (changes.empty()) std::cout << "snapshots are identical\n";
+        return 0;
+    }
+
+    if (subcommand == "restore") {
+        axiom::ExtractOptions extract;
+        std::vector<std::string> positionals;
+        for (std::size_t i = 0; i < args.size(); ++i) {
+            if (args[i] == "--overwrite") {
+                if (i + 1 >= args.size()) {
+                    print_usage();
+                    return 2;
+                }
+                const auto mode = args[++i];
+                if (mode == "fail") {
+                    extract.overwrite = axiom::ExtractOptions::Overwrite::fail;
+                } else if (mode == "skip") {
+                    extract.overwrite = axiom::ExtractOptions::Overwrite::skip;
+                } else if (mode == "all") {
+                    extract.overwrite = axiom::ExtractOptions::Overwrite::overwrite;
+                } else {
+                    throw std::invalid_argument("--overwrite must be fail, skip, or all");
+                }
+            } else if (args[i] == "--strict-metadata") {
+                extract.strict_metadata = true;
+            } else if (args[i] == "--threads") {
+                if (i + 1 >= args.size()) {
+                    print_usage();
+                    return 2;
+                }
+                extract.thread_count = parse_size(args[++i]);
+            } else if (args[i] == "-p" || args[i] == "--password") {
+                if (i + 1 >= args.size()) {
+                    print_usage();
+                    return 2;
+                }
+                extract.password = args[++i];
+            } else if (args[i].rfind("--", 0) == 0) {
+                std::cerr << "axiomc: unknown option " << args[i] << '\n';
+                return 2;
+            } else {
+                positionals.push_back(args[i]);
+            }
+        }
+        if (positionals.size() != 3) {
+            print_usage();
+            return 2;
+        }
+        ScopedInteractiveProgress progress("restoring snapshot");
+        extract.operation = progress.operation();
+        axiom::restore_archive_snapshot(
+            positionals[0], positionals[1], positionals[2], extract);
+        progress.complete();
+        return 0;
+    }
+
+    if (subcommand == "prune") {
+        axiom::CompressionOptions options;
+        if (!take_compression_flags(args, options)) return 2;
+        if (args.size() < 2) {
+            print_usage();
+            return 2;
+        }
+        const fs::path archive = args.front();
+        std::vector<std::string> names(args.begin() + 1, args.end());
+        ScopedInteractiveProgress progress("pruning snapshots");
+        options.operation = progress.operation();
+        axiom::prune_archive_snapshots(archive, names, options);
+        progress.complete();
+        return 0;
+    }
+
+    std::cerr << "axiomc: unknown snapshot subcommand " << subcommand << '\n';
+    print_usage();
+    return 2;
+}
+
 int run_test(std::vector<std::string> args) {
     axiom::DecompressionOptions options;
     if (!take_decompression_flags(args, options)) {
@@ -1017,6 +1324,44 @@ int run_test(std::vector<std::string> args) {
     progress.complete();
     std::cout << "archive is intact\n";
     return 0;
+}
+
+int run_capture_report(std::vector<std::string> args) {
+    std::string password;
+    std::vector<std::string> positionals;
+    for (std::size_t i = 0; i < args.size(); ++i) {
+        if (args[i] == "-p" || args[i] == "--password") {
+            if (i + 1 >= args.size()) {
+                print_usage();
+                return 2;
+            }
+            password = args[++i];
+        } else if (args[i].rfind("--", 0) == 0) {
+            std::cerr << "axiomc: unknown option " << args[i] << '\n';
+            return 2;
+        } else {
+            positionals.push_back(args[i]);
+        }
+    }
+    if (positionals.size() != 1) {
+        print_usage();
+        return 2;
+    }
+    const fs::path archive = positionals.front();
+    const auto* provider = axiom::archive_provider_for_path(archive);
+    if (provider == nullptr || !provider->info().native) {
+        throw std::runtime_error("capture reports are supported only for Axiom archives");
+    }
+    const auto report = axiom::archive_capture_report(archive, password);
+    if (report.complete) {
+        std::cout << "source capture is complete\n";
+        return 0;
+    }
+    std::cout << report.warnings.size() << " source-capture warning(s):\n";
+    for (const auto& warning : report.warnings) {
+        std::cout << "  " << warning.path << ": " << warning.message << '\n';
+    }
+    return 1;
 }
 
 int run_recovery(const std::vector<std::string>& args) {
@@ -1143,19 +1488,86 @@ int run_verify(std::vector<std::string> args) {
     return 0;
 }
 
-int run_sfx(const std::vector<std::string>& args) {
+int run_sfx(std::vector<std::string> args) {
+    std::vector<std::uint8_t> config;
+    bool mini = false;
+
+    // --config and --stub are consumed here so the positional form stays
+    // exactly as it was: <archive> <output.exe> [compatible-stub].
+    for (std::size_t index = 0; index < args.size();) {
+        const std::string& option = args[index];
+        auto take_value = [&](std::string& out) {
+            if (index + 1 >= args.size()) {
+                throw std::runtime_error(option + " needs a value");
+            }
+            out = args[index + 1];
+            args.erase(args.begin() + static_cast<std::ptrdiff_t>(index),
+                       args.begin() + static_cast<std::ptrdiff_t>(index) + 2);
+        };
+        if (option == "--config") {
+            std::string path;
+            take_value(path);
+            if (path.empty()) {
+                throw std::runtime_error("--config needs a non-empty path");
+            }
+            std::ifstream stream(axiom::core::path_from_utf8(path), std::ios::binary);
+            if (!stream) throw std::runtime_error("cannot read SFX config: " + path);
+            // Bound the authoring file before handing it to the text parser.
+            // The parser has its own field limits, but an unbounded iterator
+            // here would allocate for an arbitrarily large input first.
+            std::string text;
+            text.reserve(axiom::kSfxMaxConfigSize);
+            std::array<char, 64 * 1024> buffer{};
+            while (stream.read(buffer.data(), static_cast<std::streamsize>(buffer.size())) ||
+                   stream.gcount() != 0) {
+                const auto count = static_cast<std::size_t>(stream.gcount());
+                if (count > axiom::kSfxMaxConfigSize - text.size()) {
+                    throw std::runtime_error("SFX config is too large");
+                }
+                text.append(buffer.data(), count);
+            }
+            if (stream.bad()) {
+                throw std::runtime_error("cannot read SFX config: " + path);
+            }
+            const auto parsed = axiom::sfx::parse_sfx_config_text(text);
+            if (!parsed.ok) {
+                throw std::runtime_error("SFX config line " +
+                                         std::to_string(parsed.line) + ": " +
+                                         parsed.error);
+            }
+            config = axiom::sfx::encode_sfx_config(parsed.value);
+            continue;
+        }
+        if (option == "--stub") {
+            std::string tier;
+            take_value(tier);
+            if (tier == "mini") {
+                mini = true;
+            } else if (tier != "full") {
+                throw std::runtime_error("--stub expects full or mini");
+            }
+            continue;
+        }
+        ++index;
+    }
+
     if (args.size() < 2 || args.size() > 3) {
         print_usage();
         return 2;
     }
+    if (mini && args.size() == 3) {
+        throw std::runtime_error("--stub cannot be combined with an explicit stub");
+    }
     ScopedInteractiveProgress progress("creating self-extractor");
     if (args.size() == 3) {
-        axiom::create_sfx_archive(
-            args[0], fs::path(args[2]), args[1], progress.operation());
+        axiom::create_sfx_archive(args[0], fs::path(args[2]), args[1],
+                                  progress.operation(), 0, config);
     } else {
 #ifdef _WIN32
         axiom::sfx::create_from_module_file(
-            GetModuleHandleW(nullptr), args[0], args[1], progress.operation());
+            GetModuleHandleW(nullptr), args[0], args[1], progress.operation(), 0,
+            config,
+            mini ? axiom::sfx::SfxStubTier::mini : axiom::sfx::SfxStubTier::full);
 #else
         throw std::runtime_error(
             "the embedded Windows SFX module is available only in Windows builds");
@@ -1248,11 +1660,23 @@ int run_command(std::string_view command, std::vector<std::string> args) {
     if (command == "repack") {
         return run_repack(std::move(args));
     }
+    if (command == "snapshot" || command == "snapshots") {
+        return run_snapshot(std::move(args));
+    }
     if (command == "comment") {
         return run_comment(std::move(args));
     }
     if (command == "lock") {
         return run_lock(std::move(args));
+    }
+    if (command == "password-add" || command == "passwd-add") {
+        return run_password_command(std::move(args), PasswordCommand::add);
+    }
+    if (command == "password-remove" || command == "passwd-remove") {
+        return run_password_command(std::move(args), PasswordCommand::remove);
+    }
+    if (command == "password-change" || command == "passwd-change") {
+        return run_password_command(std::move(args), PasswordCommand::change);
     }
     if (command == "recovery" || command == "rr") {
         return run_recovery(args);
@@ -1271,6 +1695,9 @@ int run_command(std::string_view command, std::vector<std::string> args) {
     }
     if (command == "l" || command == "list") {
         return run_list(args);
+    }
+    if (command == "capture-report" || command == "report") {
+        return run_capture_report(std::move(args));
     }
     if (command == "t" || command == "test") {
         return run_test(std::move(args));

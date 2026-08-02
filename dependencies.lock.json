@@ -1,0 +1,133 @@
+{
+  "schema": 1,
+  "generated": "2026-08-02",
+  "dependencies": {
+    "blake3": {
+      "repository": "https://github.com/BLAKE3-team/BLAKE3.git",
+      "version": "1.8.5",
+      "commit": "93a431c78a52d7ccf0f366f106467f5070e6075e",
+      "path": "src/third_party/blake3",
+      "artifacts": {
+        "blake3.h": "DF32C1E80577EABAAB8CA9BA3B8BE273BC2201A8CFF6276C62CD8DEBA15F9348"
+      },
+      "local_patches": []
+    },
+    "zstd": {
+      "repository": "https://github.com/facebook/zstd.git",
+      "version": "1.5.7",
+      "commit": "ac66b19e6bd6b83238bf008eecc1298105298532",
+      "path": "src/third_party/zstd",
+      "artifacts": {
+        "lib/zstd.h": "9B4BC8245565C98CCFC61C07749928B57E7C0F6FDDB0530C4F6AA1971893D88B"
+      },
+      "local_patches": [
+        "Assembly is disabled for the portable Windows Release and CI builds."
+      ]
+    },
+    "lzma-sdk": {
+      "repository": "https://github.com/ip7z/7zip.git",
+      "version": "26.02",
+      "commit": "f9d78aff31a5f2521ae7ddbdc97c4a8855808959",
+      "path": "src/third_party/lzma-sdk",
+      "profile": "LZMA SDK C sources from the 7-Zip 26.02 release",
+      "artifacts": {
+        "LICENSE.txt": "31D4008125D2916A561B34C2652C07AE99128785CCAD1C8FA83F675584178083"
+      },
+      "local_patches": [
+        "Built single-threaded inside each Axiom block."
+      ]
+    },
+    "miniz": {
+      "repository": "https://github.com/richgel999/miniz.git",
+      "version": "3.1.2",
+      "commit": "77d0dce8627735138c51770d1799a1ef48f2117d",
+      "path": "src/third_party/miniz",
+      "source_archive": {
+        "url": "https://codeload.github.com/richgel999/miniz/zip/refs/tags/3.1.2",
+        "sha256": "E7A0334927A069DC5AEB69616D371542A4376E1569290D7102B88C6F3992D6CB"
+      },
+      "artifacts": {
+        "miniz.c": "F23204EFEE2BFAFFB72A974D2E28C64C3C1D9787144B5C5890F129C465E467BD",
+        "miniz.h": "F0B67217BDD8E45B74EB9B7C2C7AE20ED6760A1D76F3276B93617039EBD082DF",
+        "miniz_common.h": "F1BA29821C8CAEF83585B328196AA346C5DA7C82890A70A3D10D77C6CEC0ED39",
+        "miniz_tdef.c": "85B93205232D51D092F24041934D951F11F9EDC02DF1F475E8CEB7B281A1E7F6",
+        "miniz_tdef.h": "D62DA02953C3834DFCBDE4DB026C6D9345013EF9B0E53185131016A3A4E48C33",
+        "miniz_tinfl.c": "2296EBD21EF9AF5EBBEFD5B454D4BB67D8FB4AF2D24945E7FB32114374F75A76",
+        "miniz_tinfl.h": "DA4850920FDF09F8877D9AFFABE1EBBA1852CE4B1EBBD121F2BA7A7EA8E57E5D",
+        "miniz_zip.c": "B70E502C425E2A31146178C1466DCCAF1874390009950774BE2BE9BD4EC908A9",
+        "miniz_zip.h": "B062A5DEF545445C73FD1D664E35A89165DFB0D996AB848F507244E819CFCF04",
+        "miniz_export.h": "DD800F759AA2D6317A666272FE33665A2108A9062A8B419729957BFADA5256F8"
+      },
+      "local_patches": [
+        "Retain Axiom's miniz_export.h static-library export stub."
+      ]
+    },
+    "minizip-ng": {
+      "repository": "https://github.com/zlib-ng/minizip-ng.git",
+      "version": "4.2.2",
+      "commit": "7b2387161c542fa9f427352dcdef76097d0d692b",
+      "path": "src/third_party/minizip-ng",
+      "artifacts": {
+        "mz.h": "E5394B698D2C45DF221BDC037A9DBB6C7D6848B284B381BDD2533546FE4F0C10"
+      },
+      "local_patches": [
+        "Prevent a local file header from straddling split ZIP disks."
+      ]
+    },
+    "monocypher": {
+      "repository": "https://github.com/LoupVaillant/Monocypher.git",
+      "version": "4.0.3",
+      "commit": "ab2b16dd619ad5f6979a4fbe69cfa324a6fcc35f",
+      "path": "src/third_party/monocypher",
+      "source_archive": {
+        "url": "https://codeload.github.com/LoupVaillant/Monocypher/zip/refs/tags/4.0.3",
+        "sha256": "CC369ADA956025923AE2D1A758E126317512051A6C6F103C8E7CC960D0535DC4"
+      },
+      "compiled_files": [
+        "monocypher.c",
+        "monocypher.h"
+      ],
+      "artifacts": {
+        "monocypher.c": "F1F838CDD483BDEBE0DF0FF5C5ED60535E496F769C6A2F933AC4C0B114207123",
+        "monocypher.h": "FCAF6ED771358BB4F40FBA016F6518AE86EC02B1B877D2CC35AD92D3A26FD7B3"
+      },
+      "local_patches": []
+    },
+    "7zip-engine": {
+      "repository": "https://github.com/ip7z/7zip.git",
+      "version": "26.02",
+      "commit": "f9d78aff31a5f2521ae7ddbdc97c4a8855808959",
+      "path": "third_party/7zip/win-x64",
+      "release_asset": {
+        "url": "https://github.com/ip7z/7zip/releases/download/26.02/7z2602-x64.exe",
+        "sha256": "6745FA76DC2EA031596D8678F6F6B99C3C1B435B4164A63485ADBBC7B8D82EF0"
+      },
+      "artifacts": {
+        "7z.dll": "69FD4DF057985C40E510E2FAC182881C7F85E90AA13EC703F763A8FDB2CE61F8",
+        "7z.exe": "83967F1B02B43C4EFEDA302795722C809E0E81B8307DE73558D10484D5676A7D"
+      },
+      "local_patches": []
+    },
+    "darkmodelib": {
+      "repository": "https://github.com/ozone10/win32-darkmodelib.git",
+      "version": "0.75.0",
+      "commit": "fa99647299c4edb3cf662bc14f19b5451090723e",
+      "path": "../Wimukthi.Win32Theme/third_party/darkmodelib",
+      "local_patches": [
+        "Clear the custom-painted group-box client with the configured dialog brush before drawing its frame."
+      ]
+    },
+    "fluent-ui-system-icons": {
+      "repository": "https://github.com/microsoft/fluentui-system-icons.git",
+      "commit": "261a8ac124d677469412a44faf3f49e2e5eba438",
+      "path": "assets/icons/fluent",
+      "profile": "Pinned SVG subset used to generate toolbar alpha masks",
+      "artifacts": {
+        "README.md": "8758FF71459758A042D31854AC845935DEE4E53368BDFE51624230A56372C8B1"
+      },
+      "local_patches": [
+        "Rename the selected SVG files for Axiom's command vocabulary."
+      ]
+    }
+  }
+}

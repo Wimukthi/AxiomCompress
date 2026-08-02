@@ -1506,6 +1506,11 @@ void MainWindow::on_table_selection_changed() {
     } else {
         update_browser_status(&indices);
     }
+    if (const auto archive = active_archive_path()) {
+        // The capability worker also builds the catalog, so selected archives
+        // become ready without blocking the file browser or paint path.
+        queue_selected_archive_capability_probe(*archive);
+    }
     update_toolbar_button_states();
 }
 

@@ -1,7 +1,7 @@
 #pragma once
 
 // Minimal public 7-Zip engine ABI used by Axiom's dynamic 7z.dll adapter.
-// The interface layout and identifiers match 7-Zip 26.00's SDK headers
+// The interface layout and identifiers match 7-Zip 26.02's SDK headers
 // (CPP/7zip/{IDecl,IStream,IProgress,IPassword,Archive/IArchive}.h). Keeping
 // this narrow declaration local avoids importing 7-Zip's application framework
 // while still talking to the unmodified, separately distributed LGPL DLL.

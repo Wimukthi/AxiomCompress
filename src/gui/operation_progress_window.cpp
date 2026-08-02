@@ -422,12 +422,18 @@ void OperationProgressWindow::update_telemetry_fields() {
          progress_.planned_updated_items != 0 ||
          progress_.planned_removed_items != 0 ||
          progress_.planned_unchanged_items != 0);
+    const auto reused_summary = [&] {
+        if (!has_progress_ || progress_.reused_items == 0) return std::wstring{};
+        return L"   Reused: " + format_size(progress_.reused_bytes) +
+               L" (" + std::to_wstring(progress_.reused_items) + L")";
+    };
     if (has_sync_plan) {
         set_field_text(
             TelemetryField::compressed_size,
             L"Added: " + std::to_wstring(progress_.planned_added_items) +
                 L"   Updated: " +
-                std::to_wstring(progress_.planned_updated_items));
+                std::to_wstring(progress_.planned_updated_items) +
+                reused_summary());
         set_field_text(
             TelemetryField::compression_ratio,
             L"Removed: " + std::to_wstring(progress_.planned_removed_items) +
@@ -436,7 +442,8 @@ void OperationProgressWindow::update_telemetry_fields() {
     } else {
         set_field_text(TelemetryField::compressed_size,
                        L"Compressed size: " + format_size(
-                           has_progress_ ? progress_.compressed_bytes : 0));
+                           has_progress_ ? progress_.compressed_bytes : 0) +
+                           reused_summary());
         std::wstringstream ratio;
         ratio.setf(std::ios::fixed);
         ratio.precision(2);
@@ -486,6 +493,12 @@ void OperationProgressWindow::update_telemetry_fields() {
         activity = L"Waiting for checkpoint";
     } else if (has_progress_) {
         activity = L"Active";
+    }
+    if (has_progress_ && progress_.archive_bytes_read > 0 &&
+        (progress_.stage == OperationStage::testing ||
+         progress_.stage == OperationStage::extracting)) {
+        activity += L"   Archive read: " +
+                    format_size(progress_.archive_bytes_read);
     }
     set_field_text(TelemetryField::activity, L"Activity: " + activity);
 }

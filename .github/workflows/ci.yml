@@ -22,6 +22,9 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v6
+      - name: Verify vendored dependency lock
+        shell: pwsh
+        run: .\tools\verify_dependencies.ps1
       - name: Checkout Wimukthi.Win32Theme
         if: runner.os == 'Windows'
         uses: actions/checkout@v6
@@ -40,6 +43,18 @@ jobs:
         run: cmake --build build --config Release
       - name: Test
         run: ctest --test-dir build -C Release --output-on-failure
+      - name: Test SFX runtime compatibility
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: .\tools\test_sfx_runtime.ps1 -BuildRoot .\build -Configuration Release
+      - name: Test Authenticode SFX
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: .\tools\test_sfx_authenticode.ps1 -BuildRoot .\build -Configuration Release
+      - name: Test SFX footprint
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: .\tools\test_sfx_footprint.ps1 -BuildRoot .\build -Configuration Release
 
   # Coverage-guided libFuzzer under AddressSanitizer over the untrusted decode
   # surfaces: the single-stream decoder and the archive container parser.

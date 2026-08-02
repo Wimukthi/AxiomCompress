@@ -82,6 +82,9 @@
     <ClInclude Include="src\codec\varint.hpp" />
     <ClInclude Include="src\core\archive.hpp" />
     <ClInclude Include="src\archive\container_internal.hpp" />
+    <ClInclude Include="src\archive\sfx_image.hpp" />
+    <ClInclude Include="src\sfx\sfx_config.hpp" />
+    <ClInclude Include="src\sfx\sfx_options.hpp" />
     <ClInclude Include="src\archive\seven_zip_abi.hpp" />
     <ClInclude Include="src\archive\seven_zip_library.hpp" />
     <ClInclude Include="src\archive\system_provider.hpp" />
@@ -127,6 +130,9 @@
   <ItemGroup>
     <ClCompile Include="src\archive\container.cpp" />
     <ClCompile Include="src\archive\container_formats.cpp" />
+    <ClCompile Include="src\archive\sfx_image.cpp" />
+    <ClCompile Include="src\sfx\sfx_config.cpp" />
+    <ClCompile Include="src\sfx\sfx_options.cpp" />
     <ClCompile Include="src\archive\container_zip.cpp" />
     <ClCompile Include="src\archive\seven_zip_library.cpp" />
     <ClCompile Include="src\archive\system_provider.cpp" />

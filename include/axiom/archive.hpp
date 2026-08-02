@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <optional>
+#include <ostream>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -14,6 +15,28 @@
 #include <vector>
 
 namespace axiom {
+
+struct ArchiveSparseExtent {
+    std::uint64_t offset = 0;
+    std::uint64_t length = 0;
+};
+
+struct ArchiveMetadataBlob {
+    std::string name;
+    std::vector<std::uint8_t> data;
+};
+
+// A compressed range that can be fetched independently during selected
+// extraction. `uncompressed_offset` is relative to the archive entry and
+// `archive_offset` points at the complete AXC subframe in the archive file.
+// Legacy archives and blocks whose codec has no independent frames leave this
+// vector empty and continue to use ordinary whole-block extraction.
+struct ArchiveSubframeRange {
+    std::uint64_t uncompressed_offset = 0;
+    std::uint64_t uncompressed_size = 0;
+    std::uint64_t archive_offset = 0;
+    std::uint64_t compressed_size = 0;
+};
 
 // One entry in a multi-file archive's central directory.
 struct ArchiveEntry {
@@ -30,6 +53,46 @@ struct ArchiveEntry {
     bool has_crc32 = false;      // false when the format/provider does not expose CRC-32
     bool has_blake3 = false;     // whether blake3 below is populated
     std::array<std::uint8_t, 32> blake3{};  // BLAKE3-256 of file bytes
+    bool is_sparse = false;      // allocation map was captured for this file
+    std::vector<ArchiveSparseExtent> sparse_extents;
+    bool has_security_descriptor = false;
+    std::vector<std::uint8_t> security_descriptor;
+    std::vector<ArchiveMetadataBlob> xattrs;
+    bool has_reparse_data = false;
+    std::uint32_t reparse_tag = 0;
+    std::vector<std::uint8_t> reparse_data;
+    // Number of content-defined chunks used by a snapshot entry. Zero means
+    // either an empty file or the ordinary solid-block profile.
+    std::uint64_t chunk_count = 0;
+    std::vector<ArchiveSubframeRange> subframes;
+};
+
+struct ArchiveSnapshotInfo {
+    std::string name;
+    std::uint64_t generation = 0;
+    std::int64_t created = 0;
+    std::uint64_t entry_count = 0;
+    std::uint64_t file_bytes = 0;
+    bool current = false;
+};
+
+enum class ArchiveSnapshotChangeKind {
+    added,
+    removed,
+    modified,
+};
+
+struct ArchiveSnapshotChange {
+    std::string path;
+    ArchiveSnapshotChangeKind kind = ArchiveSnapshotChangeKind::modified;
+    std::uint64_t old_size = 0;
+    std::uint64_t new_size = 0;
+};
+
+struct ArchiveCaptureReport {
+    // False means at least one source item could not be captured completely.
+    bool complete = true;
+    std::vector<OperationWarning> warnings;
 };
 
 enum class ArchiveFormat {
@@ -164,8 +227,14 @@ struct ArchiveCapabilities {
     bool comments = false;
     bool lock = false;
     bool metadata = false;
+    bool sparse_files = false;
+    bool capture_warnings = false;
     bool links = false;
     bool authenticity = false;
+    bool snapshots = false;
+    // Path-specific state: true when this existing AXAR uses the snapshot
+    // chunk-table profile. Snapshot content changes must use snapshot APIs.
+    bool snapshot_repository = false;
     bool sfx = false;
     bool locked = false;
     bool encrypted = false;
@@ -186,6 +255,9 @@ struct ExtractOptions {
     std::shared_ptr<OperationControl> operation;
     // Password for an encrypted archive; required to read one, ignored otherwise.
     std::string password;
+    // Refuse extraction when the archive cannot recreate a captured sparse
+    // allocation map or carries a non-empty capture warning report.
+    bool strict_metadata = false;
 };
 
 // A filesystem object mapped to an explicit path in an archive. For a directory,
@@ -315,6 +387,23 @@ ArchiveSignatureInfo verify_archive_signature(
     const std::string& password = {},
     const std::optional<std::array<std::uint8_t, 32>>& trusted_key = std::nullopt);
 
+// Manage password slots without recompressing or re-encrypting existing block
+// bytes. The current password authenticates the archive; add/remove/change then
+// rewrites only the encryption metadata and directory. A v4 archive is migrated
+// to the v5 encryption-v2 profile while preserving its data blocks verbatim.
+void add_archive_password(const std::filesystem::path& archive_path,
+                          const std::string& current_password,
+                          const std::string& new_password,
+                          const CompressionOptions& options = {});
+void remove_archive_password(const std::filesystem::path& archive_path,
+                             const std::string& current_password,
+                             const std::string& password_to_remove,
+                             const CompressionOptions& options = {});
+void change_archive_password(const std::filesystem::path& archive_path,
+                             const std::string& current_password,
+                             const std::string& new_password,
+                             const CompressionOptions& options = {});
+
 // Inspect, add/replace, or remove (percent=0) the archive's Reed-Solomon recovery
 // service. Repair writes atomically in place and returns false when no recovery
 // service exists; malformed data beyond the available redundancy throws.
@@ -356,28 +445,49 @@ void create_zip_volumes(const std::filesystem::path& archive_path,
                         std::uint64_t volume_size,
                         const std::shared_ptr<OperationControl>& operation = nullptr);
 
-// Create a Windows self-extracting executable by appending an intact archive and
-// an Axiom SFX trailer to a compatible native PE stub.
+// Create a Windows self-extracting executable by writing an Axiom SFX
+// descriptor, an optional configuration blob, and the intact archive at the end
+// of a compatible native PE stub's image. `config` is the encoded blob from
+// axiom::sfx::encode_sfx_config(); pass an empty span for a plain extractor.
+//
+// The stub must be an unsigned PE image. Sign the generated executable instead:
+// the descriptor is anchored to the end of the image, so a certificate appended
+// afterwards does not disturb it.
 void create_sfx_archive(const std::filesystem::path& archive_path,
                         const std::filesystem::path& stub_executable,
                         const std::filesystem::path& output_executable,
                         const std::shared_ptr<OperationControl>& operation = nullptr,
-                        std::size_t io_buffer_size = 0);
+                        std::size_t io_buffer_size = 0,
+                        std::span<const std::uint8_t> config = {});
 // Package an embedded PE stub without materializing a separate stub executable.
-// The resulting file is still a normal Windows executable followed by the
-// intact archive and the fixed Axiom SFX trailer.
 void create_sfx_archive(const std::filesystem::path& archive_path,
                         std::span<const std::uint8_t> stub_image,
                         const std::filesystem::path& output_executable,
                         const std::shared_ptr<OperationControl>& operation = nullptr,
-                        std::size_t io_buffer_size = 0);
+                        std::size_t io_buffer_size = 0,
+                        std::span<const std::uint8_t> config = {});
+
+// The configuration blob embedded in an existing SFX executable, if any.
+std::optional<std::vector<std::uint8_t>> sfx_archive_config(
+    const std::filesystem::path& sfx_executable);
 
 // Build a `.axar` archive from the given files/directories (directories are
 // scanned recursively). Archive paths are stored relative to each input's
-// parent, so adding "dir" yields entries "dir/...". Written atomically.
+// parent, so adding "dir" yields entries "dir/...". A normal create remains
+// atomic because its header is finalized in a temporary file before install.
 void create_archive(const std::vector<std::filesystem::path>& inputs,
                     const std::filesystem::path& archive_path,
                     const CompressionOptions& options = {});
+
+// Write a new AXAR archive sequentially to a caller-owned stream. This profile
+// is intended for pipes/stdout: it emits an AXAR v5 header up front and therefore
+// does not support recovery records (which require a second read pass) or
+// post-hoc signing. Encryption remains supported; the stream must stay writable
+// until the function returns.
+void create_archive_to_stream(
+    std::ostream& output,
+    const std::vector<std::filesystem::path>& inputs,
+    const CompressionOptions& options = {});
 
 CompressionEstimateResult estimate_compression(
     const std::vector<std::filesystem::path>& inputs,
@@ -394,7 +504,8 @@ CompressionEstimateCurveResult estimate_compression_curve(
 // recompressed — their solid blocks are copied verbatim and new files become new
 // blocks appended after them, then the directory is rebuilt. An added path that
 // matches an existing entry replaces it (the old data remains as dead space until a
-// future repack). Written atomically.
+// future repack). Compatible updates append a generation and retain the previous
+// footer; header-changing cases use the atomic temporary-file path.
 void add_to_archive(const std::vector<std::filesystem::path>& inputs,
                     const std::filesystem::path& archive_path,
                     const CompressionOptions& options = {});
@@ -434,7 +545,8 @@ void update_archive(const std::vector<ArchiveInput>& inputs,
                     const CompressionOptions& options = {}, bool fresh_only = false);
 
 // Mirror the inputs into the archive: add new and newer files (by mtime), then
-// remove any archived entry no longer present in the inputs. Written atomically.
+// remove any archived entry no longer present in the inputs. Compatible syncs
+// append a generation; header-changing cases use the atomic temporary-file path.
 void sync_archive(const std::vector<std::filesystem::path>& inputs,
                   const std::filesystem::path& archive_path,
                   const CompressionOptions& options = {},
@@ -446,6 +558,38 @@ void sync_archive(const std::vector<ArchiveInput>& inputs,
                   const std::filesystem::path& archive_path,
                   const CompressionOptions& options = {},
                   const ArchiveSyncFinalization& finalization = {});
+
+// Snapshot repositories store content-defined chunks once and retain a compact
+// manifest for each named filesystem view. Existing ordinary AXAR archives are
+// not silently converted; create a snapshot repository explicitly, then use
+// add_archive_snapshot for later points in time.
+void create_snapshot_archive(
+    const std::vector<std::filesystem::path>& inputs,
+    const std::filesystem::path& archive_path,
+    const std::string& snapshot_name,
+    const CompressionOptions& options = {});
+void add_archive_snapshot(
+    const std::vector<std::filesystem::path>& inputs,
+    const std::filesystem::path& archive_path,
+    const std::string& snapshot_name,
+    const CompressionOptions& options = {});
+std::vector<ArchiveSnapshotInfo> list_archive_snapshots(
+    const std::filesystem::path& archive_path,
+    const std::string& password = {});
+std::vector<ArchiveSnapshotChange> diff_archive_snapshots(
+    const std::filesystem::path& archive_path,
+    const std::string& from_snapshot,
+    const std::string& to_snapshot,
+    const std::string& password = {});
+void prune_archive_snapshots(
+    const std::filesystem::path& archive_path,
+    const std::vector<std::string>& snapshot_names,
+    const CompressionOptions& options = {});
+void restore_archive_snapshot(
+    const std::filesystem::path& archive_path,
+    const std::string& snapshot_name,
+    const std::filesystem::path& dest_dir,
+    const ExtractOptions& options = {});
 
 // Apply comment/lock/signature metadata in one archive-directory transaction,
 // preserving or rebuilding recovery data exactly once.
@@ -480,12 +624,19 @@ void lock_archive(const std::filesystem::path& archive_path,
 bool archive_is_locked(const std::filesystem::path& archive_path,
                        const std::string& password = {});
 
+// Read the persisted source-capture report. A password is required only when
+// the archive's central directory is encrypted.
+ArchiveCaptureReport archive_capture_report(
+    const std::filesystem::path& archive_path,
+    const std::string& password = {});
+
 // Whether the archive is password-encrypted (block contents, and possibly the
 // directory). Never needs a password itself.
 bool archive_is_encrypted(const std::filesystem::path& archive_path);
+bool archive_is_snapshot_repository(const std::filesystem::path& archive_path);
 
-// Distinguish editable block-only encryption from encrypted-directory mode, which
-// currently requires a password even to list and does not support editing.
+// Distinguish block-only encryption from encrypted-directory mode, which requires
+// a password even to list.
 ArchiveEncryptionMode archive_encryption_mode(const std::filesystem::path& archive_path);
 
 // Read the central directory without decompressing any block. A password is required

@@ -4,8 +4,34 @@
 
 #include <cstdint>
 #include <span>
+#include <vector>
 
 namespace axiom::codec {
+
+// External AXC codecs frame each independently decoded chunk. Offsets are
+// relative to the external-codec payload (not the surrounding AXC stream).
+struct ExternalCodecFrame {
+    std::uint64_t uncompressed_offset = 0;
+    std::uint64_t uncompressed_size = 0;
+    std::uint64_t frame_offset = 0;
+    std::uint64_t frame_size = 0;
+    std::uint64_t payload_offset = 0;
+    std::uint64_t payload_size = 0;
+    bool stored = false;
+    std::uint8_t lzma_property = 0;
+};
+
+std::vector<ExternalCodecFrame> inspect_external_codec_frames(
+    std::span<const std::uint8_t> payload,
+    CompressionMethod method,
+    std::size_t expected_size);
+
+// Decode one complete external-codec frame returned by
+// inspect_external_codec_frames().
+ByteVector decode_external_codec_frame(std::span<const std::uint8_t> frame,
+                                       CompressionMethod method,
+                                       std::size_t expected_size,
+                                       std::uint8_t lzma_property = 0);
 
 ByteVector encode_external_codec(std::span<const std::uint8_t> input,
                                  CompressionMethod method,

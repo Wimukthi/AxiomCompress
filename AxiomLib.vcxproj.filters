@@ -30,6 +30,15 @@
     <ClInclude Include="src\archive\container_internal.hpp">
       <Filter>Archive</Filter>
     </ClInclude>
+    <ClInclude Include="src\archive\sfx_image.hpp">
+      <Filter>Archive</Filter>
+    </ClInclude>
+    <ClInclude Include="src\sfx\sfx_config.hpp">
+      <Filter>Archive</Filter>
+    </ClInclude>
+    <ClInclude Include="src\sfx\sfx_options.hpp">
+      <Filter>Archive</Filter>
+    </ClInclude>
     <ClInclude Include="src\archive\seven_zip_abi.hpp">
       <Filter>Archive</Filter>
     </ClInclude>
@@ -138,6 +147,15 @@
       <Filter>Archive</Filter>
     </ClCompile>
     <ClCompile Include="src\archive\container_formats.cpp">
+      <Filter>Archive</Filter>
+    </ClCompile>
+    <ClCompile Include="src\archive\sfx_image.cpp">
+      <Filter>Archive</Filter>
+    </ClCompile>
+    <ClCompile Include="src\sfx\sfx_config.cpp">
+      <Filter>Archive</Filter>
+    </ClCompile>
+    <ClCompile Include="src\sfx\sfx_options.cpp">
       <Filter>Archive</Filter>
     </ClCompile>
     <ClCompile Include="src\archive\container_zip.cpp">

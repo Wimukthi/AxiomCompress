@@ -1,5 +1,7 @@
 #include "sfx/module_file.hpp"
 
+#include "core/path_text.hpp"
+
 #include <stdexcept>
 #include <system_error>
 #include <vector>
@@ -28,8 +30,11 @@ std::filesystem::path application_path(HINSTANCE module) {
 
 }  // namespace
 
-std::filesystem::path module_file_path(HINSTANCE application_module) {
-    return application_path(application_module).parent_path() / L"AxiomSfx.bin";
+std::filesystem::path module_file_path(HINSTANCE application_module,
+                                       SfxStubTier tier) {
+    const wchar_t* name =
+        tier == SfxStubTier::mini ? L"AxiomSfxMini.bin" : L"AxiomSfx.bin";
+    return application_path(application_module).parent_path() / name;
 }
 
 void create_from_module_file(
@@ -37,16 +42,19 @@ void create_from_module_file(
     const std::filesystem::path& archive_path,
     const std::filesystem::path& output_executable,
     const std::shared_ptr<OperationControl>& operation,
-    std::size_t io_buffer_size) {
+    std::size_t io_buffer_size,
+    std::span<const std::uint8_t> config,
+    SfxStubTier tier) {
     const std::filesystem::path module_path =
-        module_file_path(application_module);
+        module_file_path(application_module, tier);
     std::error_code error;
     if (!std::filesystem::is_regular_file(module_path, error)) {
         throw std::runtime_error(
-            "AxiomSfx.bin is missing from the Axiom application folder");
+            core::path_to_utf8(module_path.filename()) +
+            " is missing from the Axiom application folder");
     }
     create_sfx_archive(archive_path, module_path, output_executable, operation,
-                       io_buffer_size);
+                       io_buffer_size, config);
 }
 
 }  // namespace axiom::sfx

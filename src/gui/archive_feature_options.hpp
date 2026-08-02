@@ -40,7 +40,27 @@ struct ArchiveFeatureOptions {
     bool sign_archive = false;
     std::filesystem::path signing_key;
     bool create_sfx = false;
+    // Output .exe path chosen on the General row, not an extraction folder.
     std::wstring sfx_destination;
+
+    // Configuration embedded in the generated extractor. These mirror the keys
+    // documented for `axiomc sfx --config`; anything not exposed here keeps its
+    // documented default. Indices match the combo boxes on the SFX options
+    // page and are validated before use.
+    int sfx_stub_tier = 0;    // 0 = full window, 1 = console only
+    int sfx_overwrite = 0;    // 0 = replace, 1 = skip, 2 = stop
+    int sfx_mode = 0;         // 0 = interactive, 1 = silent, 2 = no window
+    int sfx_elevation = 0;    // 0 = never, 1 = when needed, 2 = always
+    int sfx_theme = 0;        // 0 = system, 1 = light, 2 = dark
+    std::wstring sfx_title;
+    std::wstring sfx_description;
+    std::wstring sfx_default_path;
+    std::wstring sfx_run_program;
+    std::wstring sfx_run_arguments;
+    std::wstring sfx_license_text;
+    bool sfx_allow_path_change = true;
+    bool sfx_require_accept = false;
+    bool sfx_open_destination = true;
     bool sfx_run_after_extract = false;
 };
 

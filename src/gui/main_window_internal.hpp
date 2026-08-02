@@ -25,6 +25,7 @@
 #include "gui/sfx_dialog.hpp"
 #include "sfx/module_file.hpp"
 #include "sfx/runtime.hpp"
+#include "sfx/sfx_dialog_ui.hpp"
 #include "gui/toolbar_icons.hpp"
 #include "gui/update_checker.hpp"
 
@@ -985,6 +986,7 @@ private:
         fs::path archive;
         const axiom::ArchiveProvider* provider = nullptr;
         axiom::gui::ArchiveCapabilities capabilities;
+        std::shared_ptr<const axiom::gui::ArchiveCatalog> catalog;
     };
     void populate_tree_filesystem_children(DirectoryTreeItem& item, const fs::path& path);
     bool tree_archive_was_detected(const fs::path& path) const;
@@ -1174,6 +1176,7 @@ private:
     void on_table_begin_drag();
     std::optional<fs::path> active_archive_path() const;
     axiom::gui::ArchiveCapabilities active_archive_capabilities() const;
+    bool active_archive_catalog_ready() const;
     const axiom::ArchiveProvider* active_archive_provider() const;
     static axiom::gui::ArchiveFeatureAvailability implemented_feature_availability();
     static axiom::gui::ArchiveFeatureAvailability feature_availability_from_capabilities(
@@ -1245,6 +1248,10 @@ private:
     void on_open_archive();
     void on_drop_files(HDROP drop);
     void save_current_settings();
+    // Carries the SFX options the user just authored forward as the defaults
+    // the next Add to archive dialog opens with. Per-package content — the
+    // license text — is deliberately not remembered.
+    void remember_sfx_defaults(const axiom::gui::ArchiveFeatureOptions& features);
     fs::path log_file_path() const;
     void append_log(const std::wstring& message) const;
     void apply_operation_priority();

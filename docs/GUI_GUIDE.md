@@ -46,10 +46,29 @@ Add, extract, test, delete entries, edit the archive comment, lock, repair from
 recovery data, split and join volumes, sign and verify, and build a
 self-extracting `.exe`.
 
+AXAR snapshot repositories are identified in the archive capability summary as
+**Snapshot repository**. The GUI browses, tests, and extracts their current
+snapshot through the normal archive view, while content-changing Add, Update,
+Freshen, Synchronize, Delete, Move, and ordinary Repack commands stay guarded
+by the snapshot profile rather than risking the historical manifest. Use the
+`axiomc snapshot` commands documented in
+[CLI_GUIDE.md](../CLI_GUIDE.md#snapshot-repositories), or the public archive
+API, for snapshot create/add/list/diff/restore/prune and snapshot garbage
+collection. This keeps the native GUI's existing file-manager workflows safe
+while making the repository type visible instead of presenting incompatible
+legacy controls.
+
 Long operations run on worker threads. The window stays responsive, and
 progress shows byte counts, throughput, ETA, output size, and compression ratio
 where available. Pause, resume, and cancel use the same cooperative
 `OperationControl` path as the CLI, so cancelling leaves no partial output.
+
+Selecting individual AXAR entries uses seekable extraction automatically when
+the archive contains an optional subframe map. The operation window reports the
+physical archive bytes read while testing or extracting, so a selected restore
+can be compared with the archive size. Older archives and blocks that are
+encrypted, transformed, or not independently framed continue through the
+whole-block path without requiring a setting.
 
 Update, freshen, and synchronize run as a single planned transaction: unchanged
 compressed blocks are copied directly, changed and new files are compressed
@@ -72,9 +91,16 @@ across all tabs.
 |---|---|
 | Compression | Method, level, dictionary and word size, solid block size, threads, threading model |
 | General | Update mode, archive comment, metadata notes |
-| Security | Password, filename encryption, show-password toggle |
+| Security | Password, filename encryption, show-password toggle, archive signing |
 | Recovery & volumes | Recovery record percentage, split volume size, recovery volumes |
-| SFX & signing | Self-extracting output and archive signing |
+| SFX | Self-extracting output and everything the generated extractor does |
+
+AXAR metadata capture is automatic. File attributes/timestamps, sparse layout,
+alternate streams, and supported security or extended attributes are collected
+when the source permits them. If a source item or a restore step is incomplete,
+the operation result reports the affected paths and the warning text; the result
+dialog keeps the operation successful when the loss is best-effort. Use the CLI
+or library `strict_metadata` option when metadata loss must fail the operation.
 
 For AXAR the Method list offers Axiom adaptive, Zstandard, LZMA2, Deflate, and
 Store. Choosing a method rebuilds the level list and enables only the controls
@@ -84,6 +110,49 @@ native levels. ZIP creation is deliberately limited to Deflate and Store.
 
 If SFX is enabled, the output path becomes the final merged `.exe` — Axiom does
 not leave a separate archive beside it.
+
+### SFX
+
+Signing lives on the Security tab with the other authenticity controls, so the
+SFX tab is only about self-extracting output. Enabling **Create one
+self-extracting Windows executable** turns on the rest of the tab, which
+configures what the finished `.exe` does when someone runs it. The settings are
+stored inside the executable itself.
+
+| Setting | Effect |
+|---|---|
+| Extractor type | Full window shows dialogs; Console only (unattended) uses the smaller decode-only runtime and never prompts. Selecting it disables window title, description, appearance, destination editing, opening the destination, and interface settings |
+| Window title | Replaces the default extractor title |
+| Default destination | Editable drop-down with common templates such as `%TEMP%\%SFXNAME%`, `%LOCALAPPDATA%\%SFXNAME%`, and `%PROGRAMFILES%\%SFXNAME%`; custom absolute paths and templates are also accepted. `%SFXDIR%` means beside the executable, and an empty value has the same effect |
+| Existing files | Replace, skip, or stop |
+| Interface | Interactive, silent, or no window |
+| Elevation | Never, when the destination needs it, or always |
+| Run after extracting | An archive-relative regular file to launch once extraction finishes, plus its arguments; paths cannot escape through `..` or reparse points |
+| License text | Shown before extraction when acceptance is required |
+
+For the Console only tier, the extraction settings remain available: default
+destination, overwrite behavior, elevation, run-after-extract, and license
+handling. The window title, description, appearance, interface mode, destination
+editing, and Explorer-open options are disabled because the console runtime does
+not use them. Its interface mode is fixed to **No window**.
+
+For the Full window tier, three checkboxes control whether the user may edit the
+destination, whether the license must be accepted, and whether the destination
+opens when extraction finishes.
+
+Shell folders resolve through the Windows known-folder API rather than
+environment variables, so `%ProgramFiles%` cannot be redirected by a variable
+set before launch. The program named under **Run after extracting** must be a
+regular file the extraction produced; absolute paths, `..`, alternate-data-
+stream syntax, and symlink/reparse-point components are rejected. The runtime
+also caps worker counts at 4096. Combinations the
+extractor would refuse — requiring acceptance with no license text, arguments
+with no program, or an unattended elevated run-after chain — are reported when
+you select OK rather than failing on the recipient's machine.
+
+Everything on this page is also available from the command line through
+`axiomc sfx --config`, documented in
+[CLI_GUIDE.md](../CLI_GUIDE.md#configuring-an-extractor).
 
 ### Compression profiles
 

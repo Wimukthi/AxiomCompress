@@ -1,59 +1,113 @@
 #define NOMINMAX
 #include "sfx/runtime.hpp"
 
+#include "archive/sfx_image.hpp"
 #include "axiom/archive.hpp"
-#include "gui/archive_feature_dialogs.hpp"
-#include "gui/dialog_support.hpp"
-#include "gui/message_dialog.hpp"
-#include "gui/operation_progress_window.hpp"
-#include "gui/sfx_dialog.hpp"
-
-#include <shellapi.h>
+#include "core/hash.hpp"
+#include "core/path_text.hpp"
+#include "sfx/sfx_config.hpp"
+#include "sfx/sfx_archive_reader.hpp"
+#include "sfx/sfx_host.hpp"
+#include "sfx/sfx_options.hpp"
+#include "sfx/sfx_ui.hpp"
 
 #include <algorithm>
 #include <array>
-#include <atomic>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
+#include <limits>
 #include <memory>
+#include <optional>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
-#include <thread>
+#include <system_error>
 #include <vector>
 
 namespace axiom::sfx {
 namespace fs = std::filesystem;
 namespace {
 
-constexpr std::array<char, 8> kMagic{
-    'A', 'X', 'I', 'O', 'M', 'S', 'F', 'X'};
-
 std::wstring widen(std::string_view text) {
     if (text.empty()) return {};
     const int length = MultiByteToWideChar(
-        CP_UTF8, MB_ERR_INVALID_CHARS, text.data(),
-        static_cast<int>(text.size()), nullptr, 0);
-    if (length <= 0) return L"Archive operation failed.";
+        CP_UTF8, 0, text.data(), static_cast<int>(text.size()), nullptr, 0);
+    if (length <= 0) return L"<unrepresentable text>";
     std::wstring result(static_cast<std::size_t>(length), L'\0');
-    MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text.data(),
-                        static_cast<int>(text.size()), result.data(), length);
+    MultiByteToWideChar(CP_UTF8, 0, text.data(), static_cast<int>(text.size()),
+                        result.data(), length);
     return result;
 }
 
 std::string utf8(std::wstring_view text) {
     if (text.empty()) return {};
-    const int length = WideCharToMultiByte(
-        CP_UTF8, WC_ERR_INVALID_CHARS, text.data(),
-        static_cast<int>(text.size()), nullptr, 0, nullptr, nullptr);
-    if (length <= 0) throw std::runtime_error("password is not valid Unicode");
+    const int length =
+        WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, text.data(),
+                            static_cast<int>(text.size()), nullptr, 0, nullptr,
+                            nullptr);
+    if (length <= 0) throw std::runtime_error("text is not valid Unicode");
     std::string result(static_cast<std::size_t>(length), '\0');
     WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, text.data(),
                         static_cast<int>(text.size()), result.data(), length,
                         nullptr, nullptr);
     return result;
 }
+
+class Transcript {
+public:
+    std::optional<fs::path> open(const fs::path& requested,
+                                 const fs::path& executable,
+                                 std::string& error) {
+        std::error_code ec;
+        fs::path normalized = fs::absolute(requested, ec);
+        if (ec || normalized.empty()) {
+            error = "cannot resolve the log path";
+            return std::nullopt;
+        }
+        normalized = normalized.lexically_normal();
+        if (normalized == executable.lexically_normal()) {
+            error = "the log file must not be the self-extractor";
+            return std::nullopt;
+        }
+        const bool exists = fs::exists(normalized, ec);
+        if (ec) {
+            error = "cannot inspect the log path: " + ec.message();
+            return std::nullopt;
+        }
+        if (exists && fs::equivalent(normalized, executable, ec)) {
+            error = "the log file must not be the self-extractor";
+            return std::nullopt;
+        }
+        if (ec) {
+            error = "cannot inspect the log path: " + ec.message();
+            return std::nullopt;
+        }
+        stream_.open(normalized, std::ios::binary | std::ios::app);
+        if (!stream_) {
+            error = "cannot open the log file";
+            return std::nullopt;
+        }
+        return normalized;
+    }
+
+    void append(std::wstring_view text) {
+        if (!stream_) return;
+        try {
+            const std::string encoded = utf8(text);
+            stream_.write(encoded.data(), static_cast<std::streamsize>(encoded.size()));
+            stream_.flush();
+        } catch (...) {
+            // A transcript is diagnostic output. It must never turn a valid
+            // extraction into a failure after the requested file was opened.
+        }
+    }
+
+private:
+    std::ofstream stream_;
+};
 
 void secure_clear(std::wstring& text) {
     if (!text.empty()) {
@@ -69,300 +123,595 @@ void secure_clear(std::string& text) {
     }
 }
 
-class TemporaryPayload {
-public:
-    TemporaryPayload() {
-        wchar_t folder[32768]{};
-        const DWORD length = GetTempPathW(
-            static_cast<DWORD>(std::size(folder)), folder);
-        if (length == 0 || length >= std::size(folder)) {
-            throw std::runtime_error("cannot locate the temporary folder");
-        }
-
-        for (unsigned attempt = 0; attempt < 32; ++attempt) {
-            GUID id{};
-            if (FAILED(CoCreateGuid(&id))) {
-                throw std::runtime_error("cannot create a temporary payload name");
-            }
-            wchar_t name[64]{};
-            if (StringFromGUID2(id, name, static_cast<int>(std::size(name))) <= 0) {
-                continue;
-            }
-            path_ = fs::path(folder) / (std::wstring(L"AxiomSfx-") + name + L".payload");
-            handle_ = CreateFileW(
-                path_.c_str(), GENERIC_WRITE, FILE_SHARE_READ,
-                nullptr, CREATE_NEW,
-                FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
-            if (handle_ != INVALID_HANDLE_VALUE) return;
-            if (GetLastError() != ERROR_FILE_EXISTS &&
-                GetLastError() != ERROR_ALREADY_EXISTS) {
-                break;
-            }
-        }
-        throw std::runtime_error("cannot create the temporary archive");
+std::wstring format_size(std::uint64_t bytes) {
+    constexpr const wchar_t* units[] = {L"B", L"KiB", L"MiB", L"GiB", L"TiB"};
+    double value = static_cast<double>(bytes);
+    std::size_t unit = 0;
+    while (value >= 1024.0 && unit + 1 < std::size(units)) {
+        value /= 1024.0;
+        ++unit;
     }
-
-    ~TemporaryPayload() {
-        close();
-        if (!path_.empty()) {
-            std::error_code ignored;
-            fs::remove(path_, ignored);
-        }
-    }
-
-    TemporaryPayload(const TemporaryPayload&) = delete;
-    TemporaryPayload& operator=(const TemporaryPayload&) = delete;
-
-    void write(const void* bytes, DWORD size) {
-        const auto* cursor = static_cast<const std::uint8_t*>(bytes);
-        DWORD remaining = size;
-        while (remaining != 0) {
-            DWORD written = 0;
-            if (!WriteFile(handle_, cursor, remaining, &written, nullptr) ||
-                written == 0) {
-                throw std::runtime_error("cannot write the temporary archive");
-            }
-            cursor += written;
-            remaining -= written;
-        }
-    }
-
-    void close() {
-        if (handle_ != INVALID_HANDLE_VALUE) {
-            CloseHandle(handle_);
-            handle_ = INVALID_HANDLE_VALUE;
-        }
-    }
-
-    const fs::path& path() const { return path_; }
-
-private:
-    fs::path path_;
-    HANDLE handle_{INVALID_HANDLE_VALUE};
-};
-
-axiom::gui::OperationWindowTheme operation_theme(bool dark) {
-    const auto colors = axiom::gui::dialog_colors(dark);
-    return {
-        dark,
-        colors.background,
-        colors.control_background,
-        colors.text,
-        colors.disabled_text,
-        colors.border,
-        colors.control_background,
-        colors.selection_background,
-        colors.border,
-        colors.control_background,
-        axiom::gui::dialog_accent_color(),
-    };
+    std::wstringstream stream;
+    stream.setf(std::ios::fixed);
+    stream.precision(unit == 0 ? 0 : 1);
+    stream << value << L' ' << units[unit];
+    return stream.str();
 }
 
-fs::path current_executable() {
-    std::wstring module(32768, L'\0');
-    const DWORD length = GetModuleFileNameW(
-        nullptr, module.data(), static_cast<DWORD>(module.size()));
-    if (length == 0 || length >= module.size()) {
-        throw std::runtime_error("cannot locate the self-extractor");
+// Everything the run needs after the config and the command line have been
+// merged, so the stages below never re-derive precedence.
+struct Session {
+    fs::path executable;
+    SfxConfig config;
+    SfxCommandLine command_line;
+    SfxMode mode = SfxMode::interactive;
+    std::wstring title = L"Axiom Self-Extractor";
+    std::optional<SfxArchiveReader> archive;
+    axiom::ExtractOptions options;
+    std::vector<axiom::ArchiveEntry> entries;
+    axiom::ArchiveCapabilities capabilities;
+    axiom::ArchiveSignatureInfo signature;
+    fs::path destination;
+    std::uint64_t unpacked_size = 0;
+    std::unique_ptr<Transcript> transcript;
+};
+
+// Interactive means both "the package did not ask for silence" and "this stub
+// can actually ask a question". The mini stub is never interactive.
+bool interactive(const Session& session, const SfxUi& ui) {
+    return session.mode == SfxMode::interactive && ui.supports_prompts();
+}
+
+void report(const Session& session, SfxUi& ui, const std::wstring& text,
+            bool error) {
+    if (session.transcript) session.transcript->append(text + L"\n");
+    if (session.mode == SfxMode::very_silent && !error) return;
+    ui.message(session.title, text, error);
+}
+
+void write_text(Session& session, SfxUi& ui, const std::wstring& text) {
+    if (session.transcript) session.transcript->append(text);
+    ui.write(text);
+}
+
+// Verifies the payload against the hash prefix recorded in the descriptor. Only
+// --test does this: it is a full extra read, and the archive layer already
+// checks per-block CRC-32 and per-file BLAKE3 while extracting.
+bool payload_hash_matches(const fs::path& executable, const SfxPayload& payload) {
+    if (payload.format != SfxFormat::v2) return true;  // v1 has no hash field
+    std::ifstream stream(executable, std::ios::binary);
+    if (!stream) return false;
+    stream.seekg(static_cast<std::streamoff>(payload.payload_offset), std::ios::beg);
+    core::Blake3 hasher;
+    std::vector<std::uint8_t> buffer(std::size_t{1} << 20);
+    std::uint64_t remaining = payload.payload_size;
+    while (remaining != 0) {
+        const auto count = static_cast<std::streamsize>(
+            std::min<std::uint64_t>(remaining, buffer.size()));
+        stream.read(reinterpret_cast<char*>(buffer.data()), count);
+        if (stream.gcount() != count) return false;
+        hasher.update(std::span<const std::uint8_t>(
+            buffer.data(), static_cast<std::size_t>(count)));
+        remaining -= static_cast<std::uint64_t>(count);
     }
-    module.resize(length);
-    return fs::path(std::move(module));
+    const auto digest = hasher.finalize();
+    return std::equal(payload.payload_hash.begin(), payload.payload_hash.end(),
+                      digest.begin());
+}
+
+std::optional<std::wstring> read_password_from_stdin() {
+    const HANDLE input = GetStdHandle(STD_INPUT_HANDLE);
+    if (input == INVALID_HANDLE_VALUE || input == nullptr) return std::nullopt;
+    std::string raw;
+    std::array<char, 512> buffer{};
+    DWORD read = 0;
+    bool clean_end = true;
+    for (;;) {
+        if (!ReadFile(input, buffer.data(), static_cast<DWORD>(buffer.size()), &read,
+                      nullptr)) {
+            clean_end = GetLastError() == ERROR_BROKEN_PIPE;
+            break;
+        }
+        if (read == 0) break;
+        raw.append(buffer.data(), read);
+        if (raw.size() > (1u << 16)) return std::nullopt;
+    }
+    if (!clean_end) return std::nullopt;
+    while (!raw.empty() && (raw.back() == '\n' || raw.back() == '\r')) raw.pop_back();
+    if (raw.empty()) return std::nullopt;
+    return widen(raw);
+}
+
+// Entries selected by --include. Directories are implied by their contents.
+std::vector<std::string> select_entries(
+    const std::vector<axiom::ArchiveEntry>& entries,
+    const std::vector<std::wstring>& patterns) {
+    std::vector<std::string> selected;
+    for (const auto& entry : entries) {
+        if (entry.is_directory) continue;
+        const bool matched = std::any_of(
+            patterns.begin(), patterns.end(), [&](const std::wstring& pattern) {
+                return matches_include_pattern(entry.path, utf8(pattern));
+            });
+        if (matched) selected.push_back(entry.path);
+    }
+    return selected;
+}
+
+int run_after_extract(Session& session, SfxUi& ui) {
+    if (session.config.run_program.empty() || session.command_line.no_run) {
+        return static_cast<int>(ExitCode::success);
+    }
+    const auto program =
+        resolve_run_program(session.destination, session.config.run_program);
+    if (!program) {
+        report(session, ui,
+               L"The configured program was not found inside the extracted "
+               L"files: " +
+                   widen(session.config.run_program),
+               true);
+        return static_cast<int>(ExitCode::run_failed);
+    }
+    fs::path working = session.destination;
+    if (!session.config.run_working_dir.empty()) {
+        const auto resolved =
+            resolve_run_directory(session.destination, session.config.run_working_dir);
+        if (!resolved) {
+            report(session, ui,
+                   L"The configured working directory was not found inside the "
+                   L"extracted files.",
+                   true);
+            return static_cast<int>(ExitCode::run_failed);
+        }
+        working = *resolved;
+    }
+    const auto result = run_extracted_program(
+        session.destination, *program, widen(session.config.run_arguments), working,
+        session.config.wait_for_exit);
+    if (!result.started) {
+        report(session, ui, L"Could not start " + program->wstring(), true);
+        return static_cast<int>(ExitCode::run_failed);
+    }
+    if (session.config.propagate_exit_code && result.exit_code.has_value() &&
+        *result.exit_code != 0) {
+        // Documented as ">8 carries the program's own code"; keep the low
+        // numbers reserved for Axiom's own failures.
+        const DWORD code = *result.exit_code;
+        return code <= static_cast<DWORD>(ExitCode::run_failed)
+                   ? static_cast<int>(ExitCode::run_failed)
+                   : static_cast<int>(code);
+    }
+    return static_cast<int>(ExitCode::success);
 }
 
 }  // namespace
 
-std::optional<int> run_embedded(
-    HINSTANCE instance,
-    const std::wstring& requested_destination) {
-    const fs::path executable = current_executable();
-    std::ifstream input(executable, std::ios::binary);
-    if (!input) return std::nullopt;
-    input.seekg(0, std::ios::end);
-    const auto end = input.tellg();
-    if (end < static_cast<std::streamoff>(16)) return std::nullopt;
-    input.seekg(end - static_cast<std::streamoff>(16));
+int run_self_extractor(HINSTANCE, std::span<const std::wstring> arguments,
+                       SfxUi& ui) {
+    Session session;
 
-    std::array<char, 8> found{};
-    std::array<std::uint8_t, 8> encoded_size{};
-    input.read(found.data(), static_cast<std::streamsize>(found.size()));
-    input.read(reinterpret_cast<char*>(encoded_size.data()),
-               static_cast<std::streamsize>(encoded_size.size()));
-    if (!input || found != kMagic) return std::nullopt;
-
-    std::uint64_t archive_size = 0;
-    for (unsigned index = 0; index < encoded_size.size(); ++index) {
-        archive_size |=
-            static_cast<std::uint64_t>(encoded_size[index]) << (index * 8);
+    const auto parsed = parse_sfx_command_line(arguments);
+    if (!parsed.ok) {
+        ui.write(parsed.error + L"\n\n" + sfx_usage_text());
+        ui.flush(session.title, true);
+        return static_cast<int>(ExitCode::usage);
     }
-    const std::uint64_t file_size = static_cast<std::uint64_t>(end);
-    if (archive_size == 0 || archive_size > file_size - 16) return std::nullopt;
-    const std::uint64_t archive_offset = file_size - 16 - archive_size;
+    session.command_line = parsed.value;
 
-    fs::path destination = requested_destination.empty()
-        ? executable.parent_path() / executable.stem()
-        : fs::path(requested_destination);
-    const bool dark = axiom::gui::dialog_system_prefers_dark_mode();
+    auto finish = [&](int code, bool error) {
+        secure_clear(session.options.password);
+        if (session.transcript) {
+            session.transcript->append(L"\nExit code: " + std::to_wstring(code) +
+                                       L"\n");
+        }
+        ui.flush(session.title, error);
+        return code;
+    };
 
     try {
-        TemporaryPayload temporary;
-        input.clear();
-        input.seekg(static_cast<std::streamoff>(archive_offset));
-        std::vector<char> buffer(std::size_t{1} << 20);
-        std::uint64_t remaining = archive_size;
-        while (remaining != 0) {
-            const auto count = static_cast<std::streamsize>(
-                std::min<std::uint64_t>(remaining, buffer.size()));
-            input.read(buffer.data(), count);
-            if (input.gcount() != count) {
-                throw std::runtime_error("SFX payload is truncated");
+        std::wstring module(32768, L'\0');
+        const DWORD length = GetModuleFileNameW(nullptr, module.data(),
+                                                static_cast<DWORD>(module.size()));
+        if (length == 0 || length >= module.size()) {
+            throw std::runtime_error("cannot locate the self-extractor");
+        }
+        module.resize(length);
+        session.executable = fs::path(module);
+
+        if (session.command_line.log.has_value()) {
+            session.transcript = std::make_unique<Transcript>();
+            std::string log_error;
+            const auto log_path = session.transcript->open(
+                fs::path(*session.command_line.log), session.executable, log_error);
+            if (!log_path) {
+                ui.write(L"Cannot open the requested SFX log: " + widen(log_error) +
+                         L"\n");
+                return finish(static_cast<int>(ExitCode::failure), true);
             }
-            temporary.write(buffer.data(), static_cast<DWORD>(count));
-            remaining -= static_cast<std::uint64_t>(count);
-        }
-        temporary.close();
-
-        const auto* provider =
-            axiom::archive_provider_for_contents(temporary.path());
-        if (provider == nullptr ||
-            (provider->info().format != axiom::ArchiveFormat::axar &&
-             provider->info().format != axiom::ArchiveFormat::zip)) {
-            throw std::runtime_error(
-                "SFX payload is not an Axiom or ZIP archive");
+            // Elevation forwards the resolved path so the child appends to the
+            // same file even if the parent and child have different cwd state.
+            session.command_line.log = log_path->wstring();
         }
 
-        axiom::ExtractOptions options;
-        options.overwrite = axiom::ExtractOptions::Overwrite::overwrite;
-        auto capabilities = provider->capabilities(temporary.path());
-        if (capabilities.encrypted) {
+        if (session.command_line.help) {
+            write_text(session, ui, sfx_usage_text());
+            return finish(static_cast<int>(ExitCode::success), false);
+        }
+
+        const auto payload = axiom::sfx_locate_payload(session.executable);
+        if (!payload) {
+            write_text(session, ui,
+                       L"This file does not contain a valid embedded archive.\n");
+            return finish(static_cast<int>(ExitCode::failure), true);
+        }
+
+        if (payload->config_size != 0) {
+            const auto blob = axiom::sfx_archive_config(session.executable);
+            if (!blob) {
+                report(session, ui, L"The embedded configuration could not be read.",
+                       true);
+                return finish(static_cast<int>(ExitCode::integrity), true);
+            }
+            const auto decoded = decode_sfx_config(*blob);
+            if (!decoded) {
+                write_text(session, ui,
+                           L"The embedded configuration is not valid.\n");
+                return finish(static_cast<int>(ExitCode::integrity), true);
+            }
+            session.config = *decoded;
+        }
+
+        session.mode = session.command_line.mode.value_or(session.config.mode);
+        if (!session.config.window_title.empty()) {
+            session.title = widen(session.config.window_title);
+        } else if (!session.config.title.empty()) {
+            session.title = widen(session.config.title);
+        }
+        // SfxTheme::automatic leaves the UI on whatever the system reports.
+        if (session.config.theme == SfxTheme::light) ui.set_theme(false);
+        if (session.config.theme == SfxTheme::dark) ui.set_theme(true);
+
+        session.archive = SfxArchiveReader::open(session.executable);
+        if (!session.archive) {
+            report(session, ui, L"SFX payload is not an Axiom or ZIP archive.", true);
+            return finish(static_cast<int>(ExitCode::integrity), true);
+        }
+
+        session.options.overwrite =
+            session.command_line.overwrite.value_or(session.config.overwrite);
+        session.options.restore_mtime = session.config.restore_mtime;
+        session.options.thread_count = session.command_line.threads.value_or(
+            static_cast<std::size_t>(session.config.threads));
+
+        // ---- password -----------------------------------------------------
+        session.capabilities = session.archive->capabilities();
+        if (session.capabilities.encrypted) {
             std::wstring password;
-            if (!axiom::gui::show_archive_password_dialog(nullptr, password)) {
-                return 0;
-            }
-            options.password = utf8(password);
-            secure_clear(password);
-            capabilities =
-                provider->capabilities(temporary.path(), options.password);
-        }
-        if (!capabilities.extract) {
-            secure_clear(options.password);
-            throw std::runtime_error(
-                "SFX payload cannot be extracted with the supplied password");
-        }
-
-        axiom::ArchiveSignatureInfo signature;
-        if (provider->info().native) {
-            signature =
-                axiom::verify_archive_signature(temporary.path(), options.password);
-        }
-        if (signature.present && !signature.valid) {
-            secure_clear(options.password);
-            throw std::runtime_error(
-                "archive authenticity signature is invalid");
-        }
-
-        const auto entries =
-            provider->list(temporary.path(), options.password);
-        axiom::gui::SfxArchiveSummary summary;
-        summary.archive_name = executable.filename().wstring();
-        summary.encrypted = capabilities.encrypted;
-        summary.signature_present = signature.present;
-        summary.signature_valid = signature.valid;
-        if (provider->info().native) {
-            summary.comment =
-                widen(axiom::archive_comment(temporary.path(), options.password));
-        }
-        for (const auto& entry : entries) {
-            if (entry.is_directory) {
-                ++summary.directory_count;
+            if (session.command_line.password.has_value()) {
+                password = *session.command_line.password;
+            } else if (session.command_line.password_stdin) {
+                const auto piped = read_password_from_stdin();
+                if (!piped) {
+                    report(session, ui, L"No password was supplied on stdin.", true);
+                    return finish(static_cast<int>(ExitCode::password), true);
+                }
+                password = *piped;
+            } else if (interactive(session, ui)) {
+                if (!ui.ask_password(password)) {
+                    return finish(static_cast<int>(ExitCode::cancelled), false);
+                }
             } else {
-                ++summary.file_count;
-                summary.unpacked_size += entry.size;
+                report(session, ui,
+                       L"This archive is encrypted; supply --password.", true);
+                return finish(static_cast<int>(ExitCode::password), true);
+            }
+            session.options.password = utf8(password);
+            secure_clear(password);
+            session.capabilities = session.archive->capabilities(
+                session.options.password);
+        }
+        if (!session.capabilities.extract) {
+            report(session, ui,
+                   L"The payload cannot be read with the supplied password.", true);
+            return finish(static_cast<int>(ExitCode::password), true);
+        }
+
+        // ---- authenticity -------------------------------------------------
+        session.signature = session.archive->signature(session.options.password);
+        if (session.signature.present && !session.signature.valid) {
+            report(session, ui, L"The archive signature is invalid.", true);
+            return finish(static_cast<int>(ExitCode::integrity), true);
+        }
+
+        session.entries = session.archive->list(session.options.password);
+        for (const auto& entry : session.entries) {
+            if (!entry.is_directory) session.unpacked_size += entry.size;
+        }
+
+        // ---- read-only modes ----------------------------------------------
+        if (session.command_line.list) {
+            std::wstringstream out;
+            for (const auto& entry : session.entries) {
+                out << (entry.is_directory ? L"      <DIR>  " : L"           ")
+                    << std::setw(12) << entry.size << L"  " << widen(entry.path)
+                    << L"\n";
+            }
+            out << session.entries.size() << L" entries, " << session.unpacked_size
+                << L" bytes uncompressed\n";
+            write_text(session, ui, out.str());
+            return finish(static_cast<int>(ExitCode::success), false);
+        }
+            if (session.command_line.test) {
+            if (!payload_hash_matches(session.executable, *payload)) {
+                report(session, ui,
+                       L"The embedded payload does not match its recorded hash.",
+                       true);
+                return finish(static_cast<int>(ExitCode::integrity), true);
+            }
+            axiom::DecompressionOptions test_options;
+            test_options.password = session.options.password;
+            session.archive->test(test_options);
+            report(session, ui, L"Payload is intact.", false);
+            return finish(static_cast<int>(ExitCode::success), false);
+        }
+
+        // ---- license ------------------------------------------------------
+        if (session.config.require_accept && !session.command_line.accept) {
+            const std::wstring license = widen(session.config.license_text);
+            if (session.transcript && !license.empty()) {
+                session.transcript->append(license + L"\n");
+            }
+            if (interactive(session, ui)) {
+                if (!ui.ask_license(session.title, license)) {
+                    return finish(static_cast<int>(ExitCode::cancelled), false);
+                }
+            } else {
+                ui.ask_license(session.title, license);
+                report(session, ui,
+                       L"This package requires accepting a license; pass -y to "
+                       L"accept it, or run interactively to read it.",
+                       true);
+                return finish(static_cast<int>(ExitCode::usage), true);
             }
         }
 
-        axiom::gui::SfxExtractDialogOptions dialog_options;
-        dialog_options.destination = destination;
-        dialog_options.overwrite =
-            axiom::ExtractOptions::Overwrite::overwrite;
-        if (!axiom::gui::show_sfx_extract_dialog(
-                nullptr, instance, summary, dialog_options)) {
-            secure_clear(options.password);
-            return 0;
+        // ---- destination --------------------------------------------------
+        if (session.command_line.destination.has_value()) {
+            session.destination = fs::path(*session.command_line.destination);
+        } else if (!session.config.default_path.empty()) {
+            const auto expanded = expand_sfx_path_template(
+                session.config.default_path, session.executable);
+            if (!expanded) {
+                report(session, ui,
+                       L"The configured destination could not be resolved.", true);
+                return finish(static_cast<int>(ExitCode::failure), true);
+            }
+            session.destination = *expanded;
+        } else {
+            session.destination =
+                session.executable.parent_path() / session.executable.stem();
         }
-        destination = dialog_options.destination;
-        options.overwrite = dialog_options.overwrite;
-        options.restore_mtime = dialog_options.restore_mtime;
-        options.thread_count = dialog_options.thread_count;
+        if (session.config.create_subfolder) {
+            session.destination /= session.executable.stem();
+        }
+        session.destination = fs::absolute(session.destination).lexically_normal();
 
+        bool open_destination = session.config.open_destination;
+        if (interactive(session, ui)) {
+            SfxSummary summary;
+            summary.archive_name = session.executable.filename().wstring();
+            summary.window_title = session.title;
+            summary.encrypted = session.capabilities.encrypted;
+            summary.signature_present = session.signature.present;
+            summary.signature_valid = session.signature.valid;
+            summary.unpacked_size = session.unpacked_size;
+            for (const auto& entry : session.entries) {
+                if (entry.is_directory) {
+                    ++summary.directory_count;
+                } else {
+                    ++summary.file_count;
+                }
+            }
+            summary.comment = widen(
+                session.archive->comment(session.options.password));
+            summary.banner_text = widen(session.config.banner_text);
+            summary.description = widen(session.config.description);
+
+            SfxChoices choices;
+            choices.destination = session.destination;
+            choices.overwrite = session.options.overwrite;
+            choices.thread_count = session.options.thread_count;
+            choices.restore_mtime = session.options.restore_mtime;
+            choices.open_destination = open_destination;
+            choices.allow_path_change = session.config.allow_path_change;
+            if (!ui.ask_options(summary, choices)) {
+                return finish(static_cast<int>(ExitCode::cancelled), false);
+            }
+            session.destination = choices.destination;
+            session.options.overwrite = choices.overwrite;
+            session.options.restore_mtime = choices.restore_mtime;
+            session.options.thread_count = choices.thread_count;
+            open_destination = choices.open_destination;
+        }
+
+        // ---- elevation ----------------------------------------------------
+        const bool writable = destination_is_writable(session.destination);
+        const bool needs_elevation =
+            session.config.elevation == SfxElevation::require ||
+            (session.config.elevation == SfxElevation::automatic && !writable);
+        if (needs_elevation && !process_is_elevated()) {
+            if (session.command_line.password.has_value() ||
+                session.command_line.password_stdin) {
+                // Forwarding the password would expose it in the elevated
+                // process's command line, and a runas launch cannot be piped to.
+                report(session, ui,
+                       L"Elevation is required, which cannot be combined with a "
+                       L"password supplied on the command line.",
+                       true);
+                return finish(static_cast<int>(ExitCode::elevation), true);
+            }
+            auto quote_argument = [](std::wstring_view argument) {
+                std::wstring quoted = L"\"";
+                std::size_t backslashes = 0;
+                for (const wchar_t character : argument) {
+                    if (character == L'\\') {
+                        ++backslashes;
+                        continue;
+                    }
+                    if (character == L'\"') {
+                        quoted.append(backslashes * 2 + 1, L'\\');
+                        quoted.push_back(L'\"');
+                        backslashes = 0;
+                        continue;
+                    }
+                    quoted.append(backslashes, L'\\');
+                    backslashes = 0;
+                    quoted.push_back(character);
+                }
+                quoted.append(backslashes * 2, L'\\');
+                quoted.push_back(L'\"');
+                return quoted;
+            };
+            std::vector<std::wstring> forwarded_arguments;
+            forwarded_arguments.push_back(session.destination.wstring());
+            if (session.mode == SfxMode::silent) forwarded_arguments.push_back(L"--silent");
+            if (session.mode == SfxMode::very_silent) {
+                forwarded_arguments.push_back(L"--very-silent");
+            }
+            if (session.command_line.accept) forwarded_arguments.push_back(L"-y");
+            if (session.command_line.no_run) forwarded_arguments.push_back(L"--no-run");
+            if (session.command_line.overwrite.has_value()) {
+                forwarded_arguments.push_back(L"--overwrite");
+                forwarded_arguments.push_back(
+                    *session.command_line.overwrite == ExtractOptions::Overwrite::skip
+                        ? L"skip"
+                        : *session.command_line.overwrite == ExtractOptions::Overwrite::fail
+                              ? L"fail"
+                              : L"replace");
+            }
+            if (session.command_line.threads.has_value()) {
+                forwarded_arguments.push_back(L"--threads");
+                forwarded_arguments.push_back(
+                    std::to_wstring(*session.command_line.threads));
+            }
+            for (const auto& pattern : session.command_line.include) {
+                forwarded_arguments.push_back(L"--include");
+                forwarded_arguments.push_back(pattern);
+            }
+            if (session.command_line.log.has_value()) {
+                forwarded_arguments.push_back(L"--log");
+                forwarded_arguments.push_back(*session.command_line.log);
+            }
+            std::wstring forwarded;
+            for (const auto& argument : forwarded_arguments) {
+                if (!forwarded.empty()) forwarded.push_back(L' ');
+                forwarded += quote_argument(argument);
+            }
+            secure_clear(session.options.password);
+            const auto elevated_code =
+                relaunch_elevated(session.executable, forwarded);
+            if (!elevated_code) {
+                report(session, ui, L"Elevation was refused.", true);
+                return finish(static_cast<int>(ExitCode::elevation), true);
+            }
+            if (*elevated_code >
+                static_cast<DWORD>(std::numeric_limits<int>::max())) {
+                return finish(static_cast<int>(ExitCode::failure), true);
+            }
+            const int child_code = static_cast<int>(*elevated_code);
+            return finish(child_code,
+                          child_code != static_cast<int>(ExitCode::success) &&
+                              child_code != static_cast<int>(ExitCode::cancelled));
+        }
+        if (!writable && session.config.elevation == SfxElevation::none) {
+            report(session, ui,
+                   L"The destination is not writable: " +
+                       session.destination.wstring(),
+                   true);
+            return finish(static_cast<int>(ExitCode::elevation), true);
+        }
+
+        // ---- selection and free space -------------------------------------
+        std::vector<std::string> selected;
+        std::uint64_t required = session.unpacked_size;
+        if (!session.command_line.include.empty()) {
+            if (!session.capabilities.selective_extract) {
+                report(session, ui,
+                       L"This payload does not support selective extraction.", true);
+                return finish(static_cast<int>(ExitCode::usage), true);
+            }
+            selected = select_entries(session.entries, session.command_line.include);
+            if (selected.empty()) {
+                report(session, ui, L"No entries matched --include.", true);
+                return finish(static_cast<int>(ExitCode::usage), true);
+            }
+            required = 0;
+            for (const auto& entry : session.entries) {
+                if (!entry.is_directory &&
+                    std::find(selected.begin(), selected.end(), entry.path) !=
+                        selected.end()) {
+                    required += entry.size;
+                }
+            }
+        }
+
+        // Failing here beats failing partway through a long extraction.
+        if (const auto free_space = available_free_space(session.destination)) {
+            if (*free_space < required) {
+                report(session, ui,
+                       L"Not enough free space: " + format_size(required) +
+                           L" needed, " + format_size(*free_space) + L" available.",
+                       true);
+                return finish(static_cast<int>(ExitCode::disk_space), true);
+            }
+        }
+
+        // ---- extract ------------------------------------------------------
         auto operation = std::make_shared<axiom::OperationControl>();
-        options.operation = operation;
-
-        std::atomic_bool completed = false;
-        std::atomic_bool cancelled = false;
+        session.options.operation = operation;
+        bool cancelled = false;
         std::exception_ptr failure;
-        axiom::gui::OperationProgressWindow progress_window;
-        if (!progress_window.create(
-                nullptr, instance, L"Extracting archive", {},
-                operation_theme(dark),
-                [operation](bool paused) { operation->set_paused(paused); },
-                [operation] { operation->request_cancel(); })) {
-            secure_clear(options.password);
-            throw std::runtime_error(
-                "cannot create the extraction progress window");
-        }
-        progress_window.set_progress_source(operation);
-
-        std::jthread worker([&] {
+        ui.run_with_progress(operation, [&] {
             try {
-                provider->extract_all(temporary.path(), destination, options);
+                if (selected.empty()) {
+                    session.archive->extract_all(session.destination,
+                                                 session.options);
+                } else {
+                    session.archive->extract_selected(selected, session.destination,
+                                                      session.options);
+                }
             } catch (const axiom::OperationCancelled&) {
-                cancelled.store(true, std::memory_order_release);
+                cancelled = true;
             } catch (...) {
                 failure = std::current_exception();
             }
-            completed.store(true, std::memory_order_release);
         });
-
-        while (!completed.load(std::memory_order_acquire)) {
-            MSG message{};
-            while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
-                if (message.message == WM_QUIT) {
-                    operation->request_cancel();
-                    continue;
-                }
-                if (progress_window.hwnd() != nullptr &&
-                    IsDialogMessageW(progress_window.hwnd(), &message)) {
-                    continue;
-                }
-                TranslateMessage(&message);
-                DispatchMessageW(&message);
-            }
-            MsgWaitForMultipleObjectsEx(
-                0, nullptr, 33, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
-        }
-        worker.join();
-        progress_window.close();
-        secure_clear(options.password);
+        secure_clear(session.options.password);
         if (failure) std::rethrow_exception(failure);
-        if (cancelled.load(std::memory_order_acquire)) return 0;
-
-        if (dialog_options.open_destination) {
-            ShellExecuteW(nullptr, L"open", destination.c_str(), nullptr,
-                          nullptr, SW_SHOWNORMAL);
+        if (cancelled) {
+            report(session, ui, L"Extraction was cancelled.", false);
+            return finish(static_cast<int>(ExitCode::cancelled), false);
         }
-        axiom::gui::show_message_dialog(
-            nullptr, instance, GetDpiForSystem(), dark,
-            L"Axiom Self-Extractor",
-            L"Files were extracted to:\n\n" + destination.wstring(),
-            axiom::gui::MessageDialogIcon::information);
-        return 0;
+
+        const int ran = run_after_extract(session, ui);
+        if (ran != static_cast<int>(ExitCode::success)) return finish(ran, true);
+
+        if (open_destination && interactive(session, ui)) {
+            ui.reveal(session.destination);
+        }
+        if (interactive(session, ui) && !session.config.auto_close) {
+            const std::wstring message =
+                L"Files were extracted to:\n\n" + session.destination.wstring();
+            if (session.transcript) session.transcript->append(message + L"\n");
+            ui.message(session.title, message, false);
+        } else {
+            report(session, ui, L"Extracted to " + session.destination.wstring(),
+                   false);
+        }
+        return finish(static_cast<int>(ExitCode::success), false);
     } catch (const std::exception& error) {
-        axiom::gui::show_message_dialog(
-            nullptr, instance, GetDpiForSystem(), dark,
-            L"Axiom Self-Extractor",
-            L"Extraction failed:\n\n" + widen(error.what()),
-            axiom::gui::MessageDialogIcon::error);
-        return 1;
+        report(session, ui, L"Extraction failed:\n\n" + widen(error.what()), true);
+        return finish(static_cast<int>(ExitCode::failure), true);
     }
 }
 

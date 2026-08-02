@@ -187,13 +187,17 @@ Non-Windows builds produce the library, CLI, and tests only.
 | `AxiomLib` / `axiom` | `axiom.lib` | Archive and codec engine |
 | `AxiomC` / `axiomc` | `axiomc.exe` | Command-line tool |
 | `AxiomGui` / `axiom_gui` | `Axiom.exe` | Win32 archive manager |
-| `AxiomSfx` / `axiom_sfx_module` | `AxiomSfx.bin` | Read-only SFX runtime |
+| `AxiomSfxDecodeLib` / `axiom_sfx_decode` | `AxiomSfxDecodeLib.lib` | Decode-only AXAR/ZIP SFX archive runtime |
+| `AxiomSfx` / `axiom_sfx_module` | `AxiomSfx.bin` | Full read-only SFX runtime |
+| `AxiomSfxMini` / `axiom_sfx_mini_module` | `AxiomSfxMini.bin` | Console SFX runtime using the decode-only library |
 | `AxiomRoundtrip` / `axiom_roundtrip` | `axiom_roundtrip.exe` | Test suite |
 
 ## Testing
 
 ```powershell
 .\tools\test_msvc.ps1 -Configuration Release   # or: ctest --preset default
+.\tools\test_sfx_runtime.ps1 -BuildRoot .\out -Configuration Release
+.\tools\test_sfx_footprint.ps1 -BuildRoot .\out -Configuration Release
 .\tools\build_fuzz.ps1 -Target all
 .\tools\run_fuzz.ps1 -Seconds 60 -Target all
 ```
@@ -212,6 +216,7 @@ the scheduled run uses longer fuzz durations.
 | [ARCHITECTURE.md](ARCHITECTURE.md) | Codec and container design |
 | [FORMAT.md](FORMAT.md) | `.axar` / `.axc` binary specification |
 | [docs/FORMAT_SUPPORT.md](docs/FORMAT_SUPPORT.md) | Per-format capability matrix and roadmap |
+| [docs/SFX_ARCHITECTURE.md](docs/SFX_ARCHITECTURE.md) | Self-extractor design and roadmap |
 | [docs/PERFORMANCE.md](docs/PERFORMANCE.md) | Published benchmark results |
 | [docs/BENCHMARKING.md](docs/BENCHMARKING.md) | How to measure changes |
 | [docs/INSTALLER.md](docs/INSTALLER.md) | Release packaging |

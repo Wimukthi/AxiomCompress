@@ -11,10 +11,10 @@ The components below are bundled with it and retain their own licenses.
 | [Darkmodelib](#darkmodelib) | 0.75.0 | MPL-2.0, with MIT parts | Dark mode, via the theme framework |
 | [Zstandard](#zstandard) | 1.5.7 | BSD-3-Clause | Optional AXAR Zstandard block codec |
 | [LZMA SDK](#lzma-sdk) | 26.02 | Public domain | Optional AXAR LZMA2 block codec |
-| [miniz](#miniz) | 3.1.1 | MIT | ZIP container read/write and Deflate |
+| [miniz](#miniz) | 3.1.2 | MIT | ZIP container read/write and Deflate |
 | [minizip-ng](#minizip-ng) | 4.2.2 | zlib | Standard split-ZIP container core |
-| [7-Zip engine](#7-zip-engine) | 26.00 | LGPL-2.1+, BSD parts, unRAR restriction | Read-only 7z/RAR/ISO/CAB support |
-| [Monocypher](#monocypher) | vendored snapshot | BSD-2-Clause | Argon2id, XChaCha20-Poly1305, EdDSA |
+| [7-Zip engine](#7-zip-engine) | 26.02 | LGPL-2.1+, BSD parts, unRAR restriction | Read-only 7z/RAR/ISO/CAB support |
+| [Monocypher](#monocypher) | 4.0.3 | BSD-2-Clause / CC0-1.0 | Argon2id, XChaCha20-Poly1305, EdDSA |
 | [BLAKE3](#blake3) | 1.8.5 | CC0-1.0 or Apache-2.0 | Content hashing and integrity |
 | [Fluent UI System Icons](#fluent-ui-system-icons) | icon subset | MIT | GUI toolbar icons |
 
@@ -74,6 +74,7 @@ parallelism.
 Provides the ZIP container reader/writer and the Deflate/Inflate
 implementation, which the AXAR Deflate method also uses.
 
+- Version: 3.1.2, pinned in `dependencies.lock.json`
 - License: `src/third_party/miniz/LICENSE` (MIT)
 
 ## minizip-ng
@@ -91,6 +92,7 @@ Axiom loads the 64-bit 7-Zip engine DLL directly, so read-only support for 7z,
 RAR/RAR5, ISO/UDF, and CAB works on Windows without launching a console helper
 or requiring 7-Zip to be installed.
 
+- Version: 26.02, pinned in `dependencies.lock.json`
 - Shipped: `backends/7zip/7z.dll`, `License.txt`, `readme.txt`
 - Copyright © 1999-2026 Igor Pavlov
 - Mainly GNU LGPL, with BSD-licensed parts and the upstream **unRAR
@@ -108,8 +110,9 @@ Provides Axiom's cryptographic primitives: Argon2id key derivation,
 XChaCha20-Poly1305 authenticated encryption, and EdDSA signatures.
 
 - License: header notice in `src/third_party/monocypher/monocypher.h`
-  (BSD-2-Clause; also available under CC0-1.0 upstream)
-- Upstream: <https://monocypher.org/>
+  (BSD-2-Clause or CC0-1.0)
+- Version: 4.0.3, pinned in `dependencies.lock.json`
+- Upstream: <https://github.com/LoupVaillant/Monocypher>
 
 Note that Monocypher's EdDSA uses a BLAKE2b-based primitive and is **not**
 wire-compatible with standard SHA-512 Ed25519.

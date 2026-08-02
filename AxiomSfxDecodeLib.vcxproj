@@ -1,0 +1,257 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <VCProjectVersion>18.0</VCProjectVersion>
+    <Keyword>Win32Proj</Keyword>
+    <ProjectGuid>{C438F5C4-7D14-4A4D-8FCB-1F2F0A6A8B90}</ProjectGuid>
+    <RootNamespace>AxiomSfxDecodeLib</RootNamespace>
+    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
+    <ConfigurationType>StaticLibrary</ConfigurationType>
+    <UseDebugLibraries>true</UseDebugLibraries>
+    <PlatformToolset>v145</PlatformToolset>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
+    <ConfigurationType>StaticLibrary</ConfigurationType>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <PlatformToolset>v145</PlatformToolset>
+    <WholeProgramOptimization>true</WholeProgramOptimization>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <ImportGroup Label="ExtensionSettings" />
+  <ImportGroup Label="Shared" />
+  <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <PropertyGroup Label="UserMacros" />
+  <PropertyGroup>
+    <OutDir>$(SolutionDir)out\$(Configuration)\</OutDir>
+    <IntDir>$(SolutionDir)build\msvc\$(ProjectName)\$(Configuration)\</IntDir>
+    <TargetName>AxiomSfxDecodeLib</TargetName>
+    <DisableFastUpToDateCheck>true</DisableFastUpToDateCheck>
+  </PropertyGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <ClCompile>
+      <WarningLevel>Level4</WarningLevel>
+      <SDLCheck>true</SDLCheck>
+      <PreprocessorDefinitions>_DEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>$(ProjectDir)include;$(ProjectDir)src;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <LanguageStandard>stdcpp20</LanguageStandard>
+      <ConformanceMode>true</ConformanceMode>
+    </ClCompile>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <ClCompile>
+      <WarningLevel>Level4</WarningLevel>
+      <FunctionLevelLinking>true</FunctionLevelLinking>
+      <IntrinsicFunctions>true</IntrinsicFunctions>
+      <SDLCheck>true</SDLCheck>
+      <PreprocessorDefinitions>NDEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>$(ProjectDir)include;$(ProjectDir)src;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <LanguageStandard>stdcpp20</LanguageStandard>
+      <ConformanceMode>true</ConformanceMode>
+    </ClCompile>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <ClInclude Include="include\axiom\axiom.hpp" />
+    <ClInclude Include="include\axiom\archive.hpp" />
+    <ClInclude Include="src\archive\container_internal.hpp" />
+    <ClInclude Include="src\archive\sfx_image.hpp" />
+    <ClInclude Include="src\archive\zip_split_backend.hpp" />
+    <ClInclude Include="src\codec\block.hpp" />
+    <ClInclude Include="src\codec\external_codecs.hpp" />
+    <ClInclude Include="src\codec\fast_lz.hpp" />
+    <ClInclude Include="src\codec\lz77.hpp" />
+    <ClInclude Include="src\codec\lz77_split.hpp" />
+    <ClInclude Include="src\codec\transform.hpp" />
+    <ClInclude Include="src\core\archive.hpp" />
+    <ClInclude Include="src\core\checksum.hpp" />
+    <ClInclude Include="src\core\cpu.hpp" />
+    <ClInclude Include="src\core\crypto.hpp" />
+    <ClInclude Include="src\core\file_meta.hpp" />
+    <ClInclude Include="src\core\path_text.hpp" />
+    <ClInclude Include="src\entropy\huffman.hpp" />
+    <ClInclude Include="src\entropy\range.hpp" />
+    <ClInclude Include="src\sfx\sfx_archive_reader.hpp" />
+    <ClInclude Include="src\third_party\blake3\blake3.h" />
+    <ClInclude Include="src\third_party\blake3\blake3_impl.h" />
+    <ClInclude Include="src\third_party\miniz\miniz.h" />
+    <ClInclude Include="src\third_party\miniz\miniz_common.h" />
+    <ClInclude Include="src\third_party\miniz\miniz_export.h" />
+    <ClInclude Include="src\third_party\miniz\miniz_tdef.h" />
+    <ClInclude Include="src\third_party\miniz\miniz_tinfl.h" />
+    <ClInclude Include="src\third_party\miniz\miniz_zip.h" />
+    <ClInclude Include="src\third_party\monocypher\monocypher.h" />
+    <ClInclude Include="src\third_party\zstd\lib\*.h" />
+    <ClInclude Include="src\third_party\zstd\lib\common\*.h" />
+    <ClInclude Include="src\third_party\zstd\lib\decompress\*.h" />
+    <ClInclude Include="src\third_party\lzma-sdk\*.h" />
+    <ClInclude Include="src\third_party\minizip-ng\mz.h" />
+    <ClInclude Include="src\third_party\minizip-ng\mz_config.h" />
+    <ClInclude Include="src\third_party\minizip-ng\mz_crypt.h" />
+    <ClInclude Include="src\third_party\minizip-ng\mz_os.h" />
+    <ClInclude Include="src\third_party\minizip-ng\mz_strm.h" />
+    <ClInclude Include="src\third_party\minizip-ng\mz_strm_buf.h" />
+    <ClInclude Include="src\third_party\minizip-ng\mz_strm_mem.h" />
+    <ClInclude Include="src\third_party\minizip-ng\mz_strm_os.h" />
+    <ClInclude Include="src\third_party\minizip-ng\mz_strm_split.h" />
+    <ClInclude Include="src\third_party\minizip-ng\mz_zip.h" />
+    <ClInclude Include="src\third_party\minizip-ng\mz_zip_rw.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="src\sfx\sfx_archive_reader.cpp" />
+    <ClCompile Include="src\archive\container.cpp" />
+    <ClCompile Include="src\archive\container_zip.cpp" />
+    <ClCompile Include="src\archive\sfx_image.cpp" />
+    <ClCompile Include="src\archive\zip_split_backend.cpp" />
+    <ClCompile Include="src\codec\block.cpp" />
+    <ClCompile Include="src\codec\external_codecs_decode.cpp" />
+    <ClCompile Include="src\codec\fast_lz.cpp" />
+    <ClCompile Include="src\codec\lz77.cpp" />
+    <ClCompile Include="src\codec\lz77_split.cpp" />
+    <ClCompile Include="src\codec\transform.cpp" />
+    <ClCompile Include="src\core\archive.cpp" />
+    <ClCompile Include="src\core\checksum.cpp" />
+    <ClCompile Include="src\core\checksum_clmul.cpp" />
+    <ClCompile Include="src\core\cpu.cpp" />
+    <ClCompile Include="src\core\crypto.cpp" />
+    <ClCompile Include="src\core\file_meta.cpp" />
+    <ClCompile Include="src\core\reed_solomon.cpp" />
+    <ClCompile Include="src\entropy\huffman.cpp" />
+    <ClCompile Include="src\entropy\range.cpp" />
+    <ClCompile Include="src\third_party\blake3\blake3.c">
+      <CompileAs>CompileAsC</CompileAs>
+      <WarningLevel>TurnOffAllWarnings</WarningLevel>
+    </ClCompile>
+    <ClCompile Include="src\third_party\blake3\blake3_dispatch.c">
+      <CompileAs>CompileAsC</CompileAs>
+      <WarningLevel>TurnOffAllWarnings</WarningLevel>
+    </ClCompile>
+    <ClCompile Include="src\third_party\blake3\blake3_portable.c">
+      <CompileAs>CompileAsC</CompileAs>
+      <WarningLevel>TurnOffAllWarnings</WarningLevel>
+    </ClCompile>
+    <ClCompile Include="src\third_party\blake3\blake3_sse2.c">
+      <CompileAs>CompileAsC</CompileAs>
+      <WarningLevel>TurnOffAllWarnings</WarningLevel>
+    </ClCompile>
+    <ClCompile Include="src\third_party\blake3\blake3_sse41.c">
+      <CompileAs>CompileAsC</CompileAs>
+      <WarningLevel>TurnOffAllWarnings</WarningLevel>
+    </ClCompile>
+    <ClCompile Include="src\third_party\blake3\blake3_avx2.c">
+      <CompileAs>CompileAsC</CompileAs>
+      <WarningLevel>TurnOffAllWarnings</WarningLevel>
+      <EnableEnhancedInstructionSet>AdvancedVectorExtensions2</EnableEnhancedInstructionSet>
+    </ClCompile>
+    <ClCompile Include="src\third_party\blake3\blake3_avx512.c">
+      <CompileAs>CompileAsC</CompileAs>
+      <WarningLevel>TurnOffAllWarnings</WarningLevel>
+      <EnableEnhancedInstructionSet>AdvancedVectorExtensions512</EnableEnhancedInstructionSet>
+    </ClCompile>
+    <ClCompile Include="src\third_party\miniz\miniz.c">
+      <CompileAs>CompileAsC</CompileAs>
+      <WarningLevel>TurnOffAllWarnings</WarningLevel>
+    </ClCompile>
+    <ClCompile Include="src\third_party\miniz\miniz_tdef.c">
+      <CompileAs>CompileAsC</CompileAs>
+      <WarningLevel>TurnOffAllWarnings</WarningLevel>
+    </ClCompile>
+    <ClCompile Include="src\third_party\miniz\miniz_tinfl.c">
+      <CompileAs>CompileAsC</CompileAs>
+      <WarningLevel>TurnOffAllWarnings</WarningLevel>
+    </ClCompile>
+    <ClCompile Include="src\third_party\miniz\miniz_zip.c">
+      <CompileAs>CompileAsC</CompileAs>
+      <WarningLevel>TurnOffAllWarnings</WarningLevel>
+    </ClCompile>
+    <ClCompile Include="src\third_party\zstd\lib\common\*.c">
+      <CompileAs>CompileAsC</CompileAs>
+      <WarningLevel>TurnOffAllWarnings</WarningLevel>
+      <PreprocessorDefinitions>ZSTD_DISABLE_ASM;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+    <ClCompile Include="src\third_party\zstd\lib\decompress\*.c">
+      <CompileAs>CompileAsC</CompileAs>
+      <WarningLevel>TurnOffAllWarnings</WarningLevel>
+      <PreprocessorDefinitions>ZSTD_DISABLE_ASM;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+    <ClCompile Include="src\third_party\lzma-sdk\CpuArch.c">
+      <CompileAs>CompileAsC</CompileAs>
+      <WarningLevel>TurnOffAllWarnings</WarningLevel>
+      <PreprocessorDefinitions>Z7_ST;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+    <ClCompile Include="src\third_party\lzma-sdk\LzmaDec.c">
+      <CompileAs>CompileAsC</CompileAs>
+      <WarningLevel>TurnOffAllWarnings</WarningLevel>
+      <PreprocessorDefinitions>Z7_ST;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+    <ClCompile Include="src\third_party\lzma-sdk\Lzma2Dec.c">
+      <CompileAs>CompileAsC</CompileAs>
+      <WarningLevel>TurnOffAllWarnings</WarningLevel>
+      <PreprocessorDefinitions>Z7_ST;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+    <ClCompile Include="src\third_party\minizip-ng\mz_crypt.c">
+      <PreprocessorDefinitions>MZ_ZIP_NO_CRYPTO;_CRT_SECURE_NO_DEPRECATE;_CRT_NONSTDC_NO_DEPRECATE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <DisableSpecificWarnings>4100;4244;4267;4706;%(DisableSpecificWarnings)</DisableSpecificWarnings>
+    </ClCompile>
+    <ClCompile Include="src\third_party\minizip-ng\mz_os.c">
+      <WarningLevel>TurnOffAllWarnings</WarningLevel>
+      <PreprocessorDefinitions>MZ_ZIP_NO_CRYPTO;_CRT_SECURE_NO_DEPRECATE;_CRT_NONSTDC_NO_DEPRECATE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+    <ClCompile Include="src\third_party\minizip-ng\mz_os_win32.c">
+      <WarningLevel>TurnOffAllWarnings</WarningLevel>
+      <PreprocessorDefinitions>MZ_ZIP_NO_CRYPTO;_CRT_SECURE_NO_DEPRECATE;_CRT_NONSTDC_NO_DEPRECATE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+    <ClCompile Include="src\third_party\minizip-ng\mz_strm.c">
+      <WarningLevel>TurnOffAllWarnings</WarningLevel>
+      <PreprocessorDefinitions>MZ_ZIP_NO_CRYPTO;_CRT_SECURE_NO_DEPRECATE;_CRT_NONSTDC_NO_DEPRECATE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+    <ClCompile Include="src\third_party\minizip-ng\mz_strm_buf.c">
+      <WarningLevel>TurnOffAllWarnings</WarningLevel>
+      <PreprocessorDefinitions>MZ_ZIP_NO_CRYPTO;_CRT_SECURE_NO_DEPRECATE;_CRT_NONSTDC_NO_DEPRECATE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+    <ClCompile Include="src\third_party\minizip-ng\mz_strm_mem.c">
+      <WarningLevel>TurnOffAllWarnings</WarningLevel>
+      <PreprocessorDefinitions>MZ_ZIP_NO_CRYPTO;_CRT_SECURE_NO_DEPRECATE;_CRT_NONSTDC_NO_DEPRECATE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+    <ClCompile Include="src\third_party\minizip-ng\mz_strm_os_win32.c">
+      <WarningLevel>TurnOffAllWarnings</WarningLevel>
+      <PreprocessorDefinitions>MZ_ZIP_NO_CRYPTO;_CRT_SECURE_NO_DEPRECATE;_CRT_NONSTDC_NO_DEPRECATE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+    <ClCompile Include="src\third_party\minizip-ng\mz_strm_split.c">
+      <WarningLevel>TurnOffAllWarnings</WarningLevel>
+      <PreprocessorDefinitions>MZ_ZIP_NO_CRYPTO;_CRT_SECURE_NO_DEPRECATE;_CRT_NONSTDC_NO_DEPRECATE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+    <ClCompile Include="src\third_party\minizip-ng\mz_zip.c">
+      <WarningLevel>TurnOffAllWarnings</WarningLevel>
+      <PreprocessorDefinitions>MZ_ZIP_NO_CRYPTO;_CRT_SECURE_NO_DEPRECATE;_CRT_NONSTDC_NO_DEPRECATE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+    <ClCompile Include="src\third_party\minizip-ng\mz_zip_rw.c">
+      <WarningLevel>TurnOffAllWarnings</WarningLevel>
+      <PreprocessorDefinitions>MZ_ZIP_NO_CRYPTO;_CRT_SECURE_NO_DEPRECATE;_CRT_NONSTDC_NO_DEPRECATE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+    <ClCompile Include="src\third_party\monocypher\monocypher.c">
+      <CompileAs>CompileAsC</CompileAs>
+      <WarningLevel>TurnOffAllWarnings</WarningLevel>
+    </ClCompile>
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <ImportGroup Label="ExtensionTargets" />
+</Project>

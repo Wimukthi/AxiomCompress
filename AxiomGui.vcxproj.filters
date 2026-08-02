@@ -67,6 +67,8 @@
     <ClCompile Include="src\gui\about_dialog.cpp"><Filter>Source Files</Filter></ClCompile>
     <ClCompile Include="src\gui\update_checker.cpp"><Filter>Source Files</Filter></ClCompile>
     <ClCompile Include="src\sfx\runtime.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="src\sfx\sfx_host.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="src\gui\license_dialog.cpp"><Filter>Source Files</Filter></ClCompile>
     <ClCompile Include="src\sfx\module_file.cpp"><Filter>Source Files</Filter></ClCompile>
   </ItemGroup>
   <ItemGroup>
@@ -116,6 +118,8 @@
     <ClInclude Include="src\gui\update_checker.hpp"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="src\gui\resource.hpp"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="src\sfx\runtime.hpp"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="src\sfx\sfx_host.hpp"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="src\gui\license_dialog.hpp"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="src\sfx\module_file.hpp"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="src\sfx\resource.hpp"><Filter>Header Files</Filter></ClInclude>
   </ItemGroup>

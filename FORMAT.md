@@ -9,8 +9,13 @@ in the archive file unless stated otherwise.
 Documented limits and validation rules are **part of the format**. Rejecting
 malformed data is intended behavior, not an implementation detail.
 
-> **Status: pre-release.** The format is free to change. The AXAR container is
-> version `4`; see [Compatibility](#compatibility).
+> **Compatibility baseline.** AXAR v4 remains readable indefinitely. AXAR v5 is
+> an additive container revision for required fidelity metadata, encryption-v2,
+> and snapshot repositories; readers reject
+> required features they do not understand instead of silently losing them. The
+> append-generation record described below is an additive v4/v5 extension and
+> does not change the header version. The current v4 and v5 golden fixtures live
+> under `tests/fixtures/`.
 
 ## Contents
 
@@ -19,6 +24,7 @@ malformed data is intended behavior, not an implementation detail.
 - [Solid blocks](#solid-blocks)
 - [Embedded AXC streams](#embedded-axc-streams)
 - [Central directory](#central-directory)
+- [Append generations](#append-generations)
 - [Encryption](#encryption)
 - [Recovery service](#recovery-service)
 - [Split and recovery volumes](#split-and-recovery-volumes)
@@ -39,6 +45,8 @@ malformed data is intended behavior, not an implementation detail.
 +--------------------+
 | Central directory  |  block table + file/directory entries + archive TLV
 +--------------------+
+| Generation record  |  optional 64-byte append-history extension
++--------------------+
 | Recovery service   |  optional Reed-Solomon parity + locator
 +--------------------+
 | Footer (24 bytes)  |
@@ -47,7 +55,8 @@ malformed data is intended behavior, not an implementation detail.
 
 In plain terms: the header identifies the file, solid blocks hold the
 compressed bytes, the central directory says which files exist and where their
-bytes live, optional recovery data protects against damage, and the footer
+bytes live, an optional generation record links an appended update to its
+previous footer, optional recovery data protects against damage, and the footer
 points back to the directory.
 
 ### Design goals
@@ -67,8 +76,8 @@ points back to the directory.
 | Field | Type | Notes |
 |---|---|---|
 | `magic` | `u8[8]` | `"AXIOMAR\0"` |
-| `version` | `u16` | Format version, currently `4` |
-| `flags` | `u16` | Required-feature flags. Bit `0x0001` = encrypted directory, which means a plaintext encryption preamble follows the header. A reader must reject any bit it does not understand |
+| `version` | `u16` | `4` for the baseline container, `5` when v5 fidelity metadata or encryption-v2 is present |
+| `flags` | `u16` | Required-feature flags. Bit `0x0001` = encrypted directory, `0x0002` = sparse entry maps, `0x0004` = source-capture warning report, `0x0008` = extended metadata (ACL/xattr/reparse payloads), `0x0010` = encryption-v2 password slots, `0x0020` = snapshot chunk table and manifest. A reader must reject any bit it does not understand |
 | `reserved` | `u32` | Must be `0` |
 
 ## Solid blocks
@@ -90,6 +99,13 @@ and checksum.
 Before building solid blocks, writers group regular files by broad type and
 then by extension. This improves cross-file matching without changing AXAR
 directory semantics. Directories and links retain their scan order.
+
+During an add/update/fresh/sync operation, a regular file whose size, CRC-32,
+and BLAKE3 digest match an existing stored file may reuse that file's data
+range. Repack performs the same coalescing for duplicate entries while it
+rewrites blocks. This is represented entirely by ordinary directory addresses;
+it does not add a flag or require a new AXAR version. If the source cannot be
+hashed reliably, the writer uses the normal new-block path.
 
 ## Embedded AXC streams
 
@@ -232,6 +248,10 @@ Archive-wide service data. Unknown types are skipped by length.
 | 2 | lock | None — its presence marks the archive read-only |
 | 3 | encryption | KDF params + salt + key-check token (see [Encryption](#encryption)) |
 | 4 | signature | Signer public key (32 bytes) + Monocypher EdDSA signature (64 bytes) |
+| 5 | capture_report | `vint warning_count`, followed by `vint path_len`, UTF-8 path, `vint message_len`, UTF-8 message for each incomplete source capture |
+| 6 | encryption_v2 | Key identifier plus one or more password slots (see [Encryption](#encryption)) |
+| 7 | chunk_table | Snapshot chunk-table version, keyed-ID flag, and chunk records: logical size, CRC-32, BLAKE3 identity, block index, and block offset |
+| 8 | snapshot_manifest | Snapshot manifest version and bounded named snapshot records. Each record contains generation, creation time, and length-prefixed snapshot entry bodies |
 
 Recovery data is deliberately **outside** this TLV, so repair can locate it
 even when the protected directory itself is damaged.
@@ -243,8 +263,37 @@ even when the protected directory itself is damaged.
 | `compressed_offset` | vint | Absolute offset of the block's `.axc` |
 | `compressed_size` | vint | Byte length of the block's `.axc` |
 | `uncompressed_size` | vint | Bytes the block expands to |
-| `extra_len` | vint | Length of a reserved block extra area (`0` today) |
-| `extra` | `u8[]` | `extra_len` bytes, skipped if unknown |
+| `extra_len` | vint | Length of the optional block extra area |
+| `extra` | `u8[]` | Block-level TLV records; skipped by readers that do not use them |
+
+The current optional block extra profile is type `1`, **subframe map**. It is
+not a new AXAR version or required header flag, and writers omit it when a
+block is encrypted, transformed, or has no independently decodable frames.
+Its payload is:
+
+```text
+vint     map_version             1
+vint     frame_count
+frame_count × {
+  vint   uncompressed_offset     relative to the start of this solid block
+  vint   uncompressed_size
+  vint   compressed_offset       relative to the start of the AXC block
+  vint   compressed_size         complete independently decodable frame
+  vint   kind                    1 = stored, 2 = parallel AXC block, 3 = AXEC chunk
+  vint   codec                   inner parallel codec, or outer AXC codec
+  vint   lzma_property           LZMA2 property for kind 3; otherwise zero
+}
+```
+
+The map ranges are sorted, non-empty, and cover the complete uncompressed
+solid block without gaps. Compressed ranges are bounded and non-overlapping.
+For a stored AXC block there is one range; for the parallel-block and external
+codec envelopes each range points at the complete frame/chunk header as well as
+its payload. AXAR readers may use these ranges to decode only the frames that
+intersect a selected file. The public `ArchiveEntry::subframes` view converts
+them to entry-relative ranges and absolute archive offsets for inspection.
+Unknown block-extra TLVs remain length-delimited and are skipped, preserving
+the old directory parser contract.
 
 ### EntryRec
 
@@ -283,24 +332,133 @@ u8[]     payload
 | 5 | win_times | Windows creation/access/write times, 100 ns FILETIME ticks since 1601 UTC (3 × `u64` LE); full precision, supersedes `mtime` on restore |
 | 6 | ads_stream | One NTFS named alternate data stream: `vint name_len`, the UTF-8 stream name, then the stream bytes (rest of the record). A file may carry several; each ≤ 1 MiB — larger streams are skipped at capture time |
 | 7 | posix | POSIX mode, uid, and gid (3 × `u32` LE); ignored on Windows |
+| 8 | sparse_map | Map version `vint 1`, then `vint extent_count`, followed by ordered `vint offset`, `vint length` allocated ranges. The complement of these ranges is logically zero-filled and is recreated as holes when supported |
+
+| 9 | security_descriptor | Bounded self-relative Windows security descriptor; maximum 64 KiB |
+| 10 | xattr | `vint name_len`, UTF-8 attribute name, then raw value; maximum 1 MiB per value and 128 values per entry |
+| 11 | reparse | `vint tag`, `vint data_len`, and the bounded opaque Windows reparse buffer; restored only after content writes |
+| 12 | chunk_refs | Snapshot-only: `vint profile_version 1`, `vint reference_count`, then chunk-table indices |
 
 Readers consume the records they understand and **skip the rest by
 `payload_len`**. A file's bytes are recovered by reading `size` bytes starting
 at (`first_block`, `offset`), continuing into consecutive blocks using each
 block's `uncompressed_size` when the file straddles a boundary.
+Multiple file entries may intentionally contain the same (`first_block`,
+`offset`) pair. Readers must treat data ranges as shareable rather than
+assuming that every entry owns a unique range.
+
+### Snapshot repositories and chunk deduplication
+
+The snapshot profile sets required header flag `0x0020` and writes AXAR v5.
+Instead of giving each snapshot file a single solid-block address, the archive
+stores a content-defined sequence of independently addressable chunks. The
+default boundaries target 256 KiB minimum, 1 MiB average, and 4 MiB maximum;
+the exact geometry is writer policy and is recorded only through the resulting
+chunk references. Each distinct chunk is compressed once and the current entry
+stores an ordered list of chunk-table indices. A changed file therefore reuses
+unchanged chunks from earlier snapshots while only new chunks are appended.
+
+Archive extra type 7 is the chunk table. Each record contains the logical chunk
+size, CRC-32, a 32-byte BLAKE3 identity, and the block/offset containing the
+chunk bytes. With keyed identifiers enabled, the BLAKE3 identity is keyed by
+the archive data key; the key is never stored in the identifier. Keyed IDs are
+the default for encrypted snapshot repositories, while `--plain-chunks` may be
+used when equality across encrypted repositories is an intentional requirement.
+Every extracted chunk is checked against both its CRC and identity before it is
+returned to the file stream.
+
+Archive extra type 8 is the snapshot manifest. It stores a bounded unique name,
+generation number, creation time, and a complete entry catalogue for each
+snapshot. Manifest entry bodies use the same path, content, sparse, link, and
+metadata semantics as the live directory, plus entry extra type 12. The live
+directory is the newest snapshot, so ordinary listing, testing, and extraction
+remain correct without selecting a historical snapshot.
+
+Snapshot creation and addition are append-compatible. `prune` removes selected
+historical manifests but never the current one; `repack` marks chunks reachable
+from the current and retained manifests, copies only their blocks, remaps all
+references, and thereby performs snapshot garbage collection. Content mutation
+through ordinary add/update/fresh/sync/delete/move operations is rejected so a
+legacy operation cannot silently discard snapshot history. Metadata-only
+operations such as comments, locking, password-slot changes, and signing keep
+the chunk table and manifests intact.
+
+### Sparse-file allocation maps
+
+AXAR always stores the complete logical byte stream, including zero bytes in
+holes. When the source filesystem exposes reliable allocated ranges, the writer
+adds entry extra type 8 and upgrades the header to v5. This keeps compression,
+hashing, and old v4 directory addressing straightforward while allowing a
+restore to recover the source file's physical allocation pattern.
+
+The extent list is sorted, non-overlapping, non-empty, and bounded by the
+entry's logical `size`. An empty list is valid and represents a file whose
+entire logical range is a hole. If a sparse candidate cannot be queried, the
+writer archives the bytes densely, records the reason in archive extra type 5,
+and reports it through the operation warning channel. Strict metadata mode turns
+that warning into a failed operation. Extraction similarly reports an inability
+  to punch holes unless strict metadata mode is enabled.
+
+## Append generations
+
+An archive update can append a new generation without copying the previous block
+region. The previous complete archive remains byte-for-byte at the start of the
+file, including its directory, optional recovery data, and legacy footer. The
+new generation appends any new solid blocks, a new directory, this extension,
+optional recovery data, and a new legacy footer. Replaced data is therefore
+retained as dead space until `repack` or another compacting rewrite.
+
+The original v4/v5 layout without this record is the legacy starting generation.
+The first appended generation is numbered `1`; later generations increment that
+number. The fixed extension is immediately after the current directory and is
+always exactly 64 bytes:
+
+| Field | Type | Notes |
+|---|---|---|
+| `magic` | `u8[8]` | `"AXIOMGF\0"` |
+| `version` | `u16` | Generation-extension version, currently `1` |
+| `flags` | `u16` | Must be `0` |
+| `size` | `u32` | Must be `64` |
+| `generation` | `u64` | Non-zero monotonically increasing generation number |
+| `previous_footer_offset` | `u64` | Absolute offset of the previous generation's 24-byte footer |
+| `previous_directory_offset` | `u64` | Directory offset copied from that previous footer |
+| `previous_directory_size` | `u64` | Directory size copied from that previous footer |
+| `previous_generation_offset` | `u64` | Previous generation extension offset, or `0` for the legacy starting layout |
+| `reserved` | `u64` | Must be `0` |
+
+The generation record is part of the protected range when recovery data is
+present: `[0, directory_offset + directory_size + 64)`. The final footer keeps
+the legacy 24-byte shape, so a reader that understands AXAR v4/v5 can still
+locate the current directory in an intact appended archive. A generation-aware
+reader additionally scans backward for the newest valid footer when a write was
+interrupted after the previous footer; an incomplete or invalid newer extension
+is ignored and the previous complete generation is opened.
+
+Signatures include the canonical generation fields and the current directory
+semantics. A signature mutation appends a new generation; ordinary edits clear
+the old signature before writing the replacement directory. Direct append is
+used when header features remain compatible. Header-changing operations,
+compaction, deletion, and other paths that need a complete rebuild retain the
+atomic temporary-file replacement path.
 
 ## Encryption
 
-When an archive is created with a password, every solid block is encrypted and
-the `encryption` archive-extra record records how to derive the key.
+When an archive is created with a password, every solid block is encrypted. AXAR
+has two encryption profiles: legacy v1, retained for AXAR v4 compatibility, and
+encryption-v2, used for new password archives. Readers must support both.
 
-At a glance:
+### Common block encryption
 
 - The password is never stored.
-- Argon2id derives one archive key from the password and a per-archive salt.
-- Each compressed solid block is sealed independently.
-- Block-only encryption leaves the central directory readable.
-- `--encrypt-names` also seals the directory, so listing needs the password.
+- Each compressed solid block is sealed independently with XChaCha20-Poly1305.
+- A block's index is the AEAD associated data, preventing block reordering or
+  cross-archive transplant.
+- Block-only encryption leaves the central directory readable. `--encrypt-names`
+  also seals the directory, so listing needs a password.
+
+### Legacy encryption v1 (AXAR v4)
+
+Legacy encrypted archives store archive-extra type `3`:
 
 ```text
 vint     kdf_algorithm     2 = Argon2id
@@ -313,42 +471,103 @@ vint     check_len
 u8[]     key_check         a fixed plaintext sealed under the key (salt as AD)
 ```
 
-**Key.** `Argon2id(password, salt, params)` → 32 bytes, derived once per
-archive.
+`Argon2id(password, salt, params)` derives the 32-byte archive key. The same
+key seals the solid blocks and, when requested, the directory. The `key_check`
+value is a known plaintext sealed under that key; readers authenticate it
+before reading block data, so a wrong password is rejected early.
 
-**Blocks.** Each block's compressed `.axc` bytes are sealed with
-XChaCha20-Poly1305 (Monocypher). The stored block is
-`nonce(24) ‖ tag(16) ‖ ciphertext`, and the block's index (8-byte LE) is the
-AEAD associated data — so a block is valid only at its own position, with no
-reordering or cross-archive transplant. `compressed_size` covers the whole
-sealed blob; `uncompressed_size` is the plaintext block size as before.
+### Encryption-v2 password slots (AXAR v5)
 
-**Wrong-password check.** `key_check` is a known constant sealed under the key.
-A reader re-derives the key and opens it first, rejecting a wrong password
-before any block is read.
+New password archives use header flag `0x0010` and archive-extra type `6` when
+the directory is public. The type-6 payload is:
 
-**Editing.** Block-only encrypted archives can be edited with the password:
-`add`/`update`/`sync` copy existing sealed blocks verbatim and seal new ones
-under the same key, while `delete`/`repack` decrypt the survivors and re-seal
-them. A wrong password is rejected via the key-check before anything is
-written.
+```text
+u8[8]  magic                 "AXIOME2\\0"
+u16    profile_version       2
+u16    options               0 (no optional options are currently allowed)
+u8[16] key_id                random archive key identifier
+vint   slot_count            1..16
 
-**Encrypted directory.** With `--encrypt-names`, the whole central directory is
-additionally sealed, hiding names, sizes, and hashes. Header `flags` bit
-`0x0001` is set, and the KDF parameters move to a **plaintext preamble**
-immediately after the 16-byte header — a `u32` length, then the vint-encoded
-KDF params, salt, and key_check — because they must be read before the sealed
-directory can be opened. The directory blob at `directory_offset` is then
-`nonce ‖ tag ‖ ciphertext` with a fixed `"AXDIR"` associated-data tag, and it
-carries no `encryption` archive-extra. Editing a directory-encrypted archive is
-not supported.
+repeat slot_count times:
+  u32   slot_id
+  vint  kdf_algorithm
+  vint  mem_blocks
+  vint  passes
+  vint  lanes
+  vint  salt_len             16
+  u8[]  salt
+  vint  wrapped_key_len      72
+  u8[]  wrapped_key
+```
+
+The writer generates a random 32-byte archive data key. Each password slot
+derives its own Argon2 key from its own salt, then wraps that same data key with
+XChaCha20-Poly1305. The key identifier and slot identifier are authenticated
+associated data. Any slot password can therefore unlock the same archive, while
+changing a password only replaces that slot's wrapper.
+
+For an encrypted directory, the same payload is stored in a plaintext preamble
+immediately after the 16-byte header: a little-endian `u32` payload length
+followed by the type-6 payload. The directory is then sealed as
+`nonce(24) ‖ tag(16) ‖ ciphertext` with the fixed directory associated-data
+tag. In this form there is no type-6 directory record because the directory is
+not readable until after the preamble has been processed. Header flags `0x0001`
+and `0x0010` are both set.
+
+**Blocks.** Each block's compressed `.axc` bytes is sealed under the random
+archive data key. `compressed_size` covers the complete
+`nonce(24) ‖ tag(16) ‖ ciphertext` blob, and `uncompressed_size` remains the
+plaintext block size.
+
+**Wrong-password check.** A reader tries the bounded slot list and accepts a
+password only when one wrapped data key authenticates. Corrupt slot metadata,
+duplicate slot IDs, unsupported options, and implausible KDF costs are rejected
+before expensive key derivation or archive writes.
+
+**Password management.** The CLI exposes three slot operations:
+
+```powershell
+axiomc password-add -p "current password" archive.axar "new password"
+axiomc password-change -p "current password" archive.axar "replacement password"
+axiomc password-remove -p "current password" archive.axar "password to remove"
+```
+
+`password-add` appends a slot, `password-change` replaces the slot identified
+by the current password, and `password-remove` removes the slot identified by
+the final password. The last remaining slot cannot be removed. A password
+mutation authenticates the current password first, then rewrites only the
+encryption metadata and directory. Existing compressed/encrypted block bytes
+are copied verbatim; they are not decompressed, recompressed, or re-encrypted.
+For an encrypted directory, its preamble and directory are rewritten and block
+offsets may move, but the stored block payloads remain unchanged.
+
+Mutating a legacy v1 encrypted archive migrates its encryption metadata to the
+v2 profile while preserving the existing data key and block bytes. The archive
+then uses AXAR v5 and can have multiple password slots. Existing v4 encrypted
+archives remain readable without migration.
+
+Password mutations remove an existing archive signature because the signed
+password metadata changes; re-sign the archive after the operation. Any
+existing recovery service is rebuilt against the new header/directory layout.
+
+### Encrypted directory
+
+With `--encrypt-names`, the whole central directory is sealed, hiding names,
+sizes, and hashes. The v2 preamble is public because it contains only salts, KDF
+costs, slot identifiers, and wrapped keys; it does not contain the password or
+plaintext archive key. Both legacy v1 and v2 encrypted-directory archives can
+be listed, tested, extracted, edited, signed, and verified when the correct
+password is supplied.
 
 ## Recovery service
 
 An archive created with `--recovery N`, or updated with `axiomc recovery`,
-places a systematic Reed-Solomon service after the central directory. The
-protected range is `[0, directory_offset + directory_size)`: header, optional
-encryption preamble, all stored solid blocks, and the complete directory.
+places a systematic Reed-Solomon service after the central directory. For a
+legacy layout the protected range is `[0, directory_offset + directory_size)`.
+For an appended generation it is
+`[0, directory_offset + directory_size + 64)`, including the generation
+extension: header, optional encryption preamble, all stored solid blocks, the
+complete directory, and the generation history.
 
 | Field | Type | Notes |
 |---|---|---|
@@ -409,7 +628,9 @@ modification and for recovery from missing or corrupt data parts.
 
 ## Footer
 
-24 bytes at end of file.
+The legacy footer is 24 bytes at the end of each complete generation (and at the
+end of an intact archive). It remains the final fixed record even when a
+generation extension or recovery service precedes it.
 
 | Field | Type | Notes |
 |---|---|---|
@@ -419,6 +640,10 @@ modification and for recovery from missing or corrupt data parts.
 
 A reader opens the file, reads the trailing 24 bytes, validates the magic, then
 seeks to `directory_offset` — no scanning of the blocks.
+
+Generation-aware readers additionally scan backward for the newest valid footer
+if the physical tail is longer than a complete generation because an append was
+interrupted. The older footer remains usable as the crash fallback.
 
 ## Resource limits
 
@@ -434,6 +659,13 @@ declared size. The decoder defends before allocating:
   and confirms the result matches afterwards.
 - Pre-reservations are capped, so a malformed count or size cannot force a huge
   allocation even transiently.
+- A subframe map is limited to `2^20` frames per solid block; every mapped
+  range is checked for monotonic, bounded geometry before it can drive a read.
+- A sparse map is limited to `2^20` extents per entry; capture-report records are
+  limited to `2^16` warnings, with each path and message limited to `2^20` bytes.
+- Encryption-v2 accepts at most `16` password slots. Passwords are limited to
+  `2^20` bytes; each slot's Argon2 memory cost is `8 * lanes` through `2^21`
+  1 KiB blocks and its pass count is `1..64`.
 
 ### Size ceilings
 
@@ -451,16 +683,30 @@ The format is **pre-release and free to change**.
 
 | Layer | Written | Accepted |
 |---|---|---|
-| AXAR container | `4` | `4` |
+| AXAR container | `4` or `5` | `4` and `5` |
 | AXC, native Axiom method | `9` | `4`–`10` |
 | AXC, external codec methods | `10` | `4`–`10` |
+| Append-generation extension | `1` | `1` |
 | Recovery service | `1` | `1` |
 | Volume header | `1` | `1` |
 
 Older readers reject AXC `9` and `10`, so archives written with an external
-method require Axiom 0.7.0.0 or newer. Unknown AXAR versions, AXC versions,
-required flags, codecs, transforms, and transform parameters are all rejected
-with a clear error.
+method require Axiom 0.7.0.0 or newer. Existing AXAR v4 archives remain
+readable. An archive with encryption-v2, sparse maps, a capture report, or a
+snapshot chunk table is AXAR v5 and requires
+a reader that understands the corresponding required flags; a v4 reader must
+reject it rather than silently restoring a dense file or hiding a capture loss.
+An archive with extended ACL, xattr, or reparse metadata also uses AXAR v5 and
+requires the `0x0008` required flag.
+Snapshot repositories additionally require the `0x0020` flag. Readers that do
+not implement the snapshot profile must reject the archive rather than treating
+chunk references as ordinary contiguous block addresses.
+An appended generation does not change the AXAR header version. Readers that do
+not understand its 64-byte extension can still read the current directory from
+the final legacy footer of an intact archive, but generation history and the
+generation-aware crash fallback are unavailable to them.
+Unknown AXAR versions, AXC versions, required flags, codecs, transforms, and
+transform parameters are all rejected with a clear error.
 
 The `version` field and the reserved `flags` bitfield exist so that, once the
 format stabilizes, an incompatible structural change can bump `version` while
@@ -486,11 +732,22 @@ older archives and reject only the flags they genuinely cannot interpret.
 - **Solid compression** with per-block and per-file CRC-32, random-access
   listing, selective file and directory extraction, atomic writes,
   `--overwrite fail|skip|all`, mtime restore, and threaded encode/decode.
+- **Seekable selected extraction** — new plaintext AXAR blocks may carry a
+  skippable subframe map. Selected restores fetch and decode only intersecting
+  independent frames; legacy, encrypted, transformed, and serial blocks use
+  the ordinary whole-block path. The operation telemetry exposes physical
+  archive bytes read, including directory reads.
+- **Sparse-file fidelity** — logical bytes remain fully checksummed while
+  supported files preserve their allocated ranges on extraction. The archive
+  exposes an explicit capture report for skipped/unavailable source metadata;
+  strict metadata mode is available to callers that require lossless capture.
 - **Add and update** into an existing archive: existing files are not
-  recompressed — their solid blocks are copied verbatim, new files are appended
-  as new blocks, and the directory is rebuilt. An added path replaces the
-  existing entry of the same name, and the replaced bytes become dead space
-  until a repack.
+  recompressed — their solid blocks are copied verbatim, exact content matches
+  reuse existing ranges, new files are appended as new blocks when needed, and
+  the directory is rebuilt. When the header feature set remains compatible, the
+  completed directory is appended as a new generation while the previous footer
+  remains available for crash fallback. An added path replaces the existing
+  entry of the same name, and replaced bytes become dead space until a repack.
 - **File-manager operations:** map a filesystem file or directory to an
   explicit archive destination, extract selected entries (a selected directory
   includes its subtree), and rename or move files and whole subtrees without
@@ -500,8 +757,8 @@ older archives and reject only the flags they genuinely cannot interpret.
 - **Update / fresh / sync** — refresh by modification time.
 - **Delete / repack** — rebuild keeping only surviving entries, re-solidifying
   their files into fresh blocks so removed and replaced data is physically
-  reclaimed. A directory path removes its whole subtree; a hard link whose
-  target is removed is dropped.
+  reclaimed while duplicate content shares one range. A directory path removes
+  its whole subtree; a hard link whose target is removed is dropped.
 - **Comment and lock** — a free-form UTF-8 comment and a one-way read-only
   flag. Both live in the archive-level TLV and survive edits; reads ignore the
   lock.
@@ -512,26 +769,47 @@ older archives and reject only the flags they genuinely cannot interpret.
   semantics. `test` rejects an invalid signature, and any edit removes the
   stale signature. This primitive is **not** wire-compatible with standard
   SHA-512 Ed25519.
-- **SFX packaging** — an intact `.axar` or `.zip` is appended to Axiom's
-  read-only SFX PE image, followed by `"AXIOMSFX"` and a `u64` payload length.
-  The image ships as the non-executable `AxiomSfx.bin` and is read only during
-  SFX creation. This wrapper does not change either archive format.
+- **SFX packaging** — a 64-byte descriptor and an intact `.axar` or `.zip` are
+  written at the end of Axiom's read-only SFX PE image. The descriptor begins
+  with `"AXSFX2\0\0"` and carries a format version, payload offset and length,
+  the first eight bytes of the payload's BLAKE3-256, and a CRC-32 over itself.
+  It sits at the end of the *image*, computed from the PE section table, rather
+  than at the end of the *file*, so an Authenticode certificate can be appended
+  afterwards without displacing it — and, because Authenticode covers trailing
+  data, signing a packaged SFX authenticates the payload as well as the stub.
+  Readers fall back to the pre-0.8.0.0 layout, an `"AXIOMSFX"` magic and `u64`
+  length in the last 16 bytes, so existing executables keep working. The image
+  ships as the non-executable `AxiomSfx.bin` and is read only during SFX
+  creation. This wrapper does not change either archive format.
 - **Recovery records** and **split/recovery volumes**, as specified above.
+- **Sequential AXAR v5 output** to a non-seekable stream. The writer reserves
+  the known required-feature flags up front and emits a counted directory/footer
+  without seeking; recovery records and streaming-time signatures are not part
+  of this profile.
 
 ### Metadata
 
 mtime in seconds, plus on Windows the file attributes, full-precision
 creation/access/write times, and **NTFS alternate data streams** (named streams
 ≤ 1 MiB each; larger ones are skipped). POSIX mode, uid, and gid are stored and
-restored best-effort on POSIX hosts; ownership requires privilege.
+restored best-effort on POSIX hosts; ownership requires privilege. Sparse
+allocation maps and incomplete-capture warnings are v5 metadata, and can be
+queried through the library's archive capture-report API.
+
+Windows self-relative security descriptors, POSIX extended attributes, and
+non-symlink reparse buffers are bounded v5 metadata. Reparse buffers are
+materialized only after all ordinary descendants have been written, and an
+unsupported or failed restore is reported (or fails in strict metadata mode).
 
 ### Not supported
 
 - **No special files** — devices, FIFOs, and sockets are skipped. Only regular
   files, directories, symlinks, and hard links are stored.
-- **No in-place append.** Editing rewrites the whole file via a temporary plus
-  atomic rename, and writing needs a seekable output because the directory and
-  footer are written last.
+- **No arbitrary in-place mutation.** Append-compatible updates retain prior
+  generations and append a new directory, but compaction, deletion, header
+  changes, and other rebuilds still use a temporary plus atomic rename. Recovery
+  and signing are file-output services, not available on the non-seekable stream
+  profile.
 - **No editing of directory-encrypted archives.**
 
 ### Extraction safety
@@ -556,5 +834,3 @@ anywhere. The guarantee is that no archive entry is ever written *through* one.
 ## Planned
 
 - POSIX special-file records for devices, FIFOs, and sockets.
-- Append and update in place, plus a seekable streaming-write mode for
-  non-seekable outputs.

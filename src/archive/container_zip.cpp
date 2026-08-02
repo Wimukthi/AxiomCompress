@@ -112,20 +112,29 @@ void reject_split_zip_edit(const fs::path& path) {
 class ZipReader final {
 public:
     explicit ZipReader(const fs::path& path,
-                       const std::shared_ptr<OperationControl>& operation = nullptr)
-        : path_(zip_final_volume_path(path)) {
-        if (is_numbered_zip_volume(path) && path_ == path) {
+                       const std::shared_ptr<OperationControl>& operation = nullptr,
+                       const SfxZipPayloadRange& payload_range = std::nullopt)
+        : path_(payload_range ? path : zip_final_volume_path(path)) {
+        if (payload_range) {
+            const auto [offset, size] = *payload_range;
+            const auto file_size = checked_file_size(path_);
+            if (offset > file_size || size > file_size - offset) {
+                throw FormatError("embedded ZIP payload is outside the executable");
+            }
+            payload_offset_ = offset;
+            size_ = size;
+        } else if (is_numbered_zip_volume(path) && path_ == path) {
             fs::path final = path;
             final.replace_extension(L".zip");
             throw FormatError("split ZIP is incomplete; final volume is missing: " +
                               core::path_to_utf8(final));
-        }
-        if (zip_is_multidisk(path_)) {
+        } else if (zip_is_multidisk(path_)) {
             split_reader_ = std::make_unique<SplitZipReader>(path_, operation);
             return;
+        } else {
+            size_ = checked_file_size(path_);
         }
         stream_.open(path_, std::ios::binary);
-        size_ = checked_file_size(path_);
         if (!stream_) {
             throw std::runtime_error("cannot open ZIP archive: " +
                                      core::path_to_utf8(path));
@@ -185,7 +194,17 @@ private:
         const auto to_read = static_cast<std::streamsize>(
             std::min<std::uint64_t>(remaining, count));
         self->stream_.clear();
-        self->stream_.seekg(static_cast<std::streamoff>(file_ofs), std::ios::beg);
+        // miniz addresses bytes relative to the ZIP, while an SFX reader maps
+        // those requests into the executable's absolute payload range.
+        const auto max_stream_offset =
+            static_cast<std::uint64_t>(std::numeric_limits<std::streamoff>::max());
+        if (file_ofs > max_stream_offset ||
+            self->payload_offset_ > max_stream_offset - file_ofs) {
+            return 0;
+        }
+        self->stream_.seekg(static_cast<std::streamoff>(
+                                self->payload_offset_ + file_ofs),
+                            std::ios::beg);
         if (!self->stream_) {
             return 0;
         }
@@ -196,6 +215,7 @@ private:
     fs::path path_;
     std::ifstream stream_;
     std::unique_ptr<SplitZipReader> split_reader_;
+    std::uint64_t payload_offset_ = 0;
     std::uint64_t size_ = 0;
     mz_zip_archive zip_{};
     bool open_ = false;
@@ -2584,12 +2604,15 @@ public:
         move_zip_entries(archive_path, moves, options);
     }
 
-private:
-    void extract_matching(const std::filesystem::path& archive_path,
-                          const std::vector<std::string>& wanted,
-                          const std::filesystem::path& dest_dir,
-                          const ExtractOptions& options) const {
-        ZipReader reader(archive_path, options.operation);
+public:
+    // This is static so the decode-only SFX library can reuse the hardened ZIP
+    // extraction path without constructing the full mutation provider.
+    static void extract_matching(const std::filesystem::path& archive_path,
+                                 const std::vector<std::string>& wanted,
+                                 const std::filesystem::path& dest_dir,
+                                 const ExtractOptions& options,
+                                 const SfxZipPayloadRange& payload_range = std::nullopt) {
+        ZipReader reader(archive_path, options.operation, payload_range);
         auto plans = read_zip_entry_plans(reader);
 
         std::vector<const ZipEntryPlan*> selected;
@@ -2750,6 +2773,125 @@ private:
 };
 
 }  // namespace
+
+ArchiveCapabilities sfx_zip_capabilities(
+    const std::filesystem::path& archive_path,
+    const std::string& password,
+    const SfxZipPayloadRange& payload_range) {
+    const bool multidisk = !payload_range &&
+                           (is_numbered_zip_volume(archive_path) ||
+                            zip_is_multidisk(archive_path));
+    try {
+        ZipReader reader(archive_path, nullptr, payload_range);
+        auto result = zip_capabilities_for_plans(
+            read_zip_entry_plans(reader), !password.empty());
+        if (multidisk) {
+            result.can_create_volumes = false;
+            result.is_multi_volume = true;
+            result.update = false;
+            result.delete_entries = false;
+            result.move_entries = false;
+        }
+        return result;
+    } catch (...) {
+        auto result = zip_capabilities_for_plans({}, !password.empty());
+        if (multidisk) {
+            result.can_create_volumes = false;
+            result.is_multi_volume = true;
+            result.update = false;
+            result.delete_entries = false;
+            result.move_entries = false;
+        }
+        return result;
+    }
+}
+
+std::vector<ArchiveEntry> sfx_zip_list(
+    const std::filesystem::path& archive_path,
+    const std::string& password,
+    const SfxZipPayloadRange& payload_range) {
+    (void)password;
+    ZipReader reader(archive_path, nullptr, payload_range);
+    auto plans = read_zip_entry_plans(reader);
+    std::vector<ArchiveEntry> result;
+    result.reserve(plans.size());
+    for (auto& plan : plans) {
+        result.push_back(std::move(plan.entry));
+    }
+    return result;
+}
+
+void sfx_zip_test(const std::filesystem::path& archive_path,
+                  const DecompressionOptions& options,
+                  const SfxZipPayloadRange& payload_range) {
+    ZipReader reader(archive_path, options.operation, payload_range);
+    auto plans = read_zip_entry_plans(reader);
+    const auto capabilities = zip_capabilities_for_plans(plans, !options.password.empty());
+    if (!capabilities.test) {
+        throw FormatError("ZIP archive uses encryption or compression methods not supported yet");
+    }
+
+    std::uint64_t total_bytes = 0;
+    std::uint64_t total_items = 0;
+    for (const auto& plan : plans) {
+        if (!plan.entry.is_directory) {
+            total_bytes += plan.entry.size;
+        }
+        ++total_items;
+    }
+    std::uint64_t completed_bytes = 0;
+    std::uint64_t completed_items = 0;
+    report_operation(options.operation, OperationStage::testing, completed_bytes,
+                     total_bytes, completed_items, total_items);
+
+    for (const auto& plan : plans) {
+        operation_checkpoint(options.operation);
+        if (plan.entry.is_directory) {
+            ++completed_items;
+            report_operation(options.operation, OperationStage::testing, completed_bytes,
+                             total_bytes, completed_items, total_items, plan.entry.path);
+            continue;
+        }
+
+        ZipExtractCallbackContext context;
+        context.stage = OperationStage::testing;
+        context.operation = options.operation;
+        context.completed_bytes = &completed_bytes;
+        context.total_bytes = total_bytes;
+        context.completed_items = completed_items;
+        context.total_items = total_items;
+        context.current_path = plan.entry.path;
+        context.current_file_total = plan.entry.size;
+        extract_zip_entry(reader, plan, options.password, context,
+                          "ZIP integrity test failed");
+        ++completed_items;
+        report_operation(options.operation, OperationStage::testing, completed_bytes,
+                         total_bytes, completed_items, total_items, plan.entry.path);
+    }
+}
+
+void sfx_zip_extract_all(const std::filesystem::path& archive_path,
+                         const std::filesystem::path& dest_dir,
+                         const ExtractOptions& options,
+                         const SfxZipPayloadRange& payload_range) {
+    ZipArchiveProvider::extract_matching(archive_path, {}, dest_dir, options,
+                                         payload_range);
+}
+
+void sfx_zip_extract_selected(const std::filesystem::path& archive_path,
+                              const std::vector<std::string>& entries,
+                              const std::filesystem::path& dest_dir,
+                              const ExtractOptions& options,
+                              const SfxZipPayloadRange& payload_range) {
+    std::vector<std::string> normalized;
+    normalized.reserve(entries.size());
+    for (auto entry : entries) {
+        normalized.push_back(normalize_archive_path(std::move(entry),
+                                                    "ZIP selected entry"));
+    }
+    ZipArchiveProvider::extract_matching(archive_path, normalized, dest_dir, options,
+                                         payload_range);
+}
 
 const ArchiveProvider& zip_archive_provider() {
     static const ZipArchiveProvider provider;

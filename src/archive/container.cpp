@@ -1,9 +1,13 @@
 #include "axiom/archive.hpp"
 
 #include "archive/container_internal.hpp"
+#include "archive/sfx_image.hpp"
+#include "codec/block.hpp"
+#include "codec/external_codecs.hpp"
 #include "codec/transform.hpp"
 #include "archive/fuzz_support.hpp"
 #include "core/checksum.hpp"
+#include "core/archive.hpp"
 #include "core/cpu.hpp"
 #include "core/crypto.hpp"
 #include "core/file_meta.hpp"
@@ -42,10 +46,15 @@
 #include <vector>
 
 namespace axiom {
+
+bool open_input_with_retry(std::ifstream& input, const std::filesystem::path& path,
+                           unsigned retries,
+                           const std::shared_ptr<OperationControl>& operation);
+
 namespace {
 
 int compression_type_class(const ScanItem& item) {
-    if (item.is_directory || item.is_symlink) return 0;
+    if (item.is_directory || item.is_symlink || item.is_reparse_point) return 0;
     const auto extension = lower_ascii(item.absolute.extension().wstring());
     static constexpr std::array<std::wstring_view, 17> text{
         L".txt", L".md", L".csv", L".tsv", L".json", L".xml", L".html",
@@ -88,16 +97,61 @@ std::vector<const ScanItem*> compression_order(const std::vector<ScanItem>& item
 namespace fs = std::filesystem;
 
 // kArchiveMagic lives in container_internal.hpp (container_formats.cpp sniffs it too).
-constexpr std::uint16_t kArchiveVersion = 4;
+constexpr std::uint16_t kArchiveVersion4 = 4;
+constexpr std::uint16_t kArchiveVersion5 = 5;
 constexpr std::size_t kHeaderSize = 16;
 // Header flag: the central directory is sealed and the encryption parameters live in
 // a plaintext preamble after the header (rather than in the directory's TLV). Old
 // readers reject this flag, so it doubles as the compatibility gate.
 constexpr std::uint16_t kFlagEncryptedDirectory = 0x0001;
+// AXAR v5 required-feature flags. They are deliberately explicit so a reader
+// can reject a v5 archive whose fidelity metadata it cannot safely apply.
+constexpr std::uint16_t kFlagSparseEntries = 0x0002;
+constexpr std::uint16_t kFlagCaptureReport = 0x0004;
+constexpr std::uint16_t kFlagExtendedMetadata = 0x0008;
+// AXAR v5 encryption profile: a random archive data key is wrapped by one or
+// more independently salted password slots. This is a required feature flag so
+// older readers cannot mistake the v2 preamble/TLV for legacy KDF metadata.
+constexpr std::uint16_t kFlagEncryptionV2 = 0x0010;
+// Snapshot repositories use non-contiguous chunk references in their entry
+// manifests. Older readers must reject this required feature instead of using
+// the legacy first_block/offset range as if all chunks were adjacent.
+constexpr std::uint16_t kFlagChunkTable = 0x0020;
+constexpr std::uint16_t kKnownArchiveFlags = kFlagEncryptedDirectory |
+                                               kFlagSparseEntries |
+                                               kFlagCaptureReport |
+                                               kFlagExtendedMetadata |
+                                               kFlagEncryptionV2 |
+                                               kFlagChunkTable;
+
+// Optional block-extra profile. Older AXAR readers already skip the reserved
+// block-extra byte range, so this remains additive and does not require a new
+// AXAR header version or feature flag.
+constexpr std::uint64_t kBlockExtraSubframeMap = 1;
+constexpr std::uint64_t kSubframeStore = 1;
+constexpr std::uint64_t kSubframeParallelBlock = 2;
+constexpr std::uint64_t kSubframeExternalChunk = 3;
+constexpr std::uint64_t kSubframeMapVersion = 1;
+constexpr std::uint64_t kMaxSubframesPerBlock = 1u << 20;
 // AEAD associated data tag for a sealed directory (distinct from any block index).
 constexpr std::array<std::uint8_t, 8> kDirectoryAd = {'A', 'X', 'D', 'I', 'R', 0, 0, 0};
+constexpr std::array<std::uint8_t, 8> kEncryptionV2Magic = {
+    'A', 'X', 'I', 'O', 'M', 'E', '2', 0};
+constexpr std::uint16_t kEncryptionV2Version = 2;
+constexpr std::size_t kEncryptionKeyIdSize = 16;
+constexpr std::uint64_t kMaxEncryptionSlots = 16;
+constexpr std::size_t kWrappedEncryptionKeySize =
+    sizeof(core::CryptoKey) + core::kAeadOverhead;
+constexpr std::array<std::uint8_t, 8> kEncryptionSlotAd = {
+    'A', 'X', 'I', 'O', 'M', '-', 'S', 'L'};
 constexpr std::size_t kFooterSize = 24;
-constexpr std::array<std::uint8_t, 8> kSfxMagic = {'A', 'X', 'I', 'O', 'M', 'S', 'F', 'X'};
+// Generation metadata deliberately precedes the optional recovery body and the
+// legacy 24-byte footer. Keeping the legacy footer as the final suffix means
+// existing v4/v5 readers still open the newest complete generation.
+constexpr std::size_t kGenerationExtensionSize = 64;
+constexpr std::array<std::uint8_t, 8> kGenerationMagic = {
+    'A', 'X', 'I', 'O', 'M', 'G', 'F', 0};
+constexpr std::uint16_t kGenerationVersion = 1;
 constexpr std::array<std::uint8_t, 8> kRecoveryMagic = {'A', 'X', 'I', 'O', 'M', 'R', 'R', 0};
 constexpr std::array<std::uint8_t, 8> kVolumeMagic = {'A', 'X', 'I', 'O', 'M', 'V', 'L', 0};
 constexpr std::uint16_t kRecoveryVersion = 1;
@@ -168,6 +222,11 @@ constexpr std::uint64_t kExtraWinAttrs = 4;  // Windows file attributes (u32 LE)
 constexpr std::uint64_t kExtraWinTimes = 5;  // Windows creation/access/write FILETIMEs (3 × u64 LE)
 constexpr std::uint64_t kExtraAdsStream = 6; // one NTFS named stream: vint name_len, name, bytes
 constexpr std::uint64_t kExtraPosix = 7;     // mode, uid, gid (3 x u32 LE)
+constexpr std::uint64_t kExtraSparseMap = 8; // version + allocated extent list
+constexpr std::uint64_t kExtraSecurityDescriptor = 9; // self-relative Windows descriptor
+constexpr std::uint64_t kExtraXattr = 10;    // vint name length, name, raw value
+constexpr std::uint64_t kExtraReparse = 11; // tag + opaque Windows reparse buffer
+constexpr std::uint64_t kExtraChunkRefs = 12; // version + content chunk indices
 
 // Archive-level extra record types (the TLV area after the entry list). Separate
 // numbering from the per-entry extras above; unknown types are skipped by length.
@@ -175,6 +234,10 @@ constexpr std::uint64_t kArchiveComment = 1;  // UTF-8 archive comment (payload 
 constexpr std::uint64_t kArchiveLock = 2;     // presence marks the archive read-only (no payload)
 constexpr std::uint64_t kArchiveEncryption = 3;  // KDF params + salt + password key-check token
 constexpr std::uint64_t kArchiveSignature = 4;   // public key (32) + EdDSA signature (64)
+constexpr std::uint64_t kArchiveCaptureReport = 5; // omitted/lossy source capture warnings
+constexpr std::uint64_t kArchiveEncryptionV2 = 6; // key id + password slots
+constexpr std::uint64_t kArchiveChunkTable = 7; // content-defined chunk index
+constexpr std::uint64_t kArchiveSnapshotManifest = 8; // named snapshot entry manifests
 
 // ---- little-endian serialization -------------------------------------------
 
@@ -189,6 +252,31 @@ void put_u32(ByteVector& out, std::uint32_t value) {
 void put_u64(ByteVector& out, std::uint64_t value) {
     for (unsigned shift = 0; shift < 64; shift += 8) {
         out.push_back(static_cast<std::uint8_t>(value >> shift));
+    }
+}
+
+ByteVector archive_header_bytes(std::uint16_t version, std::uint16_t flags) {
+    ByteVector header;
+    header.insert(header.end(), kArchiveMagic.begin(), kArchiveMagic.end());
+    put_u16(header, version);
+    put_u16(header, flags);
+    put_u32(header, 0);  // reserved
+    return header;
+}
+
+void patch_archive_header(std::ofstream& out, std::uint16_t version,
+                          std::uint16_t flags) {
+    const auto header = archive_header_bytes(version, flags);
+    out.flush();
+    if (!out) {
+        throw std::runtime_error("failed before patching archive header");
+    }
+    out.seekp(0, std::ios::beg);
+    out.write(reinterpret_cast<const char*>(header.data()),
+              static_cast<std::streamsize>(header.size()));
+    out.seekp(0, std::ios::end);
+    if (!out) {
+        throw std::runtime_error("failed to patch archive header");
     }
 }
 
@@ -239,6 +327,11 @@ public:
         for (unsigned shift = 0; shift < 64; shift += 7) {
             need(1);
             const auto byte = data_[cursor_++];
+            // At shift 63 only bit zero fits in a u64. Reject the other six
+            // payload bits instead of silently wrapping a hostile length.
+            if (shift == 63 && (byte & 0x7Eu) != 0) {
+                throw FormatError("archive varint overflows 64 bits");
+            }
             value |= static_cast<std::uint64_t>(byte & 0x7Fu) << shift;
             if ((byte & 0x80u) == 0) {
                 return value;
@@ -431,10 +524,25 @@ namespace {
 
 // ---- archive model ---------------------------------------------------------
 
+struct SubframeRec {
+    // All offsets are relative to the surrounding AXC block. The compressed
+    // range includes the complete independently decodable frame header.
+    std::uint64_t uncompressed_offset = 0;
+    std::uint64_t uncompressed_size = 0;
+    std::uint64_t compressed_offset = 0;
+    std::uint64_t compressed_size = 0;
+    std::uint8_t kind = 0;
+    // Parallel frames carry their inner block codec. External frames carry
+    // the outer AXC codec id (zstandard/lzma2/deflate).
+    std::uint8_t codec = 0;
+    std::uint8_t lzma_property = 0;
+};
+
 struct BlockRec {
     std::uint64_t compressed_offset = 0;
     std::uint64_t compressed_size = 0;
     std::uint64_t uncompressed_size = 0;
+    std::vector<SubframeRec> subframes;
 };
 
 struct EntryRec {
@@ -448,18 +556,110 @@ struct EntryRec {
     bool has_blake3 = false;
     core::Blake3Digest blake3{};
     core::FileMetadata meta;
+    core::SparseFileMap sparse;
     std::string link_target;  // symlink target (verbatim) for kEntrySymlink
     std::vector<core::AdsStream> ads;  // NTFS alternate data streams (kEntryFile)
+    std::vector<std::uint64_t> chunk_refs;
 };
 
+struct SnapshotRec {
+    std::string name;
+    std::uint64_t generation = 0;
+    std::int64_t created = 0;
+    std::vector<EntryRec> entries;
+};
+
+// Exact content identity used for safe reuse. CRC-32 keeps the lookup cheap to
+// inspect while BLAKE3 provides the collision-resistant identity and size binds
+// the identity to the complete logical file.
+struct ContentIdentity {
+    std::uint64_t size = 0;
+    std::uint32_t crc = 0;
+    core::Blake3Digest blake3{};
+
+    bool operator==(const ContentIdentity&) const = default;
+
+    bool operator<(const ContentIdentity& other) const {
+        if (size != other.size) return size < other.size;
+        if (crc != other.crc) return crc < other.crc;
+        return std::lexicographical_compare(
+            blake3.begin(), blake3.end(), other.blake3.begin(), other.blake3.end());
+    }
+};
+
+// Snapshot chunk identity is separate from the ordinary file identity. When
+// keyed identifiers are enabled, `id` is a keyed BLAKE3 digest; the plaintext
+// CRC remains a chunk-integrity value but is not used for lookup.
+struct ChunkIdentity {
+    std::uint64_t size = 0;
+    core::Blake3Digest id{};
+
+    bool operator==(const ChunkIdentity&) const = default;
+
+    bool operator<(const ChunkIdentity& other) const {
+        if (size != other.size) return size < other.size;
+        return std::lexicographical_compare(
+            id.begin(), id.end(), other.id.begin(), other.id.end());
+    }
+};
+
+struct ChunkRec {
+    ChunkIdentity identity;
+    std::uint32_t crc = 0;
+    std::uint64_t block_index = 0;
+    std::uint64_t offset = 0;
+};
+
+struct ArchiveDataReference {
+    std::uint64_t first_block = 0;
+    std::uint64_t offset = 0;
+};
+
+struct ReuseCandidate {
+    ContentIdentity identity;
+    ArchiveDataReference data;
+    std::int64_t source_stamp = 0;
+};
+
+struct ArchiveReuseStats {
+    std::uint64_t reused_items = 0;
+    std::uint64_t reused_bytes = 0;
+};
+
+using ArchiveReuseByPath = std::unordered_map<std::string, ReuseCandidate>;
+
+ContentIdentity content_identity(const EntryRec& entry) {
+    return {entry.size, entry.crc, entry.blake3};
+}
+
+std::map<ContentIdentity, ArchiveDataReference> build_reuse_candidates(
+    const std::vector<EntryRec>& entries) {
+    std::map<ContentIdentity, ArchiveDataReference> candidates;
+    for (const auto& entry : entries) {
+        if (entry.type != kEntryFile || !entry.has_blake3) continue;
+        candidates.emplace(content_identity(entry),
+                           ArchiveDataReference{entry.first_block, entry.offset});
+    }
+    return candidates;
+}
+
 // Password-encryption parameters recorded in the directory (present only when the
-// archive is encrypted). The salt + cost parameters let a reader re-derive the key;
-// the key-check token is a sealed constant used to reject a wrong password up front.
+// archive is encrypted). v1 stores one password-derived block key directly; v2
+// stores a random data key wrapped independently by each password slot.
+struct EncryptionSlot {
+    std::uint32_t id = 0;
+    core::KdfParams kdf;
+    std::vector<std::uint8_t> wrapped_key;
+};
+
 struct EncryptionInfo {
     bool enabled = false;
     bool encrypt_directory = false;  // directory sealed + params in the header preamble
+    bool v2 = false;
     core::KdfParams kdf;
     std::vector<std::uint8_t> key_check;
+    std::array<std::uint8_t, kEncryptionKeyIdSize> key_id{};
+    std::vector<EncryptionSlot> slots;
 };
 
 // Archive-wide metadata stored in the directory's trailing TLV area.
@@ -470,6 +670,10 @@ struct ArchiveMeta {
     bool has_signature = false;
     std::array<std::uint8_t, 32> signature_public_key{};
     std::array<std::uint8_t, 64> signature{};
+    std::vector<OperationWarning> capture_warnings;
+    bool chunk_table = false;
+    bool keyed_chunk_ids = false;
+    std::vector<SnapshotRec> snapshots;
 };
 
 // Fixed plaintext sealed under the archive key to verify a password without touching
@@ -480,8 +684,410 @@ constexpr std::array<std::uint8_t, 16> kKeyCheckPlaintext = {
 struct ArchiveIndex {
     std::vector<BlockRec> blocks;
     std::vector<EntryRec> entries;
+    std::vector<ChunkRec> chunks;
     ArchiveMeta meta;
 };
+
+constexpr std::uint64_t kSnapshotManifestVersion = 1;
+constexpr std::uint64_t kChunkTableVersion = 1;
+constexpr std::uint64_t kMaxSnapshotCount = 1u << 16;
+constexpr std::uint64_t kMaxSnapshotEntries = 1u << 24;
+constexpr std::uint64_t kMaxChunkCount = 1u << 24;
+constexpr std::uint64_t kMaxChunkRefsPerEntry = 1u << 20;
+constexpr std::size_t kMaxSnapshotNameBytes = 256;
+
+void validate_snapshot_name(std::string_view name) {
+    if (name.empty() || name.size() > kMaxSnapshotNameBytes) {
+        throw std::invalid_argument("snapshot name must be 1..256 bytes");
+    }
+    if (name == "." || name == ".." || name.find('/') != std::string_view::npos ||
+        name.find('\\') != std::string_view::npos ||
+        std::any_of(name.begin(), name.end(), [](unsigned char value) {
+            return value < 0x20 || value == 0x7F;
+        })) {
+        throw std::invalid_argument("snapshot name contains an unsupported character");
+    }
+}
+
+void validate_snapshot_entry_paths_for_write(const std::vector<EntryRec>& entries) {
+    if (entries.size() > kMaxSnapshotEntries) {
+        throw std::invalid_argument("snapshot contains too many entries");
+    }
+
+    std::vector<std::pair<std::string, std::uint8_t>> ordered;
+    ordered.reserve(entries.size());
+    std::unordered_set<std::string> seen;
+    seen.reserve(entries.size());
+    for (const auto& entry : entries) {
+        if (entry.type > kEntryHardlink) {
+            throw std::invalid_argument("snapshot contains an unknown entry type");
+        }
+        const auto normalized = normalize_archive_path(entry.path, "snapshot archive path");
+        if (normalized != entry.path) {
+            throw std::invalid_argument("snapshot archive path is not normalized: " +
+                                        entry.path);
+        }
+        if (!seen.insert(entry.path).second) {
+            throw std::invalid_argument("snapshot contains a duplicate path: " + entry.path);
+        }
+        if (entry.type == kEntryHardlink) {
+            const auto target = normalize_archive_path(entry.link_target,
+                                                        "snapshot hard-link target");
+            if (target != entry.link_target) {
+                throw std::invalid_argument(
+                    "snapshot hard-link target is not normalized: " + entry.link_target);
+            }
+        }
+        ordered.emplace_back(entry.path, entry.type);
+    }
+    std::sort(ordered.begin(), ordered.end(),
+              [](const auto& first, const auto& second) {
+                  return first.first < second.first;
+              });
+    for (std::size_t index = 1; index < ordered.size(); ++index) {
+        if (is_same_or_child(ordered[index].first, ordered[index - 1].first) &&
+            ordered[index - 1].second != kEntryDir) {
+            throw std::invalid_argument(
+                "snapshot has a non-directory entry with children: " +
+                ordered[index - 1].first);
+        }
+    }
+}
+
+void validate_snapshot_entry_paths_for_read(const std::vector<EntryRec>& entries) {
+    if (entries.size() > kMaxSnapshotEntries) {
+        throw FormatError("snapshot contains too many entries");
+    }
+
+    std::vector<std::pair<std::string, std::uint8_t>> ordered;
+    ordered.reserve(entries.size());
+    std::unordered_set<std::string> seen;
+    seen.reserve(entries.size());
+    for (const auto& entry : entries) {
+        if (entry.type > kEntryHardlink) {
+            throw FormatError("snapshot contains an unknown entry type");
+        }
+        try {
+            if (normalize_archive_path(entry.path, "snapshot manifest path") != entry.path) {
+                throw FormatError("snapshot manifest path is not normalized");
+            }
+        } catch (const std::invalid_argument&) {
+            throw FormatError("snapshot manifest path is not safe");
+        }
+        if (!seen.insert(entry.path).second) {
+            throw FormatError("snapshot manifest contains a duplicate path");
+        }
+        if (entry.type == kEntryHardlink) {
+            try {
+                if (normalize_archive_path(entry.link_target,
+                                           "snapshot hard-link target") != entry.link_target) {
+                    throw FormatError("snapshot hard-link target is not normalized");
+                }
+            } catch (const std::invalid_argument&) {
+                throw FormatError("snapshot hard-link target is not safe");
+            }
+        }
+        ordered.emplace_back(entry.path, entry.type);
+    }
+    std::sort(ordered.begin(), ordered.end(),
+              [](const auto& first, const auto& second) {
+                  return first.first < second.first;
+              });
+    for (std::size_t index = 1; index < ordered.size(); ++index) {
+        if (is_same_or_child(ordered[index].first, ordered[index - 1].first) &&
+            ordered[index - 1].second != kEntryDir) {
+            throw FormatError("snapshot has a non-directory entry with children");
+        }
+    }
+}
+
+core::Blake3Digest chunk_digest(std::span<const std::uint8_t> bytes,
+                                const core::CryptoKey* key, bool keyed) {
+    if (!keyed) return core::Blake3::hash(bytes);
+    if (key == nullptr) {
+        throw std::invalid_argument("keyed chunk identifiers require archive encryption");
+    }
+    blake3_hasher hasher;
+    blake3_hasher_init_keyed(&hasher, key->data());
+    blake3_hasher_update(&hasher, bytes.data(), bytes.size());
+    core::Blake3Digest digest{};
+    blake3_hasher_finalize(&hasher, digest.data(), digest.size());
+    return digest;
+}
+
+ChunkIdentity make_chunk_identity(std::span<const std::uint8_t> bytes,
+                                  const core::CryptoKey* key, bool keyed) {
+    return {static_cast<std::uint64_t>(bytes.size()), chunk_digest(bytes, key, keyed)};
+}
+
+std::array<std::uint64_t, 256> snapshot_gear_table() {
+    std::array<std::uint64_t, 256> table{};
+    std::uint64_t state = 0xA710C0DE5EED1234ull;
+    for (auto& value : table) {
+        // splitmix64 gives a stable, platform-independent gear table. This is
+        // not cryptographic; the BLAKE3 identity below remains authoritative.
+        state += 0x9E3779B97F4A7C15ull;
+        std::uint64_t z = state;
+        z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+        z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+        value = z ^ (z >> 31);
+    }
+    return table;
+}
+
+void validate_snapshot_chunk_sizes(const CompressionOptions& options) {
+    const auto min_size = options.snapshot_min_chunk_size;
+    const auto average_size = options.snapshot_average_chunk_size;
+    const auto max_size = options.snapshot_max_chunk_size;
+    if (min_size < (4u << 10) || average_size < min_size || max_size < average_size ||
+        max_size > (64u << 20)) {
+        throw std::invalid_argument(
+            "snapshot chunk sizes must satisfy 4 KiB <= min <= average <= max <= 64 MiB");
+    }
+}
+
+template <typename Callback>
+void read_content_defined_chunks(const fs::path& path,
+                                 const CompressionOptions& options,
+                                 const std::shared_ptr<OperationControl>& operation,
+                                 Callback&& callback) {
+    validate_snapshot_chunk_sizes(options);
+    std::ifstream input;
+    if (!open_input_with_retry(input, path, options.input_open_retries, operation)) {
+        throw std::runtime_error("cannot read input file: " + core::path_to_utf8(path));
+    }
+    const auto gear = snapshot_gear_table();
+    std::size_t mask = 1;
+    while (mask < options.snapshot_average_chunk_size &&
+           mask <= std::numeric_limits<std::size_t>::max() / 2) {
+        mask <<= 1;
+    }
+    --mask;
+
+    ByteVector chunk;
+    chunk.reserve(options.snapshot_max_chunk_size);
+    std::uint64_t fingerprint = 0;
+    std::vector<char> buffer(effective_io_buffer_size(options.io_buffer_size));
+    while (input) {
+        operation_checkpoint(operation);
+        input.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+        const auto count = input.gcount();
+        if (count <= 0) break;
+        for (std::streamsize index = 0; index < count; ++index) {
+            const auto byte = static_cast<std::uint8_t>(buffer[static_cast<std::size_t>(index)]);
+            chunk.push_back(byte);
+            fingerprint = (fingerprint << 1) ^ gear[byte];
+            const bool at_min = chunk.size() >= options.snapshot_min_chunk_size;
+            const bool at_cut = at_min && ((fingerprint & mask) == 0);
+            const bool at_max = chunk.size() >= options.snapshot_max_chunk_size;
+            if (at_cut || at_max) {
+                callback(std::move(chunk));
+                chunk = {};
+                chunk.reserve(options.snapshot_max_chunk_size);
+                fingerprint = 0;
+            }
+        }
+    }
+    if (input.bad()) {
+        throw std::runtime_error("failed while reading input file: " +
+                                 core::path_to_utf8(path));
+    }
+    if (!chunk.empty()) callback(std::move(chunk));
+}
+
+std::vector<SubframeRec> make_subframe_map(std::span<const std::uint8_t> compressed) {
+    const auto header = core::read_archive_header(compressed);
+    // Filters are defined over the complete logical stream. Until the inverse
+    // transform can be proven local to a selected range, such blocks retain the
+    // safe whole-block path.
+    if (!header.transform_ranges.empty() || header.original_size == 0) {
+        return {};
+    }
+    const auto payload = core::archive_payload(compressed, header);
+    std::vector<SubframeRec> result;
+    if (header.codec == core::CodecId::store) {
+        if (payload.empty()) return {};
+        result.push_back({0,
+                          header.original_size,
+                          header.payload_offset,
+                          payload.size(),
+                          static_cast<std::uint8_t>(kSubframeStore),
+                          0,
+                          0});
+        return result;
+    }
+    if (header.codec == core::CodecId::parallel_blocks) {
+        const auto frames = codec::inspect_parallel_block_frames(
+            payload, static_cast<std::size_t>(header.original_size),
+            header.format_version >= 6,
+            header.format_version >= 7,
+            header.format_version >= 8,
+            header.format_version >= 9);
+        result.reserve(frames.size());
+        for (const auto& frame : frames) {
+            result.push_back({frame.uncompressed_offset,
+                              frame.uncompressed_size,
+                              static_cast<std::uint64_t>(header.payload_offset) +
+                                  frame.frame_offset,
+                              frame.frame_size,
+                              static_cast<std::uint8_t>(kSubframeParallelBlock),
+                              frame.codec,
+                              0});
+        }
+        return result;
+    }
+
+    CompressionMethod method = CompressionMethod::store;
+    if (header.codec == core::CodecId::zstandard) {
+        method = CompressionMethod::zstandard;
+    } else if (header.codec == core::CodecId::lzma2) {
+        method = CompressionMethod::lzma2;
+    } else if (header.codec == core::CodecId::deflate) {
+        method = CompressionMethod::deflate;
+    } else {
+        return {};
+    }
+    const auto frames = codec::inspect_external_codec_frames(
+        payload, method, static_cast<std::size_t>(header.original_size));
+    result.reserve(frames.size());
+    for (const auto& frame : frames) {
+        result.push_back({frame.uncompressed_offset,
+                          frame.uncompressed_size,
+                          static_cast<std::uint64_t>(header.payload_offset) +
+                              frame.frame_offset,
+                          frame.frame_size,
+                          static_cast<std::uint8_t>(kSubframeExternalChunk),
+                          static_cast<std::uint8_t>(header.codec),
+                          frame.lzma_property});
+    }
+    return result;
+}
+
+void validate_subframe_geometry(const BlockRec& block,
+                                const std::vector<SubframeRec>& subframes) {
+    if (subframes.empty()) return;
+    if (subframes.size() > kMaxSubframesPerBlock) {
+        throw FormatError("subframe map has too many frames");
+    }
+
+    std::uint64_t uncompressed_end = 0;
+    std::uint64_t compressed_end = 0;
+    for (const auto& frame : subframes) {
+        if (frame.uncompressed_size == 0 || frame.compressed_size == 0 ||
+            frame.uncompressed_offset != uncompressed_end ||
+            uncompressed_end > block.uncompressed_size ||
+            frame.uncompressed_size > block.uncompressed_size - uncompressed_end) {
+            throw FormatError("subframe map has invalid uncompressed geometry");
+        }
+        if (frame.compressed_offset < 32 ||
+            frame.compressed_offset > block.compressed_size ||
+            frame.compressed_size > block.compressed_size - frame.compressed_offset ||
+            frame.compressed_offset < compressed_end) {
+            throw FormatError("subframe map has invalid compressed geometry");
+        }
+        if (frame.kind != kSubframeStore &&
+            frame.kind != kSubframeParallelBlock &&
+            frame.kind != kSubframeExternalChunk) {
+            throw FormatError("subframe map has an unknown frame kind");
+        }
+        if (frame.kind == kSubframeParallelBlock && frame.codec > 10) {
+            throw FormatError("subframe map has an unknown parallel codec");
+        }
+        if (frame.kind == kSubframeExternalChunk &&
+            (frame.codec < 8 || frame.codec > 10 || frame.lzma_property > 40)) {
+            throw FormatError("subframe map has an invalid external codec");
+        }
+        uncompressed_end += frame.uncompressed_size;
+        compressed_end = frame.compressed_offset + frame.compressed_size;
+    }
+    if (uncompressed_end != block.uncompressed_size) {
+        throw FormatError("subframe map does not cover the block");
+    }
+}
+
+void parse_block_extras(std::span<const std::uint8_t> bytes, BlockRec& block) {
+    Reader extras(bytes);
+    bool saw_subframe_map = false;
+    while (extras.has_more()) {
+        const auto record_type = extras.vint();
+        const auto length = extras.vint();
+        if (length > extras.remaining()) {
+            throw FormatError("block extra record exceeds its enclosing range");
+        }
+        Reader payload(extras.take(static_cast<std::size_t>(length)));
+        if (record_type != kBlockExtraSubframeMap) {
+            continue;
+        }
+        if (saw_subframe_map) {
+            throw FormatError("block has duplicate subframe maps");
+        }
+        saw_subframe_map = true;
+        if (payload.vint() != kSubframeMapVersion) {
+            throw FormatError("unsupported subframe map version");
+        }
+        const auto count = payload.vint();
+        if (count == 0 || count > kMaxSubframesPerBlock) {
+            throw FormatError("subframe map has an invalid frame count");
+        }
+        block.subframes.reserve(static_cast<std::size_t>(count));
+        for (std::uint64_t i = 0; i < count; ++i) {
+            SubframeRec frame;
+            frame.uncompressed_offset = payload.vint();
+            frame.uncompressed_size = payload.vint();
+            frame.compressed_offset = payload.vint();
+            frame.compressed_size = payload.vint();
+            const auto kind = payload.vint();
+            const auto codec = payload.vint();
+            const auto lzma_property = payload.vint();
+            if (kind > std::numeric_limits<std::uint8_t>::max() ||
+                codec > std::numeric_limits<std::uint8_t>::max() ||
+                lzma_property > std::numeric_limits<std::uint8_t>::max()) {
+                throw FormatError("subframe map byte field overflows");
+            }
+            frame.kind = static_cast<std::uint8_t>(kind);
+            frame.codec = static_cast<std::uint8_t>(codec);
+            frame.lzma_property = static_cast<std::uint8_t>(lzma_property);
+            block.subframes.push_back(frame);
+        }
+        if (payload.has_more()) {
+            throw FormatError("subframe map has trailing data");
+        }
+    }
+    validate_subframe_geometry(block, block.subframes);
+}
+
+bool has_sparse_entries(const std::vector<EntryRec>& entries) {
+    return std::any_of(entries.begin(), entries.end(), [](const EntryRec& entry) {
+        return entry.type == kEntryFile && entry.sparse.is_sparse;
+    });
+}
+
+bool has_extended_metadata(const std::vector<EntryRec>& entries) {
+    return std::any_of(entries.begin(), entries.end(), [](const EntryRec& entry) {
+        return entry.meta.has_windows_security_descriptor ||
+               !entry.meta.xattrs.empty() || entry.meta.has_reparse_data;
+    });
+}
+
+std::uint16_t archive_header_flags(const std::vector<EntryRec>& entries,
+                                   const ArchiveMeta& meta) {
+    std::uint16_t flags = meta.encryption.encrypt_directory
+        ? kFlagEncryptedDirectory : static_cast<std::uint16_t>(0);
+    if (meta.encryption.v2) flags |= kFlagEncryptionV2;
+    if (has_sparse_entries(entries)) flags |= kFlagSparseEntries;
+    if (!meta.capture_warnings.empty()) flags |= kFlagCaptureReport;
+    if (has_extended_metadata(entries)) flags |= kFlagExtendedMetadata;
+    if (meta.chunk_table) flags |= kFlagChunkTable;
+    return flags;
+}
+
+std::uint16_t archive_header_version(const std::vector<EntryRec>& entries,
+                                     const ArchiveMeta& meta) {
+    return meta.encryption.v2 || has_sparse_entries(entries) ||
+           !meta.capture_warnings.empty() || has_extended_metadata(entries) ||
+           meta.chunk_table
+        ? kArchiveVersion5 : kArchiveVersion4;
+}
 
 }  // namespace
 
@@ -503,11 +1109,23 @@ void scan_input(const fs::path& input, std::vector<ScanItem>& items) {
         return ScanItem{path, relative_path(path), false, true,
                         core::generic_path_to_utf8(fs::read_symlink(path, ec))};
     };
+    auto reparse_item = [&](const fs::path& path) {
+        const bool directory = fs::is_directory(path, ec);
+        return ScanItem{path, relative_path(path), directory, false, {}, true};
+    };
 
     // A symlink given directly is archived as a symlink, not its target — check
     // before fs::exists (which follows links and rejects dangling ones).
     if (fs::is_symlink(fs::symlink_status(input, ec))) {
         items.push_back(symlink_item(input));
+        return;
+    }
+
+    // Junctions and other Windows reparse points are not reported as symlinks
+    // by every std::filesystem implementation. Capture them as opaque entries
+    // and never recurse through them during source scanning.
+    if (core::is_reparse_point(input)) {
+        items.push_back(reparse_item(input));
         return;
     }
 
@@ -534,6 +1152,9 @@ void scan_input(const fs::path& input, std::vector<ScanItem>& items) {
             }
             if (fs::is_symlink(entry_status)) {
                 items.push_back(symlink_item(entry.path()));
+            } else if (core::is_reparse_point(entry.path())) {
+                items.push_back(reparse_item(entry.path()));
+                it.disable_recursion_pending();
             } else if (fs::is_directory(entry_status)) {
                 items.push_back({entry.path(), relative_path(entry.path()), true});
             } else if (fs::is_regular_file(entry_status)) {
@@ -571,6 +1192,10 @@ void scan_input_at(const ArchiveInput& input, std::vector<ScanItem>& items,
         items.push_back({path, archive_path_for(path), false, true,
                          core::generic_path_to_utf8(target)});
     };
+    auto add_reparse = [&](const fs::path& path) {
+        const bool directory = fs::is_directory(path, ec);
+        items.push_back({path, archive_path_for(path), directory, false, {}, true});
+    };
 
     const fs::file_status status = fs::symlink_status(input.source, ec);
     if (ec) {
@@ -579,6 +1204,10 @@ void scan_input_at(const ArchiveInput& input, std::vector<ScanItem>& items,
     }
     if (fs::is_symlink(status)) {
         add_symlink(input.source);
+        return;
+    }
+    if (core::is_reparse_point(input.source)) {
+        add_reparse(input.source);
         return;
     }
     if (!fs::exists(status)) {
@@ -609,6 +1238,9 @@ void scan_input_at(const ArchiveInput& input, std::vector<ScanItem>& items,
         }
         if (fs::is_symlink(entry_status)) {
             add_symlink(entry.path());
+        } else if (core::is_reparse_point(entry.path())) {
+            add_reparse(entry.path());
+            it.disable_recursion_pending();
         } else if (fs::is_directory(entry_status)) {
             items.push_back({entry.path(), archive_path_for(entry.path()), true});
         } else if (fs::is_regular_file(entry_status)) {
@@ -636,6 +1268,19 @@ std::uint8_t scan_item_type(const ScanItem& item) {
         return kEntryDir;
     }
     return item.is_symlink ? kEntrySymlink : kEntryFile;
+}
+
+bool same_mapped_entry_class(std::uint8_t stored_type, std::uint8_t incoming_type) {
+    if (stored_type == incoming_type) {
+        return true;
+    }
+    // Hard-link entries are an internal storage optimization for regular files.
+    // A mapped filesystem scan cannot emit that representation, so replacing an
+    // archived hard-link name with a regular-file item is not a type conflict.
+    const auto is_file_like = [](std::uint8_t type) {
+        return type == kEntryFile || type == kEntryHardlink;
+    };
+    return is_file_like(stored_type) && is_file_like(incoming_type);
 }
 
 void validate_mapped_items(const std::vector<ScanItem>& items,
@@ -675,7 +1320,7 @@ void validate_mapped_items(const std::vector<ScanItem>& items,
     for (const auto& [path, type] : incoming) {
         operation_checkpoint(operation);
         if (const auto found = current.find(path);
-            found != current.end() && found->second != type) {
+            found != current.end() && !same_mapped_entry_class(found->second, type)) {
             throw std::invalid_argument("archive destination changes entry type: " + path);
         }
         for (const auto& [old_path, old_type] : current) {
@@ -699,7 +1344,7 @@ void validate_mapped_items(const std::vector<ScanItem>& items,
 std::uint64_t scanned_file_bytes(const std::vector<ScanItem>& items) {
     std::uint64_t total = 0;
     for (const auto& item : items) {
-        if (item.is_directory) {
+        if (item.is_directory || item.is_reparse_point) {
             continue;
         }
         std::error_code ec;
@@ -764,7 +1409,10 @@ void report_operation(const std::shared_ptr<OperationControl>& operation,
                       std::uint64_t current_file_total_bytes,
                       std::uint64_t throughput_bytes,
                       std::uint64_t compressed_bytes,
-                      std::uint64_t compressed_source_bytes) {
+                      std::uint64_t compressed_source_bytes,
+                      std::uint64_t reused_items,
+                      std::uint64_t reused_bytes,
+                      std::uint64_t archive_bytes_read) {
     if (operation) {
         operation->report(OperationProgress{
             stage,
@@ -778,6 +1426,16 @@ void report_operation(const std::shared_ptr<OperationControl>& operation,
             throughput_bytes,
             compressed_bytes,
             compressed_source_bytes,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            reused_items,
+            reused_bytes,
+            archive_bytes_read,
         });
     }
 }
@@ -786,6 +1444,114 @@ void operation_checkpoint(const std::shared_ptr<OperationControl>& operation) {
     if (operation) {
         operation->checkpoint();
     }
+}
+
+struct HashedInput {
+    ContentIdentity identity;
+    std::int64_t source_stamp = 0;
+};
+
+std::optional<ContentIdentity> try_hash_input_stream(
+    std::ifstream& input, std::uint64_t declared_size,
+    const CompressionOptions& options,
+    const std::shared_ptr<OperationControl>& operation) {
+    core::Blake3 hasher;
+    auto crc = core::crc32_init();
+    std::vector<std::uint8_t> buffer(effective_io_buffer_size(options.io_buffer_size));
+    std::uint64_t actual_size = 0;
+    while (input) {
+        operation_checkpoint(operation);
+        input.read(reinterpret_cast<char*>(buffer.data()),
+                   static_cast<std::streamsize>(buffer.size()));
+        const auto count = input.gcount();
+        if (count <= 0) continue;
+        const auto bytes = std::span<const std::uint8_t>(
+            buffer.data(), static_cast<std::size_t>(count));
+        hasher.update(bytes);
+        crc = core::crc32_update(crc, bytes);
+        actual_size += static_cast<std::uint64_t>(count);
+    }
+    if (input.bad() || actual_size != declared_size) return std::nullopt;
+    return ContentIdentity{
+        actual_size, core::crc32_final(crc), hasher.finalize()};
+}
+
+std::optional<HashedInput> try_hash_input_for_reuse(
+    const ScanItem& item, const CompressionOptions& options,
+    const std::shared_ptr<OperationControl>& operation) {
+    std::error_code size_error;
+    const auto declared_size = fs::file_size(item.absolute, size_error);
+    if (size_error) return std::nullopt;
+
+    std::error_code mtime_error;
+    const auto stamp = fs::last_write_time(item.absolute, mtime_error);
+    if (mtime_error) return std::nullopt;
+    const auto source_stamp =
+        static_cast<std::int64_t>(stamp.time_since_epoch().count());
+
+    std::ifstream input;
+    if (!open_input_with_retry(input, item.absolute, options.input_open_retries,
+                               operation)) {
+        return std::nullopt;
+    }
+    const auto identity = try_hash_input_stream(
+        input, declared_size, options, operation);
+    if (!identity) return std::nullopt;
+    return HashedInput{*identity, source_stamp};
+}
+
+ArchiveReuseByPath prepare_reuse_by_path(
+    const std::vector<ScanItem>& items,
+    const std::map<ContentIdentity, ArchiveDataReference>& candidates,
+    const CompressionOptions& options,
+    const std::shared_ptr<OperationControl>& operation) {
+    ArchiveReuseByPath reuse;
+    if (items.empty() || candidates.empty()) return reuse;
+
+    std::unordered_set<std::uint64_t> candidate_sizes;
+    candidate_sizes.reserve(candidates.size());
+    for (const auto& [identity, data] : candidates) {
+        (void)data;
+        candidate_sizes.insert(identity.size);
+    }
+
+    std::uint64_t candidate_total = 0;
+    std::uint64_t candidate_items = 0;
+    for (const auto& item : items) {
+        if (item.is_directory || item.is_symlink || item.is_reparse_point) continue;
+        std::error_code ec;
+        const auto size = fs::file_size(item.absolute, ec);
+        if (!ec && candidate_sizes.contains(static_cast<std::uint64_t>(size))) {
+            ++candidate_items;
+            candidate_total += static_cast<std::uint64_t>(size);
+        }
+    }
+    if (candidate_items == 0) return reuse;
+
+    std::uint64_t compared_bytes = 0;
+    std::uint64_t compared_items = 0;
+    report_operation(operation, OperationStage::comparing, 0, candidate_total,
+                     0, items.size(), "Checking unchanged file content");
+    for (const auto& item : items) {
+        operation_checkpoint(operation);
+        if (item.is_directory || item.is_symlink || item.is_reparse_point) continue;
+        std::error_code ec;
+        const auto size = fs::file_size(item.absolute, ec);
+        if (ec || !candidate_sizes.contains(static_cast<std::uint64_t>(size))) continue;
+
+        const auto hashed = try_hash_input_for_reuse(item, options, operation);
+        if (!hashed) continue;
+        compared_bytes += hashed->identity.size;
+        ++compared_items;
+        report_operation(operation, OperationStage::comparing, compared_bytes,
+                         candidate_total, compared_items, items.size(), item.archive_path);
+        const auto found = candidates.find(hashed->identity);
+        if (found == candidates.end()) continue;
+        reuse.emplace(item.archive_path,
+                      ReuseCandidate{hashed->identity, found->second,
+                                     hashed->source_stamp});
+    }
+    return reuse;
 }
 
 namespace {
@@ -851,11 +1617,18 @@ private:
 // Random-access byte source for an archive, backed by either a file (so large
 // archives are read on demand, not loaded whole) or an in-memory span (used by
 // tests and fuzzers). Every read is bounds-checked.
+struct ArchiveReadStats {
+    std::atomic<std::uint64_t> archive_bytes_read{0};
+};
+
 class ByteSource {
 public:
-    ByteSource(ArchiveStream& stream, std::uint64_t size) : stream_(&stream), size_(size) {}
-    explicit ByteSource(std::span<const std::uint8_t> data)
-        : data_(data), size_(data.size()) {}
+    ByteSource(ArchiveStream& stream, std::uint64_t size,
+               std::shared_ptr<ArchiveReadStats> stats = {})
+        : stream_(&stream), size_(size), stats_(std::move(stats)) {}
+    explicit ByteSource(std::span<const std::uint8_t> data,
+                        std::shared_ptr<ArchiveReadStats> stats = {})
+        : data_(data), size_(data.size()), stats_(std::move(stats)) {}
 
     std::uint64_t size() const { return size_; }
 
@@ -868,17 +1641,62 @@ public:
             // Serialize only the short random-access read; decompression happens
             // after the lock is released.
             std::lock_guard lock(stream_mutex_);
-            return stream_->read(offset, length);
+            auto result = stream_->read(offset, length);
+            if (stats_) {
+                stats_->archive_bytes_read.fetch_add(length, std::memory_order_relaxed);
+            }
+            return result;
         }
-        return ByteVector(data_.begin() + static_cast<std::ptrdiff_t>(offset),
-                          data_.begin() + static_cast<std::ptrdiff_t>(offset + length));
+        auto result = ByteVector(
+            data_.begin() + static_cast<std::ptrdiff_t>(offset),
+            data_.begin() + static_cast<std::ptrdiff_t>(offset + length));
+        if (stats_) {
+            stats_->archive_bytes_read.fetch_add(length, std::memory_order_relaxed);
+        }
+        return result;
+    }
+
+    ByteVector read_compressed(std::uint64_t offset, std::uint64_t length) const {
+        return read(offset, length);
     }
 
 private:
     ArchiveStream* stream_ = nullptr;
     std::span<const std::uint8_t> data_{};
     std::uint64_t size_ = 0;
+    std::shared_ptr<ArchiveReadStats> stats_;
     mutable std::mutex stream_mutex_;
+};
+
+// Sequential archive writers cannot seek back to patch a header or a footer.
+// This adapter keeps the byte position explicit while preserving the ordinary
+// ostream interface used by the block and directory writers.
+class CountedOutput {
+public:
+    explicit CountedOutput(std::ostream& stream, std::uint64_t position = 0)
+        : stream_(stream), position_(position) {}
+
+    void write(const char* data, std::streamsize size) {
+        if (size < 0 || static_cast<std::uint64_t>(size) >
+                           std::numeric_limits<std::uint64_t>::max() - position_) {
+            throw std::runtime_error("archive output position overflows");
+        }
+        stream_.write(data, size);
+        if (stream_) position_ += static_cast<std::uint64_t>(size);
+    }
+
+    void flush() { stream_.flush(); }
+
+    // File-backed callers use close() to release the file before recovery is
+    // appended. A non-owning stream must only be flushed, never closed.
+    void close() { flush(); }
+
+    explicit operator bool() const { return static_cast<bool>(stream_); }
+    std::uint64_t position() const { return position_; }
+
+private:
+    std::ostream& stream_;
+    std::uint64_t position_ = 0;
 };
 
 ArchiveStream open_archive(const fs::path& archive_path, std::uint64_t& file_size);
@@ -886,12 +1704,30 @@ ArchiveStream open_archive(const fs::path& archive_path, std::uint64_t& file_siz
 // Where an archive's fixed structure points: directory location, plus the header
 // flags and (if the directory is encrypted) the plaintext preamble's extent.
 struct ArchiveLayout {
+    std::uint16_t version = 0;
     std::uint16_t flags = 0;
     std::uint64_t directory_offset = 0;
     std::uint64_t directory_size = 0;
     std::uint64_t preamble_offset = 0;  // start of the encryption preamble (if any)
     std::uint64_t preamble_size = 0;    // length of the preamble's parameter bytes
+    std::uint64_t footer_offset = 0;    // selected legacy footer, not necessarily EOF
+    std::uint64_t generation_offset = 0;
+    std::uint64_t generation_size = 0;
+    std::uint64_t generation = 0;
+    std::uint64_t previous_footer_offset = 0;
+    std::uint64_t previous_directory_offset = 0;
+    std::uint64_t previous_directory_size = 0;
+    std::uint64_t previous_generation_offset = 0;
 };
+
+struct FooterCandidate {
+    std::uint64_t footer_offset = 0;
+    std::uint64_t directory_offset = 0;
+    std::uint64_t directory_size = 0;
+};
+
+bool generation_extension_is_valid(const ByteSource& source,
+                                   const FooterCandidate& candidate);
 
 struct RecoveryService {
     unsigned percent = 0;
@@ -913,9 +1749,178 @@ std::uint32_t recovery_crc(std::span<const std::uint8_t> bytes) {
     return core::crc32_final(crc);
 }
 
-std::optional<RecoveryService> read_recovery_service(const ByteSource& source) {
-    if (source.size() < kFooterSize + kRecoveryTailSize) return std::nullopt;
-    const std::uint64_t tail_offset = source.size() - kFooterSize - kRecoveryTailSize;
+std::optional<FooterCandidate> read_footer_candidate(const ByteSource& source,
+                                                      std::uint64_t footer_offset) {
+    if (footer_offset > source.size() ||
+        kFooterSize > source.size() - footer_offset) {
+        return std::nullopt;
+    }
+    const auto footer = source.read(footer_offset, kFooterSize);
+    if (!std::equal(kArchiveMagic.begin(), kArchiveMagic.end(), footer.begin() + 16)) {
+        return std::nullopt;
+    }
+    Reader reader(footer);
+    FooterCandidate candidate;
+    candidate.footer_offset = footer_offset;
+    candidate.directory_offset = reader.u64();
+    candidate.directory_size = reader.u64();
+    if (candidate.directory_offset < kHeaderSize ||
+        candidate.directory_offset > footer_offset ||
+        candidate.directory_size > footer_offset - candidate.directory_offset) {
+        return std::nullopt;
+    }
+    return candidate;
+}
+
+// A torn append can leave arbitrary bytes after the last complete footer. Scan
+// backward in bounded chunks and select the newest structurally valid legacy
+// footer; the directory parser performs the deeper format validation later.
+std::optional<FooterCandidate> find_latest_footer(const ByteSource& source) {
+    if (source.size() < kFooterSize) return std::nullopt;
+    const auto last_offset = source.size() - kFooterSize;
+    if (const auto direct = read_footer_candidate(source, last_offset)) {
+        if (generation_extension_is_valid(source, *direct)) return direct;
+    }
+
+    constexpr std::uint64_t scan_chunk = 1u << 20;
+    std::uint64_t search_end = last_offset;
+    while (true) {
+        const auto start = search_end >= scan_chunk - 1
+            ? search_end - (scan_chunk - 1) : 0;
+        const auto end = search_end + kFooterSize;
+        const auto bytes = source.read(start, end - start);
+        const auto first = bytes.size() - kFooterSize + 1;
+        for (std::size_t position = first; position > 0; --position) {
+            const auto local = position - 1;
+            if (!std::equal(kArchiveMagic.begin(), kArchiveMagic.end(),
+                            bytes.begin() + static_cast<std::ptrdiff_t>(local + 16))) {
+                continue;
+            }
+            if (const auto candidate = read_footer_candidate(
+                    source, start + static_cast<std::uint64_t>(local))) {
+                if (generation_extension_is_valid(source, *candidate)) return candidate;
+            }
+        }
+        if (start == 0) break;
+        search_end = start - 1;
+    }
+    return std::nullopt;
+}
+
+void read_generation_extension(const ByteSource& source, ArchiveLayout& layout) {
+    const auto directory_end = layout.directory_offset + layout.directory_size;
+    if (directory_end < layout.directory_offset ||
+        directory_end > layout.footer_offset ||
+        layout.footer_offset - directory_end < kGenerationExtensionSize) {
+        return;
+    }
+    const auto bytes = source.read(directory_end, kGenerationExtensionSize);
+    if (!std::equal(kGenerationMagic.begin(), kGenerationMagic.end(), bytes.begin())) {
+        return;
+    }
+
+    Reader reader(bytes);
+    (void)reader.take(kGenerationMagic.size());
+    if (reader.u16() != kGenerationVersion) {
+        throw FormatError("unsupported AXAR generation extension version");
+    }
+    if (reader.u16() != 0 || reader.u32() != kGenerationExtensionSize) {
+        throw FormatError("invalid AXAR generation extension flags or size");
+    }
+    layout.generation = reader.u64();
+    layout.previous_footer_offset = reader.u64();
+    layout.previous_directory_offset = reader.u64();
+    layout.previous_directory_size = reader.u64();
+    layout.previous_generation_offset = reader.u64();
+    if (reader.u64() != 0) {
+        throw FormatError("AXAR generation extension has non-zero reserved fields");
+    }
+    if (layout.generation == 0) {
+        throw FormatError("AXAR generation number must be non-zero");
+    }
+    if (layout.previous_footer_offset == 0) {
+        if (layout.previous_directory_offset != 0 ||
+            layout.previous_directory_size != 0 ||
+            layout.previous_generation_offset != 0) {
+            throw FormatError("AXAR first generation has previous-generation metadata");
+        }
+    } else {
+        if (layout.previous_footer_offset < kHeaderSize ||
+            layout.previous_footer_offset >= layout.directory_offset) {
+            throw FormatError("AXAR previous footer is outside the archive history");
+        }
+        const auto previous = read_footer_candidate(source, layout.previous_footer_offset);
+        if (!previous || previous->directory_offset != layout.previous_directory_offset ||
+            previous->directory_size != layout.previous_directory_size) {
+            throw FormatError("AXAR previous footer does not match its directory reference");
+        }
+        if (layout.previous_generation_offset != 0 &&
+            (layout.previous_generation_offset < kHeaderSize ||
+             layout.previous_generation_offset >= layout.previous_footer_offset)) {
+            throw FormatError("AXAR previous generation reference is out of range");
+        }
+        if (layout.previous_generation_offset == 0) {
+            if (layout.generation != 1) {
+                throw FormatError(
+                    "AXAR first appended generation must be generation one");
+            }
+        } else {
+            const auto previous_directory_end =
+                layout.previous_directory_offset + layout.previous_directory_size;
+            if (previous_directory_end < layout.previous_directory_offset ||
+                previous_directory_end != layout.previous_generation_offset ||
+                layout.previous_footer_offset < kGenerationExtensionSize ||
+                layout.previous_generation_offset >
+                    layout.previous_footer_offset - kGenerationExtensionSize) {
+                throw FormatError("AXAR previous generation offset does not match its directory");
+            }
+            const auto previous_extension = source.read(
+                layout.previous_generation_offset, kGenerationExtensionSize);
+            Reader previous_reader(previous_extension);
+            if (!std::equal(kGenerationMagic.begin(), kGenerationMagic.end(),
+                            previous_reader.take(kGenerationMagic.size()).begin()) ||
+                previous_reader.u16() != kGenerationVersion ||
+                previous_reader.u16() != 0 ||
+                previous_reader.u32() != kGenerationExtensionSize) {
+                throw FormatError("AXAR previous generation extension is invalid");
+            }
+            const auto previous_generation = previous_reader.u64();
+            (void)previous_reader.u64();
+            (void)previous_reader.u64();
+            (void)previous_reader.u64();
+            (void)previous_reader.u64();
+            if (previous_reader.u64() != 0 || previous_generation == 0 ||
+                previous_generation == std::numeric_limits<std::uint64_t>::max() ||
+                previous_generation + 1 != layout.generation) {
+                throw FormatError("AXAR generation numbers are not sequential");
+            }
+        }
+    }
+    layout.generation_offset = directory_end;
+    layout.generation_size = kGenerationExtensionSize;
+}
+
+bool generation_extension_is_valid(const ByteSource& source,
+                                   const FooterCandidate& candidate) {
+    ArchiveLayout layout;
+    layout.footer_offset = candidate.footer_offset;
+    layout.directory_offset = candidate.directory_offset;
+    layout.directory_size = candidate.directory_size;
+    try {
+        read_generation_extension(source, layout);
+        return true;
+    } catch (const FormatError&) {
+        // A torn generation may leave a footer-shaped byte sequence whose
+        // extension is incomplete. Keep scanning for the previous complete
+        // footer instead of allowing that tail to hide it.
+        return false;
+    }
+}
+
+std::optional<RecoveryService> read_recovery_service(const ByteSource& source,
+                                                      const ArchiveLayout& layout) {
+    if (layout.footer_offset < kRecoveryTailSize) return std::nullopt;
+    const std::uint64_t tail_offset = layout.footer_offset - kRecoveryTailSize;
     const auto tail = source.read(tail_offset, kRecoveryTailSize);
     if (!std::equal(kRecoveryMagic.begin(), kRecoveryMagic.end(), tail.begin() + 16)) {
         return std::nullopt;
@@ -924,7 +1929,10 @@ std::optional<RecoveryService> read_recovery_service(const ByteSource& source) {
     RecoveryService service;
     service.service_offset = tail_reader.u64();
     service.service_size = tail_reader.u64();
-    if (service.service_size > tail_offset ||
+    const auto protected_end = layout.directory_offset + layout.directory_size +
+                               layout.generation_size;
+    if (protected_end < layout.directory_offset ||
+        service.service_size > tail_offset ||
         service.service_offset != tail_offset - service.service_size) {
         throw FormatError("invalid recovery service location");
     }
@@ -946,13 +1954,19 @@ std::optional<RecoveryService> read_recovery_service(const ByteSource& source) {
         service.parity_shards == 0 ||
         service.data_shards + service.parity_shards > 255 || service.shard_size == 0 ||
         service.protected_size > service.service_offset ||
-        service.directory_offset + service.directory_size > service.protected_size) {
+        service.directory_offset > service.protected_size ||
+        service.directory_size > service.protected_size - service.directory_offset ||
+        service.protected_size != protected_end) {
         throw FormatError("invalid recovery service parameters");
     }
     const std::size_t checksum_count =
         static_cast<std::size_t>(service.data_shards + service.parity_shards);
     service.checksums.reserve(checksum_count);
     for (std::size_t i = 0; i < checksum_count; ++i) service.checksums.push_back(reader.u32());
+    if (service.shard_size > std::numeric_limits<std::uint64_t>::max() /
+                              service.parity_shards) {
+        throw FormatError("recovery service parity size overflows");
+    }
     const std::uint64_t parity_bytes =
         static_cast<std::uint64_t>(service.parity_shards) * service.shard_size;
     if (parity_bytes > reader.remaining()) throw FormatError("recovery service is truncated");
@@ -972,26 +1986,33 @@ ArchiveLayout read_layout(const ByteSource& source) {
         throw FormatError("not an Axiom archive");
     }
     Reader header_reader(header, kArchiveMagic.size());
-    if (header_reader.u16() != kArchiveVersion) {
+    ArchiveLayout layout;
+    layout.version = header_reader.u16();
+    if (layout.version != kArchiveVersion4 && layout.version != kArchiveVersion5) {
         throw FormatError("unsupported archive version");
     }
-    ArchiveLayout layout;
     layout.flags = header_reader.u16();
-    if ((layout.flags & ~kFlagEncryptedDirectory) != 0) {
+    if (header_reader.u32() != 0) {
+        throw FormatError("archive header has non-zero reserved fields");
+    }
+    if ((layout.flags & ~kKnownArchiveFlags) != 0) {
         throw FormatError("archive uses features this build does not support");
     }
+    if (layout.version < kArchiveVersion5 &&
+        (layout.flags & (kFlagSparseEntries | kFlagCaptureReport |
+                         kFlagExtendedMetadata | kFlagEncryptionV2 |
+                         kFlagChunkTable)) != 0) {
+        throw FormatError("archive uses v5 features with an older version header");
+    }
 
-    const auto footer = source.read(file_size - kFooterSize, kFooterSize);
-    if (!std::equal(kArchiveMagic.begin(), kArchiveMagic.end(), footer.begin() + 16)) {
+    const auto footer = find_latest_footer(source);
+    if (!footer) {
         throw FormatError("invalid archive footer");
     }
-    Reader footer_reader(footer);
-    layout.directory_offset = footer_reader.u64();
-    layout.directory_size = footer_reader.u64();
-    if (layout.directory_offset < kHeaderSize ||
-        layout.directory_offset + layout.directory_size > file_size - kFooterSize) {
-        throw FormatError("invalid directory location");
-    }
+    layout.footer_offset = footer->footer_offset;
+    layout.directory_offset = footer->directory_offset;
+    layout.directory_size = footer->directory_size;
+    read_generation_extension(source, layout);
     if ((layout.flags & kFlagEncryptedDirectory) != 0) {
         // The preamble is a fixed u32 length right after the header, then that many
         // plaintext parameter bytes, before the (encrypted) block region.
@@ -999,7 +2020,8 @@ ArchiveLayout read_layout(const ByteSource& source) {
         Reader len_reader(len_bytes);
         layout.preamble_size = len_reader.u32();
         layout.preamble_offset = kHeaderSize + 4;
-        if (layout.preamble_offset + layout.preamble_size > layout.directory_offset) {
+        if (layout.preamble_offset > layout.directory_offset ||
+            layout.preamble_size > layout.directory_offset - layout.preamble_offset) {
             throw FormatError("invalid encryption preamble");
         }
     }
@@ -1013,6 +2035,36 @@ ByteVector archive_footer_bytes(std::uint64_t directory_offset,
     put_u64(footer, directory_size);
     footer.insert(footer.end(), kArchiveMagic.begin(), kArchiveMagic.end());
     return footer;
+}
+
+ByteVector generation_extension_bytes(std::uint64_t generation,
+                                      std::uint64_t previous_footer_offset,
+                                      std::uint64_t previous_directory_offset,
+                                      std::uint64_t previous_directory_size,
+                                      std::uint64_t previous_generation_offset) {
+    if (generation == 0) {
+        throw std::invalid_argument("archive generation must be non-zero");
+    }
+    if (previous_footer_offset == 0 &&
+        (previous_directory_offset != 0 || previous_directory_size != 0 ||
+         previous_generation_offset != 0)) {
+        throw std::invalid_argument("archive generation has inconsistent history metadata");
+    }
+    ByteVector extension;
+    extension.insert(extension.end(), kGenerationMagic.begin(), kGenerationMagic.end());
+    put_u16(extension, kGenerationVersion);
+    put_u16(extension, 0);
+    put_u32(extension, static_cast<std::uint32_t>(kGenerationExtensionSize));
+    put_u64(extension, generation);
+    put_u64(extension, previous_footer_offset);
+    put_u64(extension, previous_directory_offset);
+    put_u64(extension, previous_directory_size);
+    put_u64(extension, previous_generation_offset);
+    put_u64(extension, 0);
+    if (extension.size() != kGenerationExtensionSize) {
+        throw std::logic_error("archive generation extension has the wrong size");
+    }
+    return extension;
 }
 
 struct EncodedRecoveryService {
@@ -1151,7 +2203,8 @@ void rewrite_recovery_service(const fs::path& archive_path, unsigned percent,
     auto input = open_archive(archive_path, file_size);
     const ByteSource source(input, file_size);
     const ArchiveLayout layout = read_layout(source);
-    const std::uint64_t protected_size = layout.directory_offset + layout.directory_size;
+    const std::uint64_t protected_size = layout.directory_offset + layout.directory_size +
+                                          layout.generation_size;
     EncodedRecoveryService recovery;
     if (percent != 0) {
         recovery = encode_recovery_service(source, protected_size, layout.directory_offset,
@@ -1207,7 +2260,8 @@ void append_recovery_to_staged_archive(
     auto input = open_archive(staged_path, file_size);
     const ByteSource source(input, file_size);
     const ArchiveLayout layout = read_layout(source);
-    const std::uint64_t protected_size = layout.directory_offset + layout.directory_size;
+    const std::uint64_t protected_size = layout.directory_offset + layout.directory_size +
+                                          layout.generation_size;
     constexpr std::uint64_t target_shard_size = 1u << 20;
     const std::uint64_t desired_data = std::max<std::uint64_t>(
         1, (protected_size + target_shard_size - 1) / target_shard_size);
@@ -1415,23 +2469,341 @@ void append_recovery_to_staged_archive(
     }
 }
 
+// Finish an append generation after its directory has been written without a
+// footer. The generation record is placed before the legacy footer so old
+// readers still see the current directory. On any write failure, truncate back
+// to the previous complete generation; a process crash before this cleanup is
+// handled by read_layout's backward footer scan.
+void append_generation_trailer(
+    const fs::path& staged_path,
+    std::uint64_t directory_offset,
+    std::uint64_t directory_size,
+    std::uint64_t generation,
+    std::uint64_t previous_footer_offset,
+    std::uint64_t previous_directory_offset,
+    std::uint64_t previous_directory_size,
+    std::uint64_t previous_generation_offset,
+    unsigned recovery_percent,
+    const std::shared_ptr<OperationControl>& operation,
+    std::size_t requested_threads,
+    std::uint64_t rollback_size) {
+    try {
+        const auto directory_end = directory_offset + directory_size;
+        if (directory_end < directory_offset) {
+            throw FormatError("archive directory offset overflows generation trailer");
+        }
+        std::error_code size_error;
+        const auto current_size = fs::file_size(staged_path, size_error);
+        if (size_error || current_size != directory_end) {
+            throw FormatError("generation trailer is not positioned after the directory");
+        }
+        const auto extension = generation_extension_bytes(
+            generation, previous_footer_offset, previous_directory_offset,
+            previous_directory_size, previous_generation_offset);
+        const auto footer = archive_footer_bytes(directory_offset, directory_size);
+        std::ofstream output(staged_path, std::ios::binary | std::ios::app);
+        if (!output) {
+            throw std::runtime_error("cannot reopen archive for generation trailer");
+        }
+        output.write(reinterpret_cast<const char*>(extension.data()),
+                     static_cast<std::streamsize>(extension.size()));
+        output.write(reinterpret_cast<const char*>(footer.data()),
+                     static_cast<std::streamsize>(footer.size()));
+        output.close();
+        if (!output) {
+            throw std::runtime_error("failed to write generation trailer");
+        }
+        if (recovery_percent != 0) {
+            append_recovery_to_staged_archive(
+                staged_path, recovery_percent, operation, requested_threads);
+        }
+    } catch (...) {
+        std::error_code rollback_error;
+        fs::resize_file(staged_path, rollback_size, rollback_error);
+        throw;
+    }
+}
+
+std::uint32_t read_u32_vint(Reader& reader, const char* field) {
+    const auto value = reader.vint();
+    if (value > std::numeric_limits<std::uint32_t>::max()) {
+        throw FormatError(std::string(field) + " exceeds 32 bits");
+    }
+    return static_cast<std::uint32_t>(value);
+}
+
+void validate_encryption_slot_shape(const EncryptionSlot& slot) {
+    if (slot.wrapped_key.size() != kWrappedEncryptionKeySize) {
+        throw FormatError("encryption slot has an invalid wrapped key");
+    }
+}
+
+ByteVector encryption_slot_associated_data(const EncryptionInfo& enc,
+                                           std::uint32_t slot_id) {
+    ByteVector ad(kEncryptionSlotAd.begin(), kEncryptionSlotAd.end());
+    ad.insert(ad.end(), enc.key_id.begin(), enc.key_id.end());
+    put_u32(ad, slot_id);
+    return ad;
+}
+
+EncryptionInfo parse_encryption_v2_payload(std::span<const std::uint8_t> bytes,
+                                           bool encrypt_directory) {
+    EncryptionInfo enc;
+    enc.enabled = true;
+    enc.encrypt_directory = encrypt_directory;
+    enc.v2 = true;
+    Reader reader(bytes);
+    const auto magic = reader.take(kEncryptionV2Magic.size());
+    if (!std::equal(kEncryptionV2Magic.begin(), kEncryptionV2Magic.end(), magic.begin())) {
+        throw FormatError("invalid AXAR encryption-v2 magic");
+    }
+    if (reader.u16() != kEncryptionV2Version) {
+        throw FormatError("unsupported AXAR encryption-v2 version");
+    }
+    if (reader.u16() != 0) {
+        throw FormatError("AXAR encryption-v2 has unknown required options");
+    }
+    const auto key_id = reader.take(kEncryptionKeyIdSize);
+    std::copy(key_id.begin(), key_id.end(), enc.key_id.begin());
+    const auto slot_count = reader.vint();
+    if (slot_count == 0 || slot_count > kMaxEncryptionSlots) {
+        throw FormatError("AXAR encryption-v2 has an invalid password-slot count");
+    }
+    enc.slots.reserve(static_cast<std::size_t>(slot_count));
+    std::unordered_set<std::uint32_t> slot_ids;
+    for (std::uint64_t i = 0; i < slot_count; ++i) {
+        EncryptionSlot slot;
+        slot.id = reader.u32();
+        if (!slot_ids.insert(slot.id).second) {
+            throw FormatError("AXAR encryption-v2 contains duplicate password slots");
+        }
+        slot.kdf.algorithm = read_u32_vint(reader, "encryption slot algorithm");
+        slot.kdf.mem_blocks = read_u32_vint(reader, "encryption slot memory cost");
+        slot.kdf.passes = read_u32_vint(reader, "encryption slot pass count");
+        slot.kdf.lanes = read_u32_vint(reader, "encryption slot lane count");
+        const auto salt_length = reader.vint();
+        if (salt_length != slot.kdf.salt.size()) {
+            throw FormatError("encryption slot salt must be 16 bytes");
+        }
+        const auto salt = reader.take(slot.kdf.salt.size());
+        std::copy(salt.begin(), salt.end(), slot.kdf.salt.begin());
+        const auto wrapped_length = reader.vint();
+        if (wrapped_length != kWrappedEncryptionKeySize) {
+            throw FormatError("encryption slot has an invalid wrapped-key length");
+        }
+        const auto wrapped = reader.take(kWrappedEncryptionKeySize);
+        slot.wrapped_key.assign(wrapped.begin(), wrapped.end());
+        enc.slots.push_back(std::move(slot));
+    }
+    if (reader.has_more()) {
+        throw FormatError("AXAR encryption-v2 payload has trailing data");
+    }
+    return enc;
+}
+
 // Parse the plaintext encryption parameters carried in the header preamble.
 EncryptionInfo parse_encryption_preamble(const ByteVector& bytes) {
+    // read_layout consumes the fixed u32 length and exposes only the parameter
+    // bytes at preamble_offset. Keep the legacy on-disk outer length out of this
+    // parser so v1 and v2 share the same bounded payload path.
+    if (bytes.size() >= kEncryptionV2Magic.size() &&
+        std::equal(kEncryptionV2Magic.begin(), kEncryptionV2Magic.end(), bytes.begin())) {
+        return parse_encryption_v2_payload(bytes, true);
+    }
+
     EncryptionInfo enc;
     enc.enabled = true;
     enc.encrypt_directory = true;
-    Reader r(bytes);
-    enc.kdf.algorithm = static_cast<std::uint32_t>(r.vint());
-    enc.kdf.mem_blocks = static_cast<std::uint32_t>(r.vint());
-    enc.kdf.passes = static_cast<std::uint32_t>(r.vint());
-    enc.kdf.lanes = static_cast<std::uint32_t>(r.vint());
-    const auto salt_len = static_cast<std::size_t>(r.vint());
-    const auto salt = r.take(salt_len);
-    std::copy_n(salt.begin(), std::min(salt_len, enc.kdf.salt.size()), enc.kdf.salt.begin());
-    const auto check_len = static_cast<std::size_t>(r.vint());
-    const auto check = r.take(check_len);
+    Reader reader(bytes);
+    enc.kdf.algorithm = read_u32_vint(reader, "legacy encryption algorithm");
+    enc.kdf.mem_blocks = read_u32_vint(reader, "legacy encryption memory cost");
+    enc.kdf.passes = read_u32_vint(reader, "legacy encryption pass count");
+    enc.kdf.lanes = read_u32_vint(reader, "legacy encryption lane count");
+    const auto salt_len = reader.vint();
+    if (salt_len != enc.kdf.salt.size()) {
+        throw FormatError("legacy encryption salt must be 16 bytes");
+    }
+    const auto salt = reader.take(enc.kdf.salt.size());
+    std::copy(salt.begin(), salt.end(), enc.kdf.salt.begin());
+    const auto check_len = reader.vint();
+    if (check_len != core::kAeadOverhead + kKeyCheckPlaintext.size()) {
+        throw FormatError("legacy encryption key-check length is invalid");
+    }
+    const auto check = reader.take(static_cast<std::size_t>(check_len));
     enc.key_check.assign(check.begin(), check.end());
+    if (reader.has_more()) {
+        throw FormatError("legacy encryption preamble has trailing data");
+    }
     return enc;
+}
+
+EntryRec parse_snapshot_entry_body(std::span<const std::uint8_t> bytes) {
+    Reader body(bytes);
+    EntryRec entry;
+    const auto type = body.vint();
+    if (type > kEntryHardlink) {
+        throw FormatError("snapshot manifest has an unknown entry type");
+    }
+    entry.type = static_cast<std::uint8_t>(type);
+    const auto path_length = body.vint();
+    if (path_length > body.remaining()) {
+        throw FormatError("snapshot manifest path is truncated");
+    }
+    entry.path = body.str(static_cast<std::size_t>(path_length));
+    if (entry.type == kEntryFile) {
+        entry.size = body.vint();
+        entry.first_block = body.vint();
+        entry.offset = body.vint();
+    } else if (entry.type == kEntrySymlink || entry.type == kEntryHardlink) {
+        const auto target_length = body.vint();
+        if (target_length > body.remaining()) {
+            throw FormatError("snapshot manifest link target is truncated");
+        }
+        entry.link_target = body.str(static_cast<std::size_t>(target_length));
+    }
+    while (body.has_more()) {
+        const auto record_type = body.vint();
+        const auto payload_length = body.vint();
+        if (payload_length > body.remaining()) {
+            throw FormatError("snapshot manifest entry extra is truncated");
+        }
+        Reader payload(body.take(static_cast<std::size_t>(payload_length)));
+        if (record_type == kExtraMtime) {
+            if (payload.remaining() != 8) throw FormatError("snapshot mtime is invalid");
+            entry.mtime = static_cast<std::int64_t>(payload.u64());
+        } else if (record_type == kExtraCrc32) {
+            if (payload.remaining() != 4) throw FormatError("snapshot CRC is invalid");
+            entry.crc = payload.u32();
+        } else if (record_type == kExtraBlake3) {
+            if (payload.remaining() != entry.blake3.size()) {
+                throw FormatError("snapshot BLAKE3 is invalid");
+            }
+            const auto digest = payload.take(entry.blake3.size());
+            std::copy(digest.begin(), digest.end(), entry.blake3.begin());
+            entry.has_blake3 = true;
+        } else if (record_type == kExtraWinAttrs) {
+            if (payload.remaining() != 4) throw FormatError("snapshot Windows attributes are invalid");
+            entry.meta.has_windows_attributes = true;
+            entry.meta.windows_attributes = payload.u32();
+        } else if (record_type == kExtraWinTimes) {
+            if (payload.remaining() != 24) throw FormatError("snapshot Windows times are invalid");
+            entry.meta.has_windows_times = true;
+            entry.meta.windows_creation_time = payload.u64();
+            entry.meta.windows_access_time = payload.u64();
+            entry.meta.windows_write_time = payload.u64();
+        } else if (record_type == kExtraPosix) {
+            if (payload.remaining() != 12) throw FormatError("snapshot POSIX metadata is invalid");
+            entry.meta.has_posix = true;
+            entry.meta.posix_mode = payload.u32();
+            entry.meta.posix_uid = payload.u32();
+            entry.meta.posix_gid = payload.u32();
+        } else if (record_type == kExtraAdsStream) {
+            if (entry.ads.size() >= core::kMaxMetadataBlobCount) {
+                throw FormatError("too many snapshot alternate data streams");
+            }
+            const auto name_length = payload.vint();
+            if (name_length == 0 || name_length > (4u << 10) ||
+                name_length > payload.remaining()) {
+                throw FormatError("snapshot alternate data stream name is invalid");
+            }
+            core::AdsStream stream;
+            stream.name = payload.str(static_cast<std::size_t>(name_length));
+            if (payload.remaining() > core::kMaxAdsBytes) {
+                throw FormatError("snapshot alternate data stream exceeds its metadata limit");
+            }
+            const auto data = payload.take(payload.remaining());
+            stream.data.assign(data.begin(), data.end());
+            entry.ads.push_back(std::move(stream));
+        } else if (record_type == kExtraSecurityDescriptor) {
+            if (payload.remaining() == 0 ||
+                payload.remaining() > core::kMaxSecurityDescriptorBytes) {
+                throw FormatError("snapshot security descriptor exceeds its metadata limit");
+            }
+            const auto descriptor = payload.take(payload.remaining());
+            entry.meta.has_windows_security_descriptor = true;
+            entry.meta.windows_security_descriptor.assign(descriptor.begin(), descriptor.end());
+        } else if (record_type == kExtraXattr) {
+            if (entry.meta.xattrs.size() >= core::kMaxMetadataBlobCount) {
+                throw FormatError("too many snapshot extended attributes");
+            }
+            const auto name_length = payload.vint();
+            if (name_length == 0 || name_length > (4u << 10) ||
+                name_length > payload.remaining()) {
+                throw FormatError("snapshot extended attribute name is invalid");
+            }
+            core::MetadataBlob blob;
+            blob.name = payload.str(static_cast<std::size_t>(name_length));
+            if (payload.remaining() > core::kMaxMetadataBlobBytes) {
+                throw FormatError("snapshot extended attribute exceeds its metadata limit");
+            }
+            const auto value = payload.take(payload.remaining());
+            blob.data.assign(value.begin(), value.end());
+            entry.meta.xattrs.push_back(std::move(blob));
+        } else if (record_type == kExtraReparse) {
+            const auto tag = payload.vint();
+            const auto data_length = payload.vint();
+            if (data_length < 8 || data_length > core::kMaxReparseDataBytes ||
+                data_length != payload.remaining()) {
+                throw FormatError("snapshot reparse metadata is invalid");
+            }
+            const auto data = payload.take(static_cast<std::size_t>(data_length));
+            const auto stored_tag = static_cast<std::uint32_t>(data[0]) |
+                                    (static_cast<std::uint32_t>(data[1]) << 8) |
+                                    (static_cast<std::uint32_t>(data[2]) << 16) |
+                                    (static_cast<std::uint32_t>(data[3]) << 24);
+            const auto stored_length = static_cast<std::uint16_t>(data[4]) |
+                                       (static_cast<std::uint16_t>(data[5]) << 8);
+            if (stored_tag != static_cast<std::uint32_t>(tag) ||
+                static_cast<std::uint64_t>(stored_length) + 8 != data_length) {
+                throw FormatError("snapshot reparse metadata header does not match");
+            }
+            entry.meta.has_reparse_data = true;
+            entry.meta.reparse_tag = static_cast<std::uint32_t>(tag);
+            entry.meta.reparse_data.assign(data.begin(), data.end());
+        } else if (record_type == kExtraChunkRefs) {
+            if (entry.type != kEntryFile) {
+                throw FormatError("snapshot chunk references are only valid on files");
+            }
+            if (payload.vint() != kChunkTableVersion) {
+                throw FormatError("unsupported snapshot chunk-reference version");
+            }
+            const auto count = payload.vint();
+            if (count > kMaxChunkRefsPerEntry) {
+                throw FormatError("snapshot entry has too many chunk references");
+            }
+            entry.chunk_refs.reserve(static_cast<std::size_t>(count));
+            for (std::uint64_t i = 0; i < count; ++i) {
+                entry.chunk_refs.push_back(payload.vint());
+            }
+        } else if (record_type == kExtraSparseMap) {
+            if (entry.type != kEntryFile) {
+                throw FormatError("snapshot sparse metadata is only valid on files");
+            }
+            if (payload.vint() != 1) throw FormatError("unsupported snapshot sparse-map version");
+            const auto count = payload.vint();
+            if (count > (1u << 20)) {
+                throw FormatError("snapshot sparse map has too many extents");
+            }
+            entry.sparse.is_sparse = true;
+            std::uint64_t previous_end = 0;
+            entry.sparse.allocated.reserve(static_cast<std::size_t>(count));
+            for (std::uint64_t i = 0; i < count; ++i) {
+                const auto offset = payload.vint();
+                const auto length = payload.vint();
+                if (length == 0 || offset < previous_end || offset > entry.size ||
+                    length > entry.size - offset) {
+                    throw FormatError("snapshot sparse map has invalid geometry");
+                }
+                entry.sparse.allocated.push_back({offset, length});
+                previous_end = offset + length;
+            }
+        }
+        if (record_type >= kExtraMtime && record_type <= kExtraChunkRefs &&
+            payload.has_more()) {
+            throw FormatError("snapshot manifest entry extra has trailing data");
+        }
+    }
+    return entry;
 }
 
 // Parse a (decrypted) directory image into the block table, entries, and metadata.
@@ -1446,7 +2818,11 @@ ArchiveIndex parse_directory(const ByteVector& directory, std::uint64_t director
         block.compressed_offset = reader.vint();
         block.compressed_size = reader.vint();
         block.uncompressed_size = reader.vint();
-        (void)reader.take(static_cast<std::size_t>(reader.vint()));  // reserved block extra
+        const auto extra_size = reader.vint();
+        if (extra_size > reader.remaining()) {
+            throw FormatError("block extra exceeds the directory");
+        }
+        parse_block_extras(reader.take(static_cast<std::size_t>(extra_size)), block);
         if (block.compressed_offset < kHeaderSize ||
             block.compressed_size > directory_offset ||
             block.compressed_offset > directory_offset - block.compressed_size) {
@@ -1486,33 +2862,150 @@ ArchiveIndex parse_directory(const ByteVector& directory, std::uint64_t director
         while (body.has_more()) {
             const auto record_type = body.vint();
             Reader payload(body.take(static_cast<std::size_t>(body.vint())));
+            const auto require_payload_size = [&payload](std::size_t expected,
+                                                          const char* name) {
+                if (payload.remaining() != expected) {
+                    throw FormatError(std::string(name) + " has an invalid payload length");
+                }
+            };
             if (record_type == kExtraMtime) {
+                require_payload_size(8, "mtime record");
                 entry.mtime = static_cast<std::int64_t>(payload.u64());
             } else if (record_type == kExtraCrc32) {
+                require_payload_size(4, "CRC record");
                 entry.crc = payload.u32();
             } else if (record_type == kExtraBlake3) {
+                require_payload_size(entry.blake3.size(), "BLAKE3 record");
                 const auto digest = payload.take(entry.blake3.size());
                 std::copy(digest.begin(), digest.end(), entry.blake3.begin());
                 entry.has_blake3 = true;
             } else if (record_type == kExtraWinAttrs) {
+                require_payload_size(4, "Windows attribute record");
                 entry.meta.has_windows_attributes = true;
                 entry.meta.windows_attributes = payload.u32();
             } else if (record_type == kExtraWinTimes) {
+                require_payload_size(24, "Windows time record");
                 entry.meta.has_windows_times = true;
                 entry.meta.windows_creation_time = payload.u64();
                 entry.meta.windows_access_time = payload.u64();
                 entry.meta.windows_write_time = payload.u64();
             } else if (record_type == kExtraAdsStream) {
+                if (entry.ads.size() >= core::kMaxMetadataBlobCount) {
+                    throw FormatError("too many alternate data streams in one entry");
+                }
                 core::AdsStream stream;
-                stream.name = payload.str(static_cast<std::size_t>(payload.vint()));
+                const auto name_length = payload.vint();
+                if (name_length == 0 || name_length > (4u << 10) ||
+                    name_length > payload.remaining()) {
+                    throw FormatError("alternate data stream name is invalid");
+                }
+                stream.name = payload.str(static_cast<std::size_t>(name_length));
+                if (payload.remaining() > core::kMaxAdsBytes) {
+                    throw FormatError("alternate data stream exceeds its metadata limit");
+                }
                 const auto data = payload.take(payload.remaining());
                 stream.data.assign(data.begin(), data.end());
                 entry.ads.push_back(std::move(stream));
             } else if (record_type == kExtraPosix) {
+                require_payload_size(12, "POSIX metadata record");
                 entry.meta.has_posix = true;
                 entry.meta.posix_mode = payload.u32();
                 entry.meta.posix_uid = payload.u32();
                 entry.meta.posix_gid = payload.u32();
+            } else if (record_type == kExtraSecurityDescriptor) {
+                if (payload.remaining() == 0 ||
+                    payload.remaining() > core::kMaxSecurityDescriptorBytes) {
+                    throw FormatError("security descriptor exceeds its metadata limit");
+                }
+                const auto descriptor = payload.take(payload.remaining());
+                entry.meta.has_windows_security_descriptor = true;
+                entry.meta.windows_security_descriptor.assign(descriptor.begin(), descriptor.end());
+            } else if (record_type == kExtraXattr) {
+                if (entry.meta.xattrs.size() >= core::kMaxMetadataBlobCount) {
+                    throw FormatError("too many extended attributes in one entry");
+                }
+                const auto name_length = payload.vint();
+                if (name_length == 0 || name_length > (4u << 10) ||
+                    name_length > payload.remaining()) {
+                    throw FormatError("extended attribute name is invalid");
+                }
+                core::MetadataBlob blob;
+                blob.name = payload.str(static_cast<std::size_t>(name_length));
+                if (payload.remaining() > core::kMaxMetadataBlobBytes) {
+                    throw FormatError("extended attribute exceeds its metadata limit");
+                }
+                const auto value = payload.take(payload.remaining());
+                blob.data.assign(value.begin(), value.end());
+                entry.meta.xattrs.push_back(std::move(blob));
+            } else if (record_type == kExtraReparse) {
+                const auto tag = payload.vint();
+                const auto data_length = payload.vint();
+                if (data_length < 8 ||
+                    data_length > core::kMaxReparseDataBytes ||
+                    data_length != payload.remaining()) {
+                    throw FormatError("reparse metadata is invalid");
+                }
+                const auto data = payload.take(static_cast<std::size_t>(data_length));
+                const auto stored_tag = static_cast<std::uint32_t>(data[0]) |
+                                        (static_cast<std::uint32_t>(data[1]) << 8) |
+                                        (static_cast<std::uint32_t>(data[2]) << 16) |
+                                        (static_cast<std::uint32_t>(data[3]) << 24);
+                const auto stored_length = static_cast<std::uint16_t>(data[4]) |
+                                           (static_cast<std::uint16_t>(data[5]) << 8);
+                if (stored_tag != static_cast<std::uint32_t>(tag) ||
+                    static_cast<std::uint64_t>(stored_length) + 8 != data_length) {
+                    throw FormatError("reparse metadata header does not match its payload");
+                }
+                entry.meta.has_reparse_data = true;
+                entry.meta.reparse_tag = static_cast<std::uint32_t>(tag);
+                entry.meta.reparse_data.assign(data.begin(), data.end());
+            } else if (record_type == kExtraSparseMap) {
+                if (entry.type != kEntryFile) {
+                    throw FormatError("sparse allocation metadata is only valid on files");
+                }
+                if (payload.vint() != 1) {
+                    throw FormatError("unsupported sparse allocation map version");
+                }
+                const auto extent_count = payload.vint();
+                constexpr std::uint64_t kMaxSparseExtents = 1u << 20;
+                if (extent_count > kMaxSparseExtents) {
+                    throw FormatError("sparse allocation map has too many extents");
+                }
+                entry.sparse.is_sparse = true;
+                entry.sparse.allocated.reserve(static_cast<std::size_t>(extent_count));
+                std::uint64_t previous_end = 0;
+                for (std::uint64_t extent_index = 0; extent_index < extent_count;
+                     ++extent_index) {
+                    const auto offset = payload.vint();
+                    const auto length = payload.vint();
+                    if (length == 0 || offset < previous_end || offset > entry.size ||
+                        length > entry.size - offset) {
+                        throw FormatError("sparse allocation map contains an invalid extent");
+                    }
+                    entry.sparse.allocated.push_back({offset, length});
+                    previous_end = offset + length;
+                }
+                if (payload.has_more()) {
+                    throw FormatError("sparse allocation map has trailing data");
+                }
+            } else if (record_type == kExtraChunkRefs) {
+                if (entry.type != kEntryFile) {
+                    throw FormatError("chunk references are only valid on files");
+                }
+                if (payload.vint() != kChunkTableVersion) {
+                    throw FormatError("unsupported chunk-reference version");
+                }
+                const auto count = payload.vint();
+                if (count > kMaxChunkRefsPerEntry) {
+                    throw FormatError("entry has too many chunk references");
+                }
+                entry.chunk_refs.reserve(static_cast<std::size_t>(count));
+                for (std::uint64_t ref = 0; ref < count; ++ref) {
+                    entry.chunk_refs.push_back(payload.vint());
+                }
+                if (payload.has_more()) {
+                    throw FormatError("chunk-reference record has trailing data");
+                }
             }
             // Unknown extra records are intentionally skipped (consumed by length).
         }
@@ -1521,6 +3014,9 @@ ArchiveIndex parse_directory(const ByteVector& directory, std::uint64_t director
 
     // Archive-level extra records (comment, lock, …); unknown ones skipped by length.
     const auto archive_extra_count = reader.vint();
+    bool saw_encryption_record = false;
+    bool saw_chunk_table = false;
+    bool saw_snapshot_manifest = false;
     for (std::uint64_t i = 0; i < archive_extra_count; ++i) {
         const auto record_type = reader.vint();
         Reader payload(reader.take(static_cast<std::size_t>(reader.vint())));
@@ -1529,18 +3025,39 @@ ArchiveIndex parse_directory(const ByteVector& directory, std::uint64_t director
         } else if (record_type == kArchiveLock) {
             index.meta.locked = true;
         } else if (record_type == kArchiveEncryption) {
+            if (saw_encryption_record) {
+                throw FormatError("archive has duplicate encryption records");
+            }
+            saw_encryption_record = true;
             auto& enc = index.meta.encryption;
             enc.enabled = true;
-            enc.kdf.algorithm = static_cast<std::uint32_t>(payload.vint());
-            enc.kdf.mem_blocks = static_cast<std::uint32_t>(payload.vint());
-            enc.kdf.passes = static_cast<std::uint32_t>(payload.vint());
-            enc.kdf.lanes = static_cast<std::uint32_t>(payload.vint());
-            const auto salt_len = static_cast<std::size_t>(payload.vint());
-            const auto salt = payload.take(salt_len);
-            std::copy_n(salt.begin(), std::min(salt_len, enc.kdf.salt.size()), enc.kdf.salt.begin());
-            const auto check_len = static_cast<std::size_t>(payload.vint());
-            const auto check = payload.take(check_len);
+            enc.v2 = false;
+            enc.kdf.algorithm = read_u32_vint(payload, "legacy encryption algorithm");
+            enc.kdf.mem_blocks = read_u32_vint(payload, "legacy encryption memory cost");
+            enc.kdf.passes = read_u32_vint(payload, "legacy encryption pass count");
+            enc.kdf.lanes = read_u32_vint(payload, "legacy encryption lane count");
+            const auto salt_len = payload.vint();
+            if (salt_len != enc.kdf.salt.size()) {
+                throw FormatError("legacy encryption salt must be 16 bytes");
+            }
+            const auto salt = payload.take(enc.kdf.salt.size());
+            std::copy(salt.begin(), salt.end(), enc.kdf.salt.begin());
+            const auto check_len = payload.vint();
+            if (check_len != core::kAeadOverhead + kKeyCheckPlaintext.size()) {
+                throw FormatError("legacy encryption key-check length is invalid");
+            }
+            const auto check = payload.take(static_cast<std::size_t>(check_len));
             enc.key_check.assign(check.begin(), check.end());
+            if (payload.has_more()) {
+                throw FormatError("legacy encryption record has trailing data");
+            }
+        } else if (record_type == kArchiveEncryptionV2) {
+            if (saw_encryption_record) {
+                throw FormatError("archive has duplicate encryption records");
+            }
+            saw_encryption_record = true;
+            index.meta.encryption =
+                parse_encryption_v2_payload(payload.take(payload.remaining()), false);
         } else if (record_type == kArchiveSignature) {
             if (payload.remaining() != index.meta.signature_public_key.size() +
                                            index.meta.signature.size()) {
@@ -1552,10 +3069,184 @@ ArchiveIndex parse_directory(const ByteVector& directory, std::uint64_t director
             const auto signature = payload.take(index.meta.signature.size());
             std::copy(signature.begin(), signature.end(), index.meta.signature.begin());
             index.meta.has_signature = true;
+        } else if (record_type == kArchiveCaptureReport) {
+            const auto warning_count = payload.vint();
+            constexpr std::uint64_t kMaxCaptureWarnings = 1u << 16;
+            if (warning_count > kMaxCaptureWarnings) {
+                throw FormatError("archive capture report has too many warnings");
+            }
+            index.meta.capture_warnings.reserve(
+                static_cast<std::size_t>(warning_count));
+            for (std::uint64_t warning_index = 0; warning_index < warning_count;
+                 ++warning_index) {
+                const auto read_report_string = [&payload](const char* field) {
+                    const auto length = payload.vint();
+                    if (length > payload.remaining() ||
+                        length > (std::uint64_t{1} << 20)) {
+                        throw FormatError(std::string("capture report ") + field +
+                                          " is too large");
+                    }
+                    return payload.str(static_cast<std::size_t>(length));
+                };
+                index.meta.capture_warnings.push_back({
+                    read_report_string("path"), read_report_string("message")});
+            }
+            if (payload.has_more()) {
+                throw FormatError("archive capture report has trailing data");
+            }
+        } else if (record_type == kArchiveChunkTable) {
+            if (saw_chunk_table) {
+                throw FormatError("archive has duplicate chunk tables");
+            }
+            saw_chunk_table = true;
+            if (payload.vint() != kChunkTableVersion) {
+                throw FormatError("unsupported chunk-table version");
+            }
+            const auto table_flags = payload.vint();
+            if ((table_flags & ~std::uint64_t{1}) != 0) {
+                throw FormatError("chunk table uses unsupported flags");
+            }
+            index.meta.chunk_table = true;
+            index.meta.keyed_chunk_ids = (table_flags & 1u) != 0;
+            const auto count = payload.vint();
+            if (count > kMaxChunkCount) {
+                throw FormatError("archive chunk table is too large");
+            }
+            index.chunks.reserve(static_cast<std::size_t>(count));
+            for (std::uint64_t chunk_index = 0; chunk_index < count; ++chunk_index) {
+                ChunkRec chunk;
+                chunk.identity.size = payload.vint();
+                chunk.crc = payload.u32();
+                const auto digest = payload.take(chunk.identity.id.size());
+                std::copy(digest.begin(), digest.end(), chunk.identity.id.begin());
+                chunk.block_index = payload.vint();
+                chunk.offset = payload.vint();
+                index.chunks.push_back(std::move(chunk));
+            }
+            if (payload.has_more()) {
+                throw FormatError("chunk table has trailing data");
+            }
+        } else if (record_type == kArchiveSnapshotManifest) {
+            if (saw_snapshot_manifest) {
+                throw FormatError("archive has duplicate snapshot manifests");
+            }
+            saw_snapshot_manifest = true;
+            if (payload.vint() != kSnapshotManifestVersion) {
+                throw FormatError("unsupported snapshot manifest version");
+            }
+            const auto snapshot_count = payload.vint();
+            if (snapshot_count == 0 || snapshot_count > kMaxSnapshotCount) {
+                throw FormatError("snapshot manifest has an invalid snapshot count");
+            }
+            index.meta.snapshots.reserve(static_cast<std::size_t>(snapshot_count));
+            for (std::uint64_t snapshot_index = 0;
+                 snapshot_index < snapshot_count; ++snapshot_index) {
+                SnapshotRec snapshot;
+                const auto name_length = payload.vint();
+                if (name_length == 0 || name_length > kMaxSnapshotNameBytes ||
+                    name_length > payload.remaining()) {
+                    throw FormatError("snapshot manifest name is invalid");
+                }
+                snapshot.name = payload.str(static_cast<std::size_t>(name_length));
+                validate_snapshot_name(snapshot.name);
+                snapshot.generation = payload.vint();
+                snapshot.created = static_cast<std::int64_t>(payload.u64());
+                const auto snapshot_entry_count = payload.vint();
+                if (snapshot_entry_count > kMaxSnapshotEntries) {
+                    throw FormatError("snapshot manifest has too many entries");
+                }
+                snapshot.entries.reserve(static_cast<std::size_t>(snapshot_entry_count));
+                for (std::uint64_t entry_index = 0; entry_index < snapshot_entry_count;
+                     ++entry_index) {
+                    const auto body_size = payload.vint();
+                    if (body_size > payload.remaining()) {
+                        throw FormatError("snapshot manifest entry is truncated");
+                    }
+                    snapshot.entries.push_back(parse_snapshot_entry_body(
+                        payload.take(static_cast<std::size_t>(body_size))));
+                }
+                index.meta.snapshots.push_back(std::move(snapshot));
+            }
+            if (payload.has_more()) {
+                throw FormatError("snapshot manifest has trailing data");
+            }
         }
     }
 
+    if (reader.has_more()) {
+        throw FormatError("archive directory has trailing data");
+    }
+
+    if (saw_snapshot_manifest && !saw_chunk_table) {
+        throw FormatError("snapshot manifest is missing its chunk table");
+    }
     return index;
+}
+
+void validate_snapshot_index(const ArchiveIndex& index, const ArchiveLayout& layout) {
+    const bool chunk_flag = (layout.flags & kFlagChunkTable) != 0;
+    if (chunk_flag != index.meta.chunk_table) {
+        throw FormatError("chunk-table header flag does not match directory metadata");
+    }
+    if (!index.meta.chunk_table) {
+        if (!index.chunks.empty() || !index.meta.snapshots.empty()) {
+            throw FormatError("ordinary archive contains snapshot-only metadata");
+        }
+        return;
+    }
+    if (layout.version < kArchiveVersion5 || index.meta.snapshots.empty()) {
+        throw FormatError("snapshot archive is missing its v5 manifest");
+    }
+    if (index.meta.keyed_chunk_ids && !index.meta.encryption.enabled) {
+        throw FormatError("keyed chunk identifiers require archive encryption");
+    }
+    for (const auto& chunk : index.chunks) {
+        if (chunk.identity.size == 0 || chunk.block_index >= index.blocks.size()) {
+            throw FormatError("chunk table contains an invalid chunk reference");
+        }
+        const auto& block = index.blocks[static_cast<std::size_t>(chunk.block_index)];
+        if (chunk.offset > block.uncompressed_size ||
+            chunk.identity.size > block.uncompressed_size - chunk.offset) {
+            throw FormatError("chunk table points outside a block");
+        }
+    }
+
+    const auto validate_entries = [&index](const std::vector<EntryRec>& entries) {
+        validate_snapshot_entry_paths_for_read(entries);
+        for (const auto& entry : entries) {
+            if (entry.type != kEntryFile) {
+                if (!entry.chunk_refs.empty()) {
+                    throw FormatError("non-file snapshot entry has chunk references");
+                }
+                continue;
+            }
+            std::uint64_t total = 0;
+            for (const auto ref : entry.chunk_refs) {
+                if (ref >= index.chunks.size()) {
+                    throw FormatError("snapshot entry points outside the chunk table");
+                }
+                const auto size = index.chunks[static_cast<std::size_t>(ref)].identity.size;
+                if (total > entry.size || size > entry.size - total) {
+                    throw FormatError("snapshot chunk sizes overflow the file");
+                }
+                total += size;
+            }
+            if (total != entry.size) {
+                throw FormatError("snapshot chunks do not cover the file");
+            }
+        }
+    };
+
+    std::unordered_set<std::string> names;
+    names.reserve(index.meta.snapshots.size());
+    for (const auto& snapshot : index.meta.snapshots) {
+        validate_snapshot_name(snapshot.name);
+        if (!names.insert(snapshot.name).second) {
+            throw FormatError("snapshot manifest contains duplicate names");
+        }
+        validate_entries(snapshot.entries);
+    }
+    validate_entries(index.entries);
 }
 
 // Read the directory of a non-directory-encrypted archive (plaintext directory).
@@ -1566,7 +3257,31 @@ ArchiveIndex read_index(const ByteSource& source) {
         throw std::runtime_error("archive directory is encrypted; a password is required");
     }
     const auto directory = source.read(layout.directory_offset, layout.directory_size);
-    return parse_directory(directory, layout.directory_offset);
+    auto index = parse_directory(directory, layout.directory_offset);
+    const bool v2_flag = (layout.flags & kFlagEncryptionV2) != 0;
+    if (v2_flag != index.meta.encryption.v2) {
+        throw FormatError("archive encryption-v2 flag does not match its directory metadata");
+    }
+    validate_snapshot_index(index, layout);
+    return index;
+}
+
+std::uint64_t archive_block_region_end(const ArchiveLayout& layout,
+                                      const ArchiveIndex& index) {
+    if (index.blocks.empty()) {
+        // An encrypted-directory archive still has its plaintext preamble even
+        // when it contains no data blocks; a block-only archive starts at the
+        // fixed header end.
+        return (layout.flags & kFlagEncryptedDirectory) != 0
+            ? layout.directory_offset
+            : kHeaderSize;
+    }
+    const auto& last = index.blocks.back();
+    if (last.compressed_size > std::numeric_limits<std::uint64_t>::max() -
+                                   last.compressed_offset) {
+        throw FormatError("archive block region overflows");
+    }
+    return last.compressed_offset + last.compressed_size;
 }
 
 // Decodes solid blocks on demand, caching the most recently used one so the many
@@ -1597,7 +3312,8 @@ ByteVector decode_solid_block(const ByteSource& source,
     }
 
     const auto& record = index.blocks[block_index];
-    auto compressed = source.read(record.compressed_offset, record.compressed_size);
+    auto compressed = source.read_compressed(record.compressed_offset,
+                                             record.compressed_size);
     if (key) {
         // Verify + decrypt before decompressing; the index is the AEAD's AD.
         std::vector<std::uint8_t> plaintext;
@@ -1621,6 +3337,55 @@ ByteVector decode_solid_block(const ByteSource& source,
     return decoded;
 }
 
+struct AxCFrameContext {
+    std::uint16_t version = 0;
+    std::uint8_t codec = 0;
+    bool transforms = false;
+    std::uint64_t payload_offset = 0;
+};
+
+AxCFrameContext read_axc_frame_context(const ByteSource& source,
+                                       const BlockRec& record) {
+    const auto prefix_size = std::min<std::uint64_t>(record.compressed_size, 36);
+    const auto prefix = source.read_compressed(record.compressed_offset, prefix_size);
+    constexpr std::array<std::uint8_t, 8> magic = {'A', 'X', 'I', 'O', 'M', 'C', '1', 0};
+    if (prefix.size() < 32 || !std::equal(magic.begin(), magic.end(), prefix.begin())) {
+        throw FormatError("subframe map points to an invalid AXC block");
+    }
+    const auto version = static_cast<std::uint16_t>(
+        static_cast<std::uint16_t>(prefix[8]) |
+        (static_cast<std::uint16_t>(prefix[9]) << 8));
+    const bool legacy = version == 4;
+    if (!legacy && version != 5 && version != 6 && version != 7 &&
+        version != 8 && version != 9 && version != 10) {
+        throw FormatError("subframe map points to an unsupported AXC version");
+    }
+    AxCFrameContext context;
+    context.version = version;
+    context.codec = prefix[10];
+    if (legacy) {
+        context.payload_offset = 32;
+    } else {
+        if (prefix.size() < 36) {
+            throw FormatError("AXC block header is truncated");
+        }
+        const auto flags = prefix[11];
+        if ((flags & ~1u) != 0) {
+            throw FormatError("AXC block flags are invalid");
+        }
+        const auto metadata_size = static_cast<std::uint64_t>(prefix[32]) |
+            (static_cast<std::uint64_t>(prefix[33]) << 8) |
+            (static_cast<std::uint64_t>(prefix[34]) << 16) |
+            (static_cast<std::uint64_t>(prefix[35]) << 24);
+        context.transforms = (flags & 1u) != 0;
+        context.payload_offset = 36 + metadata_size;
+    }
+    if (context.payload_offset > record.compressed_size) {
+        throw FormatError("AXC block metadata exceeds its compressed size");
+    }
+    return context;
+}
+
 class BlockSource {
 public:
     using DecodeProgressCallback =
@@ -1630,12 +3395,14 @@ public:
                 const ArchiveIndex& index,
                 std::size_t thread_count,
                 std::shared_ptr<OperationControl> operation,
-                std::optional<core::CryptoKey> key = std::nullopt)
+                std::optional<core::CryptoKey> key = std::nullopt,
+                bool use_subframes = false)
         : source_(source),
           index_(index),
           thread_count_(thread_count),
           operation_(std::move(operation)),
-          key_(std::move(key)) {}
+          key_(std::move(key)),
+          use_subframes_(use_subframes) {}
 
     void set_decode_progress(DecodeProgressCallback callback) {
         decode_progress_ = std::move(callback);
@@ -1656,15 +3423,211 @@ public:
         return cached_;
     }
 
+    ByteVector chunk(std::uint64_t chunk_index) {
+        if (chunk_index >= index_.chunks.size()) {
+            throw FormatError("chunk index out of range");
+        }
+        const auto& record = index_.chunks[static_cast<std::size_t>(chunk_index)];
+        const auto& bytes = block(record.block_index);
+        if (record.offset > bytes.size() ||
+            record.identity.size > bytes.size() - record.offset) {
+            throw FormatError("chunk points outside its decoded block");
+        }
+        const auto chunk_bytes = std::span<const std::uint8_t>(
+            bytes.data() + static_cast<std::ptrdiff_t>(record.offset),
+            static_cast<std::size_t>(record.identity.size));
+        auto crc = core::crc32_init();
+        crc = core::crc32_update(crc, chunk_bytes);
+        if (core::crc32_final(crc) != record.crc) {
+            throw FormatError("snapshot chunk checksum mismatch");
+        }
+        const auto digest = chunk_digest(
+            chunk_bytes, key_ ? &*key_ : nullptr, index_.meta.keyed_chunk_ids);
+        if (digest != record.identity.id) {
+            throw FormatError("snapshot chunk identity mismatch");
+        }
+        return ByteVector(
+            bytes.begin() + static_cast<std::ptrdiff_t>(record.offset),
+            bytes.begin() + static_cast<std::ptrdiff_t>(record.offset +
+                                                         record.identity.size));
+    }
+
+    std::uint64_t block_size(std::uint64_t block_index) const {
+        if (block_index >= index_.blocks.size()) {
+            throw FormatError("block index out of range");
+        }
+        return index_.blocks[static_cast<std::size_t>(block_index)].uncompressed_size;
+    }
+
+    ByteVector read_slice(std::uint64_t block_index,
+                          std::uint64_t offset,
+                          std::uint64_t length) {
+        if (block_index >= index_.blocks.size()) {
+            throw FormatError("block index out of range");
+        }
+        const auto& record = index_.blocks[static_cast<std::size_t>(block_index)];
+        if (offset > record.uncompressed_size ||
+            length > record.uncompressed_size - offset) {
+            throw FormatError("requested block range is outside the block");
+        }
+        if (length == 0) return {};
+
+        if (!use_subframes_ || key_ || record.subframes.empty()) {
+            const auto& bytes = block(block_index);
+            return ByteVector(
+                bytes.begin() + static_cast<std::ptrdiff_t>(offset),
+                bytes.begin() + static_cast<std::ptrdiff_t>(offset + length));
+        }
+
+        const auto context = seek_context(block_index, record);
+        if (context.transforms) {
+            const auto& bytes = block(block_index);
+            return ByteVector(
+                bytes.begin() + static_cast<std::ptrdiff_t>(offset),
+                bytes.begin() + static_cast<std::ptrdiff_t>(offset + length));
+        }
+        const auto request_end = offset + length;
+        ByteVector result(static_cast<std::size_t>(length));
+        std::uint64_t copied = 0;
+        for (std::size_t frame_index = 0; frame_index < record.subframes.size();
+             ++frame_index) {
+            const auto& frame = record.subframes[frame_index];
+            const auto frame_end = frame.uncompressed_offset + frame.uncompressed_size;
+            if (frame_end <= offset) continue;
+            if (frame.uncompressed_offset >= request_end) break;
+            const auto copy_begin = std::max(offset, frame.uncompressed_offset);
+            const auto copy_end = std::min(request_end, frame_end);
+            const auto& decoded = subframe(block_index, frame_index, context);
+            const auto source_offset = copy_begin - frame.uncompressed_offset;
+            const auto target_offset = copy_begin - offset;
+            const auto copy_size = copy_end - copy_begin;
+            std::copy(decoded.begin() + static_cast<std::ptrdiff_t>(source_offset),
+                      decoded.begin() + static_cast<std::ptrdiff_t>(source_offset + copy_size),
+                      result.begin() + static_cast<std::ptrdiff_t>(target_offset));
+            copied += copy_size;
+        }
+        if (copied != length) {
+            throw FormatError("subframe map does not cover the requested range");
+        }
+        return result;
+    }
+
 private:
+    const AxCFrameContext& seek_context(std::uint64_t block_index,
+                                        const BlockRec& record) {
+        if (seek_context_block_ != block_index || !seek_context_) {
+            seek_context_ = read_axc_frame_context(source_, record);
+            seek_context_block_ = block_index;
+            cached_subframe_block_ = std::numeric_limits<std::uint64_t>::max();
+            cached_subframe_index_ = std::numeric_limits<std::size_t>::max();
+            cached_subframe_.clear();
+        }
+        const auto& context = *seek_context_;
+        const auto expected_parallel = static_cast<std::uint8_t>(
+            core::CodecId::parallel_blocks);
+        if (context.transforms) return context;
+        for (const auto& frame : record.subframes) {
+            if (frame.compressed_offset < context.payload_offset) {
+                throw FormatError("subframe map points into the AXC header");
+            }
+            if (frame.kind == kSubframeStore &&
+                context.codec != static_cast<std::uint8_t>(core::CodecId::store)) {
+                throw FormatError("stored subframe map does not match its AXC codec");
+            }
+            if (frame.kind == kSubframeParallelBlock && context.codec != expected_parallel) {
+                throw FormatError("parallel subframe map does not match its AXC codec");
+            }
+            if (frame.kind == kSubframeParallelBlock &&
+                ((frame.codec == 6 && context.version < 6) ||
+                 (frame.codec == 7 && context.version < 7) ||
+                 ((frame.codec == 8 || frame.codec == 9) && context.version < 8) ||
+                 (frame.codec == 10 && context.version < 9))) {
+                throw FormatError("parallel subframe codec requires a newer AXC version");
+            }
+            if (frame.kind == kSubframeExternalChunk &&
+                frame.codec != context.codec) {
+                throw FormatError("external subframe map does not match its AXC codec");
+            }
+            if (frame.kind == kSubframeExternalChunk && context.version < 10) {
+                throw FormatError("external subframe codec requires AXC version 10");
+            }
+        }
+        return context;
+    }
+
+    const ByteVector& subframe(std::uint64_t block_index,
+                               std::size_t frame_index,
+                               const AxCFrameContext& context) {
+        if (cached_subframe_block_ == block_index &&
+            cached_subframe_index_ == frame_index) {
+            return cached_subframe_;
+        }
+        const auto& record = index_.blocks[static_cast<std::size_t>(block_index)];
+        const auto& frame = record.subframes[frame_index];
+        if (frame.compressed_offset > record.compressed_size ||
+            frame.compressed_size > record.compressed_size - frame.compressed_offset ||
+            frame.compressed_size >
+                static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max()) ||
+            frame.uncompressed_size >
+                static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) {
+            throw FormatError("subframe exceeds the platform size limit");
+        }
+        if (frame.compressed_offset >
+            std::numeric_limits<std::uint64_t>::max() - record.compressed_offset) {
+            throw FormatError("subframe archive offset overflows");
+        }
+        const auto encoded = source_.read_compressed(
+            record.compressed_offset + frame.compressed_offset,
+            frame.compressed_size);
+        cached_subframe_.resize(static_cast<std::size_t>(frame.uncompressed_size));
+        if (frame.kind == kSubframeStore) {
+            if (encoded.size() != cached_subframe_.size()) {
+                throw FormatError("stored subframe size does not match its map");
+            }
+            std::copy(encoded.begin(), encoded.end(), cached_subframe_.begin());
+        } else if (frame.kind == kSubframeParallelBlock) {
+            codec::decode_parallel_block_frame(
+                encoded, cached_subframe_, frame.codec);
+        } else if (frame.kind == kSubframeExternalChunk) {
+            CompressionMethod method = CompressionMethod::store;
+            if (context.codec == static_cast<std::uint8_t>(core::CodecId::zstandard)) {
+                method = CompressionMethod::zstandard;
+            } else if (context.codec == static_cast<std::uint8_t>(core::CodecId::lzma2)) {
+                method = CompressionMethod::lzma2;
+            } else if (context.codec == static_cast<std::uint8_t>(core::CodecId::deflate)) {
+                method = CompressionMethod::deflate;
+            } else {
+                throw FormatError("external subframe map has an invalid AXC codec");
+            }
+            cached_subframe_ = codec::decode_external_codec_frame(
+                encoded, method, cached_subframe_.size(), frame.lzma_property);
+        } else {
+            throw FormatError("unknown subframe kind");
+        }
+        if (decode_progress_) {
+            decode_progress_(block_index,
+                             frame.uncompressed_offset + frame.uncompressed_size,
+                             record.uncompressed_size);
+        }
+        cached_subframe_block_ = block_index;
+        cached_subframe_index_ = frame_index;
+        return cached_subframe_;
+    }
+
     const ByteSource& source_;
     const ArchiveIndex& index_;
     std::size_t thread_count_ = 0;
     std::shared_ptr<OperationControl> operation_;
     std::optional<core::CryptoKey> key_;
+    bool use_subframes_ = false;
     DecodeProgressCallback decode_progress_;
     std::uint64_t cached_index_ = std::numeric_limits<std::uint64_t>::max();
     ByteVector cached_;
+    std::uint64_t seek_context_block_ = std::numeric_limits<std::uint64_t>::max();
+    std::optional<AxCFrameContext> seek_context_;
+    std::uint64_t cached_subframe_block_ = std::numeric_limits<std::uint64_t>::max();
+    std::size_t cached_subframe_index_ = std::numeric_limits<std::size_t>::max();
+    ByteVector cached_subframe_;
 };
 
 void read_file_bytes(BlockSource& source,
@@ -1678,66 +3641,61 @@ void read_file_bytes(BlockSource& source,
     std::uint64_t within = entry.offset;
     const std::size_t io_chunk = effective_io_buffer_size(io_buffer_size);
 
+    if (!entry.chunk_refs.empty()) {
+        std::uint64_t emitted = 0;
+        for (const auto ref : entry.chunk_refs) {
+            operation_checkpoint(operation);
+            auto chunk = source.chunk(ref);
+            std::size_t offset = 0;
+            while (offset < chunk.size()) {
+                const auto take = std::min<std::size_t>(io_chunk, chunk.size() - offset);
+                sink(std::span<const std::uint8_t>(chunk.data() + offset, take));
+                offset += take;
+                emitted += take;
+            }
+        }
+        if (emitted != entry.size) {
+            throw FormatError("snapshot chunks do not cover the file");
+        }
+        return;
+    }
+
     while (remaining > 0) {
         operation_checkpoint(operation);
         if (block_index >= block_count) {
             throw FormatError("file extends past the last block");
         }
-        const auto& bytes = source.block(block_index);
-        if (within > bytes.size()) {
+        const auto block_size = source.block_size(block_index);
+        if (within > block_size) {
             throw FormatError("file offset lies past its block");
         }
-        const auto available = static_cast<std::uint64_t>(bytes.size()) - within;
+        const auto available = block_size - within;
         const auto take = std::min<std::uint64_t>(
             std::min<std::uint64_t>(available, remaining), io_chunk);
-        sink(std::span<const std::uint8_t>(bytes.data() + within, static_cast<std::size_t>(take)));
+        const auto bytes = source.read_slice(block_index, within, take);
+        sink(bytes);
         remaining -= take;
         within += take;
-        if (within >= bytes.size()) {
+        // `take` is capped by the extraction I/O buffer, so the returned
+        // slice can end well before the solid block does. Advance the archive
+        // block only after consuming the block's declared uncompressed range.
+        if (within >= block_size) {
             within = 0;
             ++block_index;
         }
     }
 }
 
-std::uint64_t read_le64(const std::array<std::uint8_t, 8>& bytes) {
-    std::uint64_t value = 0;
-    for (std::size_t index = 0; index < bytes.size(); ++index) {
-        value |= static_cast<std::uint64_t>(bytes[index]) << (index * 8);
-    }
-    return value;
-}
-
 }  // namespace
 
 // Shared with container_formats.cpp via container_internal.hpp (SFX detection).
+// The layout and both the v2 and v1 read paths live in sfx_image.cpp, which the
+// SFX runtime links as well so the two cannot disagree.
 std::optional<std::pair<std::uint64_t, std::uint64_t>> sfx_embedded_payload_range(
     const fs::path& path) {
-    std::ifstream stream(path, std::ios::binary);
-    if (!stream) return std::nullopt;
-    stream.seekg(0, std::ios::end);
-    const auto end = stream.tellg();
-    if (end < std::streamoff(kSfxMagic.size() + 8 + 1)) {
-        return std::nullopt;
-    }
-    const auto physical_size = static_cast<std::uint64_t>(end);
-    stream.seekg(-static_cast<std::streamoff>(kSfxMagic.size() + 8), std::ios::end);
-    std::array<std::uint8_t, 8> magic{};
-    std::array<std::uint8_t, 8> size_bytes{};
-    stream.read(reinterpret_cast<char*>(magic.data()),
-                static_cast<std::streamsize>(magic.size()));
-    stream.read(reinterpret_cast<char*>(size_bytes.data()),
-                static_cast<std::streamsize>(size_bytes.size()));
-    if (!stream || !std::equal(kSfxMagic.begin(), kSfxMagic.end(), magic.begin())) {
-        return std::nullopt;
-    }
-    const std::uint64_t archive_size = read_le64(size_bytes);
-    const std::uint64_t trailer_size = kSfxMagic.size() + size_bytes.size();
-    if (archive_size == 0 || archive_size > physical_size - trailer_size) {
-        return std::nullopt;
-    }
-    const std::uint64_t archive_offset = physical_size - trailer_size - archive_size;
-    return std::make_pair(archive_offset, archive_size);
+    const auto payload = sfx_locate_payload(path);
+    if (!payload) return std::nullopt;
+    return std::make_pair(payload->payload_offset, payload->payload_size);
 }
 
 std::optional<std::pair<std::uint64_t, std::uint64_t>> sfx_embedded_archive_range(
@@ -1785,7 +3743,8 @@ ArchiveStream open_archive(const fs::path& archive_path, std::uint64_t& file_siz
 // `blocks`/`entries` vectors and advancing `written`. New blocks are numbered from
 // blocks.size(), so seeding `blocks`/`entries`/`written` with an existing archive's
 // contents (and having pre-copied its block bytes into `out`) appends to it.
-void compress_items_into(std::ofstream& out, std::uint64_t& written,
+template <typename Output>
+void compress_items_into(Output& out, std::uint64_t& written,
                          std::vector<BlockRec>& blocks, std::vector<EntryRec>& entries,
                          const std::vector<ScanItem>& items, const CompressionOptions& options,
                          std::size_t block_size,
@@ -1793,12 +3752,22 @@ void compress_items_into(std::ofstream& out, std::uint64_t& written,
                          std::uint64_t total_bytes, std::uint64_t total_items,
                          std::uint64_t& completed_bytes_out, std::uint64_t& completed_items_out,
                          bool allow_unreadable_skips,
-                         const core::CryptoKey* key = nullptr) {
+                         const core::CryptoKey* key = nullptr,
+                         ArchiveMeta* archive_meta = nullptr,
+                         const ArchiveReuseByPath* reuse_by_path = nullptr,
+                         ArchiveReuseStats* reuse_stats = nullptr) {
     ByteVector buffer;
     std::string buffer_path;
     std::vector<CompressionTransformRange> buffer_transform_ranges;
     std::uint64_t current_block = blocks.size();
     std::vector<char> io_buffer(effective_io_buffer_size(options.io_buffer_size));
+    const auto record_capture_warning = [&](const OperationWarning& warning) {
+        if (operation) operation->add_warning(warning);
+        if (archive_meta != nullptr) archive_meta->capture_warnings.push_back(warning);
+        if (options.strict_metadata) {
+            throw std::runtime_error(warning.message + ": " + warning.path);
+        }
+    };
 
     // Shared progress counters: the reader thread advances items, the pipeline
     // worker advances bytes (a block's bytes complete when it finishes
@@ -1806,6 +3775,8 @@ void compress_items_into(std::ofstream& out, std::uint64_t& written,
     std::atomic<std::uint64_t> completed_bytes{completed_bytes_out};
     std::atomic<std::uint64_t> completed_items{completed_items_out};
     std::atomic<std::uint64_t> read_bytes{completed_bytes_out};
+    std::atomic<std::uint64_t> reused_items{0};
+    std::atomic<std::uint64_t> reused_bytes{0};
     const std::uint64_t compression_base = completed_bytes_out;
 
     // A sole regular file has an exact mapping between the operation-wide byte
@@ -1816,7 +3787,7 @@ void compress_items_into(std::ofstream& out, std::uint64_t& written,
     const ScanItem* single_file = nullptr;
     bool multiple_files = false;
     for (const auto& item : items) {
-        if (item.is_directory || item.is_symlink) continue;
+        if (item.is_directory || item.is_symlink || item.is_reparse_point) continue;
         if (single_file != nullptr) {
             multiple_files = true;
             break;
@@ -1884,6 +3855,7 @@ void compress_items_into(std::ofstream& out, std::uint64_t& written,
         std::uint64_t index = 0;
         std::uint64_t original_size = 0;
         ByteVector payload;
+        std::vector<SubframeRec> subframes;
         std::string path;
     };
 
@@ -1937,7 +3909,9 @@ void compress_items_into(std::ofstream& out, std::uint64_t& written,
                              ? single_file->archive_path : path,
                          file_completed, file_total, displayed,
                          compressed_bytes.load(std::memory_order_relaxed),
-                         compressed_source_bytes.load(std::memory_order_relaxed));
+                         compressed_source_bytes.load(std::memory_order_relaxed),
+                         reused_items.load(std::memory_order_relaxed),
+                         reused_bytes.load(std::memory_order_relaxed));
     };
 
     auto compress_block = [&](PendingBlock block) {
@@ -1947,9 +3921,11 @@ void compress_items_into(std::ofstream& out, std::uint64_t& written,
                          initial_progress, total_bytes, completed_items, total_items,
                          block.path.empty() && single_file != nullptr
                              ? single_file->archive_path : block.path,
-                         file_completed, file_total, throughput_progress(),
-                         compressed_bytes.load(std::memory_order_relaxed),
-                         compressed_source_bytes.load(std::memory_order_relaxed));
+                          file_completed, file_total, throughput_progress(),
+                          compressed_bytes.load(std::memory_order_relaxed),
+                          compressed_source_bytes.load(std::memory_order_relaxed),
+                          reused_items.load(std::memory_order_relaxed),
+                          reused_bytes.load(std::memory_order_relaxed));
         auto block_options = options;
         block_options.thread_count = inner_thread_count;
         block_options.task_executor = task_executor;
@@ -1975,6 +3951,8 @@ void compress_items_into(std::ofstream& out, std::uint64_t& written,
                 publish_progress(path);
             };
         auto compressed = compress(block.data, block_options);
+        auto subframes = !key ? make_subframe_map(compressed)
+                                        : std::vector<SubframeRec>{};
         if (key != nullptr) {
             // The block index is allocated at dispatch, so parallel completion
             // cannot change the AEAD associated data or archive byte order.
@@ -1988,7 +3966,8 @@ void compress_items_into(std::ofstream& out, std::uint64_t& written,
         completed_bytes.fetch_add(block.data.size(), std::memory_order_relaxed);
         publish_progress(block.path);
         return CompletedBlock{block.index, static_cast<std::uint64_t>(block.data.size()),
-                              std::move(compressed), std::move(block.path)};
+                              std::move(compressed), std::move(subframes),
+                              std::move(block.path)};
     };
 
     auto pipeline_worker = [&] {
@@ -2072,7 +4051,7 @@ void compress_items_into(std::ofstream& out, std::uint64_t& written,
 
             operation_checkpoint(operation);
             blocks.push_back({written, static_cast<std::uint64_t>(block.payload.size()),
-                              block.original_size});
+                              block.original_size, std::move(block.subframes)});
             out.write(reinterpret_cast<const char*>(block.payload.data()),
                       static_cast<std::streamsize>(block.payload.size()));
             if (!out) {
@@ -2090,7 +4069,9 @@ void compress_items_into(std::ofstream& out, std::uint64_t& written,
                                  ? single_file->archive_path : std::move(block.path),
                              file_completed, file_total, throughput_progress(),
                              compressed_bytes.load(std::memory_order_relaxed),
-                             compressed_source_bytes.load(std::memory_order_relaxed));
+                             compressed_source_bytes.load(std::memory_order_relaxed),
+                             reused_items.load(std::memory_order_relaxed),
+                             reused_bytes.load(std::memory_order_relaxed));
         }
     };
 
@@ -2139,7 +4120,7 @@ void compress_items_into(std::ofstream& out, std::uint64_t& written,
             throw std::runtime_error("path too long to archive: " + item.archive_path);
         }
 
-        if (!item.is_directory && !item.is_symlink) {
+        if (!item.is_directory && !item.is_symlink && !item.is_reparse_point) {
             const int current_class = compression_type_class(item);
             const auto minimum_group = std::max<std::size_t>(
                 1, std::min<std::size_t>(std::size_t{1} << 20, block_size / 4));
@@ -2153,21 +4134,50 @@ void compress_items_into(std::ofstream& out, std::uint64_t& written,
         EntryRec entry;
         entry.path = item.archive_path;
         entry.meta = core::capture_metadata(item.absolute);
+        for (const auto& message : entry.meta.capture_warnings) {
+            record_capture_warning({item.archive_path, message});
+        }
+
+        if (item.is_reparse_point && !item.is_directory) {
+            record_capture_warning({
+                item.archive_path,
+                "Skipped a non-directory reparse point because following its target is unsafe.",
+            });
+            ++completed_items;
+            report_operation(operation, OperationStage::reading, displayed_progress(), total_bytes,
+                             completed_items, total_items, item.archive_path, 0, 0,
+                             throughput_progress(), 0, 0,
+                             reused_items.load(std::memory_order_relaxed),
+                             reused_bytes.load(std::memory_order_relaxed));
+            continue;
+        }
 
         if (item.is_symlink) {
             entry.type = kEntrySymlink;
             entry.link_target = item.symlink_target;
+            // The link target is already represented by the entry type. Do not
+            // duplicate the platform-specific raw reparse buffer for symlinks.
+            entry.meta.has_reparse_data = false;
+            entry.meta.reparse_tag = 0;
+            entry.meta.reparse_data.clear();
             entries.push_back(std::move(entry));
             ++completed_items;
             report_operation(operation, OperationStage::reading, displayed_progress(), total_bytes,
                              completed_items, total_items, item.archive_path, 0, 0,
-                             throughput_progress());
+                             throughput_progress(), 0, 0,
+                             reused_items.load(std::memory_order_relaxed),
+                             reused_bytes.load(std::memory_order_relaxed));
             continue;
         }
 
         std::error_code ec;
+        std::int64_t source_stamp = 0;
+        bool source_stamp_valid = false;
         const auto stamp = fs::last_write_time(item.absolute, ec);
         if (!ec) {
+            source_stamp =
+                static_cast<std::int64_t>(stamp.time_since_epoch().count());
+            source_stamp_valid = true;
             try {
                 entry.mtime = to_unix_seconds(stamp);
             } catch (...) {
@@ -2180,7 +4190,9 @@ void compress_items_into(std::ofstream& out, std::uint64_t& written,
             ++completed_items;
             report_operation(operation, OperationStage::reading, displayed_progress(), total_bytes,
                              completed_items, total_items, item.archive_path, 0, 0,
-                             throughput_progress());
+                             throughput_progress(), 0, 0,
+                             reused_items.load(std::memory_order_relaxed),
+                             reused_bytes.load(std::memory_order_relaxed));
             continue;
         }
 
@@ -2192,10 +4204,22 @@ void compress_items_into(std::ofstream& out, std::uint64_t& written,
                                          core::path_to_utf8(item.absolute));
             }
             report_skipped_input(item, operation);
+            const OperationWarning warning{
+                item.archive_path,
+                "Skipped because the file disappeared or access remained denied after retries.",
+            };
+            if (archive_meta != nullptr) {
+                archive_meta->capture_warnings.push_back(warning);
+            }
+            if (options.strict_metadata) {
+                throw std::runtime_error(warning.message + ": " + item.archive_path);
+            }
             ++completed_items;
             report_operation(operation, OperationStage::reading, displayed_progress(),
                              total_bytes, completed_items, total_items,
-                             item.archive_path, 0, 0, throughput_progress());
+                             item.archive_path, 0, 0, throughput_progress(), 0, 0,
+                             reused_items.load(std::memory_order_relaxed),
+                             reused_bytes.load(std::memory_order_relaxed));
             continue;
         }
 
@@ -2213,10 +4237,99 @@ void compress_items_into(std::ofstream& out, std::uint64_t& written,
                 ++completed_items;
                 report_operation(operation, OperationStage::reading, displayed_progress(), total_bytes,
                                  completed_items, total_items, item.archive_path, 0, 0,
-                                 throughput_progress());
+                                 throughput_progress(), 0, 0,
+                                 reused_items.load(std::memory_order_relaxed),
+                                 reused_bytes.load(std::memory_order_relaxed));
                 continue;
             }
             hardlinks.emplace(identity, item.archive_path);  // canonical copy follows below
+        }
+
+        std::error_code size_error;
+        std::uint64_t file_total = fs::file_size(item.absolute, size_error);
+        if (size_error) {
+            file_total = 0;
+        }
+        const ReuseCandidate* reuse_candidate = nullptr;
+        if (reuse_by_path != nullptr && !size_error && source_stamp_valid) {
+            const auto found = reuse_by_path->find(item.archive_path);
+            if (found != reuse_by_path->end() &&
+                file_total == found->second.identity.size &&
+                source_stamp == found->second.source_stamp) {
+                reuse_candidate = &found->second;
+            }
+        }
+        if (reuse_candidate != nullptr) {
+            // The comparison pass runs before the archive is staged. Rehash a
+            // candidate through a fresh handle so a same-size source mutation
+            // between those phases cannot make the directory point at the wrong
+            // existing bytes. The original handle remains untouched for the
+            // normal compression fallback.
+            std::ifstream verification;
+            if (!open_input_with_retry(verification, item.absolute,
+                                       options.input_open_retries, operation)) {
+                reuse_candidate = nullptr;
+            } else {
+                const auto verified = try_hash_input_stream(
+                    verification, file_total, options, operation);
+                std::error_code verification_stamp_error;
+                const auto verification_stamp =
+                    fs::last_write_time(item.absolute, verification_stamp_error);
+                const bool stamp_unchanged = !verification_stamp_error &&
+                    static_cast<std::int64_t>(
+                        verification_stamp.time_since_epoch().count()) == source_stamp;
+                if (!verified || *verified != reuse_candidate->identity ||
+                    !stamp_unchanged) {
+                    reuse_candidate = nullptr;
+                }
+            }
+        }
+        if (reuse_candidate != nullptr) {
+            // The input was opened above so normal disappearing/permission errors
+            // retain the same policy as a fresh compression. Its bytes are already
+            // present in an existing block range; only the directory entry changes.
+            in.close();
+            entry.type = kEntryFile;
+            entry.size = reuse_candidate->identity.size;
+            entry.crc = reuse_candidate->identity.crc;
+            entry.blake3 = reuse_candidate->identity.blake3;
+            entry.has_blake3 = true;
+            entry.first_block = reuse_candidate->data.first_block;
+            entry.offset = reuse_candidate->data.offset;
+            if (options.preserve_sparse_files && file_total != 0) {
+                const auto sparse_capture =
+                    core::capture_sparse_file(item.absolute, file_total);
+                if (sparse_capture.map) {
+                    entry.sparse = std::move(*sparse_capture.map);
+                } else if (!sparse_capture.warning.empty()) {
+                    OperationWarning warning{
+                        item.archive_path,
+                        "Sparse allocation was not captured: " + sparse_capture.warning,
+                    };
+                    if (archive_meta != nullptr) {
+                        archive_meta->capture_warnings.push_back(warning);
+                    }
+                    if (operation) operation->add_warning(warning);
+                    if (options.strict_metadata) {
+                        throw std::runtime_error(warning.message + ": " + item.archive_path);
+                    }
+                }
+            }
+            entry.ads = core::capture_ads(item.absolute);
+            entries.push_back(std::move(entry));
+            reused_items.fetch_add(1, std::memory_order_relaxed);
+            reused_bytes.fetch_add(file_total, std::memory_order_relaxed);
+            read_bytes.fetch_add(file_total, std::memory_order_relaxed);
+            compressed_source_bytes.fetch_add(file_total, std::memory_order_relaxed);
+            ++completed_items;
+            report_operation(operation, OperationStage::reading, displayed_progress(),
+                             total_bytes, completed_items, total_items,
+                             item.archive_path, file_total, file_total,
+                             throughput_progress(), compressed_bytes.load(std::memory_order_relaxed),
+                             compressed_source_bytes.load(std::memory_order_relaxed),
+                             reused_items.load(std::memory_order_relaxed),
+                             reused_bytes.load(std::memory_order_relaxed));
+            continue;
         }
 
         entry.type = kEntryFile;
@@ -2228,14 +4341,30 @@ void compress_items_into(std::ofstream& out, std::uint64_t& written,
         std::uint64_t total = 0;
         codec::TransformHint transform_hint;
         bool transform_classified = false;
-        std::error_code size_error;
-        std::uint64_t file_total = fs::file_size(item.absolute, size_error);
-        if (size_error) {
-            file_total = 0;
+        if (options.preserve_sparse_files && file_total != 0) {
+            const auto sparse_capture =
+                core::capture_sparse_file(item.absolute, file_total);
+            if (sparse_capture.map) {
+                entry.sparse = std::move(*sparse_capture.map);
+            } else if (!sparse_capture.warning.empty()) {
+                OperationWarning warning{
+                    item.archive_path,
+                    "Sparse allocation was not captured: " + sparse_capture.warning,
+                };
+                if (archive_meta != nullptr) {
+                    archive_meta->capture_warnings.push_back(warning);
+                }
+                if (operation) operation->add_warning(warning);
+                if (options.strict_metadata) {
+                    throw std::runtime_error(warning.message + ": " + item.archive_path);
+                }
+            }
         }
         report_operation(operation, OperationStage::reading, displayed_progress(), total_bytes,
                          completed_items, total_items, item.archive_path, 0, file_total,
-                         throughput_progress());
+                         throughput_progress(), 0, 0,
+                         reused_items.load(std::memory_order_relaxed),
+                         reused_bytes.load(std::memory_order_relaxed));
         while (in) {
             operation_checkpoint(operation);
             in.read(io_buffer.data(), static_cast<std::streamsize>(io_buffer.size()));
@@ -2286,7 +4415,9 @@ void compress_items_into(std::ofstream& out, std::uint64_t& written,
             buffer.insert(buffer.end(), bytes.begin(), bytes.end());
             report_operation(operation, OperationStage::reading, displayed_progress(), total_bytes,
                              completed_items, total_items, item.archive_path, total,
-                             std::max(total, file_total), throughput_progress());
+                             std::max(total, file_total), throughput_progress(), 0, 0,
+                             reused_items.load(std::memory_order_relaxed),
+                             reused_bytes.load(std::memory_order_relaxed));
             if (buffer.size() >= block_size) {
                 flush_block();
             }
@@ -2297,6 +4428,20 @@ void compress_items_into(std::ofstream& out, std::uint64_t& written,
         }
 
         entry.size = total;
+        if (entry.sparse.is_sparse && file_total != total) {
+            const OperationWarning warning{
+                item.archive_path,
+                "Sparse allocation was not captured consistently because the source file changed while it was being read.",
+            };
+            entry.sparse = {};
+            if (archive_meta != nullptr) {
+                archive_meta->capture_warnings.push_back(warning);
+            }
+            if (operation) operation->add_warning(warning);
+            if (options.strict_metadata) {
+                throw std::runtime_error(warning.message + ": " + item.archive_path);
+            }
+        }
         entry.crc = core::crc32_final(crc);
         entry.blake3 = hasher.finalize();
         entry.has_blake3 = true;
@@ -2305,7 +4450,9 @@ void compress_items_into(std::ofstream& out, std::uint64_t& written,
         ++completed_items;
         report_operation(operation, OperationStage::reading, displayed_progress(), total_bytes,
                          completed_items, total_items, item.archive_path, total, total,
-                         throughput_progress());
+                         throughput_progress(), 0, 0,
+                         reused_items.load(std::memory_order_relaxed),
+                         reused_bytes.load(std::memory_order_relaxed));
     }
     flush_block();
 
@@ -2339,14 +4486,66 @@ void compress_items_into(std::ofstream& out, std::uint64_t& written,
             worker.join();
         }
     }
-    completed_bytes_out = completed_bytes;
-    completed_items_out = completed_items;
+    const auto reused_item_count = reused_items.load(std::memory_order_relaxed);
+    const auto reused_byte_count = reused_bytes.load(std::memory_order_relaxed);
+    completed_bytes.fetch_add(reused_byte_count, std::memory_order_relaxed);
+    completed_bytes_out = completed_bytes.load(std::memory_order_relaxed);
+    completed_items_out = completed_items.load(std::memory_order_relaxed);
+    if (reuse_stats != nullptr) {
+        reuse_stats->reused_items = reused_item_count;
+        reuse_stats->reused_bytes = reused_byte_count;
+    }
+    if (reused_item_count != 0) {
+        report_operation(operation, OperationStage::finalizing, completed_bytes_out,
+                         total_bytes, completed_items_out, total_items, {}, 0, 0,
+                         throughput_progress(),
+                         compressed_bytes.load(std::memory_order_relaxed),
+                         compressed_source_bytes.load(std::memory_order_relaxed),
+                         reused_item_count, reused_byte_count);
+    }
 }
 
-// Build encryption parameters for a new archive: random salt, default Argon2id cost,
-// a freshly derived key, and a key-check token (the fixed plaintext sealed under the
-// key, with the salt as associated data). Returns the metadata and the live key.
+constexpr std::uint32_t kMaxKdfMemBlocks = 1u << 21;  // 2 GiB of 1 KiB blocks
+constexpr std::uint32_t kMaxKdfPasses = 64;
+constexpr std::size_t kMaxEncryptionPasswordBytes = 1u << 20;
+
+void validate_password_input(const std::string& password, const char* field) {
+    if (password.empty()) {
+        throw std::invalid_argument(std::string(field) + " must not be empty");
+    }
+    if (password.size() > kMaxEncryptionPasswordBytes) {
+        throw std::invalid_argument(std::string(field) + " is too long");
+    }
+}
+
+void validate_kdf_parameters(const core::KdfParams& kdf, const char* context) {
+    if (kdf.algorithm > 2 || kdf.lanes < 1 ||
+        kdf.passes < 1 || kdf.passes > kMaxKdfPasses ||
+        kdf.mem_blocks < 8 * kdf.lanes || kdf.mem_blocks > kMaxKdfMemBlocks) {
+        throw FormatError(std::string(context) + " has implausible KDF parameters");
+    }
+}
+
+EncryptionSlot make_encryption_slot(const EncryptionInfo& enc, std::uint32_t id,
+                                    const std::string& password,
+                                    const core::CryptoKey& data_key) {
+    validate_password_input(password, "password");
+    EncryptionSlot slot;
+    slot.id = id;
+    core::random_bytes(slot.kdf.salt);
+    auto password_key = core::derive_key(password, slot.kdf);
+    const auto ad = encryption_slot_associated_data(enc, slot.id);
+    slot.wrapped_key = core::aead_seal(password_key, data_key, ad);
+    core::secure_wipe(password_key);
+    validate_encryption_slot_shape(slot);
+    return slot;
+}
+
+// Build the legacy v1 encryption parameters used by old v4 archives. New
+// archives use make_encryption_v2 below, but retaining this path keeps a local
+// compatibility writer and the old wire format readable/testable forever.
 std::pair<EncryptionInfo, core::CryptoKey> make_encryption(const std::string& password) {
+    validate_password_input(password, "password");
     EncryptionInfo enc;
     enc.enabled = true;
     enc.kdf = core::KdfParams{};
@@ -2357,23 +4556,93 @@ std::pair<EncryptionInfo, core::CryptoKey> make_encryption(const std::string& pa
     return {std::move(enc), key};
 }
 
+std::pair<EncryptionInfo, core::CryptoKey> make_encryption_v2(
+    const std::string& password) {
+    validate_password_input(password, "password");
+    EncryptionInfo enc;
+    enc.enabled = true;
+    enc.v2 = true;
+    core::random_bytes(enc.key_id);
+    core::CryptoKey data_key{};
+    core::random_bytes(data_key);
+    enc.slots.push_back(make_encryption_slot(enc, 1, password, data_key));
+    return {std::move(enc), data_key};
+}
+
+ByteVector serialize_encryption_v2_payload(const EncryptionInfo& enc) {
+    if (!enc.enabled || !enc.v2 || enc.slots.empty() ||
+        enc.slots.size() > kMaxEncryptionSlots) {
+        throw std::runtime_error("invalid encryption-v2 metadata");
+    }
+    ByteVector payload;
+    payload.insert(payload.end(), kEncryptionV2Magic.begin(), kEncryptionV2Magic.end());
+    put_u16(payload, kEncryptionV2Version);
+    put_u16(payload, 0);  // no optional/unknown required options
+    payload.insert(payload.end(), enc.key_id.begin(), enc.key_id.end());
+    put_vint(payload, enc.slots.size());
+    std::unordered_set<std::uint32_t> slot_ids;
+    for (const auto& slot : enc.slots) {
+        if (!slot_ids.insert(slot.id).second) {
+            throw std::runtime_error("duplicate encryption-v2 password slot");
+        }
+        validate_kdf_parameters(slot.kdf, "encryption slot");
+        validate_encryption_slot_shape(slot);
+        put_u32(payload, slot.id);
+        put_vint(payload, slot.kdf.algorithm);
+        put_vint(payload, slot.kdf.mem_blocks);
+        put_vint(payload, slot.kdf.passes);
+        put_vint(payload, slot.kdf.lanes);
+        put_vint(payload, slot.kdf.salt.size());
+        payload.insert(payload.end(), slot.kdf.salt.begin(), slot.kdf.salt.end());
+        put_vint(payload, slot.wrapped_key.size());
+        payload.insert(payload.end(), slot.wrapped_key.begin(), slot.wrapped_key.end());
+    }
+    return payload;
+}
+
 // Serialize the plaintext encryption preamble (a fixed u32 length then the Argon2
 // parameters, salt, and key-check) that precedes the blocks of a sealed-directory
 // archive.
 ByteVector serialize_encryption_preamble(const EncryptionInfo& enc) {
-    ByteVector params;
-    put_vint(params, enc.kdf.algorithm);
-    put_vint(params, enc.kdf.mem_blocks);
-    put_vint(params, enc.kdf.passes);
-    put_vint(params, enc.kdf.lanes);
-    put_vint(params, enc.kdf.salt.size());
-    params.insert(params.end(), enc.kdf.salt.begin(), enc.kdf.salt.end());
-    put_vint(params, enc.key_check.size());
-    params.insert(params.end(), enc.key_check.begin(), enc.key_check.end());
+    ByteVector params = enc.v2 ? serialize_encryption_v2_payload(enc) : ByteVector{};
+    if (!enc.v2) {
+        put_vint(params, enc.kdf.algorithm);
+        put_vint(params, enc.kdf.mem_blocks);
+        put_vint(params, enc.kdf.passes);
+        put_vint(params, enc.kdf.lanes);
+        put_vint(params, enc.kdf.salt.size());
+        params.insert(params.end(), enc.kdf.salt.begin(), enc.kdf.salt.end());
+        put_vint(params, enc.key_check.size());
+        params.insert(params.end(), enc.key_check.begin(), enc.key_check.end());
+    }
+    if (params.size() > std::numeric_limits<std::uint32_t>::max()) {
+        throw std::runtime_error("encryption preamble is too large");
+    }
     ByteVector out;
     put_u32(out, static_cast<std::uint32_t>(params.size()));
     out.insert(out.end(), params.begin(), params.end());
     return out;
+}
+
+bool try_unwrap_encryption_slot(const EncryptionInfo& enc,
+                                const EncryptionSlot& slot,
+                                const std::string& password,
+                                core::CryptoKey& data_key) {
+    validate_kdf_parameters(slot.kdf, "encryption slot");
+    validate_encryption_slot_shape(slot);
+    auto password_key = core::derive_key(password, slot.kdf);
+    const auto ad = encryption_slot_associated_data(enc, slot.id);
+    std::vector<std::uint8_t> plain;
+    const bool ok = core::aead_open(password_key, slot.wrapped_key, ad, plain) &&
+                    plain.size() == sizeof(core::CryptoKey);
+    core::secure_wipe(password_key);
+    if (!ok) {
+        core::secure_wipe(plain);
+        return false;
+    }
+    std::copy(plain.begin(), plain.end(), data_key.begin());
+    core::secure_wipe(plain);
+    return true;
 }
 
 // Re-derive an encrypted archive's key from the password and verify it against the
@@ -2383,21 +4652,30 @@ core::CryptoKey derive_archive_key(const EncryptionInfo& enc, const std::string&
     if (password.empty()) {
         throw std::runtime_error("archive is encrypted; a password is required");
     }
-    // The KDF parameters come from the untrusted header; a hostile archive could ask
-    // for terabytes of Argon2 memory to OOM whoever supplies a password. Bound them
-    // (and enforce Argon2's own minimums) before allocating.
-    constexpr std::uint32_t kMaxKdfMemBlocks = 1u << 21;  // 2 GiB of 1 KiB blocks
-    constexpr std::uint32_t kMaxKdfPasses = 64;
-    if (enc.kdf.lanes < 1 || enc.kdf.passes < 1 || enc.kdf.passes > kMaxKdfPasses ||
-        enc.kdf.mem_blocks < 8 * enc.kdf.lanes || enc.kdf.mem_blocks > kMaxKdfMemBlocks) {
-        throw std::runtime_error("encrypted archive has implausible KDF parameters");
+    validate_password_input(password, "password");
+    if (enc.v2) {
+        if (enc.slots.empty() || enc.slots.size() > kMaxEncryptionSlots) {
+            throw FormatError("encrypted archive has no valid password slots");
+        }
+        for (const auto& slot : enc.slots) {
+            core::CryptoKey data_key{};
+            if (try_unwrap_encryption_slot(enc, slot, password, data_key)) {
+                return data_key;
+            }
+        }
+        throw std::runtime_error("wrong password for encrypted archive");
     }
+
+    // The KDF parameters come from the untrusted header; validate them before
+    // Argon2 allocates its memory-hard work area.
+    validate_kdf_parameters(enc.kdf, "encrypted archive");
     core::CryptoKey key = core::derive_key(password, enc.kdf);
     const std::span<const std::uint8_t> ad(enc.kdf.salt.data(), enc.kdf.salt.size());
     std::vector<std::uint8_t> check;
     const bool ok = core::aead_open(key, enc.key_check, ad, check) &&
                     check.size() == kKeyCheckPlaintext.size() &&
                     std::equal(check.begin(), check.end(), kKeyCheckPlaintext.begin());
+    core::secure_wipe(check);
     if (!ok) {
         core::secure_wipe(key);
         throw std::runtime_error("wrong password for encrypted archive");
@@ -2411,6 +4689,18 @@ struct LoadedArchive {
     std::optional<core::CryptoKey> key;
 };
 
+struct OptionalKeyWipeGuard {
+    std::optional<core::CryptoKey>& key;
+    ~OptionalKeyWipeGuard() {
+        if (key) core::secure_wipe(*key);
+    }
+};
+
+struct CryptoKeyWipeGuard {
+    core::CryptoKey& key;
+    ~CryptoKeyWipeGuard() { core::secure_wipe(key); }
+};
+
 // Read an archive's directory, transparently handling encryption. For a
 // directory-encrypted archive the preamble carries the parameters, the directory is
 // decrypted before parsing, and a password is mandatory; for a block-only encrypted
@@ -2421,6 +4711,9 @@ LoadedArchive load_index(const ByteSource& source, const std::string& password) 
     if ((layout.flags & kFlagEncryptedDirectory) != 0) {
         const auto preamble = source.read(layout.preamble_offset, layout.preamble_size);
         const EncryptionInfo enc = parse_encryption_preamble(preamble);
+        if (((layout.flags & kFlagEncryptionV2) != 0) != enc.v2) {
+            throw FormatError("archive encryption-v2 flag does not match its preamble");
+        }
         core::CryptoKey key = derive_archive_key(enc, password);
         const auto sealed = source.read(layout.directory_offset, layout.directory_size);
         ByteVector plain;
@@ -2433,18 +4726,27 @@ LoadedArchive load_index(const ByteSource& source, const std::string& password) 
         loaded.index = parse_directory(plain, layout.directory_offset);
         loaded.index.meta.encryption = enc;
         loaded.key = key;
+        validate_snapshot_index(loaded.index, layout);
     } else {
         const auto directory = source.read(layout.directory_offset, layout.directory_size);
         loaded.index = parse_directory(directory, layout.directory_offset);
+        if (((layout.flags & kFlagEncryptionV2) != 0) !=
+            loaded.index.meta.encryption.v2) {
+            throw FormatError(
+                "archive encryption-v2 flag does not match its directory metadata");
+        }
         // Block-only encryption keeps the directory plaintext, so list/comment work
         // without a password; the key is derived only when one is supplied (to read
         // blocks). Callers that need block data check for the key and demand it.
         if (loaded.index.meta.encryption.enabled && !password.empty()) {
             loaded.key = derive_archive_key(loaded.index.meta.encryption, password);
         }
+        validate_snapshot_index(loaded.index, layout);
     }
     return loaded;
 }
+
+ByteVector serialize_snapshot_entry_body(const EntryRec& entry);
 
 core::Blake3Digest archive_signature_digest(const ByteSource& source,
                                             const ArchiveLayout& layout,
@@ -2467,12 +4769,41 @@ core::Blake3Digest archive_signature_digest(const ByteSource& source,
         offset += count;
     }
 
+    // A generation's history is part of what was signed.  Hash the canonical
+    // extension bytes rather than reading them from the source so the digest is
+    // stable when the signed directory is rewritten and changes its length.
+    if (layout.generation_size != 0) {
+        if (layout.generation_size != kGenerationExtensionSize) {
+            throw FormatError("archive generation extension has an invalid size");
+        }
+        const auto extension = generation_extension_bytes(
+            layout.generation, layout.previous_footer_offset,
+            layout.previous_directory_offset, layout.previous_directory_size,
+            layout.previous_generation_offset);
+        hasher.update(extension);
+    }
+
     ByteVector manifest;
     put_vint(manifest, index.blocks.size());
+    const bool has_subframe_map = std::any_of(
+        index.blocks.begin(), index.blocks.end(),
+        [](const BlockRec& block) { return !block.subframes.empty(); });
     for (const auto& block : index.blocks) {
         put_u64(manifest, block.compressed_offset);
         put_u64(manifest, block.compressed_size);
         put_u64(manifest, block.uncompressed_size);
+        if (has_subframe_map) {
+            put_vint(manifest, block.subframes.size());
+            for (const auto& frame : block.subframes) {
+                put_u64(manifest, frame.uncompressed_offset);
+                put_u64(manifest, frame.uncompressed_size);
+                put_u64(manifest, frame.compressed_offset);
+                put_u64(manifest, frame.compressed_size);
+                manifest.push_back(frame.kind);
+                manifest.push_back(frame.codec);
+                manifest.push_back(frame.lzma_property);
+            }
+        }
     }
     put_vint(manifest, index.entries.size());
     for (const auto& entry : index.entries) {
@@ -2507,6 +4838,60 @@ core::Blake3Digest archive_signature_digest(const ByteSource& source,
             put_vint(manifest, stream.data.size());
             manifest.insert(manifest.end(), stream.data.begin(), stream.data.end());
         }
+        if ((layout.flags & kFlagExtendedMetadata) != 0) {
+            manifest.push_back(entry.meta.has_windows_security_descriptor ? 1 : 0);
+            put_vint(manifest, entry.meta.windows_security_descriptor.size());
+            manifest.insert(manifest.end(), entry.meta.windows_security_descriptor.begin(),
+                            entry.meta.windows_security_descriptor.end());
+            put_vint(manifest, entry.meta.xattrs.size());
+            for (const auto& xattr : entry.meta.xattrs) {
+                put_vint(manifest, xattr.name.size());
+                manifest.insert(manifest.end(), xattr.name.begin(), xattr.name.end());
+                put_vint(manifest, xattr.data.size());
+                manifest.insert(manifest.end(), xattr.data.begin(), xattr.data.end());
+            }
+            manifest.push_back(entry.meta.has_reparse_data ? 1 : 0);
+            put_u32(manifest, entry.meta.reparse_tag);
+            put_vint(manifest, entry.meta.reparse_data.size());
+            manifest.insert(manifest.end(), entry.meta.reparse_data.begin(),
+                            entry.meta.reparse_data.end());
+        }
+        if (layout.version >= kArchiveVersion5) {
+            manifest.push_back(entry.sparse.is_sparse ? 1 : 0);
+            put_vint(manifest, entry.sparse.allocated.size());
+            for (const auto& extent : entry.sparse.allocated) {
+                put_u64(manifest, extent.offset);
+                put_u64(manifest, extent.length);
+            }
+        }
+        if (index.meta.chunk_table) {
+            put_vint(manifest, entry.chunk_refs.size());
+            for (const auto ref : entry.chunk_refs) put_vint(manifest, ref);
+        }
+    }
+    if (index.meta.chunk_table) {
+        put_vint(manifest, index.meta.keyed_chunk_ids ? 1 : 0);
+        put_vint(manifest, index.chunks.size());
+        for (const auto& chunk : index.chunks) {
+            put_u64(manifest, chunk.identity.size);
+            put_u32(manifest, chunk.crc);
+            manifest.insert(manifest.end(), chunk.identity.id.begin(), chunk.identity.id.end());
+            put_u64(manifest, chunk.block_index);
+            put_u64(manifest, chunk.offset);
+        }
+        put_vint(manifest, index.meta.snapshots.size());
+        for (const auto& snapshot : index.meta.snapshots) {
+            put_vint(manifest, snapshot.name.size());
+            manifest.insert(manifest.end(), snapshot.name.begin(), snapshot.name.end());
+            put_u64(manifest, snapshot.generation);
+            put_u64(manifest, static_cast<std::uint64_t>(snapshot.created));
+            put_vint(manifest, snapshot.entries.size());
+            for (const auto& entry : snapshot.entries) {
+                const auto body = serialize_snapshot_entry_body(entry);
+                put_vint(manifest, body.size());
+                manifest.insert(manifest.end(), body.begin(), body.end());
+            }
+        }
     }
     put_vint(manifest, index.meta.comment.size());
     manifest.insert(manifest.end(), index.meta.comment.begin(), index.meta.comment.end());
@@ -2514,36 +4899,292 @@ core::Blake3Digest archive_signature_digest(const ByteSource& source,
     manifest.push_back(index.meta.encryption.enabled ? 1 : 0);
     manifest.push_back(index.meta.encryption.encrypt_directory ? 1 : 0);
     if (index.meta.encryption.enabled) {
-        const auto& kdf = index.meta.encryption.kdf;
-        put_u32(manifest, kdf.algorithm);
-        put_u32(manifest, kdf.mem_blocks);
-        put_u32(manifest, kdf.passes);
-        put_u32(manifest, kdf.lanes);
-        manifest.insert(manifest.end(), kdf.salt.begin(), kdf.salt.end());
-        put_vint(manifest, index.meta.encryption.key_check.size());
-        manifest.insert(manifest.end(), index.meta.encryption.key_check.begin(),
-                        index.meta.encryption.key_check.end());
+        if (index.meta.encryption.v2) {
+            manifest.push_back(2);
+            manifest.insert(manifest.end(), index.meta.encryption.key_id.begin(),
+                            index.meta.encryption.key_id.end());
+            put_vint(manifest, index.meta.encryption.slots.size());
+            for (const auto& slot : index.meta.encryption.slots) {
+                put_u32(manifest, slot.id);
+                put_u32(manifest, slot.kdf.algorithm);
+                put_u32(manifest, slot.kdf.mem_blocks);
+                put_u32(manifest, slot.kdf.passes);
+                put_u32(manifest, slot.kdf.lanes);
+                manifest.insert(manifest.end(), slot.kdf.salt.begin(), slot.kdf.salt.end());
+                put_vint(manifest, slot.wrapped_key.size());
+                manifest.insert(manifest.end(), slot.wrapped_key.begin(),
+                                slot.wrapped_key.end());
+            }
+        } else {
+            // Keep the legacy manifest layout byte-for-byte stable for signatures
+            // made before encryption-v2 existed.
+            const auto& kdf = index.meta.encryption.kdf;
+            put_u32(manifest, kdf.algorithm);
+            put_u32(manifest, kdf.mem_blocks);
+            put_u32(manifest, kdf.passes);
+            put_u32(manifest, kdf.lanes);
+            manifest.insert(manifest.end(), kdf.salt.begin(), kdf.salt.end());
+            put_vint(manifest, index.meta.encryption.key_check.size());
+            manifest.insert(manifest.end(), index.meta.encryption.key_check.begin(),
+                            index.meta.encryption.key_check.end());
+        }
+    }
+    if (layout.version >= kArchiveVersion5) {
+        put_vint(manifest, index.meta.capture_warnings.size());
+        for (const auto& warning : index.meta.capture_warnings) {
+            put_vint(manifest, warning.path.size());
+            manifest.insert(manifest.end(), warning.path.begin(), warning.path.end());
+            put_vint(manifest, warning.message.size());
+            manifest.insert(manifest.end(), warning.message.begin(), warning.message.end());
+        }
     }
     hasher.update(manifest);
     return hasher.finalize();
 }
 
-// Serialize the central directory and footer for the given blocks/entries to `out`
-// (already positioned at `written`) and close the stream. When `dir_key` is given the
-// directory is sealed before writing (its parameters live in the header preamble, not
-// in the directory's own TLV).
-void write_directory_and_footer(std::ofstream& out, std::uint64_t written,
-                                const std::vector<BlockRec>& blocks,
-                                const std::vector<EntryRec>& entries,
-                                const ArchiveMeta& meta,
-                                const core::CryptoKey* dir_key = nullptr) {
+struct DirectoryWriteResult {
+    std::uint64_t directory_offset = 0;
+    std::uint64_t directory_size = 0;
+};
+
+ByteVector serialize_block_extras(const BlockRec& block) {
+    if (block.subframes.empty()) return {};
+    validate_subframe_geometry(block, block.subframes);
+    ByteVector map;
+    put_vint(map, kSubframeMapVersion);
+    put_vint(map, block.subframes.size());
+    for (const auto& frame : block.subframes) {
+        put_vint(map, frame.uncompressed_offset);
+        put_vint(map, frame.uncompressed_size);
+        put_vint(map, frame.compressed_offset);
+        put_vint(map, frame.compressed_size);
+        put_vint(map, frame.kind);
+        put_vint(map, frame.codec);
+        put_vint(map, frame.lzma_property);
+    }
+
+    ByteVector extras;
+    put_vint(extras, kBlockExtraSubframeMap);
+    put_vint(extras, map.size());
+    extras.insert(extras.end(), map.begin(), map.end());
+    return extras;
+}
+
+ByteVector serialize_snapshot_entry_body(const EntryRec& entry) {
+    ByteVector body;
+    put_vint(body, entry.type);
+    put_vint(body, entry.path.size());
+    body.insert(body.end(), entry.path.begin(), entry.path.end());
+    if (entry.type == kEntryFile) {
+        put_vint(body, entry.size);
+        put_vint(body, entry.first_block);
+        put_vint(body, entry.offset);
+        put_vint(body, kExtraCrc32);
+        put_vint(body, 4);
+        put_u32(body, entry.crc);
+        if (entry.has_blake3) {
+            put_vint(body, kExtraBlake3);
+            put_vint(body, entry.blake3.size());
+            body.insert(body.end(), entry.blake3.begin(), entry.blake3.end());
+        }
+        ByteVector chunks;
+        put_vint(chunks, kChunkTableVersion);
+        put_vint(chunks, entry.chunk_refs.size());
+        for (const auto ref : entry.chunk_refs) put_vint(chunks, ref);
+        put_vint(body, kExtraChunkRefs);
+        put_vint(body, chunks.size());
+        body.insert(body.end(), chunks.begin(), chunks.end());
+    } else if (entry.type == kEntrySymlink || entry.type == kEntryHardlink) {
+        put_vint(body, entry.link_target.size());
+        body.insert(body.end(), entry.link_target.begin(), entry.link_target.end());
+    }
+    if (entry.mtime != 0) {
+        put_vint(body, kExtraMtime);
+        put_vint(body, 8);
+        put_u64(body, static_cast<std::uint64_t>(entry.mtime));
+    }
+    if (entry.meta.has_windows_attributes) {
+        put_vint(body, kExtraWinAttrs);
+        put_vint(body, 4);
+        put_u32(body, entry.meta.windows_attributes);
+    }
+    if (entry.meta.has_windows_times) {
+        put_vint(body, kExtraWinTimes);
+        put_vint(body, 24);
+        put_u64(body, entry.meta.windows_creation_time);
+        put_u64(body, entry.meta.windows_access_time);
+        put_u64(body, entry.meta.windows_write_time);
+    }
+    if (entry.meta.has_posix) {
+        put_vint(body, kExtraPosix);
+        put_vint(body, 12);
+        put_u32(body, entry.meta.posix_mode);
+        put_u32(body, entry.meta.posix_uid);
+        put_u32(body, entry.meta.posix_gid);
+    }
+    for (const auto& stream : entry.ads) {
+        if (stream.name.empty() || stream.name.size() > (4u << 10) ||
+            stream.data.size() > core::kMaxAdsBytes) {
+            throw std::runtime_error("snapshot alternate data stream exceeds its metadata limit");
+        }
+        ByteVector payload;
+        put_vint(payload, stream.name.size());
+        payload.insert(payload.end(), stream.name.begin(), stream.name.end());
+        payload.insert(payload.end(), stream.data.begin(), stream.data.end());
+        put_vint(body, kExtraAdsStream);
+        put_vint(body, payload.size());
+        body.insert(body.end(), payload.begin(), payload.end());
+    }
+    if (entry.meta.has_windows_security_descriptor) {
+        if (entry.meta.windows_security_descriptor.empty() ||
+            entry.meta.windows_security_descriptor.size() >
+                core::kMaxSecurityDescriptorBytes) {
+            throw std::runtime_error("snapshot security descriptor exceeds its metadata limit");
+        }
+        put_vint(body, kExtraSecurityDescriptor);
+        put_vint(body, entry.meta.windows_security_descriptor.size());
+        body.insert(body.end(), entry.meta.windows_security_descriptor.begin(),
+                    entry.meta.windows_security_descriptor.end());
+    }
+    for (const auto& xattr : entry.meta.xattrs) {
+        if (xattr.name.empty() || xattr.name.size() > (4u << 10) ||
+            xattr.data.size() > core::kMaxMetadataBlobBytes) {
+            throw std::runtime_error("snapshot extended attribute exceeds its metadata limit");
+        }
+        ByteVector payload;
+        put_vint(payload, xattr.name.size());
+        payload.insert(payload.end(), xattr.name.begin(), xattr.name.end());
+        payload.insert(payload.end(), xattr.data.begin(), xattr.data.end());
+        put_vint(body, kExtraXattr);
+        put_vint(body, payload.size());
+        body.insert(body.end(), payload.begin(), payload.end());
+    }
+    if (entry.meta.has_reparse_data) {
+        if (entry.meta.reparse_data.size() < 8 ||
+            entry.meta.reparse_data.size() > core::kMaxReparseDataBytes) {
+            throw std::runtime_error("snapshot reparse metadata exceeds its safety bounds");
+        }
+        const auto& data = entry.meta.reparse_data;
+        const auto stored_tag = static_cast<std::uint32_t>(data[0]) |
+                                (static_cast<std::uint32_t>(data[1]) << 8) |
+                                (static_cast<std::uint32_t>(data[2]) << 16) |
+                                (static_cast<std::uint32_t>(data[3]) << 24);
+        const auto stored_length = static_cast<std::uint16_t>(data[4]) |
+                                   (static_cast<std::uint16_t>(data[5]) << 8);
+        if (stored_tag != entry.meta.reparse_tag ||
+            static_cast<std::size_t>(stored_length) + 8 != data.size()) {
+            throw std::runtime_error("snapshot reparse metadata header does not match");
+        }
+        ByteVector payload;
+        put_vint(payload, entry.meta.reparse_tag);
+        put_vint(payload, entry.meta.reparse_data.size());
+        payload.insert(payload.end(), entry.meta.reparse_data.begin(),
+                       entry.meta.reparse_data.end());
+        put_vint(body, kExtraReparse);
+        put_vint(body, payload.size());
+        body.insert(body.end(), payload.begin(), payload.end());
+    }
+    if (entry.type == kEntryFile && entry.sparse.is_sparse) {
+        ByteVector sparse;
+        put_vint(sparse, 1);
+        put_vint(sparse, entry.sparse.allocated.size());
+        for (const auto& extent : entry.sparse.allocated) {
+            put_vint(sparse, extent.offset);
+            put_vint(sparse, extent.length);
+        }
+        put_vint(body, kExtraSparseMap);
+        put_vint(body, sparse.size());
+        body.insert(body.end(), sparse.begin(), sparse.end());
+    }
+    return body;
+}
+
+// Serialize the central directory to `out` (already positioned at `written`).
+// The ordinary footer is optional so an append-generation writer can place its
+// generation metadata between the directory and the legacy footer.
+template <typename Output>
+DirectoryWriteResult write_directory_and_footer(
+    Output& out, std::uint64_t written,
+    const std::vector<BlockRec>& blocks,
+    const std::vector<EntryRec>& entries,
+    const ArchiveMeta& meta,
+    const core::CryptoKey* dir_key = nullptr,
+    bool write_footer = true,
+    const std::vector<ChunkRec>* chunk_table = nullptr) {
+    if (meta.chunk_table) {
+        if (chunk_table == nullptr || meta.snapshots.empty()) {
+            throw std::runtime_error("snapshot archive is missing its chunk table or manifest");
+        }
+        if (meta.snapshots.size() > kMaxSnapshotCount ||
+            chunk_table->size() > kMaxChunkCount) {
+            throw std::runtime_error("snapshot archive exceeds its format limits");
+        }
+        if (meta.keyed_chunk_ids && !meta.encryption.enabled) {
+            throw std::runtime_error("keyed chunk identifiers require archive encryption");
+        }
+        const auto validate_chunks = [&]() {
+            for (const auto& chunk : *chunk_table) {
+                if (chunk.identity.size == 0 || chunk.block_index >= blocks.size()) {
+                    throw std::runtime_error("snapshot chunk table contains an invalid reference");
+                }
+                const auto& block = blocks[static_cast<std::size_t>(chunk.block_index)];
+                if (chunk.offset > block.uncompressed_size ||
+                    chunk.identity.size > block.uncompressed_size - chunk.offset) {
+                    throw std::runtime_error("snapshot chunk lies outside its block");
+                }
+            }
+        };
+        const auto validate_entries = [&](const std::vector<EntryRec>& snapshot_entries) {
+            validate_snapshot_entry_paths_for_write(snapshot_entries);
+            for (const auto& entry : snapshot_entries) {
+                if (entry.type != kEntryFile) {
+                    if (!entry.chunk_refs.empty()) {
+                        throw std::runtime_error(
+                            "non-file snapshot entry has chunk references");
+                    }
+                    continue;
+                }
+                if (entry.chunk_refs.size() > kMaxChunkRefsPerEntry) {
+                    throw std::runtime_error("snapshot entry has too many chunk references");
+                }
+                std::uint64_t total = 0;
+                for (const auto ref : entry.chunk_refs) {
+                    if (ref >= chunk_table->size()) {
+                        throw std::runtime_error(
+                            "snapshot entry points outside the chunk table");
+                    }
+                    const auto size = (*chunk_table)[static_cast<std::size_t>(ref)]
+                                          .identity.size;
+                    if (total > entry.size || size > entry.size - total) {
+                        throw std::runtime_error("snapshot chunk sizes overflow the file");
+                    }
+                    total += size;
+                }
+                if (total != entry.size) {
+                    throw std::runtime_error("snapshot chunks do not cover the file");
+                }
+            }
+        };
+        validate_chunks();
+        validate_entries(entries);
+        for (const auto& snapshot : meta.snapshots) {
+            if (snapshot.entries.size() > kMaxSnapshotEntries) {
+                throw std::runtime_error("snapshot manifest has too many entries");
+            }
+            validate_entries(snapshot.entries);
+        }
+    } else if (meta.keyed_chunk_ids || !meta.snapshots.empty()) {
+        throw std::runtime_error("snapshot metadata requires a chunk table");
+    }
     ByteVector directory;
     put_vint(directory, blocks.size());
     for (const auto& block : blocks) {
         put_vint(directory, block.compressed_offset);
         put_vint(directory, block.compressed_size);
         put_vint(directory, block.uncompressed_size);
-        put_vint(directory, 0);  // block extra length (reserved for later)
+        const auto extras = serialize_block_extras(block);
+        put_vint(directory, extras.size());
+        directory.insert(directory.end(), extras.begin(), extras.end());
     }
     put_vint(directory, entries.size());
     for (const auto& entry : entries) {
@@ -2603,6 +5244,76 @@ void write_directory_and_footer(std::ofstream& out, std::uint64_t written,
             put_vint(body, payload.size());
             body.insert(body.end(), payload.begin(), payload.end());
         }
+        if (entry.meta.has_windows_security_descriptor) {
+            if (entry.meta.windows_security_descriptor.empty() ||
+                entry.meta.windows_security_descriptor.size() >
+                    core::kMaxSecurityDescriptorBytes) {
+                throw std::runtime_error("security descriptor exceeds its metadata limit");
+            }
+            put_vint(body, kExtraSecurityDescriptor);
+            put_vint(body, entry.meta.windows_security_descriptor.size());
+            body.insert(body.end(), entry.meta.windows_security_descriptor.begin(),
+                        entry.meta.windows_security_descriptor.end());
+        }
+        for (const auto& xattr : entry.meta.xattrs) {
+            if (xattr.name.empty() || xattr.name.size() > (4u << 10) ||
+                xattr.data.size() > core::kMaxMetadataBlobBytes) {
+                throw std::runtime_error("extended attribute exceeds its metadata limit");
+            }
+            ByteVector payload;
+            put_vint(payload, xattr.name.size());
+            payload.insert(payload.end(), xattr.name.begin(), xattr.name.end());
+            payload.insert(payload.end(), xattr.data.begin(), xattr.data.end());
+            put_vint(body, kExtraXattr);
+            put_vint(body, payload.size());
+            body.insert(body.end(), payload.begin(), payload.end());
+        }
+        if (entry.meta.has_reparse_data) {
+            if (entry.meta.reparse_data.size() < 8 ||
+                entry.meta.reparse_data.size() > core::kMaxReparseDataBytes) {
+                throw std::runtime_error("reparse metadata exceeds its safety bounds");
+            }
+            const auto& data = entry.meta.reparse_data;
+            const auto stored_tag = static_cast<std::uint32_t>(data[0]) |
+                                    (static_cast<std::uint32_t>(data[1]) << 8) |
+                                    (static_cast<std::uint32_t>(data[2]) << 16) |
+                                    (static_cast<std::uint32_t>(data[3]) << 24);
+            const auto stored_length = static_cast<std::uint16_t>(data[4]) |
+                                       (static_cast<std::uint16_t>(data[5]) << 8);
+            if (stored_tag != entry.meta.reparse_tag ||
+                static_cast<std::size_t>(stored_length) + 8 != data.size()) {
+                throw std::runtime_error("reparse metadata header does not match its payload");
+            }
+            ByteVector payload;
+            put_vint(payload, entry.meta.reparse_tag);
+            put_vint(payload, entry.meta.reparse_data.size());
+            payload.insert(payload.end(), entry.meta.reparse_data.begin(),
+                           entry.meta.reparse_data.end());
+            put_vint(body, kExtraReparse);
+            put_vint(body, payload.size());
+            body.insert(body.end(), payload.begin(), payload.end());
+        }
+        if (entry.type == kEntryFile && entry.sparse.is_sparse) {
+            ByteVector payload;
+            put_vint(payload, 1);  // sparse-map payload version
+            put_vint(payload, entry.sparse.allocated.size());
+            for (const auto& extent : entry.sparse.allocated) {
+                put_vint(payload, extent.offset);
+                put_vint(payload, extent.length);
+            }
+            put_vint(body, kExtraSparseMap);
+            put_vint(body, payload.size());
+            body.insert(body.end(), payload.begin(), payload.end());
+        }
+        if (meta.chunk_table && entry.type == kEntryFile) {
+            ByteVector payload;
+            put_vint(payload, kChunkTableVersion);
+            put_vint(payload, entry.chunk_refs.size());
+            for (const auto ref : entry.chunk_refs) put_vint(payload, ref);
+            put_vint(body, kExtraChunkRefs);
+            put_vint(body, payload.size());
+            body.insert(body.end(), payload.begin(), payload.end());
+        }
         put_vint(directory, body.size());
         directory.insert(directory.end(), body.begin(), body.end());
     }
@@ -2626,16 +5337,18 @@ void write_directory_and_footer(std::ofstream& out, std::uint64_t written,
     // parameters are in the plaintext preamble instead (dir_key != nullptr).
     if (meta.encryption.enabled && dir_key == nullptr) {
         const auto& enc = meta.encryption;
-        ByteVector payload;
-        put_vint(payload, enc.kdf.algorithm);
-        put_vint(payload, enc.kdf.mem_blocks);
-        put_vint(payload, enc.kdf.passes);
-        put_vint(payload, enc.kdf.lanes);
-        put_vint(payload, enc.kdf.salt.size());
-        payload.insert(payload.end(), enc.kdf.salt.begin(), enc.kdf.salt.end());
-        put_vint(payload, enc.key_check.size());
-        payload.insert(payload.end(), enc.key_check.begin(), enc.key_check.end());
-        put_vint(archive_extras, kArchiveEncryption);
+        ByteVector payload = enc.v2 ? serialize_encryption_v2_payload(enc) : ByteVector{};
+        if (!enc.v2) {
+            put_vint(payload, enc.kdf.algorithm);
+            put_vint(payload, enc.kdf.mem_blocks);
+            put_vint(payload, enc.kdf.passes);
+            put_vint(payload, enc.kdf.lanes);
+            put_vint(payload, enc.kdf.salt.size());
+            payload.insert(payload.end(), enc.kdf.salt.begin(), enc.kdf.salt.end());
+            put_vint(payload, enc.key_check.size());
+            payload.insert(payload.end(), enc.key_check.begin(), enc.key_check.end());
+        }
+        put_vint(archive_extras, enc.v2 ? kArchiveEncryptionV2 : kArchiveEncryption);
         put_vint(archive_extras, payload.size());
         archive_extras.insert(archive_extras.end(), payload.begin(), payload.end());
         ++archive_extra_count;
@@ -2647,6 +5360,65 @@ void write_directory_and_footer(std::ofstream& out, std::uint64_t written,
         archive_extras.insert(archive_extras.end(), meta.signature_public_key.begin(),
                               meta.signature_public_key.end());
         archive_extras.insert(archive_extras.end(), meta.signature.begin(), meta.signature.end());
+        ++archive_extra_count;
+    }
+    if (!meta.capture_warnings.empty()) {
+        ByteVector payload;
+        put_vint(payload, meta.capture_warnings.size());
+        for (const auto& warning : meta.capture_warnings) {
+            put_vint(payload, warning.path.size());
+            payload.insert(payload.end(), warning.path.begin(), warning.path.end());
+            put_vint(payload, warning.message.size());
+            payload.insert(payload.end(), warning.message.begin(), warning.message.end());
+        }
+        put_vint(archive_extras, kArchiveCaptureReport);
+        put_vint(archive_extras, payload.size());
+        archive_extras.insert(archive_extras.end(), payload.begin(), payload.end());
+        ++archive_extra_count;
+    }
+    if (meta.chunk_table) {
+        if (chunk_table == nullptr) {
+            throw std::runtime_error("snapshot archive is missing its chunk table");
+        }
+        ByteVector payload;
+        put_vint(payload, kChunkTableVersion);
+        put_vint(payload, meta.keyed_chunk_ids ? 1 : 0);
+        put_vint(payload, chunk_table->size());
+        for (const auto& chunk : *chunk_table) {
+            put_vint(payload, chunk.identity.size);
+            put_u32(payload, chunk.crc);
+            payload.insert(payload.end(), chunk.identity.id.begin(), chunk.identity.id.end());
+            put_vint(payload, chunk.block_index);
+            put_vint(payload, chunk.offset);
+        }
+        put_vint(archive_extras, kArchiveChunkTable);
+        put_vint(archive_extras, payload.size());
+        archive_extras.insert(archive_extras.end(), payload.begin(), payload.end());
+        ++archive_extra_count;
+    }
+    if (!meta.snapshots.empty()) {
+        if (!meta.chunk_table || meta.snapshots.size() > kMaxSnapshotCount) {
+            throw std::runtime_error("invalid snapshot manifest state");
+        }
+        ByteVector payload;
+        put_vint(payload, kSnapshotManifestVersion);
+        put_vint(payload, meta.snapshots.size());
+        for (const auto& snapshot : meta.snapshots) {
+            validate_snapshot_name(snapshot.name);
+            put_vint(payload, snapshot.name.size());
+            payload.insert(payload.end(), snapshot.name.begin(), snapshot.name.end());
+            put_vint(payload, snapshot.generation);
+            put_u64(payload, static_cast<std::uint64_t>(snapshot.created));
+            put_vint(payload, snapshot.entries.size());
+            for (const auto& entry : snapshot.entries) {
+                const auto body = serialize_snapshot_entry_body(entry);
+                put_vint(payload, body.size());
+                payload.insert(payload.end(), body.begin(), body.end());
+            }
+        }
+        put_vint(archive_extras, kArchiveSnapshotManifest);
+        put_vint(archive_extras, payload.size());
+        archive_extras.insert(archive_extras.end(), payload.begin(), payload.end());
         ++archive_extra_count;
     }
     put_vint(directory, archive_extra_count);
@@ -2661,17 +5433,20 @@ void write_directory_and_footer(std::ofstream& out, std::uint64_t written,
     out.write(reinterpret_cast<const char*>(directory.data()),
               static_cast<std::streamsize>(directory.size()));
 
-    ByteVector footer;
-    put_u64(footer, directory_offset);
-    put_u64(footer, directory.size());
-    footer.insert(footer.end(), kArchiveMagic.begin(), kArchiveMagic.end());
-    out.write(reinterpret_cast<const char*>(footer.data()), static_cast<std::streamsize>(footer.size()));
+    if (write_footer) {
+        const auto footer = archive_footer_bytes(directory_offset, directory.size());
+        out.write(reinterpret_cast<const char*>(footer.data()),
+                  static_cast<std::streamsize>(footer.size()));
+    }
 
     out.flush();
     if (!out) {
         throw std::runtime_error("failed to finalize archive");
     }
-    out.close();
+    if (write_footer) {
+        out.close();
+    }
+    return {directory_offset, static_cast<std::uint64_t>(directory.size())};
 }
 
 // Rewrite an archive keeping only the entries for which `keep` returns true,
@@ -2687,10 +5462,15 @@ void rebuild_archive_keeping(const fs::path& archive_path,
     std::uint64_t file_size = 0;
     auto in = open_archive(archive_path, file_size);
     const ByteSource bytes(in, file_size);
-    const auto existing_recovery = read_recovery_service(bytes);
-    auto index = read_index(bytes);
+    const auto layout = read_layout(bytes);
+    const auto existing_recovery = read_recovery_service(bytes, layout);
+    auto index = load_index(bytes, options.password).index;
     if (index.meta.locked) {
         throw std::runtime_error("archive is locked (read-only)");
+    }
+    if (index.meta.chunk_table) {
+        throw std::runtime_error(
+            "snapshot repositories require snapshot operations; use snapshot prune or repack");
     }
     index.meta.has_signature = false;
     // For an encrypted archive, derive the key once: it both decrypts the surviving
@@ -2726,16 +5506,21 @@ void rebuild_archive_keeping(const fs::path& archive_path,
                                  core::path_to_utf8(temp_path));
     }
 
-    ByteVector header;
-    header.insert(header.end(), kArchiveMagic.begin(), kArchiveMagic.end());
-    put_u16(header, kArchiveVersion);
-    put_u16(header, 0);  // flags
-    put_u32(header, 0);  // reserved
+    const auto header = archive_header_bytes(
+        archive_header_version({}, index.meta), archive_header_flags({}, index.meta));
     out.write(reinterpret_cast<const char*>(header.data()), static_cast<std::streamsize>(header.size()));
     std::uint64_t written = header.size();
+    if (index.meta.encryption.encrypt_directory) {
+        const auto preamble = serialize_encryption_preamble(index.meta.encryption);
+        out.write(reinterpret_cast<const char*>(preamble.data()),
+                  static_cast<std::streamsize>(preamble.size()));
+        written += preamble.size();
+    }
 
     std::vector<BlockRec> new_blocks;
     std::vector<EntryRec> new_entries;
+    std::map<ContentIdentity, ArchiveDataReference> repack_candidates;
+    ArchiveReuseStats reuse_stats;
     ByteVector buffer;
     std::uint64_t current_block = 0;
     std::uint64_t completed_bytes = 0;
@@ -2746,7 +5531,9 @@ void rebuild_archive_keeping(const fs::path& archive_path,
             return;
         }
         report_operation(operation, OperationStage::compressing, completed_bytes, total_bytes,
-                         completed_items, total_items);
+                         completed_items, total_items, {}, 0, 0, completed_bytes, written,
+                         completed_bytes, reuse_stats.reused_items,
+                         reuse_stats.reused_bytes);
         // As in compress_items_into: bytes complete as their sub-blocks finish
         // compressing, so long recompressions tick instead of stalling.
         const auto block_base = completed_bytes;
@@ -2761,16 +5548,21 @@ void rebuild_archive_keeping(const fs::path& archive_path,
             } while (!reported.compare_exchange_weak(previous, done,
                                                      std::memory_order_relaxed));
             report_operation(operation, OperationStage::compressing, block_base + done,
-                             total_bytes, completed_items, total_items);
+                             total_bytes, completed_items, total_items, {}, 0, 0,
+                             block_base + done, written, completed_bytes,
+                             reuse_stats.reused_items, reuse_stats.reused_bytes);
         };
         auto compressed = compress(buffer, block_options);
+        auto subframes = !key ? make_subframe_map(compressed)
+                                        : std::vector<SubframeRec>{};
         completed_bytes = block_base + buffer.size();
         if (key) {
             compressed = core::aead_seal(*key, compressed, block_associated_data(new_blocks.size()));
         }
         operation_checkpoint(operation);
         new_blocks.push_back({written, static_cast<std::uint64_t>(compressed.size()),
-                              static_cast<std::uint64_t>(buffer.size())});
+                              static_cast<std::uint64_t>(buffer.size()),
+                              std::move(subframes)});
         out.write(reinterpret_cast<const char*>(compressed.data()),
                   static_cast<std::streamsize>(compressed.size()));
         if (!out) {
@@ -2792,6 +5584,23 @@ void rebuild_archive_keeping(const fs::path& archive_path,
         }
 
         EntryRec out_entry = entry;  // carries metadata, crc/blake3, link target, ads
+        if (entry.type == kEntryFile && entry.has_blake3) {
+            const auto found = repack_candidates.find(content_identity(entry));
+            if (found != repack_candidates.end()) {
+                out_entry.first_block = found->second.first_block;
+                out_entry.offset = found->second.offset;
+                new_entries.push_back(std::move(out_entry));
+                ++completed_items;
+                completed_bytes += entry.size;
+                ++reuse_stats.reused_items;
+                reuse_stats.reused_bytes += entry.size;
+                report_operation(operation, OperationStage::writing, completed_bytes,
+                                 total_bytes, completed_items, total_items, entry.path,
+                                 0, entry.size, completed_bytes, written, completed_bytes,
+                                 reuse_stats.reused_items, reuse_stats.reused_bytes);
+                continue;
+            }
+        }
         if (entry.type == kEntryFile) {
             out_entry.first_block = current_block;
             out_entry.offset = buffer.size();
@@ -2803,19 +5612,34 @@ void rebuild_archive_keeping(const fs::path& archive_path,
                                     flush_block();
                                 }
                             },
-                            options.io_buffer_size);
+                             options.io_buffer_size);
+            if (entry.has_blake3) {
+                repack_candidates.emplace(
+                    content_identity(entry),
+                    ArchiveDataReference{out_entry.first_block, out_entry.offset});
+            }
         }
         new_entries.push_back(std::move(out_entry));
         ++completed_items;
         report_operation(operation, OperationStage::writing, completed_bytes, total_bytes,
-                         completed_items, total_items, entry.path);
+                         completed_items, total_items, entry.path, 0, entry.size,
+                         completed_bytes, written, completed_bytes,
+                         reuse_stats.reused_items, reuse_stats.reused_bytes);
     }
     flush_block();
     in.close();  // release the source handle so the rename can replace it (Windows)
 
+    patch_archive_header(out, archive_header_version(new_entries, index.meta),
+                         archive_header_flags(new_entries, index.meta));
+
     report_operation(operation, OperationStage::finalizing, completed_bytes, total_bytes,
-                     completed_items, total_items);
-    write_directory_and_footer(out, written, new_blocks, new_entries, index.meta);
+                     completed_items, total_items, {}, 0, 0, completed_bytes, written,
+                     completed_bytes, reuse_stats.reused_items,
+                     reuse_stats.reused_bytes);
+    const core::CryptoKey* directory_key =
+        index.meta.encryption.encrypt_directory && key ? &*key : nullptr;
+    write_directory_and_footer(out, written, new_blocks, new_entries, index.meta,
+                               directory_key);
 
     if (key) {
         core::secure_wipe(*key);
@@ -2828,13 +5652,16 @@ void rebuild_archive_keeping(const fs::path& archive_path,
             temp_path, recovery_percent, operation, options.thread_count);
     }
     report_operation(operation, OperationStage::committing, 0, 1, 0, 1,
-                     "Replacing original archive");
+                     "Replacing original archive", 0, 0, 0, written, completed_bytes,
+                     reuse_stats.reused_items, reuse_stats.reused_bytes);
     replace_archive_file(temp_path, archive_path);
     temp_guard.dismiss();
     report_operation(operation, OperationStage::committing, 1, 1, 1, 1,
-                     "Archive committed");
+                     "Archive committed", 0, 0, 0, written, completed_bytes,
+                     reuse_stats.reused_items, reuse_stats.reused_bytes);
     report_operation(operation, OperationStage::finalizing, total_bytes, total_bytes,
-                     total_items, total_items);
+                     total_items, total_items, {}, 0, 0, total_bytes, written,
+                     total_bytes, reuse_stats.reused_items, reuse_stats.reused_bytes);
 }
 
 // Append already-scanned items to an existing archive: existing block bytes are
@@ -2855,11 +5682,23 @@ void append_items_to_archive_indexed(
     if (existing.meta.locked) {
         throw std::runtime_error("archive is locked (read-only)");
     }
-    // Encrypted archives: existing blocks are copied verbatim (still sealed), so only
-    // a change that writes *new* blocks needs the key. Derive it then, sealing new
-    // blocks with the same key; a comment/lock-only rewrite (no items) needs no key.
+    if (existing.meta.chunk_table && !items.empty()) {
+        throw std::runtime_error(
+            "snapshot repositories require snapshot add for content changes");
+    }
+    ArchiveLayout existing_layout;
+    std::uint64_t existing_physical_size = 0;
+    {
+        auto existing_input = open_archive(archive_path, existing_physical_size);
+        const ByteSource existing_source(existing_input, existing_physical_size);
+        existing_layout = read_layout(existing_source);
+        existing_input.close();
+    }
+    // Encrypted archives: existing blocks are copied verbatim (still sealed), so a
+    // key is needed for new blocks and for sealing an encrypted directory.
     std::optional<core::CryptoKey> key;
-    if (existing.meta.encryption.enabled && !items.empty()) {
+    if (existing.meta.encryption.enabled &&
+        (!items.empty() || existing.meta.encryption.encrypt_directory)) {
         key = derive_archive_key(existing.meta.encryption, options.password);
     }
     const core::CryptoKey* key_ptr = key ? &*key : nullptr;
@@ -2869,11 +5708,12 @@ void append_items_to_archive_indexed(
         if (finalization->comment) result_meta.comment = *finalization->comment;
         if (finalization->lock_archive) result_meta.locked = true;
     }
-    std::uint64_t block_region_end = kHeaderSize;
-    if (!existing.blocks.empty()) {
-        const auto& last = existing.blocks.back();
-        block_region_end = last.compressed_offset + last.compressed_size;
-    }
+    const auto reuse_candidates = build_reuse_candidates(existing.entries);
+    const auto reuse_by_path = prepare_reuse_by_path(
+        items, reuse_candidates, options, operation);
+    ArchiveReuseStats reuse_stats;
+    const std::uint64_t block_region_end =
+        archive_block_region_end(existing_layout, existing);
 
     // Added paths replace any existing entry with the same path; the replaced data
     // stays in its solid block as dead space until a repack reclaims it.
@@ -2901,6 +5741,7 @@ void append_items_to_archive_indexed(
         });
     }
     std::vector<BlockRec> blocks = std::move(existing.blocks);
+    std::vector<ChunkRec> chunks = std::move(existing.chunks);
 
     const auto total_bytes = scanned_file_bytes(items);
     const auto total_items = static_cast<std::uint64_t>(items.size());
@@ -2910,6 +5751,229 @@ void append_items_to_archive_indexed(
                      completed_items, total_items);
 
     const auto block_size = effective_solid_block_size(options);
+
+    // A direct generation append can retain the existing header only when the
+    // new directory needs the same feature flags. Metadata and sparse capture
+    // happen inside compress_items_into, so probe only flags that are not already
+    // present. If a probe finds a new v5 feature, the established transactional
+    // rewrite path below remains the safe compatibility fallback.
+    bool predicted_sparse = has_sparse_entries(existing.entries);
+    bool predicted_extended = has_extended_metadata(existing.entries);
+    bool predicted_capture_report = !result_meta.capture_warnings.empty();
+    const auto existing_flags = existing_layout.flags;
+    const bool probe_sparse = (existing_flags & kFlagSparseEntries) == 0;
+    const bool probe_extended = (existing_flags & kFlagExtendedMetadata) == 0;
+    const bool probe_capture = (existing_flags & kFlagCaptureReport) == 0;
+    if (probe_sparse || probe_extended || probe_capture) {
+        for (const auto& item : items) {
+            if (item.is_reparse_point && !item.is_directory) {
+                // compress_items_into records this deliberate skip as a capture
+                // warning, even though no entry is emitted for the object.
+                predicted_capture_report = true;
+                continue;
+            }
+
+            const auto metadata = core::capture_metadata(item.absolute);
+            if (probe_capture && !metadata.capture_warnings.empty()) {
+                predicted_capture_report = true;
+            }
+            if (probe_extended) {
+                predicted_extended = predicted_extended ||
+                    (metadata.has_windows_security_descriptor ||
+                     !metadata.xattrs.empty() || metadata.has_reparse_data);
+            }
+
+            if (item.is_symlink || item.is_directory || !probe_sparse ||
+                !options.preserve_sparse_files) {
+                continue;
+            }
+            std::error_code size_error;
+            const auto file_size = fs::file_size(item.absolute, size_error);
+            if (size_error || file_size == 0) continue;
+            const auto sparse = core::capture_sparse_file(item.absolute, file_size);
+            if (sparse.map) {
+                predicted_sparse = true;
+            } else if (!sparse.warning.empty()) {
+                predicted_capture_report = true;
+            }
+        }
+    }
+    std::uint16_t predicted_flags = archive_header_flags(existing.entries, result_meta);
+    if (predicted_sparse) predicted_flags |= kFlagSparseEntries;
+    if (predicted_capture_report) predicted_flags |= kFlagCaptureReport;
+    if (predicted_extended) predicted_flags |= kFlagExtendedMetadata;
+    const std::uint16_t predicted_version =
+        result_meta.encryption.v2 ||
+                (predicted_flags & (kFlagSparseEntries | kFlagCaptureReport |
+                                    kFlagExtendedMetadata)) != 0
+            ? kArchiveVersion5 : kArchiveVersion4;
+    const bool append_generation =
+        !sfx_embedded_archive_range(archive_path).has_value() &&
+        predicted_version == existing_layout.version &&
+        predicted_flags == existing_layout.flags;
+
+    const unsigned recovery_percent = options.recovery_percent != 0
+        ? options.recovery_percent : existing_recovery_percent;
+
+    if (append_generation) {
+        if (existing_layout.footer_offset >
+            std::numeric_limits<std::uint64_t>::max() - kFooterSize) {
+            throw FormatError("archive footer offset overflows append position");
+        }
+        const auto previous_end = existing_layout.footer_offset + kFooterSize;
+        if (existing_physical_size < previous_end) {
+            throw FormatError("archive is truncated before its selected footer");
+        }
+        if (existing_layout.generation == std::numeric_limits<std::uint64_t>::max()) {
+            throw FormatError("archive generation number is exhausted");
+        }
+        const auto generation = existing_layout.generation + 1;
+        const auto previous_footer_offset = existing_layout.footer_offset;
+        const auto previous_directory_offset = existing_layout.directory_offset;
+        const auto previous_directory_size = existing_layout.directory_size;
+        const auto previous_generation_offset = existing_layout.generation_offset;
+
+        try {
+            if (existing_physical_size != previous_end) {
+                std::error_code trim_error;
+                fs::resize_file(archive_path, previous_end, trim_error);
+                if (trim_error) {
+                    throw fs::filesystem_error(
+                        "failed to discard an incomplete archive generation",
+                        archive_path, trim_error);
+                }
+            }
+
+            std::ofstream out(archive_path, std::ios::binary | std::ios::app);
+            if (!out) {
+                throw std::runtime_error("cannot open archive for append: " +
+                                         core::path_to_utf8(archive_path));
+            }
+            if (phased_update && operation) operation->set_progress_phase(2, 6);
+            report_operation(operation, OperationStage::copying, 1, 1,
+                             static_cast<std::uint64_t>(existing.blocks.size()),
+                             static_cast<std::uint64_t>(existing.blocks.size()),
+                             "Retaining previous archive generations");
+            std::uint64_t written = previous_end;
+
+            if (phased_update && operation) operation->set_progress_phase(3, 6);
+            compress_items_into(out, written, blocks, entries, items, options, block_size,
+                                operation, total_bytes, total_items, completed_bytes,
+                                completed_items, false, key_ptr, &result_meta,
+                                &reuse_by_path, &reuse_stats);
+
+            // A source can change between the preflight probe and capture. Do not
+            // publish a directory whose feature flags disagree with the immutable
+            // header; the catch block leaves the previous generation intact.
+            const auto actual_version = archive_header_version(entries, result_meta);
+            const auto actual_flags = archive_header_flags(entries, result_meta);
+            if (actual_version != existing_layout.version ||
+                actual_flags != existing_layout.flags) {
+                throw std::runtime_error(
+                    "append generation requires a header feature change; retry with a repack");
+            }
+
+            report_operation(operation, OperationStage::finalizing, completed_bytes,
+                             total_bytes, completed_items, total_items, {}, 0, 0,
+                             completed_bytes, written, completed_bytes,
+                             reuse_stats.reused_items, reuse_stats.reused_bytes);
+            const core::CryptoKey* directory_key =
+                result_meta.encryption.encrypt_directory && key ? &*key : nullptr;
+            const auto unsigned_directory = write_directory_and_footer(
+                out, written, blocks, entries, result_meta, directory_key, false, &chunks);
+            out.close();
+            if (!out) throw std::runtime_error("failed to close appended archive directory");
+
+            if (finalization != nullptr && finalization->signing_key != nullptr) {
+                // Build a provisional generation so the signature digest includes
+                // the exact generation history that the final directory will carry.
+                append_generation_trailer(
+                    archive_path, unsigned_directory.directory_offset,
+                    unsigned_directory.directory_size, generation,
+                    previous_footer_offset, previous_directory_offset,
+                    previous_directory_size, previous_generation_offset, 0,
+                    operation, options.thread_count, previous_end);
+
+                std::uint64_t staged_size = 0;
+                auto staged_input = open_archive(archive_path, staged_size);
+                const ByteSource staged_source(staged_input, staged_size);
+                const ArchiveLayout staged_layout = read_layout(staged_source);
+                ArchiveIndex signing_index{blocks, entries, chunks, result_meta};
+                const auto digest = archive_signature_digest(
+                    staged_source, staged_layout, signing_index);
+                const auto signature = core::sign_message(
+                    finalization->signing_key->secret_key, digest);
+                if (!core::verify_message(
+                        finalization->signing_key->public_key, signature, digest)) {
+                    throw std::invalid_argument(
+                        "signing key public and secret components do not match");
+                }
+                staged_input.close();
+
+                result_meta.has_signature = true;
+                result_meta.signature_public_key =
+                    finalization->signing_key->public_key;
+                result_meta.signature = signature;
+
+                std::error_code truncate_error;
+                fs::resize_file(archive_path, unsigned_directory.directory_offset,
+                                truncate_error);
+                if (truncate_error) {
+                    throw fs::filesystem_error(
+                        "failed to stage archive signature", archive_path, truncate_error);
+                }
+                std::ofstream signed_output(
+                    archive_path, std::ios::binary | std::ios::app);
+                if (!signed_output) {
+                    throw std::runtime_error(
+                        "cannot reopen archive for generation signature");
+                }
+                const auto signed_directory = write_directory_and_footer(
+                    signed_output, unsigned_directory.directory_offset, blocks, entries,
+                    result_meta, result_meta.encryption.encrypt_directory && key ? &*key
+                                                                                   : nullptr,
+                    false, &chunks);
+                signed_output.close();
+                if (!signed_output) {
+                    throw std::runtime_error(
+                        "failed to close signed archive directory");
+                }
+                append_generation_trailer(
+                    archive_path, signed_directory.directory_offset,
+                    signed_directory.directory_size, generation,
+                    previous_footer_offset, previous_directory_offset,
+                    previous_directory_size, previous_generation_offset,
+                    recovery_percent, operation, options.thread_count, previous_end);
+            } else {
+                append_generation_trailer(
+                    archive_path, unsigned_directory.directory_offset,
+                    unsigned_directory.directory_size, generation,
+                    previous_footer_offset, previous_directory_offset,
+                    previous_directory_size, previous_generation_offset,
+                    recovery_percent, operation, options.thread_count, previous_end);
+            }
+
+            if (key) core::secure_wipe(*key);
+            if (phased_update && operation) operation->set_progress_phase(5, 6);
+            report_operation(operation, OperationStage::committing, 1, 1, 1, 1,
+                             "Archive generation committed");
+            std::uint64_t logical_archive_bytes = 0;
+            for (const auto& entry : entries) {
+                if (entry.type == kEntryFile) logical_archive_bytes += entry.size;
+            }
+            report_operation(operation, OperationStage::finalizing, total_bytes, total_bytes,
+                             total_items, total_items, {}, 0, 0, total_bytes,
+                             static_cast<std::uint64_t>(fs::file_size(archive_path)),
+                             logical_archive_bytes, reuse_stats.reused_items,
+                             reuse_stats.reused_bytes);
+            return;
+        } catch (...) {
+            if (key) core::secure_wipe(*key);
+            std::error_code rollback_error;
+            fs::resize_file(archive_path, previous_end, rollback_error);
+            throw;
+        }
+    }
 
     fs::path temp_path = archive_path;
     temp_path += ".tmp";
@@ -2955,26 +6019,25 @@ void append_items_to_archive_indexed(
     if (phased_update && operation) operation->set_progress_phase(3, 6);
     compress_items_into(out, written, blocks, entries, items, options, block_size, operation,
                         total_bytes, total_items, completed_bytes, completed_items, false,
-                        key_ptr);
-    if (key) {
-        core::secure_wipe(*key);
-    }
+                        key_ptr, &result_meta, &reuse_by_path, &reuse_stats);
+    patch_archive_header(out, archive_header_version(entries, result_meta),
+                         archive_header_flags(entries, result_meta));
 
     report_operation(operation, OperationStage::finalizing, completed_bytes, total_bytes,
                      completed_items, total_items, {}, 0, 0, completed_bytes,
-                     written, completed_bytes);
-    write_directory_and_footer(out, written, blocks, entries, result_meta);
+                     written, completed_bytes, reuse_stats.reused_items,
+                     reuse_stats.reused_bytes);
+    const core::CryptoKey* directory_key =
+        result_meta.encryption.encrypt_directory && key ? &*key : nullptr;
+    write_directory_and_footer(out, written, blocks, entries, result_meta, directory_key,
+                               true, &chunks);
 
     if (finalization != nullptr && finalization->signing_key != nullptr) {
-        if (result_meta.encryption.encrypt_directory) {
-            throw std::runtime_error(
-                "signing an archive with an encrypted directory is not supported");
-        }
         std::uint64_t staged_size = 0;
         auto staged_input = open_archive(temp_path, staged_size);
         const ByteSource staged_source(staged_input, staged_size);
         const ArchiveLayout staged_layout = read_layout(staged_source);
-        ArchiveIndex signing_index{blocks, entries, result_meta};
+        ArchiveIndex signing_index{blocks, entries, chunks, result_meta};
         const auto digest =
             archive_signature_digest(staged_source, staged_layout, signing_index);
         const auto signature = core::sign_message(
@@ -3003,11 +6066,15 @@ void append_items_to_archive_indexed(
                 "cannot reopen staged archive for signing");
         }
         write_directory_and_footer(
-            signed_output, written, blocks, entries, result_meta);
+            signed_output, written, blocks, entries, result_meta,
+            result_meta.encryption.encrypt_directory && key ? &*key : nullptr,
+            true, &chunks);
     }
 
-    const unsigned recovery_percent = options.recovery_percent != 0
-        ? options.recovery_percent : existing_recovery_percent;
+    if (key) {
+        core::secure_wipe(*key);
+    }
+
     if (phased_update && operation) operation->set_progress_phase(4, 6);
     if (recovery_percent != 0) {
         append_recovery_to_staged_archive(
@@ -3030,7 +6097,8 @@ void append_items_to_archive_indexed(
     report_operation(operation, OperationStage::finalizing, total_bytes, total_bytes,
                      total_items, total_items, {}, 0, 0, total_bytes,
                      static_cast<std::uint64_t>(fs::file_size(archive_path)),
-                     logical_archive_bytes);
+                     logical_archive_bytes, reuse_stats.reused_items,
+                     reuse_stats.reused_bytes);
 }
 
 void append_items_to_archive(const fs::path& archive_path,
@@ -3045,10 +6113,11 @@ void append_items_to_archive(const fs::path& archive_path,
         std::uint64_t file_size = 0;
         auto in = open_archive(archive_path, file_size);
         const ByteSource source(in, file_size);
-        if (const auto recovery = read_recovery_service(source)) {
+        const auto layout = read_layout(source);
+        if (const auto recovery = read_recovery_service(source, layout)) {
             existing_recovery_percent = recovery->percent;
         }
-        existing = read_index(source);
+        existing = load_index(source, options.password).index;
     }
     append_items_to_archive_indexed(
         archive_path, items, options, std::move(existing),
@@ -3062,24 +6131,21 @@ void rewrite_archive_directory(const fs::path& archive_path, ArchiveIndex index,
     std::uint64_t file_size = 0;
     auto in = open_archive(archive_path, file_size);
     const ByteSource source(in, file_size);
-    const auto existing_recovery = read_recovery_service(source);
     const ArchiveLayout layout = read_layout(source);
-    if ((layout.flags & kFlagEncryptedDirectory) != 0) {
-        throw std::runtime_error("editing an archive with an encrypted directory is not supported");
-    }
+    const auto existing_recovery = read_recovery_service(source, layout);
     if (index.meta.locked) {
         throw std::runtime_error("archive is locked (read-only)");
     }
+    if (index.meta.chunk_table) {
+        throw std::runtime_error(
+            "snapshot repositories do not support archive entry moves");
+    }
+    std::optional<core::CryptoKey> key;
     if (index.meta.encryption.enabled) {
-        auto key = derive_archive_key(index.meta.encryption, options.password);
-        core::secure_wipe(key);
+        key = derive_archive_key(index.meta.encryption, options.password);
     }
 
-    std::uint64_t block_region_end = kHeaderSize;
-    if (!index.blocks.empty()) {
-        const auto& last = index.blocks.back();
-        block_region_end = last.compressed_offset + last.compressed_size;
-    }
+    const std::uint64_t block_region_end = archive_block_region_end(layout, index);
 
     fs::path temp_path = archive_path;
     temp_path += ".tmp";
@@ -3109,9 +6175,18 @@ void rewrite_archive_directory(const fs::path& archive_path, ArchiveIndex index,
     }
     in.close();
 
+    patch_archive_header(out, archive_header_version(index.entries, index.meta),
+                         archive_header_flags(index.entries, index.meta));
+
     report_operation(operation, OperationStage::finalizing, copied, block_region_end,
                      total_items, total_items);
-    write_directory_and_footer(out, block_region_end, index.blocks, index.entries, index.meta);
+    const core::CryptoKey* directory_key =
+        index.meta.encryption.encrypt_directory && key ? &*key : nullptr;
+    write_directory_and_footer(out, block_region_end, index.blocks, index.entries,
+                               index.meta, directory_key);
+    if (key) {
+        core::secure_wipe(*key);
+    }
 
     const unsigned recovery_percent = options.recovery_percent != 0
         ? options.recovery_percent
@@ -3128,6 +6203,471 @@ void rewrite_archive_directory(const fs::path& archive_path, ArchiveIndex index,
                      "Archive committed");
     report_operation(operation, OperationStage::finalizing, block_region_end, block_region_end,
                      total_items, total_items);
+}
+
+using SnapshotChunkLookup = std::map<ChunkIdentity, std::uint64_t>;
+
+SnapshotChunkLookup build_snapshot_chunk_lookup(const std::vector<ChunkRec>& chunks) {
+    SnapshotChunkLookup lookup;
+    for (std::uint64_t index = 0; index < chunks.size(); ++index) {
+        const auto [it, inserted] = lookup.emplace(chunks[static_cast<std::size_t>(index)].identity,
+                                                    index);
+        if (!inserted) {
+            // A valid table may contain one physical chunk more than once only
+            // when a future profile adds aliases. Reuse the first stable index.
+            (void)it;
+        }
+    }
+    return lookup;
+}
+
+template <typename Output>
+std::uint64_t append_snapshot_chunk(
+    Output& out, std::uint64_t& written, std::vector<BlockRec>& blocks,
+    std::vector<ChunkRec>& chunks, SnapshotChunkLookup& lookup,
+    const ByteVector& data, const CompressionOptions& options,
+    const std::shared_ptr<OperationControl>& operation,
+    const core::CryptoKey* key, bool keyed, ArchiveReuseStats& reuse_stats) {
+    const auto identity = make_chunk_identity(data, key, keyed);
+    const auto found = lookup.find(identity);
+    if (found != lookup.end()) {
+        reuse_stats.reused_items++;
+        reuse_stats.reused_bytes += data.size();
+        return found->second;
+    }
+    if (chunks.size() >= kMaxChunkCount) {
+        throw std::runtime_error("snapshot chunk table is full");
+    }
+
+    operation_checkpoint(operation);
+    auto chunk_options = options;
+    chunk_options.enable_snapshot_dedup = false;
+    chunk_options.transform_ranges.clear();
+    chunk_options.task_executor.reset();
+    auto compressed = compress(data, chunk_options);
+    auto subframes = !key ? make_subframe_map(compressed)
+                           : std::vector<SubframeRec>{};
+    const auto block_index = static_cast<std::uint64_t>(blocks.size());
+    if (key != nullptr) {
+        compressed = core::aead_seal(*key, compressed, block_associated_data(block_index));
+    }
+    const auto archive_offset = written;
+    out.write(reinterpret_cast<const char*>(compressed.data()),
+              static_cast<std::streamsize>(compressed.size()));
+    if (!out) throw std::runtime_error("failed while writing snapshot chunk");
+    blocks.push_back({archive_offset, static_cast<std::uint64_t>(compressed.size()),
+                      static_cast<std::uint64_t>(data.size()), std::move(subframes)});
+    chunks.push_back({identity, core::crc32_final(core::crc32_update(
+                          core::crc32_init(), data)), block_index, 0});
+    written += compressed.size();
+    const auto chunk_index = static_cast<std::uint64_t>(chunks.size() - 1);
+    lookup.emplace(identity, chunk_index);
+    return chunk_index;
+}
+
+template <typename Output>
+std::vector<EntryRec> build_snapshot_entries(
+    Output& out, std::uint64_t& written, std::vector<BlockRec>& blocks,
+    std::vector<ChunkRec>& chunks, SnapshotChunkLookup& lookup,
+    const std::vector<ScanItem>& items, const CompressionOptions& options,
+    const std::shared_ptr<OperationControl>& operation,
+    const core::CryptoKey* key, bool keyed, ArchiveMeta& meta,
+    ArchiveReuseStats& reuse_stats) {
+    validate_snapshot_chunk_sizes(options);
+    const auto total_bytes = scanned_file_bytes(items);
+    const auto total_items = static_cast<std::uint64_t>(items.size());
+    std::uint64_t completed_bytes = 0;
+    std::uint64_t completed_items = 0;
+    report_operation(operation, OperationStage::reading, 0, total_bytes, 0, total_items);
+
+    const auto record_capture_warning = [&](const OperationWarning& warning) {
+        if (operation) operation->add_warning(warning);
+        meta.capture_warnings.push_back(warning);
+        if (options.strict_metadata) {
+            throw std::runtime_error(warning.message + ": " + warning.path);
+        }
+    };
+
+    std::vector<EntryRec> entries;
+    entries.reserve(items.size());
+    if (items.size() > kMaxSnapshotEntries) {
+        throw std::invalid_argument("snapshot contains too many input entries");
+    }
+    std::map<std::tuple<std::uint64_t, std::uint64_t, std::uint64_t>, std::string> hardlinks;
+    for (const auto& item : items) {
+        operation_checkpoint(operation);
+        EntryRec entry;
+        entry.path = normalize_archive_path(item.archive_path, "snapshot archive path");
+        entry.meta = core::capture_metadata(item.absolute);
+        for (const auto& message : entry.meta.capture_warnings) {
+            record_capture_warning({item.archive_path, message});
+        }
+        if (item.is_reparse_point && !item.is_directory) {
+            record_capture_warning({
+                item.archive_path,
+                "Skipped a non-directory reparse point because following its target is unsafe.",
+            });
+            ++completed_items;
+            continue;
+        }
+        if (item.is_symlink) {
+            entry.type = kEntrySymlink;
+            entry.link_target = item.symlink_target;
+            entry.meta.has_reparse_data = false;
+            entry.meta.reparse_tag = 0;
+            entry.meta.reparse_data.clear();
+            entries.push_back(std::move(entry));
+            ++completed_items;
+            continue;
+        }
+        std::error_code stamp_error;
+        const auto stamp = fs::last_write_time(item.absolute, stamp_error);
+        if (!stamp_error) {
+            try {
+                entry.mtime = to_unix_seconds(stamp);
+            } catch (...) {
+                entry.mtime = 0;
+            }
+        }
+        if (item.is_directory) {
+            entry.type = kEntryDir;
+            entries.push_back(std::move(entry));
+            ++completed_items;
+            continue;
+        }
+
+        std::ifstream probe;
+        if (!open_input_with_retry(probe, item.absolute, options.input_open_retries, operation)) {
+            if (!options.skip_unreadable_files) {
+                throw std::runtime_error("cannot read input file: " +
+                                         core::path_to_utf8(item.absolute));
+            }
+            record_capture_warning({
+                item.archive_path,
+                "Skipped because the file disappeared or access remained denied after retries.",
+            });
+            ++completed_items;
+            continue;
+        }
+        probe.close();
+
+        if (auto id = core::hardlink_identity(item.absolute)) {
+            const auto identity = std::make_tuple(id->volume, id->index_high, id->index_low);
+            const auto found = hardlinks.find(identity);
+            if (found != hardlinks.end()) {
+                entry.type = kEntryHardlink;
+                entry.link_target = found->second;
+                entry.mtime = 0;
+                entry.meta = {};
+                entries.push_back(std::move(entry));
+                ++completed_items;
+                continue;
+            }
+            hardlinks.emplace(identity, item.archive_path);
+        }
+
+        std::error_code size_error;
+        const auto declared_size = fs::file_size(item.absolute, size_error);
+        if (size_error) {
+            throw std::runtime_error("cannot stat input file: " +
+                                     core::path_to_utf8(item.absolute));
+        }
+        entry.type = kEntryFile;
+        auto crc = core::crc32_init();
+        core::Blake3 hasher;
+        std::uint64_t total = 0;
+        if (options.preserve_sparse_files && declared_size != 0) {
+            const auto sparse_capture = core::capture_sparse_file(item.absolute, declared_size);
+            if (sparse_capture.map) {
+                entry.sparse = std::move(*sparse_capture.map);
+            } else if (!sparse_capture.warning.empty()) {
+                record_capture_warning({
+                    item.archive_path,
+                    "Sparse allocation was not captured: " + sparse_capture.warning,
+                });
+            }
+        }
+        read_content_defined_chunks(
+            item.absolute, options, operation,
+            [&](ByteVector chunk) {
+                const auto bytes = std::span<const std::uint8_t>(chunk);
+                crc = core::crc32_update(crc, bytes);
+                hasher.update(bytes);
+                if (entry.chunk_refs.size() >= kMaxChunkRefsPerEntry) {
+                    throw std::runtime_error("snapshot file has too many chunk references");
+                }
+                const auto chunk_ref = append_snapshot_chunk(
+                    out, written, blocks, chunks, lookup, chunk, options,
+                    operation, key, keyed, reuse_stats);
+                if (entry.chunk_refs.empty()) {
+                    const auto& first_chunk = chunks[static_cast<std::size_t>(chunk_ref)];
+                    entry.first_block = first_chunk.block_index;
+                    entry.offset = first_chunk.offset;
+                }
+                entry.chunk_refs.push_back(chunk_ref);
+                total += bytes.size();
+                completed_bytes += bytes.size();
+                report_operation(operation, OperationStage::writing, completed_bytes,
+                                 total_bytes, completed_items, total_items,
+                                 item.archive_path, total, declared_size,
+                                 completed_bytes, written, completed_bytes,
+                                 reuse_stats.reused_items, reuse_stats.reused_bytes);
+            });
+        if (total != declared_size) {
+            throw std::runtime_error("source file changed while creating snapshot: " +
+                                     item.archive_path);
+        }
+        entry.size = total;
+        entry.crc = core::crc32_final(crc);
+        entry.blake3 = hasher.finalize();
+        entry.has_blake3 = true;
+        entry.ads = core::capture_ads(item.absolute);
+        entries.push_back(std::move(entry));
+        ++completed_items;
+        report_operation(operation, OperationStage::writing, completed_bytes, total_bytes,
+                         completed_items, total_items, item.archive_path, total, total,
+                         completed_bytes, written, completed_bytes,
+                         reuse_stats.reused_items, reuse_stats.reused_bytes);
+    }
+    validate_snapshot_entry_paths_for_write(entries);
+    return entries;
+}
+
+std::int64_t snapshot_now() {
+    return std::chrono::duration_cast<std::chrono::seconds>(
+               std::chrono::system_clock::now().time_since_epoch())
+        .count();
+}
+
+const SnapshotRec& find_snapshot(const ArchiveMeta& meta, std::string_view name) {
+    validate_snapshot_name(name);
+    const auto found = std::find_if(
+        meta.snapshots.begin(), meta.snapshots.end(),
+        [name](const SnapshotRec& snapshot) { return snapshot.name == name; });
+    if (found == meta.snapshots.end()) {
+        throw std::invalid_argument("snapshot does not exist: " + std::string(name));
+    }
+    return *found;
+}
+
+void require_snapshot_profile(const ArchiveIndex& index) {
+    if (!index.meta.chunk_table || index.meta.snapshots.empty()) {
+        throw std::runtime_error(
+            "archive is not a snapshot repository; create one with the snapshot command");
+    }
+}
+
+enum class PasswordMutation {
+    add,
+    remove,
+    change,
+};
+
+std::size_t find_password_slot(const EncryptionInfo& enc,
+                               const std::string& password,
+                               const core::CryptoKey& expected_key) {
+    validate_password_input(password, "password");
+    for (std::size_t i = 0; i < enc.slots.size(); ++i) {
+        core::CryptoKey candidate{};
+        if (!try_unwrap_encryption_slot(enc, enc.slots[i], password, candidate)) {
+            continue;
+        }
+        const bool matches = candidate == expected_key;
+        core::secure_wipe(candidate);
+        if (matches) {
+            return i;
+        }
+    }
+    throw std::runtime_error("password does not unlock an archive password slot");
+}
+
+std::uint32_t next_encryption_slot_id(const EncryptionInfo& enc) {
+    std::uint32_t next = 1;
+    for (const auto& slot : enc.slots) {
+        if (slot.id == std::numeric_limits<std::uint32_t>::max()) {
+            continue;
+        }
+        next = std::max(next, static_cast<std::uint32_t>(slot.id + 1));
+    }
+    while (std::any_of(enc.slots.begin(), enc.slots.end(),
+                       [next](const EncryptionSlot& slot) { return slot.id == next; })) {
+        if (next == std::numeric_limits<std::uint32_t>::max()) {
+            throw std::runtime_error("archive password slot identifiers are exhausted");
+        }
+        ++next;
+    }
+    return next;
+}
+
+void rewrite_archive_password(const fs::path& archive_path,
+                              const std::string& current_password,
+                              const std::string& secondary_password,
+                              PasswordMutation mutation,
+                              const CompressionOptions& options) {
+    reject_volume_mutation(archive_path);
+    validate_password_input(current_password, "current password");
+    if (mutation != PasswordMutation::remove) {
+        validate_password_input(secondary_password, "new password");
+    } else {
+        validate_password_input(secondary_password, "password to remove");
+    }
+
+    std::uint64_t file_size = 0;
+    auto input = open_archive(archive_path, file_size);
+    const ByteSource source(input, file_size);
+    const auto layout = read_layout(source);
+    const auto existing_recovery = read_recovery_service(source, layout);
+    auto loaded = load_index(source, current_password);
+    OptionalKeyWipeGuard loaded_key_wipe{loaded.key};
+    if (loaded.index.meta.locked) {
+        throw std::runtime_error("archive is locked (read-only)");
+    }
+    if (!loaded.index.meta.encryption.enabled || !loaded.key) {
+        throw std::runtime_error("archive is not password-encrypted");
+    }
+
+    core::CryptoKey data_key = *loaded.key;
+    CryptoKeyWipeGuard data_key_wipe{data_key};
+    EncryptionInfo updated;
+    const auto& old = loaded.index.meta.encryption;
+    if (old.v2) {
+        updated = old;
+        if (mutation == PasswordMutation::add) {
+            if (updated.slots.size() >= kMaxEncryptionSlots) {
+                throw std::runtime_error("archive already has the maximum password slots");
+            }
+            updated.slots.push_back(make_encryption_slot(
+                updated, next_encryption_slot_id(updated), secondary_password, data_key));
+        } else if (mutation == PasswordMutation::remove) {
+            const auto index = find_password_slot(updated, secondary_password, data_key);
+            if (updated.slots.size() <= 1) {
+                throw std::runtime_error("cannot remove the archive's last password");
+            }
+            updated.slots.erase(updated.slots.begin() + static_cast<std::ptrdiff_t>(index));
+        } else {
+            const auto index = find_password_slot(updated, current_password, data_key);
+            updated.slots[index] = make_encryption_slot(
+                updated, updated.slots[index].id, secondary_password, data_key);
+        }
+    } else {
+        // A legacy archive has exactly one password-derived data key. Migration
+        // wraps that same key in v2 slots, so every compressed/encrypted byte is
+        // retained even when the directory preamble grows.
+        updated.enabled = true;
+        updated.encrypt_directory = old.encrypt_directory;
+        updated.v2 = true;
+        core::random_bytes(updated.key_id);
+        if (mutation == PasswordMutation::remove) {
+            throw std::runtime_error("cannot remove the last legacy archive password");
+        }
+        updated.slots.push_back(make_encryption_slot(
+            updated, 1, mutation == PasswordMutation::change
+                           ? secondary_password : current_password,
+            data_key));
+        if (mutation == PasswordMutation::add) {
+            updated.slots.push_back(make_encryption_slot(
+                updated, 2, secondary_password, data_key));
+        }
+    }
+    loaded.index.meta.encryption = std::move(updated);
+    loaded.index.meta.has_signature = false;
+
+    const std::uint64_t old_block_start =
+        (layout.flags & kFlagEncryptedDirectory) != 0
+            ? layout.preamble_offset + layout.preamble_size
+            : kHeaderSize;
+    const std::uint64_t old_block_end = archive_block_region_end(layout, loaded.index);
+    if (old_block_end < old_block_start) {
+        throw FormatError("archive block region is before its encryption preamble");
+    }
+    for (const auto& block : loaded.index.blocks) {
+        if (block.compressed_offset < old_block_start ||
+            block.compressed_offset > old_block_end ||
+            block.compressed_size > old_block_end - block.compressed_offset) {
+            throw FormatError("archive block lies outside its protected block region");
+        }
+    }
+
+    fs::path temp_path = archive_path;
+    temp_path += ".tmp";
+    TempFileGuard temp_guard(temp_path);
+    std::ofstream output(temp_path, std::ios::binary | std::ios::trunc);
+    if (!output) {
+        throw std::runtime_error("cannot create archive: " + core::path_to_utf8(temp_path));
+    }
+    const auto header = archive_header_bytes(
+        archive_header_version(loaded.index.entries, loaded.index.meta),
+        archive_header_flags(loaded.index.entries, loaded.index.meta));
+    output.write(reinterpret_cast<const char*>(header.data()),
+                 static_cast<std::streamsize>(header.size()));
+    std::uint64_t new_block_start = header.size();
+    if (loaded.index.meta.encryption.encrypt_directory) {
+        const auto preamble = serialize_encryption_preamble(loaded.index.meta.encryption);
+        output.write(reinterpret_cast<const char*>(preamble.data()),
+                     static_cast<std::streamsize>(preamble.size()));
+        new_block_start += preamble.size();
+    }
+    if (!output) {
+        throw std::runtime_error("failed to write archive encryption header");
+    }
+
+    const auto shift_offset = [&](std::uint64_t offset) {
+        if (new_block_start >= old_block_start) {
+            const auto delta = new_block_start - old_block_start;
+            if (offset > std::numeric_limits<std::uint64_t>::max() - delta) {
+                throw FormatError("archive block offset overflows during rekeying");
+            }
+            return offset + delta;
+        }
+        const auto delta = old_block_start - new_block_start;
+        if (offset < delta) {
+            throw FormatError("archive block offset underflows during rekeying");
+        }
+        return offset - delta;
+    };
+    for (auto& block : loaded.index.blocks) {
+        block.compressed_offset = shift_offset(block.compressed_offset);
+    }
+
+    std::uint64_t copied = 0;
+    const std::uint64_t copy_size = old_block_end - old_block_start;
+    const auto chunk_size = effective_io_buffer_size(options.io_buffer_size);
+    report_operation(options.operation, OperationStage::copying, 0, copy_size,
+                     0, loaded.index.blocks.size(), "Preserving encrypted blocks");
+    while (copied < copy_size) {
+        operation_checkpoint(options.operation);
+        const auto want = std::min<std::uint64_t>(chunk_size, copy_size - copied);
+        const auto chunk = source.read(old_block_start + copied, want);
+        output.write(reinterpret_cast<const char*>(chunk.data()),
+                     static_cast<std::streamsize>(chunk.size()));
+        if (!output) {
+            throw std::runtime_error("failed while preserving encrypted blocks");
+        }
+        copied += want;
+        report_operation(options.operation, OperationStage::copying, copied, copy_size,
+                         loaded.index.blocks.size(), loaded.index.blocks.size(),
+                         "Preserving encrypted blocks");
+    }
+    const std::uint64_t written = new_block_start + copy_size;
+    patch_archive_header(output,
+                         archive_header_version(loaded.index.entries, loaded.index.meta),
+                         archive_header_flags(loaded.index.entries, loaded.index.meta));
+    const core::CryptoKey* directory_key =
+        loaded.index.meta.encryption.encrypt_directory ? &data_key : nullptr;
+    write_directory_and_footer(output, written, loaded.index.blocks, loaded.index.entries,
+                               loaded.index.meta, directory_key, true,
+                               loaded.index.meta.chunk_table ? &loaded.index.chunks : nullptr);
+    input.close();
+
+    const unsigned recovery_percent = options.recovery_percent != 0
+        ? options.recovery_percent
+        : (existing_recovery ? existing_recovery->percent : 0);
+    if (recovery_percent != 0) {
+        append_recovery_to_staged_archive(
+            temp_path, recovery_percent, options.operation, options.thread_count);
+    }
+    replace_archive_file(temp_path, archive_path);
+    temp_guard.dismiss();
 }
 
 }  // namespace
@@ -3170,18 +6710,17 @@ void create_archive(const std::vector<std::filesystem::path>& inputs,
     const core::CryptoKey* key_ptr = nullptr;
     const bool encrypt_dir = !options.password.empty() && options.encrypt_header;
     if (!options.password.empty()) {
-        auto [enc, derived] = make_encryption(options.password);
+        auto [enc, derived] = options.use_encryption_v2
+            ? make_encryption_v2(options.password)
+            : make_encryption(options.password);
         enc.encrypt_directory = encrypt_dir;
         meta.encryption = std::move(enc);
         key = derived;
         key_ptr = &key;
     }
 
-    ByteVector header;
-    header.insert(header.end(), kArchiveMagic.begin(), kArchiveMagic.end());
-    put_u16(header, kArchiveVersion);
-    put_u16(header, encrypt_dir ? kFlagEncryptedDirectory : static_cast<std::uint16_t>(0));
-    put_u32(header, 0);  // reserved
+    const auto header = archive_header_bytes(
+        archive_header_version({}, meta), archive_header_flags({}, meta));
     out.write(reinterpret_cast<const char*>(header.data()), static_cast<std::streamsize>(header.size()));
     std::uint64_t written = header.size();
 
@@ -3196,7 +6735,10 @@ void create_archive(const std::vector<std::filesystem::path>& inputs,
     std::vector<EntryRec> entries;
     compress_items_into(out, written, blocks, entries, items, options, block_size, operation,
                         total_bytes, total_items, completed_bytes, completed_items,
-                        options.skip_unreadable_files, key_ptr);
+                        options.skip_unreadable_files, key_ptr, &meta);
+
+    patch_archive_header(out, archive_header_version(entries, meta),
+                         archive_header_flags(entries, meta));
 
     report_operation(operation, OperationStage::finalizing, completed_bytes, total_bytes,
                      completed_items, total_items, {}, 0, 0, completed_bytes,
@@ -3219,6 +6761,529 @@ void create_archive(const std::vector<std::filesystem::path>& inputs,
                      total_items, total_items, {}, 0, 0, total_bytes,
                      static_cast<std::uint64_t>(fs::file_size(archive_path)),
                      total_bytes);
+}
+
+void create_snapshot_archive(
+    const std::vector<std::filesystem::path>& inputs,
+    const std::filesystem::path& archive_path,
+    const std::string& snapshot_name,
+    const CompressionOptions& options) {
+    reject_volume_mutation(archive_path);
+    validate_snapshot_name(snapshot_name);
+    if (inputs.empty()) throw std::invalid_argument("snapshot needs at least one input");
+
+    const auto operation = options.operation;
+    report_operation(operation, OperationStage::scanning, 0, 0, 0, inputs.size());
+    std::vector<ScanItem> items;
+    for (const auto& input : inputs) {
+        operation_checkpoint(operation);
+        scan_input(input, items);
+    }
+
+    CompressionOptions snapshot_options = options;
+    snapshot_options.enable_snapshot_dedup = true;
+    const bool keyed = !options.password.empty() && options.keyed_chunk_ids;
+
+    fs::path temp_path = archive_path;
+    temp_path += ".tmp";
+    TempFileGuard temp_guard(temp_path);
+    std::ofstream out(temp_path, std::ios::binary | std::ios::trunc);
+    if (!out) {
+        throw std::runtime_error("cannot create snapshot archive: " +
+                                 core::path_to_utf8(temp_path));
+    }
+
+    ArchiveMeta meta;
+    meta.chunk_table = true;
+    meta.keyed_chunk_ids = keyed;
+    core::CryptoKey key{};
+    struct KeyWipeGuard {
+        core::CryptoKey& key;
+        ~KeyWipeGuard() { core::secure_wipe(key); }
+    } key_wipe{key};
+    const core::CryptoKey* key_ptr = nullptr;
+    const bool encrypt_dir = !options.password.empty() && options.encrypt_header;
+    if (!options.password.empty()) {
+        auto [enc, derived] = options.use_encryption_v2
+            ? make_encryption_v2(options.password)
+            : make_encryption(options.password);
+        enc.encrypt_directory = encrypt_dir;
+        meta.encryption = std::move(enc);
+        key = derived;
+        key_ptr = &key;
+    }
+
+    auto header = archive_header_bytes(
+        archive_header_version({}, meta), archive_header_flags({}, meta));
+    out.write(reinterpret_cast<const char*>(header.data()),
+              static_cast<std::streamsize>(header.size()));
+    std::uint64_t written = header.size();
+    if (encrypt_dir) {
+        const auto preamble = serialize_encryption_preamble(meta.encryption);
+        out.write(reinterpret_cast<const char*>(preamble.data()),
+                  static_cast<std::streamsize>(preamble.size()));
+        written += preamble.size();
+    }
+    if (!out) throw std::runtime_error("failed to write snapshot archive header");
+
+    std::vector<BlockRec> blocks;
+    std::vector<ChunkRec> chunks;
+    SnapshotChunkLookup lookup;
+    ArchiveReuseStats reuse_stats;
+    const auto entries = build_snapshot_entries(
+        out, written, blocks, chunks, lookup, items, snapshot_options, operation,
+        key_ptr, keyed, meta, reuse_stats);
+    meta.snapshots.push_back({snapshot_name, 0, snapshot_now(), entries});
+
+    out.seekp(0, std::ios::beg);
+    header = archive_header_bytes(archive_header_version(entries, meta),
+                                  archive_header_flags(entries, meta));
+    out.write(reinterpret_cast<const char*>(header.data()),
+              static_cast<std::streamsize>(header.size()));
+    out.seekp(0, std::ios::end);
+    if (!out) throw std::runtime_error("failed to finalize snapshot archive header");
+    report_operation(operation, OperationStage::finalizing, scanned_file_bytes(items),
+                     scanned_file_bytes(items), items.size(), items.size(), {}, 0, 0,
+                     scanned_file_bytes(items), written, scanned_file_bytes(items),
+                     reuse_stats.reused_items, reuse_stats.reused_bytes);
+    write_directory_and_footer(out, written, blocks, entries, meta,
+                               encrypt_dir ? key_ptr : nullptr, true, &chunks);
+    core::secure_wipe(key);
+    if (options.recovery_percent != 0) {
+        append_recovery_to_staged_archive(
+            temp_path, options.recovery_percent, operation, options.thread_count);
+    }
+    replace_archive_file(temp_path, archive_path);
+    temp_guard.dismiss();
+    report_operation(operation, OperationStage::finalizing, scanned_file_bytes(items),
+                     scanned_file_bytes(items), items.size(), items.size(), {}, 0, 0,
+                     scanned_file_bytes(items),
+                     static_cast<std::uint64_t>(fs::file_size(archive_path)),
+                     scanned_file_bytes(items), reuse_stats.reused_items,
+                     reuse_stats.reused_bytes);
+}
+
+void add_archive_snapshot(
+    const std::vector<std::filesystem::path>& inputs,
+    const std::filesystem::path& archive_path,
+    const std::string& snapshot_name,
+    const CompressionOptions& options) {
+    reject_volume_mutation(archive_path);
+    validate_snapshot_name(snapshot_name);
+    if (inputs.empty()) throw std::invalid_argument("snapshot needs at least one input");
+    if (!fs::exists(archive_path)) {
+        throw std::runtime_error("snapshot repository does not exist; use snapshot create");
+    }
+
+    const auto operation = options.operation;
+    report_operation(operation, OperationStage::scanning, 0, 0, 0, inputs.size());
+    std::vector<ScanItem> items;
+    for (const auto& input : inputs) {
+        operation_checkpoint(operation);
+        scan_input(input, items);
+    }
+
+    std::uint64_t physical_size = 0;
+    auto input = open_archive(archive_path, physical_size);
+    const ByteSource source(input, physical_size);
+    const auto layout = read_layout(source);
+    const auto recovery = read_recovery_service(source, layout);
+    auto loaded = load_index(source, options.password);
+    OptionalKeyWipeGuard key_wipe{loaded.key};
+    require_snapshot_profile(loaded.index);
+    if (loaded.index.meta.locked) throw std::runtime_error("archive is locked (read-only)");
+    if (std::any_of(loaded.index.meta.snapshots.begin(), loaded.index.meta.snapshots.end(),
+                    [&snapshot_name](const SnapshotRec& snapshot) {
+                        return snapshot.name == snapshot_name;
+                    })) {
+        throw std::invalid_argument("snapshot name already exists: " + snapshot_name);
+    }
+    if (loaded.index.meta.encryption.enabled && !loaded.key) {
+        throw std::runtime_error("encrypted snapshot repository requires a password");
+    }
+    const bool keyed = loaded.index.meta.encryption.enabled && options.keyed_chunk_ids;
+    if (keyed != loaded.index.meta.keyed_chunk_ids) {
+        throw std::invalid_argument(
+            "snapshot chunk identifier mode does not match the repository");
+    }
+    if (layout.footer_offset > std::numeric_limits<std::uint64_t>::max() - kFooterSize) {
+        throw FormatError("archive footer offset overflows append position");
+    }
+    const auto previous_end = layout.footer_offset + kFooterSize;
+    if (physical_size < previous_end) throw FormatError("archive is truncated before its footer");
+    if (layout.generation == std::numeric_limits<std::uint64_t>::max()) {
+        throw FormatError("archive generation number is exhausted");
+    }
+    const auto generation = layout.generation + 1;
+    const auto previous_footer_offset = layout.footer_offset;
+    const auto previous_directory_offset = layout.directory_offset;
+    const auto previous_directory_size = layout.directory_size;
+    const auto previous_generation_offset = layout.generation_offset;
+    auto blocks = std::move(loaded.index.blocks);
+    auto chunks = std::move(loaded.index.chunks);
+    auto meta = std::move(loaded.index.meta);
+    meta.has_signature = false;
+    auto lookup = build_snapshot_chunk_lookup(chunks);
+    ArchiveReuseStats reuse_stats;
+
+    input.close();
+    try {
+        if (physical_size != previous_end) {
+            std::error_code error;
+            fs::resize_file(archive_path, previous_end, error);
+            if (error) throw fs::filesystem_error("failed to trim archive tail",
+                                                   archive_path, error);
+        }
+        std::ofstream out(archive_path, std::ios::binary | std::ios::app);
+        if (!out) throw std::runtime_error("cannot open snapshot repository for append");
+        std::uint64_t written = previous_end;
+        CompressionOptions snapshot_options = options;
+        snapshot_options.enable_snapshot_dedup = true;
+        const auto entries = build_snapshot_entries(
+            out, written, blocks, chunks, lookup, items, snapshot_options, operation,
+            loaded.key ? &*loaded.key : nullptr, keyed, meta, reuse_stats);
+        meta.snapshots.push_back({snapshot_name, generation, snapshot_now(), entries});
+        const auto actual_version = archive_header_version(entries, meta);
+        const auto actual_flags = archive_header_flags(entries, meta);
+        if (actual_version != layout.version || actual_flags != layout.flags) {
+            throw std::runtime_error(
+                "snapshot capture changed required header features; retry with a fresh repository");
+        }
+        const auto directory_key =
+            meta.encryption.encrypt_directory && loaded.key ? &*loaded.key : nullptr;
+        const auto directory = write_directory_and_footer(
+            out, written, blocks, entries, meta, directory_key, false, &chunks);
+        out.close();
+        if (!out) throw std::runtime_error("failed to close snapshot directory");
+        append_generation_trailer(
+            archive_path, directory.directory_offset, directory.directory_size,
+            generation, previous_footer_offset, previous_directory_offset,
+            previous_directory_size, previous_generation_offset,
+            options.recovery_percent != 0
+                ? options.recovery_percent : (recovery ? recovery->percent : 0),
+            operation, options.thread_count, previous_end);
+    } catch (...) {
+        std::error_code error;
+        fs::resize_file(archive_path, previous_end, error);
+        throw;
+    }
+    report_operation(operation, OperationStage::finalizing, scanned_file_bytes(items),
+                     scanned_file_bytes(items), items.size(), items.size(), {}, 0, 0,
+                     scanned_file_bytes(items),
+                     static_cast<std::uint64_t>(fs::file_size(archive_path)),
+                     scanned_file_bytes(items), reuse_stats.reused_items,
+                     reuse_stats.reused_bytes);
+}
+
+std::vector<ArchiveSnapshotInfo> list_archive_snapshots(
+    const std::filesystem::path& archive_path, const std::string& password) {
+    std::uint64_t file_size = 0;
+    auto input = open_archive(archive_path, file_size);
+    const ByteSource source(input, file_size);
+    auto loaded = load_index(source, password);
+    OptionalKeyWipeGuard key_wipe{loaded.key};
+    require_snapshot_profile(loaded.index);
+
+    std::vector<ArchiveSnapshotInfo> result;
+    result.reserve(loaded.index.meta.snapshots.size());
+    for (std::size_t index = 0; index < loaded.index.meta.snapshots.size(); ++index) {
+        const auto& snapshot = loaded.index.meta.snapshots[index];
+        ArchiveSnapshotInfo info;
+        info.name = snapshot.name;
+        info.generation = snapshot.generation;
+        info.created = snapshot.created;
+        info.entry_count = snapshot.entries.size();
+        info.current = index + 1 == loaded.index.meta.snapshots.size();
+        for (const auto& entry : snapshot.entries) {
+            if (entry.type == kEntryFile) info.file_bytes += entry.size;
+        }
+        result.push_back(std::move(info));
+    }
+    return result;
+}
+
+std::vector<ArchiveSnapshotChange> diff_archive_snapshots(
+    const std::filesystem::path& archive_path,
+    const std::string& from_snapshot,
+    const std::string& to_snapshot,
+    const std::string& password) {
+    std::uint64_t file_size = 0;
+    auto input = open_archive(archive_path, file_size);
+    const ByteSource source(input, file_size);
+    auto loaded = load_index(source, password);
+    OptionalKeyWipeGuard key_wipe{loaded.key};
+    require_snapshot_profile(loaded.index);
+    const auto& from = find_snapshot(loaded.index.meta, from_snapshot);
+    const auto& to = find_snapshot(loaded.index.meta, to_snapshot);
+
+    const auto same_entry = [](const EntryRec& left, const EntryRec& right) {
+        const auto same_blobs = [](const auto& first, const auto& second) {
+            if (first.size() != second.size()) return false;
+            return std::equal(first.begin(), first.end(), second.begin(),
+                              [](const auto& a, const auto& b) {
+                                  return a.name == b.name && a.data == b.data;
+                              });
+        };
+        const auto same_metadata = [&](const core::FileMetadata& first,
+                                       const core::FileMetadata& second) {
+            return first.has_windows_attributes == second.has_windows_attributes &&
+                   (!first.has_windows_attributes ||
+                    first.windows_attributes == second.windows_attributes) &&
+                   first.has_windows_times == second.has_windows_times &&
+                   (!first.has_windows_times ||
+                    (first.windows_creation_time == second.windows_creation_time &&
+                     first.windows_access_time == second.windows_access_time &&
+                     first.windows_write_time == second.windows_write_time)) &&
+                   first.has_posix == second.has_posix &&
+                   (!first.has_posix ||
+                    (first.posix_mode == second.posix_mode &&
+                     first.posix_uid == second.posix_uid &&
+                     first.posix_gid == second.posix_gid)) &&
+                   first.has_windows_security_descriptor ==
+                       second.has_windows_security_descriptor &&
+                   (!first.has_windows_security_descriptor ||
+                    first.windows_security_descriptor == second.windows_security_descriptor) &&
+                   same_blobs(first.xattrs, second.xattrs) &&
+                   first.has_reparse_data == second.has_reparse_data &&
+                   (!first.has_reparse_data ||
+                    (first.reparse_tag == second.reparse_tag &&
+                     first.reparse_data == second.reparse_data));
+        };
+        const auto same_sparse_map = [](const core::SparseFileMap& first,
+                                        const core::SparseFileMap& second) {
+            if (first.is_sparse != second.is_sparse ||
+                first.allocated.size() != second.allocated.size()) {
+                return false;
+            }
+            return std::equal(first.allocated.begin(), first.allocated.end(),
+                              second.allocated.begin(),
+                              [](const core::SparseExtent& a,
+                                 const core::SparseExtent& b) {
+                                  return a.offset == b.offset && a.length == b.length;
+                              });
+        };
+        return left.type == right.type && left.path == right.path &&
+               left.size == right.size && left.mtime == right.mtime &&
+               left.crc == right.crc && left.has_blake3 == right.has_blake3 &&
+               (!left.has_blake3 || left.blake3 == right.blake3) &&
+               left.chunk_refs == right.chunk_refs &&
+               left.link_target == right.link_target &&
+               same_blobs(left.ads, right.ads) &&
+               same_metadata(left.meta, right.meta) &&
+               same_sparse_map(left.sparse, right.sparse);
+    };
+
+    std::map<std::string, const EntryRec*> before;
+    std::map<std::string, const EntryRec*> after;
+    for (const auto& entry : from.entries) before.emplace(entry.path, &entry);
+    for (const auto& entry : to.entries) after.emplace(entry.path, &entry);
+
+    std::vector<ArchiveSnapshotChange> result;
+    auto before_it = before.begin();
+    auto after_it = after.begin();
+    while (before_it != before.end() || after_it != after.end()) {
+        if (after_it == after.end() ||
+            (before_it != before.end() && before_it->first < after_it->first)) {
+            result.push_back({before_it->first, ArchiveSnapshotChangeKind::removed,
+                              before_it->second->size, 0});
+            ++before_it;
+            continue;
+        }
+        if (before_it == before.end() || after_it->first < before_it->first) {
+            result.push_back({after_it->first, ArchiveSnapshotChangeKind::added,
+                              0, after_it->second->size});
+            ++after_it;
+            continue;
+        }
+        if (!same_entry(*before_it->second, *after_it->second)) {
+            result.push_back({after_it->first, ArchiveSnapshotChangeKind::modified,
+                              before_it->second->size, after_it->second->size});
+        }
+        ++before_it;
+        ++after_it;
+    }
+    return result;
+}
+
+void prune_archive_snapshots(
+    const std::filesystem::path& archive_path,
+    const std::vector<std::string>& snapshot_names,
+    const CompressionOptions& options) {
+    reject_volume_mutation(archive_path);
+    if (snapshot_names.empty()) {
+        throw std::invalid_argument("prune requires at least one snapshot name");
+    }
+
+    std::uint64_t physical_size = 0;
+    auto input = open_archive(archive_path, physical_size);
+    const ByteSource source(input, physical_size);
+    const auto layout = read_layout(source);
+    const auto recovery = read_recovery_service(source, layout);
+    auto loaded = load_index(source, options.password);
+    OptionalKeyWipeGuard key_wipe{loaded.key};
+    require_snapshot_profile(loaded.index);
+    if (loaded.index.meta.locked) throw std::runtime_error("archive is locked (read-only)");
+
+    std::unordered_set<std::string> remove;
+    remove.reserve(snapshot_names.size());
+    for (const auto& name : snapshot_names) {
+        validate_snapshot_name(name);
+        if (!remove.insert(name).second) {
+            throw std::invalid_argument("duplicate snapshot name: " + name);
+        }
+        (void)find_snapshot(loaded.index.meta, name);
+    }
+    const auto& current = loaded.index.meta.snapshots.back();
+    if (remove.find(current.name) != remove.end()) {
+        throw std::invalid_argument("cannot prune the current snapshot: " + current.name);
+    }
+
+    std::vector<SnapshotRec> retained;
+    retained.reserve(loaded.index.meta.snapshots.size() - remove.size());
+    for (auto& snapshot : loaded.index.meta.snapshots) {
+        if (remove.find(snapshot.name) == remove.end()) {
+            retained.push_back(std::move(snapshot));
+        }
+    }
+    loaded.index.meta.snapshots = std::move(retained);
+    loaded.index.meta.has_signature = false;
+
+    if (layout.footer_offset > std::numeric_limits<std::uint64_t>::max() - kFooterSize) {
+        throw FormatError("archive footer offset overflows append position");
+    }
+    const auto previous_end = layout.footer_offset + kFooterSize;
+    if (physical_size < previous_end) throw FormatError("archive is truncated before its footer");
+    if (layout.generation == std::numeric_limits<std::uint64_t>::max()) {
+        throw FormatError("archive generation number is exhausted");
+    }
+    const auto generation = layout.generation + 1;
+    const auto previous_footer_offset = layout.footer_offset;
+    const auto previous_directory_offset = layout.directory_offset;
+    const auto previous_directory_size = layout.directory_size;
+    const auto previous_generation_offset = layout.generation_offset;
+    input.close();
+
+    try {
+        if (physical_size != previous_end) {
+            std::error_code error;
+            fs::resize_file(archive_path, previous_end, error);
+            if (error) throw fs::filesystem_error("failed to trim archive tail",
+                                                   archive_path, error);
+        }
+        std::ofstream out(archive_path, std::ios::binary | std::ios::app);
+        if (!out) throw std::runtime_error("cannot open snapshot repository for append");
+        std::uint64_t written = previous_end;
+        const auto directory_key = loaded.index.meta.encryption.encrypt_directory && loaded.key
+            ? &*loaded.key : nullptr;
+        const auto directory = write_directory_and_footer(
+            out, written, loaded.index.blocks, loaded.index.entries, loaded.index.meta,
+            directory_key, false, &loaded.index.chunks);
+        out.close();
+        if (!out) throw std::runtime_error("failed to close pruned snapshot directory");
+        append_generation_trailer(
+            archive_path, directory.directory_offset, directory.directory_size,
+            generation, previous_footer_offset, previous_directory_offset,
+            previous_directory_size, previous_generation_offset,
+            options.recovery_percent != 0
+                ? options.recovery_percent : (recovery ? recovery->percent : 0),
+            options.operation, options.thread_count, previous_end);
+    } catch (...) {
+        std::error_code error;
+        fs::resize_file(archive_path, previous_end, error);
+        throw;
+    }
+}
+
+void restore_archive_snapshot(
+    const std::filesystem::path& archive_path,
+    const std::string& snapshot_name,
+    const std::filesystem::path& dest_dir,
+    const ExtractOptions& options);
+
+void create_archive_to_stream(
+    std::ostream& output,
+    const std::vector<std::filesystem::path>& inputs,
+    const CompressionOptions& options) {
+    if (!output) throw std::invalid_argument("archive output stream is not writable");
+    if (options.recovery_percent != 0) {
+        throw std::invalid_argument(
+            "stream archive output does not support recovery records; write a file archive first");
+    }
+
+    const auto operation = options.operation;
+    report_operation(operation, OperationStage::scanning, 0, 0, 0, inputs.size());
+    std::vector<ScanItem> items;
+    for (const auto& input : inputs) {
+        operation_checkpoint(operation);
+        scan_input(input, items);
+    }
+
+    const auto total_bytes = scanned_file_bytes(items);
+    const auto total_items = static_cast<std::uint64_t>(items.size());
+    std::uint64_t completed_bytes = 0;
+    std::uint64_t completed_items = 0;
+    report_operation(operation, OperationStage::reading, completed_bytes, total_bytes,
+                     completed_items, total_items);
+
+    ArchiveMeta meta;
+    core::CryptoKey key{};
+    struct KeyWipeGuard {
+        core::CryptoKey& key;
+        ~KeyWipeGuard() { core::secure_wipe(key); }
+    } key_wipe{key};
+    const core::CryptoKey* key_ptr = nullptr;
+    const bool encrypt_dir = !options.password.empty() && options.encrypt_header;
+    if (!options.password.empty()) {
+        auto [enc, derived] = options.use_encryption_v2
+            ? make_encryption_v2(options.password)
+            : make_encryption(options.password);
+        enc.encrypt_directory = encrypt_dir;
+        meta.encryption = std::move(enc);
+        key = derived;
+        key_ptr = &key;
+    }
+
+    // The feature bits are reserved up front because a non-seekable stream cannot
+    // patch them after metadata capture. Unused capability bits are harmless: the
+    // directory still carries the authoritative per-entry records.
+    constexpr std::uint16_t stream_feature_flags =
+        kFlagSparseEntries | kFlagCaptureReport | kFlagExtendedMetadata;
+    const auto header = archive_header_bytes(
+        kArchiveVersion5,
+        static_cast<std::uint16_t>(archive_header_flags({}, meta) |
+                                    stream_feature_flags));
+    CountedOutput sink(output);
+    std::uint64_t written = 0;
+    sink.write(reinterpret_cast<const char*>(header.data()),
+               static_cast<std::streamsize>(header.size()));
+    written += header.size();
+    if (!sink) throw std::runtime_error("failed to write archive stream header");
+
+    if (encrypt_dir) {
+        const auto preamble = serialize_encryption_preamble(meta.encryption);
+        sink.write(reinterpret_cast<const char*>(preamble.data()),
+                   static_cast<std::streamsize>(preamble.size()));
+        written += preamble.size();
+        if (!sink) throw std::runtime_error("failed to write archive stream preamble");
+    }
+
+    std::vector<BlockRec> blocks;
+    std::vector<EntryRec> entries;
+    compress_items_into(sink, written, blocks, entries, items,
+                        options, effective_solid_block_size(options), operation,
+                        total_bytes, total_items, completed_bytes, completed_items,
+                        options.skip_unreadable_files, key_ptr, &meta);
+
+    report_operation(operation, OperationStage::finalizing, completed_bytes, total_bytes,
+                     completed_items, total_items, {}, 0, 0, completed_bytes,
+                     written, completed_bytes);
+    const core::CryptoKey* directory_key = encrypt_dir ? key_ptr : nullptr;
+    write_directory_and_footer(sink, written, blocks, entries, meta, directory_key);
+    if (!sink) throw std::runtime_error("failed to finalize archive stream");
+    const auto final_size = sink.position();
+    report_operation(operation, OperationStage::finalizing, total_bytes, total_bytes,
+                     total_items, total_items, {}, 0, 0, total_bytes,
+                     final_size, total_bytes);
 }
 
 void add_to_archive(const std::vector<std::filesystem::path>& inputs,
@@ -3252,7 +7317,7 @@ void add_to_archive(const std::vector<ArchiveInput>& inputs,
         std::uint64_t file_size = 0;
         auto in = open_archive(archive_path, file_size);
         const ByteSource source(in, file_size);
-        existing = read_index(source);
+        existing = load_index(source, options.password).index;
     }
     validate_mapped_items(items, existing, operation);
     append_items_to_archive(archive_path, items, options);
@@ -3291,8 +7356,189 @@ void delete_from_archive(const std::filesystem::path& archive_path,
         archive_path, [&](const EntryRec& entry) { return !is_deleted(entry.path); }, options);
 }
 
+namespace {
+
+void repack_snapshot_archive(const std::filesystem::path& archive_path,
+                             const CompressionOptions& options) {
+    reject_volume_mutation(archive_path);
+    std::uint64_t physical_size = 0;
+    auto input = open_archive(archive_path, physical_size);
+    const ByteSource source(input, physical_size);
+    const auto layout = read_layout(source);
+    const auto recovery = read_recovery_service(source, layout);
+    auto loaded = load_index(source, options.password);
+    OptionalKeyWipeGuard key_wipe{loaded.key};
+    require_snapshot_profile(loaded.index);
+    if (loaded.index.meta.locked) throw std::runtime_error("archive is locked (read-only)");
+    if (loaded.index.meta.encryption.enabled && !loaded.key) {
+        throw std::runtime_error("encrypted snapshot repository requires a password to repack");
+    }
+
+    try {
+        std::vector<bool> live_blocks(loaded.index.blocks.size(), false);
+        const auto mark_entries = [&](const std::vector<EntryRec>& entries) {
+            for (const auto& entry : entries) {
+                for (const auto chunk_index : entry.chunk_refs) {
+                    if (chunk_index >= loaded.index.chunks.size()) {
+                        throw FormatError("snapshot entry references an unknown chunk");
+                    }
+                    const auto block_index = loaded.index.chunks[
+                        static_cast<std::size_t>(chunk_index)].block_index;
+                    if (block_index >= live_blocks.size()) {
+                        throw FormatError("snapshot chunk references an unknown block");
+                    }
+                    live_blocks[static_cast<std::size_t>(block_index)] = true;
+                }
+            }
+        };
+        mark_entries(loaded.index.entries);
+        for (const auto& snapshot_record : loaded.index.meta.snapshots) {
+            mark_entries(snapshot_record.entries);
+        }
+
+        std::vector<std::uint64_t> block_remap(
+            loaded.index.blocks.size(), std::numeric_limits<std::uint64_t>::max());
+        std::vector<std::uint64_t> chunk_remap(
+            loaded.index.chunks.size(), std::numeric_limits<std::uint64_t>::max());
+        std::vector<BlockRec> new_blocks;
+        std::vector<ChunkRec> new_chunks;
+        new_blocks.reserve(loaded.index.blocks.size());
+        new_chunks.reserve(loaded.index.chunks.size());
+
+        fs::path temp_path = archive_path;
+        temp_path += ".tmp";
+        TempFileGuard temp_guard(temp_path);
+        std::ofstream out(temp_path, std::ios::binary | std::ios::trunc);
+        if (!out) {
+            throw std::runtime_error("cannot create archive: " +
+                                     core::path_to_utf8(temp_path));
+        }
+
+        auto meta = loaded.index.meta;
+        meta.has_signature = false;
+        const auto header = archive_header_bytes(
+            archive_header_version(loaded.index.entries, meta),
+            archive_header_flags(loaded.index.entries, meta));
+        out.write(reinterpret_cast<const char*>(header.data()),
+                  static_cast<std::streamsize>(header.size()));
+        std::uint64_t written = header.size();
+        if (meta.encryption.encrypt_directory) {
+            const auto preamble = serialize_encryption_preamble(meta.encryption);
+            out.write(reinterpret_cast<const char*>(preamble.data()),
+                      static_cast<std::streamsize>(preamble.size()));
+            written += preamble.size();
+        }
+        if (!out) throw std::runtime_error("failed to write snapshot repack header");
+
+        report_operation(options.operation, OperationStage::copying, 0,
+                         archive_block_region_end(layout, loaded.index), 0,
+                         loaded.index.blocks.size(), "Reclaiming snapshot chunks");
+        for (std::uint64_t old_index = 0; old_index < loaded.index.blocks.size(); ++old_index) {
+            operation_checkpoint(options.operation);
+            if (!live_blocks[static_cast<std::size_t>(old_index)]) continue;
+            const auto& old_block = loaded.index.blocks[static_cast<std::size_t>(old_index)];
+            auto encoded = source.read_compressed(old_block.compressed_offset,
+                                                   old_block.compressed_size);
+            if (loaded.key) {
+                ByteVector plaintext;
+                if (!core::aead_open(*loaded.key, encoded,
+                                     block_associated_data(old_index), plaintext)) {
+                    throw FormatError("snapshot block authentication failed during repack");
+                }
+                encoded = core::aead_seal(
+                    *loaded.key, plaintext,
+                    block_associated_data(static_cast<std::uint64_t>(new_blocks.size())));
+            }
+            const auto new_index = static_cast<std::uint64_t>(new_blocks.size());
+            block_remap[static_cast<std::size_t>(old_index)] = new_index;
+            out.write(reinterpret_cast<const char*>(encoded.data()),
+                      static_cast<std::streamsize>(encoded.size()));
+            if (!out) throw std::runtime_error("failed while writing snapshot blocks");
+            new_blocks.push_back({written, static_cast<std::uint64_t>(encoded.size()),
+                                  old_block.uncompressed_size, old_block.subframes});
+            written += encoded.size();
+            report_operation(options.operation, OperationStage::copying,
+                             old_block.compressed_offset + old_block.compressed_size,
+                             archive_block_region_end(layout, loaded.index),
+                             old_index + 1, loaded.index.blocks.size(),
+                             "Reclaiming snapshot chunks");
+        }
+
+        for (std::uint64_t old_index = 0; old_index < loaded.index.chunks.size(); ++old_index) {
+            const auto& old_chunk = loaded.index.chunks[static_cast<std::size_t>(old_index)];
+            if (old_chunk.block_index >= block_remap.size() ||
+                block_remap[static_cast<std::size_t>(old_chunk.block_index)] ==
+                    std::numeric_limits<std::uint64_t>::max()) {
+                continue;
+            }
+            chunk_remap[static_cast<std::size_t>(old_index)] = new_chunks.size();
+            auto chunk = old_chunk;
+            chunk.block_index = block_remap[static_cast<std::size_t>(old_chunk.block_index)];
+            new_chunks.push_back(std::move(chunk));
+        }
+
+        const auto remap_entries = [&](std::vector<EntryRec>& entries) {
+            for (auto& entry : entries) {
+                for (auto& chunk_index : entry.chunk_refs) {
+                    if (chunk_index >= chunk_remap.size() ||
+                        chunk_remap[static_cast<std::size_t>(chunk_index)] ==
+                            std::numeric_limits<std::uint64_t>::max()) {
+                        throw FormatError("snapshot entry references a reclaimed chunk");
+                    }
+                    chunk_index = chunk_remap[static_cast<std::size_t>(chunk_index)];
+                }
+                if (!entry.chunk_refs.empty()) {
+                    const auto& first = new_chunks[
+                        static_cast<std::size_t>(entry.chunk_refs.front())];
+                    entry.first_block = first.block_index;
+                    entry.offset = first.offset;
+                } else {
+                    entry.first_block = 0;
+                    entry.offset = 0;
+                }
+            }
+        };
+        remap_entries(loaded.index.entries);
+        for (auto& snapshot_record : meta.snapshots) {
+            remap_entries(snapshot_record.entries);
+        }
+
+        patch_archive_header(out,
+                             archive_header_version(loaded.index.entries, meta),
+                             archive_header_flags(loaded.index.entries, meta));
+        const core::CryptoKey* directory_key =
+            meta.encryption.encrypt_directory && loaded.key ? &*loaded.key : nullptr;
+        write_directory_and_footer(out, written, new_blocks, loaded.index.entries, meta,
+                                   directory_key, true, &new_chunks);
+        out.close();
+        input.close();
+
+        const unsigned recovery_percent = options.recovery_percent != 0
+            ? options.recovery_percent : (recovery ? recovery->percent : 0);
+        if (recovery_percent != 0) {
+            append_recovery_to_staged_archive(
+                temp_path, recovery_percent, options.operation, options.thread_count);
+        }
+        replace_archive_file(temp_path, archive_path);
+        temp_guard.dismiss();
+    } catch (...) {
+        throw;
+    }
+}
+
+}  // namespace
+
 void repack_archive(const std::filesystem::path& archive_path,
                     const CompressionOptions& options) {
+    std::uint64_t file_size = 0;
+    auto input = open_archive(archive_path, file_size);
+    const ByteSource source(input, file_size);
+    const auto index = load_index(source, options.password).index;
+    input.close();
+    if (index.meta.chunk_table) {
+        repack_snapshot_archive(archive_path, options);
+        return;
+    }
     rebuild_archive_keeping(archive_path, [](const EntryRec&) { return true; }, options);
 }
 
@@ -3303,15 +7549,17 @@ struct LoadedMutationState {
     unsigned recovery_percent = 0;
 };
 
-LoadedMutationState load_mutation_state(const fs::path& archive_path) {
+LoadedMutationState load_mutation_state(const fs::path& archive_path,
+                                        const std::string& password) {
     std::uint64_t file_size = 0;
     auto input = open_archive(archive_path, file_size);
     const ByteSource source(input, file_size);
+    const auto layout = read_layout(source);
     LoadedMutationState state;
-    if (const auto recovery = read_recovery_service(source)) {
+    if (const auto recovery = read_recovery_service(source, layout)) {
         state.recovery_percent = recovery->percent;
     }
-    state.index = read_index(source);
+    state.index = load_index(source, password).index;
     return state;
 }
 
@@ -3365,7 +7613,7 @@ void update_archive_items(const std::vector<ScanItem>& items,
                           const std::filesystem::path& archive_path,
                           const CompressionOptions& options,
                           bool fresh_only, bool validate_mapping) {
-    auto state = load_mutation_state(archive_path);
+    auto state = load_mutation_state(archive_path, options.password);
     if (validate_mapping) {
         validate_mapped_items(items, state.index, options.operation);
     }
@@ -3394,7 +7642,7 @@ void sync_archive_items(const std::vector<ScanItem>& items,
                         const CompressionOptions& options,
                         bool validate_mapping,
                         const ArchiveSyncFinalization& finalization) {
-    auto state = load_mutation_state(archive_path);
+    auto state = load_mutation_state(archive_path, options.password);
     if (validate_mapping) {
         validate_mapped_items(items, state.index, options.operation);
     }
@@ -3546,7 +7794,7 @@ void finalize_archive_metadata(
     const std::filesystem::path& archive_path,
     const ArchiveSyncFinalization& finalization,
     const CompressionOptions& options) {
-    auto state = load_mutation_state(archive_path);
+    auto state = load_mutation_state(archive_path, options.password);
     const bool changed =
         (finalization.comment &&
          *finalization.comment != state.index.meta.comment) ||
@@ -3616,7 +7864,7 @@ void move_archive_entries(const std::filesystem::path& archive_path,
         std::uint64_t file_size = 0;
         auto in = open_archive(archive_path, file_size);
         const ByteSource source(in, file_size);
-        index = read_index(source);
+        index = load_index(source, options.password).index;
     }
 
     std::unordered_map<std::string, std::uint8_t> original_types;
@@ -3714,7 +7962,7 @@ void set_archive_comment(const std::filesystem::path& archive_path, const std::s
         std::uint64_t file_size = 0;
         auto in = open_archive(archive_path, file_size);
         const ByteSource source(in, file_size);
-        meta = read_index(source).meta;
+        meta = load_index(source, options.password).index.meta;
     }
     if (meta.locked) {
         throw std::runtime_error("archive is locked (read-only)");
@@ -3731,7 +7979,7 @@ void lock_archive(const std::filesystem::path& archive_path, const CompressionOp
         std::uint64_t file_size = 0;
         auto in = open_archive(archive_path, file_size);
         const ByteSource source(in, file_size);
-        meta = read_index(source).meta;  // preserve any existing comment
+        meta = load_index(source, options.password).index.meta;  // preserve any existing comment
     }
     meta.locked = true;
     meta.has_signature = false;
@@ -3753,6 +8001,15 @@ bool archive_is_locked(const std::filesystem::path& archive_path, const std::str
     return load_index(source, password).index.meta.locked;
 }
 
+ArchiveCaptureReport archive_capture_report(const std::filesystem::path& archive_path,
+                                            const std::string& password) {
+    std::uint64_t file_size = 0;
+    auto in = open_archive(archive_path, file_size);
+    const ByteSource source(in, file_size);
+    const auto warnings = load_index(source, password).index.meta.capture_warnings;
+    return ArchiveCaptureReport{warnings.empty(), warnings};
+}
+
 ArchiveEncryptionMode archive_encryption_mode(const std::filesystem::path& archive_path) {
     std::uint64_t file_size = 0;
     auto in = open_archive(archive_path, file_size);
@@ -3770,6 +8027,13 @@ ArchiveEncryptionMode archive_encryption_mode(const std::filesystem::path& archi
 
 bool archive_is_encrypted(const std::filesystem::path& archive_path) {
     return archive_encryption_mode(archive_path) != ArchiveEncryptionMode::none;
+}
+
+bool archive_is_snapshot_repository(const std::filesystem::path& archive_path) {
+    std::uint64_t file_size = 0;
+    auto in = open_archive(archive_path, file_size);
+    const ByteSource source(in, file_size);
+    return (read_layout(source).flags & kFlagChunkTable) != 0;
 }
 
 namespace {
@@ -4011,7 +8275,8 @@ ArchiveRecoveryInfo archive_recovery_info(const std::filesystem::path& archive_p
     std::uint64_t file_size = 0;
     auto stream = open_archive(archive_path, file_size);
     const ByteSource source(stream, file_size);
-    const auto service = read_recovery_service(source);
+    const auto layout = read_layout(source);
+    const auto service = read_recovery_service(source, layout);
     if (!service) return {};
     return {true, service->percent, service->data_shards, service->parity_shards,
             service->protected_size};
@@ -4029,7 +8294,8 @@ bool repair_archive(const std::filesystem::path& archive_path,
     std::uint64_t file_size = 0;
     auto input = open_archive(archive_path, file_size);
     const ByteSource source(input, file_size);
-    const auto service_optional = read_recovery_service(source);
+    const auto layout = read_layout(source);
+    const auto service_optional = read_recovery_service(source, layout);
     if (!service_optional) return false;
     const auto& service = *service_optional;
     const int data_count = service.data_shards;
@@ -4356,24 +8622,24 @@ void sign_archive(const std::filesystem::path& archive_path,
     auto stream = open_archive(archive_path, file_size);
     const ByteSource source(stream, file_size);
     const ArchiveLayout layout = read_layout(source);
-    if ((layout.flags & kFlagEncryptedDirectory) != 0) {
-        throw std::runtime_error(
-            "signing an archive with an encrypted directory is not supported");
-    }
     auto loaded = load_index(source, options.password);
     if (loaded.index.meta.locked) {
         throw std::runtime_error("archive is locked (read-only)");
     }
-    const auto digest = archive_signature_digest(source, layout, loaded.index);
-    const auto signature = core::sign_message(key.secret_key, digest);
-    if (!core::verify_message(key.public_key, signature, digest)) {
-        throw std::invalid_argument("signing key public and secret components do not match");
-    }
-    loaded.index.meta.has_signature = true;
-    loaded.index.meta.signature_public_key = key.public_key;
-    loaded.index.meta.signature = signature;
+    const auto existing_recovery = read_recovery_service(source, layout);
     stream.close();
-    rewrite_archive_directory(archive_path, std::move(loaded.index), options);
+
+    // Signing is a metadata mutation. Route it through the same generation
+    // transaction as synchronize so a signed archive keeps its history and the
+    // generation extension is included in the signed digest. Archives that need
+    // a header rewrite (or are embedded in an SFX) fall back to the established
+    // directory-rewrite path inside append_items_to_archive_indexed.
+    ArchiveSyncFinalization finalization;
+    finalization.signing_key = &key;
+    append_items_to_archive_indexed(
+        archive_path, {}, options, std::move(loaded.index),
+        existing_recovery ? existing_recovery->percent : 0, nullptr, nullptr,
+        true, &finalization);
 }
 
 ArchiveSignatureInfo verify_archive_signature(
@@ -4395,34 +8661,106 @@ ArchiveSignatureInfo verify_archive_signature(
     return info;
 }
 
+void add_archive_password(const std::filesystem::path& archive_path,
+                          const std::string& current_password,
+                          const std::string& new_password,
+                          const CompressionOptions& options) {
+    rewrite_archive_password(archive_path, current_password, new_password,
+                             PasswordMutation::add, options);
+}
+
+void remove_archive_password(const std::filesystem::path& archive_path,
+                             const std::string& current_password,
+                             const std::string& password_to_remove,
+                             const CompressionOptions& options) {
+    rewrite_archive_password(archive_path, current_password, password_to_remove,
+                             PasswordMutation::remove, options);
+}
+
+void change_archive_password(const std::filesystem::path& archive_path,
+                             const std::string& current_password,
+                             const std::string& new_password,
+                             const CompressionOptions& options) {
+    rewrite_archive_password(archive_path, current_password, new_password,
+                             PasswordMutation::change, options);
+}
+
 void create_sfx_archive(const std::filesystem::path& archive_path,
                         std::span<const std::uint8_t> stub_image,
                         const std::filesystem::path& output_executable,
                         const std::shared_ptr<OperationControl>& operation,
-                        std::size_t io_buffer_size) {
+                        std::size_t io_buffer_size,
+                        std::span<const std::uint8_t> config) {
     const auto normalized_output = fs::absolute(output_executable).lexically_normal();
-    if (fs::absolute(archive_path).lexically_normal() == normalized_output) {
+    const auto normalized_archive = fs::absolute(archive_path).lexically_normal();
+    if (normalized_archive == normalized_output) {
         throw std::invalid_argument("SFX output must differ from its archive");
     }
     if (stub_image.empty()) throw std::invalid_argument("SFX stub image is empty");
+    if (config.size() > kSfxMaxConfigSize) {
+        throw std::invalid_argument("SFX configuration is too large");
+    }
     std::error_code error;
+    if (!fs::is_regular_file(archive_path, error)) {
+        throw std::invalid_argument("SFX archive input is not a regular file");
+    }
     const std::uint64_t archive_size = fs::file_size(archive_path, error);
     if (error) throw std::runtime_error("cannot read SFX archive: " + error.message());
-    const std::uint64_t stub_size = stub_image.size();
+    if (archive_size == 0) {
+        throw std::invalid_argument("SFX archive input is empty");
+    }
+    if (fs::exists(output_executable, error) &&
+        fs::equivalent(archive_path, output_executable, error)) {
+        throw std::invalid_argument("SFX output must not alias its archive");
+    }
+    if (error) throw std::runtime_error("cannot inspect SFX output: " + error.message());
 
-    fs::path temporary = output_executable;
-    temporary += ".tmp";
+    // The v2 payload is anchored to the end of the PE image, not to the end of
+    // the file, so that an Authenticode certificate can be appended afterwards
+    // without displacing it. That requires knowing where the image ends.
+    std::uint64_t image_end = 0;
+    {
+        std::string stub_bytes(reinterpret_cast<const char*>(stub_image.data()),
+                               stub_image.size());
+        std::istringstream stub_stream(std::move(stub_bytes),
+                                       std::ios::in | std::ios::binary);
+        const auto computed = pe_image_end(stub_stream);
+        if (!computed) {
+            throw std::invalid_argument("SFX stub is not a valid PE image");
+        }
+        if (pe_certificate_table(stub_stream)) {
+            // Appending would invalidate the stub's signature, and dropping it
+            // silently would be worse. Signing belongs on the finished output.
+            throw std::invalid_argument(
+                "SFX stub is already signed; sign the generated executable "
+                "instead of the stub");
+        }
+        image_end = *computed;
+    }
+    if (image_end > stub_image.size()) {
+        throw std::invalid_argument("SFX stub image is truncated");
+    }
+    if (image_end != stub_image.size()) {
+        throw std::invalid_argument(
+            "SFX stub contains trailing data; provide the PE image without an overlay");
+    }
+
+    fs::path temporary = core::unique_sibling_path(output_executable, L"sfx");
     TempFileGuard guard(temporary);
     std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
     if (!output) throw std::runtime_error("cannot create SFX output");
 
     std::uint64_t completed = 0;
-    const std::uint64_t total = stub_size + archive_size;
+    if (archive_size > std::numeric_limits<std::uint64_t>::max() - image_end) {
+        throw std::invalid_argument("SFX output size overflows the file range");
+    }
+    const std::uint64_t total = image_end + archive_size;
     const std::size_t io_chunk = effective_io_buffer_size(io_buffer_size);
-    for (std::size_t offset = 0; offset < stub_image.size();) {
+    // Any bytes past image_end are not part of the PE and are not carried over.
+    for (std::uint64_t offset = 0; offset < image_end;) {
         operation_checkpoint(operation);
-        const std::size_t count =
-            std::min(io_chunk, stub_image.size() - offset);
+        const std::size_t count = static_cast<std::size_t>(
+            std::min<std::uint64_t>(io_chunk, image_end - offset));
         output.write(
             reinterpret_cast<const char*>(stub_image.data() + offset),
             static_cast<std::streamsize>(count));
@@ -4433,6 +8771,29 @@ void create_sfx_archive(const std::filesystem::path& archive_path,
                          0, 2, "embedded SFX module");
     }
 
+    SfxPayload descriptor_fields;
+    if (!config.empty()) {
+        descriptor_fields.config_offset = image_end + kSfxDescriptorSize;
+        descriptor_fields.config_size = config.size();
+    }
+    descriptor_fields.payload_offset =
+        image_end + kSfxDescriptorSize + config.size();
+    descriptor_fields.payload_size = archive_size;
+
+    // The descriptor precedes the payload but records its hash, so a
+    // placeholder goes down first and is rewritten once the payload is known.
+    // That keeps this to a single pass over the archive.
+    const auto placeholder = sfx_encode_descriptor(image_end, descriptor_fields);
+    output.write(reinterpret_cast<const char*>(placeholder.data()),
+                 static_cast<std::streamsize>(placeholder.size()));
+    if (!config.empty()) {
+        output.write(reinterpret_cast<const char*>(config.data()),
+                     static_cast<std::streamsize>(config.size()));
+    }
+    if (!output) throw std::runtime_error("failed while writing SFX output");
+
+    core::Blake3 payload_hasher;
+    std::uint64_t copied_payload = 0;
     auto copy = [&](const fs::path& path) {
         std::ifstream input(path, std::ios::binary);
         if (!input) {
@@ -4445,28 +8806,41 @@ void create_sfx_archive(const std::filesystem::path& archive_path,
             input.read(chunk.data(), static_cast<std::streamsize>(chunk.size()));
             const auto count = input.gcount();
             if (count <= 0) break;
+            const auto count_u64 = static_cast<std::uint64_t>(count);
+            if (copied_payload > archive_size ||
+                count_u64 > archive_size - copied_payload) {
+                throw std::runtime_error(
+                    "SFX archive changed while it was being packaged");
+            }
             output.write(chunk.data(), count);
             if (!output) throw std::runtime_error("failed while writing SFX output");
-            completed += static_cast<std::uint64_t>(count);
+            payload_hasher.update(std::span<const std::uint8_t>(
+                reinterpret_cast<const std::uint8_t*>(chunk.data()),
+                static_cast<std::size_t>(count)));
+            copied_payload += count_u64;
+            completed += count_u64;
             report_operation(operation, OperationStage::writing, completed, total, 0, 2,
                              core::path_to_utf8(path.filename()));
         }
+        if (input.bad() || copied_payload != archive_size) {
+            throw std::runtime_error("SFX archive changed while it was being packaged");
+        }
     };
     copy(archive_path);
-    output.write(reinterpret_cast<const char*>(kSfxMagic.data()),
-                 static_cast<std::streamsize>(kSfxMagic.size()));
-    ByteVector size;
-    put_u64(size, archive_size);
-    output.write(reinterpret_cast<const char*>(size.data()),
-                 static_cast<std::streamsize>(size.size()));
+
+    const auto digest = payload_hasher.finalize();
+    std::copy(digest.begin(), digest.begin() + descriptor_fields.payload_hash.size(),
+              descriptor_fields.payload_hash.begin());
+    const auto final_descriptor =
+        sfx_encode_descriptor(image_end, descriptor_fields);
+    output.seekp(static_cast<std::streamoff>(image_end), std::ios::beg);
+    if (!output) throw std::runtime_error("failed while writing SFX output");
+    output.write(reinterpret_cast<const char*>(final_descriptor.data()),
+                 static_cast<std::streamsize>(final_descriptor.size()));
+    if (!output) throw std::runtime_error("failed while writing SFX output");
     output.close();
     if (!output) throw std::runtime_error("failed to finalize SFX output");
-    fs::rename(temporary, output_executable, error);
-    if (error) {
-        fs::remove(output_executable, error);
-        fs::rename(temporary, output_executable, error);
-        if (error) throw std::runtime_error("cannot install SFX output: " + error.message());
-    }
+    core::replace_file(temporary, output_executable, "SFX output");
     guard.dismiss();
 }
 
@@ -4474,13 +8848,20 @@ void create_sfx_archive(const std::filesystem::path& archive_path,
                         const std::filesystem::path& stub_executable,
                         const std::filesystem::path& output_executable,
                         const std::shared_ptr<OperationControl>& operation,
-                        std::size_t io_buffer_size) {
+                        std::size_t io_buffer_size,
+                        std::span<const std::uint8_t> config) {
     const auto normalized_output =
         fs::absolute(output_executable).lexically_normal();
-    if (fs::absolute(stub_executable).lexically_normal() == normalized_output) {
+    const auto normalized_stub = fs::absolute(stub_executable).lexically_normal();
+    if (normalized_stub == normalized_output) {
         throw std::invalid_argument("SFX output must differ from its stub");
     }
     std::error_code error;
+    if (fs::exists(output_executable, error) &&
+        fs::equivalent(stub_executable, output_executable, error)) {
+        throw std::invalid_argument("SFX output must not alias its stub");
+    }
+    if (error) throw std::runtime_error("cannot inspect SFX output: " + error.message());
     const std::uint64_t stub_size = fs::file_size(stub_executable, error);
     if (error) {
         throw std::runtime_error("cannot read SFX stub: " + error.message());
@@ -4497,12 +8878,77 @@ void create_sfx_archive(const std::filesystem::path& archive_path,
         throw std::runtime_error("cannot read SFX stub");
     }
     create_sfx_archive(archive_path, std::span<const std::uint8_t>(stub),
-                       output_executable, operation, io_buffer_size);
+                       output_executable, operation, io_buffer_size, config);
+}
+
+std::optional<std::vector<std::uint8_t>> sfx_archive_config(
+    const std::filesystem::path& sfx_executable) {
+    const auto payload = sfx_locate_payload(sfx_executable);
+    if (!payload || payload->config_size == 0 ||
+        payload->config_size > kSfxMaxConfigSize ||
+        payload->config_offset >
+            static_cast<std::uint64_t>(std::numeric_limits<std::streamoff>::max())) {
+        return std::nullopt;
+    }
+    std::ifstream stream(sfx_executable, std::ios::binary);
+    if (!stream) return std::nullopt;
+    stream.seekg(static_cast<std::streamoff>(payload->config_offset), std::ios::beg);
+    std::vector<std::uint8_t> blob(static_cast<std::size_t>(payload->config_size));
+    stream.read(reinterpret_cast<char*>(blob.data()),
+                static_cast<std::streamsize>(blob.size()));
+    if (stream.gcount() != static_cast<std::streamsize>(blob.size())) {
+        return std::nullopt;
+    }
+    return blob;
 }
 
 std::optional<std::uint64_t> estimate_solid_entry_packed_size(
     const EntryRec& entry,
     const std::vector<BlockRec>& blocks);
+
+void append_entry_subframe_ranges(const EntryRec& entry,
+                                  const std::vector<BlockRec>& blocks,
+                                  ArchiveEntry& output) {
+    // Snapshot files are assembled from independently compressed chunks. Their
+    // chunk table already supplies the seek unit; the solid-block subframe map
+    // describes neither their logical file order nor their reusable storage.
+    if (entry.type != kEntryFile || entry.size == 0 || !entry.chunk_refs.empty()) return;
+    std::uint64_t remaining = entry.size;
+    std::uint64_t block_index = entry.first_block;
+    std::uint64_t within = entry.offset;
+    std::uint64_t entry_offset = 0;
+    while (remaining > 0) {
+        if (block_index >= blocks.size()) {
+            throw FormatError("file extends past the last block");
+        }
+        const auto& block = blocks[static_cast<std::size_t>(block_index)];
+        if (within > block.uncompressed_size) {
+            throw FormatError("file offset lies outside its block");
+        }
+        const auto block_take = std::min(remaining, block.uncompressed_size - within);
+        if (!block.subframes.empty()) {
+            const auto block_end = within + block_take;
+            for (const auto& frame : block.subframes) {
+                const auto frame_end = frame.uncompressed_offset + frame.uncompressed_size;
+                const auto begin = std::max(within, frame.uncompressed_offset);
+                const auto end = std::min(block_end, frame_end);
+                if (begin >= end) continue;
+                if (block.compressed_offset >
+                    std::numeric_limits<std::uint64_t>::max() - frame.compressed_offset) {
+                    throw FormatError("subframe archive offset overflows");
+                }
+                output.subframes.push_back({
+                    entry_offset + (begin - within), end - begin,
+                    block.compressed_offset + frame.compressed_offset,
+                    frame.compressed_size});
+            }
+        }
+        remaining -= block_take;
+        entry_offset += block_take;
+        within = 0;
+        ++block_index;
+    }
+}
 
 std::vector<ArchiveEntry> list_archive(const std::filesystem::path& archive_path,
                                        const std::string& password) {
@@ -4523,14 +8969,48 @@ std::vector<ArchiveEntry> list_archive(const std::filesystem::path& archive_path
         out.link_target = entry.link_target;
         out.size = entry.size;
         if (entry.type == kEntryFile) {
-            out.packed_size = estimate_solid_entry_packed_size(entry, index.blocks);
-            out.packed_size_estimated = entry.size != 0;
+            if (!entry.chunk_refs.empty()) {
+                std::uint64_t packed = 0;
+                for (const auto ref : entry.chunk_refs) {
+                    if (ref >= index.chunks.size()) {
+                        throw FormatError("snapshot entry points outside the chunk table");
+                    }
+                    const auto block_index = index.chunks[static_cast<std::size_t>(ref)].block_index;
+                    if (block_index >= index.blocks.size() ||
+                        packed > std::numeric_limits<std::uint64_t>::max() -
+                                     index.blocks[static_cast<std::size_t>(block_index)].compressed_size) {
+                        throw FormatError("snapshot packed size overflows");
+                    }
+                    packed += index.blocks[static_cast<std::size_t>(block_index)].compressed_size;
+                }
+                out.packed_size = packed;
+                out.packed_size_estimated = false;
+            } else {
+                out.packed_size = estimate_solid_entry_packed_size(entry, index.blocks);
+                out.packed_size_estimated = entry.size != 0;
+            }
         }
         out.mtime = entry.mtime;
         out.crc32 = entry.crc;
         out.has_crc32 = entry.type == kEntryFile;
         out.has_blake3 = entry.has_blake3;
         out.blake3 = entry.blake3;
+        out.chunk_count = entry.chunk_refs.size();
+        out.is_sparse = entry.sparse.is_sparse;
+        out.sparse_extents.reserve(entry.sparse.allocated.size());
+        for (const auto& extent : entry.sparse.allocated) {
+            out.sparse_extents.push_back({extent.offset, extent.length});
+        }
+        out.has_security_descriptor = entry.meta.has_windows_security_descriptor;
+        out.security_descriptor = entry.meta.windows_security_descriptor;
+        out.xattrs.reserve(entry.meta.xattrs.size());
+        for (const auto& xattr : entry.meta.xattrs) {
+            out.xattrs.push_back({xattr.name, xattr.data});
+        }
+        out.has_reparse_data = entry.meta.has_reparse_data;
+        out.reparse_tag = entry.meta.reparse_tag;
+        out.reparse_data = entry.meta.reparse_data;
+        append_entry_subframe_ranges(entry, index.blocks, out);
         result.push_back(std::move(out));
     }
     return result;
@@ -4584,8 +9064,10 @@ void test_archive(const std::filesystem::path& archive_path,
     const auto operation = options.operation;
     std::uint64_t file_size = 0;
     auto stream = open_archive(archive_path, file_size);
-    const ByteSource bytes(stream, file_size);
+    const auto read_stats = std::make_shared<ArchiveReadStats>();
+    const ByteSource bytes(stream, file_size, read_stats);
     auto loaded = load_index(bytes, options.password);
+    OptionalKeyWipeGuard key_wipe{loaded.key};
     const auto& index = loaded.index;
     if (index.meta.has_signature) {
         const auto layout = read_layout(bytes);
@@ -4660,12 +9142,36 @@ void test_archive(const std::filesystem::path& archive_path,
         }
     };
 
+    const auto validate_snapshot_chunk = [&](const ChunkRec& chunk,
+                                             std::span<const std::uint8_t> bytes) {
+        auto crc = core::crc32_init();
+        crc = core::crc32_update(crc, bytes);
+        if (core::crc32_final(crc) != chunk.crc) {
+            throw FormatError("snapshot chunk checksum mismatch");
+        }
+        const auto digest = chunk_digest(
+            bytes, loaded.key ? &*loaded.key : nullptr, index.meta.keyed_chunk_ids);
+        if (digest != chunk.identity.id) {
+            throw FormatError("snapshot chunk identity mismatch");
+        }
+    };
+
     if (!use_parallel_test_decode) {
         BlockSource source(bytes, index, options.thread_count, operation, loaded.key);
+        if (index.meta.chunk_table) {
+            for (std::uint64_t chunk_index = 0; chunk_index < index.chunks.size();
+                 ++chunk_index) {
+                operation_checkpoint(operation);
+                (void)source.chunk(chunk_index);
+            }
+        }
         verify_entries([&](const EntryRec& entry, const auto& sink) {
             read_file_bytes(source, index.blocks.size(), entry, operation, sink,
                             options.io_buffer_size);
         });
+        report_operation(operation, OperationStage::testing, completed_bytes, total_bytes,
+                         completed_items, total_items, {}, 0, 0, 0, 0, 0, 0, 0,
+                         read_stats->archive_bytes_read.load(std::memory_order_relaxed));
         return;
     }
 
@@ -4708,7 +9214,56 @@ void test_archive(const std::filesystem::path& archive_path,
         std::rethrow_exception(first_exception);
     }
 
+    if (index.meta.chunk_table) {
+        for (const auto& chunk : index.chunks) {
+            operation_checkpoint(operation);
+            if (chunk.block_index >= decoded.size()) {
+                throw FormatError("snapshot chunk points outside the block table");
+            }
+            const auto& block = decoded[static_cast<std::size_t>(chunk.block_index)];
+            if (chunk.offset > block.size() ||
+                chunk.identity.size > block.size() - chunk.offset) {
+                throw FormatError("snapshot chunk points outside its block");
+            }
+            const auto chunk_bytes = std::span<const std::uint8_t>(
+                block.data() + static_cast<std::size_t>(chunk.offset),
+                static_cast<std::size_t>(chunk.identity.size));
+            validate_snapshot_chunk(chunk, chunk_bytes);
+        }
+    }
+
     verify_entries([&](const EntryRec& entry, const auto& sink) {
+        if (!entry.chunk_refs.empty()) {
+            const auto io_chunk = effective_io_buffer_size(options.io_buffer_size);
+            for (const auto ref : entry.chunk_refs) {
+                if (ref >= index.chunks.size()) {
+                    throw FormatError("snapshot entry points outside the chunk table");
+                }
+                const auto& chunk = index.chunks[static_cast<std::size_t>(ref)];
+                if (chunk.block_index >= decoded.size()) {
+                    throw FormatError("snapshot chunk points outside the block table");
+                }
+                const auto& block = decoded[static_cast<std::size_t>(chunk.block_index)];
+                if (chunk.offset > block.size() ||
+                    chunk.identity.size > block.size() - chunk.offset) {
+                    throw FormatError("snapshot chunk points outside its block");
+                }
+                const auto chunk_bytes = std::span<const std::uint8_t>(
+                    block.data() + static_cast<std::size_t>(chunk.offset),
+                    static_cast<std::size_t>(chunk.identity.size));
+                validate_snapshot_chunk(chunk, chunk_bytes);
+                std::uint64_t offset = 0;
+                while (offset < chunk.identity.size) {
+                    const auto take = std::min<std::uint64_t>(
+                        io_chunk, chunk.identity.size - offset);
+                    sink(std::span<const std::uint8_t>(
+                        block.data() + chunk.offset + offset,
+                        static_cast<std::size_t>(take)));
+                    offset += take;
+                }
+            }
+            return;
+        }
         std::uint64_t remaining = entry.size;
         std::uint64_t block_index = entry.first_block;
         std::uint64_t within = entry.offset;
@@ -4735,31 +9290,70 @@ void test_archive(const std::filesystem::path& archive_path,
             }
         }
     });
+    report_operation(operation, OperationStage::testing, completed_bytes, total_bytes,
+                     completed_items, total_items, {}, 0, 0, 0, 0, 0, 0, 0,
+                     read_stats->archive_bytes_read.load(std::memory_order_relaxed));
 }
 
 namespace {
 
+// Directory records are still parsed and validated eagerly because encrypted
+// directories arrive as one authenticated image. Path lookup itself is lazy:
+// ordinary full extraction does not pay for a duplicate hash table unless a
+// hard-link or an explicit selection actually needs one.
+class LazyPathIndex {
+public:
+    explicit LazyPathIndex(const std::vector<EntryRec>& entries) : entries_(entries) {}
+
+    std::optional<std::size_t> find(const std::string& path) const {
+        ensure();
+        const auto found = index_->find(path);
+        if (found == index_->end()) return std::nullopt;
+        return found->second;
+    }
+
+private:
+    void ensure() const {
+        if (index_) return;
+        index_.emplace();
+        index_->reserve(entries_.size());
+        for (std::size_t i = 0; i < entries_.size(); ++i) {
+            index_->emplace(entries_[i].path, i);
+        }
+    }
+
+    const std::vector<EntryRec>& entries_;
+    mutable std::optional<std::unordered_map<std::string, std::size_t>> index_;
+};
+
 void extract_entries_impl(const std::filesystem::path& archive_path,
                           const std::vector<std::string>* requested_entries,
                           const std::filesystem::path& dest_dir,
-                          const ExtractOptions& options) {
+                          const ExtractOptions& options,
+                          const std::string* snapshot_name = nullptr) {
     const auto operation = options.operation;
     std::uint64_t file_size = 0;
     auto stream = open_archive(archive_path, file_size);
-    const ByteSource bytes(stream, file_size);
+    const auto read_stats = std::make_shared<ArchiveReadStats>();
+    const ByteSource bytes(stream, file_size, read_stats);
     auto loaded = load_index(bytes, options.password);
+    OptionalKeyWipeGuard key_wipe{loaded.key};
+    if (snapshot_name != nullptr) {
+        require_snapshot_profile(loaded.index);
+        const auto& snapshot = find_snapshot(loaded.index.meta, *snapshot_name);
+        loaded.index.entries = snapshot.entries;
+    }
     const auto& index = loaded.index;
     if (index.meta.encryption.enabled && !loaded.key) {
         throw std::runtime_error("archive is encrypted; a password is required");
     }
-    BlockSource source(bytes, index, options.thread_count, operation, loaded.key);
-
-    std::unordered_map<std::string, std::size_t> entry_by_path;
-    entry_by_path.reserve(index.entries.size());
-    for (std::size_t i = 0; i < index.entries.size(); ++i) {
-        operation_checkpoint(operation);
-        entry_by_path.emplace(index.entries[i].path, i);
+    if (options.strict_metadata && !index.meta.capture_warnings.empty()) {
+        throw FormatError("archive contains source-capture warnings");
     }
+    BlockSource source(bytes, index, options.thread_count, operation, loaded.key,
+                       requested_entries != nullptr);
+
+    LazyPathIndex entry_by_path(index.entries);
     std::vector<bool> selected(index.entries.size(), requested_entries == nullptr);
     if (requested_entries != nullptr) {
         std::unordered_set<std::string> unique_requests;
@@ -4771,11 +9365,11 @@ void extract_entries_impl(const std::filesystem::path& archive_path,
             }
             const auto found = entry_by_path.find(path);
             bool matched = false;
-            if (found != entry_by_path.end()) {
-                selected[found->second] = true;
+            if (found) {
+                selected[*found] = true;
                 matched = true;
             }
-            if (found == entry_by_path.end() || index.entries[found->second].type == kEntryDir) {
+            if (!found || index.entries[*found].type == kEntryDir) {
                 for (std::size_t i = 0; i < index.entries.size(); ++i) {
                     if (is_same_or_child(index.entries[i].path, path) &&
                         index.entries[i].path != path) {
@@ -4803,11 +9397,11 @@ void extract_entries_impl(const std::filesystem::path& archive_path,
             total_bytes += entry.size;
         } else if (entry.type == kEntryHardlink) {
             const auto target = entry_by_path.find(entry.link_target);
-            if (target == entry_by_path.end() || index.entries[target->second].type != kEntryFile) {
+            if (!target || index.entries[*target].type != kEntryFile) {
                 throw FormatError("archive contains a dangling hard link: " + entry.path);
             }
-            if (!selected[target->second]) {
-                total_bytes += index.entries[target->second].size;
+            if (!selected[*target]) {
+                total_bytes += index.entries[*target].size;
             }
         }
     }
@@ -4824,6 +9418,7 @@ void extract_entries_impl(const std::filesystem::path& archive_path,
     // into a directory does not overwrite its restored mtime; applied deepest-first.
     struct DeferredDir {
         fs::path target;
+        std::string archive_path;
         core::FileMetadata meta;
         std::int64_t mtime = 0;
     };
@@ -4874,6 +9469,13 @@ void extract_entries_impl(const std::filesystem::path& archive_path,
             // Best effort: creating a symlink can require privilege (Windows
             // without Developer Mode); on failure the rest of the archive still
             // extracts rather than aborting.
+            for (const auto& warning : core::apply_metadata(target, entry.meta,
+                                                            options.restore_mtime)) {
+                if (operation) operation->add_warning({entry.path, warning});
+                if (options.strict_metadata) {
+                    throw std::runtime_error(warning + ": " + entry.path);
+                }
+            }
             ++completed_items;
             report_operation(operation, OperationStage::extracting, completed_bytes, total_bytes,
                              completed_items, total_items, entry.path);
@@ -4883,15 +9485,14 @@ void extract_entries_impl(const std::filesystem::path& archive_path,
         const EntryRec* file_entry = &entry;
         if (entry.type == kEntryHardlink) {
             const auto canonical = entry_by_path.find(entry.link_target);
-            if (canonical == entry_by_path.end() ||
-                index.entries[canonical->second].type != kEntryFile) {
+            if (!canonical || index.entries[*canonical].type != kEntryFile) {
                 throw FormatError("archive contains a dangling hard link: " + entry.path);
             }
-            if (!selected[canonical->second]) {
+            if (!selected[*canonical]) {
                 // A selected hardlink whose canonical file is outside the selection
                 // is materialized directly from the canonical entry. This keeps the
                 // requested output self-contained without exposing unrelated paths.
-                file_entry = &index.entries[canonical->second];
+                file_entry = &index.entries[*canonical];
             } else {
             // The canonical file precedes its hard links in the directory, so its
             // target already exists on disk by the time we reach this entry.
@@ -4934,9 +9535,10 @@ void extract_entries_impl(const std::filesystem::path& archive_path,
                 throw FormatError("refusing to restore a directory over a symlink: " + entry.path);
             }
             fs::create_directories(target, ec);
-            // Attributes now (harmless to later child writes); timestamps deferred.
-            core::apply_metadata(target, entry.meta, /*restore_times=*/false);
-            deferred_dirs.push_back({target, entry.meta, entry.mtime});
+            // All directory metadata is deferred until descendants are written;
+            // restoring a restrictive ACL/read-only attribute first could make a
+            // later child write fail.
+            deferred_dirs.push_back({target, entry.path, entry.meta, entry.mtime});
             ++completed_items;
             report_operation(operation, OperationStage::extracting, completed_bytes, total_bytes,
                              completed_items, total_items, entry.path);
@@ -4968,6 +9570,8 @@ void extract_entries_impl(const std::filesystem::path& archive_path,
                                          core::path_to_utf8(temp_target));
             }
             std::uint64_t current_file_bytes = 0;
+            auto file_crc = core::crc32_init();
+            core::Blake3 file_hasher;
             // A solid block can span several files. While its inner blocks are
             // decoding, map their cumulative bytes onto the current file's
             // overlap so the file bar continues moving before the first output
@@ -5034,6 +9638,8 @@ void extract_entries_impl(const std::filesystem::path& archive_path,
                                         "failed writing file: " +
                                         core::path_to_utf8(temp_target));
                                 }
+                                file_crc = core::crc32_update(file_crc, bytes);
+                                file_hasher.update(bytes);
                                 completed_bytes += bytes.size();
                                 current_file_bytes += bytes.size();
                                 const auto file_done = advance_file_progress(current_file_bytes);
@@ -5043,6 +9649,13 @@ void extract_entries_impl(const std::filesystem::path& archive_path,
                                                  file_done, file_entry->size);
                             },
                             options.io_buffer_size);
+            if (current_file_bytes != file_entry->size ||
+                core::crc32_final(file_crc) != file_entry->crc) {
+                throw FormatError("checksum mismatch for extracted file: " + entry.path);
+            }
+            if (file_entry->has_blake3 && file_hasher.finalize() != file_entry->blake3) {
+                throw FormatError("BLAKE3 mismatch for extracted file: " + entry.path);
+            }
         }
 
         fs::rename(temp_target, target, ec);
@@ -5055,11 +9668,43 @@ void extract_entries_impl(const std::filesystem::path& archive_path,
         }
         temp_guard.dismiss();
 
+        if (file_entry->sparse.is_sparse) {
+            std::string sparse_error;
+            if (!core::restore_sparse_file(target, file_entry->sparse,
+                                           file_entry->size, &sparse_error)) {
+                OperationWarning warning{
+                    entry.path,
+                    "Sparse allocation could not be restored: " + sparse_error,
+                };
+                if (operation) operation->add_warning(warning);
+                if (options.strict_metadata) {
+                    throw std::runtime_error(warning.message + ": " + entry.path);
+                }
+            }
+        }
+
         // NTFS named streams are written before timestamps so restoring the write
         // time isn't disturbed by the stream writes that follow it.
         core::apply_ads(target, file_entry->ads);
         // High-precision Windows times (when present) supersede the seconds mtime.
-        core::apply_metadata(target, file_entry->meta, options.restore_mtime);
+        for (const auto& warning : core::apply_metadata(target, file_entry->meta,
+                                                        options.restore_mtime)) {
+            if (operation) operation->add_warning({entry.path, warning});
+            if (options.strict_metadata) {
+                throw std::runtime_error(warning + ": " + entry.path);
+            }
+        }
+        if (file_entry->meta.has_reparse_data) {
+            std::string reparse_error;
+            if (!core::apply_reparse_point(target, file_entry->meta.reparse_tag,
+                                           file_entry->meta.reparse_data,
+                                           &reparse_error)) {
+                if (operation) operation->add_warning({entry.path, reparse_error});
+                if (options.strict_metadata) {
+                    throw std::runtime_error(reparse_error + ": " + entry.path);
+                }
+            }
+        }
         if (options.restore_mtime && !file_entry->meta.has_windows_times &&
             file_entry->mtime != 0) {
             try {
@@ -5076,7 +9721,25 @@ void extract_entries_impl(const std::filesystem::path& archive_path,
     // Restore directory timestamps last (deepest-first) so nothing written into a
     // directory afterward disturbs its restored time.
     for (auto it = deferred_dirs.rbegin(); it != deferred_dirs.rend(); ++it) {
-        core::apply_metadata(it->target, it->meta, options.restore_mtime);
+        for (const auto& warning : core::apply_metadata(it->target, it->meta,
+                                                        options.restore_mtime)) {
+            if (operation) operation->add_warning({it->archive_path, warning});
+            if (options.strict_metadata) {
+                throw std::runtime_error(warning + ": " + core::path_to_utf8(it->target));
+            }
+        }
+        if (it->meta.has_reparse_data) {
+            std::string reparse_error;
+            if (!core::apply_reparse_point(it->target, it->meta.reparse_tag,
+                                           it->meta.reparse_data, &reparse_error)) {
+                if (operation) operation->add_warning({
+                    it->archive_path, reparse_error});
+                if (options.strict_metadata) {
+                    throw std::runtime_error(reparse_error + ": " +
+                                             core::path_to_utf8(it->target));
+                }
+            }
+        }
         if (options.restore_mtime && !it->meta.has_windows_times && it->mtime != 0) {
             try {
                 fs::last_write_time(it->target, from_unix_seconds(it->mtime), ec);
@@ -5085,6 +9748,9 @@ void extract_entries_impl(const std::filesystem::path& archive_path,
             }
         }
     }
+    report_operation(operation, OperationStage::extracting, completed_bytes, total_bytes,
+                     completed_items, total_items, {}, 0, 0, 0, 0, 0, 0, 0,
+                     read_stats->archive_bytes_read.load(std::memory_order_relaxed));
 }
 
 }  // namespace
@@ -5092,14 +9758,23 @@ void extract_entries_impl(const std::filesystem::path& archive_path,
 void extract_archive(const std::filesystem::path& archive_path,
                      const std::filesystem::path& dest_dir,
                      const ExtractOptions& options) {
-    extract_entries_impl(archive_path, nullptr, dest_dir, options);
+    extract_entries_impl(archive_path, nullptr, dest_dir, options, nullptr);
 }
 
 void extract_entries(const std::filesystem::path& archive_path,
                      const std::vector<std::string>& entries,
                      const std::filesystem::path& dest_dir,
                      const ExtractOptions& options) {
-    extract_entries_impl(archive_path, &entries, dest_dir, options);
+    extract_entries_impl(archive_path, &entries, dest_dir, options, nullptr);
+}
+
+void restore_archive_snapshot(
+    const std::filesystem::path& archive_path,
+    const std::string& snapshot_name,
+    const std::filesystem::path& dest_dir,
+    const ExtractOptions& options) {
+    validate_snapshot_name(snapshot_name);
+    extract_entries_impl(archive_path, nullptr, dest_dir, options, &snapshot_name);
 }
 
 

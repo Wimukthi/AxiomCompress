@@ -44,6 +44,24 @@ public:
         dialog_options.features.create_recovery_volumes =
             application_options_.default_recovery_volumes;
         dialog_options.features.create_sfx = application_options_.default_create_sfx;
+        dialog_options.features.sfx_stub_tier =
+            application_options_.default_sfx_stub_tier;
+        dialog_options.features.sfx_overwrite =
+            application_options_.default_sfx_overwrite;
+        dialog_options.features.sfx_mode = application_options_.default_sfx_mode;
+        dialog_options.features.sfx_elevation =
+            application_options_.default_sfx_elevation;
+        dialog_options.features.sfx_title = application_options_.default_sfx_title;
+        dialog_options.features.sfx_default_path =
+            application_options_.default_sfx_default_path;
+        dialog_options.features.sfx_run_program =
+            application_options_.default_sfx_run_program;
+        dialog_options.features.sfx_run_arguments =
+            application_options_.default_sfx_run_arguments;
+        dialog_options.features.sfx_allow_path_change =
+            application_options_.default_sfx_allow_path_change;
+        dialog_options.features.sfx_open_destination =
+            application_options_.default_sfx_open_destination;
         dialog_options.features.sign_archive = application_options_.default_sign_archive;
         dialog_options.features.signing_key = application_options_.default_signing_key;
         dialog_options.archive_path = default_archive_path();
@@ -64,6 +82,28 @@ public:
         if (dialog_options.archive_path.has_parent_path()) {
             persisted_settings_.last_archive_output_folder =
                 dialog_options.archive_path.parent_path().wstring();
+            axiom::gui::save_gui_settings(persisted_settings_);
+        }
+        if (dialog_options.features.create_sfx) {
+            application_options_.default_sfx_stub_tier =
+                dialog_options.features.sfx_stub_tier;
+            application_options_.default_sfx_overwrite =
+                dialog_options.features.sfx_overwrite;
+            application_options_.default_sfx_mode = dialog_options.features.sfx_mode;
+            application_options_.default_sfx_elevation =
+                dialog_options.features.sfx_elevation;
+            application_options_.default_sfx_title = dialog_options.features.sfx_title;
+            application_options_.default_sfx_default_path =
+                dialog_options.features.sfx_default_path;
+            application_options_.default_sfx_run_program =
+                dialog_options.features.sfx_run_program;
+            application_options_.default_sfx_run_arguments =
+                dialog_options.features.sfx_run_arguments;
+            application_options_.default_sfx_allow_path_change =
+                dialog_options.features.sfx_allow_path_change;
+            application_options_.default_sfx_open_destination =
+                dialog_options.features.sfx_open_destination;
+            persisted_settings_.application = application_options_;
             axiom::gui::save_gui_settings(persisted_settings_);
         }
 
@@ -539,12 +579,18 @@ private:
 
         apply_operation_priority();
         const std::vector<fs::path> inputs = inputs_;
+        // The SFX options authored on the dialog become the configuration
+        // embedded in the generated executable.
+        const auto sfx_config = axiom::sfx::encode_sfx_config(
+            axiom::gui::sfx_config_from_features(dialog_options.features));
+        const auto sfx_tier =
+            axiom::gui::sfx_stub_tier_from_features(dialog_options.features);
         const bool started = operation_runner_.start(
             hwnd_, kOperationDoneMessage,
             running, success,
             [inputs, archive, options, mode, comment, set_comment,
              repack_after, lock_after, sign_after, signing_key,
-             create_sfx_after, sfx_output, split_after,
+             create_sfx_after, sfx_output, split_after, sfx_config, sfx_tier,
              volume_size = *volume_size, recovery_volumes](
                 std::shared_ptr<axiom::OperationControl> operation) mutable {
                 auto run_options = options;
@@ -629,7 +675,8 @@ private:
                     if (create_sfx_after) {
                         axiom::sfx::create_from_module_file(
                             GetModuleHandleW(nullptr), archive, sfx_output,
-                            operation, options.io_buffer_size);
+                            operation, options.io_buffer_size,
+                            std::span<const std::uint8_t>(sfx_config), sfx_tier);
                         std::error_code remove_error;
                         if (!fs::remove(archive, remove_error) && remove_error) {
                             std::error_code cleanup_error;

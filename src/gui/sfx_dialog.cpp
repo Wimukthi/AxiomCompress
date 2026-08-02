@@ -110,7 +110,8 @@ public:
         owner_ = owner;
         instance_ = instance;
         dpi_ = owner != nullptr ? GetDpiForWindow(owner) : GetDpiForSystem();
-        dark_ = dialog_system_prefers_dark_mode();
+        dark_ = summary_.theme_forced ? summary_.dark
+                                      : dialog_system_prefers_dark_mode();
         if (!register_class()) return false;
 
         RECT window_rect{0, 0, scale(680), scale(470)};
@@ -125,7 +126,7 @@ public:
         const int x = anchor.left + (anchor.right - anchor.left - width) / 2;
         const int y = anchor.top + (anchor.bottom - anchor.top - height) / 2;
         window_ = CreateWindowExW(WS_EX_DLGMODALFRAME, kWindowClass,
-                                  L"Axiom Self-Extractor", style,
+                                  caption().c_str(), style,
                                   x, y, width, height, owner, nullptr, instance, this);
         if (window_ == nullptr) return false;
         const int show_command =
@@ -148,6 +149,11 @@ public:
     const SfxExtractDialogOptions& options() const { return options_; }
 
 private:
+    std::wstring caption() const {
+        return summary_.window_title.empty() ? std::wstring(L"Axiom Self-Extractor")
+                                             : summary_.window_title;
+    }
+
     bool register_class() const {
         WNDCLASSEXW wc{sizeof(wc)};
         wc.lpfnWndProc = &SfxDialog::window_proc;
@@ -181,7 +187,10 @@ private:
     void create_controls() {
         font_ = create_dialog_font(dpi_);
         tooltip_ = create_dialog_tooltip(window_);
-        heading_ = create_label((L"Extract " + summary_.archive_name).c_str());
+        const std::wstring heading = summary_.banner_text.empty()
+            ? L"Extract " + summary_.archive_name
+            : summary_.banner_text;
+        heading_ = create_label(heading.c_str());
 
         const std::wstring item_summary =
             std::to_wstring(summary_.file_count) +
@@ -205,6 +214,12 @@ private:
         SendMessageW(destination_edit_, EM_SETLIMITTEXT, 32767, 0);
         browse_button_ = create_control(L"BUTTON", L"Browse...",
                                         WS_TABSTOP | BS_OWNERDRAW, kBrowseButton);
+        if (!options_.allow_path_change) {
+            // The package fixed the destination. Show it, but read-only, so the
+            // user can still see where files will land.
+            SendMessageW(destination_edit_, EM_SETREADONLY, TRUE, 0);
+            EnableWindow(browse_button_, FALSE);
+        }
 
         overwrite_label_ = create_label(L"Existing files");
         overwrite_combo_ = create_control(
@@ -250,11 +265,17 @@ private:
         open_checkbox_ = create_control(L"BUTTON", L"Open destination when extraction finishes",
                                         WS_TABSTOP | BS_OWNERDRAW, kOpenDestination);
 
-        if (!summary_.comment.empty()) {
-            comment_heading_ = create_label(L"Archive comment");
-            std::wstring comment = summary_.comment;
-            if (comment.size() > 220) comment = comment.substr(0, 217) + L"...";
-            comment_label_ = create_label(comment.c_str());
+        // A configured description is the author speaking about the
+        // package, so it outranks the archive comment and gets its own
+        // heading rather than masquerading as one.
+        const bool has_description = !summary_.description.empty();
+        if (has_description || !summary_.comment.empty()) {
+            comment_heading_ = create_label(
+                has_description ? L"About this package" : L"Archive comment");
+            std::wstring body =
+                has_description ? summary_.description : summary_.comment;
+            if (body.size() > 220) body = body.substr(0, 217) + L"...";
+            comment_label_ = create_label(body.c_str());
         }
 
         extract_button_ = create_control(L"BUTTON", L"Extract",
@@ -291,7 +312,7 @@ private:
     }
 
     void apply_theme() {
-        dark_ = dialog_system_prefers_dark_mode();
+        if (!summary_.theme_forced) dark_ = dialog_system_prefers_dark_mode();
         recreate_brushes();
         apply_dialog_dark_frame(window_, dark_);
         for (HWND control : controls_) apply_dialog_control_theme(control, dark_);
@@ -349,7 +370,7 @@ private:
         const auto destination = validate_dialog_path(
             window_text(destination_edit_), DialogPathKind::destination_folder);
         if (!destination) {
-            show_message_dialog(window_, instance_, dpi_, dark_, L"Axiom Self-Extractor",
+            show_message_dialog(window_, instance_, dpi_, dark_, caption(),
                                 destination.error,
                                 MessageDialogIcon::warning);
             SetFocus(destination_edit_);

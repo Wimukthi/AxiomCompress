@@ -66,7 +66,7 @@
       <SubSystem>Windows</SubSystem>
       <ProgramDatabaseFile>$(OutDir)AxiomGui.pdb</ProgramDatabaseFile>
       <ImportLibrary>$(OutDir)AxiomGui.lib</ImportLibrary>
-      <AdditionalDependencies>Bcrypt.lib;Comctl32.lib;Dwmapi.lib;Gdiplus.lib;Msimg32.lib;Ole32.lib;OleAut32.lib;Shell32.lib;Shlwapi.lib;Version.lib;Winhttp.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>Advapi32.lib;Bcrypt.lib;Comctl32.lib;Dwmapi.lib;Gdiplus.lib;Msimg32.lib;Ole32.lib;OleAut32.lib;Shell32.lib;Shlwapi.lib;Version.lib;Winhttp.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
@@ -86,7 +86,7 @@
       <OptimizeReferences>true</OptimizeReferences>
       <ProgramDatabaseFile>$(OutDir)AxiomGui.pdb</ProgramDatabaseFile>
       <ImportLibrary>$(OutDir)AxiomGui.lib</ImportLibrary>
-      <AdditionalDependencies>Bcrypt.lib;Comctl32.lib;Dwmapi.lib;Gdiplus.lib;Msimg32.lib;Ole32.lib;OleAut32.lib;Shell32.lib;Shlwapi.lib;Version.lib;Winhttp.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>Advapi32.lib;Bcrypt.lib;Comctl32.lib;Dwmapi.lib;Gdiplus.lib;Msimg32.lib;Ole32.lib;OleAut32.lib;Shell32.lib;Shlwapi.lib;Version.lib;Winhttp.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
@@ -114,11 +114,14 @@
     <ClCompile Include="src\gui\operation_runner.cpp" />
     <ClCompile Include="src\gui\operation_progress_window.cpp" />
     <ClCompile Include="src\gui\sfx_dialog.cpp" />
+    <ClCompile Include="src\gui\license_dialog.cpp" />
     <ClCompile Include="src\gui\dialog_support.cpp" />
     <ClCompile Include="src\gui\message_dialog.cpp" />
     <ClCompile Include="src\gui\about_dialog.cpp" />
     <ClCompile Include="src\gui\update_checker.cpp" />
     <ClCompile Include="src\sfx\runtime.cpp" />
+    <ClCompile Include="src\sfx\sfx_host.cpp" />
+    <ClCompile Include="src\sfx\sfx_dialog_ui.cpp" />
     <ClCompile Include="src\sfx\module_file.cpp" />
   </ItemGroup>
   <ItemGroup>
@@ -139,12 +142,16 @@
     <ClInclude Include="src\gui\operation_runner.hpp" />
     <ClInclude Include="src\gui\operation_progress_window.hpp" />
     <ClInclude Include="src\gui\sfx_dialog.hpp" />
+    <ClInclude Include="src\gui\license_dialog.hpp" />
     <ClInclude Include="src\gui\dialog_support.hpp" />
     <ClInclude Include="src\gui\message_dialog.hpp" />
     <ClInclude Include="src\gui\about_dialog.hpp" />
     <ClInclude Include="src\gui\update_checker.hpp" />
     <ClInclude Include="src\gui\resource.hpp" />
     <ClInclude Include="src\sfx\runtime.hpp" />
+    <ClInclude Include="src\sfx\sfx_host.hpp" />
+    <ClInclude Include="src\sfx\sfx_dialog_ui.hpp" />
+    <ClInclude Include="src\sfx\sfx_ui.hpp" />
     <ClInclude Include="src\sfx\module_file.hpp" />
     <ClInclude Include="src\sfx\resource.hpp" />
   </ItemGroup>
@@ -171,6 +178,9 @@
     <ProjectReference Include="AxiomSfx.vcxproj">
       <Project>{9D28131A-22D1-4D07-9865-C6E975454A61}</Project>
       <LinkLibraryDependencies>false</LinkLibraryDependencies>
+    </ProjectReference>
+    <ProjectReference Include="AxiomSfxDecodeLib.vcxproj">
+      <Project>{C438F5C4-7D14-4A4D-8FCB-1F2F0A6A8B90}</Project>
     </ProjectReference>
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

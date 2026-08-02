@@ -145,6 +145,7 @@ bool MainWindow::can_execute_shortcut_command(UINT command) const {
     const axiom::gui::ArchiveCapabilities capabilities = active_archive_capabilities();
     const bool archive_editable = capabilities.update && !capabilities.locked &&
                                   !capabilities.directory_encrypted;
+    const bool archive_catalog_ready = active_archive_catalog_ready();
     const std::wstring current_location = current_location_value();
     const bool favorite = favorite_contains(current_location);
     switch (command) {
@@ -173,7 +174,7 @@ bool MainWindow::can_execute_shortcut_command(UINT command) const {
         case kFreshenArchive:
         case kSynchronizeArchive:
         case kRepackArchive:
-            return !busy_ && has_archive && archive_editable;
+            return !busy_ && has_archive && archive_editable && archive_catalog_ready;
         case kDeleteArchiveEntries:
             return !busy_ && browsing_archive && has_selection && archive_editable;
         case kEditArchiveComment:
@@ -307,6 +308,7 @@ std::vector<axiom::gui::CustomMenuItem> MainWindow::menu_items(UINT menu_id) con
     const axiom::gui::ArchiveCapabilities capabilities = active_archive_capabilities();
     const bool archive_editable = capabilities.update && !capabilities.locked &&
                                   !capabilities.directory_encrypted;
+    const bool archive_catalog_ready = active_archive_catalog_ready();
     const std::wstring current_location = current_location_value();
     const bool favorite = favorite_contains(current_location);
     const auto shortcut = [this](UINT command) { return shortcut_for_command(command); };
@@ -348,13 +350,13 @@ std::vector<axiom::gui::CustomMenuItem> MainWindow::menu_items(UINT menu_id) con
                   !busy_ && has_archive && capabilities.test},
                 {0, L"", L"", false, true},
                 {kUpdateArchive, L"&Update archive...", shortcut(kUpdateArchive),
-                  !busy_ && has_archive && archive_editable},
+                  !busy_ && has_archive && archive_editable && archive_catalog_ready},
                 {kFreshenArchive, L"&Freshen archive...", shortcut(kFreshenArchive),
-                 !busy_ && has_archive && archive_editable},
+                 !busy_ && has_archive && archive_editable && archive_catalog_ready},
                 {kSynchronizeArchive, L"S&ynchronize archive...", shortcut(kSynchronizeArchive),
-                  !busy_ && has_archive && archive_editable},
+                  !busy_ && has_archive && archive_editable && archive_catalog_ready},
                 {kRepackArchive, L"&Repack archive...", shortcut(kRepackArchive),
-                  !busy_ && has_archive && archive_editable},
+                  !busy_ && has_archive && archive_editable && archive_catalog_ready},
                 {0, L"", L"", false, true},
                 {kSplitArchive, L"S&plit archive...", shortcut(kSplitArchive),
                  !busy_ && has_archive && capabilities.can_create_volumes},

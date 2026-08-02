@@ -1,6 +1,9 @@
 #include "axiom/archive.hpp"
 #include "axiom/axiom.hpp"
 #include "archive/container_internal.hpp"
+#include "archive/sfx_image.hpp"
+#include "sfx/sfx_config.hpp"
+#include "sfx/sfx_options.hpp"
 #include "codec/block.hpp"
 #include "codec/fast_lz.hpp"
 #include "codec/lz77.hpp"
@@ -12,6 +15,7 @@
 #include "core/cpu.hpp"
 #include "core/hash.hpp"
 #include "core/file_replace.hpp"
+#include "core/file_meta.hpp"
 #include "core/reed_solomon.hpp"
 #include "core/task_executor.hpp"
 #include "entropy/huffman.hpp"
@@ -28,11 +32,17 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <winioctl.h>
+#endif
+
+#if !defined(_WIN32) && (defined(__linux__) || defined(__APPLE__))
+#include <sys/xattr.h>
 #endif
 
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cerrno>
 #include <cstring>
 #include <cstdint>
 #include <cstdlib>
@@ -109,6 +119,36 @@ void expect_parallel_block_roundtrip(const std::vector<std::uint8_t>& input) {
     const auto encoded = axiom::codec::encode_parallel_blocks(input, options);
     const auto restored = axiom::codec::decode_parallel_blocks(encoded, input.size(), options.thread_count);
     AXIOM_CHECK(restored == input);
+
+    const auto frames = axiom::codec::inspect_parallel_block_frames(
+        encoded, input.size());
+    AXIOM_CHECK(!frames.empty());
+    std::size_t covered = 0;
+    for (const auto& frame : frames) {
+        AXIOM_CHECK(frame.uncompressed_offset == covered);
+        AXIOM_CHECK(frame.frame_offset <= encoded.size());
+        AXIOM_CHECK(frame.frame_size <= encoded.size() - frame.frame_offset);
+        std::vector<std::uint8_t> frame_output(frame.uncompressed_size);
+        const auto frame_bytes = std::span<const std::uint8_t>(
+            encoded.data() + frame.frame_offset, frame.frame_size);
+        axiom::codec::decode_parallel_block_frame(
+            frame_bytes, frame_output, frame.codec);
+        AXIOM_CHECK(std::equal(
+            frame_output.begin(), frame_output.end(),
+            input.begin() + static_cast<std::ptrdiff_t>(frame.uncompressed_offset)));
+        covered += frame.uncompressed_size;
+    }
+    AXIOM_CHECK(covered == input.size());
+    auto truncated = encoded;
+    truncated.pop_back();
+    bool rejected_truncation = false;
+    try {
+        (void)axiom::codec::inspect_parallel_block_frames(
+            truncated, input.size());
+    } catch (const std::exception&) {
+        rejected_truncation = true;
+    }
+    AXIOM_CHECK(rejected_truncation);
 }
 
 void expect_fast_lz_roundtrip(const std::vector<std::uint8_t>& input) {
@@ -773,6 +813,155 @@ void write_all(const fs::path& path, const std::vector<std::uint8_t>& bytes) {
                  static_cast<std::streamsize>(bytes.size()));
 }
 
+std::vector<std::uint8_t> axar_block_region(const fs::path& path) {
+    const auto bytes = read_all(path);
+    constexpr std::size_t kFooterSize = 24;
+    constexpr std::size_t kHeaderSize = 16;
+    AXIOM_CHECK(bytes.size() >= kHeaderSize + kFooterSize);
+    std::uint64_t directory_offset = 0;
+    for (unsigned index = 0; index < 8; ++index) {
+        directory_offset |= static_cast<std::uint64_t>(
+            bytes[bytes.size() - kFooterSize + index]) << (index * 8);
+    }
+    AXIOM_CHECK(directory_offset >= kHeaderSize);
+    AXIOM_CHECK(directory_offset <= bytes.size() - kFooterSize);
+    return {bytes.begin() + static_cast<std::ptrdiff_t>(kHeaderSize),
+            bytes.begin() + static_cast<std::ptrdiff_t>(directory_offset)};
+}
+
+std::vector<std::uint8_t> axar_encrypted_block_region(const fs::path& path) {
+    const auto bytes = read_all(path);
+    constexpr std::size_t kHeaderSize = 16;
+    constexpr std::size_t kPreambleLengthSize = 4;
+    constexpr std::size_t kFooterSize = 24;
+    AXIOM_CHECK(bytes.size() >= kHeaderSize + kPreambleLengthSize + kFooterSize);
+    std::uint32_t preamble_size = 0;
+    for (unsigned index = 0; index < 4; ++index) {
+        preamble_size |= static_cast<std::uint32_t>(bytes[kHeaderSize + index]) << (index * 8);
+    }
+    const auto block_start = static_cast<std::uint64_t>(kHeaderSize + kPreambleLengthSize) +
+        preamble_size;
+    std::uint64_t directory_offset = 0;
+    for (unsigned index = 0; index < 8; ++index) {
+        directory_offset |= static_cast<std::uint64_t>(
+            bytes[bytes.size() - kFooterSize + index]) << (index * 8);
+    }
+    AXIOM_CHECK(block_start <= directory_offset);
+    AXIOM_CHECK(directory_offset <= bytes.size() - kFooterSize);
+    return {bytes.begin() + static_cast<std::ptrdiff_t>(block_start),
+            bytes.begin() + static_cast<std::ptrdiff_t>(directory_offset)};
+}
+
+std::vector<std::uint8_t> read_hex_fixture(const std::string& name) {
+    const fs::path path = fs::path(__FILE__).parent_path() / "fixtures" / name;
+    std::ifstream stream(path);
+    if (!stream) {
+        throw std::runtime_error("cannot open AXAR fixture: " + path.string());
+    }
+    std::vector<std::uint8_t> bytes;
+    std::string token;
+    while (stream >> token) {
+        if (token.size() != 2) {
+            throw std::runtime_error("invalid AXAR fixture byte: " + token);
+        }
+        const auto value = std::stoul(token, nullptr, 16);
+        if (value > 0xFFu) {
+            throw std::runtime_error("AXAR fixture byte is out of range: " + token);
+        }
+        bytes.push_back(static_cast<std::uint8_t>(value));
+    }
+    return bytes;
+}
+
+// ---- synthetic PE images for the SFX tests ----------------------------------
+//
+// The SFX layout anchors on the end of the PE image, so these tests need a stub
+// whose section table is real enough to locate. This builds the smallest PE32+
+// image that satisfies that: one section holding filler bytes.
+
+constexpr std::array<std::uint8_t, 8> kSfxDescriptorMagicBytes = {
+    'A', 'X', 'S', 'F', 'X', '2', '\0', '\0'};
+
+void store_le(std::vector<std::uint8_t>& bytes, std::size_t offset,
+              std::uint64_t value, std::size_t width) {
+    for (std::size_t index = 0; index < width; ++index) {
+        bytes[offset + index] = static_cast<std::uint8_t>((value >> (index * 8)) & 0xFF);
+    }
+}
+
+std::vector<std::uint8_t> synthetic_pe_stub() {
+    constexpr std::size_t kPeOffset = 0x40;
+    constexpr std::size_t kOptionalHeaderSize = 240;  // PE32+ with 16 directories
+    constexpr std::size_t kSectionDataOffset = 512;
+    constexpr std::size_t kSectionDataSize = 512;
+
+    std::vector<std::uint8_t> image(kSectionDataOffset + kSectionDataSize, 0);
+    image[0] = 'M';
+    image[1] = 'Z';
+    store_le(image, 0x3C, kPeOffset, 4);
+    image[kPeOffset + 0] = 'P';
+    image[kPeOffset + 1] = 'E';
+
+    const std::size_t coff = kPeOffset + 4;
+    store_le(image, coff + 0, 0x8664, 2);               // Machine: x64
+    store_le(image, coff + 2, 1, 2);                    // NumberOfSections
+    store_le(image, coff + 16, kOptionalHeaderSize, 2); // SizeOfOptionalHeader
+    store_le(image, coff + 18, 0x0022, 2);              // Characteristics
+
+    const std::size_t optional_header = coff + 20;
+    store_le(image, optional_header, 0x20B, 2);          // PE32+ magic
+    store_le(image, optional_header + 108, 16, 4);       // NumberOfRvaAndSizes
+    // Data directories start at +112; the security entry (index 4) stays zero,
+    // which is what an unsigned image looks like.
+
+    const std::size_t section = optional_header + kOptionalHeaderSize;
+    const std::string name = ".text";
+    std::copy(name.begin(), name.end(), image.begin() + static_cast<std::ptrdiff_t>(section));
+    store_le(image, section + 8, kSectionDataSize, 4);    // VirtualSize
+    store_le(image, section + 12, 0x1000, 4);             // VirtualAddress
+    store_le(image, section + 16, kSectionDataSize, 4);   // SizeOfRawData
+    store_le(image, section + 20, kSectionDataOffset, 4); // PointerToRawData
+    for (std::size_t index = 0; index < kSectionDataSize; ++index) {
+        image[kSectionDataOffset + index] = static_cast<std::uint8_t>(index & 0xFF);
+    }
+    return image;
+}
+
+void refresh_sfx_descriptor_crc(std::vector<std::uint8_t>& image,
+                                std::size_t descriptor_offset) {
+    const auto crc = axiom::core::crc32(std::span<const std::uint8_t>(
+        image.data() + descriptor_offset, axiom::kSfxDescriptorSize - 4));
+    store_le(image, descriptor_offset + axiom::kSfxDescriptorSize - 4, crc, 4);
+}
+
+// Appends a WIN_CERTIFICATE and points the security data directory at it, the
+// way signtool does. Used to prove the payload survives signing.
+std::vector<std::uint8_t> with_appended_certificate(
+    const std::vector<std::uint8_t>& image) {
+    std::vector<std::uint8_t> signed_image = image;
+    while (signed_image.size() % 8 != 0) signed_image.push_back(0);
+    const std::uint64_t certificate_offset = signed_image.size();
+
+    const std::vector<std::uint8_t> blob(128, 0xA5);
+    std::vector<std::uint8_t> entry(8, 0);
+    store_le(entry, 0, blob.size() + 8, 4);  // dwLength
+    store_le(entry, 4, 0x0200, 2);           // wRevision
+    store_le(entry, 6, 0x0002, 2);           // wCertificateType
+    entry.insert(entry.end(), blob.begin(), blob.end());
+    while (entry.size() % 8 != 0) entry.push_back(0);
+    signed_image.insert(signed_image.end(), entry.begin(), entry.end());
+
+    std::uint32_t pe_offset = 0;
+    for (unsigned index = 0; index < 4; ++index) {
+        pe_offset |= static_cast<std::uint32_t>(signed_image[0x3C + index]) << (index * 8);
+    }
+    const std::size_t optional_header = pe_offset + 4 + 20;
+    const std::size_t security = optional_header + 112 + 4 * 8;
+    store_le(signed_image, security, certificate_offset, 4);
+    store_le(signed_image, security + 4, entry.size(), 4);
+    return signed_image;
+}
+
 fs::path make_temp_dir() {
     static int counter = 0;
     const auto stamp = std::chrono::high_resolution_clock::now().time_since_epoch().count();
@@ -831,6 +1020,21 @@ void test_benchmark_corpus_generator() {
     // The default workload must continue to exercise actual match coding,
     // rather than silently degrading into another incompressible byte stream.
     AXIOM_CHECK(axiom::compress(first).size() < axiom::compress(random).size());
+
+    // The production benchmark is above the incompressible-data heuristic's
+    // 1 MiB threshold. Synthetic LZ matches are intentionally short and sparse,
+    // so verify that the benchmark-specific bypass reaches the real candidate
+    // bake-off and still produces a smaller, valid archive.
+    options.kind = axiom::core::BenchmarkCorpusKind::lz_synthetic;
+    options.size = 4u << 20;
+    options.window_size = 1u << 20;
+    options.segment_size = options.size;
+    const auto large_lz = axiom::core::generate_benchmark_corpus(options);
+    axiom::CompressionOptions benchmark_options;
+    benchmark_options.bypass_incompressible_heuristic = true;
+    const auto large_archive = axiom::compress(large_lz, benchmark_options);
+    AXIOM_CHECK(large_archive.size() < large_lz.size());
+    AXIOM_CHECK(axiom::decompress(large_archive) == large_lz);
 }
 
 void test_rans_contextual_edges() {
@@ -886,6 +1090,15 @@ std::uint32_t test_read_le32(const std::vector<std::uint8_t>& bytes, std::size_t
            (static_cast<std::uint32_t>(bytes[offset + 1]) << 8) |
            (static_cast<std::uint32_t>(bytes[offset + 2]) << 16) |
            (static_cast<std::uint32_t>(bytes[offset + 3]) << 24);
+}
+
+std::uint64_t test_read_le64(const std::vector<std::uint8_t>& bytes, std::size_t offset) {
+    AXIOM_CHECK(offset + 8 <= bytes.size());
+    std::uint64_t value = 0;
+    for (unsigned index = 0; index < 8; ++index) {
+        value |= static_cast<std::uint64_t>(bytes[offset + index]) << (index * 8);
+    }
+    return value;
 }
 
 void test_write_le16(std::vector<std::uint8_t>& bytes, std::size_t offset,
@@ -1245,10 +1458,20 @@ void test_archive_roundtrip() {
     write_all(src / "sub" / "data.bin", binary);
     write_all(src / "sub" / "deep" / "note.md", bytes_from_string("# note\n"));
     write_all(src / "empty.dat", {});
-
-    const auto archive = root / "out.axar";
     axiom::CompressionOptions options;
     options.block_size = 16 * 1024;  // small, to force the big file to span blocks
+
+    // The sequential writer emits a directly readable AXAR without seeking back
+    // to patch its header. This is the library-level equivalent of `axiomc a -`.
+    std::ostringstream stream_output(std::ios::out | std::ios::binary);
+    axiom::create_archive_to_stream(stream_output, {src}, options);
+    const auto stream_archive = root / "stream.axar";
+    const auto stream_bytes = stream_output.str();
+    write_all(stream_archive, std::vector<std::uint8_t>(
+        stream_bytes.begin(), stream_bytes.end()));
+    axiom::test_archive(stream_archive);
+
+    const auto archive = root / "out.axar";
     axiom::create_archive({src}, archive, options);
 
     const auto entries = axiom::list_archive(archive);
@@ -1643,6 +1866,14 @@ void test_skip_unreadable_archive_inputs() {
     tolerant.skip_unreadable_files = true;
     tolerant.input_open_retries = 0;
     tolerant.operation = std::make_shared<axiom::OperationControl>();
+
+    auto strict_tolerant = tolerant;
+    strict_tolerant.strict_metadata = true;
+    strict_tolerant.operation = std::make_shared<axiom::OperationControl>();
+    expect_throws([&] {
+        axiom::create_archive({source}, root / "strict-tolerant.axar", strict_tolerant);
+    });
+
     const auto axar = root / "tolerant.axar";
     axiom::create_archive({source}, axar, tolerant);
     const auto axar_entries = axiom::list_archive(axar);
@@ -1655,6 +1886,10 @@ void test_skip_unreadable_archive_inputs() {
     const auto axar_warnings = tolerant.operation->warnings();
     AXIOM_CHECK(axar_warnings.size() == 1);
     AXIOM_CHECK(axar_warnings.front().path == "source/blocked.exe");
+    const auto capture_report = axiom::archive_capture_report(axar);
+    AXIOM_CHECK(!capture_report.complete);
+    AXIOM_CHECK(capture_report.warnings.size() == 1);
+    AXIOM_CHECK(capture_report.warnings.front().path == "source/blocked.exe");
 
     const auto zip = root / "tolerant.zip";
     const auto* zip_provider = axiom::archive_provider_for_path(zip);
@@ -2435,6 +2670,168 @@ void test_archive_hardlinks() {
     AXIOM_CHECK(read_all(moved / fs::path(moved_target)) == payload);
     AXIOM_CHECK(read_all(moved / fs::path(hardlink_path)) == payload);
 
+    // A mapped synchronize scan sees every filesystem hard-link name as a
+    // regular file, while AXAR stores the later name as an internal hard-link
+    // entry. That representation change must not be rejected as a path-type
+    // conflict.
+    const auto sync_archive = root / "hard-sync.axar";
+    axiom::create_archive({src}, sync_archive, {});
+    axiom::sync_archive(
+        std::vector<axiom::ArchiveInput>{{src, "src"}}, sync_archive, {});
+    axiom::test_archive(sync_archive);
+    const auto synced = root / "hard-sync-out";
+    axiom::extract_archive(sync_archive, synced, {});
+    AXIOM_CHECK(read_all(synced / "src" / "a.txt") == payload);
+    AXIOM_CHECK(read_all(synced / "src" / "b.txt") == payload);
+
+    fs::remove_all(root, ec);
+}
+
+void test_axar_seekable_extraction() {
+    const auto root = make_temp_dir();
+    const auto source = root / "src";
+    fs::create_directories(source);
+
+    std::vector<std::uint8_t> tiny(16u << 10, 0x41);
+    std::vector<std::uint8_t> bulk(8u << 20);
+    for (std::size_t i = 0; i < bulk.size(); ++i) {
+        bulk[i] = static_cast<std::uint8_t>('A' + ((i / 97) % 19));
+    }
+    write_all(source / "tiny.txt", tiny);
+    write_all(source / "bulk.txt", bulk);
+
+    axiom::CompressionOptions options;
+    options.block_size = 1u << 20;
+    options.thread_count = 4;
+    options.force_parallel_blocks = true;
+    options.enable_file_filters = false;
+    const auto archive = root / "seekable.axar";
+    axiom::create_archive({source}, archive, options);
+
+    const auto listed = axiom::list_archive(archive);
+    const auto tiny_entry = std::find_if(
+        listed.begin(), listed.end(), [](const auto& entry) {
+            return entry.path == "src/tiny.txt";
+        });
+    AXIOM_CHECK(tiny_entry != listed.end());
+    AXIOM_CHECK(!tiny_entry->subframes.empty());
+    std::uint64_t mapped_bytes = 0;
+    for (const auto& frame : tiny_entry->subframes) {
+        AXIOM_CHECK(frame.uncompressed_size > 0);
+        AXIOM_CHECK(frame.compressed_size > 0);
+        mapped_bytes += frame.uncompressed_size;
+    }
+    AXIOM_CHECK(mapped_bytes >= tiny.size());
+
+    const auto selected_control = std::make_shared<axiom::OperationControl>();
+    axiom::ExtractOptions selected_options;
+    selected_options.thread_count = 1;
+    selected_options.operation = selected_control;
+    const auto selected = root / "selected";
+    axiom::extract_entries(archive, {"src/tiny.txt"}, selected, selected_options);
+    AXIOM_CHECK(read_all(selected / "src" / "tiny.txt") == tiny);
+    const auto selected_progress = selected_control->latest_progress();
+    AXIOM_CHECK(selected_progress.has_value());
+    AXIOM_CHECK(selected_progress->archive_bytes_read > 0);
+    AXIOM_CHECK(selected_progress->archive_bytes_read < fs::file_size(archive));
+
+    const auto full_control = std::make_shared<axiom::OperationControl>();
+    axiom::ExtractOptions full_options;
+    full_options.thread_count = 1;
+    full_options.operation = full_control;
+    const auto full = root / "full";
+    axiom::extract_archive(archive, full, full_options);
+    AXIOM_CHECK(read_all(full / "src" / "tiny.txt") == tiny);
+    AXIOM_CHECK(read_all(full / "src" / "bulk.txt") == bulk);
+    const auto full_progress = full_control->latest_progress();
+    AXIOM_CHECK(full_progress.has_value());
+    AXIOM_CHECK(full_progress->archive_bytes_read >
+                selected_progress->archive_bytes_read);
+
+    std::error_code ec;
+    fs::remove_all(root, ec);
+}
+
+void test_axar_version_fixtures_and_validation() {
+    const auto root = make_temp_dir();
+    const auto v4 = root / "golden-v4.axar";
+    const auto v5 = root / "golden-v5.axar";
+    const auto bad = root / "bad.axar";
+
+    const auto v4_bytes = read_hex_fixture("axar_v4_empty.hex");
+    write_all(v4, v4_bytes);
+    AXIOM_CHECK(axiom::list_archive(v4).empty());
+    axiom::test_archive(v4);
+
+    const auto v5_bytes = read_hex_fixture("axar_v5_capture_report.hex");
+    write_all(v5, v5_bytes);
+    AXIOM_CHECK(axiom::list_archive(v5).empty());
+    const auto report = axiom::archive_capture_report(v5);
+    AXIOM_CHECK(!report.complete);
+    AXIOM_CHECK(report.warnings.size() == 1);
+    AXIOM_CHECK(report.warnings.front().path == "source.bin");
+    AXIOM_CHECK(report.warnings.front().message == "read failed");
+    axiom::test_archive(v5);
+
+    // The reserved header word is part of the fixed compatibility contract.
+    {
+        auto bytes = v4_bytes;
+        bytes[12] = 1;
+        write_all(bad, bytes);
+        expect_throws([&] { (void)axiom::list_archive(bad); });
+    }
+    // Unknown required flags must never be silently downgraded to v4 behavior.
+    {
+        auto bytes = v4_bytes;
+        bytes[10] = 0x80;
+        write_all(bad, bytes);
+        expect_throws([&] { (void)axiom::list_archive(bad); });
+    }
+    // A v4 header cannot claim a v5-only required feature.
+    {
+        auto bytes = v4_bytes;
+        bytes[10] = 0x04;
+        write_all(bad, bytes);
+        expect_throws([&] { (void)axiom::list_archive(bad); });
+    }
+    {
+        auto bytes = v4_bytes;
+        bytes[10] = 0x08;
+        write_all(bad, bytes);
+        expect_throws([&] { (void)axiom::list_archive(bad); });
+    }
+    // The unknown archive-level TLV in the v5 fixture is skipped by length.
+    // Expanding that length past the directory must instead be rejected.
+    {
+        auto bytes = v5_bytes;
+        bytes[25] = 0x7F;
+        write_all(bad, bytes);
+        expect_throws([&] { (void)axiom::list_archive(bad); });
+    }
+    // Truncation at the footer is rejected before any archive state is exposed.
+    {
+        auto bytes = v5_bytes;
+        bytes.pop_back();
+        write_all(bad, bytes);
+        expect_throws([&] { (void)axiom::list_archive(bad); });
+    }
+
+    // A ten-byte varint whose final payload contains more than bit 63 must be
+    // rejected instead of wrapping into a small directory count or length.
+    {
+        std::vector<std::uint8_t> bytes(v4_bytes.begin(), v4_bytes.begin() + 16);
+        for (int index = 0; index < 9; ++index) bytes.push_back(0x80);
+        bytes.push_back(0x02);
+        const auto footer_offset = bytes.size();
+        bytes.resize(footer_offset + 24);
+        store_le(bytes, footer_offset, 16, 8);
+        store_le(bytes, footer_offset + 8, 10, 8);
+        std::copy(v4_bytes.end() - 8, v4_bytes.end(), bytes.begin() + footer_offset + 16);
+        write_all(bad, bytes);
+        expect_throws([&] { (void)axiom::list_archive(bad); });
+    }
+
+    std::error_code ec;
     fs::remove_all(root, ec);
 }
 
@@ -2449,6 +2846,7 @@ void test_archive_add() {
 
     const auto archive = root / "a.axar";
     axiom::create_archive({src}, archive, {});
+    const auto first_generation = read_all(archive);
 
     // Append a brand-new file in a separate directory.
     const auto more = root / "more";
@@ -2457,6 +2855,43 @@ void test_archive_add() {
     write_all(more / "b.txt", b);
     axiom::add_to_archive({more}, archive, {});
     axiom::test_archive(archive);
+    const auto second_generation = read_all(archive);
+    AXIOM_CHECK(second_generation.size() > first_generation.size());
+    AXIOM_CHECK(std::equal(first_generation.begin(), first_generation.end(),
+                           second_generation.begin()));
+    const auto generation_marker = std::string("AXIOMGF\0", 8);
+    const auto generation_offset = find_bytes(second_generation, generation_marker);
+    AXIOM_CHECK(generation_offset > first_generation.size());
+    AXIOM_CHECK(test_read_le16(second_generation, generation_offset + 8) == 1);
+    AXIOM_CHECK(test_read_le32(second_generation, generation_offset + 12) == 64);
+    AXIOM_CHECK(test_read_le64(second_generation, generation_offset + 16) == 1);
+    AXIOM_CHECK(test_read_le64(second_generation, generation_offset + 24) != 0);
+
+    // A torn tail after a complete generation is ignored. An invalid newer
+    // generation extension must not hide the last valid footer either.
+    auto torn = second_generation;
+    torn.insert(torn.end(), 137, 0xA5);
+    const auto torn_archive = root / "torn.axar";
+    write_all(torn_archive, torn);
+    axiom::test_archive(torn_archive);
+
+    auto invalid_generation = second_generation;
+    const auto invalid_extension_offset = invalid_generation.size();
+    invalid_generation.resize(invalid_generation.size() + 64, 0);
+    std::copy(generation_marker.begin(), generation_marker.end(),
+              invalid_generation.begin() +
+                  static_cast<std::ptrdiff_t>(invalid_extension_offset));
+    store_le(invalid_generation, invalid_extension_offset + 8, 99, 2);
+    store_le(invalid_generation, invalid_extension_offset + 12, 64, 4);
+    const auto invalid_footer_offset = invalid_generation.size();
+    invalid_generation.resize(invalid_generation.size() + 24, 0);
+    store_le(invalid_generation, invalid_footer_offset, invalid_extension_offset, 8);
+    store_le(invalid_generation, invalid_footer_offset + 8, 0, 8);
+    std::copy(axiom::kArchiveMagic.begin(), axiom::kArchiveMagic.end(),
+              invalid_generation.begin() + invalid_footer_offset + 16);
+    const auto invalid_generation_archive = root / "invalid-generation.axar";
+    write_all(invalid_generation_archive, invalid_generation);
+    axiom::test_archive(invalid_generation_archive);
 
     {
         bool has_a = false, has_b = false;
@@ -2487,6 +2922,217 @@ void test_archive_add() {
     axiom::extract_archive(archive, dest2, {});
     AXIOM_CHECK(read_all(dest2 / "src" / "a.txt") == a2);
     AXIOM_CHECK(read_all(dest2 / "more" / "b.txt") == b);  // earlier add untouched
+
+    std::error_code ec;
+    fs::remove_all(root, ec);
+}
+
+void test_archive_content_reuse() {
+    const auto root = make_temp_dir();
+    const auto src = root / "src";
+    fs::create_directories(src);
+
+    // A deterministic high-entropy payload makes the saved block range visible
+    // to the reuse counters without relying on a particular codec ratio.
+    std::vector<std::uint8_t> payload(256u << 10);
+    std::uint32_t state = 0xA71C0DEDu;
+    for (auto& byte : payload) {
+        state = state * 1664525u + 1013904223u;
+        byte = static_cast<std::uint8_t>(state >> 24);
+    }
+    const auto original = src / "original.bin";
+    const auto duplicate = root / "duplicate.bin";
+    write_all(original, payload);
+    write_all(duplicate, payload);
+
+    const auto archive = root / "reuse.axar";
+    axiom::create_archive({original}, archive, {});
+
+    auto add_operation = std::make_shared<axiom::OperationControl>();
+    axiom::CompressionOptions add_options;
+    add_options.operation = add_operation;
+    axiom::add_to_archive(
+        std::vector<axiom::ArchiveInput>{{duplicate, "copies/duplicate.bin"}},
+        archive, add_options);
+    const auto add_progress = add_operation->latest_progress();
+    AXIOM_CHECK(add_progress.has_value());
+    AXIOM_CHECK(add_progress->reused_items == 1);
+    AXIOM_CHECK(add_progress->reused_bytes == payload.size());
+    axiom::test_archive(archive);
+
+    const auto add_output = root / "add-output";
+    axiom::extract_archive(archive, add_output, {});
+    AXIOM_CHECK(read_all(add_output / "original.bin") == payload);
+    AXIOM_CHECK(read_all(add_output / "copies" / "duplicate.bin") == payload);
+
+    // The same data-range reuse must work when existing blocks are encrypted.
+    const auto encrypted = root / "reuse-encrypted.axar";
+    axiom::CompressionOptions encrypted_create;
+    encrypted_create.password = "reuse password";
+    axiom::create_archive({original}, encrypted, encrypted_create);
+    auto encrypted_operation = std::make_shared<axiom::OperationControl>();
+    axiom::CompressionOptions encrypted_add;
+    encrypted_add.password = encrypted_create.password;
+    encrypted_add.operation = encrypted_operation;
+    axiom::add_to_archive(
+        std::vector<axiom::ArchiveInput>{{duplicate, "copies/duplicate.bin"}},
+        encrypted, encrypted_add);
+    const auto encrypted_progress = encrypted_operation->latest_progress();
+    AXIOM_CHECK(encrypted_progress.has_value());
+    AXIOM_CHECK(encrypted_progress->reused_items == 1);
+    AXIOM_CHECK(encrypted_progress->reused_bytes == payload.size());
+    axiom::DecompressionOptions encrypted_test;
+    encrypted_test.password = encrypted_create.password;
+    axiom::test_archive(encrypted, encrypted_test);
+    axiom::ExtractOptions encrypted_extract;
+    encrypted_extract.password = encrypted_create.password;
+    const auto encrypted_output = root / "encrypted-output";
+    axiom::extract_archive(encrypted, encrypted_output, encrypted_extract);
+    AXIOM_CHECK(read_all(encrypted_output / "copies" / "duplicate.bin") == payload);
+
+    // A newly-created archive can contain duplicate entries; repack should
+    // coalesce them using the directory's existing BLAKE3 identities.
+    const auto repack_first = root / "repack-first.bin";
+    const auto repack_second = root / "repack-second.bin";
+    write_all(repack_first, payload);
+    write_all(repack_second, payload);
+    const auto repack_archive = root / "reuse-repack.axar";
+    axiom::create_archive({repack_first, repack_second}, repack_archive, {});
+    auto repack_operation = std::make_shared<axiom::OperationControl>();
+    axiom::CompressionOptions repack_options;
+    repack_options.operation = repack_operation;
+    axiom::repack_archive(repack_archive, repack_options);
+    const auto repack_progress = repack_operation->latest_progress();
+    AXIOM_CHECK(repack_progress.has_value());
+    AXIOM_CHECK(repack_progress->reused_items == 1);
+    AXIOM_CHECK(repack_progress->reused_bytes == payload.size());
+    axiom::test_archive(repack_archive);
+    const auto repack_output = root / "repack-output";
+    axiom::extract_archive(repack_archive, repack_output, {});
+    AXIOM_CHECK(read_all(repack_output / "repack-first.bin") == payload);
+    AXIOM_CHECK(read_all(repack_output / "repack-second.bin") == payload);
+
+    std::error_code ec;
+    fs::remove_all(root, ec);
+}
+
+void test_archive_snapshots() {
+    const auto root = make_temp_dir();
+    const auto source = root / "source";
+    fs::create_directories(source);
+
+    const auto make_payload = [](std::size_t size, std::uint8_t seed) {
+        std::vector<std::uint8_t> bytes(size);
+        for (std::size_t index = 0; index < bytes.size(); ++index) {
+            const auto block = static_cast<std::uint8_t>((index / 97) & 0xFFu);
+            bytes[index] = static_cast<std::uint8_t>(seed + block +
+                                                      ((index * 13) >> 8));
+        }
+        return bytes;
+    };
+    const auto base_a = make_payload(96u << 10, 0x21);
+    const auto base_b = make_payload(72u << 10, 0x73);
+    write_all(source / "a.bin", base_a);
+    write_all(source / "b.bin", base_b);
+
+    axiom::CompressionOptions options;
+    options.thread_count = 1;
+    options.block_size = 32u << 10;
+    options.snapshot_min_chunk_size = 4u << 10;
+    options.snapshot_average_chunk_size = 8u << 10;
+    options.snapshot_max_chunk_size = 16u << 10;
+    const auto archive = root / "snapshots.axar";
+    axiom::create_snapshot_archive({source}, archive, "base", options);
+    AXIOM_CHECK(axiom::archive_is_snapshot_repository(archive));
+    axiom::test_archive(archive);
+
+    const auto first = axiom::list_archive_snapshots(archive);
+    AXIOM_CHECK(first.size() == 1);
+    AXIOM_CHECK(first.front().name == "base");
+    AXIOM_CHECK(first.front().current);
+    AXIOM_CHECK(first.front().file_bytes == base_a.size() + base_b.size());
+    const auto live_entries = axiom::list_archive(archive);
+    const auto live_file = std::find_if(
+        live_entries.begin(), live_entries.end(),
+        [](const axiom::ArchiveEntry& entry) { return entry.path == "source/a.bin"; });
+    AXIOM_CHECK(live_file != live_entries.end());
+    AXIOM_CHECK(live_file->chunk_count > 1);
+
+    const auto base_restore = root / "base-restore";
+    axiom::ExtractOptions restore_options;
+    restore_options.overwrite = axiom::ExtractOptions::Overwrite::overwrite;
+    axiom::restore_archive_snapshot(archive, "base", base_restore, restore_options);
+    AXIOM_CHECK(read_all(base_restore / "source" / "a.bin") == base_a);
+    AXIOM_CHECK(read_all(base_restore / "source" / "b.bin") == base_b);
+
+    auto changed_a = base_a;
+    for (std::size_t index = 43u << 10; index < (47u << 10); ++index) {
+        changed_a[index] ^= static_cast<std::uint8_t>(0x5Au + (index & 7u));
+    }
+    write_all(source / "a.bin", changed_a);
+    const auto changed_b = base_b;
+    axiom::add_archive_snapshot({source}, archive, "changed", options);
+    axiom::test_archive(archive);
+
+    const auto snapshots = axiom::list_archive_snapshots(archive);
+    AXIOM_CHECK(snapshots.size() == 2);
+    AXIOM_CHECK(snapshots.back().name == "changed");
+    AXIOM_CHECK(snapshots.back().current);
+    AXIOM_CHECK(!snapshots.front().current);
+    const auto changes = axiom::diff_archive_snapshots(archive, "base", "changed");
+    AXIOM_CHECK(std::any_of(
+        changes.begin(), changes.end(), [](const axiom::ArchiveSnapshotChange& change) {
+            return change.path == "source/a.bin" &&
+                   change.kind == axiom::ArchiveSnapshotChangeKind::modified;
+        }));
+
+    std::error_code metadata_stamp_error;
+    const auto metadata_stamp = fs::last_write_time(
+        source / "b.bin", metadata_stamp_error);
+    AXIOM_CHECK(!metadata_stamp_error);
+    fs::last_write_time(source / "b.bin", metadata_stamp + std::chrono::seconds(120),
+                        metadata_stamp_error);
+    AXIOM_CHECK(!metadata_stamp_error);
+    axiom::add_archive_snapshot({source}, archive, "metadata", options);
+    const auto metadata_changes =
+        axiom::diff_archive_snapshots(archive, "changed", "metadata");
+    AXIOM_CHECK(std::any_of(
+        metadata_changes.begin(), metadata_changes.end(),
+        [](const axiom::ArchiveSnapshotChange& change) {
+            return change.path == "source/b.bin" &&
+                   change.kind == axiom::ArchiveSnapshotChangeKind::modified;
+        }));
+
+    const auto changed_restore = root / "changed-restore";
+    axiom::restore_archive_snapshot(archive, "changed", changed_restore, restore_options);
+    AXIOM_CHECK(read_all(changed_restore / "source" / "a.bin") == changed_a);
+    AXIOM_CHECK(read_all(changed_restore / "source" / "b.bin") == changed_b);
+    expect_throws([&] { axiom::restore_archive_snapshot(archive, "missing", root / "nope", {}); });
+    expect_throws([&] { axiom::prune_archive_snapshots(archive, {"metadata"}, {}); });
+    expect_throws([&] { axiom::add_to_archive({source}, archive, {}); });
+
+    axiom::prune_archive_snapshots(archive, {"base"}, options);
+    AXIOM_CHECK(axiom::list_archive_snapshots(archive).size() == 2);
+    axiom::repack_archive(archive, options);
+    axiom::test_archive(archive);
+    const auto post_repack_restore = root / "post-repack";
+    axiom::restore_archive_snapshot(archive, "changed", post_repack_restore,
+                                     restore_options);
+    AXIOM_CHECK(read_all(post_repack_restore / "source" / "a.bin") == changed_a);
+
+    axiom::CompressionOptions encrypted = options;
+    encrypted.password = "snapshot-password";
+    encrypted.encrypt_header = true;
+    encrypted.use_encryption_v2 = true;
+    const auto encrypted_archive = root / "encrypted-snapshots.axar";
+    axiom::create_snapshot_archive({source}, encrypted_archive, "encrypted", encrypted);
+    axiom::test_archive(encrypted_archive, axiom::DecompressionOptions{
+        .password = encrypted.password});
+    AXIOM_CHECK(axiom::list_archive_snapshots(encrypted_archive, encrypted.password).size() == 1);
+    expect_throws([&] { (void)axiom::list_archive_snapshots(encrypted_archive, "wrong"); });
+    axiom::repack_archive(encrypted_archive, encrypted);
+    axiom::test_archive(encrypted_archive, axiom::DecompressionOptions{
+        .password = encrypted.password});
 
     std::error_code ec;
     fs::remove_all(root, ec);
@@ -3038,21 +3684,97 @@ void test_archive_authenticity_and_sfx() {
     axiom::set_archive_comment(archive, "changed after signing");
     AXIOM_CHECK(!axiom::verify_archive_signature(archive).present);
 
-    // SFX packaging preserves both the stub and the exact archive, then appends
-    // the fixed trailer used by the native self-extractor.
+    // SFX packaging preserves the PE image and the exact archive, separated by
+    // the v2 descriptor written at the end of the image.
     const auto stub = root / "stub.exe";
     const auto sfx = root / "package.exe";
-    const auto stub_bytes = bytes_from_string("MZ fake test stub");
+    const auto stub_bytes = synthetic_pe_stub();
     write_all(stub, stub_bytes);
     const auto archive_bytes = read_all(archive);
     axiom::create_sfx_archive(archive, stub, sfx);
     const auto packaged = read_all(sfx);
-    AXIOM_CHECK(packaged.size() == stub_bytes.size() + archive_bytes.size() + 16);
+    AXIOM_CHECK(packaged.size() ==
+                stub_bytes.size() + axiom::kSfxDescriptorSize + archive_bytes.size());
     AXIOM_CHECK(std::equal(stub_bytes.begin(), stub_bytes.end(), packaged.begin()));
-    AXIOM_CHECK(std::equal(archive_bytes.begin(), archive_bytes.end(),
-                           packaged.begin() + static_cast<std::ptrdiff_t>(stub_bytes.size())));
-    const std::string marker = "AXIOMSFX";
-    AXIOM_CHECK(std::equal(marker.begin(), marker.end(), packaged.end() - 16));
+    AXIOM_CHECK(std::equal(kSfxDescriptorMagicBytes.begin(),
+                           kSfxDescriptorMagicBytes.end(),
+                           packaged.begin() +
+                               static_cast<std::ptrdiff_t>(stub_bytes.size())));
+    AXIOM_CHECK(std::equal(
+        archive_bytes.begin(), archive_bytes.end(),
+        packaged.begin() + static_cast<std::ptrdiff_t>(
+                               stub_bytes.size() + axiom::kSfxDescriptorSize)));
+
+    // The descriptor resolves to the payload, and its recorded hash prefix
+    // matches the archive actually embedded.
+    {
+        const auto located = axiom::sfx_locate_payload(sfx);
+        AXIOM_CHECK(located.has_value());
+        AXIOM_CHECK(located->format == axiom::SfxFormat::v2);
+        AXIOM_CHECK(located->payload_offset ==
+                    stub_bytes.size() + axiom::kSfxDescriptorSize);
+        AXIOM_CHECK(located->payload_size == archive_bytes.size());
+        const auto digest = axiom::core::Blake3::hash(
+            std::span<const std::uint8_t>(archive_bytes));
+        AXIOM_CHECK(std::equal(located->payload_hash.begin(),
+                               located->payload_hash.end(), digest.begin()));
+    }
+
+    // A descriptor with a valid CRC is still rejected when its structural
+    // contract is not exact. The CRC only protects the fields; it does not
+    // make an impossible layout meaningful.
+    for (const auto mutate : {0, 1, 2}) {
+        auto malformed = packaged;
+        const std::size_t descriptor = stub_bytes.size();
+        if (mutate == 0) store_le(malformed, descriptor + 10, 63, 2);
+        if (mutate == 1) store_le(malformed, descriptor + 12, 1, 4);
+        if (mutate == 2) store_le(malformed, descriptor + 56, 1, 4);
+        refresh_sfx_descriptor_crc(malformed, descriptor);
+        const auto path = root / ("malformed-descriptor-" + std::to_string(mutate) + ".exe");
+        write_all(path, malformed);
+        AXIOM_CHECK(!axiom::sfx_locate_payload(path).has_value());
+    }
+
+    // The whole point of anchoring on the PE image: appending an Authenticode
+    // certificate must not displace the payload. The v1 trailer, read from
+    // EOF-16, could never survive this, which is why the layout changed.
+    {
+        const auto signed_sfx = root / "package-signed.exe";
+        write_all(signed_sfx, with_appended_certificate(packaged));
+        const auto located = axiom::sfx_locate_payload(signed_sfx);
+        AXIOM_CHECK(located.has_value());
+        AXIOM_CHECK(located->format == axiom::SfxFormat::v2);
+        AXIOM_CHECK(located->payload_offset ==
+                    stub_bytes.size() + axiom::kSfxDescriptorSize);
+        AXIOM_CHECK(located->payload_size == archive_bytes.size());
+        AXIOM_CHECK(axiom::is_axiom_sfx_archive(signed_sfx));
+        // Still a fully readable archive through the SFX wrapper.
+        const auto listed = axiom::list_archive(signed_sfx);
+        AXIOM_CHECK(!listed.empty());
+    }
+
+    // Executables produced before 0.8.0.0 carry the v1 trailer and must keep
+    // working, so the reader falls back when no descriptor is present.
+    {
+        const auto legacy = root / "legacy.exe";
+        auto legacy_bytes = stub_bytes;
+        legacy_bytes.insert(legacy_bytes.end(), archive_bytes.begin(),
+                            archive_bytes.end());
+        const std::string legacy_magic = "AXIOMSFX";
+        legacy_bytes.insert(legacy_bytes.end(), legacy_magic.begin(),
+                            legacy_magic.end());
+        for (unsigned index = 0; index < 8; ++index) {
+            legacy_bytes.push_back(static_cast<std::uint8_t>(
+                (archive_bytes.size() >> (index * 8)) & 0xFF));
+        }
+        write_all(legacy, legacy_bytes);
+        const auto located = axiom::sfx_locate_payload(legacy);
+        AXIOM_CHECK(located.has_value());
+        AXIOM_CHECK(located->format == axiom::SfxFormat::legacy);
+        AXIOM_CHECK(located->payload_offset == stub_bytes.size());
+        AXIOM_CHECK(located->payload_size == archive_bytes.size());
+        AXIOM_CHECK(!axiom::list_archive(legacy).empty());
+    }
 
     // Product builds package the PE image directly from an embedded resource,
     // without installing or materializing a separate stub executable.
@@ -3065,6 +3787,270 @@ void test_archive_authenticity_and_sfx() {
             archive, std::span<const std::uint8_t>{},
             root / "empty-stub.exe");
     });
+    // A stub that is not a PE image has no computable descriptor position.
+    expect_throws([&] {
+        const auto garbage = bytes_from_string("MZ fake test stub");
+        axiom::create_sfx_archive(
+            archive, std::span<const std::uint8_t>(garbage),
+            root / "garbage-stub.exe");
+    });
+    // Signing belongs on the finished executable; packaging onto an already
+    // signed stub would silently invalidate that signature.
+    expect_throws([&] {
+        const auto signed_stub = with_appended_certificate(stub_bytes);
+        axiom::create_sfx_archive(
+            archive, std::span<const std::uint8_t>(signed_stub),
+            root / "signed-stub.exe");
+    });
+    expect_throws([&] {
+        auto overlay_stub = stub_bytes;
+        overlay_stub.push_back(0xA5);
+        axiom::create_sfx_archive(
+            archive, std::span<const std::uint8_t>(overlay_stub),
+            root / "overlay-stub.exe");
+    });
+    expect_throws([&] {
+        axiom::create_sfx_archive(archive, stub, stub);
+    });
+    expect_throws([&] {
+        const auto empty_archive = root / "empty.axar";
+        write_all(empty_archive, {});
+        axiom::create_sfx_archive(
+            empty_archive, std::span<const std::uint8_t>(stub_bytes),
+            root / "empty-archive.exe");
+    });
+
+    std::error_code error;
+    fs::remove_all(root, error);
+}
+
+// The self-extractor's command line, configuration blob, and authoring format.
+// These parse input that arrives with an untrusted executable, so the negative
+// cases matter as much as the positive ones.
+void test_sfx_options_and_config() {
+    using axiom::sfx::SfxElevation;
+    using axiom::sfx::SfxMode;
+    using axiom::sfx::SfxTheme;
+
+    auto parse = [](std::vector<std::wstring> arguments) {
+        return axiom::sfx::parse_sfx_command_line(arguments);
+    };
+
+    // A lone positional is the destination, which is how every pre-0.9
+    // self-extractor accepted one.
+    {
+        const auto result = parse({L"D:\\Target"});
+        AXIOM_CHECK(result.ok);
+        AXIOM_CHECK(result.value.destination.has_value());
+        AXIOM_CHECK(*result.value.destination == L"D:\\Target");
+    }
+    {
+        const auto result = parse({L"--output", L"D:\\A", L"--silent", L"-y",
+                                   L"--overwrite", L"skip", L"--threads", L"4",
+                                   L"--include", L"*.dll", L"--include", L"*.exe"});
+        AXIOM_CHECK(result.ok);
+        AXIOM_CHECK(*result.value.destination == L"D:\\A");
+        AXIOM_CHECK(result.value.mode == SfxMode::silent);
+        AXIOM_CHECK(result.value.accept);
+        AXIOM_CHECK(result.value.overwrite == axiom::ExtractOptions::Overwrite::skip);
+        AXIOM_CHECK(result.value.threads == std::size_t{4});
+        AXIOM_CHECK(result.value.include.size() == 2);
+    }
+    // --name=value and /name are equivalent spellings.
+    {
+        const auto result = parse({L"--output=D:\\B", L"/very-silent"});
+        AXIOM_CHECK(result.ok);
+        AXIOM_CHECK(*result.value.destination == L"D:\\B");
+        AXIOM_CHECK(result.value.mode == SfxMode::very_silent);
+    }
+    AXIOM_CHECK(!parse({L"--unknown"}).ok);
+    AXIOM_CHECK(!parse({L"--threads"}).ok);              // missing value
+    AXIOM_CHECK(!parse({L"--threads", L"many"}).ok);     // not a number
+    AXIOM_CHECK(!parse({L"--overwrite", L"maybe"}).ok);  // not a mode
+    AXIOM_CHECK(!parse({L"A", L"B"}).ok);                // two destinations
+    AXIOM_CHECK(!parse({L"--silent=yes"}).ok);           // flag takes no value
+    AXIOM_CHECK(!parse({L"--list", L"--test"}).ok);
+    AXIOM_CHECK(!parse({L"-p", L"x", L"--password-stdin"}).ok);
+    AXIOM_CHECK(!parse({L"--threads", L"4097"}).ok);
+    AXIOM_CHECK(!parse({L"--output="}).ok);
+    AXIOM_CHECK(!parse({L"--log="}).ok);
+    AXIOM_CHECK(!parse({L"--password="}).ok);
+
+    // Configuration survives a TLV round trip unchanged.
+    {
+        axiom::sfx::SfxConfig config;
+        config.title = "Demo";
+        config.window_title = "Demo Setup";
+        config.description = "Line one\nLine two";
+        config.default_path = "%LOCALAPPDATA%\\Demo";
+        config.license_text = "Terms apply.";
+        config.require_accept = true;
+        config.mode = SfxMode::silent;
+        config.overwrite = axiom::ExtractOptions::Overwrite::skip;
+        config.theme = SfxTheme::dark;
+        config.elevation = SfxElevation::automatic;
+        config.threads = 8;
+        config.run_program = "setup\\install.exe";
+        config.propagate_exit_code = true;
+        config.auto_close = true;
+        config.restore_mtime = false;
+
+        const auto blob = axiom::sfx::encode_sfx_config(config);
+        const auto decoded = axiom::sfx::decode_sfx_config(blob);
+        AXIOM_CHECK(decoded.has_value());
+        AXIOM_CHECK(decoded->title == config.title);
+        AXIOM_CHECK(decoded->window_title == config.window_title);
+        AXIOM_CHECK(decoded->description == config.description);
+        AXIOM_CHECK(decoded->default_path == config.default_path);
+        AXIOM_CHECK(decoded->require_accept);
+        AXIOM_CHECK(decoded->mode == SfxMode::silent);
+        AXIOM_CHECK(decoded->overwrite == axiom::ExtractOptions::Overwrite::skip);
+        AXIOM_CHECK(decoded->theme == SfxTheme::dark);
+        AXIOM_CHECK(decoded->elevation == SfxElevation::automatic);
+        AXIOM_CHECK(decoded->threads == 8);
+        AXIOM_CHECK(decoded->run_program == config.run_program);
+        AXIOM_CHECK(decoded->propagate_exit_code);
+        AXIOM_CHECK(decoded->auto_close);
+        AXIOM_CHECK(!decoded->restore_mtime);
+
+        // Truncation, a bad magic, and an unknown tag are all refused rather
+        // than partially honoured.
+        AXIOM_CHECK(!axiom::sfx::decode_sfx_config(
+            std::span<const std::uint8_t>(blob.data(), blob.size() - 3)));
+        auto corrupted = blob;
+        corrupted[0] = 'X';
+        AXIOM_CHECK(!axiom::sfx::decode_sfx_config(corrupted));
+        auto unknown_tag = blob;
+        unknown_tag.push_back(0xFE);  // tag low byte
+        unknown_tag.push_back(0x00);  // tag high byte
+        unknown_tag.push_back(4);
+        unknown_tag.push_back(0);
+        unknown_tag.push_back(0);
+        unknown_tag.push_back(0);
+        for (int index = 0; index < 4; ++index) unknown_tag.push_back(0);
+        AXIOM_CHECK(!axiom::sfx::decode_sfx_config(unknown_tag));
+        auto duplicate_tag = blob;
+        duplicate_tag.insert(duplicate_tag.end(), {1, 0, 1, 0, 0, 0, 'x'});
+        AXIOM_CHECK(!axiom::sfx::decode_sfx_config(duplicate_tag));
+    }
+
+    {
+        axiom::sfx::SfxConfig invalid;
+        invalid.threads = 4097;
+        std::string error;
+        AXIOM_CHECK(!axiom::sfx::sfx_validate_config(invalid, error));
+        expect_throws([&] { (void)axiom::sfx::encode_sfx_config(invalid); });
+        invalid = {};
+        invalid.title = "bad";
+        invalid.title.push_back(static_cast<char>(0xC3));
+        expect_throws([&] { (void)axiom::sfx::encode_sfx_config(invalid); });
+    }
+
+    // The authoring format, including the BOM every Windows editor writes.
+    {
+        const std::string text =
+            "\xEF\xBB\xBF# comment\n"
+            "[presentation]\n"
+            "title = Demo Package\n"
+            "description = First\\nSecond\n"
+            "\n"
+            "mode = silent\n"
+            "threads = 3\n"
+            "open_destination = no\n";
+        const auto parsed = axiom::sfx::parse_sfx_config_text(text);
+        AXIOM_CHECK(parsed.ok);
+        AXIOM_CHECK(parsed.value.title == "Demo Package");
+        AXIOM_CHECK(parsed.value.description == "First\nSecond");
+        AXIOM_CHECK(parsed.value.mode == SfxMode::silent);
+        AXIOM_CHECK(parsed.value.threads == 3);
+        AXIOM_CHECK(!parsed.value.open_destination);
+    }
+    AXIOM_CHECK(!axiom::sfx::parse_sfx_config_text("nonsense\n").ok);
+    AXIOM_CHECK(!axiom::sfx::parse_sfx_config_text("unknown_key = 1\n").ok);
+    AXIOM_CHECK(!axiom::sfx::parse_sfx_config_text("mode = loud\n").ok);
+    AXIOM_CHECK(!axiom::sfx::parse_sfx_config_text("auto_close = perhaps\n").ok);
+    AXIOM_CHECK(!axiom::sfx::parse_sfx_config_text("[presentation\n").ok);
+    AXIOM_CHECK(!axiom::sfx::parse_sfx_config_text("title = one\ntitle = two\n").ok);
+    AXIOM_CHECK(!axiom::sfx::parse_sfx_config_text("threads = 4097\n").ok);
+    AXIOM_CHECK(!axiom::sfx::parse_sfx_config_text(
+        "run_program = ..\\setup.exe\n").ok);
+    AXIOM_CHECK(!axiom::sfx::parse_sfx_config_text(
+        "run_program = C:\\setup.exe\n").ok);
+    AXIOM_CHECK(!axiom::sfx::parse_sfx_config_text(
+        "run_program = setup.exe\nwait_for_exit = false\npropagate_exit_code = true\n").ok);
+    AXIOM_CHECK(!axiom::sfx::parse_sfx_config_text(
+        "allow_file_selection = true\n").ok);
+    std::string invalid_utf8 = "title = bad";
+    invalid_utf8.push_back(static_cast<char>(0xC3));
+    invalid_utf8.push_back('\n');
+    AXIOM_CHECK(!axiom::sfx::parse_sfx_config_text(invalid_utf8).ok);
+    // require_accept without a license would gate on an empty dialog.
+    AXIOM_CHECK(!axiom::sfx::parse_sfx_config_text("require_accept = yes\n").ok);
+    // The unattended-elevated-run chain is refused as a combination.
+    AXIOM_CHECK(!axiom::sfx::parse_sfx_config_text(
+        "mode = very_silent\nelevation = require\nrun_program = a.exe\n").ok);
+
+    // Destination templates are checked at creation time, not on the user's
+    // machine, and a traversal is never legitimate.
+    {
+        std::string error;
+        AXIOM_CHECK(axiom::sfx::sfx_validate_path_template("%ProgramFiles%\\App",
+                                                           error));
+        AXIOM_CHECK(axiom::sfx::sfx_validate_path_template("%SFXDIR%\\%SFXNAME%",
+                                                           error));
+        AXIOM_CHECK(!axiom::sfx::sfx_validate_path_template("%WINDIR%\\x", error));
+        AXIOM_CHECK(!axiom::sfx::sfx_validate_path_template("%TEMP%\\..\\..\\x",
+                                                            error));
+        AXIOM_CHECK(!axiom::sfx::sfx_validate_path_template("%TEMP", error));
+    }
+}
+
+// A configuration blob survives packaging and comes back out of the executable.
+void test_sfx_config_packaging() {
+    const auto root = make_temp_dir();
+    const auto source = root / "payload";
+    fs::create_directories(source);
+    write_all(source / "file.txt", bytes_from_string("configured sfx"));
+    const auto archive = root / "payload.axar";
+    axiom::create_archive({source}, archive);
+
+    axiom::sfx::SfxConfig config;
+    config.title = "Packaged";
+    config.default_path = "%LOCALAPPDATA%\\Packaged";
+    config.auto_close = true;
+    const auto blob = axiom::sfx::encode_sfx_config(config);
+
+    const auto stub_bytes = synthetic_pe_stub();
+    const auto packaged = root / "configured.exe";
+    axiom::create_sfx_archive(archive, std::span<const std::uint8_t>(stub_bytes),
+                              packaged, nullptr, 0,
+                              std::span<const std::uint8_t>(blob));
+
+    const auto located = axiom::sfx_locate_payload(packaged);
+    AXIOM_CHECK(located.has_value());
+    AXIOM_CHECK(located->config_size == blob.size());
+    AXIOM_CHECK(located->config_offset == stub_bytes.size() +
+                                              axiom::kSfxDescriptorSize);
+    AXIOM_CHECK(located->payload_offset ==
+                located->config_offset + blob.size());
+
+    const auto recovered = axiom::sfx_archive_config(packaged);
+    AXIOM_CHECK(recovered.has_value());
+    AXIOM_CHECK(*recovered == blob);
+    const auto decoded = axiom::sfx::decode_sfx_config(*recovered);
+    AXIOM_CHECK(decoded.has_value());
+    AXIOM_CHECK(decoded->title == "Packaged");
+    AXIOM_CHECK(decoded->auto_close);
+
+    // The archive is still readable through the wrapper with a config present.
+    AXIOM_CHECK(!axiom::list_archive(packaged).empty());
+
+    // And it still survives signing.
+    const auto signed_packaged = root / "configured-signed.exe";
+    write_all(signed_packaged, with_appended_certificate(read_all(packaged)));
+    const auto after = axiom::sfx_archive_config(signed_packaged);
+    AXIOM_CHECK(after.has_value());
+    AXIOM_CHECK(*after == blob);
 
     std::error_code error;
     fs::remove_all(root, error);
@@ -3214,6 +4200,140 @@ void test_archive_encryption() {
     fs::remove_all(root, ec);
 }
 
+void test_archive_encryption_v2_password_slots() {
+    const auto root = make_temp_dir();
+    const auto src = root / "src";
+    fs::create_directories(src);
+    const auto payload = bytes_from_string("slot-protected payload " + std::string(4000, 'P'));
+    write_all(src / "payload.bin", payload);
+
+    axiom::CompressionOptions options;
+    options.block_size = 1024;
+    options.password = "slot-one";
+    const auto archive = root / "slots.axar";
+    axiom::create_archive({src}, archive, options);
+    const auto initial_blocks = axar_block_region(archive);
+    axiom::DecompressionOptions test_options;
+    test_options.password = options.password;
+    axiom::test_archive(archive, test_options);
+
+    axiom::add_archive_password(archive, "slot-one", "slot-two");
+    test_options.password = "slot-two";
+    axiom::test_archive(archive, test_options);
+    test_options.password = "slot-one";
+    axiom::test_archive(archive, test_options);
+
+    axiom::change_archive_password(archive, "slot-one", "slot-three");
+    test_options.password = "slot-three";
+    axiom::test_archive(archive, test_options);
+    test_options.password = "slot-one";
+    expect_throws([&] { axiom::test_archive(archive, test_options); });
+
+    axiom::remove_archive_password(archive, "slot-three", "slot-two");
+    test_options.password = "slot-two";
+    expect_throws([&] { axiom::test_archive(archive, test_options); });
+    test_options.password = "slot-three";
+    axiom::test_archive(archive, test_options);
+    AXIOM_CHECK(axar_block_region(archive) == initial_blocks);
+
+    const auto before_wrong_password = read_all(archive);
+    expect_throws([&] {
+        axiom::add_archive_password(archive, "not-the-password", "unused");
+    });
+    AXIOM_CHECK(read_all(archive) == before_wrong_password);
+    expect_throws([&] {
+        axiom::remove_archive_password(archive, "slot-three", "slot-three");
+    });
+    AXIOM_CHECK(read_all(archive) == before_wrong_password);
+
+    const auto key = axiom::generate_archive_signing_key();
+    axiom::CompressionOptions signing_options;
+    signing_options.password = "slot-three";
+    axiom::sign_archive(archive, key, signing_options);
+    auto signature = axiom::verify_archive_signature(archive, "slot-three");
+    AXIOM_CHECK(signature.present);
+    AXIOM_CHECK(signature.valid);
+    axiom::add_archive_password(archive, "slot-three", "slot-four");
+    signature = axiom::verify_archive_signature(archive, "slot-four");
+    AXIOM_CHECK(!signature.present);
+    test_options.password = "slot-four";
+    axiom::test_archive(archive, test_options);
+
+    // The directory remains parseable without a password, but a corrupted wrapped
+    // data key must fail before any encrypted block is decoded.
+    {
+        auto raw = read_all(archive);
+        constexpr std::array<std::uint8_t, 8> magic = {
+            'A', 'X', 'I', 'O', 'M', 'E', '2', 0};
+        const auto found = std::search(raw.begin(), raw.end(), magic.begin(), magic.end());
+        AXIOM_CHECK(found != raw.end());
+        const auto magic_offset = static_cast<std::size_t>(found - raw.begin());
+        AXIOM_CHECK(magic_offset + 60 < raw.size());
+        raw[magic_offset + 60] ^= 0x80u;
+        const auto corrupt = root / "corrupt-slot.axar";
+        write_all(corrupt, raw);
+        auto corrupted_slot = test_options;
+        corrupted_slot.password = "slot-three";
+        expect_throws([&] { axiom::test_archive(corrupt, corrupted_slot); });
+    }
+
+    // Recovery data is rebuilt around a metadata-only rekey and remains usable.
+    {
+        axiom::CompressionOptions recovery_options = options;
+        recovery_options.password = "recovery-one";
+        recovery_options.recovery_percent = 15;
+        const auto recovery_archive = root / "recovery-slots.axar";
+        axiom::create_archive({src}, recovery_archive, recovery_options);
+        AXIOM_CHECK(axiom::archive_recovery_info(recovery_archive).present);
+        axiom::add_archive_password(recovery_archive, "recovery-one", "recovery-two");
+        AXIOM_CHECK(axiom::archive_recovery_info(recovery_archive).present);
+        axiom::DecompressionOptions recovered;
+        recovered.password = "recovery-two";
+        axiom::test_archive(recovery_archive, recovered);
+    }
+
+    // A v4 legacy encrypted archive remains readable and migrates without changing
+    // its encrypted block bytes when a password slot is added.
+    {
+        axiom::CompressionOptions legacy = options;
+        legacy.password = "legacy-one";
+        legacy.use_encryption_v2 = false;
+        const auto legacy_archive = root / "legacy.axar";
+        axiom::create_archive({src}, legacy_archive, legacy);
+        const auto legacy_blocks = axar_block_region(legacy_archive);
+        axiom::DecompressionOptions legacy_test;
+        legacy_test.password = "legacy-one";
+        axiom::test_archive(legacy_archive, legacy_test);
+        axiom::add_archive_password(legacy_archive, "legacy-one", "legacy-two");
+        legacy_test.password = "legacy-two";
+        axiom::test_archive(legacy_archive, legacy_test);
+        AXIOM_CHECK(axar_block_region(legacy_archive) == legacy_blocks);
+    }
+
+    // The old v4 encrypted-directory preamble remains readable and migrates to
+    // v2 before any password-slot operation changes the directory protection.
+    {
+        axiom::CompressionOptions legacy_directory = options;
+        legacy_directory.password = "legacy-directory-one";
+        legacy_directory.encrypt_header = true;
+        legacy_directory.use_encryption_v2 = false;
+        const auto legacy_directory_archive = root / "legacy-directory.axar";
+        axiom::create_archive({src}, legacy_directory_archive, legacy_directory);
+        expect_throws([&] { axiom::list_archive(legacy_directory_archive); });
+        AXIOM_CHECK(axiom::list_archive(
+                        legacy_directory_archive, legacy_directory.password).size() >= 2);
+        axiom::add_archive_password(
+            legacy_directory_archive, "legacy-directory-one", "legacy-directory-two");
+        AXIOM_CHECK(axiom::list_archive(
+                        legacy_directory_archive, "legacy-directory-one").size() >= 2);
+        AXIOM_CHECK(axiom::list_archive(
+                        legacy_directory_archive, "legacy-directory-two").size() >= 2);
+    }
+
+    std::error_code ec;
+    fs::remove_all(root, ec);
+}
+
 // Directory encryption (--encrypt-names): the whole central directory is sealed, so
 // names/sizes are hidden and even listing needs the password.
 void test_archive_encrypted_directory() {
@@ -3229,14 +4349,21 @@ void test_archive_encrypted_directory() {
     opt.encrypt_header = true;
     const auto archive = root / "hp.axar";
     axiom::create_archive({src}, archive, opt);
+    const auto initial_encrypted_blocks = axar_encrypted_block_region(archive);
 
     AXIOM_CHECK(axiom::archive_is_encrypted(archive));  // detectable without a password
     AXIOM_CHECK(axiom::archive_encryption_mode(archive) ==
                 axiom::ArchiveEncryptionMode::data_and_directory);
 
-    expect_throws([&] {
-        axiom::move_archive_entries(archive, {{"src", "renamed"}}, opt);
-    });
+    const std::string original_password = opt.password;
+    axiom::add_archive_password(archive, original_password, "directory second");
+    AXIOM_CHECK(axiom::list_archive(archive, "directory second").size() >= 2);
+    axiom::change_archive_password(archive, original_password, "directory changed");
+    expect_throws([&] { (void)axiom::list_archive(archive, original_password); });
+    opt.password = "directory changed";
+
+    axiom::set_archive_comment(archive, "directory edit", opt);
+    AXIOM_CHECK(axiom::archive_comment(archive, opt.password) == "directory edit");
 
     // Listing is refused without (or with a wrong) password — the directory is sealed.
     expect_throws([&] { (void)axiom::list_archive(archive); });
@@ -3274,6 +4401,25 @@ void test_archive_encrypted_directory() {
         bad.password = "nope";
         expect_throws([&] { axiom::test_archive(archive, bad); });
     }
+
+    {
+        const auto key = axiom::generate_archive_signing_key();
+        axiom::CompressionOptions signing_options;
+        signing_options.password = opt.password;
+        axiom::sign_archive(archive, key, signing_options);
+        const auto signed_info = axiom::verify_archive_signature(archive, opt.password);
+        AXIOM_CHECK(signed_info.present);
+        AXIOM_CHECK(signed_info.valid);
+        axiom::add_archive_password(archive, opt.password, "directory final");
+        const auto unsigned_info =
+            axiom::verify_archive_signature(archive, "directory final");
+        AXIOM_CHECK(!unsigned_info.present);
+        opt.password = "directory final";
+        axiom::DecompressionOptions post_rekey;
+        post_rekey.password = opt.password;
+        axiom::test_archive(archive, post_rekey);
+    }
+    AXIOM_CHECK(axar_encrypted_block_region(archive) == initial_encrypted_blocks);
 
     // Direct volume reads preserve sealed-directory and block encryption. The
     // original archive is absent, so the password-protected directory and data
@@ -3735,6 +4881,17 @@ void test_windows_metadata() {
 
     const auto archive = root / "meta.axar";
     axiom::create_archive({src}, archive, {});
+    const auto archive_bytes = read_all(archive);
+    AXIOM_CHECK(archive_bytes.size() >= 16);
+    AXIOM_CHECK((archive_bytes[10] & 0x08u) != 0);  // AXAR v5 extended metadata flag
+    const auto listed = axiom::list_archive(archive);
+    const auto listed_file = std::find_if(
+        listed.begin(), listed.end(), [](const auto& entry) {
+            return entry.path == "src/ro.txt";
+        });
+    AXIOM_CHECK(listed_file != listed.end());
+    AXIOM_CHECK(listed_file->has_security_descriptor);
+    AXIOM_CHECK(!listed_file->security_descriptor.empty());
     const auto dest = root / "out";
     axiom::extract_archive(archive, dest, {});
 
@@ -3794,6 +4951,173 @@ void test_archive_ads() {
     const auto extracted = dest / "src" / "host.txt";
     AXIOM_CHECK(read_all(extracted) == bytes_from_string("primary content stream"));
     AXIOM_CHECK(read_stream(extracted.wstring() + L":Zone.Identifier") == ads_data);
+
+    std::error_code ec;
+    fs::remove_all(root, ec);
+}
+
+// Sparse files must retain their logical bytes and, when the destination
+// filesystem supports it, their unallocated holes across an AXAR v5 round-trip.
+void test_archive_sparse_files() {
+    const auto root = make_temp_dir();
+    const auto src = root / "src";
+    fs::create_directories(src);
+    const auto file = src / "sparse.bin";
+    constexpr std::uint64_t logical_size = 8u << 20;
+    constexpr std::uint64_t first_offset = 512u << 10;
+    constexpr std::uint64_t second_offset = 6u << 20;
+    const std::vector<std::uint8_t> first_data(64u << 10, 0xA5);
+    const std::vector<std::uint8_t> second_data(96u << 10, 0x3C);
+
+    const HANDLE handle = CreateFileW(
+        file.c_str(), GENERIC_READ | GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+        CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    AXIOM_CHECK(handle != INVALID_HANDLE_VALUE);
+    DWORD returned = 0;
+    if (!DeviceIoControl(handle, FSCTL_SET_SPARSE, nullptr, 0, nullptr, 0,
+                         &returned, nullptr)) {
+        CloseHandle(handle);
+        std::error_code ec;
+        fs::remove_all(root, ec);
+        return;  // The test volume does not expose sparse-file controls.
+    }
+    LARGE_INTEGER end{};
+    end.QuadPart = logical_size;
+    AXIOM_CHECK(SetFilePointerEx(handle, end, nullptr, FILE_BEGIN));
+    AXIOM_CHECK(SetEndOfFile(handle));
+    auto write_at = [&](std::uint64_t offset, const std::vector<std::uint8_t>& data) {
+        LARGE_INTEGER position{};
+        position.QuadPart = offset;
+        AXIOM_CHECK(SetFilePointerEx(handle, position, nullptr, FILE_BEGIN));
+        DWORD wrote = 0;
+        AXIOM_CHECK(WriteFile(handle, data.data(), static_cast<DWORD>(data.size()),
+                              &wrote, nullptr));
+        AXIOM_CHECK(wrote == data.size());
+    };
+    write_at(first_offset, first_data);
+    write_at(second_offset, second_data);
+    CloseHandle(handle);
+
+    const auto all_hole_file = src / "all-hole.bin";
+    const HANDLE all_hole_handle = CreateFileW(
+        all_hole_file.c_str(), GENERIC_READ | GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+        CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    AXIOM_CHECK(all_hole_handle != INVALID_HANDLE_VALUE);
+    AXIOM_CHECK(DeviceIoControl(all_hole_handle, FSCTL_SET_SPARSE, nullptr, 0, nullptr, 0,
+                                &returned, nullptr));
+    LARGE_INTEGER all_hole_end{};
+    all_hole_end.QuadPart = logical_size;
+    AXIOM_CHECK(SetFilePointerEx(all_hole_handle, all_hole_end, nullptr, FILE_BEGIN));
+    AXIOM_CHECK(SetEndOfFile(all_hole_handle));
+    CloseHandle(all_hole_handle);
+
+    const DWORD source_attributes = GetFileAttributesW(file.c_str());
+    AXIOM_CHECK((source_attributes & FILE_ATTRIBUTE_SPARSE_FILE) != 0);
+
+    const auto archive = root / "sparse.axar";
+    axiom::create_archive({src}, archive, {});
+    const auto archive_bytes = read_all(archive);
+    AXIOM_CHECK(archive_bytes.size() >= 10);
+    AXIOM_CHECK(archive_bytes[8] == 5 && archive_bytes[9] == 0);
+    const auto archive_flags = static_cast<std::uint16_t>(archive_bytes[10]) |
+        (static_cast<std::uint16_t>(archive_bytes[11]) << 8);
+    AXIOM_CHECK((archive_flags & 0x0002u) != 0);
+
+    const auto listed = axiom::list_archive(archive);
+    const auto found = std::find_if(listed.begin(), listed.end(), [](const auto& entry) {
+        return entry.path == "src/sparse.bin";
+    });
+    AXIOM_CHECK(found != listed.end());
+    AXIOM_CHECK(found->is_sparse);
+    AXIOM_CHECK(!found->sparse_extents.empty());
+    const auto all_hole_listed = std::find_if(listed.begin(), listed.end(), [](const auto& entry) {
+        return entry.path == "src/all-hole.bin";
+    });
+    AXIOM_CHECK(all_hole_listed != listed.end());
+    AXIOM_CHECK(all_hole_listed->is_sparse);
+    AXIOM_CHECK(all_hole_listed->sparse_extents.empty());
+    AXIOM_CHECK(axiom::archive_capture_report(archive).complete);
+    axiom::test_archive(archive);
+
+    axiom::ExtractOptions extract_options;
+    extract_options.strict_metadata = true;
+    const auto dest = root / "out";
+    axiom::extract_archive(archive, dest, extract_options);
+    const auto extracted = dest / "src" / "sparse.bin";
+    const auto restored = read_all(extracted);
+    AXIOM_CHECK(restored.size() == logical_size);
+    AXIOM_CHECK(restored[first_offset] == first_data.front());
+    AXIOM_CHECK(restored[second_offset] == second_data.front());
+    const auto extracted_attributes = GetFileAttributesW(extracted.c_str());
+    AXIOM_CHECK((extracted_attributes & FILE_ATTRIBUTE_SPARSE_FILE) != 0);
+    const auto restored_map = axiom::core::capture_sparse_file(extracted, logical_size);
+    AXIOM_CHECK(restored_map.map.has_value());
+
+    const auto extracted_all_hole = dest / "src" / "all-hole.bin";
+    AXIOM_CHECK(read_all(extracted_all_hole).size() == logical_size);
+    const auto all_hole_attributes = GetFileAttributesW(extracted_all_hole.c_str());
+    AXIOM_CHECK((all_hole_attributes & FILE_ATTRIBUTE_SPARSE_FILE) != 0);
+    const auto restored_all_hole_map =
+        axiom::core::capture_sparse_file(extracted_all_hole, logical_size);
+    AXIOM_CHECK(restored_all_hole_map.map.has_value());
+    AXIOM_CHECK(restored_all_hole_map.map->allocated.empty());
+
+    std::error_code ec;
+    fs::remove_all(root, ec);
+}
+#endif
+
+#if !defined(_WIN32) && (defined(__linux__) || defined(__APPLE__))
+void test_archive_xattrs() {
+    const auto root = make_temp_dir();
+    const auto src = root / "src";
+    fs::create_directories(src);
+    const auto file = src / "xattr.txt";
+    write_all(file, bytes_from_string("xattr content"));
+    const std::string value = "axiom-xattr-value";
+#if defined(__APPLE__)
+    const int set_result = ::setxattr(file.c_str(), "user.axiom.test", value.data(),
+                                      value.size(), 0, 0);
+#else
+    const int set_result = ::setxattr(file.c_str(), "user.axiom.test", value.data(),
+                                      value.size(), 0);
+#endif
+    if (set_result != 0 && (errno == ENOTSUP || errno == EOPNOTSUPP || errno == EPERM)) {
+        std::error_code ec;
+        fs::remove_all(root, ec);
+        return;  // The test filesystem does not expose writable xattrs.
+    }
+    AXIOM_CHECK(set_result == 0);
+
+    const auto archive = root / "xattr.axar";
+    axiom::create_archive({src}, archive, {});
+    const auto listed = axiom::list_archive(archive);
+    const auto listed_file = std::find_if(
+        listed.begin(), listed.end(), [](const auto& entry) {
+            return entry.path == "src/xattr.txt";
+        });
+    AXIOM_CHECK(listed_file != listed.end());
+    const auto attribute = std::find_if(
+        listed_file->xattrs.begin(), listed_file->xattrs.end(),
+        [](const auto& item) { return item.name == "user.axiom.test"; });
+    AXIOM_CHECK(attribute != listed_file->xattrs.end());
+    AXIOM_CHECK(std::string(attribute->data.begin(), attribute->data.end()) == value);
+
+    const auto dest = root / "out";
+    axiom::extract_archive(archive, dest, {});
+    const auto extracted = dest / "src" / "xattr.txt";
+    std::vector<char> restored(value.size());
+#if defined(__APPLE__)
+    const auto restored_size = ::getxattr(extracted.c_str(), "user.axiom.test",
+                                          restored.data(), restored.size(), 0, 0);
+#else
+    const auto restored_size = ::getxattr(extracted.c_str(), "user.axiom.test",
+                                          restored.data(), restored.size());
+#endif
+    AXIOM_CHECK(restored_size == static_cast<ssize_t>(value.size()));
+    AXIOM_CHECK(std::string(restored.begin(), restored.end()) == value);
 
     std::error_code ec;
     fs::remove_all(root, ec);
@@ -4176,7 +5500,9 @@ int main() {
     test_rans_edges();
     test_rans_contextual_edges();
     test_archive_roundtrip();
+    test_axar_version_fixtures_and_validation();
     test_external_codec_axar_roundtrip();
+    test_axar_seekable_extraction();
     test_archive_provider_layer();
     test_zip_provider_layer();
     test_safe_file_replacement();
@@ -4193,6 +5519,8 @@ int main() {
     test_archive_symlinks();
     test_archive_hardlinks();
     test_archive_add();
+    test_archive_content_reuse();
+    test_archive_snapshots();
     test_archive_file_manager_apis();
     test_archive_delete_repack();
     test_archive_update_sync();
@@ -4200,7 +5528,10 @@ int main() {
     test_archive_comment_lock();
     test_archive_recovery_and_volumes();
     test_archive_authenticity_and_sfx();
+    test_sfx_options_and_config();
+    test_sfx_config_packaging();
     test_archive_encryption();
+    test_archive_encryption_v2_password_slots();
     test_archive_encrypted_directory();
     test_archive_timestamp_conversion();
     test_archive_operation_control();
@@ -4208,6 +5539,9 @@ int main() {
 #if defined(_WIN32)
     test_windows_metadata();
     test_archive_ads();
+    test_archive_sparse_files();
+#else
+    test_archive_xattrs();
 #endif
     test_archive_safety();
     test_extract_link_safety();

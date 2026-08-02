@@ -223,7 +223,9 @@ entropy cost, rANS for the practical high-ratio mode, and context-mixed literal
 coding reserved for a max-ratio research mode.
 
 Future block headers should add a dictionary identifier, codec parameters,
-per-block checksums, and an optional seek index.
+per-block checksums, and additional codec parameters. The current seek map
+lives in the skippable AXAR block-extra area so it does not change the AXAR
+header version or the AXC payload bytes.
 
 ## Container
 
@@ -238,9 +240,61 @@ destination-aware insertion (`ArchiveInput`), selective extraction,
 metadata-only entry moves (`ArchiveMove`), add/update/freshen/sync/delete/
 repack, comments and locking, and encryption-mode queries.
 
-All mutating operations write a temporary archive and replace by rename. They
-honor `OperationControl` and reject locked archives. Block-encrypted archives
-are editable with the password; directory-encrypted archives are read-only.
+Mutating operations honor `OperationControl` and reject locked archives. AXAR
+block-encrypted and directory-encrypted archives are editable with the password.
+Append-compatible add/update/freshen/sync operations, and signing, retain the
+previous complete footer and append a generation containing the replacement
+directory; if header flags must change, or the operation is a compaction/rebuild,
+the established temporary-archive-plus-rename path is used. Encryption-v2
+password-slot changes rewrite only encryption metadata/directory and preserve
+existing compressed block bytes; they invalidate signatures and rebuild recovery
+data against the new layout.
+
+Archive creation is split between a seekable file writer, which can patch the
+final v4/v5 header after metadata capture, and a counted sequential sink. The
+`create_archive_to_stream` profile writes AXAR v5 with all known fidelity flags
+reserved up front, supports compression and encryption, and deliberately rejects
+recovery records because a non-seekable output cannot be repaired or signed in
+place. The sink owns no stream lifetime and reports its byte position explicitly.
+
+Selected AXAR extraction is seek-aware when the block carries the optional
+subframe map described in `FORMAT.md`. `BlockSource` reads the AXC prefix once,
+validates the map against the outer codec, and decodes only the intersecting
+parallel block or external-codec chunk. Encrypted, transformed, serial, and
+legacy blocks deliberately fall back to the existing bounded whole-block path.
+The directory is parsed once, while the path lookup table is built lazily only
+when selection or hard-link resolution needs it. Shared reader statistics count
+physical archive bytes fetched so the CLI and native progress window can show
+the cost of a selected restore.
+
+### Snapshot deduplication
+
+The snapshot profile is isolated behind the AXAR v5 required chunk-table flag.
+`build_snapshot_entries` scans each regular file once, feeds bounded
+content-defined chunks to the normal block writer, and consults a stable
+`(logical_size, BLAKE3)` identity table before writing a new chunk. Encrypted
+repositories use a keyed BLAKE3 identity derived from the archive data key by
+default, preventing an observer from learning chunk equality from the table.
+`EntryRec::chunk_refs` is the only content address used by snapshot entries;
+`BlockSource::chunk` validates the stored CRC and identity before exposing the
+bytes to extraction, testing, or snapshot restore.
+
+The archive metadata carries both the live directory and bounded historical
+manifests. `add_archive_snapshot` appends new chunk blocks and one generation
+directory, while list and diff operate only on manifest data and never decode
+unchanged content. `restore_archive_snapshot` temporarily selects a historical
+entry catalogue while retaining the same chunk table and reader validation.
+Ordinary content mutation paths reject a chunk-table archive; this prevents a
+legacy update, sync, delete, or move from dropping history. Metadata-only
+directory rewrites preserve the chunk table.
+
+`prune_archive_snapshots` appends a manifest-only generation and protects the
+current snapshot from deletion. `repack_snapshot_archive` marks every chunk
+reachable from the current and retained manifests, copies only the referenced
+blocks, remaps chunk and entry addresses, re-seals encrypted blocks with their
+new block-index associated data, and rebuilds recovery data. This gives snapshot
+repositories an explicit garbage-collection boundary without changing old
+archives or pretending that historical chunks are ordinary dead solid ranges.
 
 ### Providers
 
@@ -253,7 +307,7 @@ Archive browsing goes through a built-in provider layer:
 | `system-readonly` | Windows only. Loads `7z.dll` directly for 7z, RAR/RAR5, hybrid ISO/UDF, and CAB; uses `tar.exe` for the TAR family. Never advertises create, update, delete, or move |
 
 The GUI asks a provider for format identity and file-type text, capability
-flags (list, extract, test, update, comments, encryption, recovery,
+flags (list, extract, test, update, comments, encryption, recovery, snapshots,
 signatures, SFX), directory entries, and the test/extract/write operations.
 Commands are enabled from those flags rather than failing late.
 
@@ -268,7 +322,7 @@ display; hybrid media use the authoritative UDF catalog from the DLL. The DLL
 adapter consumes structured properties and callbacks rather than launching a
 helper process or parsing console text.
 
-ZIP vendors miniz 3.1.1 for a small, build-system-friendly container
+ZIP vendors miniz 3.1.2 for a small, build-system-friendly container
 reader/writer and Deflate implementation. zlib-ng is a reasonable future
 Deflate backend candidate if profiling shows miniz's codec path is the
 bottleneck, but it is not a ZIP container layer. A privately namespaced
@@ -283,12 +337,23 @@ The per-format roadmap is in
 
 - **Signatures** cover exact stored block bytes and canonical directory
   semantics.
-- **SFX** appends an intact AXAR or ZIP plus a fixed trailer to a dedicated
-  read-only native module. The module ships as `AxiomSfx.bin`, is never exposed
-  as a separate executable, and is read only during SFX creation.
+- **SFX** writes a descriptor and an intact AXAR or ZIP at the end of the PE
+  image of a dedicated read-only native module, so the payload survives
+  Authenticode signing. The module ships as `AxiomSfx.bin`, is never exposed as
+  a separate executable, and is read only during SFX creation. The layout and
+  both read paths live in `src/archive/sfx_image.cpp`, which the engine and the
+  extractor runtime share so they cannot disagree. `AxiomSfxDecodeLib` puts
+  AXAR/ZIP listing, testing, signature inspection, and extraction behind the
+  read-only `SfxArchiveReader` facade; the Mini stub does not link archive
+  writers, mutation providers, or encoder backends. The runtime opens the
+  payload where it lies rather than copying it out, and drives all interaction
+  through the `SfxUi` interface, so one code path serves both the dialog stub
+  and the console-only one. Design and roadmap:
+  [docs/SFX_ARCHITECTURE.md](docs/SFX_ARCHITECTURE.md).
 - **POSIX metadata** rides in a skippable entry TLV.
 - **Recovery records** use the portable Reed-Solomon core and protect the
-  archive through the end of the central directory. Repair is atomic.
+  archive through the end of the current directory and, for an appended
+  generation, its 64-byte generation extension. Repair is atomic.
 - **Volumes** are numbered data parts plus optional `.revNNN` parity volumes.
   Joining validates the reconstruction with BLAKE3 before installing it.
 
@@ -306,10 +371,15 @@ a joined archive. Missing data parts fall back to Reed-Solomon reconstruction.
 Synchronization is one archive transaction: the source is scanned once and
 compared with one loaded catalogue, unchanged compressed blocks are copied
 verbatim, changed and new entries are compressed once, and stale entries are
-omitted from the final directory. Comment, lock, and signature metadata fold
-into that directory before recovery is generated. The completed temporary
-archive receives one recovery record and is atomically installed. A no-change
-sync returns without touching the archive.
+omitted from the final directory. Exact size/CRC/BLAKE3 matches reuse an
+existing block range, so content-identical files added under a new path do not
+create another compressed copy; repack applies the same coalescing while
+rebuilding. When header features remain compatible, the changed blocks and new
+directory are appended as one generation and the previous footer remains the
+crash fallback. Comment, lock, and signature metadata fold into that directory
+before recovery is generated. Header-changing sync and compaction continue to
+receive the atomic temporary-file treatment. A no-change sync returns without
+touching the archive.
 
 ## Threading
 
@@ -335,7 +405,7 @@ Two layers:
 - Archive **solid blocks** group file bytes for cross-file compression and
   selective extraction.
 - The single-stream codec can split a solid block into independently compressed
-  **sub-blocks**.
+  **sub-blocks**, and AXAR records their optional seek map in the directory.
 
 By default the archive layer raises the target solid-block size to at least
 `hardware_threads × 1 MiB` when multiple workers are available, and the codec
@@ -399,7 +469,8 @@ checkpoint framing can never worsen a written block.
 `OperationControl` is the single source of progress truth. Producers publish a
 coherent snapshot containing stage bytes, item counts, current path, per-file
 bytes, an optional operation-wide phase index and count, a dedicated throughput
-counter, and archive-output and source-byte counters for live size and ratio.
+counter, archive-output and source-byte counters for live size and ratio, and
+the number of source items/bytes represented by reused AXAR ranges.
 The phase coordinates let the GUI render one non-resetting overall bar across
 scanning, comparison, unchanged-block copying, compression, recovery, and
 atomic commit while keeping exact phase-local counters.

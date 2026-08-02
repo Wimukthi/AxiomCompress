@@ -2,15 +2,20 @@
 
 #include <windows.h>
 
-#include <optional>
+#include <span>
 #include <string>
 
 namespace axiom::sfx {
 
-// Runs only when the current executable contains the fixed AXIOMSFX trailer.
-// A missing trailer returns nullopt so Axiom.exe can continue normal startup.
-std::optional<int> run_embedded(
-    HINSTANCE instance,
-    const std::wstring& requested_destination = {});
+class SfxUi;
+
+// Runs the extractor embedded in the current executable. `arguments` excludes
+// argv[0]. Returns one of the documented ExitCode values; a file with no
+// embedded payload reports ExitCode::failure after explaining itself.
+//
+// All interaction goes through `ui`, so the same runtime drives the dialog stub
+// and the console-only mini stub.
+int run_self_extractor(HINSTANCE instance,
+                       std::span<const std::wstring> arguments, SfxUi& ui);
 
 }  // namespace axiom::sfx

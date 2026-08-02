@@ -83,6 +83,15 @@ struct OperationProgress {
     std::uint64_t planned_updated_items = 0;
     std::uint64_t planned_removed_items = 0;
     std::uint64_t planned_unchanged_items = 0;
+    // Exact content reuse performed by an archive update/repack. These counters
+    // describe source bytes represented by existing archive data ranges rather
+    // than recompressed in the current operation.
+    std::uint64_t reused_items = 0;
+    std::uint64_t reused_bytes = 0;
+    // Physical archive bytes fetched by the reader. This includes directory
+    // reads and is useful for proving that seekable extraction avoided unrelated
+    // compressed frames; zero means the producer did not collect this telemetry.
+    std::uint64_t archive_bytes_read = 0;
 };
 
 struct OperationWarning {
@@ -184,6 +193,12 @@ public:
             progress_compressed_bytes_.load(std::memory_order_relaxed);
         const auto previous_compressed_source_bytes =
             progress_compressed_source_bytes_.load(std::memory_order_relaxed);
+        const auto previous_reused_items =
+            progress_reused_items_.load(std::memory_order_relaxed);
+        const auto previous_reused_bytes =
+            progress_reused_bytes_.load(std::memory_order_relaxed);
+        const auto previous_archive_bytes_read =
+            progress_archive_bytes_read_.load(std::memory_order_relaxed);
         const bool first = progress_version_.load(std::memory_order_relaxed) == 0;
 
         const bool same_totals = !first &&
@@ -209,6 +224,12 @@ public:
             published.compressed_source_bytes = std::max(
                 published.compressed_source_bytes,
                 previous_compressed_source_bytes);
+            published.reused_items =
+                std::max(published.reused_items, previous_reused_items);
+            published.reused_bytes =
+                std::max(published.reused_bytes, previous_reused_bytes);
+            published.archive_bytes_read = std::max(
+                published.archive_bytes_read, previous_archive_bytes_read);
         }
 
         const bool same_file = monotonic_epoch &&
@@ -239,8 +260,12 @@ public:
             published.throughput_bytes >=
                 previous_throughput_bytes + kPublishQuantum ||
             published.compressed_bytes >=
-                previous_compressed_bytes + kPublishQuantum;
-        if (!boundary && !byte_quantum) {
+                 previous_compressed_bytes + kPublishQuantum ||
+            published.reused_bytes >= previous_reused_bytes + kPublishQuantum;
+        const bool read_byte_quantum =
+            published.archive_bytes_read >=
+            previous_archive_bytes_read + kPublishQuantum;
+        if (!boundary && !byte_quantum && !read_byte_quantum) {
             progress_writer_.clear(std::memory_order_release);
             return;
         }
@@ -276,6 +301,12 @@ public:
                                          std::memory_order_relaxed);
         progress_compressed_source_bytes_.store(
             published.compressed_source_bytes, std::memory_order_relaxed);
+        progress_reused_items_.store(published.reused_items,
+                                     std::memory_order_relaxed);
+        progress_reused_bytes_.store(published.reused_bytes,
+                                     std::memory_order_relaxed);
+        progress_archive_bytes_read_.store(published.archive_bytes_read,
+                                            std::memory_order_relaxed);
         if (progress_writer_path_ != published.current_path) {
             progress_writer_path_ = published.current_path;
             std::lock_guard lock(progress_path_mutex_);
@@ -337,6 +368,12 @@ public:
                 progress_compressed_bytes_.load(std::memory_order_relaxed);
             result.compressed_source_bytes =
                 progress_compressed_source_bytes_.load(std::memory_order_relaxed);
+            result.reused_items =
+                progress_reused_items_.load(std::memory_order_relaxed);
+            result.reused_bytes =
+                progress_reused_bytes_.load(std::memory_order_relaxed);
+            result.archive_bytes_read =
+                progress_archive_bytes_read_.load(std::memory_order_relaxed);
             std::shared_ptr<const std::string> path;
             {
                 std::lock_guard lock(progress_path_mutex_);
@@ -433,6 +470,9 @@ private:
     mutable std::atomic_uint64_t progress_throughput_bytes_{0};
     mutable std::atomic_uint64_t progress_compressed_bytes_{0};
     mutable std::atomic_uint64_t progress_compressed_source_bytes_{0};
+    mutable std::atomic_uint64_t progress_reused_items_{0};
+    mutable std::atomic_uint64_t progress_reused_bytes_{0};
+    mutable std::atomic_uint64_t progress_archive_bytes_read_{0};
     mutable std::mutex progress_path_mutex_;
     mutable std::shared_ptr<const std::string> progress_path_{
         std::make_shared<const std::string>()};
@@ -537,6 +577,11 @@ struct CompressionOptions {
     bool use_fast_lz = false;
     bool force_store = false;
     bool force_parallel_blocks = false;
+    // Skip the high-entropy/low-sample store shortcut. Candidate selection
+    // still keeps stored output when every actual compressed representation
+    // loses; benchmark generators use this only when they intentionally embed
+    // short LZ matches that the heuristic's sparse samples can miss.
+    bool bypass_incompressible_heuristic = false;
     bool enable_optimal_parser = false;
     // Two-pass optimal parsing re-parses with costs measured from the first DP
     // pass and keeps the smaller coded result; single-pass (false) measures
@@ -549,6 +594,14 @@ struct CompressionOptions {
     // update paths deliberately ignore this option to preserve old entries.
     bool skip_unreadable_files = false;
     unsigned input_open_retries = 4;
+    // Capture and restore sparse-file allocation maps when the host filesystem
+    // exposes them. Dense archives remain AXAR v4; an archive containing a map
+    // or capture report is automatically written as AXAR v5.
+    bool preserve_sparse_files = true;
+    // Fail archive creation when an input is skipped or a sparse allocation map
+    // cannot be captured. Without this flag, source bytes that can be read are
+    // archived and any omission is persisted in the archive capture report.
+    bool strict_metadata = false;
     // File-aware reversible filters are selected only when a fast trial predicts
     // a net win. Archive writers populate ranges from individual file content;
     // direct compress() calls auto-detect a supported whole-input transform.
@@ -585,10 +638,25 @@ struct CompressionOptions {
     // hashes are hidden (reading then requires the password even to list). Ignored
     // when password is empty.
     bool encrypt_header = false;
+    // New password-protected AXAR archives use random data keys wrapped by one or
+    // more password slots. Keep this true for new archives; false is retained only
+    // for producing legacy v4 encryption fixtures and compatibility exports.
+    bool use_encryption_v2 = true;
     // Optional archive recovery redundancy, as a percentage of protected archive
     // bytes. Zero disables the recovery service record; valid enabled values are
     // 1..100. Applies only to the multi-file archive container.
     unsigned recovery_percent = 0;
+    // Snapshot profile. The public snapshot APIs enable this profile explicitly;
+    // keeping the switch here lets archive frontends pass one options object
+    // through the existing compression/update plumbing.
+    bool enable_snapshot_dedup = false;
+    // A keyed identifier is only meaningful when an archive data key exists. It
+    // prevents equal plaintext chunks in an encrypted snapshot repository from
+    // advertising equality through the chunk table.
+    bool keyed_chunk_ids = true;
+    std::size_t snapshot_min_chunk_size = 256u << 10;
+    std::size_t snapshot_average_chunk_size = 1u << 20;
+    std::size_t snapshot_max_chunk_size = 4u << 20;
 };
 
 // Effort presets, fastest (1) to maximum ratio (9). Each level picks a coherent

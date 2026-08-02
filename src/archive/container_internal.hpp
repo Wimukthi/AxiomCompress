@@ -115,6 +115,7 @@ struct ScanItem {
     bool is_directory = false;
     bool is_symlink = false;
     std::string symlink_target{};  // verbatim target when is_symlink
+    bool is_reparse_point = false; // non-symlink redirecting filesystem object
 };
 
 void scan_input(const std::filesystem::path& input, std::vector<ScanItem>& items);
@@ -139,9 +140,12 @@ void report_operation(const std::shared_ptr<OperationControl>& operation,
                       std::string current_path = {},
                       std::uint64_t current_file_completed_bytes = 0,
                       std::uint64_t current_file_total_bytes = 0,
-                      std::uint64_t throughput_bytes = 0,
-                      std::uint64_t compressed_bytes = 0,
-                      std::uint64_t compressed_source_bytes = 0);
+                       std::uint64_t throughput_bytes = 0,
+                       std::uint64_t compressed_bytes = 0,
+                       std::uint64_t compressed_source_bytes = 0,
+                       std::uint64_t reused_items = 0,
+                       std::uint64_t reused_bytes = 0,
+                       std::uint64_t archive_bytes_read = 0);
 void operation_checkpoint(const std::shared_ptr<OperationControl>& operation);
 
 // ---- archive path safety -------------------------------------------------------
@@ -218,6 +222,33 @@ inline std::wstring lower_ascii(std::wstring text) {
     }
     return text;
 }
+
+// ---- decode-only ZIP entry points -----------------------------------------------
+
+// These entry points deliberately bypass ArchiveProvider. The SFX decode library
+// links the ZIP reader without exposing the archive mutation vtable or registry.
+using SfxZipPayloadRange = std::optional<std::pair<std::uint64_t, std::uint64_t>>;
+
+ArchiveCapabilities sfx_zip_capabilities(
+    const std::filesystem::path& archive_path,
+    const std::string& password = {},
+    const SfxZipPayloadRange& payload_range = std::nullopt);
+std::vector<ArchiveEntry> sfx_zip_list(
+    const std::filesystem::path& archive_path,
+    const std::string& password = {},
+    const SfxZipPayloadRange& payload_range = std::nullopt);
+void sfx_zip_test(const std::filesystem::path& archive_path,
+                  const DecompressionOptions& options = {},
+                  const SfxZipPayloadRange& payload_range = std::nullopt);
+void sfx_zip_extract_all(const std::filesystem::path& archive_path,
+                         const std::filesystem::path& dest_dir,
+                         const ExtractOptions& options = {},
+                         const SfxZipPayloadRange& payload_range = std::nullopt);
+void sfx_zip_extract_selected(const std::filesystem::path& archive_path,
+                              const std::vector<std::string>& entries,
+                              const std::filesystem::path& dest_dir,
+                              const ExtractOptions& options = {},
+                              const SfxZipPayloadRange& payload_range = std::nullopt);
 
 // ---- provider registry glue ------------------------------------------------------
 

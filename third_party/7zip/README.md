@@ -14,7 +14,7 @@ Files shipped with Axiom:
 for interoperability tests. It is not included in Axiom installers or portable
 packages.
 
-The bundled copy is 7-Zip 26.00 for Windows x64.
+The bundled copy is 7-Zip 26.02 for Windows x64.
 
 7-Zip is copyright (C) 1999-2026 Igor Pavlov. See `win-x64/License.txt` for
 the full license notice. In summary, 7-Zip is mainly GNU LGPL, with BSD-licensed

@@ -2,6 +2,7 @@
 
 #include "axiom/archive.hpp"
 #include "gui/archive_feature_options.hpp"
+#include "sfx/sfx_config.hpp"
 #include "gui/keyboard_shortcuts.hpp"
 #include "gui/toolbar_icons.hpp"
 
@@ -256,6 +257,18 @@ struct ApplicationDialogOptions {
     int default_recovery_percent = 0;
     bool default_recovery_volumes = false;
     bool default_create_sfx = false;
+    // Defaults for the SFX options page. License text is deliberately not
+    // persisted: it belongs to one package, not to the application.
+    int default_sfx_stub_tier = 0;
+    int default_sfx_overwrite = 0;
+    int default_sfx_mode = 0;
+    int default_sfx_elevation = 0;
+    std::wstring default_sfx_title;
+    std::wstring default_sfx_default_path;
+    std::wstring default_sfx_run_program;
+    std::wstring default_sfx_run_arguments;
+    bool default_sfx_allow_path_change = true;
+    bool default_sfx_open_destination = true;
     bool default_sign_archive = false;
     std::wstring default_signing_key;
     bool confirm_delete = true;
@@ -336,5 +349,13 @@ bool show_application_settings_dialog(
     HWND owner,
     ApplicationDialogOptions& options,
     const std::function<void(const ApplicationDialogOptions&)>& apply_callback);
+
+// Converts the SFX settings authored on the dialog's SFX options page into the
+// configuration embedded in the generated executable. Shared with the operation
+// code that packages it, so the dialog and the packager cannot disagree about
+// what a setting means.
+axiom::sfx::SfxConfig sfx_config_from_features(const ArchiveFeatureOptions& features);
+axiom::sfx::SfxStubTier sfx_stub_tier_from_features(
+    const ArchiveFeatureOptions& features);
 
 }  // namespace axiom::gui

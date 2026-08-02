@@ -514,4 +514,129 @@ ByteVector decode_external_codec(std::span<const std::uint8_t> payload,
     return output;
 }
 
+std::vector<ExternalCodecFrame> inspect_external_codec_frames(
+    std::span<const std::uint8_t> payload,
+    CompressionMethod method,
+    std::size_t expected_size) {
+    if (method != CompressionMethod::zstandard &&
+        method != CompressionMethod::lzma2 &&
+        method != CompressionMethod::deflate) {
+        throw FormatError("method is not an external AXC codec");
+    }
+    if (payload.size() < kHeaderSize ||
+        !std::equal(kMagic.begin(), kMagic.end(), payload.begin())) {
+        throw FormatError("external codec payload header is invalid");
+    }
+    std::size_t cursor = kMagic.size();
+    if (payload[cursor++] != kPayloadVersion) {
+        throw FormatError("unsupported external codec payload version");
+    }
+    const auto property_size = static_cast<std::size_t>(payload[cursor++]);
+    if (property_size > kMaxPropertySize || read_u16(payload, cursor) != 0) {
+        throw FormatError("external codec properties are invalid");
+    }
+    const auto chunk_size = static_cast<std::size_t>(read_u32(payload, cursor));
+    const auto chunk_count = static_cast<std::size_t>(read_u32(payload, cursor));
+    const auto maximum_chunk = method == CompressionMethod::lzma2
+        ? kMaxLzmaChunkSize : kMaxFastCodecChunkSize;
+    if (chunk_size < kMinChunkSize || chunk_size > maximum_chunk ||
+        property_size > payload.size() - cursor) {
+        throw FormatError("external codec geometry is invalid");
+    }
+    const auto expected_chunks = expected_size == 0
+        ? std::size_t{0} : 1 + (expected_size - 1) / chunk_size;
+    if (chunk_count != expected_chunks) {
+        throw FormatError("external codec chunk count is invalid");
+    }
+    const auto properties = payload.subspan(cursor, property_size);
+    cursor += property_size;
+    if ((method == CompressionMethod::lzma2 && property_size != 1) ||
+        (method != CompressionMethod::lzma2 && property_size != 0)) {
+        throw FormatError("external codec properties do not match the codec");
+    }
+    std::uint8_t lzma_property = 0;
+    if (method == CompressionMethod::lzma2) {
+        lzma_property = properties.front();
+        if (lzma_property > 40) {
+            throw FormatError("LZMA2 dictionary property is invalid");
+        }
+    }
+
+    std::vector<ExternalCodecFrame> frames;
+    frames.reserve(chunk_count);
+    std::size_t uncompressed_offset = 0;
+    for (std::size_t index = 0; index < chunk_count; ++index) {
+        const auto frame_offset = cursor;
+        const auto raw_size = static_cast<std::size_t>(read_u32(payload, cursor));
+        const auto encoded_size = static_cast<std::size_t>(read_u32(payload, cursor));
+        if (payload.size() - cursor < 4) {
+            throw FormatError("external codec chunk header is truncated");
+        }
+        const auto flags = payload[cursor++];
+        if ((flags & ~kStoredChunk) != 0 || payload[cursor++] != 0 ||
+            payload[cursor++] != 0 || payload[cursor++] != 0) {
+            throw FormatError("external codec chunk flags are invalid");
+        }
+        if (uncompressed_offset > expected_size ||
+            raw_size != std::min(chunk_size, expected_size - uncompressed_offset) ||
+            encoded_size > payload.size() - cursor) {
+            throw FormatError("external codec chunk size is invalid");
+        }
+        const auto payload_offset = cursor;
+        cursor += encoded_size;
+        frames.push_back({uncompressed_offset,
+                          raw_size,
+                          frame_offset,
+                          cursor - frame_offset,
+                          payload_offset,
+                          encoded_size,
+                          (flags & kStoredChunk) != 0,
+                          lzma_property});
+        uncompressed_offset += raw_size;
+    }
+    if (cursor != payload.size() || uncompressed_offset != expected_size) {
+        throw FormatError("external codec payload has trailing or missing data");
+    }
+    return frames;
+}
+
+ByteVector decode_external_codec_frame(std::span<const std::uint8_t> frame,
+                                       CompressionMethod method,
+                                       std::size_t expected_size,
+                                       std::uint8_t lzma_property) {
+    std::size_t cursor = 0;
+    const auto raw_size = static_cast<std::size_t>(read_u32(frame, cursor));
+    const auto encoded_size = static_cast<std::size_t>(read_u32(frame, cursor));
+    if (frame.size() - cursor < 4) {
+        throw FormatError("external codec chunk header is truncated");
+    }
+    const auto flags = frame[cursor++];
+    if ((flags & ~kStoredChunk) != 0 || frame[cursor++] != 0 ||
+        frame[cursor++] != 0 || frame[cursor++] != 0 ||
+        encoded_size > frame.size() - cursor ||
+        cursor + encoded_size != frame.size() || raw_size != expected_size) {
+        throw FormatError("external codec chunk does not match its subframe map");
+    }
+    const auto encoded = frame.subspan(cursor, encoded_size);
+    if ((flags & kStoredChunk) != 0) {
+        if (encoded_size != expected_size) {
+            throw FormatError("stored external codec chunk has the wrong size");
+        }
+        return ByteVector(encoded.begin(), encoded.end());
+    }
+    if (method == CompressionMethod::zstandard) {
+        return decode_zstandard(encoded, expected_size);
+    }
+    if (method == CompressionMethod::lzma2) {
+        if (lzma_property > 40) {
+            throw FormatError("LZMA2 dictionary property is invalid");
+        }
+        return decode_lzma2(encoded, expected_size, lzma_property);
+    }
+    if (method == CompressionMethod::deflate) {
+        return decode_deflate(encoded, expected_size);
+    }
+    throw FormatError("unsupported external codec");
+}
+
 }  // namespace axiom::codec

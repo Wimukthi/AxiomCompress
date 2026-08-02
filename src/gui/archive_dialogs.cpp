@@ -1,6 +1,7 @@
 #define NOMINMAX
 #include "gui/archive_dialogs.hpp"
 #include "core/cpu.hpp"
+#include "core/path_text.hpp"
 #include "gui/dialog_support.hpp"
 #include "gui/main_window_internal.hpp"
 #include "gui/message_dialog.hpp"
@@ -69,6 +70,21 @@ constexpr int kSignArchive = 2140;
 constexpr int kSigningKey = 2141;
 constexpr int kBrowseSigningKey = 2142;
 constexpr int kCreateSfx = 2143;
+// SFX options page. 2144-2199 is free before the settings-dialog block.
+constexpr int kSfxStubTier = 2144;
+constexpr int kSfxTitle = 2145;
+constexpr int kSfxDefaultPath = 2146;
+constexpr int kSfxOverwrite = 2147;
+constexpr int kSfxMode = 2148;
+constexpr int kSfxElevation = 2149;
+constexpr int kSfxRunProgram = 2150;
+constexpr int kSfxRunArguments = 2151;
+constexpr int kSfxLicenseText = 2152;
+constexpr int kSfxAllowPathChange = 2153;
+constexpr int kSfxRequireAccept = 2154;
+constexpr int kSfxOpenDestination = 2155;
+constexpr int kSfxDescription = 2156;
+constexpr int kSfxTheme = 2157;
 constexpr int kSettingsTabs = 2200;
 constexpr int kSettingsTabBase = 2210;
 constexpr int kThemeMode = 2230;
@@ -235,7 +251,27 @@ bool is_built_in_profile_name(std::wstring_view name) {
         });
 }
 constexpr std::array<const wchar_t*, 5> kCreateTabNames{
-    L"Compression", L"General", L"Security", L"Recovery & volumes", L"SFX & signing"};
+    L"Compression", L"General", L"Security", L"Recovery & volumes", L"SFX"};
+constexpr std::array<const wchar_t*, 2> kSfxStubTierNames{
+    L"Full window (dialogs)", L"Console only (unattended)"};
+constexpr std::array<const wchar_t*, 9> kSfxDefaultPathNames{
+    L"%SFXDIR%",
+    L"%SFXDIR%\\%SFXNAME%",
+    L"%TEMP%\\%SFXNAME%",
+    L"%LOCALAPPDATA%\\%SFXNAME%",
+    L"%APPDATA%\\%SFXNAME%",
+    L"%PROGRAMFILES%\\%SFXNAME%",
+    L"%USERPROFILE%\\%SFXNAME%",
+    L"%DESKTOP%\\%SFXNAME%",
+    L"%DOCUMENTS%\\%SFXNAME%"};
+constexpr std::array<const wchar_t*, 3> kSfxOverwriteNames{
+    L"Replace existing files", L"Skip existing files", L"Stop on an existing file"};
+constexpr std::array<const wchar_t*, 3> kSfxModeNames{
+    L"Interactive", L"Silent (progress and errors only)", L"No window"};
+constexpr std::array<const wchar_t*, 3> kSfxThemeNames{
+    L"Follow the system", L"Always light", L"Always dark"};
+constexpr std::array<const wchar_t*, 3> kSfxElevationNames{
+    L"Never elevate", L"Elevate when the destination needs it", L"Always elevate"};
 constexpr std::array<const wchar_t*, 11> kSettingsTabNames{
     L"General", L"Compression", L"Paths", L"File list", L"Viewer",
     L"Security", L"Integration", L"Updates", L"Shortcuts", L"Toolbar", L"Advanced"};
@@ -279,6 +315,12 @@ int value_index(const std::array<std::size_t, Size>& values, std::size_t value) 
 
 std::wstring widen_ascii(std::string_view value) {
     return std::wstring(value.begin(), value.end());
+}
+
+// The SFX configuration is UTF-8 on disk while dialog text is UTF-16. Going
+// through path's u8string conversion keeps every valid Unicode string intact.
+std::string narrow_utf8(const std::wstring& value) {
+    return axiom::core::path_to_utf8(std::filesystem::path(value));
 }
 
 class CompressionGraphGdiplusSession {
@@ -3528,18 +3570,55 @@ private:
             L"Axiom verifies this after compression. A recovery record repairs bounded damage "
             L"inside an archive; .rev volumes reconstruct missing or corrupt parts.", true);
 
-        sign_archive_ = page_checkbox(4, kSignArchive,
+        // Signing is an authenticity control, so it lives with the other
+        // security settings rather than sharing a tab with SFX output.
+        sign_archive_ = page_checkbox(2, kSignArchive,
                                       L"Sign the completed archive");
-        signing_key_label_ = page_label(4, L"Signing key file path");
-        signing_key_edit_ = page_edit(4, kSigningKey);
-        browse_signing_key_ = page_control(4, L"BUTTON", L"Browse...",
+        signing_key_label_ = page_label(2, L"Signing key file path");
+        signing_key_edit_ = page_edit(2, kSigningKey);
+        browse_signing_key_ = page_control(2, L"BUTTON", L"Browse...",
                                            WS_TABSTOP | BS_OWNERDRAW, kBrowseSigningKey);
+
         create_sfx_ = page_checkbox(4, kCreateSfx,
                                     L"Create one self-extracting Windows executable");
+        sfx_stub_tier_label_ = page_label(4, L"Extractor type");
+        sfx_stub_tier_combo_ = page_combo(4, kSfxStubTier, kSfxStubTierNames);
+        sfx_title_label_ = page_label(4, L"Window title (text)");
+        sfx_title_edit_ = page_edit(4, kSfxTitle);
+        sfx_default_path_label_ = page_label(4, L"Default destination (path)");
+        sfx_default_path_combo_ = page_combo(
+            4, kSfxDefaultPath, kSfxDefaultPathNames, true);
+        sfx_description_label_ = page_label(4, L"Description (text)");
+        sfx_description_edit_ = page_edit(4, kSfxDescription);
+        sfx_overwrite_label_ = page_label(4, L"Existing files");
+        sfx_overwrite_combo_ = page_combo(4, kSfxOverwrite, kSfxOverwriteNames);
+        sfx_mode_label_ = page_label(4, L"Interface");
+        sfx_mode_combo_ = page_combo(4, kSfxMode, kSfxModeNames);
+        sfx_elevation_label_ = page_label(4, L"Elevation");
+        sfx_elevation_combo_ = page_combo(4, kSfxElevation, kSfxElevationNames);
+        sfx_run_program_label_ = page_label(4, L"Run after extracting (path)");
+        sfx_run_program_edit_ = page_edit(4, kSfxRunProgram);
+        sfx_run_arguments_label_ = page_label(4, L"Run arguments (text)");
+        sfx_run_arguments_edit_ = page_edit(4, kSfxRunArguments);
+        sfx_theme_label_ = page_label(4, L"Appearance");
+        sfx_theme_combo_ = page_combo(4, kSfxTheme, kSfxThemeNames);
+        sfx_license_label_ = page_label(4, L"License text");
+        sfx_license_edit_ = page_edit(
+            4, kSfxLicenseText,
+            ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN | WS_VSCROLL);
+        sfx_allow_path_change_ = page_checkbox(
+            4, kSfxAllowPathChange, L"Let the user change the destination");
+        sfx_require_accept_ = page_checkbox(
+            4, kSfxRequireAccept, L"Require the license to be accepted");
+        sfx_open_destination_ = page_checkbox(
+            4, kSfxOpenDestination, L"Open the destination when finished");
         sfx_info_ = page_label(
             4,
-            L"When SFX is enabled, the Output field becomes an .exe path. The completed archive "
-            L"is merged into that executable and no separate archive is retained.", true);
+            L"The Output file path becomes the .exe, and no separate archive is kept. "
+            L"These settings are stored inside it. Leave the destination empty to extract "
+            L"beside the executable, or use %ProgramFiles%, %LOCALAPPDATA%, %APPDATA%, "
+            L"%USERPROFILE%, %DESKTOP%, %DOCUMENTS%, %TEMP%, %SFXDIR%, or %SFXNAME%.",
+            true);
 
         SendMessageW(path_edit_, EM_SETLIMITTEXT, 32767, 0);
         SendMessageW(comment_edit_, EM_SETLIMITTEXT, 65535, 0);
@@ -3593,6 +3672,46 @@ private:
                            L"Choose an existing Axiom signing-key file.");
         add_dialog_tooltip(tooltip_, create_sfx_,
                            L"Build one Windows .exe containing the selected archive format and extraction stub.");
+        SendMessageW(sfx_title_edit_, EM_SETLIMITTEXT, 1024, 0);
+        SendMessageW(sfx_description_edit_, EM_SETLIMITTEXT, 4096, 0);
+        SendMessageW(sfx_default_path_combo_, CB_LIMITTEXT, 32767, 0);
+        SendMessageW(sfx_run_program_edit_, EM_SETLIMITTEXT, 32767, 0);
+        SendMessageW(sfx_run_arguments_edit_, EM_SETLIMITTEXT, 32767, 0);
+        SendMessageW(sfx_license_edit_, EM_SETLIMITTEXT, 65535, 0);
+        add_dialog_tooltip(
+            tooltip_, sfx_stub_tier_combo_,
+            L"Full window shows dialogs when the extractor runs. Console only uses the smaller decode-only runtime and never prompts; window-only settings are disabled for that tier.");
+        add_dialog_tooltip(tooltip_, sfx_title_edit_,
+                           L"Unicode text shown as the extractor's window title. Leave empty to use the Axiom default.");
+        add_dialog_tooltip(tooltip_, sfx_description_edit_,
+                           L"Unicode text shown to the user under the heading when the extractor runs. Replaces the archive comment there.");
+        add_dialog_tooltip(tooltip_, sfx_theme_combo_,
+                           L"Appearance of the extractor. Follow the system tracks the Windows light or dark setting; the other two pin it.");
+        add_dialog_tooltip(
+            tooltip_, sfx_default_path_combo_,
+            L"Editable destination template. Choose a common location or type an absolute path. Accepts %ProgramFiles%, %ProgramFiles(x86)%, %LOCALAPPDATA%, %APPDATA%, %USERPROFILE%, %DESKTOP%, %DOCUMENTS%, %TEMP%, %SFXDIR%, and %SFXNAME%. Leave empty to extract beside the executable.");
+        add_dialog_tooltip(tooltip_, sfx_overwrite_combo_,
+                           L"What the extractor does when a target file already exists.");
+        add_dialog_tooltip(
+            tooltip_, sfx_mode_combo_,
+            L"Interactive shows the extraction dialog. Silent shows progress and errors only. No window runs without any interface, and then a destination and any password must come from the command line.");
+        add_dialog_tooltip(
+            tooltip_, sfx_elevation_combo_,
+            L"When the extractor requests administrator rights. Elevate when needed tests whether the destination is actually writable before asking.");
+        add_dialog_tooltip(
+            tooltip_, sfx_run_program_edit_,
+            L"Archive-relative path to a program to run after extracting, such as setup\\install.exe. It must be a file the extraction produced; absolute paths are rejected. Leave empty to run nothing.");
+        add_dialog_tooltip(tooltip_, sfx_run_arguments_edit_,
+                           L"Command-line text passed to the program above. Requires a program.");
+        add_dialog_tooltip(
+            tooltip_, sfx_license_edit_,
+            L"Unicode text shown before extraction when acceptance is required. Leave empty for no license step.");
+        add_dialog_tooltip(tooltip_, sfx_allow_path_change_,
+                           L"When cleared, the extractor shows the destination but does not let the user edit it.");
+        add_dialog_tooltip(tooltip_, sfx_require_accept_,
+                           L"Show the license and require the user to accept before extracting. Needs license text.");
+        add_dialog_tooltip(tooltip_, sfx_open_destination_,
+                           L"Open the destination folder in Explorer once extraction finishes.");
         accept_ = control(L"BUTTON", L"OK", WS_TABSTOP | BS_DEFPUSHBUTTON | BS_OWNERDRAW, kAccept);
         cancel_ = control(L"BUTTON", L"Cancel", WS_TABSTOP | BS_OWNERDRAW, kCancel);
         load_create_values();
@@ -5049,6 +5168,21 @@ private:
                 MoveWindow(show_password_, content_left + label_width, y,
                            content_width - label_width, row, TRUE);
                 y += row + scale(20);
+                MoveWindow(sign_archive_, content_left, y, content_width, row, TRUE);
+                y += row + scale(12);
+                MoveWindow(signing_key_label_, content_left, y + scale(6),
+                           label_width, row, TRUE);
+                MoveWindow(signing_key_edit_, content_left + label_width, y,
+                           std::max(scale(120), std::min(scale(340),
+                                    content_width - label_width - browse_width - gap)),
+                           row, TRUE);
+                MoveWindow(browse_signing_key_,
+                           content_left + label_width +
+                               std::max(scale(120), std::min(scale(340),
+                                        content_width - label_width - browse_width - gap)) +
+                               gap,
+                           y, browse_width, row, TRUE);
+                y += row + scale(18);
                 move_wrapped(security_info_, content_left, y, content_width, 46);
                 break;
             case 3:
@@ -5068,20 +5202,93 @@ private:
                 y += row + scale(28);
                 move_wrapped(recovery_info_, content_left, y, content_width, 52);
                 break;
-            case 4:
-                MoveWindow(sign_archive_, content_left, y, content_width, row, TRUE);
-                y += row + scale(15);
-                MoveWindow(signing_key_label_, content_left, y + scale(6), label_width, row, TRUE);
-                MoveWindow(signing_key_edit_, content_left + label_width, y,
-                           std::max(scale(120), content_width - label_width - browse_width - gap),
-                           row, TRUE);
-                MoveWindow(browse_signing_key_, content_right - browse_width, y,
-                           browse_width, row, TRUE);
-                y += row + scale(28);
+            case 4: {
                 MoveWindow(create_sfx_, content_left, y, content_width, row, TRUE);
-                y += row + scale(26);
-                move_wrapped(sfx_info_, content_left, y, content_width, 52);
+                y += row + scale(16);
+
+                // Two columns: this page carries twice as many settings as the
+                // others, and a single column overran the buttons while leaving
+                // the right half of a 1180-wide dialog empty.
+                const int column_gap = scale(28);
+                const bool two_columns =
+                    content_width >= label_width * 2 + scale(240) * 2 + column_gap;
+                const int column_width = two_columns
+                    ? (content_width - column_gap) / 2
+                    : content_width;
+                const int value_width =
+                    std::max(scale(150), column_width - label_width);
+                const int right_left = content_left + column_width + column_gap;
+                const int form_top = y;
+
+                auto cell = [&](HWND label_window, HWND value, int left, int top,
+                                bool combo) {
+                    MoveWindow(label_window, left, top + scale(6), label_width, row,
+                               TRUE);
+                    MoveWindow(value, left + label_width, top, value_width,
+                               combo ? scale(240) : row, TRUE);
+                };
+
+                const int pitch = row + scale(12);
+                int left_y = form_top;
+                cell(sfx_stub_tier_label_, sfx_stub_tier_combo_, content_left,
+                     left_y, true);
+                left_y += pitch;
+                cell(sfx_title_label_, sfx_title_edit_, content_left, left_y, false);
+                left_y += pitch;
+                cell(sfx_description_label_, sfx_description_edit_, content_left,
+                     left_y, false);
+                left_y += pitch;
+                cell(sfx_default_path_label_, sfx_default_path_combo_, content_left,
+                     left_y, true);
+                left_y += pitch;
+                cell(sfx_overwrite_label_, sfx_overwrite_combo_, content_left,
+                     left_y, true);
+                left_y += pitch;
+
+                int right_y = two_columns ? form_top : left_y;
+                const int right_x = two_columns ? right_left : content_left;
+                cell(sfx_mode_label_, sfx_mode_combo_, right_x, right_y, true);
+                right_y += pitch;
+                cell(sfx_elevation_label_, sfx_elevation_combo_, right_x, right_y,
+                     true);
+                right_y += pitch;
+                cell(sfx_run_program_label_, sfx_run_program_edit_, right_x, right_y,
+                     false);
+                right_y += pitch;
+                cell(sfx_run_arguments_label_, sfx_run_arguments_edit_, right_x,
+                     right_y, false);
+                right_y += pitch;
+                cell(sfx_theme_label_, sfx_theme_combo_, right_x, right_y, true);
+                right_y += pitch;
+
+                y = std::max(left_y, right_y) + scale(4);
+
+                // Everything below is anchored up from the bottom of the page so
+                // the info text can never reach the OK and Cancel buttons.
+                const int info_height = scale(46);
+                const int checkbox_block = row * 2 + scale(8);
+                const int info_y = page_bottom - info_height;
+                const int checkbox_y = info_y - checkbox_block - scale(12);
+                const int license_height =
+                    std::max(scale(56), checkbox_y - y - scale(12));
+                MoveWindow(sfx_license_label_, content_left, y + scale(6),
+                           label_width, row, TRUE);
+                MoveWindow(sfx_license_edit_, content_left + label_width, y,
+                           std::max(scale(240), content_width - label_width),
+                           license_height, TRUE);
+
+                const int checkbox_width = std::max(scale(240),
+                                                    (content_width - gap) / 2);
+                MoveWindow(sfx_allow_path_change_, content_left, checkbox_y,
+                           checkbox_width, row, TRUE);
+                MoveWindow(sfx_require_accept_, content_left + checkbox_width + gap,
+                           checkbox_y, checkbox_width, row, TRUE);
+                MoveWindow(sfx_open_destination_, content_left,
+                           checkbox_y + row + scale(8), checkbox_width, row, TRUE);
+                y = info_y;  // move_wrapped advances its y argument
+                move_wrapped(sfx_info_, content_left, y, content_width, 46);
                 break;
+            }
         }
         SendMessageW(window_, WM_SETREDRAW, TRUE, 0);
         RedrawWindow(window_, nullptr, nullptr,
@@ -5438,6 +5645,31 @@ private:
                      static_cast<WPARAM>(create_options.features.update_mode), 0);
         SendMessageW(volume_unit_combo_, CB_SETCURSEL,
                      static_cast<WPARAM>(std::clamp(create_options.features.volume_unit, 0, 3)), 0);
+        SendMessageW(sfx_stub_tier_combo_, CB_SETCURSEL,
+                     static_cast<WPARAM>(std::clamp(
+                         create_options.features.sfx_stub_tier, 0, 1)), 0);
+        SendMessageW(sfx_overwrite_combo_, CB_SETCURSEL,
+                     static_cast<WPARAM>(std::clamp(
+                         create_options.features.sfx_overwrite, 0, 2)), 0);
+        SendMessageW(sfx_mode_combo_, CB_SETCURSEL,
+                     static_cast<WPARAM>(std::clamp(
+                         create_options.features.sfx_mode, 0, 2)), 0);
+        SendMessageW(sfx_elevation_combo_, CB_SETCURSEL,
+                     static_cast<WPARAM>(std::clamp(
+                         create_options.features.sfx_elevation, 0, 2)), 0);
+        SendMessageW(sfx_theme_combo_, CB_SETCURSEL,
+                     static_cast<WPARAM>(std::clamp(
+                         create_options.features.sfx_theme, 0, 2)), 0);
+        set_window_text(sfx_title_edit_, create_options.features.sfx_title);
+        set_window_text(sfx_description_edit_,
+                        create_options.features.sfx_description);
+        set_window_text(sfx_default_path_combo_,
+                        create_options.features.sfx_default_path);
+        set_window_text(sfx_run_program_edit_,
+                        create_options.features.sfx_run_program);
+        set_window_text(sfx_run_arguments_edit_,
+                        create_options.features.sfx_run_arguments);
+        set_window_text(sfx_license_edit_, create_options.features.sfx_license_text);
         set_window_text(summary_, std::to_wstring(input_count) +
                         (input_count == 1 ? L" item selected" : L" items selected"));
 
@@ -5672,6 +5904,23 @@ private:
         }
     }
 
+    int combo_selection(HWND combo, int lowest, int highest) const {
+        const LRESULT selection = SendMessageW(combo, CB_GETCURSEL, 0, 0);
+        if (selection == CB_ERR) return lowest;
+        return std::clamp(static_cast<int>(selection), lowest, highest);
+    }
+
+    // Runs the same checks the extractor applies to an embedded configuration,
+    // so an impossible combination is reported here rather than shipping in an
+    // executable that refuses to start.
+    bool sfx_options_valid(std::string& error) const {
+        const auto config = sfx_config_from_features(create_options.features);
+        if (!axiom::sfx::sfx_validate_path_template(config.default_path, error)) {
+            return false;
+        }
+        return axiom::sfx::sfx_validate_config(config, error);
+    }
+
     void update_create_dependencies() {
         const auto available = selected_format_availability();
         const bool updating = create_options.features.update_mode != ArchiveUpdateMode::create_new;
@@ -5785,6 +6034,43 @@ private:
         EnableWindow(signing_key_edit_, key_enabled);
         EnableWindow(browse_signing_key_, key_enabled);
         EnableWindow(create_sfx_, available.sfx);
+        // The whole SFX options page only means anything for an SFX build.
+        const bool sfx_options_enabled =
+            available.sfx && create_options.features.create_sfx;
+        const bool mini_stub =
+            sfx_options_enabled && combo_selection(sfx_stub_tier_combo_, 0, 1) == 1;
+        // Mini has no dialog stack. Keep extraction and command-line behavior
+        // configurable, but make dialog-only settings visibly unavailable.
+        if (mini_stub) {
+            SendMessageW(sfx_mode_combo_, CB_SETCURSEL, 2, 0);
+        }
+        for (HWND control : {sfx_stub_tier_label_, sfx_stub_tier_combo_,
+                             sfx_default_path_label_, sfx_default_path_combo_,
+                             sfx_overwrite_label_, sfx_overwrite_combo_,
+                             sfx_elevation_label_, sfx_elevation_combo_,
+                             sfx_license_label_, sfx_license_edit_}) {
+            EnableWindow(control, sfx_options_enabled);
+        }
+        const bool dialog_options_enabled = sfx_options_enabled && !mini_stub;
+        for (HWND control : {sfx_title_label_, sfx_title_edit_,
+                             sfx_description_label_, sfx_description_edit_,
+                             sfx_theme_label_, sfx_theme_combo_,
+                             sfx_mode_label_, sfx_mode_combo_}) {
+            EnableWindow(control, dialog_options_enabled);
+        }
+        EnableWindow(sfx_allow_path_change_, dialog_options_enabled);
+        EnableWindow(sfx_open_destination_, dialog_options_enabled);
+        // Arguments need a program, and acceptance needs something to accept.
+        const bool run_configured =
+            sfx_options_enabled &&
+            !trim_dialog_input(window_text(sfx_run_program_edit_)).empty();
+        EnableWindow(sfx_run_program_label_, sfx_options_enabled);
+        EnableWindow(sfx_run_program_edit_, sfx_options_enabled);
+        EnableWindow(sfx_run_arguments_label_, run_configured);
+        EnableWindow(sfx_run_arguments_edit_, run_configured);
+        EnableWindow(sfx_require_accept_,
+                     sfx_options_enabled &&
+                         !trim_dialog_input(window_text(sfx_license_edit_)).empty());
         InvalidateRect(window_, nullptr, TRUE);
     }
 
@@ -6767,7 +7053,7 @@ private:
             trim_dialog_input(window_text(signing_key_edit_));
         if (create_options.features.sign_archive &&
             create_options.features.signing_key.empty()) {
-            select_create_page(4);
+            select_create_page(2);
             show_message_dialog(window_, instance_, dpi_, palette_.dark,
                                 L"Archive signing", L"Choose an Axiom signing key.",
                                 MessageDialogIcon::warning);
@@ -6775,7 +7061,7 @@ private:
         }
         if (create_options.features.sign_archive &&
             !valid_signing_secret_key(create_options.features.signing_key)) {
-            select_create_page(4);
+            select_create_page(2);
             show_message_dialog(window_, instance_, dpi_, palette_.dark,
                                 L"Archive signing",
                                 L"Signing key must be an existing 64-byte Axiom secret key. Public keys and unrelated files cannot sign archives.",
@@ -6784,6 +7070,43 @@ private:
             return;
         }
         if (create_options.features.create_sfx) {
+            create_options.features.sfx_stub_tier =
+                combo_selection(sfx_stub_tier_combo_, 0, 1);
+            create_options.features.sfx_overwrite =
+                combo_selection(sfx_overwrite_combo_, 0, 2);
+            create_options.features.sfx_mode = combo_selection(sfx_mode_combo_, 0, 2);
+            create_options.features.sfx_elevation =
+                combo_selection(sfx_elevation_combo_, 0, 2);
+            create_options.features.sfx_theme =
+                combo_selection(sfx_theme_combo_, 0, 2);
+            create_options.features.sfx_title =
+                trim_dialog_input(window_text(sfx_title_edit_));
+            create_options.features.sfx_description =
+                trim_dialog_input(window_text(sfx_description_edit_));
+            create_options.features.sfx_default_path =
+                trim_dialog_input(window_text(sfx_default_path_combo_));
+            create_options.features.sfx_run_program =
+                trim_dialog_input(window_text(sfx_run_program_edit_));
+            create_options.features.sfx_run_arguments =
+                trim_dialog_input(window_text(sfx_run_arguments_edit_));
+            create_options.features.sfx_license_text = window_text(sfx_license_edit_);
+            if (create_options.features.sfx_license_text.empty()) {
+                create_options.features.sfx_require_accept = false;
+            }
+            if (create_options.features.sfx_run_program.empty()) {
+                create_options.features.sfx_run_arguments.clear();
+            }
+            // The stub validates the same rules; catching them here points at
+            // the offending control instead of failing on the user's machine.
+            std::string sfx_error;
+            if (!sfx_options_valid(sfx_error)) {
+                select_create_page(4);
+                show_message_dialog(window_, instance_, dpi_, palette_.dark,
+                                    L"SFX options",
+                                    widen_ascii(sfx_error),
+                                    MessageDialogIcon::warning);
+                return;
+            }
             displayed_output.replace_extension(L".exe");
             create_options.features.sfx_destination = displayed_output.wstring();
             create_options.archive_path = displayed_output;
@@ -6875,6 +7198,12 @@ private:
             case kRecoveryVolumes: return create_options.features.create_recovery_volumes;
             case kSignArchive: return create_options.features.sign_archive;
             case kCreateSfx: return create_options.features.create_sfx;
+            case kSfxAllowPathChange:
+                return create_options.features.sfx_allow_path_change;
+            case kSfxRequireAccept:
+                return create_options.features.sfx_require_accept;
+            case kSfxOpenDestination:
+                return create_options.features.sfx_open_destination;
             default: return false;
         }
     }
@@ -7037,6 +7366,18 @@ private:
             case kSignArchive:
                 create_options.features.sign_archive = !create_options.features.sign_archive;
                 break;
+            case kSfxAllowPathChange:
+                create_options.features.sfx_allow_path_change =
+                    !create_options.features.sfx_allow_path_change;
+                break;
+            case kSfxRequireAccept:
+                create_options.features.sfx_require_accept =
+                    !create_options.features.sfx_require_accept;
+                break;
+            case kSfxOpenDestination:
+                create_options.features.sfx_open_destination =
+                    !create_options.features.sfx_open_destination;
+                break;
             case kCreateSfx:
                 create_options.features.create_sfx = !create_options.features.create_sfx;
                 if (create_options.features.create_sfx) {
@@ -7100,6 +7441,9 @@ private:
             case kRecoveryVolumes:
             case kSignArchive:
             case kCreateSfx:
+            case kSfxAllowPathChange:
+            case kSfxRequireAccept:
+            case kSfxOpenDestination:
                 return true;
             default:
                 return false;
@@ -7412,6 +7756,21 @@ private:
                     }
                     return 0;
                 }
+                // Two SFX controls gate on the contents of an edit box: the
+                // acceptance checkbox needs license text, and run arguments
+                // need a program. Without this they never re-evaluate as the
+                // user types, so the dependent control stays disabled.
+                if (mode_ == DialogMode::create_archive &&
+                    (id == kSfxLicenseText || id == kSfxRunProgram) &&
+                    HIWORD(wparam) == EN_CHANGE) {
+                    update_create_dependencies();
+                    return 0;
+                }
+                if (mode_ == DialogMode::create_archive &&
+                    id == kSfxStubTier && HIWORD(wparam) == CBN_SELCHANGE) {
+                    update_create_dependencies();
+                    return 0;
+                }
                 if (mode_ == DialogMode::create_archive &&
                     id == kVolumeUnit && HIWORD(wparam) == CBN_SELCHANGE) {
                     update_create_dependencies();
@@ -7510,6 +7869,15 @@ private:
                         toggle(kRecoveryVolumes, recovery_volumes_); return 0;
                     case kSignArchive: toggle(kSignArchive, sign_archive_); return 0;
                     case kCreateSfx: toggle(kCreateSfx, create_sfx_); return 0;
+                    case kSfxAllowPathChange:
+                        toggle(kSfxAllowPathChange, sfx_allow_path_change_);
+                        return 0;
+                    case kSfxRequireAccept:
+                        toggle(kSfxRequireAccept, sfx_require_accept_);
+                        return 0;
+                    case kSfxOpenDestination:
+                        toggle(kSfxOpenDestination, sfx_open_destination_);
+                        return 0;
                 }
                 break;
             }
@@ -7624,6 +7992,31 @@ private:
     HWND browse_signing_key_ = nullptr;
     HWND create_sfx_ = nullptr;
     HWND sfx_info_ = nullptr;
+    HWND sfx_stub_tier_label_ = nullptr;
+    HWND sfx_stub_tier_combo_ = nullptr;
+    HWND sfx_title_label_ = nullptr;
+    HWND sfx_title_edit_ = nullptr;
+    HWND sfx_default_path_label_ = nullptr;
+    HWND sfx_default_path_combo_ = nullptr;
+    HWND sfx_overwrite_label_ = nullptr;
+    HWND sfx_overwrite_combo_ = nullptr;
+    HWND sfx_mode_label_ = nullptr;
+    HWND sfx_mode_combo_ = nullptr;
+    HWND sfx_elevation_label_ = nullptr;
+    HWND sfx_elevation_combo_ = nullptr;
+    HWND sfx_run_program_label_ = nullptr;
+    HWND sfx_run_program_edit_ = nullptr;
+    HWND sfx_run_arguments_label_ = nullptr;
+    HWND sfx_run_arguments_edit_ = nullptr;
+    HWND sfx_license_label_ = nullptr;
+    HWND sfx_license_edit_ = nullptr;
+    HWND sfx_allow_path_change_ = nullptr;
+    HWND sfx_require_accept_ = nullptr;
+    HWND sfx_open_destination_ = nullptr;
+    HWND sfx_description_label_ = nullptr;
+    HWND sfx_description_edit_ = nullptr;
+    HWND sfx_theme_label_ = nullptr;
+    HWND sfx_theme_combo_ = nullptr;
     HWND overwrite_ = nullptr;
     HWND restore_time_ = nullptr;
     HWND confirm_delete_ = nullptr;
@@ -7679,6 +8072,48 @@ bool show_extract_archive_dialog(HWND owner,
     if (!dialog.show(owner)) return false;
     options = std::move(dialog.extract_options);
     return true;
+}
+
+axiom::sfx::SfxConfig sfx_config_from_features(const ArchiveFeatureOptions& features) {
+    axiom::sfx::SfxConfig config;
+    config.title = narrow_utf8(features.sfx_title);
+    config.description = narrow_utf8(features.sfx_description);
+    config.default_path = narrow_utf8(features.sfx_default_path);
+    config.license_text = narrow_utf8(features.sfx_license_text);
+    config.run_program = narrow_utf8(features.sfx_run_program);
+    config.run_arguments = narrow_utf8(features.sfx_run_arguments);
+    config.allow_path_change = features.sfx_allow_path_change;
+    config.require_accept =
+        features.sfx_require_accept && !config.license_text.empty();
+    config.open_destination = features.sfx_open_destination;
+    switch (std::clamp(features.sfx_overwrite, 0, 2)) {
+        case 1: config.overwrite = ExtractOptions::Overwrite::skip; break;
+        case 2: config.overwrite = ExtractOptions::Overwrite::fail; break;
+        default: config.overwrite = ExtractOptions::Overwrite::overwrite; break;
+    }
+    switch (std::clamp(features.sfx_mode, 0, 2)) {
+        case 1: config.mode = axiom::sfx::SfxMode::silent; break;
+        case 2: config.mode = axiom::sfx::SfxMode::very_silent; break;
+        default: config.mode = axiom::sfx::SfxMode::interactive; break;
+    }
+    switch (std::clamp(features.sfx_theme, 0, 2)) {
+        case 1: config.theme = axiom::sfx::SfxTheme::light; break;
+        case 2: config.theme = axiom::sfx::SfxTheme::dark; break;
+        default: config.theme = axiom::sfx::SfxTheme::automatic; break;
+    }
+    switch (std::clamp(features.sfx_elevation, 0, 2)) {
+        case 1: config.elevation = axiom::sfx::SfxElevation::automatic; break;
+        case 2: config.elevation = axiom::sfx::SfxElevation::require; break;
+        default: config.elevation = axiom::sfx::SfxElevation::none; break;
+    }
+    if (config.run_program.empty()) config.run_arguments.clear();
+    return config;
+}
+
+axiom::sfx::SfxStubTier sfx_stub_tier_from_features(
+    const ArchiveFeatureOptions& features) {
+    return features.sfx_stub_tier == 1 ? axiom::sfx::SfxStubTier::mini
+                                       : axiom::sfx::SfxStubTier::full;
 }
 
 bool show_application_settings_dialog(HWND owner, ApplicationDialogOptions& options) {

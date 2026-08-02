@@ -20,6 +20,7 @@
 #include <mutex>
 #include <optional>
 #include <span>
+#include <string>
 #include <thread>
 
 namespace axiom::codec {
@@ -49,6 +50,8 @@ struct EncodedBlock {
     BlockCodec codec = BlockCodec::store;
     std::size_t original_size = 0;
     std::size_t output_offset = 0;
+    std::size_t frame_offset = 0;
+    std::size_t frame_size = 0;
     std::size_t payload_offset = 0;
     std::size_t payload_size = 0;
 };
@@ -198,6 +201,13 @@ std::size_t lz_payload_limit(std::size_t original_size) {
     return original_size + (original_size / 8) + 4096;
 }
 
+std::size_t checked_size(std::uint64_t value, const char* field_name) {
+    if (value > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) {
+        throw FormatError(std::string(field_name) + " exceeds the platform size limit");
+    }
+    return static_cast<std::size_t>(value);
+}
+
 BlockResult compress_block(std::span<const std::uint8_t> input,
                            const CompressionOptions& options,
                            core::TaskExecutor* executor) {
@@ -213,7 +223,7 @@ BlockResult compress_block(std::span<const std::uint8_t> input,
         return std::move(best);
     };
 
-    if (likely_incompressible(input)) {
+    if (!options.bypass_incompressible_heuristic && likely_incompressible(input)) {
         return finish_best();
     }
 
@@ -590,7 +600,7 @@ void write_block(ByteVector& output, const BlockResult& block) {
 std::vector<EncodedBlock> read_block_table(std::span<const std::uint8_t> encoded,
                                            std::size_t& cursor,
                                            std::size_t output_size) {
-    const auto block_count = static_cast<std::size_t>(read_varuint(encoded, cursor));
+    const auto block_count = checked_size(read_varuint(encoded, cursor), "block count");
     std::vector<EncodedBlock> blocks;
     // block_count is attacker-controlled; cap the pre-reserve. The loop below
     // validates each block against the payload, so a bogus count fails fast.
@@ -600,23 +610,28 @@ std::vector<EncodedBlock> read_block_table(std::span<const std::uint8_t> encoded
     std::size_t total_output = 0;
 
     for (std::size_t i = 0; i < block_count; ++i) {
-        const auto original_size = static_cast<std::size_t>(read_varuint(encoded, cursor));
+        const auto frame_offset = cursor;
+        const auto original_size =
+            checked_size(read_varuint(encoded, cursor), "block output size");
 
         if (cursor >= encoded.size()) {
             throw FormatError("truncated block codec id");
         }
         const auto block_codec = read_block_codec(encoded[cursor++]);
 
-        const auto payload_size = static_cast<std::size_t>(read_varuint(encoded, cursor));
+        const auto payload_size =
+            checked_size(read_varuint(encoded, cursor), "block payload size");
         if (payload_size > encoded.size() - cursor) {
             throw FormatError("block payload exceeds archive payload");
         }
-        if (original_size > output_size - total_output) {
+        if (total_output > output_size || original_size > output_size - total_output) {
             throw FormatError("block output exceeds declared archive size");
         }
 
-        blocks.push_back(EncodedBlock{block_codec, original_size, total_output, cursor, payload_size});
+        blocks.push_back(EncodedBlock{block_codec, original_size, total_output,
+                                      frame_offset, 0, cursor, payload_size});
         cursor += payload_size;
+        blocks.back().frame_size = cursor - frame_offset;
         total_output += original_size;
     }
 
@@ -627,7 +642,95 @@ std::vector<EncodedBlock> read_block_table(std::span<const std::uint8_t> encoded
     return blocks;
 }
 
+void validate_block_codec_permissions(const std::vector<EncodedBlock>& blocks,
+                                      bool allow_sequence_codec,
+                                      bool allow_context_split_codec,
+                                      bool allow_contextual_footer_codec,
+                                      bool allow_checkpoint_codec) {
+    if (!allow_sequence_codec &&
+        std::any_of(blocks.begin(), blocks.end(), [](const auto& block) {
+            return block.codec == BlockCodec::lz77_sequences;
+        })) {
+        throw FormatError("sequence block codec requires AXC version 6");
+    }
+    if (!allow_context_split_codec &&
+        std::any_of(blocks.begin(), blocks.end(), [](const auto& block) {
+            return block.codec == BlockCodec::lz77_context_split;
+        })) {
+        throw FormatError("context-split block codec requires AXC version 7");
+    }
+    if (!allow_contextual_footer_codec &&
+        std::any_of(blocks.begin(), blocks.end(), [](const auto& block) {
+            return block.codec == BlockCodec::lz77_contextual_slots ||
+                   block.codec == BlockCodec::lz77_contextual_slots_context_split;
+        })) {
+        throw FormatError("contextual footer block codec requires AXC version 8");
+    }
+    if (!allow_checkpoint_codec &&
+        std::any_of(blocks.begin(), blocks.end(), [](const auto& block) {
+            return block.codec == BlockCodec::lz77_checkpoint_context_split;
+        })) {
+        throw FormatError("parser-checkpoint block codec requires AXC version 9");
+    }
+}
+
 }  // namespace
+
+std::vector<ParallelBlockFrame> inspect_parallel_block_frames(
+    std::span<const std::uint8_t> encoded,
+    std::size_t output_size,
+    bool allow_sequence_codec,
+    bool allow_context_split_codec,
+    bool allow_contextual_footer_codec,
+    bool allow_checkpoint_codec) {
+    std::size_t cursor = 0;
+    const auto blocks = read_block_table(encoded, cursor, output_size);
+    if (cursor != encoded.size()) {
+        throw FormatError("trailing bytes after block payloads");
+    }
+    validate_block_codec_permissions(blocks, allow_sequence_codec,
+                                     allow_context_split_codec,
+                                     allow_contextual_footer_codec,
+                                     allow_checkpoint_codec);
+
+    std::vector<ParallelBlockFrame> frames;
+    frames.reserve(blocks.size());
+    for (const auto& block : blocks) {
+        frames.push_back({block.output_offset,
+                          block.original_size,
+                          block.frame_offset,
+                          block.frame_size,
+                          block.payload_offset,
+                          block.payload_size,
+                          static_cast<std::uint8_t>(block.codec)});
+    }
+    return frames;
+}
+
+void decode_parallel_block_frame(std::span<const std::uint8_t> frame,
+                                 std::span<std::uint8_t> output,
+                                 std::uint8_t expected_codec) {
+    std::size_t cursor = 0;
+    const auto original_size = checked_size(read_varuint(frame, cursor),
+                                            "block output size");
+    if (cursor >= frame.size()) {
+        throw FormatError("truncated block codec id");
+    }
+    const auto codec = read_block_codec(frame[cursor++]);
+    if (expected_codec != 0xFF &&
+        expected_codec != static_cast<std::uint8_t>(codec)) {
+        throw FormatError("subframe codec does not match its map");
+    }
+    const auto payload_size = checked_size(read_varuint(frame, cursor),
+                                           "block payload size");
+    if (payload_size > frame.size() - cursor) {
+        throw FormatError("block payload exceeds its subframe");
+    }
+    if (cursor + payload_size != frame.size() || original_size != output.size()) {
+        throw FormatError("parallel subframe size does not match its map");
+    }
+    decompress_block_into(frame.subspan(cursor, payload_size), codec, output);
+}
 
 std::size_t effective_thread_count(std::size_t requested_threads, std::size_t work_items) {
     if (work_items == 0) {
@@ -855,32 +958,10 @@ ByteVector decode_parallel_blocks(std::span<const std::uint8_t> encoded,
     if (cursor != encoded.size()) {
         throw FormatError("trailing bytes after block payloads");
     }
-    if (!allow_sequence_codec &&
-        std::any_of(blocks.begin(), blocks.end(), [](const auto& block) {
-            return block.codec == BlockCodec::lz77_sequences;
-        })) {
-        throw FormatError("sequence block codec requires AXC version 6");
-    }
-    if (!allow_context_split_codec &&
-        std::any_of(blocks.begin(), blocks.end(), [](const auto& block) {
-            return block.codec == BlockCodec::lz77_context_split;
-        })) {
-        throw FormatError("context-split block codec requires AXC version 7");
-    }
-    if (!allow_contextual_footer_codec &&
-        std::any_of(blocks.begin(), blocks.end(), [](const auto& block) {
-            return block.codec == BlockCodec::lz77_contextual_slots ||
-                   block.codec ==
-                       BlockCodec::lz77_contextual_slots_context_split;
-        })) {
-        throw FormatError("contextual footer block codec requires AXC version 8");
-    }
-    if (!allow_checkpoint_codec &&
-        std::any_of(blocks.begin(), blocks.end(), [](const auto& block) {
-            return block.codec == BlockCodec::lz77_checkpoint_context_split;
-        })) {
-        throw FormatError("parser-checkpoint block codec requires AXC version 9");
-    }
+    validate_block_codec_permissions(blocks, allow_sequence_codec,
+                                     allow_context_split_codec,
+                                     allow_contextual_footer_codec,
+                                     allow_checkpoint_codec);
 
     ByteVector output(output_size);
     std::vector<std::uint32_t> block_crcs(blocks.size());

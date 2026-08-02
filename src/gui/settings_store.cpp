@@ -306,6 +306,22 @@ PersistedGuiSettings load_gui_settings() {
         read_clamped_int(key, L"RecoveryPercent", 0, 0, 100);
     settings.application.default_recovery_volumes = read_bool(key, L"RecoveryVolumes", false);
     settings.application.default_create_sfx = read_bool(key, L"CreateSfx", false);
+    settings.application.default_sfx_stub_tier =
+        read_clamped_int(key, L"SfxStubTier", 0, 0, 1);
+    settings.application.default_sfx_overwrite =
+        read_clamped_int(key, L"SfxOverwrite", 0, 0, 2);
+    settings.application.default_sfx_mode = read_clamped_int(key, L"SfxMode", 0, 0, 2);
+    settings.application.default_sfx_elevation =
+        read_clamped_int(key, L"SfxElevation", 0, 0, 2);
+    settings.application.default_sfx_title = read_string(key, L"SfxTitle");
+    settings.application.default_sfx_default_path = read_string(key, L"SfxDefaultPath");
+    settings.application.default_sfx_run_program = read_string(key, L"SfxRunProgram");
+    settings.application.default_sfx_run_arguments =
+        read_string(key, L"SfxRunArguments");
+    settings.application.default_sfx_allow_path_change =
+        read_bool(key, L"SfxAllowPathChange", true);
+    settings.application.default_sfx_open_destination =
+        read_bool(key, L"SfxOpenDestination", true);
     settings.application.default_sign_archive = read_bool(key, L"SignArchive", false);
     settings.application.default_signing_key = read_string(key, L"SigningKey");
     settings.application.confirm_delete = read_bool(key, L"ConfirmDelete", true);
@@ -475,6 +491,29 @@ void save_gui_settings(const PersistedGuiSettings& settings) {
     write_dword(key, L"RecoveryVolumes",
                 settings.application.default_recovery_volumes ? 1 : 0);
     write_dword(key, L"CreateSfx", settings.application.default_create_sfx ? 1 : 0);
+    write_dword(key, L"SfxStubTier",
+                static_cast<DWORD>(std::clamp(
+                    settings.application.default_sfx_stub_tier, 0, 1)));
+    write_dword(key, L"SfxOverwrite",
+                static_cast<DWORD>(std::clamp(
+                    settings.application.default_sfx_overwrite, 0, 2)));
+    write_dword(key, L"SfxMode",
+                static_cast<DWORD>(std::clamp(
+                    settings.application.default_sfx_mode, 0, 2)));
+    write_dword(key, L"SfxElevation",
+                static_cast<DWORD>(std::clamp(
+                    settings.application.default_sfx_elevation, 0, 2)));
+    write_string(key, L"SfxTitle", settings.application.default_sfx_title);
+    write_string(key, L"SfxDefaultPath",
+                 settings.application.default_sfx_default_path);
+    write_string(key, L"SfxRunProgram",
+                 settings.application.default_sfx_run_program);
+    write_string(key, L"SfxRunArguments",
+                 settings.application.default_sfx_run_arguments);
+    write_dword(key, L"SfxAllowPathChange",
+                settings.application.default_sfx_allow_path_change ? 1 : 0);
+    write_dword(key, L"SfxOpenDestination",
+                settings.application.default_sfx_open_destination ? 1 : 0);
     write_dword(key, L"SignArchive", settings.application.default_sign_archive ? 1 : 0);
     write_string(key, L"SigningKey", settings.application.default_signing_key);
     write_dword(key, L"ConfirmDelete", settings.application.confirm_delete ? 1 : 0);

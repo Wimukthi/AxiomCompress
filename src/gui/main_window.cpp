@@ -1149,7 +1149,7 @@ int run_axiom_gui(HINSTANCE instance,
     }
 
     if (const auto sfx_result =
-            axiom::sfx::run_embedded(instance, initial_path)) {
+            axiom::sfx::run_embedded_if_present(instance, initial_path)) {
         OleUninitialize();
         return *sfx_result;
     }

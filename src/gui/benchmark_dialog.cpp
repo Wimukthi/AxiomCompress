@@ -1048,6 +1048,12 @@ void benchmark_worker(HWND hwnd, BenchmarkParams params,
     axiom::CompressionOptions benchmark_compression;
     axiom::apply_compression_level(benchmark_compression, params.level);
     benchmark_compression.thread_count = params.threads;
+    // The synthetic LZ corpus deliberately contains short matches mixed with
+    // random literals. Its sparse incompressible-data samples can miss those
+    // matches, so let the real candidate bake-off decide whether compression
+    // wins. Keep the shortcut enabled for random and custom corpora.
+    benchmark_compression.bypass_incompressible_heuristic =
+        !params.custom_input && params.corpus == CorpusKind::lz_synthetic;
     const SystemDetails system = collect_system_details();
     const std::size_t selected_threads = selected_thread_count(
         params.threads, system.hardware_threads);

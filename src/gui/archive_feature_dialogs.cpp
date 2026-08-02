@@ -1386,6 +1386,7 @@ std::vector<ArchiveSummaryCapabilityRow> summary_capabilities(
         {L"Create split volumes", capabilities.can_create_volumes},
         {L"Multi-volume archive", capabilities.is_multi_volume},
         {L"Signatures", capabilities.authenticity},
+        {L"Snapshot repository", capabilities.snapshots},
         {L"Self-extractor", capabilities.sfx},
         {L"Metadata", capabilities.metadata},
         {L"Links", capabilities.links},
@@ -1551,6 +1552,7 @@ void show_archive_feature_summary_dialog(
         {L"Provider mode", capabilities.create ? L"Full read/write" : L"Read-only"},
         {L"Encryption state", capabilities.encrypted ? L"Encrypted" : L"Not encrypted"},
         {L"Lock state", capabilities.locked ? L"Locked" : L"Not locked"},
+        {L"Snapshot state", capabilities.snapshot_repository ? L"Active" : L"Not active"},
     };
     data.capabilities = summary_capabilities(capabilities);
     show_archive_summary_dialog(owner, std::move(data));

@@ -83,6 +83,9 @@ add_library(axiom STATIC
     src/archive/container.cpp
     src/archive/container_formats.cpp
     src/archive/container_zip.cpp
+    src/archive/sfx_image.cpp
+    src/sfx/sfx_config.cpp
+    src/sfx/sfx_options.cpp
     src/archive/seven_zip_library.cpp
     src/archive/zip_split_backend.cpp
     src/archive/system_provider.cpp
@@ -150,7 +153,7 @@ endif()
 
 # Windows CSPRNG (BCryptGenRandom) used by core/crypto.
 if(WIN32)
-    target_link_libraries(axiom PUBLIC bcrypt ole32 oleaut32)
+    target_link_libraries(axiom PUBLIC advapi32 bcrypt ole32 oleaut32)
 endif()
 
 set(AXIOMC_SOURCES
@@ -178,10 +181,74 @@ if(WIN32)
         "${WIMUKTHI_WIN32_THEME_ROOT}"
         "${CMAKE_CURRENT_BINARY_DIR}/wimukthi-win32-theme")
 
+    # The SFX runtimes only need to inspect, verify, and extract AXAR/ZIP
+    # payloads. Keep their archive dependency separate from the full provider
+    # registry so the Mini image cannot accidentally acquire mutation code.
+    file(GLOB SFX_DECODE_ZSTD_SOURCES CONFIGURE_DEPENDS
+        src/third_party/zstd/lib/common/*.c
+        src/third_party/zstd/lib/decompress/*.c)
+    set(SFX_DECODE_LZMA_SOURCES
+        src/third_party/lzma-sdk/CpuArch.c
+        src/third_party/lzma-sdk/LzmaDec.c
+        src/third_party/lzma-sdk/Lzma2Dec.c)
+    add_library(axiom_sfx_decode STATIC
+        src/sfx/sfx_archive_reader.cpp
+        src/archive/container.cpp
+        src/archive/container_zip.cpp
+        src/archive/sfx_image.cpp
+        src/archive/zip_split_backend.cpp
+        src/codec/block.cpp
+        src/codec/external_codecs_decode.cpp
+        src/codec/fast_lz.cpp
+        src/codec/lz77.cpp
+        src/codec/lz77_split.cpp
+        src/codec/transform.cpp
+        src/core/archive.cpp
+        src/core/checksum.cpp
+        src/core/checksum_clmul.cpp
+        src/core/cpu.cpp
+        src/core/crypto.cpp
+        src/core/file_meta.cpp
+        src/core/reed_solomon.cpp
+        src/entropy/huffman.cpp
+        src/entropy/range.cpp
+        ${BLAKE3_SOURCES}
+        ${MONOCYPHER_SOURCES}
+        ${MINIZ_SOURCES}
+        ${SFX_DECODE_ZSTD_SOURCES}
+        ${SFX_DECODE_LZMA_SOURCES}
+        ${MINIZIP_NG_SOURCES})
+    target_include_directories(axiom_sfx_decode PUBLIC include PRIVATE src)
+    target_compile_features(axiom_sfx_decode PUBLIC cxx_std_20)
+    target_compile_definitions(axiom_sfx_decode PRIVATE UNICODE _UNICODE)
+    if(NOT AXIOM_X86)
+        target_compile_definitions(axiom_sfx_decode PRIVATE
+            BLAKE3_NO_SSE2 BLAKE3_NO_SSE41 BLAKE3_NO_AVX2 BLAKE3_NO_AVX512
+            BLAKE3_USE_NEON=0)
+    endif()
+    set_source_files_properties(${SFX_DECODE_ZSTD_SOURCES} PROPERTIES
+        COMPILE_DEFINITIONS "ZSTD_DISABLE_ASM")
+    set_source_files_properties(${SFX_DECODE_LZMA_SOURCES} PROPERTIES
+        COMPILE_DEFINITIONS "Z7_ST")
+    set_source_files_properties(${MINIZIP_NG_SOURCES} PROPERTIES
+        COMPILE_DEFINITIONS "MZ_ZIP_NO_CRYPTO;_CRT_SECURE_NO_DEPRECATE;_CRT_NONSTDC_NO_DEPRECATE")
+    if(MSVC)
+        target_compile_options(axiom_sfx_decode PRIVATE /W4 /permissive-)
+        set_source_files_properties(${SFX_DECODE_ZSTD_SOURCES} ${SFX_DECODE_LZMA_SOURCES}
+            ${BLAKE3_SOURCES} ${MONOCYPHER_SOURCES} ${MINIZ_SOURCES} ${MINIZIP_NG_SOURCES}
+            PROPERTIES COMPILE_OPTIONS /w)
+    endif()
+    target_link_libraries(axiom_sfx_decode PUBLIC Bcrypt Ole32 OleAut32)
+
     add_executable(axiom_sfx_module WIN32
         src/sfx/main.cpp
         src/sfx/runtime.cpp
+        src/sfx/sfx_config.cpp
+        src/sfx/sfx_options.cpp
+        src/sfx/sfx_host.cpp
+        src/sfx/sfx_dialog_ui.cpp
         src/gui/sfx_dialog.cpp
+        src/gui/license_dialog.cpp
         src/gui/archive_feature_dialogs.cpp
         src/gui/operation_progress_window.cpp
         src/gui/dialog_support.cpp
@@ -189,7 +256,7 @@ if(WIN32)
         src/gui/toolbar_icons.cpp
         src/sfx/sfx_stub.rc)
     target_link_libraries(axiom_sfx_module PRIVATE
-        axiom Wimukthi::Win32Theme Bcrypt Comctl32 Dwmapi Gdiplus
+        axiom axiom_sfx_decode Wimukthi::Win32Theme Bcrypt Comctl32 Dwmapi Gdiplus
         Msimg32 Ole32 Shell32 Shlwapi Version)
     target_include_directories(axiom_sfx_module PRIVATE src)
     target_compile_definitions(axiom_sfx_module PRIVATE UNICODE _UNICODE)
@@ -197,7 +264,28 @@ if(WIN32)
         OUTPUT_NAME "AxiomSfx"
         SUFFIX ".bin")
 
+    # Console-only extractor runtime: the same code path without the dialog
+    # stack, which is where its much smaller size comes from.
+    add_executable(axiom_sfx_mini_module
+        src/sfx/mini_main.cpp
+        src/sfx/runtime.cpp
+        src/sfx/sfx_config.cpp
+        src/sfx/sfx_options.cpp
+        src/sfx/sfx_host.cpp
+        src/sfx/sfx_console_ui.cpp
+        src/sfx/sfx_mini_stub.rc)
+    target_link_libraries(axiom_sfx_mini_module PRIVATE
+        axiom_sfx_decode Bcrypt Ole32 Shell32 Shlwapi)
+    target_include_directories(axiom_sfx_mini_module PRIVATE src)
+    target_compile_definitions(axiom_sfx_mini_module PRIVATE UNICODE _UNICODE)
+    set_target_properties(axiom_sfx_mini_module PROPERTIES
+        OUTPUT_NAME "AxiomSfxMini"
+        SUFFIX ".bin")
+
     add_executable(axiom_gui WIN32
+        src/sfx/sfx_host.cpp
+        src/sfx/sfx_dialog_ui.cpp
+        src/gui/license_dialog.cpp
         src/gui/main.cpp
         src/gui/main_window.cpp
         src/gui/main_window_address.cpp
@@ -229,7 +317,7 @@ if(WIN32)
         src/sfx/runtime.cpp
         src/sfx/module_file.cpp
         src/gui/axiom_gui.rc)
-    target_link_libraries(axiom_gui PRIVATE axiom Wimukthi::Win32Theme Bcrypt Comctl32 Dwmapi Gdiplus Msimg32 Ole32 Shell32 Shlwapi Version Winhttp)
+    target_link_libraries(axiom_gui PRIVATE axiom axiom_sfx_decode Wimukthi::Win32Theme Bcrypt Comctl32 Dwmapi Gdiplus Msimg32 Ole32 Shell32 Shlwapi Version Winhttp)
     target_include_directories(axiom_gui PRIVATE src)
     target_compile_definitions(axiom_gui PRIVATE UNICODE _UNICODE)
     set_target_properties(axiom_gui PROPERTIES OUTPUT_NAME "Axiom")

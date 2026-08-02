@@ -1712,27 +1712,46 @@ axiom::gui::ArchiveCapabilities MainWindow::active_archive_capabilities() const 
     return {};
 }
 
+bool MainWindow::active_archive_catalog_ready() const {
+    const auto archive = active_archive_path();
+    return archive && archive_catalog_ &&
+        same_filesystem_path(archive_catalog_->path(), *archive);
+}
+
 void MainWindow::queue_selected_archive_capability_probe(const fs::path& archive) const {
     if (selected_archive_capability_probe_running_ || archive.empty() || hwnd_ == nullptr) {
         return;
     }
     selected_archive_capability_probe_running_ = true;
     selected_archive_capability_probe_path_ = archive;
+    std::string password;
+    if (application_options_.cache_passwords &&
+        application_options_.password_prompt_mode == 0 &&
+        !archive_password_path_.empty() &&
+        same_filesystem_path(archive_password_path_, archive)) {
+        password = archive_password_;
+    }
     const HWND target = hwnd_;
     selected_archive_capability_thread_ = std::jthread(
-        [target, archive](std::stop_token stop) {
+        [target, archive, password = std::move(password)](std::stop_token stop) mutable {
             auto result = std::make_unique<SelectedArchiveCapabilitiesResult>();
             result->archive = archive;
             if (!stop.stop_requested()) {
                 try {
                     if (const auto* provider = axiom::archive_provider_for_path(archive)) {
                         result->provider = provider;
-                        result->capabilities = provider->capabilities(archive);
+                        result->capabilities = provider->capabilities(archive, password);
+                        if (!stop.stop_requested()) {
+                            result->catalog = axiom::gui::ArchiveCatalog::load(archive, password);
+                        }
                     }
                 } catch (...) {
-                    result->capabilities = {};
+                    // Encrypted or damaged archives can still have a known
+                    // provider. Keep that result; edit commands require a
+                    // successfully loaded catalog below.
                 }
             }
+            secure_clear(password);
             if (stop.stop_requested()) return;
             auto* payload = result.release();
             if (!PostMessageW(target, kSelectedArchiveCapabilitiesMessage, 0,
@@ -1757,6 +1776,7 @@ void MainWindow::on_selected_archive_capabilities(LPARAM lparam) {
         selected_archive_capability_cache_path_ = result->archive;
         selected_archive_provider_cache_ = result->provider;
         selected_archive_capability_cache_ = result->capabilities;
+        if (result->catalog) archive_catalog_ = std::move(result->catalog);
         update_toolbar_button_states();
         if (pending_archive_command_ &&
             same_filesystem_path(pending_archive_command_->archive, result->archive)) {
@@ -1979,6 +1999,21 @@ void MainWindow::create_archive_from_paths(
     dialog_options.features.create_recovery_volumes =
         application_options_.default_recovery_volumes;
     dialog_options.features.create_sfx = application_options_.default_create_sfx;
+    dialog_options.features.sfx_stub_tier = application_options_.default_sfx_stub_tier;
+    dialog_options.features.sfx_overwrite = application_options_.default_sfx_overwrite;
+    dialog_options.features.sfx_mode = application_options_.default_sfx_mode;
+    dialog_options.features.sfx_elevation = application_options_.default_sfx_elevation;
+    dialog_options.features.sfx_title = application_options_.default_sfx_title;
+    dialog_options.features.sfx_default_path =
+        application_options_.default_sfx_default_path;
+    dialog_options.features.sfx_run_program =
+        application_options_.default_sfx_run_program;
+    dialog_options.features.sfx_run_arguments =
+        application_options_.default_sfx_run_arguments;
+    dialog_options.features.sfx_allow_path_change =
+        application_options_.default_sfx_allow_path_change;
+    dialog_options.features.sfx_open_destination =
+        application_options_.default_sfx_open_destination;
     dialog_options.features.sign_archive = application_options_.default_sign_archive;
     dialog_options.features.signing_key = application_options_.default_signing_key;
     const fs::path source_folder =
@@ -2076,7 +2111,24 @@ void MainWindow::create_archive_from_paths(
         save_current_settings();
     }
     pending_archive_features_ = std::move(dialog_options.features);
+    remember_sfx_defaults(pending_archive_features_);
     on_compress();
+}
+
+void MainWindow::remember_sfx_defaults(
+    const axiom::gui::ArchiveFeatureOptions& features) {
+    if (!features.create_sfx) return;
+    application_options_.default_sfx_stub_tier = features.sfx_stub_tier;
+    application_options_.default_sfx_overwrite = features.sfx_overwrite;
+    application_options_.default_sfx_mode = features.sfx_mode;
+    application_options_.default_sfx_elevation = features.sfx_elevation;
+    application_options_.default_sfx_title = features.sfx_title;
+    application_options_.default_sfx_default_path = features.sfx_default_path;
+    application_options_.default_sfx_run_program = features.sfx_run_program;
+    application_options_.default_sfx_run_arguments = features.sfx_run_arguments;
+    application_options_.default_sfx_allow_path_change = features.sfx_allow_path_change;
+    application_options_.default_sfx_open_destination = features.sfx_open_destination;
+    save_current_settings();
 }
 
 void MainWindow::on_add_to_archive() {
@@ -3188,10 +3240,16 @@ void MainWindow::on_compress() {
         success = L"Split archive volumes created beside: " + archive.wstring();
     }
     operation_archive_output_ = archive;
+    // The SFX options authored on the dialog become the configuration embedded
+    // in the generated executable.
+    const auto sfx_config = axiom::sfx::encode_sfx_config(
+        axiom::gui::sfx_config_from_features(pending_archive_features_));
+    const auto sfx_tier =
+        axiom::gui::sfx_stub_tier_from_features(pending_archive_features_);
     start_operation(std::move(running), std::move(success),
                     [inputs, mapped_inputs, archive, options, mode, comment, set_comment,
                      repack_after, lock_after, sign_after, signing_key,
-                     create_sfx_after, sfx_output, split_after,
+                     create_sfx_after, sfx_output, split_after, sfx_config, sfx_tier,
                      volume_size = *volume_size, recovery_volumes](
                         std::shared_ptr<axiom::OperationControl> operation) mutable {
                         auto run_options = options;
@@ -3317,7 +3375,9 @@ void MainWindow::on_compress() {
                             if (create_sfx_after) {
                                 axiom::sfx::create_from_module_file(
                                     GetModuleHandleW(nullptr), archive, sfx_output,
-                                    operation, options.io_buffer_size);
+                                    operation, options.io_buffer_size,
+                                    std::span<const std::uint8_t>(sfx_config),
+                                    sfx_tier);
                                 std::error_code remove_error;
                                 if (!fs::remove(archive, remove_error) && remove_error) {
                                     std::error_code cleanup_error;

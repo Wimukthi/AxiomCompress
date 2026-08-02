@@ -208,8 +208,11 @@ public:
         result.comments = writable;
         result.lock = writable;
         result.metadata = true;
+        result.sparse_files = true;
+        result.capture_warnings = true;
         result.links = true;
         result.authenticity = true;
+        result.snapshots = true;
         result.sfx = writable;
         // The state flags below require opening the archive, which throws for a
         // path that does not exist yet (a new archive about to be created) or a
@@ -218,6 +221,7 @@ public:
         // leave the state flags at their defaults and the actual operation
         // reports the precise error.
         try {
+            result.snapshot_repository = archive_is_snapshot_repository(archive_path);
             const auto encryption_mode = archive_encryption_mode(archive_path);
             result.encrypted = encryption_mode != ArchiveEncryptionMode::none;
             result.directory_encrypted =
@@ -226,6 +230,13 @@ public:
                 result.locked = archive_is_locked(archive_path, password);
             }
         } catch (...) {
+        }
+        if (result.snapshot_repository) {
+            // Snapshot history must not be discarded by a legacy file-manager
+            // mutation. Snapshot add/prune/repack are separate APIs/CLI verbs.
+            result.update = false;
+            result.delete_entries = false;
+            result.move_entries = false;
         }
         return result;
     }
