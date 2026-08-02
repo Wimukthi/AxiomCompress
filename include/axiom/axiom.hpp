@@ -510,6 +510,28 @@ enum class CompressionMethod : std::uint8_t {
 
 inline constexpr int kAutomaticCodecLevel = -100;
 
+// Optional coarse-grained compression diagnostics. Events are emitted only at
+// phase boundaries, never from the match-finder hot loop. The callback may run
+// concurrently on compression workers and must be cheap, thread-safe, and
+// non-throwing; leaving it empty keeps the normal path allocation-free.
+enum class CompressionTelemetryPhase : std::uint8_t {
+    block_total,
+    parallel_blocks,
+    lz77_greedy,
+    lz77_optimal,
+    candidate_encoding,
+    entropy_encoding,
+};
+
+struct CompressionTelemetryEvent {
+    CompressionTelemetryPhase phase = CompressionTelemetryPhase::block_total;
+    std::uint64_t elapsed_nanoseconds = 0;
+    std::uint64_t input_bytes = 0;
+};
+
+using CompressionTelemetryCallback =
+    std::function<void(const CompressionTelemetryEvent&)>;
+
 struct CompressionOptions {
     CompressionMethod method = CompressionMethod::axiom;
     // User-facing effort level. Axiom accepts 1..9; external methods map the
@@ -629,6 +651,10 @@ struct CompressionOptions {
     // multi-second optimal parses instead of stalling until a block completes.
     // Cheap to leave unset; encoders check once per reporting quantum.
     std::function<void(double)> encode_progress;
+    // Optional phase timing diagnostics. This is intentionally separate from
+    // user-facing progress so benchmark/profiling callers can measure codec
+    // work without changing progress cadence or archive output.
+    CompressionTelemetryCallback compression_telemetry;
     // When non-empty, archive blocks are encrypted: a per-archive key is derived
     // from this password (Argon2id) and each solid block is sealed with
     // XChaCha20-Poly1305. Applies to the archive container, not single-stream

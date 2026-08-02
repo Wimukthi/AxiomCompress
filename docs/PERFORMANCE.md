@@ -162,3 +162,26 @@ replacement for the published cross-codec snapshot above.
 The run used `tools\bench_axiom_levels.ps1` with the corpus under
 `D:\tests\axiom-perf`. Raw, summary, and delta CSVs are written to
 `D:\tests\axiom-perf\results\speed-baseline-compare-all-2026-08-02`.
+
+## 2026-08-02 profiling and matcher checkpoint
+
+The codec now exposes opt-in phase timing through `axiomc c --profile`; the
+workflow and interpretation rules are in [BENCHMARKING.md](BENCHMARKING.md#codec-phase-profiling).
+Profiling the balanced path showed greedy LZ77 as the dominant phase, while the
+maximum path split its time between greedy candidate discovery and optimal
+parsing. The retained optimization hoists a repeated cyclic-slot division out
+of the level-7 tree matcher's lazy-lookahead descent. It changes no token or
+decoder behavior.
+
+A controlled Release x64 comparison against `f38f3a6` (the previous pass) gave
+identical archive bytes at every level on both enwik8 and the Silesia tar:
+
+| Corpus | Levels | Archive-byte delta | Round trips | Level-7 compression delta (3 repeats) |
+|---|---:|---:|---:|---:|
+| enwik8 | 1–9 | 0 bytes at every level | all passed | +0.56% |
+| Silesia tar | 1–9 | 0 bytes at every level | all passed | +1.05% |
+
+The all-level sweep used one repeat per build; its timings are directional only.
+The level-7 figures use the three-repeat targeted sweep. Raw, summary, and delta
+CSVs are in `D:\tests\axiom-perf\results\final-all-level-compare-2026-08-02`
+and `D:\tests\axiom-perf\results\tree-modulo-compare-2026-08-02`.

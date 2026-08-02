@@ -2,6 +2,7 @@
 
 #include "codec/lz77_split.hpp"
 #include "codec/match_copy.hpp"
+#include "codec/telemetry.hpp"
 #include "codec/varint.hpp"
 #include "core/cpu.hpp"
 #include "core/task_executor.hpp"
@@ -1310,6 +1311,7 @@ ByteVector encode_lz77_tree(std::span<const std::uint8_t> input,
         std::size_t len_smaller = 0;
         std::size_t len_larger = 0;
         const auto limit = std::min(max_match, n - p);
+        const auto p_slot = p % cyclic_size;
         std::size_t cycles = depth_cutoff;
         while (node != kNoPos) {
             const std::size_t np = node;
@@ -1318,7 +1320,6 @@ ByteVector encode_lz77_tree(std::span<const std::uint8_t> input,
                 return;
             }
 
-            const auto p_slot = p % cyclic_size;
             const auto node_slot =
                 p_slot >= delta ? p_slot - delta : p_slot + cyclic_size - delta;
             prefetch_read(&son[2 * node_slot]);
@@ -1890,6 +1891,8 @@ ByteVector encode_lz77_tree_swarm_impl(std::span<const std::uint8_t> input,
 
 ByteVector encode_lz77(std::span<const std::uint8_t> input,
                        const CompressionOptions& options) {
+    CompressionTelemetryScope telemetry(
+        options, CompressionTelemetryPhase::lz77_greedy, input.size());
     // 32-bit indices suffice (and halve match-finder memory) until the input
     // reaches the point where a position would collide with the sentinel.
     if (options.swarm_parse && options.use_tree_matcher &&
@@ -1917,6 +1920,8 @@ ByteVector encode_lz77(std::span<const std::uint8_t> input,
 ByteVector optimal_parse_with_costs(std::span<const std::uint8_t> input,
                                     const CompressionOptions& options,
                                     const ParseCosts& model) {
+    CompressionTelemetryScope telemetry(
+        options, CompressionTelemetryPhase::lz77_optimal, input.size());
     constexpr std::uint64_t kInf = std::numeric_limits<std::uint64_t>::max() / 4;
 
     const auto window_size = std::max<std::size_t>(kMinMatch, options.window_size);
@@ -2485,6 +2490,8 @@ std::optional<ByteVector> encode_lz77_optimal_checkpointed(
     std::span<const std::uint8_t> input,
     const CompressionOptions& options,
     const ByteVector& greedy_tokens) {
+    CompressionTelemetryScope telemetry(
+        options, CompressionTelemetryPhase::lz77_optimal, input.size());
     constexpr std::size_t kTileSize = std::size_t{2} << 20;
     constexpr std::size_t kMinimumInput = kTileSize * 2;
     if (!options.swarm_parse || !options.use_tree_matcher ||

@@ -4,6 +4,7 @@
 #include "codec/incompressible.hpp"
 #include "codec/lz77.hpp"
 #include "codec/lz77_split.hpp"
+#include "codec/telemetry.hpp"
 #include "codec/transform.hpp"
 #include "codec/varint.hpp"
 #include "core/checksum.hpp"
@@ -200,9 +201,18 @@ std::size_t checked_size(std::uint64_t value, const char* field_name) {
     return static_cast<std::size_t>(value);
 }
 
+std::optional<ByteVector> encode_huffman_profiled(
+    std::span<const std::uint8_t> input, const CompressionOptions& options) {
+    CompressionTelemetryScope telemetry(
+        options, CompressionTelemetryPhase::entropy_encoding, input.size());
+    return entropy::encode_huffman(input);
+}
+
 BlockResult compress_block(std::span<const std::uint8_t> input,
                            const CompressionOptions& options,
                            core::TaskExecutor* executor) {
+    CompressionTelemetryScope telemetry(
+        options, CompressionTelemetryPhase::block_total, input.size());
     BlockResult best;
     best.codec = BlockCodec::store;
     best.original_size = input.size();
@@ -271,6 +281,8 @@ BlockResult compress_block(std::span<const std::uint8_t> input,
     }
 
     auto consider_lz_payload = [&](ByteVector lz_payload, bool try_sequence) {
+        CompressionTelemetryScope candidate_telemetry(
+            options, CompressionTelemetryPhase::candidate_encoding, input.size());
         // Record a raw winner without copying its full token buffer. Most real
         // blocks replace it with an entropy-coded candidate below; move it into
         // the result only if it is still the winner after that bake-off.
@@ -313,8 +325,8 @@ BlockResult compress_block(std::span<const std::uint8_t> input,
             // The expensive candidates share one token analysis. Keep the
             // whole-stream Huffman trial independent, while the combined LZ77
             // bake-off reuses its split/sequence/context metadata.
-            auto huffman_task = executor->submit([&lz_payload] {
-                return entropy::encode_huffman(lz_payload);
+            auto huffman_task = executor->submit([&lz_payload, &options] {
+                return encode_huffman_profiled(lz_payload, options);
             });
             const auto useful_size = std::min(best_size, lz_payload.size());
             auto candidates_task = executor->submit(
@@ -353,7 +365,7 @@ BlockResult compress_block(std::span<const std::uint8_t> input,
             // The whole-stream Huffman candidate almost never beats split
             // streams, but thorough presets keep the exhaustive comparison.
             if (!options.fast_entropy) {
-                entropy_payload = entropy::encode_huffman(lz_payload);
+                entropy_payload = encode_huffman_profiled(lz_payload, options);
             }
             const auto useful_size = std::min(best_size, lz_payload.size());
             auto candidates = encode_lz77_payload_candidates_exhaustive(
@@ -736,6 +748,8 @@ std::size_t effective_parallel_block_size(std::size_t input_size,
 ByteVector encode_parallel_blocks(std::span<const std::uint8_t> input,
                                   const CompressionOptions& options,
                                   std::uint32_t* crc32) {
+    CompressionTelemetryScope telemetry(
+        options, CompressionTelemetryPhase::parallel_blocks, input.size());
     if (options.operation) {
         options.operation->checkpoint();
     }

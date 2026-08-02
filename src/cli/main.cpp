@@ -106,6 +106,7 @@ void print_usage() {
         "  --threads N        --block-size SIZE   --parallel\n"
         "  --chain-depth N    --nice N            (Axiom search / LZMA2 fast bytes)\n"
         "  --lazy / --no-lazy  --fast-entropy     (override level knobs)\n"
+        "  --profile                              c only: print codec phase timings\n"
         "  --fast-lz          --no-filters        (byte-token profile / disable file filters)\n"
         "  --window SIZE                          (Axiom window / LZMA2 dictionary, max 512 MiB)\n"
         "  --lzma-mf MODE                         LZMA2 match finder: bt4 or hc4\n"
@@ -467,6 +468,55 @@ struct InteractiveCommandScope {
     bool previous = false;
 };
 
+constexpr std::size_t kCompressionTelemetryPhaseCount =
+    static_cast<std::size_t>(axiom::CompressionTelemetryPhase::entropy_encoding) + 1;
+
+const char* compression_telemetry_phase_name(axiom::CompressionTelemetryPhase phase) {
+    switch (phase) {
+        case axiom::CompressionTelemetryPhase::block_total: return "block-total";
+        case axiom::CompressionTelemetryPhase::parallel_blocks: return "parallel-blocks";
+        case axiom::CompressionTelemetryPhase::lz77_greedy: return "lz77-greedy";
+        case axiom::CompressionTelemetryPhase::lz77_optimal: return "lz77-optimal";
+        case axiom::CompressionTelemetryPhase::candidate_encoding:
+            return "candidate-encoding";
+        case axiom::CompressionTelemetryPhase::entropy_encoding:
+            return "entropy-encoding";
+    }
+    return "unknown";
+}
+
+class CompressionProfile {
+public:
+    void record(const axiom::CompressionTelemetryEvent& event) {
+        const auto index = static_cast<std::size_t>(event.phase);
+        if (index >= kCompressionTelemetryPhaseCount) return;
+        std::lock_guard lock(mutex_);
+        nanoseconds_[index] += event.elapsed_nanoseconds;
+        input_bytes_[index] += event.input_bytes;
+        ++events_[index];
+    }
+
+    void print() {
+        std::lock_guard lock(mutex_);
+        std::cout << "\nCompression profile\n";
+        for (std::size_t index = 0; index < kCompressionTelemetryPhaseCount; ++index) {
+            if (events_[index] == 0) continue;
+            const auto phase = static_cast<axiom::CompressionTelemetryPhase>(index);
+            const double seconds = static_cast<double>(nanoseconds_[index]) / 1.0e9;
+            std::cout << "  " << compression_telemetry_phase_name(phase)
+                      << ": " << std::fixed << std::setprecision(3) << seconds << " s"
+                      << "  " << events_[index] << " event(s)"
+                      << "  " << input_bytes_[index] << " input bytes\n";
+        }
+    }
+
+private:
+    std::mutex mutex_;
+    std::array<std::uint64_t, kCompressionTelemetryPhaseCount> nanoseconds_{};
+    std::array<std::uint64_t, kCompressionTelemetryPhaseCount> input_bytes_{};
+    std::array<std::uint64_t, kCompressionTelemetryPhaseCount> events_{};
+};
+
 void print_splash() {
     std::cout <<
         color(kColorAmber) <<
@@ -596,7 +646,9 @@ void write_key(const fs::path& path, const std::array<std::uint8_t, Size>& key) 
 }
 
 // Pulls recognized compression flags out of args, leaving positional arguments.
-bool take_compression_flags(std::vector<std::string>& args, axiom::CompressionOptions& options) {
+bool take_compression_flags(std::vector<std::string>& args,
+                            axiom::CompressionOptions& options,
+                            bool* profile = nullptr) {
     // First pass: pick the effort level (default 5) and apply its preset, so the
     // remaining explicit flags below act as overrides regardless of ordering.
     int level = 5;
@@ -692,6 +744,12 @@ bool take_compression_flags(std::vector<std::string>& args, axiom::CompressionOp
             options.preserve_sparse_files = false;
         } else if (arg == "--strict-metadata") {
             options.strict_metadata = true;
+        } else if (arg == "--profile") {
+            if (profile == nullptr) {
+                std::cerr << "axiomc: unknown option " << arg << '\n';
+                return false;
+            }
+            *profile = true;
         } else if (arg == "--chain-depth") {
             options.max_chain_depth = parse_size(next("--chain-depth"));
         } else if (arg == "--nice") {
@@ -1580,12 +1638,25 @@ int run_sfx(std::vector<std::string> args) {
 
 int run_compress(std::vector<std::string> args) {
     axiom::CompressionOptions options;
-    if (!take_compression_flags(args, options)) {
+    bool profile = false;
+    if (!take_compression_flags(args, options, &profile)) {
         return 2;
     }
     if (args.size() != 2) {
         print_usage();
         return 2;
+    }
+    if (profile && options.method != axiom::CompressionMethod::axiom) {
+        std::cerr << "axiomc: --profile is only supported with --method axiom\n";
+        return 2;
+    }
+    std::optional<CompressionProfile> profile_report;
+    if (profile) {
+        profile_report.emplace();
+        options.compression_telemetry = [&profile_report](
+            const axiom::CompressionTelemetryEvent& event) {
+            profile_report->record(event);
+        };
     }
     ScopedInteractiveProgress progress("compressing stream");
     if (auto operation = progress.operation()) {
@@ -1604,6 +1675,9 @@ int run_compress(std::vector<std::string> args) {
     }
     axiom::compress_file(args[0], args[1], options);
     progress.complete();
+    if (profile_report) {
+        profile_report->print();
+    }
     return 0;
 }
 

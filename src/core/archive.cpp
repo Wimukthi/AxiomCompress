@@ -5,6 +5,7 @@
 #include "codec/incompressible.hpp"
 #include "codec/lz77.hpp"
 #include "codec/lz77_split.hpp"
+#include "codec/telemetry.hpp"
 #include "codec/transform.hpp"
 #include "core/checksum.hpp"
 #include "core/file_replace.hpp"
@@ -499,6 +500,8 @@ ByteVector compress(std::span<const std::uint8_t> input,
         core::TaskExecutor* candidate_executor = options.task_executor.get();
 
         auto consider_lz_payload = [&](ByteVector lz_payload, bool try_sequence) {
+            codec::CompressionTelemetryScope candidate_telemetry(
+                options, CompressionTelemetryPhase::candidate_encoding, input.size());
             if (options.operation) {
                 options.operation->checkpoint();
             }
@@ -509,6 +512,8 @@ ByteVector compress(std::span<const std::uint8_t> input,
             // skipped and the split encoder uses its cheap coder chooser.
             std::optional<ByteVector> entropy_payload;
             if (!options.fast_entropy) {
+                codec::CompressionTelemetryScope entropy_telemetry(
+                    options, CompressionTelemetryPhase::entropy_encoding, lz_payload.size());
                 entropy_payload = entropy::encode_huffman(lz_payload);
             }
             std::optional<ByteVector> split_payload;
