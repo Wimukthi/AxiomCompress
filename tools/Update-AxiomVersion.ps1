@@ -125,7 +125,8 @@ if ($IncrementBuild) {
 
     $mirrorResourceFiles = @(
         (Join-Path $PSScriptRoot "..\src\cli\axiom_cli.rc"),
-        (Join-Path $PSScriptRoot "..\src\sfx\sfx_stub.rc")
+        (Join-Path $PSScriptRoot "..\src\sfx\sfx_stub.rc"),
+        (Join-Path $PSScriptRoot "..\src\sfx\sfx_mini_stub.rc")
     )
     foreach ($mirrorResourceFile in $mirrorResourceFiles) {
         if (-not (Test-Path -LiteralPath $mirrorResourceFile)) {

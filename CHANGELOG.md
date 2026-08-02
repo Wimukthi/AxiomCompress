@@ -8,6 +8,41 @@ a four-part `major.minor.patch.build` version scheme described in
 Entries are condensed from the
 [GitHub releases](https://github.com/Wimukthi/AxiomCompress/releases).
 
+## [0.9.0.0] — 2026-08-02
+
+Configurable, signable self-extracting archives and AXAR v5 capabilities.
+
+### Added
+
+- A native SFX v2 wrapper anchored to the end of the PE image, with a bounded
+  descriptor, payload integrity hash, configuration TLV, and Authenticode-safe
+  payload location. Existing v1 SFX files remain readable.
+- Full and Mini SFX runtimes with GUI/console operation, silent and scripted
+  modes, destination templates, license acceptance, selective extraction,
+  run-after-extract controls, elevation policy, free-space checks, logging, and
+  stable exit codes.
+- AXAR v5 fidelity, password-slot encryption, append-generation, seekable
+  extraction, and snapshot repository profiles, with malformed-input and fuzz
+  coverage for the new parsing surfaces.
+- Reproducible vendored-dependency lock verification across Windows, Linux, and
+  macOS, including the refreshed 7-Zip, miniz, minizip-ng, and Monocypher
+  components.
+
+### Changed
+
+- SFX creation, extraction, GUI controls, and CLI configuration now share the
+  same validated options and read-only decode facade.
+- AXAR v4 remains readable, while optional and additive v5 features reject
+  unknown required capabilities instead of attempting an unsafe interpretation.
+
+### Fixed
+
+- Cross-platform dependency-lock checks now hash canonical text consistently,
+  and all SFX sources are included in the Linux and Windows fuzz builds.
+- Portable CLI builds now include the shared SFX configuration parser.
+- The Authenticode regression test no longer depends on hosted Windows
+  certificate-store services.
+
 ## [0.8.0.0] — 2026-07-30
 
 Faster archive update, freshen, and synchronize.
@@ -334,6 +369,7 @@ First published release: the Inno Setup installer and portable zip, carrying
 update/repair/remove maintenance handling, and dynamic light/dark setup
 styling.
 
+[0.9.0.0]: https://github.com/Wimukthi/AxiomCompress/releases/tag/0.9.0.0
 [0.8.0.0]: https://github.com/Wimukthi/AxiomCompress/releases/tag/0.8.0.0
 [0.7.1.0]: https://github.com/Wimukthi/AxiomCompress/releases/tag/0.7.1.0
 [0.7.0.0]: https://github.com/Wimukthi/AxiomCompress/releases/tag/0.7.0.0
