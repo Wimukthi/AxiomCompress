@@ -174,15 +174,20 @@ For a single Axiom stream, `--profile` reports coarse codec phase timings:
 ```
 
 The report includes block scheduling, greedy LZ77, optimal parsing, candidate
-encoding, and entropy encoding. It is diagnostic only: the callback is opt-in,
-does not change the AXC wire format, and is currently accepted only by the
-single-stream `c` command with `--method axiom`. The public C++ equivalent is
-`CompressionOptions::compression_telemetry`.
+encoding, and entropy encoding. When the tiled optimal parser is active, it also
+breaks optimal parsing into `lz77-optimal-dp`,
+`lz77-optimal-candidates`, and `lz77-optimal-reconstruction`. The candidate row
+is the aggregate CPU time of producer tiles and can overlap the DP row; it is
+omitted when the parser uses the serial tree path. It is diagnostic only: the
+callback is opt-in, does not change the AXC wire format, and is currently
+accepted only by the single-stream `c` command with `--method axiom`. The public
+C++ equivalent is `CompressionOptions::compression_telemetry`.
 
-Timings for `block-total`, `lz77-greedy`, `lz77-optimal`, and
-`candidate-encoding` are sums of worker events, so they represent aggregate
-CPU work and can overlap. `parallel-blocks` is the enclosing wall-time-like
-phase. Use the profile to choose a hot path, then use the two-build harness
+Timings for `block-total`, `lz77-greedy`, `lz77-optimal`,
+`lz77-optimal-candidates`, and `candidate-encoding` are sums of worker events,
+so they represent aggregate CPU work and can overlap. `parallel-blocks` and
+`lz77-optimal-dp` are enclosing wall-time-like phases for their respective
+scopes. Use the profile to choose a hot path, then use the two-build harness
 above to decide whether a change is a real throughput win. Keep archive bytes,
 ratio, and round-trip hashes as hard gates; a faster parse that changes the
 selected token stream or loses ratio is not an acceptable preset change.

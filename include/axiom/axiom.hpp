@@ -519,6 +519,9 @@ enum class CompressionTelemetryPhase : std::uint8_t {
     parallel_blocks,
     lz77_greedy,
     lz77_optimal,
+    lz77_optimal_dp,
+    lz77_optimal_candidates,
+    lz77_optimal_reconstruction,
     candidate_encoding,
     entropy_encoding,
 };

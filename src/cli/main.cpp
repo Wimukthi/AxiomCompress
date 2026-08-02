@@ -477,6 +477,12 @@ const char* compression_telemetry_phase_name(axiom::CompressionTelemetryPhase ph
         case axiom::CompressionTelemetryPhase::parallel_blocks: return "parallel-blocks";
         case axiom::CompressionTelemetryPhase::lz77_greedy: return "lz77-greedy";
         case axiom::CompressionTelemetryPhase::lz77_optimal: return "lz77-optimal";
+        case axiom::CompressionTelemetryPhase::lz77_optimal_dp:
+            return "lz77-optimal-dp";
+        case axiom::CompressionTelemetryPhase::lz77_optimal_candidates:
+            return "lz77-optimal-candidates";
+        case axiom::CompressionTelemetryPhase::lz77_optimal_reconstruction:
+            return "lz77-optimal-reconstruction";
         case axiom::CompressionTelemetryPhase::candidate_encoding:
             return "candidate-encoding";
         case axiom::CompressionTelemetryPhase::entropy_encoding:

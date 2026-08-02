@@ -1581,12 +1581,14 @@ class TreeCandidatePipeline {
 
 public:
     TreeCandidatePipeline(std::span<const std::uint8_t> input,
+                          const CompressionOptions& options,
                           std::size_t window_size,
                           std::size_t max_match,
                           std::size_t chain_depth,
                           std::size_t max_candidates,
                           core::TaskExecutor& executor)
         : input_(input),
+          options_(&options),
           max_match_(max_match),
           max_candidates_(max_candidates),
           executor_(executor),
@@ -1643,6 +1645,8 @@ public:
 private:
     Tile produce_tile(std::size_t start) {
         const auto length = std::min(kTileSize, input_.size() - start);
+        CompressionTelemetryScope telemetry(
+            *options_, CompressionTelemetryPhase::lz77_optimal_candidates, length);
         Tile tile;
         tile.start = start;
         tile.counts.resize(length);
@@ -1673,6 +1677,7 @@ private:
     static constexpr std::size_t kTileSize = std::size_t{1} << 20;
 
     std::span<const std::uint8_t> input_;
+    const CompressionOptions* options_;
     std::size_t max_match_;
     std::size_t max_candidates_;
     core::TaskExecutor& executor_;
@@ -1950,7 +1955,7 @@ ByteVector optimal_parse_with_costs(std::span<const std::uint8_t> input,
         // work to amortize the bounded pipeline.
         if (max_chain_depth >= 32 && executor != nullptr &&
             executor->worker_count() > 1 && input.size() >= kMinimumPipelineInput) {
-            candidate_pipeline.emplace(input, window_size, max_match,
+            candidate_pipeline.emplace(input, options, window_size, max_match,
                                        max_chain_depth, max_candidates, *executor);
         } else {
             tree.emplace(input, window_size, max_match, max_chain_depth);
@@ -1999,6 +2004,8 @@ ByteVector optimal_parse_with_costs(std::span<const std::uint8_t> input,
 
     MatchList matches;
     ParseProgressTicker progress(options.encode_progress, input.size());
+    CompressionTelemetryScope dp_telemetry(
+        options, CompressionTelemetryPhase::lz77_optimal_dp, input.size());
     std::size_t position_slot = 0;
     for (std::size_t position = 0; position < input.size(); ++position) {
         if (position_slot == cost_ring_size) {
@@ -2146,6 +2153,8 @@ ByteVector optimal_parse_with_costs(std::span<const std::uint8_t> input,
         candidate_pipeline->finish();
     }
 
+    CompressionTelemetryScope reconstruction_telemetry(
+        options, CompressionTelemetryPhase::lz77_optimal_reconstruction, input.size());
     ByteVector output;
     output.reserve(input.size());
 
