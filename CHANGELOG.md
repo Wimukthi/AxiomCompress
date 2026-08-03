@@ -8,6 +8,22 @@ a four-part `major.minor.patch.build` version scheme described in
 Entries are condensed from the
 [GitHub releases](https://github.com/Wimukthi/AxiomCompress/releases).
 
+## [0.9.1.0] - 2026-08-03
+
+Performance maintenance release.
+
+### Changed
+
+- Optimized LZ77 candidate analysis, parser ring indexing, tree candidate
+  scheduling, and the level-9 greedy search while preserving the AXC format.
+- Added opt-in codec phase profiling for identifying ratio-neutral hot paths.
+
+### Validation
+
+- The full levels 1-9 regression matrix passed all 108 compression and
+  decompression round trips. Archive bytes were unchanged at 17 of 18 corpus
+  and level pairs; the remaining level-9 Silesia result differed by 71 bytes.
+
 ## [0.9.0.0] — 2026-08-02
 
 Configurable, signable self-extracting archives and AXAR v5 capabilities.
@@ -369,6 +385,7 @@ First published release: the Inno Setup installer and portable zip, carrying
 update/repair/remove maintenance handling, and dynamic light/dark setup
 styling.
 
+[0.9.1.0]: https://github.com/Wimukthi/AxiomCompress/releases/tag/0.9.1.0
 [0.9.0.0]: https://github.com/Wimukthi/AxiomCompress/releases/tag/0.9.0.0
 [0.8.0.0]: https://github.com/Wimukthi/AxiomCompress/releases/tag/0.8.0.0
 [0.7.1.0]: https://github.com/Wimukthi/AxiomCompress/releases/tag/0.7.1.0

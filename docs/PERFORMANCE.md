@@ -333,3 +333,32 @@ times were 2.397 s, 6.528 s, 12.334 s, 4.597 s, and 11.385 s respectively.
 All five compressed streams were decompressed and matched their source
 SHA-256 exactly. The timings are host-specific and directional; repeat the
 controlled profile workflow before making cross-machine claims.
+
+## 2026-08-03 all-level regression checkpoint
+
+The current Release x64 build was compared with the last pushed baseline
+(`37dd990`) on the same host using three repeats of every level on both
+standing corpora. This was the full 108-run matrix: two builds, two corpora,
+nine levels, and compression plus decompression with SHA-256 verification for
+every row.
+
+| Corpus | Levels | Archive-byte delta | Compression-speed delta | Decompression-speed delta |
+|---|---:|---:|---:|---:|
+| enwik8 | 1-9 | 0 bytes at every level | -4.04% to +9.20% | -3.32% to +5.54% |
+| Silesia tar | 1-9 | 0 bytes at levels 1-8; +71 bytes at level 9 | -10.12% to +23.64% | -1.78% to +0.69% |
+
+The level-9 Silesia change is 71 bytes out of 211,948,032 input bytes and is
+reported as a ratio guard, not a promoted ratio improvement. The raw, summary,
+and delta CSVs are in
+`D:\tests\axiom-perf\results\all-level-regression-20260803`.
+
+The next ratio-neutral target is the hash-chain greedy matcher used by levels
+1-6, specifically `encode_lz77_impl` and its `find_best` walk in
+`src/codec/lz77.cpp`. Level 6 is the clearest signal: it is the only material
+compression regression in the matrix while producing identical archive bytes.
+Current profiling of the Silesia level-6 path reports 70.629 s of aggregate
+greedy worker time, compared with 7.392 s for candidate encoding and 1.143 s
+for entropy encoding. The next pass should preserve candidate traversal order,
+chain depth, nice-length cutoff, token decisions, and archive bytes while
+removing only redundant work from that walk. Exact archive-byte comparison and
+round-trip hashes remain hard gates before any preset change is considered.
