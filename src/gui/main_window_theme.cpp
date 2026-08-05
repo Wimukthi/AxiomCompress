@@ -307,7 +307,9 @@ void MainWindow::draw_owner_button(const DRAWITEMSTRUCT& draw) const {
 
     const bool disabled = (draw.itemState & ODS_DISABLED) != 0;
     const bool pressed = (draw.itemState & ODS_SELECTED) != 0;
-    const bool hot = (draw.itemState & ODS_HOTLIGHT) != 0;
+    const bool hot = !disabled &&
+        ((draw.itemState & ODS_HOTLIGHT) != 0 ||
+         draw.hwndItem == hot_toolbar_button_);
     const bool focused = (draw.itemState & ODS_FOCUS) != 0;
     RECT rect = draw.rcItem;
     const COLORREF button_color = pressed ? theme_.button_pressed :
@@ -339,7 +341,9 @@ void MainWindow::draw_owner_button(const DRAWITEMSTRUCT& draw) const {
     if (icon == axiom::gui::ToolbarIcon::none) {
         DrawTextW(draw.hDC, text.c_str(), -1, &rect,
                   DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-    } else if (is_icon_only_button(draw.CtlID)) {
+    } else if (is_icon_only_button(draw.CtlID) ||
+               (std::clamp(application_options_.toolbar_display_mode, 0, 1) == 1 &&
+                toolbar_button(draw.CtlID) != nullptr)) {
         axiom::gui::draw_toolbar_icon(draw.hDC, icon, rect, content_color,
                                       dpi_, 18, icon_style);
     } else {

@@ -2849,6 +2849,59 @@ void test_axar_version_fixtures_and_validation() {
         expect_throws([&] { (void)axiom::list_archive(bad); });
     }
 
+    // Count fields in archive-level manifests must be bounded by the payload
+    // before they can drive a large vector allocation. This is a minimal AXAR
+    // carrying a snapshot count that previously attempted a multi-gigabyte
+    // EntryRec reservation despite having no entry bodies.
+    {
+        const auto append_vint = [](std::vector<std::uint8_t>& bytes,
+                                    std::uint64_t value) {
+            while (value >= 0x80) {
+                bytes.push_back(static_cast<std::uint8_t>(value) | 0x80u);
+                value >>= 7;
+            }
+            bytes.push_back(static_cast<std::uint8_t>(value));
+        };
+        const auto make_archive_with_extra = [&](std::uint64_t record_type,
+                                                 const std::vector<std::uint8_t>& payload) {
+            std::vector<std::uint8_t> directory;
+            append_vint(directory, 0);  // block count
+            append_vint(directory, 0);  // entry count
+            append_vint(directory, 1);  // archive extra count
+            append_vint(directory, record_type);
+            append_vint(directory, payload.size());
+            directory.insert(directory.end(), payload.begin(), payload.end());
+
+            std::vector<std::uint8_t> bytes(v4_bytes.begin(), v4_bytes.begin() + 16);
+            bytes.insert(bytes.end(), directory.begin(), directory.end());
+            const auto footer_offset = bytes.size();
+            bytes.resize(footer_offset + 24);
+            store_le(bytes, footer_offset, 16, 8);
+            store_le(bytes, footer_offset + 8, directory.size(), 8);
+            std::copy(axiom::kArchiveMagic.begin(), axiom::kArchiveMagic.end(),
+                      bytes.begin() + static_cast<std::ptrdiff_t>(footer_offset + 16));
+            return bytes;
+        };
+
+        std::vector<std::uint8_t> snapshot_payload;
+        append_vint(snapshot_payload, 1);  // snapshot manifest version
+        append_vint(snapshot_payload, 1);  // snapshot count
+        append_vint(snapshot_payload, 1);  // snapshot name length
+        snapshot_payload.push_back('s');
+        append_vint(snapshot_payload, 1);  // generation
+        snapshot_payload.insert(snapshot_payload.end(), 8, 0);
+        append_vint(snapshot_payload, std::uint64_t{1} << 24);
+        write_all(bad, make_archive_with_extra(8, snapshot_payload));
+        expect_throws([&] { (void)axiom::list_archive(bad); });
+
+        std::vector<std::uint8_t> chunk_table_payload;
+        append_vint(chunk_table_payload, 1);  // chunk-table version
+        append_vint(chunk_table_payload, 0);  // flags
+        append_vint(chunk_table_payload, std::uint64_t{1} << 24);
+        write_all(bad, make_archive_with_extra(7, chunk_table_payload));
+        expect_throws([&] { (void)axiom::list_archive(bad); });
+    }
+
     std::error_code ec;
     fs::remove_all(root, ec);
 }
@@ -4817,6 +4870,28 @@ void test_compression_estimator() {
     AXIOM_CHECK(adaptive_estimate.confidence == axiom::EstimateConfidence::high);
     AXIOM_CHECK(adaptive_estimate.confidence_margin_percent <= 2.5);
 
+    std::vector<axiom::CompressionEstimateCurveCandidate>
+        confidence_curve_candidates;
+    for (const int level : {1, 5, 9}) {
+        axiom::CompressionOptions compression;
+        axiom::apply_compression_level(compression, level);
+        confidence_curve_candidates.push_back({level, std::move(compression)});
+    }
+    auto confidence_curve_options = adaptive;
+    confidence_curve_options.stop_when_high_confidence = true;
+    const auto confidence_curve = axiom::estimate_compression_curve(
+        {uniform}, confidence_curve_options, confidence_curve_candidates, {});
+    AXIOM_CHECK(confidence_curve.complete);
+    AXIOM_CHECK(confidence_curve.reached_high_confidence);
+    AXIOM_CHECK(confidence_curve.sampled_bytes <
+                confidence_curve.planned_sample_bytes);
+    AXIOM_CHECK(confidence_curve.completed_evaluations <
+                confidence_curve.total_evaluations);
+    for (const auto& point : confidence_curve.points) {
+        AXIOM_CHECK(point.confidence == axiom::EstimateConfidence::high);
+        AXIOM_CHECK(point.sampled_bytes == confidence_curve.sampled_bytes);
+    }
+
     const auto heterogeneous = root / "adaptive-heterogeneous.bin";
     std::vector<std::uint8_t> mixed(16u << 20, 0x41);
     std::uint32_t random = 0x9e3779b9u;
@@ -4832,6 +4907,22 @@ void test_compression_estimator() {
     AXIOM_CHECK(heterogeneous_estimate.sampled_bytes == adaptive.sample_budget);
     AXIOM_CHECK(heterogeneous_estimate.confidence != axiom::EstimateConfidence::high);
     AXIOM_CHECK(heterogeneous_estimate.confidence_margin_percent > 2.5);
+
+    const auto bounded_heterogeneous_curve = axiom::estimate_compression_curve(
+        {heterogeneous}, confidence_curve_options,
+        confidence_curve_candidates, {});
+    AXIOM_CHECK(bounded_heterogeneous_curve.complete);
+    AXIOM_CHECK(!bounded_heterogeneous_curve.reached_high_confidence);
+    AXIOM_CHECK(bounded_heterogeneous_curve.sampled_bytes ==
+                bounded_heterogeneous_curve.planned_sample_bytes);
+    AXIOM_CHECK(bounded_heterogeneous_curve.completed_evaluations ==
+                bounded_heterogeneous_curve.total_evaluations);
+    AXIOM_CHECK(std::any_of(
+        bounded_heterogeneous_curve.points.begin(),
+        bounded_heterogeneous_curve.points.end(),
+        [](const auto& point) {
+            return point.confidence != axiom::EstimateConfidence::high;
+        }));
 
     auto zip = repeated;
     zip.format = axiom::ArchiveFormat::zip;

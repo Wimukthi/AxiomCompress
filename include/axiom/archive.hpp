@@ -136,6 +136,9 @@ struct CompressionEstimateOptions {
     // Called after each completed probe. It reports the cumulative prognosis,
     // not operation completion; frontends can render a live savings meter.
     std::function<void(const CompressionEstimateSnapshot&)> progress_callback;
+    // Curve estimation may stop as soon as every candidate reaches high
+    // confidence. sample_budget and time_budget remain hard safety limits.
+    bool stop_when_high_confidence = false;
 };
 
 struct CompressionEstimateResult {
@@ -192,7 +195,10 @@ struct CompressionEstimateCurveResult {
     std::uint64_t item_count = 0;
     std::uint64_t completed_evaluations = 0;
     std::uint64_t total_evaluations = 0;
+    // complete means the estimator stopped; it may be true before all planned
+    // probes when the high-confidence target or a safety limit ended the run.
     bool complete = false;
+    bool reached_high_confidence = false;
     std::vector<CompressionEstimateCurvePoint> points;
     std::vector<OperationWarning> warnings;
 };

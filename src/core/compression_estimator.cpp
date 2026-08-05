@@ -884,6 +884,13 @@ CompressionEstimateCurveResult estimate_compression_curve(
                 warnings_present, complete);
             result.points[index].total_probes = regions.size();
         }
+        result.reached_high_confidence =
+            !result.points.empty() &&
+            std::all_of(
+                result.points.begin(), result.points.end(),
+                [](const CompressionEstimateCurvePoint& point) {
+                    return point.confidence == EstimateConfidence::high;
+                });
         if (progress_callback) progress_callback(result);
     };
 
@@ -997,6 +1004,10 @@ CompressionEstimateCurveResult estimate_compression_curve(
             result.completed_evaluations, result.total_evaluations,
             files[region.file_index].display_path,
             probe.size(), probe.size());
+        if (options.stop_when_high_confidence &&
+            result.reached_high_confidence) {
+            break;
+        }
         if (options.time_budget.count() > 0 &&
             std::chrono::steady_clock::now() - sampling_started >=
                 options.time_budget) {

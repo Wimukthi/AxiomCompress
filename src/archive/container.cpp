@@ -700,6 +700,12 @@ constexpr std::uint64_t kMaxChunkCount = 1u << 24;
 constexpr std::uint64_t kMaxChunkRefsPerEntry = 1u << 20;
 constexpr std::size_t kMaxSnapshotNameBytes = 256;
 
+// These are the smallest serialized records that can reach the corresponding
+// parsers. Count fields are untrusted, so they must not authorize more records
+// than the enclosing payload can possibly contain before a vector grows.
+constexpr std::size_t kMinChunkTableRecordBytes = 1 + sizeof(std::uint32_t) + 32 + 1 + 1;
+constexpr std::size_t kMinSnapshotEntryRecordBytes = 1 + 1 + 1;
+
 void validate_snapshot_name(std::string_view name) {
     if (name.empty() || name.size() > kMaxSnapshotNameBytes) {
         throw std::invalid_argument("snapshot name must be 1..256 bytes");
@@ -3113,7 +3119,8 @@ ArchiveIndex parse_directory(const ByteVector& directory, std::uint64_t director
             index.meta.chunk_table = true;
             index.meta.keyed_chunk_ids = (table_flags & 1u) != 0;
             const auto count = payload.vint();
-            if (count > kMaxChunkCount) {
+            if (count > kMaxChunkCount ||
+                count > payload.remaining() / kMinChunkTableRecordBytes) {
                 throw FormatError("archive chunk table is too large");
             }
             index.chunks.reserve(static_cast<std::size_t>(count));
@@ -3156,10 +3163,14 @@ ArchiveIndex parse_directory(const ByteVector& directory, std::uint64_t director
                 snapshot.generation = payload.vint();
                 snapshot.created = static_cast<std::int64_t>(payload.u64());
                 const auto snapshot_entry_count = payload.vint();
-                if (snapshot_entry_count > kMaxSnapshotEntries) {
+                if (snapshot_entry_count > kMaxSnapshotEntries ||
+                    snapshot_entry_count >
+                        payload.remaining() / kMinSnapshotEntryRecordBytes) {
                     throw FormatError("snapshot manifest has too many entries");
                 }
-                snapshot.entries.reserve(static_cast<std::size_t>(snapshot_entry_count));
+                // Do not reserve from the count. A malformed archive can claim
+                // millions of entries while providing only a few payload bytes;
+                // parse each length-prefixed body before growing this vector.
                 for (std::uint64_t entry_index = 0; entry_index < snapshot_entry_count;
                      ++entry_index) {
                     const auto body_size = payload.vint();

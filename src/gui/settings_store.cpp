@@ -338,6 +338,8 @@ PersistedGuiSettings load_gui_settings() {
         read_dword(key, L"CustomAccentColor", RGB(255, 185, 60)));
     settings.application.toolbar_icon_style =
         read_clamped_int(key, L"ToolbarIconStyle", 0, 0, 2);
+    settings.application.toolbar_display_mode =
+        read_clamped_int(key, L"ToolbarDisplayMode", 0, 0, 1);
     settings.application.startup_location_mode =
         read_clamped_int(key, L"StartupLocationMode", 0, 0, 3);
     settings.application.startup_custom_path = read_string(key, L"StartupCustomPath");
@@ -532,6 +534,9 @@ void save_gui_settings(const PersistedGuiSettings& settings) {
     write_dword(key, L"ToolbarIconStyle",
                 static_cast<DWORD>(std::clamp(
                     settings.application.toolbar_icon_style, 0, 2)));
+    write_dword(key, L"ToolbarDisplayMode",
+                static_cast<DWORD>(std::clamp(
+                    settings.application.toolbar_display_mode, 0, 1)));
     write_dword(key, L"StartupLocationMode",
                 static_cast<DWORD>(std::clamp(settings.application.startup_location_mode, 0, 3)));
     write_string(key, L"StartupCustomPath", settings.application.startup_custom_path);

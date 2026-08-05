@@ -51,7 +51,7 @@ constexpr int kCompressionProfile = 2017;
 constexpr int kSaveCompressionProfile = 2018;
 constexpr int kDeleteCompressionProfile = 2019;
 constexpr int kCompressionPreview = 2020;
-constexpr int kCreateTabs = 2099;
+constexpr int kCreateNavigation = 2099;
 constexpr int kCreateTabBase = 2100;
 constexpr int kUpdateMode = 2110;
 constexpr int kArchiveComment = 2111;
@@ -99,6 +99,7 @@ constexpr int kAccentColorMode = 2238;
 constexpr int kCustomAccentColor = 2239;
 constexpr int kCenterChildWindows = 2240;
 constexpr int kPickAccentColor = 2241;
+constexpr int kToolbarDisplayMode = 2242;
 constexpr int kDefaultUpdateMode = 2250;
 constexpr int kDefaultVolumeSize = 2251;
 constexpr int kDefaultVolumeUnit = 2252;
@@ -288,6 +289,8 @@ constexpr std::array<const wchar_t*, 7> kAccentColorNames{
     L"Custom #RRGGBB"};
 constexpr std::array<const wchar_t*, 3> kToolbarIconStyleNames{
     L"Theme-tinted monochrome", L"Colorful by command", L"Accent-colored"};
+constexpr std::array<const wchar_t*, 2> kToolbarDisplayModeNames{
+    L"Icons and text", L"Icons only"};
 constexpr std::array<const wchar_t*, 4> kStartupLocationNames{
     L"Last location", L"This PC", L"Desktop", L"Custom path"};
 constexpr std::array<const wchar_t*, 3> kFolderPolicyNames{
@@ -776,10 +779,9 @@ std::optional<fs::path> browse_executable(HWND owner, const fs::path& initial = 
                        static_cast<UINT>(sizeof(filters) / sizeof(filters[0])), initial);
 }
 
-constexpr wchar_t kDarkTabClass[] = L"AxiomDarkTabControl";
 constexpr wchar_t kSettingsNavClass[] = L"AxiomSettingsNavigation";
 constexpr wchar_t kSettingsViewportClass[] = L"AxiomSettingsViewport";
-constexpr UINT kDarkTabSetSelection = WM_APP + 41;
+constexpr UINT kPageNavigationSetSelection = WM_APP + 41;
 constexpr UINT kSettingsViewportSetMetrics = WM_APP + 81;
 constexpr UINT kSettingsViewportGetOffset = WM_APP + 82;
 constexpr UINT kSettingsViewportScrollBy = WM_APP + 83;
@@ -790,182 +792,22 @@ struct SettingsViewportMetrics {
     int line_height = 0;
 };
 
-struct DarkTabState {
-    int selected = 0;
-    int hot = -1;
-    HFONT font = nullptr;
-    bool tracking_mouse = false;
-};
-
-int dark_tab_count(HWND window) {
+int page_navigation_count(HWND window) {
     return GetDlgCtrlID(window) == kSettingsTabs
         ? static_cast<int>(kSettingsTabNames.size())
         : static_cast<int>(kCreateTabNames.size());
 }
 
-const wchar_t* dark_tab_text(HWND window, int index) {
+const wchar_t* page_navigation_text(HWND window, int index) {
     if (GetDlgCtrlID(window) == kSettingsTabs) {
         return kSettingsTabNames[static_cast<std::size_t>(index)];
     }
     return kCreateTabNames[static_cast<std::size_t>(index)];
 }
 
-int dark_tab_command_base(HWND window) {
-    return GetDlgCtrlID(window) == kSettingsTabs ? kSettingsTabBase : kCreateTabBase;
-}
-
-int tab_at_position(HWND window, int x) {
-    RECT client{};
-    GetClientRect(window, &client);
-    const int width = std::max(1, static_cast<int>(client.right));
-    const int count = dark_tab_count(window);
-    return std::clamp(x * count / width, 0, count - 1);
-}
-
-void select_dark_tab(HWND window, DarkTabState& state, int selection,
-                     bool notify_parent) {
-    selection = std::clamp(selection, 0, dark_tab_count(window) - 1);
-    if (selection == state.selected && !notify_parent) return;
-    state.selected = selection;
-    InvalidateRect(window, nullptr, FALSE);
-    if (notify_parent) {
-        SendMessageW(GetParent(window), WM_COMMAND,
-                     MAKEWPARAM(dark_tab_command_base(window) + selection, BN_CLICKED),
-                     reinterpret_cast<LPARAM>(window));
-    }
-}
-
-LRESULT CALLBACK dark_tab_window_proc(HWND window, UINT message,
-                                      WPARAM wparam, LPARAM lparam) {
-    auto* state = reinterpret_cast<DarkTabState*>(
-        GetWindowLongPtrW(window, GWLP_USERDATA));
-    if (message == WM_NCCREATE) {
-        state = new DarkTabState{};
-        SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(state));
-    }
-    if (state == nullptr) return DefWindowProcW(window, message, wparam, lparam);
-
-    switch (message) {
-        case WM_SETFONT:
-            state->font = reinterpret_cast<HFONT>(wparam);
-            if (LOWORD(lparam) != 0) InvalidateRect(window, nullptr, FALSE);
-            return 0;
-        case WM_GETFONT:
-            return reinterpret_cast<LRESULT>(state->font);
-        case kDarkTabSetSelection:
-            select_dark_tab(window, *state, static_cast<int>(wparam), false);
-            return 0;
-        case WM_GETDLGCODE:
-            return DLGC_WANTARROWS | DLGC_WANTCHARS;
-        case WM_KEYDOWN: {
-            int selection = state->selected;
-            if (wparam == VK_LEFT) --selection;
-            else if (wparam == VK_RIGHT) ++selection;
-            else if (wparam == VK_HOME) selection = 0;
-            else if (wparam == VK_END) {
-                selection = dark_tab_count(window) - 1;
-            } else {
-                break;
-            }
-            select_dark_tab(window, *state, selection, true);
-            return 0;
-        }
-        case WM_LBUTTONDOWN:
-            SetFocus(window);
-            select_dark_tab(window, *state,
-                            tab_at_position(window, GET_X_LPARAM(lparam)), true);
-            return 0;
-        case WM_MOUSEMOVE: {
-            if (!state->tracking_mouse) {
-                TRACKMOUSEEVENT tracking{sizeof(tracking), TME_LEAVE, window, 0};
-                TrackMouseEvent(&tracking);
-                state->tracking_mouse = true;
-            }
-            const int hot = tab_at_position(window, GET_X_LPARAM(lparam));
-            if (hot != state->hot) {
-                state->hot = hot;
-                InvalidateRect(window, nullptr, FALSE);
-            }
-            return 0;
-        }
-        case WM_MOUSELEAVE:
-            state->tracking_mouse = false;
-            state->hot = -1;
-            InvalidateRect(window, nullptr, FALSE);
-            return 0;
-        case WM_SETFOCUS:
-        case WM_KILLFOCUS:
-            InvalidateRect(window, nullptr, FALSE);
-            return 0;
-        case WM_ERASEBKGND:
-            return 1;
-        case WM_PAINT: {
-            PAINTSTRUCT paint{};
-            HDC target = BeginPaint(window, &paint);
-            RECT client{};
-            GetClientRect(window, &client);
-            HDC memory = CreateCompatibleDC(target);
-            HBITMAP bitmap = CreateCompatibleBitmap(
-                target, std::max(1, static_cast<int>(client.right)),
-                std::max(1, static_cast<int>(client.bottom)));
-            HGDIOBJ old_bitmap = SelectObject(memory, bitmap);
-            const Palette colors = make_palette();
-            HBRUSH background = CreateSolidBrush(colors.window);
-            FillRect(memory, &client, background);
-            DeleteObject(background);
-            HFONT font = state->font != nullptr
-                ? state->font
-                : reinterpret_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
-            HGDIOBJ old_font = SelectObject(memory, font);
-            SetBkMode(memory, TRANSPARENT);
-            SetTextColor(memory, colors.text);
-            const int count = dark_tab_count(window);
-            for (int index = 0; index < count; ++index) {
-                RECT tab{MulDiv(client.right, index, count), 0,
-                         MulDiv(client.right, index + 1, count), client.bottom};
-                const COLORREF fill = index == state->selected
-                    ? colors.focus
-                    : index == state->hot ? colors.hot : colors.button;
-                HBRUSH brush = CreateSolidBrush(fill);
-                FillRect(memory, &tab, brush);
-                DeleteObject(brush);
-                SetTextColor(memory, index == state->selected
-                    ? colors.selection_text : colors.text);
-                HBRUSH border = CreateSolidBrush(colors.border);
-                FrameRect(memory, &tab, border);
-                DeleteObject(border);
-                RECT text_rect = tab;
-                text_rect.left += 8;
-                text_rect.right -= 8;
-                DrawTextW(memory, dark_tab_text(window, index), -1, &text_rect,
-                          DT_CENTER | DT_VCENTER | DT_SINGLELINE |
-                              DT_NOPREFIX | DT_END_ELLIPSIS);
-            }
-            SelectObject(memory, old_font);
-            BitBlt(target, 0, 0, client.right, client.bottom, memory, 0, 0, SRCCOPY);
-            SelectObject(memory, old_bitmap);
-            DeleteObject(bitmap);
-            DeleteDC(memory);
-            EndPaint(window, &paint);
-            return 0;
-        }
-        case WM_NCDESTROY:
-            SetWindowLongPtrW(window, GWLP_USERDATA, 0);
-            delete state;
-            return 0;
-    }
-    return DefWindowProcW(window, message, wparam, lparam);
-}
-
-bool register_dark_tab_class(HINSTANCE instance) {
-    WNDCLASSEXW window_class{sizeof(window_class)};
-    window_class.style = CS_HREDRAW | CS_VREDRAW;
-    window_class.lpfnWndProc = dark_tab_window_proc;
-    window_class.hInstance = instance;
-    window_class.hCursor = LoadCursorW(nullptr, IDC_HAND);
-    window_class.lpszClassName = kDarkTabClass;
-    return RegisterClassExW(&window_class) != 0 ||
-           GetLastError() == ERROR_CLASS_ALREADY_EXISTS;
+int page_navigation_command_base(HWND window) {
+    return GetDlgCtrlID(window) == kSettingsTabs
+        ? kSettingsTabBase : kCreateTabBase;
 }
 
 struct SettingsNavState {
@@ -987,19 +829,21 @@ int settings_nav_item_height(HWND window) {
 int settings_nav_index_at_position(HWND window, int y) {
     if (y < 0) return -1;
     const int index = y / std::max(1, settings_nav_item_height(window));
-    const int count = dark_tab_count(window);
+    const int count = page_navigation_count(window);
     return index >= 0 && index < count ? index : -1;
 }
 
 void select_settings_nav(HWND window, SettingsNavState& state, int selection,
                          bool notify_parent) {
-    selection = std::clamp(selection, 0, dark_tab_count(window) - 1);
+    selection = std::clamp(selection, 0,
+                           page_navigation_count(window) - 1);
     if (selection == state.selected && !notify_parent) return;
     state.selected = selection;
     InvalidateRect(window, nullptr, FALSE);
     if (notify_parent) {
         SendMessageW(GetParent(window), WM_COMMAND,
-                     MAKEWPARAM(dark_tab_command_base(window) + selection, BN_CLICKED),
+                     MAKEWPARAM(page_navigation_command_base(window) + selection,
+                                BN_CLICKED),
                      reinterpret_cast<LPARAM>(window));
     }
 }
@@ -1021,7 +865,7 @@ LRESULT CALLBACK settings_nav_window_proc(HWND window, UINT message,
             return 0;
         case WM_GETFONT:
             return reinterpret_cast<LRESULT>(state->font);
-        case kDarkTabSetSelection:
+        case kPageNavigationSetSelection:
             select_settings_nav(window, *state, static_cast<int>(wparam), false);
             return 0;
         case WM_GETDLGCODE:
@@ -1031,7 +875,9 @@ LRESULT CALLBACK settings_nav_window_proc(HWND window, UINT message,
             if (wparam == VK_UP) --selection;
             else if (wparam == VK_DOWN) ++selection;
             else if (wparam == VK_HOME) selection = 0;
-            else if (wparam == VK_END) selection = dark_tab_count(window) - 1;
+            else if (wparam == VK_END) {
+                selection = page_navigation_count(window) - 1;
+            }
             else if (wparam == VK_PRIOR) selection -= 3;
             else if (wparam == VK_NEXT) selection += 3;
             else if (wparam == VK_SPACE || wparam == VK_RETURN) {
@@ -1097,7 +943,7 @@ LRESULT CALLBACK settings_nav_window_proc(HWND window, UINT message,
             SetBkMode(memory, TRANSPARENT);
             SetTextColor(memory, colors.text);
 
-            const int count = dark_tab_count(window);
+            const int count = page_navigation_count(window);
             const int item_height = settings_nav_item_height(window);
             const int text_pad_x = scale_for_window(window, 14);
             for (int index = 0; index < count; ++index) {
@@ -1121,7 +967,8 @@ LRESULT CALLBACK settings_nav_window_proc(HWND window, UINT message,
                 RECT text_rect = item;
                 text_rect.left += text_pad_x;
                 text_rect.right -= text_pad_x;
-                DrawTextW(memory, dark_tab_text(window, index), -1, &text_rect,
+                DrawTextW(memory, page_navigation_text(window, index), -1,
+                          &text_rect,
                           DT_LEFT | DT_VCENTER | DT_SINGLELINE |
                               DT_NOPREFIX | DT_END_ELLIPSIS);
             }
@@ -2555,10 +2402,14 @@ public:
                 toggle_toolbar_settings_row(toolbar_list_.focused_index());
                 continue;
             }
-            if (mode_ == DialogMode::settings &&
-                settings_viewport_ != nullptr &&
-                (message.hwnd == settings_viewport_ ||
-                 IsChild(settings_viewport_, message.hwnd))) {
+            const HWND page_viewport = mode_ == DialogMode::settings
+                ? settings_viewport_
+                : mode_ == DialogMode::create_archive
+                    ? create_viewport_
+                    : nullptr;
+            if (page_viewport != nullptr &&
+                (message.hwnd == page_viewport ||
+                 IsChild(page_viewport, message.hwnd))) {
                 wchar_t class_name[32]{};
                 GetClassNameW(message.hwnd, class_name,
                               static_cast<int>(std::size(class_name)));
@@ -2570,23 +2421,23 @@ public:
                     (toolbar_list_.hwnd() != nullptr &&
                      IsChild(toolbar_list_.hwnd(), message.hwnd));
                 if (message.message == WM_MOUSEWHEEL && !combo && !table) {
-                    SendMessageW(settings_viewport_, WM_MOUSEWHEEL,
+                    SendMessageW(page_viewport, WM_MOUSEWHEEL,
                                  message.wParam, message.lParam);
                     continue;
                 }
                 if (message.message == WM_KEYDOWN && !combo && !table &&
                     (message.wParam == VK_PRIOR ||
                      message.wParam == VK_NEXT)) {
-                    SendMessageW(settings_viewport_, WM_KEYDOWN,
+                    SendMessageW(page_viewport, WM_KEYDOWN,
                                  message.wParam, message.lParam);
                     continue;
                 }
             }
             const bool handled = IsDialogMessageW(window_, &message) != FALSE;
-            if (mode_ == DialogMode::settings &&
+            if (page_viewport != nullptr &&
                 message.message == WM_KEYDOWN &&
                 message.wParam == VK_TAB) {
-                ensure_settings_focus_visible(GetFocus());
+                ensure_viewport_focus_visible(page_viewport, GetFocus());
             }
             if (!handled) {
                 TranslateMessage(&message);
@@ -2609,10 +2460,10 @@ public:
 private:
     static const wchar_t* class_name() { return L"AxiomDarkOptionsDialog"; }
     static constexpr UINT_PTR kCompositorRevealTimer = 0xA710;
-    static constexpr int kCreateInitialClientWidth = 1180;
-    static constexpr int kCreateInitialClientHeight = 690;
-    static constexpr int kCreateMinimumClientWidth = 970;
-    static constexpr int kCreateMinimumClientHeight = 660;
+    static constexpr int kCreateInitialClientWidth = 1000;
+    static constexpr int kCreateInitialClientHeight = 650;
+    static constexpr int kCreateMinimumClientWidth = 900;
+    static constexpr int kCreateMinimumClientHeight = 600;
 
     const wchar_t* layout_name() const {
         switch (mode_) {
@@ -2637,8 +2488,7 @@ private:
             dialog_registered = atom != 0 ||
                                 GetLastError() == ERROR_CLASS_ALREADY_EXISTS;
         }
-        return dialog_registered && register_dark_tab_class(instance_) &&
-               register_settings_nav_class(instance_) &&
+        return dialog_registered && register_settings_nav_class(instance_) &&
                register_settings_viewport_class(instance_);
     }
 
@@ -2773,6 +2623,9 @@ private:
     HWND page_control(int page, const wchar_t* type, const wchar_t* text,
                       DWORD style, int id) {
         HWND result = control(type, text, style, id);
+        if (create_viewport_ != nullptr) {
+            SetParent(result, create_viewport_);
+        }
         page_controls_.push_back({result, page});
         return result;
     }
@@ -3088,7 +2941,7 @@ private:
         // of settings construction. Defer them until the Toolbar page is
         // actually requested so opening Settings is independent of toolbar
         // catalog size and does not initialize GDI+ on the first frame.
-        create_toolbar_settings_list(9, 0, 76, 2000, 462);
+        create_toolbar_settings_list(9, 0, 110, 2000, 420);
     }
 
     void toggle_toolbar_settings_row(int row) {
@@ -3356,8 +3209,12 @@ private:
         setting_label(9, L"Toolbar buttons", 0, 0, 660);
         setting_label(9,
                       L"Choose which commands appear on the main command toolbar. "
-                      L"Buttons keep this order and wrap when needed.",
+                      L"Buttons keep this order and wrap when needed. Hover a button "
+                      L"to preview its active state.",
                       0, 30, 760, 38, true);
+        setting_label(9, L"Button labels", 0, 72, 170);
+        setting_combo(9, kToolbarDisplayMode, kToolbarDisplayModeNames,
+                      180, 66, 220);
         setting_control(9, L"BUTTON", L"Restore default toolbar",
                         WS_TABSTOP | BS_OWNERDRAW,
                         kToolbarResetDefaults, 0, 552, 180, 30);
@@ -3459,6 +3316,8 @@ private:
                            L"Absolute HTTPS URL for a custom update feed. Leave empty to use Axiom's official GitHub release feed.");
         add_dialog_tooltip(tooltip_, item(kShortcutValue),
                            L"Key-chord text such as Ctrl+O, Alt+Left, F5, Delete, or None.");
+        add_dialog_tooltip(tooltip_, item(kToolbarDisplayMode),
+                           L"Choose whether the main command toolbar shows labels beside icons or uses icons only. Full command names remain available as tooltips.");
         add_dialog_tooltip(tooltip_, item(kLogFolder),
                            L"Windows folder path for verbose operation logs.");
         add_dialog_tooltip(tooltip_, item(kBrowseLogFolder),
@@ -3477,6 +3336,20 @@ private:
     }
 
     void create_create_controls() {
+        create_navigation_ = control(kSettingsNavClass, L"",
+                                     WS_TABSTOP | WS_GROUP,
+                                     kCreateNavigation);
+        create_viewport_ = CreateWindowExW(
+            WS_EX_CONTROLPARENT, kSettingsViewportClass, L"",
+            WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN | WS_CLIPSIBLINGS,
+            0, 0, 0, 0, window_, nullptr, instance_, nullptr);
+        SendMessageW(create_viewport_, WM_SETFONT,
+                     reinterpret_cast<WPARAM>(font_), TRUE);
+        create_page_heading_ = control(L"STATIC", L"",
+                                        SS_LEFT | SS_NOPREFIX,
+                                        0);
+        SetParent(create_page_heading_, create_viewport_);
+
         summary_ = label(L"");
         path_label_ = label(L"Output file path");
         path_edit_ = control(L"EDIT", L"", WS_TABSTOP | ES_AUTOHSCROLL, kPathEdit);
@@ -3485,9 +3358,6 @@ private:
                      MAKELPARAM(scale(6), scale(6)));
         format_label_ = label(L"Format");
         format_combo_ = archive_format_combo();
-
-        create_tabs_ = control(kDarkTabClass, L"", WS_TABSTOP | WS_GROUP,
-                               kCreateTabs);
 
         update_mode_label_ = page_label(1, L"Update mode");
         update_mode_combo_ = page_combo(1, kUpdateMode, kUpdateModeNames);
@@ -3536,8 +3406,8 @@ private:
             0,
             L"Default values follow the selected compression level. Larger dictionaries and "
             L"solid blocks can improve ratio but increase memory use.", true);
-        compression_preview_ = control(
-            L"STATIC", L"", SS_OWNERDRAW | SS_NOTIFY,
+        compression_preview_ = page_control(
+            0, L"STATIC", L"", SS_OWNERDRAW | SS_NOTIFY,
             kCompressionPreview);
 
         encrypt_data_ = page_checkbox(2, kEncryptData, L"Encrypt file data");
@@ -3612,13 +3482,6 @@ private:
             4, kSfxRequireAccept, L"Require the license to be accepted");
         sfx_open_destination_ = page_checkbox(
             4, kSfxOpenDestination, L"Open the destination when finished");
-        sfx_info_ = page_label(
-            4,
-            L"The Output file path becomes the .exe, and no separate archive is kept. "
-            L"These settings are stored inside it. Leave the destination empty to extract "
-            L"beside the executable, or use %ProgramFiles%, %LOCALAPPDATA%, %APPDATA%, "
-            L"%USERPROFILE%, %DESKTOP%, %DOCUMENTS%, %TEMP%, %SFXDIR%, or %SFXNAME%.",
-            true);
 
         SendMessageW(path_edit_, EM_SETLIMITTEXT, 32767, 0);
         SendMessageW(comment_edit_, EM_SETLIMITTEXT, 65535, 0);
@@ -3835,8 +3698,11 @@ private:
 
     HWND item(int id) const {
         if (HWND result = GetDlgItem(window_, id)) return result;
-        return settings_viewport_ != nullptr
-            ? GetDlgItem(settings_viewport_, id) : nullptr;
+        if (settings_viewport_ != nullptr) {
+            if (HWND result = GetDlgItem(settings_viewport_, id)) return result;
+        }
+        return create_viewport_ != nullptr
+            ? GetDlgItem(create_viewport_, id) : nullptr;
     }
 
     int selected_index(int id, int fallback = 0) const {
@@ -4242,6 +4108,8 @@ private:
                         color_to_hex(application_options.custom_accent_color));
         set_selected_index(kToolbarIconStyle,
                            std::clamp(application_options.toolbar_icon_style, 0, 2));
+        set_selected_index(kToolbarDisplayMode,
+                           std::clamp(application_options.toolbar_display_mode, 0, 1));
         application_options.toolbar_commands =
             normalize_toolbar_commands(application_options.toolbar_commands);
         refresh_toolbar_settings_list();
@@ -4552,6 +4420,8 @@ private:
                             color_to_hex(application_options.custom_accent_color));
         }
         application_options.toolbar_icon_style = selected_index(kToolbarIconStyle, 0);
+        application_options.toolbar_display_mode =
+            selected_index(kToolbarDisplayMode, 0);
         application_options.toolbar_commands =
             normalize_toolbar_commands(application_options.toolbar_commands);
         application_options.startup_location_mode = selected_index(kStartupMode, 0);
@@ -4915,7 +4785,7 @@ private:
 
             if (control.window == toolbar_list_.hwnd()) {
                 x = 0;
-                y = scale(68);
+                y = scale(110);
                 width = usable_width;
                 height = std::max(
                     scale(150), static_cast<int>(viewport.bottom) -
@@ -5012,138 +4882,168 @@ private:
     }
 
     void layout_create() {
-        if (window_ == nullptr || accept_ == nullptr) return;
+        if (window_ == nullptr || accept_ == nullptr ||
+            create_navigation_ == nullptr || create_viewport_ == nullptr) {
+            return;
+        }
+
         SendMessageW(window_, WM_SETREDRAW, FALSE, 0);
         RECT client{};
         GetClientRect(window_, &client);
-        const int margin = scale(18);
+        const int margin = scale(14);
         const int row = scale(30);
-        const int gap = scale(10);
-        const int label_width = scale(190);
-        const int content_left = margin + scale(12);
-        const int content_right = client.right - margin - scale(12);
-        const int content_width = std::max(scale(260),
-                                           content_right - content_left);
-
-        int y = margin;
-        MoveWindow(summary_, margin, y, client.right - margin * 2, scale(24), TRUE);
-        y += scale(31);
-        MoveWindow(path_label_, margin, y + scale(6), scale(120), row, TRUE);
+        const int gap = scale(8);
         const int browse_width = scale(86);
-        const int edit_x = margin + scale(126);
-        MoveWindow(path_edit_, edit_x, y,
-                   std::max(scale(120), static_cast<int>(client.right) -
-                            margin - browse_width - gap - edit_x),
-                   row, TRUE);
-        MoveWindow(browse_, client.right - margin - browse_width, y,
-                   browse_width, row, TRUE);
-        y += row + scale(10);
-        MoveWindow(format_label_, margin, y + scale(6), scale(72), row, TRUE);
-        MoveWindow(format_combo_, edit_x, y, scale(260), scale(240), TRUE);
-        y += row + scale(15);
+        const int label_width = scale(170);
 
-        MoveWindow(create_tabs_, margin, y,
-                   std::max(scale(300), static_cast<int>(client.right) - margin * 2),
-                   scale(36), TRUE);
-        const int page_top = y + scale(50);
+        // Keep the archive identity and output controls fixed while the page
+        // content scrolls. The format selector shares the first header row
+        // with the item count to reclaim the vertical space used by the old
+        // three-row header and horizontal tab strip.
+        const int header_y = margin;
+        const int format_width = scale(240);
+        const int format_label_width = scale(62);
+        const int format_x = client.right - margin - format_width;
+        MoveWindow(summary_, margin, header_y,
+                   std::max(scale(180), format_x - margin - gap -
+                            format_label_width), row, TRUE);
+        MoveWindow(format_label_, format_x - gap - format_label_width,
+                   header_y + scale(6), format_label_width, row, TRUE);
+        MoveWindow(format_combo_, format_x, header_y, format_width,
+                   scale(240), TRUE);
+
+        const int path_y = header_y + row + gap;
+        const int path_label_width = scale(112);
+        const int path_edit_x = margin + path_label_width + gap;
+        MoveWindow(path_label_, margin, path_y + scale(6), path_label_width,
+                   row, TRUE);
+        MoveWindow(path_edit_, path_edit_x, path_y,
+                   std::max(scale(120), static_cast<int>(client.right) -
+                            margin - browse_width - gap - path_edit_x),
+                   row, TRUE);
+        MoveWindow(browse_, client.right - margin - browse_width, path_y,
+                   browse_width, row, TRUE);
+
         const int button_y = client.bottom - margin - row;
-        const int page_bottom = button_y - scale(12);
         const int button_width = scale(86);
         MoveWindow(cancel_, client.right - margin - button_width, button_y,
                    button_width, row, TRUE);
-        MoveWindow(accept_, client.right - margin - button_width * 2 - scale(8),
+        MoveWindow(accept_, client.right - margin - button_width * 2 - gap,
                    button_y, button_width, row, TRUE);
 
-        y = page_top;
-        auto row_pair = [&](HWND label_window, HWND value, int value_width = 310,
-                            bool combo = true) {
-            MoveWindow(label_window, content_left, y + scale(6), label_width, row, TRUE);
-            MoveWindow(value, content_left + label_width, y,
-                       std::min(scale(value_width), content_width - label_width),
-                       combo ? scale(240) : row, TRUE);
-            y += row + scale(12);
+        const int page_top = path_y + row + scale(12);
+        const int page_bottom = button_y - scale(12);
+        const int navigation_width = scale(154);
+        const int navigation_gap = scale(14);
+        const int viewport_x = margin + navigation_width + navigation_gap;
+        const int page_height = std::max(row, page_bottom - page_top);
+        const int viewport_width = std::max(
+            scale(300), static_cast<int>(client.right) - margin - viewport_x);
+        MoveWindow(create_navigation_, margin, page_top, navigation_width,
+                   page_height, TRUE);
+        MoveWindow(create_viewport_, viewport_x, page_top, viewport_width,
+                   page_height, TRUE);
+
+        RECT viewport{};
+        GetClientRect(create_viewport_, &viewport);
+        const int scrollbar_gutter = scale(16);
+        const int content_width = std::max(
+            scale(260), static_cast<int>(viewport.right) - scrollbar_gutter);
+        const int content_top = scale(42);
+
+        const auto move_page_control = [&](HWND control, int x, int y,
+                                           int width, int height,
+                                           int scroll_offset) {
+            if (control == nullptr) return;
+            MoveWindow(control, x, y - scroll_offset, width, height, TRUE);
+        };
+        const auto move_page_wrapped = [&](HWND control, int x, int& y,
+                                           int width, int minimum,
+                                           int scroll_offset, int trailing_gap) {
+            const int height = wrapped_height(control, width, scale(minimum));
+            move_page_control(control, x, y, width, height, scroll_offset);
+            y += height + scale(trailing_gap);
         };
 
-        const int preview_gap = scale(20);
-        const bool show_compression_preview =
-            create_page_ == 0 && content_width >= scale(890);
-        int compression_content_width = content_width;
-        if (show_compression_preview) {
-            // Keep the settings form only as wide as its controls need. The
-            // prognosis chart benefits from horizontal room, while stretching
-            // short combo-box values leaves a visually empty middle column.
-            constexpr int kCompressionFormWidth = 548;
-            compression_content_width = std::min(
-                scale(kCompressionFormWidth),
-                content_width - preview_gap - scale(320));
-            const int preview_width =
-                content_width - compression_content_width - preview_gap;
-            MoveWindow(
-                compression_preview_,
-                content_left + compression_content_width + preview_gap,
-                page_top, preview_width,
-                std::max(scale(260), page_bottom - page_top),
-                TRUE);
-            ShowWindow(compression_preview_, SW_SHOWNA);
-        } else if (compression_preview_ != nullptr) {
-            ShowWindow(compression_preview_, SW_HIDE);
-        }
+        const auto layout_page = [&](int scroll_offset) {
+            move_page_control(create_page_heading_, 0, 0, content_width,
+                              row, scroll_offset);
+            int y = content_top;
+            int content_height = content_top;
+            const int value_x = label_width;
 
-        switch (create_page_) {
-            case 1: {
-                row_pair(update_mode_label_, update_mode_combo_, 340);
-                MoveWindow(comment_label_, content_left, y + scale(5), label_width, row, TRUE);
-                const int comment_height = std::clamp(
-                    page_bottom - y - scale(160), scale(58), scale(105));
-                MoveWindow(comment_edit_, content_left + label_width, y,
-                           content_width - label_width, comment_height, TRUE);
-                y += comment_height + scale(12);
-                MoveWindow(lock_archive_, content_left + label_width, y,
-                           content_width - label_width, row, TRUE);
-                y += row + scale(4);
-                MoveWindow(repack_after_update_, content_left + label_width, y,
-                           content_width - label_width, row, TRUE);
-                y += row + scale(16);
-                MoveWindow(metadata_heading_, content_left, y,
-                           content_width, scale(24), TRUE);
-                y += scale(30);
-                move_wrapped(metadata_info_, content_left, y, content_width, 38);
-                break;
-            }
-            case 0:
-                MoveWindow(compression_profile_label_, content_left, y + scale(6),
-                           label_width, row, TRUE);
-                {
-                    const int action_width = scale(58);
-                    const int action_gap = scale(8);
-                    const int combo_width = std::max(
-                        scale(180), compression_content_width - label_width -
+            const auto row_pair = [&](HWND label_window, HWND value,
+                                      int value_width = 340,
+                                      bool combo = true) {
+                move_page_control(label_window, 0, y + scale(6), label_width,
+                                  row, scroll_offset);
+                move_page_control(value, value_x, y,
+                                  std::min(scale(value_width),
+                                           std::max(scale(120),
+                                                    content_width - value_x)),
+                                  combo ? scale(240) : row, scroll_offset);
+                y += row + gap;
+            };
+
+            switch (create_page_) {
+                case 0: {
+                    const int preview_gap = scale(14);
+                    const bool show_preview = content_width >= scale(760);
+                    int form_width = content_width;
+                    if (show_preview) {
+                        form_width = std::min(
+                            scale(460), content_width - preview_gap - scale(270));
+                    }
+                    const int preview_width = content_width - form_width - preview_gap;
+                    const int compression_label_width = std::min(
+                        label_width, std::max(scale(140),
+                                             form_width - scale(250)));
+
+                    if (show_preview && compression_preview_ != nullptr) {
+                        move_page_control(compression_preview_,
+                                          form_width + preview_gap, content_top,
+                                          std::max(scale(240), preview_width),
+                                          scale(360), scroll_offset);
+                        ShowWindow(compression_preview_, SW_SHOWNA);
+                    } else if (compression_preview_ != nullptr) {
+                        ShowWindow(compression_preview_, SW_HIDE);
+                    }
+
+                    move_page_control(compression_profile_label_, 0,
+                                      y + scale(6), compression_label_width,
+                                      row, scroll_offset);
+                    const int action_width = scale(56);
+                    const int action_gap = scale(6);
+                    const int profile_value_x = compression_label_width;
+                    const int profile_combo_width = std::max(
+                        scale(120), form_width - compression_label_width -
                                         action_width * 2 - action_gap * 2);
-                    const int value_x = content_left + label_width;
-                    MoveWindow(compression_profile_combo_, value_x, y,
-                               combo_width, scale(260), TRUE);
-                    MoveWindow(save_compression_profile_, value_x + combo_width + action_gap,
-                               y, action_width, row, TRUE);
-                    MoveWindow(delete_compression_profile_,
-                               value_x + combo_width + action_gap * 2 + action_width,
-                               y, action_width, row, TRUE);
-                }
-                y += row + scale(12);
-                {
-                    const auto compression_row = [&](
-                                                     HWND label_window,
+                    move_page_control(compression_profile_combo_,
+                                      profile_value_x, y, profile_combo_width,
+                                      scale(260), scroll_offset);
+                    move_page_control(save_compression_profile_,
+                                      profile_value_x + profile_combo_width +
+                                          action_gap,
+                                      y, action_width, row, scroll_offset);
+                    move_page_control(delete_compression_profile_,
+                                      profile_value_x + profile_combo_width +
+                                          action_gap * 2 + action_width,
+                                      y, action_width, row, scroll_offset);
+                    y += row + gap;
+
+                    const auto compression_row = [&](HWND label_window,
                                                      HWND value,
                                                      int value_width = 260) {
-                        MoveWindow(
-                            label_window, content_left, y + scale(6),
-                            label_width, row, TRUE);
-                        MoveWindow(
-                            value, content_left + label_width, y,
-                            std::min(
-                                scale(value_width),
-                                compression_content_width - label_width),
-                            scale(240), TRUE);
-                        y += row + scale(12);
+                        move_page_control(label_window, 0, y + scale(6),
+                                          compression_label_width, row,
+                                          scroll_offset);
+                        move_page_control(value, compression_label_width, y,
+                                          std::min(scale(value_width),
+                                                   std::max(scale(120),
+                                                            form_width -
+                                                                compression_label_width)),
+                                          scale(240), scroll_offset);
+                        y += row + gap;
                     };
                     compression_row(method_label_, method_combo_);
                     compression_row(level_label_, level_combo_);
@@ -5152,144 +5052,208 @@ private:
                     compression_row(solid_block_label_, solid_block_combo_);
                     compression_row(threads_label_, threads_combo_, 230);
                     compression_row(thread_model_label_, thread_model_combo_);
+                    y += scale(4);
+                    move_page_wrapped(compression_info_, 0, y,
+                                      show_preview ? form_width : content_width,
+                                      54, scroll_offset, 10);
+                    content_height = std::max(
+                        y, show_preview ? content_top + scale(360) : y);
+                    break;
                 }
-                y += scale(8);
-                move_wrapped(
-                    compression_info_, content_left, y,
-                    compression_content_width, 54);
-                break;
-            case 2:
-                MoveWindow(encrypt_data_, content_left, y, content_width, row, TRUE);
-                y += row + scale(4);
-                MoveWindow(encrypt_names_, content_left, y, content_width, row, TRUE);
-                y += row + scale(14);
-                row_pair(password_label_, password_edit_, 340, false);
-                row_pair(confirm_password_label_, confirm_password_edit_, 340, false);
-                MoveWindow(show_password_, content_left + label_width, y,
-                           content_width - label_width, row, TRUE);
-                y += row + scale(20);
-                MoveWindow(sign_archive_, content_left, y, content_width, row, TRUE);
-                y += row + scale(12);
-                MoveWindow(signing_key_label_, content_left, y + scale(6),
-                           label_width, row, TRUE);
-                MoveWindow(signing_key_edit_, content_left + label_width, y,
-                           std::max(scale(120), std::min(scale(340),
-                                    content_width - label_width - browse_width - gap)),
-                           row, TRUE);
-                MoveWindow(browse_signing_key_,
-                           content_left + label_width +
-                               std::max(scale(120), std::min(scale(340),
-                                        content_width - label_width - browse_width - gap)) +
-                               gap,
-                           y, browse_width, row, TRUE);
-                y += row + scale(18);
-                move_wrapped(security_info_, content_left, y, content_width, 46);
-                break;
-            case 3:
-                MoveWindow(volume_size_label_, content_left, y + scale(6), label_width, row, TRUE);
-                MoveWindow(volume_size_edit_, content_left + label_width, y, scale(180), row, TRUE);
-                MoveWindow(volume_unit_combo_, content_left + label_width + scale(190), y,
-                           scale(105), scale(180), TRUE);
-                y += row + scale(15);
-                MoveWindow(recovery_percent_label_, content_left, y + scale(6), label_width, row, TRUE);
-                MoveWindow(recovery_percent_edit_, content_left + label_width, y,
-                           scale(90), row, TRUE);
-                MoveWindow(recovery_percent_suffix_, content_left + label_width + scale(100),
-                           y + scale(6), scale(170), row, TRUE);
-                y += row + scale(18);
-                MoveWindow(recovery_volumes_, content_left + label_width, y,
-                           content_width - label_width, row, TRUE);
-                y += row + scale(28);
-                move_wrapped(recovery_info_, content_left, y, content_width, 52);
-                break;
-            case 4: {
-                MoveWindow(create_sfx_, content_left, y, content_width, row, TRUE);
-                y += row + scale(16);
+                case 1: {
+                    row_pair(update_mode_label_, update_mode_combo_, 340);
+                    move_page_control(comment_label_, 0, y + scale(5),
+                                      label_width, row, scroll_offset);
+                    const int comment_height = scale(86);
+                    move_page_control(comment_edit_, value_x, y,
+                                      std::max(scale(160), content_width - value_x),
+                                      comment_height, scroll_offset);
+                    y += comment_height + gap;
+                    move_page_control(lock_archive_, value_x, y,
+                                      std::max(scale(160), content_width - value_x),
+                                      row, scroll_offset);
+                    y += row + scale(4);
+                    move_page_control(repack_after_update_, value_x, y,
+                                      std::max(scale(160), content_width - value_x),
+                                      row, scroll_offset);
+                    y += row + scale(12);
+                    move_page_control(metadata_heading_, 0, y, content_width,
+                                      row, scroll_offset);
+                    y += row + scale(4);
+                    move_page_wrapped(metadata_info_, 0, y, content_width,
+                                      38, scroll_offset, 10);
+                    content_height = y;
+                    break;
+                }
+                case 2: {
+                    move_page_control(encrypt_data_, 0, y, content_width, row,
+                                      scroll_offset);
+                    y += row + scale(4);
+                    move_page_control(encrypt_names_, 0, y, content_width, row,
+                                      scroll_offset);
+                    y += row + gap;
+                    row_pair(password_label_, password_edit_, 340, false);
+                    row_pair(confirm_password_label_, confirm_password_edit_,
+                             340, false);
+                    move_page_control(show_password_, value_x, y,
+                                      std::max(scale(160), content_width - value_x),
+                                      row, scroll_offset);
+                    y += row + scale(12);
+                    move_page_control(sign_archive_, 0, y, content_width, row,
+                                      scroll_offset);
+                    y += row + gap;
+                    move_page_control(signing_key_label_, 0, y + scale(6),
+                                      label_width, row, scroll_offset);
+                    const int signing_edit_width = std::max(
+                        scale(120), content_width - value_x - browse_width - gap);
+                    move_page_control(signing_key_edit_, value_x, y,
+                                      signing_edit_width, row, scroll_offset);
+                    move_page_control(browse_signing_key_,
+                                      value_x + signing_edit_width + gap, y,
+                                      browse_width, row, scroll_offset);
+                    y += row + scale(12);
+                    move_page_wrapped(security_info_, 0, y, content_width,
+                                      46, scroll_offset, 10);
+                    content_height = y;
+                    break;
+                }
+                case 3: {
+                    move_page_control(volume_size_label_, 0, y + scale(6),
+                                      label_width, row, scroll_offset);
+                    const int volume_edit_width = scale(160);
+                    move_page_control(volume_size_edit_, value_x, y,
+                                      volume_edit_width, row, scroll_offset);
+                    move_page_control(volume_unit_combo_,
+                                      value_x + volume_edit_width + gap, y,
+                                      scale(105), scale(180), scroll_offset);
+                    y += row + gap;
+                    move_page_control(recovery_percent_label_, 0, y + scale(6),
+                                      label_width, row, scroll_offset);
+                    const int recovery_edit_width = scale(80);
+                    move_page_control(recovery_percent_edit_, value_x, y,
+                                      recovery_edit_width, row, scroll_offset);
+                    move_page_control(recovery_percent_suffix_,
+                                      value_x + recovery_edit_width + gap, y + scale(6),
+                                      scale(170), row, scroll_offset);
+                    y += row + scale(10);
+                    move_page_control(recovery_volumes_, value_x, y,
+                                      std::max(scale(160), content_width - value_x),
+                                      row, scroll_offset);
+                    y += row + scale(12);
+                    move_page_wrapped(recovery_info_, 0, y, content_width,
+                                      52, scroll_offset, 10);
+                    content_height = y;
+                    break;
+                }
+                case 4: {
+                    move_page_control(create_sfx_, 0, y, content_width, row,
+                                      scroll_offset);
+                    y += row + scale(10);
 
-                // Two columns: this page carries twice as many settings as the
-                // others, and a single column overran the buttons while leaving
-                // the right half of a 1180-wide dialog empty.
-                const int column_gap = scale(28);
-                const bool two_columns =
-                    content_width >= label_width * 2 + scale(240) * 2 + column_gap;
-                const int column_width = two_columns
-                    ? (content_width - column_gap) / 2
-                    : content_width;
-                const int value_width =
-                    std::max(scale(150), column_width - label_width);
-                const int right_left = content_left + column_width + column_gap;
-                const int form_top = y;
+                    const int sfx_label_width = std::min(
+                        label_width, std::max(scale(130),
+                                             content_width - scale(120)));
+                    const int column_gap = scale(16);
+                    const bool two_columns = content_width >=
+                        sfx_label_width * 2 + scale(120) * 2 + column_gap;
+                    const int column_width = two_columns
+                        ? (content_width - column_gap) / 2
+                        : content_width;
+                    const int sfx_value_width = column_width - sfx_label_width;
+                    const int right_left = column_width + column_gap;
+                    const int form_top = y;
+                    const int pitch = row + gap;
 
-                auto cell = [&](HWND label_window, HWND value, int left, int top,
-                                bool combo) {
-                    MoveWindow(label_window, left, top + scale(6), label_width, row,
-                               TRUE);
-                    MoveWindow(value, left + label_width, top, value_width,
-                               combo ? scale(240) : row, TRUE);
-                };
+                    const auto cell = [&](HWND label_window, HWND value,
+                                          int left, int top, bool combo) {
+                        move_page_control(label_window, left, top + scale(6),
+                                          sfx_label_width, row, scroll_offset);
+                        move_page_control(value, left + sfx_label_width, top,
+                                          sfx_value_width,
+                                          combo ? scale(240) : row,
+                                          scroll_offset);
+                    };
 
-                const int pitch = row + scale(12);
-                int left_y = form_top;
-                cell(sfx_stub_tier_label_, sfx_stub_tier_combo_, content_left,
-                     left_y, true);
-                left_y += pitch;
-                cell(sfx_title_label_, sfx_title_edit_, content_left, left_y, false);
-                left_y += pitch;
-                cell(sfx_description_label_, sfx_description_edit_, content_left,
-                     left_y, false);
-                left_y += pitch;
-                cell(sfx_default_path_label_, sfx_default_path_combo_, content_left,
-                     left_y, true);
-                left_y += pitch;
-                cell(sfx_overwrite_label_, sfx_overwrite_combo_, content_left,
-                     left_y, true);
-                left_y += pitch;
+                    int left_y = form_top;
+                    cell(sfx_stub_tier_label_, sfx_stub_tier_combo_, 0, left_y, true);
+                    left_y += pitch;
+                    cell(sfx_title_label_, sfx_title_edit_, 0, left_y, false);
+                    left_y += pitch;
+                    cell(sfx_description_label_, sfx_description_edit_, 0,
+                         left_y, false);
+                    left_y += pitch;
+                    cell(sfx_default_path_label_, sfx_default_path_combo_, 0,
+                         left_y, true);
+                    left_y += pitch;
+                    cell(sfx_overwrite_label_, sfx_overwrite_combo_, 0, left_y, true);
+                    left_y += pitch;
 
-                int right_y = two_columns ? form_top : left_y;
-                const int right_x = two_columns ? right_left : content_left;
-                cell(sfx_mode_label_, sfx_mode_combo_, right_x, right_y, true);
-                right_y += pitch;
-                cell(sfx_elevation_label_, sfx_elevation_combo_, right_x, right_y,
-                     true);
-                right_y += pitch;
-                cell(sfx_run_program_label_, sfx_run_program_edit_, right_x, right_y,
-                     false);
-                right_y += pitch;
-                cell(sfx_run_arguments_label_, sfx_run_arguments_edit_, right_x,
-                     right_y, false);
-                right_y += pitch;
-                cell(sfx_theme_label_, sfx_theme_combo_, right_x, right_y, true);
-                right_y += pitch;
+                    int right_y = two_columns ? form_top : left_y;
+                    const int right_x = two_columns ? right_left : 0;
+                    cell(sfx_mode_label_, sfx_mode_combo_, right_x, right_y, true);
+                    right_y += pitch;
+                    cell(sfx_elevation_label_, sfx_elevation_combo_, right_x,
+                         right_y, true);
+                    right_y += pitch;
+                    cell(sfx_run_program_label_, sfx_run_program_edit_, right_x,
+                         right_y, false);
+                    right_y += pitch;
+                    cell(sfx_run_arguments_label_, sfx_run_arguments_edit_, right_x,
+                         right_y, false);
+                    right_y += pitch;
+                    cell(sfx_theme_label_, sfx_theme_combo_, right_x, right_y, true);
+                    right_y += pitch;
+                    y = std::max(left_y, right_y) + scale(4);
 
-                y = std::max(left_y, right_y) + scale(4);
+                    move_page_control(sfx_license_label_, 0, y + scale(6),
+                                      sfx_label_width, row, scroll_offset);
+                    const int license_height = scale(88);
+                    move_page_control(sfx_license_edit_, sfx_label_width, y,
+                                      std::max(scale(160), content_width -
+                                               sfx_label_width),
+                                      license_height, scroll_offset);
+                    y += license_height + gap;
 
-                // Everything below is anchored up from the bottom of the page so
-                // the info text can never reach the OK and Cancel buttons.
-                const int info_height = scale(46);
-                const int checkbox_block = row * 2 + scale(8);
-                const int info_y = page_bottom - info_height;
-                const int checkbox_y = info_y - checkbox_block - scale(12);
-                const int license_height =
-                    std::max(scale(56), checkbox_y - y - scale(12));
-                MoveWindow(sfx_license_label_, content_left, y + scale(6),
-                           label_width, row, TRUE);
-                MoveWindow(sfx_license_edit_, content_left + label_width, y,
-                           std::max(scale(240), content_width - label_width),
-                           license_height, TRUE);
-
-                const int checkbox_width = std::max(scale(240),
-                                                    (content_width - gap) / 2);
-                MoveWindow(sfx_allow_path_change_, content_left, checkbox_y,
-                           checkbox_width, row, TRUE);
-                MoveWindow(sfx_require_accept_, content_left + checkbox_width + gap,
-                           checkbox_y, checkbox_width, row, TRUE);
-                MoveWindow(sfx_open_destination_, content_left,
-                           checkbox_y + row + scale(8), checkbox_width, row, TRUE);
-                y = info_y;  // move_wrapped advances its y argument
-                move_wrapped(sfx_info_, content_left, y, content_width, 46);
-                break;
+                    const int checkbox_gap = scale(8);
+                    const int checkbox_width = content_width >= scale(600)
+                        ? (content_width - checkbox_gap) / 2
+                        : content_width;
+                    move_page_control(sfx_allow_path_change_, 0, y,
+                                      checkbox_width, row, scroll_offset);
+                    move_page_control(sfx_require_accept_,
+                                      checkbox_width + checkbox_gap, y,
+                                      checkbox_width, row, scroll_offset);
+                    y += row + scale(4);
+                    move_page_control(sfx_open_destination_, 0, y,
+                                      checkbox_width, row, scroll_offset);
+                    y += row + scale(10);
+                    content_height = y;
+                    break;
+                }
             }
+            return std::max(content_height, y + scale(10));
+        };
+
+        int content_height = layout_page(0);
+        const SettingsViewportMetrics metrics{content_height, scale(32)};
+        SendMessageW(create_viewport_, kSettingsViewportSetMetrics, 0,
+                     reinterpret_cast<LPARAM>(&metrics));
+        const int current_offset = static_cast<int>(SendMessageW(
+            create_viewport_, kSettingsViewportGetOffset, 0, 0));
+        const int desired_offset = create_scroll_offsets_[
+            static_cast<std::size_t>(create_page_)];
+        if (desired_offset != current_offset) {
+            SendMessageW(create_viewport_, kSettingsViewportScrollBy,
+                         static_cast<WPARAM>(desired_offset - current_offset), 0);
         }
+        const int scroll_offset = static_cast<int>(SendMessageW(
+            create_viewport_, kSettingsViewportGetOffset, 0, 0));
+        if (scroll_offset != 0) {
+            content_height = layout_page(scroll_offset);
+        }
+        create_scroll_offsets_[static_cast<std::size_t>(create_page_)] =
+            scroll_offset;
+
         SendMessageW(window_, WM_SETREDRAW, TRUE, 0);
         RedrawWindow(window_, nullptr, nullptr,
                      RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);
@@ -5694,17 +5658,24 @@ private:
     }
 
     void select_create_page(int page) {
+        if (create_viewport_ != nullptr) {
+            create_scroll_offsets_[static_cast<std::size_t>(create_page_)] =
+                static_cast<int>(SendMessageW(
+                    create_viewport_, kSettingsViewportGetOffset, 0, 0));
+        }
         create_page_ = std::clamp(page, 0, static_cast<int>(kCreateTabNames.size()) - 1);
         for (const auto& item : page_controls_) {
-            ShowWindow(item.window, SW_HIDE);
+            ShowWindow(item.window,
+                       item.page == create_page_ ? SW_SHOWNA : SW_HIDE);
+        }
+        if (create_page_heading_ != nullptr) {
+            SetWindowTextW(create_page_heading_,
+                           kCreateTabNames[static_cast<std::size_t>(create_page_)]);
         }
         layout();
         RedrawWindow(window_, nullptr, nullptr,
                      RDW_INVALIDATE | RDW_ERASE | RDW_ERASENOW | RDW_UPDATENOW);
-        for (const auto& item : page_controls_) {
-            if (item.page == create_page_) ShowWindow(item.window, SW_SHOWNA);
-        }
-        SendMessageW(create_tabs_, kDarkTabSetSelection,
+        SendMessageW(create_navigation_, kPageNavigationSetSelection,
                      static_cast<WPARAM>(create_page_), 0);
         RedrawWindow(window_, nullptr, nullptr,
                      RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN |
@@ -5733,36 +5704,36 @@ private:
             apply_dialog_control_theme(control.window, palette_.dark);
             SendMessageW(control.window, WM_SETREDRAW, TRUE, 0);
         }
-        SendMessageW(settings_tabs_, kDarkTabSetSelection,
+        SendMessageW(settings_tabs_, kPageNavigationSetSelection,
                      static_cast<WPARAM>(settings_page_), 0);
         layout_settings();
         RedrawWindow(settings_viewport_, nullptr, nullptr,
                      RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);
     }
 
-    void ensure_settings_focus_visible(HWND focus) {
-        if (settings_viewport_ == nullptr || focus == nullptr) return;
+    void ensure_viewport_focus_visible(HWND viewport_window, HWND focus) {
+        if (viewport_window == nullptr || focus == nullptr) return;
         HWND settings_control = focus;
         while (settings_control != nullptr &&
-               GetParent(settings_control) != settings_viewport_) {
+               GetParent(settings_control) != viewport_window) {
             settings_control = GetParent(settings_control);
         }
         if (settings_control == nullptr) return;
         RECT control_rect{};
         GetWindowRect(settings_control, &control_rect);
-        MapWindowPoints(nullptr, settings_viewport_,
+        MapWindowPoints(nullptr, viewport_window,
                         reinterpret_cast<POINT*>(&control_rect), 2);
-        RECT viewport{};
-        GetClientRect(settings_viewport_, &viewport);
+        RECT viewport_rect{};
+        GetClientRect(viewport_window, &viewport_rect);
         const int padding = scale(8);
         int delta = 0;
-        if (control_rect.top < viewport.top + padding) {
-            delta = control_rect.top - viewport.top - padding;
-        } else if (control_rect.bottom > viewport.bottom - padding) {
-            delta = control_rect.bottom - viewport.bottom + padding;
+        if (control_rect.top < viewport_rect.top + padding) {
+            delta = control_rect.top - viewport_rect.top - padding;
+        } else if (control_rect.bottom > viewport_rect.bottom - padding) {
+            delta = control_rect.bottom - viewport_rect.bottom + padding;
         }
         if (delta != 0) {
-            SendMessageW(settings_viewport_, kSettingsViewportScrollBy,
+            SendMessageW(viewport_window, kSettingsViewportScrollBy,
                          static_cast<WPARAM>(delta), 0);
         }
     }
@@ -5925,6 +5896,8 @@ private:
         const auto available = selected_format_availability();
         const bool updating = create_options.features.update_mode != ArchiveUpdateMode::create_new;
         const bool native = selected_format_is_native();
+        const std::wstring previous_compression_info =
+            window_text(compression_info_);
         const auto method = method_from_combo(
             method_combo_, native ? axiom::CompressionMethod::axiom
                                   : axiom::CompressionMethod::deflate);
@@ -6071,6 +6044,13 @@ private:
         EnableWindow(sfx_require_accept_,
                      sfx_options_enabled &&
                          !trim_dialog_input(window_text(sfx_license_edit_)).empty());
+        if (mode_ == DialogMode::create_archive &&
+            previous_compression_info != window_text(compression_info_)) {
+            // The description is wrapped and its height depends on the active
+            // method and available width. Recompute the page metrics after a
+            // method/format change so the viewport cannot clip the last line.
+            layout_create();
+        }
         InvalidateRect(window_, nullptr, TRUE);
     }
 
@@ -6254,16 +6234,21 @@ private:
             compression_curve_worker_.join();
         }
 
+        const auto candidates = compression_curve_candidates();
         auto estimate_options = CompressionEstimateOptions{};
         estimate_options.format = format;
-        estimate_options.sample_budget = 4u << 20;
+        // Keep enough headroom to reach high confidence on heterogeneous
+        // inputs, while bounding the total work across every curve point.
+        estimate_options.sample_budget = candidates.size() > 16
+            ? 16u << 20
+            : 32u << 20;
         estimate_options.sample_chunk_size = 256u << 10;
-        estimate_options.time_budget = std::chrono::milliseconds(7000);
+        estimate_options.time_budget = std::chrono::seconds(30);
+        estimate_options.stop_when_high_confidence = true;
         compression_curve_operation_ =
             std::make_shared<OperationControl>();
         estimate_options.compression.operation =
             compression_curve_operation_;
-        const auto candidates = compression_curve_candidates();
         const auto inputs = estimate_inputs;
         const HWND target = window_;
         compression_curve_active_key_ = key;
@@ -6292,9 +6277,13 @@ private:
                                 compression_curve_result_ = value;
                                 compression_curve_result_key_ = key;
                                 compression_curve_status_ =
-                                    value.complete
-                                        ? L"Compression preview complete"
-                                        : L"Estimating codec levels...";
+                                    !value.complete
+                                        ? L"Estimating codec levels..."
+                                        : value.reached_high_confidence ||
+                                              value.sampled_bytes >=
+                                                  value.planned_sample_bytes
+                                            ? L"Compression preview complete"
+                                            : L"Preview sample limit reached; confidence is bounded";
                             }
                             if (!compression_curve_update_posted_.exchange(
                                     true, std::memory_order_acq_rel)) {
@@ -6307,7 +6296,11 @@ private:
                         compression_curve_result_ = std::move(result);
                         compression_curve_result_key_ = key;
                         compression_curve_status_ =
-                            L"Compression preview complete";
+                            compression_curve_result_->reached_high_confidence ||
+                                    compression_curve_result_->sampled_bytes >=
+                                        compression_curve_result_->planned_sample_bytes
+                                ? L"Compression preview complete"
+                                : L"Preview sample limit reached; confidence is bounded";
                     }
                 } catch (const OperationCancelled&) {
                     // A settings change or dialog close superseded this curve.
@@ -6449,11 +6442,15 @@ private:
                 estimate_confidence_name(selected->confidence) +
                 std::wstring(L"  \u2022  sampled ") +
                 format_preview_bytes(result->sampled_bytes);
-            if (!result->complete &&
-                result->planned_sample_bytes != 0) {
-                detail += L" of " +
-                    format_preview_bytes(
-                        result->planned_sample_bytes);
+            if (result->planned_sample_bytes != 0 &&
+                result->sampled_bytes < result->planned_sample_bytes) {
+                if (result->reached_high_confidence) {
+                    detail += L"  •  high confidence reached";
+                } else {
+                    detail += L" of " +
+                        format_preview_bytes(
+                            result->planned_sample_bytes);
+                }
             }
             if (!result->warnings.empty()) {
                 detail += L"  \u2022  " +
@@ -7557,6 +7554,13 @@ private:
                     layout_settings();
                     return 0;
                 }
+                if (mode_ == DialogMode::create_archive) {
+                    create_scroll_offsets_[
+                        static_cast<std::size_t>(create_page_)] =
+                        static_cast<int>(wparam);
+                    layout_create();
+                    return 0;
+                }
                 break;
             case kTableActivateMessage:
                 if (mode_ == DialogMode::settings && settings_page_ == 9) {
@@ -7926,11 +7930,14 @@ private:
     bool create_show_password_ = false;
     int create_page_ = 0;
     int settings_page_ = 0;
-    HWND create_tabs_ = nullptr;
+    HWND create_navigation_ = nullptr;
+    HWND create_viewport_ = nullptr;
+    HWND create_page_heading_ = nullptr;
     HWND settings_tabs_ = nullptr;
     HWND settings_viewport_ = nullptr;
     SIZE settings_layout_client_size_{};
     std::array<int, kSettingsTabNames.size()> settings_scroll_offsets_{};
+    std::array<int, kCreateTabNames.size()> create_scroll_offsets_{};
     std::vector<PageControl> page_controls_;
     std::vector<SettingControl> settings_controls_;
     DarkTableView toolbar_list_;
@@ -7991,7 +7998,6 @@ private:
     HWND signing_key_edit_ = nullptr;
     HWND browse_signing_key_ = nullptr;
     HWND create_sfx_ = nullptr;
-    HWND sfx_info_ = nullptr;
     HWND sfx_stub_tier_label_ = nullptr;
     HWND sfx_stub_tier_combo_ = nullptr;
     HWND sfx_title_label_ = nullptr;

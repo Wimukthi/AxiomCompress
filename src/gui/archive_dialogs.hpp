@@ -280,6 +280,7 @@ struct ApplicationDialogOptions {
     int accent_color_mode = 0;  // 0 = Windows accent, 1 = Axiom amber, 2..5 presets, 6 = custom.
     COLORREF custom_accent_color = RGB(255, 185, 60);
     int toolbar_icon_style = 0;  // 0 = theme-tinted, 1 = colorful, 2 = accent-colored.
+    int toolbar_display_mode = 0;  // 0 = icons and text, 1 = icons only.
     int startup_location_mode = 0;  // 0 = last, 1 = This PC, 2 = Desktop, 3 = custom.
     std::wstring startup_custom_path;
     int archive_output_mode = 0;  // 0 = source folder, 1 = last used, 2 = custom.

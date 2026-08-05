@@ -130,6 +130,37 @@ HWND MainWindow::make_control(const wchar_t* class_name,
                            instance_, nullptr);
 }
 
+LRESULT CALLBACK MainWindow::toolbar_button_subclass_proc(
+    HWND window, UINT message, WPARAM wparam, LPARAM lparam,
+    UINT_PTR subclass_id, DWORD_PTR ref_data) {
+    auto* self = reinterpret_cast<MainWindow*>(ref_data);
+    if (self != nullptr) {
+        switch (message) {
+            case WM_MOUSEMOVE: {
+                TRACKMOUSEEVENT tracking{sizeof(tracking), TME_LEAVE, window, 0};
+                TrackMouseEvent(&tracking);
+                self->set_toolbar_hot_button(window);
+                break;
+            }
+            case WM_MOUSELEAVE:
+                self->set_toolbar_hot_button(nullptr);
+                break;
+            case WM_NCDESTROY:
+                // The window is already being torn down; clear only this
+                // button so destroying another toolbar child cannot erase a
+                // still-valid hover state on its neighbor.
+                if (self->hot_toolbar_button_ == window) {
+                    self->hot_toolbar_button_ = nullptr;
+                }
+                RemoveWindowSubclass(window,
+                                     &MainWindow::toolbar_button_subclass_proc,
+                                     subclass_id);
+                break;
+        }
+    }
+    return DefSubclassProc(window, message, wparam, lparam);
+}
+
 void MainWindow::apply_edit_margins() const {
     const LPARAM margins = MAKELPARAM(scale(2), scale(2));
     if (address_edit_ != nullptr) {
@@ -233,6 +264,11 @@ int MainWindow::toolbar_button_width(UINT command) {
     }
 }
 
+int MainWindow::toolbar_button_display_width(UINT command) const {
+    return std::clamp(application_options_.toolbar_display_mode, 0, 1) == 1
+        ? 36 : toolbar_button_width(command);
+}
+
 HWND MainWindow::toolbar_button(UINT command) const {
     for (const ToolbarButton& button : toolbar_buttons_) {
         if (button.command == command) return button.window;
@@ -254,6 +290,25 @@ void MainWindow::assign_toolbar_button(UINT command, HWND button) {
     }
 }
 
+void MainWindow::track_toolbar_button(HWND button) {
+    if (button == nullptr) return;
+    constexpr UINT_PTR kToolbarButtonSubclassId = 0xA7B1;
+    SetWindowSubclass(button, &MainWindow::toolbar_button_subclass_proc,
+                      kToolbarButtonSubclassId,
+                      reinterpret_cast<DWORD_PTR>(this));
+}
+
+void MainWindow::set_toolbar_hot_button(HWND button) {
+    if (button != nullptr && !IsWindow(button)) button = nullptr;
+    if (hot_toolbar_button_ == button) return;
+    HWND previous = hot_toolbar_button_;
+    hot_toolbar_button_ = button;
+    if (previous != nullptr) InvalidateRect(previous, nullptr, FALSE);
+    if (hot_toolbar_button_ != nullptr) {
+        InvalidateRect(hot_toolbar_button_, nullptr, FALSE);
+    }
+}
+
 void MainWindow::create_toolbar_buttons() {
     toolbar_buttons_.clear();
     for (const axiom::gui::ToolbarCommandInfo& command : kToolbarCommandCatalog) {
@@ -263,6 +318,7 @@ void MainWindow::create_toolbar_buttons() {
             L"BUTTON", command.button_text, WS_TABSTOP | BS_OWNERDRAW, static_cast<int>(id));
         toolbar_buttons_.push_back({id, button});
         assign_toolbar_button(id, button);
+        track_toolbar_button(button);
     }
 }
 
@@ -289,7 +345,7 @@ int MainWindow::command_toolbar_height_for_width(int width) const {
     int rows = 1;
     int x = margin;
     for (UINT command : commands) {
-        const int button_width = scale(toolbar_button_width(command));
+        const int button_width = scale(toolbar_button_display_width(command));
         if (x > margin && x + button_width > right) {
             ++rows;
             x = margin;
@@ -347,6 +403,10 @@ void MainWindow::on_create() {
     SendMessageW(address_edit_, CB_LIMITTEXT, 32767, 0);
     set_text(address_edit_, L"This PC");
     address_go_ = make_control(L"BUTTON", L"Go", WS_TABSTOP | BS_OWNERDRAW, kAddressGo);
+    for (HWND button : {navigate_back_, navigate_forward_, navigate_up_,
+                        navigate_refresh_, address_go_}) {
+        track_toolbar_button(button);
+    }
 
     tree_view_.create(hwnd_, instance_, kTree);
     tree_view_.set_populate_callback([this](DirectoryTreeItem& item) {
@@ -558,6 +618,15 @@ void MainWindow::layout() {
     };
 
     const auto toolbar_commands = visible_toolbar_commands();
+    // A settings change can remove the hovered command while the pointer is
+    // still over its former slot; do not retain a stale hot window handle.
+    if (hot_toolbar_button_ != nullptr &&
+        std::none_of(toolbar_commands.begin(), toolbar_commands.end(),
+                     [this](UINT command) {
+                         return toolbar_button(command) == hot_toolbar_button_;
+                     })) {
+        set_toolbar_hot_button(nullptr);
+    }
     for (const ToolbarButton& button : toolbar_buttons_) {
         if (button.window == nullptr) continue;
         if (std::find(toolbar_commands.begin(), toolbar_commands.end(), button.command) ==
@@ -570,7 +639,7 @@ void MainWindow::layout() {
         for (UINT command : toolbar_commands) {
             HWND button = toolbar_button(command);
             if (button == nullptr) continue;
-            const int width_px = scale(toolbar_button_width(command));
+            const int width_px = scale(toolbar_button_display_width(command));
             if (x > margin && x + width_px > right) {
                 x = margin;
                 y += button_height + gap;
@@ -790,6 +859,9 @@ LRESULT MainWindow::handle_message(UINT message, WPARAM wparam, LPARAM lparam) {
             layout();
             return 0;
         }
+        case WM_ACTIVATEAPP:
+            if (wparam == FALSE) set_toolbar_hot_button(nullptr);
+            return 0;
         // The shell and custom child controls paint every invalid region themselves.
         // Erasing here duplicates the background pass and exposes a blank frame while
         // interactive resizing or modal-window activation is in progress.

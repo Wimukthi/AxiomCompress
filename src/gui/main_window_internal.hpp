@@ -1031,10 +1031,16 @@ private:
     void add_tooltip(HWND control, const wchar_t* text) const;
     static UINT toolbar_command_for_action(std::wstring_view action);
     static int toolbar_button_width(UINT command);
+    static LRESULT CALLBACK toolbar_button_subclass_proc(
+        HWND window, UINT message, WPARAM wparam, LPARAM lparam,
+        UINT_PTR subclass_id, DWORD_PTR ref_data);
     HWND toolbar_button(UINT command) const;
     void assign_toolbar_button(UINT command, HWND button);
+    void track_toolbar_button(HWND button);
+    void set_toolbar_hot_button(HWND button);
     void create_toolbar_buttons();
     std::vector<UINT> visible_toolbar_commands() const;
+    int toolbar_button_display_width(UINT command) const;
     int command_toolbar_height_for_width(int width) const;
     void update_toolbar_button_states();
     int show_app_message(
@@ -1318,6 +1324,8 @@ private:
     };
 
     std::vector<ToolbarButton> toolbar_buttons_;
+
+    HWND hot_toolbar_button_ = nullptr;
 
     DarkDirectoryTreeView tree_view_;
 

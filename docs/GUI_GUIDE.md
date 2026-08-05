@@ -82,12 +82,13 @@ data parts are missing or damaged.
 
 ## Add to archive
 
-![The Add to archive dialog](images/axiom-add-to-archive.png)
+Archive creation is one resizable page dialog. The item summary, format, and
+output path stay visible while the page body scrolls. Its navigation follows
+the compact Settings layout, with the five option pages listed down the left.
+The Compression page keeps the live preview beside the form when there is
+enough width and moves it out of the way on narrower windows.
 
-Archive creation is one resizable tabbed dialog. The output path stays visible
-across all tabs.
-
-| Tab | Contains |
+| Page | Contains |
 |---|---|
 | Compression | Method, level, dictionary and word size, solid block size, threads, threading model |
 | General | Update mode, archive comment, metadata notes |
@@ -113,9 +114,9 @@ not leave a separate archive beside it.
 
 ### SFX
 
-Signing lives on the Security tab with the other authenticity controls, so the
-SFX tab is only about self-extracting output. Enabling **Create one
-self-extracting Windows executable** turns on the rest of the tab, which
+Signing lives on the Security page with the other authenticity controls, so the
+SFX page is only about self-extracting output. Enabling **Create one
+self-extracting Windows executable** turns on the rest of the page, which
 configures what the finished `.exe` does when someone runs it. The settings are
 stored inside the executable itself.
 
@@ -168,7 +169,7 @@ model.
 
 ### Compression preview
 
-For AXAR and ZIP, the right side of the Compression tab shows a live prediction
+For AXAR and ZIP, the right side of the Compression page shows a live prediction
 across every level the selected method supports. All points come from the same
 sampled source regions, so the curve compares codecs rather than sampling
 noise.
@@ -177,6 +178,11 @@ Blue is predicted compressed bytes, green is predicted saving, and the neutral
 band is the uncertainty range. Click a point to select that level. Changing a
 setting that affects the source cancels and re-runs the estimate after a short
 pause; changing only the level moves the marker without rescanning.
+
+The preview keeps sampling until every visible level reaches high confidence,
+or until its bounded sample/time safety limits are reached. When the limits
+win, the preview says that confidence is bounded instead of presenting the
+result as exact.
 
 ## Settings
 
@@ -187,7 +193,7 @@ eleven pages:
 
 | Page | Covers |
 |---|---|
-| General | Theme, accent color, button icons, startup location, confirmations |
+| General | Theme, accent color, icon colors, startup location, confirmations |
 | Compression | Default method, level, and threading model |
 | Paths | Default output, extraction, and temporary locations |
 | File list | Column visibility and order, sorting, display options |
@@ -196,7 +202,7 @@ eleven pages:
 | Integration | Per-user file associations and the Explorer submenu |
 | Updates | Automatic update checks |
 | Shortcuts | Rebindable keyboard shortcuts |
-| Toolbar | Which buttons appear, and in what order |
+| Toolbar | Button labels or icons-only mode, which buttons appear, and their order |
 | Advanced | Diagnostics and low-level behavior |
 
 The General page can follow the Windows accent, use an Axiom preset, or take a
@@ -209,6 +215,11 @@ and open into the browser for viewing, testing, and extraction.
 
 Options are wired only where the engine or GUI actually has the behavior.
 Unsupported future options are disabled rather than silently stored.
+
+The Toolbar page can keep command labels beside their icons or switch the main
+command toolbar to **Icons only**. Tooltips retain the full command names, and
+buttons highlight on hover while preserving separate focused, pressed, and
+disabled states.
 
 ## Benchmark
 

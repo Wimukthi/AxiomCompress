@@ -1246,6 +1246,8 @@ void MainWindow::apply_application_options(
         application_options_.custom_accent_color != previous.custom_accent_color;
     const bool icon_style_changed =
         application_options_.toolbar_icon_style != previous.toolbar_icon_style;
+    const bool toolbar_display_changed =
+        application_options_.toolbar_display_mode != previous.toolbar_display_mode;
     const bool toolbar_commands_changed =
         normalize_toolbar_commands(application_options_.toolbar_commands) !=
         normalize_toolbar_commands(previous.toolbar_commands);
@@ -1288,7 +1290,7 @@ void MainWindow::apply_application_options(
         application_options_.context_test != previous.context_test;
 
     if (theme_changed || icon_style_changed) apply_theme();
-    if (toolbar_commands_changed) {
+    if (toolbar_commands_changed || toolbar_display_changed) {
         layout();
         update_toolbar_button_states();
     }

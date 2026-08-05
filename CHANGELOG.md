@@ -8,6 +8,30 @@ a four-part `major.minor.patch.build` version scheme described in
 Entries are condensed from the
 [GitHub releases](https://github.com/Wimukthi/AxiomCompress/releases).
 
+## [0.9.2.0] - 2026-08-05
+
+Reliability and interface refinement release.
+
+### Added
+
+- Added high-confidence early stopping to compression preview curves when all
+  tested levels have converged.
+- Added a compact settings-style navigation layout and an icons-only toolbar
+  display mode with hover highlighting.
+
+### Fixed
+
+- Hardened AXAR snapshot-manifest and chunk-table count validation so malformed
+  archives cannot trigger multi-gigabyte vector allocations.
+- Added regression coverage for the malformed allocation cases found by CI
+  fuzzing.
+
+### Validation
+
+- Release MSVC build and complete codec/archive/safety regression suite passed.
+- Rebuilt Windows AddressSanitizer/libFuzzer targets, ran both fuzzers for 30
+  seconds, and replayed the exact CI crash artifact without findings.
+
 ## [0.9.1.0] - 2026-08-03
 
 Performance maintenance release.
