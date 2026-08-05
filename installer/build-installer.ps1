@@ -140,6 +140,7 @@ $testExe = Join-Path $script:RepoRoot "out\$Configuration\axiom_roundtrip.exe"
 $appExe = Join-Path $script:RepoRoot "out\$Configuration\Axiom.exe"
 $cliExe = Join-Path $script:RepoRoot "out\$Configuration\axiomc.exe"
 $sfxModule = Join-Path $script:RepoRoot "out\$Configuration\AxiomSfx.bin"
+$sfxMiniModule = Join-Path $script:RepoRoot "out\$Configuration\AxiomSfxMini.bin"
 $issFile = Join-Path $script:RepoRoot "installer\Axiom.iss"
 $msbuild = Find-MSBuild
 $iscc = Find-InnoCompiler
@@ -174,6 +175,10 @@ if (-not (Test-Path -LiteralPath $cliExe)) {
 
 if (-not (Test-Path -LiteralPath $sfxModule)) {
     throw "SFX module was not found: $sfxModule"
+}
+
+if (-not (Test-Path -LiteralPath $sfxMiniModule)) {
+    throw "Mini SFX module was not found: $sfxMiniModule"
 }
 
 $resourceVersion = Get-ResourceVersion

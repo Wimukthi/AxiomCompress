@@ -60,6 +60,7 @@ Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription:
 Source: "{#SourceRoot}\out\{#Configuration}\Axiom.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceRoot}\out\{#Configuration}\axiomc.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceRoot}\out\{#Configuration}\AxiomSfx.bin"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#SourceRoot}\out\{#Configuration}\AxiomSfxMini.bin"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceRoot}\out\{#Configuration}\backends\7zip\*"; DestDir: "{app}\backends\7zip"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "{#SourceRoot}\README.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceRoot}\CHANGELOG.md"; DestDir: "{app}"; Flags: ignoreversion

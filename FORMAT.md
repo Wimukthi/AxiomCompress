@@ -11,7 +11,7 @@ malformed data is intended behavior, not an implementation detail.
 
 > **Compatibility baseline.** AXAR v4 remains readable indefinitely. AXAR v5 is
 > an additive container revision for required fidelity metadata, encryption-v2,
-> and snapshot repositories; readers reject
+> snapshot repositories, and the large solid-block profile; readers reject
 > required features they do not understand instead of silently losing them. The
 > append-generation record described below is an additive v4/v5 extension and
 > does not change the header version. The current v4 and v5 golden fixtures live
@@ -65,7 +65,9 @@ points back to the directory.
 - Compress with cross-file redundancy — files are grouped into *solid blocks* —
   while keeping each block **independently decompressible** for selective
   extraction and bounded-memory decode.
-- Single-pass, bounded-memory writing: one solid block in memory at a time.
+- Single-pass, bounded-memory writing: one ordinary solid block in memory at a
+  time; the large LZMA2 profile uses a temporary-file spool and bounded codec
+  chunks.
 - Localizable integrity: per-block checks from the embedded `.axc`, plus
   per-file CRC-32 and BLAKE3-256 content hashes.
 
@@ -77,7 +79,7 @@ points back to the directory.
 |---|---|---|
 | `magic` | `u8[8]` | `"AXIOMAR\0"` |
 | `version` | `u16` | `4` for the baseline container, `5` when v5 fidelity metadata or encryption-v2 is present |
-| `flags` | `u16` | Required-feature flags. Bit `0x0001` = encrypted directory, `0x0002` = sparse entry maps, `0x0004` = source-capture warning report, `0x0008` = extended metadata (ACL/xattr/reparse payloads), `0x0010` = encryption-v2 password slots, `0x0020` = snapshot chunk table and manifest. A reader must reject any bit it does not understand |
+| `flags` | `u16` | Required-feature flags. Bit `0x0001` = encrypted directory, `0x0002` = sparse entry maps, `0x0004` = source-capture warning report, `0x0008` = extended metadata (ACL/xattr/reparse payloads), `0x0010` = encryption-v2 password slots, `0x0020` = snapshot chunk table and manifest, `0x0040` = large solid-block profile. A reader must reject any bit it does not understand |
 | `reserved` | `u32` | Must be `0` |
 
 ## Solid blocks
@@ -90,11 +92,31 @@ the thread count; this is writer policy, not a different on-disk layout.
 A file may straddle a block boundary, and a file larger than `block_size` spans
 several blocks.
 
-Each block's bytes are compressed with `axiom::compress`, producing a
-self-contained `.axc` payload with its own header and CRC-32 — that is the
+For ordinary blocks, the bytes are compressed with `axiom::compress`, producing
+a self-contained `.axc` payload with its own header and CRC-32 — that is the
 per-block integrity check. Blocks are written back-to-back after the header.
 The container does not interpret a block's internals beyond its declared size
 and checksum.
+
+### Large LZMA2 solid blocks
+
+When header flag `0x0040` is set, AXAR permits blocks up to **64 GiB**. This
+profile currently requires LZMA2. The writer stages the raw block in a temporary
+file and emits one AXC v10 external-codec envelope whose LZMA2 chunks are
+**512 MiB by default**, or up to **4 GiB−1** when a larger dictionary is
+explicitly requested. The outer solid-block size and the codec chunk size are
+therefore separate limits: a 64 GiB solid block does not require a 64 GiB
+allocation or a 64 GiB LZMA2 dictionary.
+
+Every large block carries a complete external-chunk subframe map. Readers use
+that map for extraction and testing, decoding only the chunk ranges needed by
+the current file operation. A large block without a valid map is rejected.
+The streamed profile disables file-aware transforms; its AXC CRC covers the
+staged source bytes directly and its transform-metadata area is empty. The
+profile is deliberately rejected when archive block encryption or recovery
+records are requested; those paths still use whole-block buffers and need their
+own streaming profiles. Older readers reject flag `0x0040` before parsing the
+directory.
 
 Before building solid blocks, writers group regular files by broad type and
 then by extension. This improves cross-file matching without changing AXAR
@@ -201,7 +223,7 @@ Codec ids `8`, `9`, and `10` share one bounded payload:
 | `payload_version` | `u8` | `1` |
 | `property_size` | `u8` | `0` for Zstandard/Deflate; `1` for LZMA2 |
 | `reserved` | `u16` | Must be zero |
-| `chunk_size` | `u32` | 256 KiB–4 MiB for Zstandard/Deflate; up to 512 MiB for LZMA2 |
+| `chunk_size` | `u32` | 256 KiB–4 MiB for Zstandard/Deflate; up to 4 GiB−1 for LZMA2. Large LZMA2 solid blocks default to 512 MiB and may raise this independently of the outer AXAR solid-block size |
 | `chunk_count` | `u32` | Exactly `ceil(original_size / chunk_size)` |
 | `properties` | `u8[]` | LZMA2 dictionary property byte when present; the decoded dictionary size must not exceed `chunk_size` |
 | `chunks` | `record[]` | Exactly `chunk_count` records |
@@ -216,7 +238,12 @@ Compressed chunks are independent Zstandard frames, LZMA2 streams, or zlib
 Deflate streams. A reader allocates exactly the validated raw chunk size,
 requires the backend to produce that exact size and consume the complete
 encoded chunk, and rejects trailing bytes. Writers store a chunk when the
-selected codec would expand it.
+selected codec would expand it. LZMA2 property `40` denotes the maximum
+4 GiB−1 dictionary; the effective dictionary is bounded by the declared chunk
+and by the stable input bound chosen for the payload. Ordinary payloads use
+their total input size, while the disk-streamed large-solid profile uses its
+  working-chunk bound, so a small payload does not force a multi-gigabyte
+  allocation and all frames retain one property byte.
 
 The chunk boundary is also the cooperative pause/cancel and progress boundary.
 Transform metadata, CRC-32, encryption, recovery, signing, and all AXAR
@@ -669,9 +696,13 @@ declared size. The decoder defends before allocating:
 
 ### Size ceilings
 
-- Match-finder positions are 32-bit, so a single block is bounded near **4 GiB**
-  (a file larger than a block is split across blocks anyway). Total archive size
-  across blocks is `u64`.
+- Native Axiom match distances are 32-bit, so the full-window path supports a
+  maximum encoded distance of **4 GiB−1**; ordinary native blocks are bounded
+  near **4 GiB** (a file larger than a block is split across blocks anyway).
+  LZMA2 dictionary properties and AXEC chunk sizes use the same **4 GiB−1**
+  ceiling. The external LZMA2 large-block profile raises the AXAR grouping
+  limit to **64 GiB** while keeping its default independently decoded codec
+  chunk at **512 MiB**. Total archive size across blocks is `u64`.
 - The level-1 `fast_lz` block codec: match **distance ≤ 16 MiB** (24-bit),
   match **length ≤ 273**.
 - Stored **path length ≤ 65,535 bytes**.
@@ -701,6 +732,12 @@ requires the `0x0008` required flag.
 Snapshot repositories additionally require the `0x0020` flag. Readers that do
 not implement the snapshot profile must reject the archive rather than treating
 chunk references as ordinary contiguous block addresses.
+Large-solid-block archives additionally require the `0x0040` profile. Readers
+that do not implement bounded external LZMA2 subframes must reject them rather
+than applying the ordinary block-size ceiling. AXC v10 readers that predate the
+4 GiB LZMA2 geometry may likewise reject an archive whose declared LZMA2 chunk
+exceeds their older 512 MiB safety bound; existing v4/v5 archives are not
+changed.
 An appended generation does not change the AXAR header version. Readers that do
 not understand its 64-byte extension can still read the current directory from
 the final legacy footer of an intact archive, but generation history and the

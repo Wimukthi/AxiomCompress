@@ -117,12 +117,17 @@ constexpr std::uint16_t kFlagEncryptionV2 = 0x0010;
 // manifests. Older readers must reject this required feature instead of using
 // the legacy first_block/offset range as if all chunks were adjacent.
 constexpr std::uint16_t kFlagChunkTable = 0x0020;
+// Large solid blocks are staged and read as bounded AXC external-codec
+// subframes. Older readers must reject this profile because their block-size
+// safety limit is intentionally lower and they do not know the streaming path.
+constexpr std::uint16_t kFlagLargeSolidBlocks = 0x0040;
 constexpr std::uint16_t kKnownArchiveFlags = kFlagEncryptedDirectory |
                                                kFlagSparseEntries |
                                                kFlagCaptureReport |
                                                kFlagExtendedMetadata |
                                                kFlagEncryptionV2 |
-                                               kFlagChunkTable;
+                                               kFlagChunkTable |
+                                               kFlagLargeSolidBlocks;
 
 // Optional block-extra profile. Older AXAR readers already skip the reserved
 // block-extra byte range, so this remains additive and does not require a new
@@ -166,6 +171,12 @@ constexpr std::size_t kFileChunk = 1u << 16;
 constexpr std::size_t kDefaultIoBufferSize = 1u << 20;
 constexpr std::size_t kMaxIoBufferSize = 64u << 20;
 constexpr std::size_t kMinAutoCodecBlockSize = std::size_t{1} << 20;
+constexpr std::uint64_t kMaxLegacySolidBlockSize = std::uint64_t{4} << 30;
+constexpr std::uint64_t kMaxLargeSolidBlockSize = std::uint64_t{64} << 30;
+// Large-solid writes default to the conservative 512 MiB working chunk, but
+// the AXEC u32 geometry can deliberately be raised to the full LZMA2 limit.
+constexpr std::size_t kLargeSolidCodecChunkSize = std::size_t{512} << 20;
+constexpr std::size_t kMaxLzmaCodecChunkSize = kMaxLzmaDictionarySize;
 
 std::size_t effective_io_buffer_size(std::size_t requested) {
     if (requested == 0) {
@@ -212,6 +223,32 @@ std::size_t effective_solid_block_size(const CompressionOptions& options) {
         return block_size;
     }
     return std::max(block_size, threads * per_worker);
+}
+
+bool requests_large_solid_blocks(std::size_t block_size) {
+    return static_cast<std::uint64_t>(block_size) > kMaxLegacySolidBlockSize;
+}
+
+void validate_large_solid_block_options(const CompressionOptions& options,
+                                        std::size_t block_size) {
+    if (!requests_large_solid_blocks(block_size)) {
+        return;
+    }
+    if (static_cast<std::uint64_t>(block_size) > kMaxLargeSolidBlockSize) {
+        throw std::invalid_argument("solid block size exceeds the 64 GiB AXAR limit");
+    }
+    if (options.method != CompressionMethod::lzma2) {
+        throw std::invalid_argument(
+            "solid blocks larger than 4 GiB currently require the LZMA2 method");
+    }
+    if (!options.password.empty()) {
+        throw std::invalid_argument(
+            "LZMA2 solid blocks larger than 4 GiB cannot be encrypted yet");
+    }
+    if (options.recovery_percent != 0) {
+        throw std::invalid_argument(
+            "recovery records are not supported with solid blocks larger than 4 GiB yet");
+    }
 }
 
 // Per-entry "extra area" record types (TLV). The directory stores each entry as a
@@ -677,6 +714,7 @@ struct ArchiveMeta {
     std::vector<OperationWarning> capture_warnings;
     bool chunk_table = false;
     bool keyed_chunk_ids = false;
+    bool large_solid_blocks = false;
     std::vector<SnapshotRec> snapshots;
 };
 
@@ -973,6 +1011,198 @@ std::vector<SubframeRec> make_subframe_map(std::span<const std::uint8_t> compres
     return result;
 }
 
+struct StreamedBlockResult {
+    fs::path payload_path;
+    std::uint64_t payload_size = 0;
+    std::vector<SubframeRec> subframes;
+};
+
+// Build one large LZMA2 AXC block without materializing the whole solid block.
+// The raw solid block is already staged on disk by the container reader. Each
+// external-codec chunk is bounded to the AXEC u32 limit (512 MiB by default,
+// or the requested LZMA2 dictionary size), and the resulting subframe map lets
+// extraction/test decode only the ranges they consume.
+StreamedBlockResult compress_large_lzma2_block(
+    const fs::path& raw_path,
+    std::uint64_t raw_size,
+    std::uint32_t raw_crc,
+    const CompressionOptions& options,
+    const std::shared_ptr<OperationControl>& operation,
+    const std::function<void(std::uint64_t)>& encoded_progress) {
+    if (raw_size == 0 || raw_size > kMaxLargeSolidBlockSize) {
+        throw std::invalid_argument("large LZMA2 block has an invalid size");
+    }
+    if (raw_size > std::numeric_limits<std::size_t>::max()) {
+        throw std::runtime_error("large LZMA2 block exceeds the platform size limit");
+    }
+
+    const auto requested_chunk = options.external_codec_chunk_size == 0
+        ? std::max(
+              kLargeSolidCodecChunkSize,
+              std::min(options.lzma_dictionary_size, kMaxLzmaCodecChunkSize))
+        : options.external_codec_chunk_size;
+    const auto chunk_size = std::clamp(
+        requested_chunk, std::size_t{256} << 10, kMaxLzmaCodecChunkSize);
+    const auto chunk_count = 1 + (raw_size - 1) / chunk_size;
+    if (chunk_count > std::numeric_limits<std::uint32_t>::max()) {
+        throw std::runtime_error("large LZMA2 block has too many codec chunks");
+    }
+
+    std::ifstream raw(raw_path, std::ios::binary);
+    if (!raw) {
+        throw std::runtime_error("cannot open staged large solid block");
+    }
+    const auto payload_path = core::unique_sibling_path(raw_path, L"lzma2");
+    TempFileGuard payload_guard(payload_path);
+    std::fstream payload(payload_path, std::ios::binary | std::ios::in |
+                                           std::ios::out | std::ios::trunc);
+    if (!payload) {
+        throw std::runtime_error("cannot create staged large LZMA2 block");
+    }
+
+    auto write_bytes = [&](std::span<const std::uint8_t> bytes) {
+        if (bytes.size() > static_cast<std::size_t>(std::numeric_limits<std::streamsize>::max())) {
+            throw std::runtime_error("staged LZMA2 block write exceeds the stream limit");
+        }
+        payload.write(reinterpret_cast<const char*>(bytes.data()),
+                      static_cast<std::streamsize>(bytes.size()));
+        if (!payload) {
+            throw std::runtime_error("failed while writing staged large LZMA2 block");
+        }
+    };
+    auto write_u32 = [&](std::uint32_t value) {
+        ByteVector bytes;
+        put_u32(bytes, value);
+        write_bytes(bytes);
+    };
+    auto write_u64 = [&](std::uint64_t value) {
+        ByteVector bytes;
+        put_u64(bytes, value);
+        write_bytes(bytes);
+    };
+
+    // AXC v10 fixed header. The payload size is patched after all bounded
+    // external frames have been written; the staging file is seekable even
+    // when the final AXAR destination is a non-seekable output stream.
+    constexpr std::array<std::uint8_t, 8> kAxcMagic = {
+        'A', 'X', 'I', 'O', 'M', 'C', '1', 0};
+    write_bytes(kAxcMagic);
+    ByteVector fixed;
+    put_u16(fixed, 10);
+    fixed.push_back(static_cast<std::uint8_t>(core::CodecId::lzma2));
+    fixed.push_back(0);
+    put_u64(fixed, raw_size);
+    put_u64(fixed, 0);  // patched payload size
+    put_u32(fixed, raw_crc);
+    put_u32(fixed, 0);  // no transform metadata in the streamed profile
+    write_bytes(fixed);
+
+    const auto external_payload_offset = std::uint64_t{36};
+    const auto external_header_size = std::uint64_t{17};
+    write_bytes(std::span<const std::uint8_t>(
+        reinterpret_cast<const std::uint8_t*>("AXEC\x01\x01\0\0"), 8));
+    write_u32(static_cast<std::uint32_t>(chunk_size));
+    write_u32(static_cast<std::uint32_t>(chunk_count));
+    // The LZMA2 property is filled in after the first codec chunk is encoded.
+    const auto property_offset = external_payload_offset + 16;
+    const std::uint8_t property_placeholder = 0;
+    write_bytes(std::span<const std::uint8_t>(&property_placeholder, 1));
+
+    StreamedBlockResult result;
+    result.payload_path = payload_path;
+    result.subframes.reserve(static_cast<std::size_t>(chunk_count));
+    std::uint64_t payload_position = external_header_size;
+    std::uint64_t uncompressed_offset = 0;
+    // Do not reserve the maximum codec chunk for a short final (or only) chunk;
+    // a large-block option must remain cheap when the input itself is small.
+    const auto input_capacity = static_cast<std::size_t>(
+        std::min<std::uint64_t>(raw_size, chunk_size));
+    std::vector<std::uint8_t> input(input_capacity);
+    std::uint8_t lzma_property = 0;
+    bool property_set = false;
+
+    for (std::uint64_t index = 0; index < chunk_count; ++index) {
+        if (operation) operation->checkpoint();
+        const auto remaining = raw_size - uncompressed_offset;
+        const auto current_size = static_cast<std::size_t>(
+            std::min<std::uint64_t>(remaining, chunk_size));
+        raw.read(reinterpret_cast<char*>(input.data()),
+                 static_cast<std::streamsize>(current_size));
+        if (raw.gcount() != static_cast<std::streamsize>(current_size)) {
+            throw FormatError("staged large LZMA2 block is truncated");
+        }
+
+        auto chunk_options = options;
+        chunk_options.block_size = chunk_size;
+        chunk_options.external_codec_chunk_size = chunk_size;
+        chunk_options.auto_block_size_for_threads = false;
+        chunk_options.enable_file_filters = false;
+        chunk_options.transform_ranges.clear();
+        chunk_options.operation = operation;
+        chunk_options.encoded_bytes_progress = {};
+        chunk_options.encode_progress = {};
+        const auto encoded = codec::encode_external_codec_with_dictionary_bound(
+            std::span<const std::uint8_t>(input.data(), current_size),
+            CompressionMethod::lzma2, chunk_options, input_capacity);
+        const auto frames = codec::inspect_external_codec_frames(
+            encoded, CompressionMethod::lzma2, current_size);
+        if (frames.size() != 1) {
+            throw FormatError("large LZMA2 chunk did not produce one external frame");
+        }
+        const auto& frame = frames.front();
+        if (frame.frame_offset > encoded.size() ||
+            frame.frame_size > encoded.size() - frame.frame_offset) {
+            throw FormatError("large LZMA2 chunk frame exceeds its payload");
+        }
+        if (!property_set) {
+            lzma_property = frame.lzma_property;
+            property_set = true;
+            payload.seekp(static_cast<std::streamoff>(property_offset), std::ios::beg);
+            write_bytes(std::span<const std::uint8_t>(&lzma_property, 1));
+            payload.seekp(0, std::ios::end);
+            if (!payload) throw std::runtime_error("failed to patch LZMA2 properties");
+        } else if (frame.lzma_property != lzma_property) {
+            throw FormatError("large LZMA2 chunks have inconsistent properties");
+        }
+
+        result.subframes.push_back({
+            uncompressed_offset,
+            current_size,
+            external_payload_offset + frame.frame_offset,
+            frame.frame_size,
+            static_cast<std::uint8_t>(kSubframeExternalChunk),
+            static_cast<std::uint8_t>(core::CodecId::lzma2),
+            lzma_property,
+        });
+        write_bytes(std::span<const std::uint8_t>(
+            encoded.data() + static_cast<std::ptrdiff_t>(frame.frame_offset),
+            static_cast<std::size_t>(frame.frame_size)));
+        payload_position += frame.frame_size;
+        uncompressed_offset += current_size;
+        if (encoded_progress) encoded_progress(uncompressed_offset);
+    }
+    if (!property_set || uncompressed_offset != raw_size) {
+        throw FormatError("large LZMA2 block has incomplete codec output");
+    }
+
+    const auto final_size = payload_position + external_payload_offset;
+    payload.seekp(20, std::ios::beg);
+    write_u64(payload_position);
+    payload.seekp(0, std::ios::end);
+    if (!payload || static_cast<std::uint64_t>(payload.tellp()) != final_size) {
+        throw std::runtime_error("failed to finalize staged large LZMA2 block");
+    }
+    payload.flush();
+    payload.close();
+    raw.close();
+    if (!payload || !raw) {
+        throw std::runtime_error("failed to close staged large LZMA2 block");
+    }
+    result.payload_size = final_size;
+    payload_guard.dismiss();
+    return result;
+}
+
 void validate_subframe_geometry(const BlockRec& block,
                                 const std::vector<SubframeRec>& subframes) {
     if (subframes.empty()) return;
@@ -1066,6 +1296,23 @@ void parse_block_extras(std::span<const std::uint8_t> bytes, BlockRec& block) {
     validate_subframe_geometry(block, block.subframes);
 }
 
+void validate_large_solid_block_map(const BlockRec& block) {
+    if (block.uncompressed_size <= kMaxLegacySolidBlockSize) {
+        return;
+    }
+    if (block.subframes.empty()) {
+        throw FormatError("large solid block is missing its bounded subframe map");
+    }
+    for (const auto& frame : block.subframes) {
+        if (frame.kind != kSubframeExternalChunk ||
+            frame.codec != static_cast<std::uint8_t>(core::CodecId::lzma2) ||
+            frame.uncompressed_size > kMaxLzmaCodecChunkSize) {
+            throw FormatError(
+                "large solid block map must contain bounded LZMA2 external chunks");
+        }
+    }
+}
+
 bool has_sparse_entries(const std::vector<EntryRec>& entries) {
     return std::any_of(entries.begin(), entries.end(), [](const EntryRec& entry) {
         return entry.type == kEntryFile && entry.sparse.is_sparse;
@@ -1088,6 +1335,7 @@ std::uint16_t archive_header_flags(const std::vector<EntryRec>& entries,
     if (!meta.capture_warnings.empty()) flags |= kFlagCaptureReport;
     if (has_extended_metadata(entries)) flags |= kFlagExtendedMetadata;
     if (meta.chunk_table) flags |= kFlagChunkTable;
+    if (meta.large_solid_blocks) flags |= kFlagLargeSolidBlocks;
     return flags;
 }
 
@@ -1095,7 +1343,7 @@ std::uint16_t archive_header_version(const std::vector<EntryRec>& entries,
                                      const ArchiveMeta& meta) {
     return meta.encryption.v2 || has_sparse_entries(entries) ||
            !meta.capture_warnings.empty() || has_extended_metadata(entries) ||
-           meta.chunk_table
+           meta.chunk_table || meta.large_solid_blocks
         ? kArchiveVersion5 : kArchiveVersion4;
 }
 
@@ -2011,7 +2259,7 @@ ArchiveLayout read_layout(const ByteSource& source) {
     if (layout.version < kArchiveVersion5 &&
         (layout.flags & (kFlagSparseEntries | kFlagCaptureReport |
                          kFlagExtendedMetadata | kFlagEncryptionV2 |
-                         kFlagChunkTable)) != 0) {
+                         kFlagChunkTable | kFlagLargeSolidBlocks)) != 0) {
         throw FormatError("archive uses v5 features with an older version header");
     }
 
@@ -2817,7 +3065,8 @@ EntryRec parse_snapshot_entry_body(std::span<const std::uint8_t> bytes) {
 }
 
 // Parse a (decrypted) directory image into the block table, entries, and metadata.
-ArchiveIndex parse_directory(const ByteVector& directory, std::uint64_t directory_offset) {
+ArchiveIndex parse_directory(const ByteVector& directory, std::uint64_t directory_offset,
+                             std::uint16_t archive_flags = 0) {
     Reader reader(directory);
 
     ArchiveIndex index;
@@ -2839,10 +3088,24 @@ ArchiveIndex parse_directory(const ByteVector& directory, std::uint64_t director
             throw FormatError("block record points outside the archive");
         }
         // Reject an absurd declared block size before it can drive a huge
-        // allocation when the block is later decoded.
-        constexpr std::uint64_t kMaxBlockUncompressed = std::uint64_t{4} << 30;  // 4 GiB
-        if (block.uncompressed_size > kMaxBlockUncompressed) {
+        // allocation when the block is later decoded. The large-block profile
+        // widens this structural limit only when its required header flag is
+        // present; old archives retain the conservative 4 GiB bound.
+        const auto max_block_size = (archive_flags & kFlagLargeSolidBlocks) != 0
+            ? kMaxLargeSolidBlockSize : kMaxLegacySolidBlockSize;
+        if (block.uncompressed_size > max_block_size) {
             throw FormatError("block declares an implausible uncompressed size");
+        }
+        if (block.uncompressed_size > std::numeric_limits<std::size_t>::max()) {
+            throw FormatError("block exceeds this platform's addressable size");
+        }
+        if ((archive_flags & kFlagLargeSolidBlocks) != 0 &&
+            block.uncompressed_size > kMaxLegacySolidBlockSize &&
+            block.subframes.empty()) {
+            throw FormatError("large solid block is missing its bounded subframe map");
+        }
+        if ((archive_flags & kFlagLargeSolidBlocks) != 0) {
+            validate_large_solid_block_map(block);
         }
         index.blocks.push_back(block);
     }
@@ -3266,13 +3529,26 @@ void validate_snapshot_index(const ArchiveIndex& index, const ArchiveLayout& lay
 
 // Read the directory of a non-directory-encrypted archive (plaintext directory).
 // A directory-encrypted archive needs the password — callers use load_index instead.
+void validate_large_solid_block_payload(const ByteSource& source,
+                                        const BlockRec& record);
+
 ArchiveIndex read_index(const ByteSource& source) {
     const auto layout = read_layout(source);
     if ((layout.flags & kFlagEncryptedDirectory) != 0) {
         throw std::runtime_error("archive directory is encrypted; a password is required");
     }
     const auto directory = source.read(layout.directory_offset, layout.directory_size);
-    auto index = parse_directory(directory, layout.directory_offset);
+    auto index = parse_directory(directory, layout.directory_offset, layout.flags);
+    index.meta.large_solid_blocks =
+        (layout.flags & kFlagLargeSolidBlocks) != 0;
+    if (index.meta.large_solid_blocks && index.meta.encryption.enabled) {
+        throw FormatError("encrypted archives cannot use the large solid-block profile");
+    }
+    if (index.meta.large_solid_blocks) {
+        for (const auto& block : index.blocks) {
+            validate_large_solid_block_payload(source, block);
+        }
+    }
     const bool v2_flag = (layout.flags & kFlagEncryptionV2) != 0;
     if (v2_flag != index.meta.encryption.v2) {
         throw FormatError("archive encryption-v2 flag does not match its directory metadata");
@@ -3399,6 +3675,77 @@ AxCFrameContext read_axc_frame_context(const ByteSource& source,
         throw FormatError("AXC block metadata exceeds its compressed size");
     }
     return context;
+}
+
+void validate_large_solid_block_payload(const ByteSource& source,
+                                        const BlockRec& record) {
+    if (record.uncompressed_size <= kMaxLegacySolidBlockSize) {
+        return;
+    }
+    const auto context = read_axc_frame_context(source, record);
+    if (context.version != 10 ||
+        context.codec != static_cast<std::uint8_t>(core::CodecId::lzma2) ||
+        context.transforms) {
+        throw FormatError(
+            "large solid block must use an AXC v10 LZMA2 payload without transforms");
+    }
+    constexpr std::uint64_t kExternalHeaderSize = 17;
+    if (context.payload_offset > record.compressed_size ||
+        kExternalHeaderSize > record.compressed_size - context.payload_offset) {
+        throw FormatError("large solid block has a truncated external codec header");
+    }
+    if (record.compressed_offset >
+        std::numeric_limits<std::uint64_t>::max() - context.payload_offset) {
+        throw FormatError("large solid block payload offset overflows");
+    }
+    const auto header = source.read_compressed(
+        record.compressed_offset + context.payload_offset, kExternalHeaderSize);
+    constexpr std::array<std::uint8_t, 4> kExternalMagic = {'A', 'X', 'E', 'C'};
+    if (header.size() != kExternalHeaderSize ||
+        !std::equal(kExternalMagic.begin(), kExternalMagic.end(), header.begin()) ||
+        header[4] != 1 || header[5] != 1 || header[6] != 0 || header[7] != 0) {
+        throw FormatError("large solid block has an invalid external codec header");
+    }
+    const auto read_header_u32 = [&header](std::size_t offset) {
+        return static_cast<std::uint32_t>(header[offset]) |
+               (static_cast<std::uint32_t>(header[offset + 1]) << 8) |
+               (static_cast<std::uint32_t>(header[offset + 2]) << 16) |
+               (static_cast<std::uint32_t>(header[offset + 3]) << 24);
+    };
+    const auto chunk_size = static_cast<std::uint64_t>(read_header_u32(8));
+    const auto chunk_count = static_cast<std::uint64_t>(read_header_u32(12));
+    if (chunk_size < (std::uint64_t{256} << 10) ||
+        chunk_size > kMaxLzmaCodecChunkSize ||
+        chunk_count != record.subframes.size() || chunk_count == 0 ||
+        header[16] > 40) {
+        throw FormatError("large solid block has invalid external chunk geometry");
+    }
+    const auto dictionary_size = header[16] == 40
+        ? std::numeric_limits<std::uint32_t>::max()
+        : (static_cast<std::uint64_t>(2u | (header[16] & 1u))
+           << (header[16] / 2u + 11u));
+    if (dictionary_size > std::max(chunk_size, std::uint64_t{1} << 12)) {
+        throw FormatError("large solid block dictionary exceeds its chunk bound");
+    }
+    const auto expected_count =
+        1 + (record.uncompressed_size - 1) / chunk_size;
+    if (chunk_count != expected_count) {
+        throw FormatError("large solid block chunk count does not match its size");
+    }
+    std::uint64_t uncompressed_offset = 0;
+    for (const auto& frame : record.subframes) {
+        const auto expected_size = std::min<std::uint64_t>(
+            chunk_size, record.uncompressed_size - uncompressed_offset);
+        if (frame.uncompressed_offset != uncompressed_offset ||
+            frame.uncompressed_size != expected_size ||
+            frame.lzma_property != header[16]) {
+            throw FormatError("large solid block subframe geometry is inconsistent");
+        }
+        uncompressed_offset += expected_size;
+    }
+    if (uncompressed_offset != record.uncompressed_size) {
+        throw FormatError("large solid block subframes do not cover the block");
+    }
 }
 
 class BlockSource {
@@ -3771,11 +4118,24 @@ void compress_items_into(Output& out, std::uint64_t& written,
                          ArchiveMeta* archive_meta = nullptr,
                          const ArchiveReuseByPath* reuse_by_path = nullptr,
                          ArchiveReuseStats* reuse_stats = nullptr) {
+    validate_large_solid_block_options(options, block_size);
+    const bool spool_large_blocks = requests_large_solid_blocks(block_size);
+    if (spool_large_blocks && archive_meta != nullptr) {
+        archive_meta->large_solid_blocks = true;
+    }
     ByteVector buffer;
+    std::uint64_t buffer_size = 0;
+    std::uint32_t buffer_crc = core::crc32_init();
+    fs::path buffer_spool_path;
+    std::ofstream buffer_spool;
+    std::vector<std::unique_ptr<TempFileGuard>> raw_spool_guards;
     std::string buffer_path;
     std::vector<CompressionTransformRange> buffer_transform_ranges;
     std::uint64_t current_block = blocks.size();
     std::vector<char> io_buffer(effective_io_buffer_size(options.io_buffer_size));
+    const auto track_raw_spool = [&](const fs::path& path) {
+        raw_spool_guards.push_back(std::make_unique<TempFileGuard>(path));
+    };
     const auto record_capture_warning = [&](const OperationWarning& warning) {
         if (operation) operation->add_warning(warning);
         if (archive_meta != nullptr) archive_meta->capture_warnings.push_back(warning);
@@ -3863,6 +4223,9 @@ void compress_items_into(Output& out, std::uint64_t& written,
     struct PendingBlock {
         std::uint64_t index = 0;
         ByteVector data;
+        fs::path spool_path;
+        std::uint64_t original_size = 0;
+        std::uint32_t crc = 0;
         std::vector<CompressionTransformRange> transform_ranges;
         std::string path;
     };
@@ -3870,6 +4233,9 @@ void compress_items_into(Output& out, std::uint64_t& written,
         std::uint64_t index = 0;
         std::uint64_t original_size = 0;
         ByteVector payload;
+        fs::path payload_path;
+        std::uint64_t payload_size = 0;
+        fs::path raw_spool_path;
         std::vector<SubframeRec> subframes;
         std::string path;
     };
@@ -3965,23 +4331,40 @@ void compress_items_into(Output& out, std::uint64_t& written,
                 inflight_done.fetch_add(done - previous, std::memory_order_relaxed);
                 publish_progress(path);
             };
-        auto compressed = compress(block.data, block_options);
-        auto subframes = !key ? make_subframe_map(compressed)
-                                        : std::vector<SubframeRec>{};
-        if (key != nullptr) {
-            // The block index is allocated at dispatch, so parallel completion
-            // cannot change the AEAD associated data or archive byte order.
-            const auto ad = block_associated_data(block.index);
-            compressed = core::aead_seal(*key, compressed, ad);
+        ByteVector compressed;
+        fs::path payload_path;
+        std::uint64_t payload_size = 0;
+        std::vector<SubframeRec> subframes;
+        const auto original_size = block.spool_path.empty()
+            ? static_cast<std::uint64_t>(block.data.size()) : block.original_size;
+        if (!block.spool_path.empty()) {
+            const auto streamed = compress_large_lzma2_block(
+                block.spool_path, original_size, block.crc, block_options,
+                operation, block_options.encoded_bytes_progress);
+            payload_path = streamed.payload_path;
+            payload_size = streamed.payload_size;
+            subframes = std::move(streamed.subframes);
+        } else {
+            compressed = compress(block.data, block_options);
+            subframes = !key ? make_subframe_map(compressed)
+                             : std::vector<SubframeRec>{};
+            if (key != nullptr) {
+                // The block index is allocated at dispatch, so parallel completion
+                // cannot change the AEAD associated data or archive byte order.
+                const auto ad = block_associated_data(block.index);
+                compressed = core::aead_seal(*key, compressed, ad);
+            }
+            payload_size = compressed.size();
         }
         // Move this block from in-flight to completed; subtracting first keeps
         // the max-clamped display from overshooting the true total.
         inflight_done.fetch_sub(block_done->load(std::memory_order_relaxed),
                                 std::memory_order_relaxed);
-        completed_bytes.fetch_add(block.data.size(), std::memory_order_relaxed);
+        completed_bytes.fetch_add(original_size, std::memory_order_relaxed);
         publish_progress(block.path);
-        return CompletedBlock{block.index, static_cast<std::uint64_t>(block.data.size()),
-                              std::move(compressed), std::move(subframes),
+        return CompletedBlock{block.index, original_size, std::move(compressed),
+                              std::move(payload_path), payload_size,
+                              std::move(block.spool_path), std::move(subframes),
                               std::move(block.path)};
     };
 
@@ -4065,14 +4448,60 @@ void compress_items_into(Output& out, std::uint64_t& written,
             pipeline_cv.notify_all();
 
             operation_checkpoint(operation);
-            blocks.push_back({written, static_cast<std::uint64_t>(block.payload.size()),
-                              block.original_size, std::move(block.subframes)});
-            out.write(reinterpret_cast<const char*>(block.payload.data()),
-                      static_cast<std::streamsize>(block.payload.size()));
-            if (!out) {
-                throw std::runtime_error("failed while writing archive blocks");
+            const auto block_payload_size = block.payload_path.empty()
+                ? static_cast<std::uint64_t>(block.payload.size()) : block.payload_size;
+            blocks.push_back({written, block_payload_size, block.original_size,
+                              std::move(block.subframes)});
+            if (block.payload_path.empty()) {
+                out.write(reinterpret_cast<const char*>(block.payload.data()),
+                          static_cast<std::streamsize>(block.payload.size()));
+                if (!out) {
+                    throw std::runtime_error("failed while writing archive blocks");
+                }
+            } else {
+                TempFileGuard payload_guard(block.payload_path);
+                std::ifstream payload(block.payload_path, std::ios::binary);
+                if (!payload) {
+                    throw std::runtime_error("cannot reopen staged large LZMA2 block");
+                }
+                std::vector<char> copy_buffer(effective_io_buffer_size(options.io_buffer_size));
+                std::uint64_t remaining = block.payload_size;
+                while (remaining > 0) {
+                    const auto want = static_cast<std::streamsize>(
+                        std::min<std::uint64_t>(remaining, copy_buffer.size()));
+                    payload.read(copy_buffer.data(), want);
+                    if (payload.gcount() != want) {
+                        throw FormatError("staged large LZMA2 block is truncated");
+                    }
+                    out.write(copy_buffer.data(), want);
+                    if (!out) {
+                        throw std::runtime_error("failed while writing archive blocks");
+                    }
+                    remaining -= static_cast<std::uint64_t>(want);
+                }
+                payload.close();
+                if (!payload) {
+                    throw std::runtime_error("failed to close staged large LZMA2 block");
+                }
+                std::error_code cleanup_error;
+                fs::remove(block.payload_path, cleanup_error);
+                if (cleanup_error) {
+                    throw fs::filesystem_error(
+                        "failed to remove staged large LZMA2 block",
+                        block.payload_path, cleanup_error);
+                }
+                payload_guard.dismiss();
             }
-            written += block.payload.size();
+            if (!block.raw_spool_path.empty()) {
+                std::error_code cleanup_error;
+                fs::remove(block.raw_spool_path, cleanup_error);
+                if (cleanup_error) {
+                    throw fs::filesystem_error(
+                        "failed to remove staged raw solid block",
+                        block.raw_spool_path, cleanup_error);
+                }
+            }
+            written += block_payload_size;
             compressed_bytes.store(written, std::memory_order_relaxed);
             compressed_source_bytes.fetch_add(block.original_size,
                                               std::memory_order_relaxed);
@@ -4091,8 +4520,16 @@ void compress_items_into(Output& out, std::uint64_t& written,
     };
 
     auto flush_block = [&] {
-        if (buffer.empty()) {
+        if (buffer_size == 0) {
             return;
+        }
+
+        if (spool_large_blocks) {
+            buffer_spool.flush();
+            buffer_spool.close();
+            if (!buffer_spool) {
+                throw std::runtime_error("failed to close staged raw solid block");
+            }
         }
 
         while (true) {
@@ -4105,13 +4542,24 @@ void compress_items_into(Output& out, std::uint64_t& written,
             }
             if (inflight_blocks < max_inflight_blocks) {
                 const auto index = current_block++;
-                pending.push_back(PendingBlock{index, std::move(buffer),
-                                                std::move(buffer_transform_ranges),
-                                                std::move(buffer_path)});
+                if (spool_large_blocks) {
+                    pending.push_back(PendingBlock{
+                        index, {}, std::move(buffer_spool_path), buffer_size,
+                        core::crc32_final(buffer_crc), {}, std::move(buffer_path)});
+                } else {
+                    pending.push_back(PendingBlock{
+                        index, std::move(buffer), {}, buffer_size,
+                        core::crc32_final(buffer_crc),
+                        std::move(buffer_transform_ranges), std::move(buffer_path)});
+                }
                 ++inflight_blocks;
                 lock.unlock();
                 pipeline_cv.notify_one();
                 buffer = ByteVector{};
+                buffer_size = 0;
+                buffer_crc = core::crc32_init();
+                buffer_spool_path.clear();
+                buffer_spool = std::ofstream{};
                 buffer_path.clear();
                 buffer_transform_ranges = {};
                 return;
@@ -4140,7 +4588,7 @@ void compress_items_into(Output& out, std::uint64_t& written,
             const auto minimum_group = std::max<std::size_t>(
                 1, std::min<std::size_t>(std::size_t{1} << 20, block_size / 4));
             if (previous_file_class && *previous_file_class != current_class &&
-                buffer.size() >= minimum_group) {
+                buffer_size >= minimum_group) {
                 flush_block();
             }
             previous_file_class = current_class;
@@ -4349,7 +4797,7 @@ void compress_items_into(Output& out, std::uint64_t& written,
 
         entry.type = kEntryFile;
         entry.first_block = current_block;
-        entry.offset = buffer.size();
+        entry.offset = buffer_size;
 
         auto crc = core::crc32_init();
         core::Blake3 hasher;
@@ -4392,16 +4840,17 @@ void compress_items_into(Output& out, std::uint64_t& written,
                 static_cast<std::size_t>(got));
             if (!transform_classified) {
                 transform_classified = true;
-                if (options.enable_file_filters) {
+                if (!spool_large_blocks && options.enable_file_filters) {
                     transform_hint = codec::detect_transform_hint(bytes);
                 }
             }
             crc = core::crc32_update(crc, bytes);
             hasher.update(bytes);
-            if (transform_hint.transform != CompressionTransform::none) {
+            if (!spool_large_blocks &&
+                transform_hint.transform != CompressionTransform::none) {
                 CompressionTransformRange range{
                     transform_hint.transform,
-                    static_cast<std::uint64_t>(buffer.size()),
+                    buffer_size,
                     static_cast<std::uint64_t>(bytes.size()),
                     total,
                     transform_hint.parameter,
@@ -4426,14 +4875,36 @@ void compress_items_into(Output& out, std::uint64_t& written,
             // completed_bytes intentionally does not advance here: bytes are
             // counted when their block finishes compressing (see flush_block),
             // which is where the wall time actually goes.
-            if (buffer.empty()) buffer_path = item.archive_path;
-            buffer.insert(buffer.end(), bytes.begin(), bytes.end());
+            if (buffer_size == 0) {
+                buffer_path = item.archive_path;
+                if (spool_large_blocks) {
+                    buffer_spool_path = core::unique_sibling_path(
+                        fs::temp_directory_path() / L"AxiomCompress-large-solid", L"raw");
+                    track_raw_spool(buffer_spool_path);
+                    buffer_spool.open(buffer_spool_path,
+                                      std::ios::binary | std::ios::trunc);
+                    if (!buffer_spool) {
+                        throw std::runtime_error("cannot create staged raw solid block");
+                    }
+                }
+            }
+            buffer_crc = core::crc32_update(buffer_crc, bytes);
+            if (spool_large_blocks) {
+                buffer_spool.write(reinterpret_cast<const char*>(bytes.data()),
+                                   static_cast<std::streamsize>(bytes.size()));
+                if (!buffer_spool) {
+                    throw std::runtime_error("failed while staging raw solid block");
+                }
+            } else {
+                buffer.insert(buffer.end(), bytes.begin(), bytes.end());
+            }
+            buffer_size += static_cast<std::uint64_t>(bytes.size());
             report_operation(operation, OperationStage::reading, displayed_progress(), total_bytes,
                              completed_items, total_items, item.archive_path, total,
                              std::max(total, file_total), throughput_progress(), 0, 0,
                              reused_items.load(std::memory_order_relaxed),
                              reused_bytes.load(std::memory_order_relaxed));
-            if (buffer.size() >= block_size) {
+            if (buffer_size >= block_size) {
                 flush_block();
             }
         }
@@ -4738,13 +5209,13 @@ LoadedArchive load_index(const ByteSource& source, const std::string& password) 
             throw std::runtime_error(
                 "archive directory failed to decrypt (wrong password or corrupt)");
         }
-        loaded.index = parse_directory(plain, layout.directory_offset);
+        loaded.index = parse_directory(plain, layout.directory_offset, layout.flags);
         loaded.index.meta.encryption = enc;
         loaded.key = key;
         validate_snapshot_index(loaded.index, layout);
     } else {
         const auto directory = source.read(layout.directory_offset, layout.directory_size);
-        loaded.index = parse_directory(directory, layout.directory_offset);
+        loaded.index = parse_directory(directory, layout.directory_offset, layout.flags);
         if (((layout.flags & kFlagEncryptionV2) != 0) !=
             loaded.index.meta.encryption.v2) {
             throw FormatError(
@@ -4757,6 +5228,17 @@ LoadedArchive load_index(const ByteSource& source, const std::string& password) 
             loaded.key = derive_archive_key(loaded.index.meta.encryption, password);
         }
         validate_snapshot_index(loaded.index, layout);
+    }
+    loaded.index.meta.large_solid_blocks =
+        (layout.flags & kFlagLargeSolidBlocks) != 0;
+    if (loaded.index.meta.large_solid_blocks &&
+        loaded.index.meta.encryption.enabled) {
+        throw FormatError("encrypted archives cannot use the large solid-block profile");
+    }
+    if (loaded.index.meta.large_solid_blocks) {
+        for (const auto& block : loaded.index.blocks) {
+            validate_large_solid_block_payload(source, block);
+        }
     }
     return loaded;
 }
@@ -5480,6 +5962,7 @@ void rebuild_archive_keeping(const fs::path& archive_path,
     const auto layout = read_layout(bytes);
     const auto existing_recovery = read_recovery_service(bytes, layout);
     auto index = load_index(bytes, options.password).index;
+    const bool source_large_solid_blocks = index.meta.large_solid_blocks;
     if (index.meta.locked) {
         throw std::runtime_error("archive is locked (read-only)");
     }
@@ -5494,7 +5977,8 @@ void rebuild_archive_keeping(const fs::path& archive_path,
     if (index.meta.encryption.enabled) {
         key = derive_archive_key(index.meta.encryption, options.password);
     }
-    BlockSource source(bytes, index, 0, operation, key);
+    BlockSource source(bytes, index, 0, operation, key,
+                       source_large_solid_blocks);
 
     // Paths surviving the filter — used to drop hardlinks whose target is removed.
     std::unordered_set<std::string> kept_paths;
@@ -5511,6 +5995,9 @@ void rebuild_archive_keeping(const fs::path& archive_path,
     }
 
     const auto block_size = effective_solid_block_size(options);
+    validate_large_solid_block_options(options, block_size);
+    const bool spool_large_blocks = requests_large_solid_blocks(block_size);
+    index.meta.large_solid_blocks = spool_large_blocks;
 
     fs::path temp_path = archive_path;
     temp_path += ".tmp";
@@ -5537,13 +6024,25 @@ void rebuild_archive_keeping(const fs::path& archive_path,
     std::map<ContentIdentity, ArchiveDataReference> repack_candidates;
     ArchiveReuseStats reuse_stats;
     ByteVector buffer;
+    std::uint64_t buffer_size = 0;
+    std::uint32_t buffer_crc = core::crc32_init();
+    fs::path buffer_spool_path;
+    std::ofstream buffer_spool;
+    std::unique_ptr<TempFileGuard> buffer_spool_guard;
     std::uint64_t current_block = 0;
     std::uint64_t completed_bytes = 0;
     std::uint64_t completed_items = 0;
 
     auto flush_block = [&]() {
-        if (buffer.empty()) {
+        if (buffer_size == 0) {
             return;
+        }
+        if (spool_large_blocks) {
+            buffer_spool.flush();
+            buffer_spool.close();
+            if (!buffer_spool) {
+                throw std::runtime_error("failed to close staged raw solid block");
+            }
         }
         report_operation(operation, OperationStage::compressing, completed_bytes, total_bytes,
                          completed_items, total_items, {}, 0, 0, completed_bytes, written,
@@ -5567,25 +6066,74 @@ void rebuild_archive_keeping(const fs::path& archive_path,
                              block_base + done, written, completed_bytes,
                              reuse_stats.reused_items, reuse_stats.reused_bytes);
         };
-        auto compressed = compress(buffer, block_options);
-        auto subframes = !key ? make_subframe_map(compressed)
-                                        : std::vector<SubframeRec>{};
-        completed_bytes = block_base + buffer.size();
-        if (key) {
-            compressed = core::aead_seal(*key, compressed, block_associated_data(new_blocks.size()));
+        if (spool_large_blocks) {
+            const auto streamed = compress_large_lzma2_block(
+                buffer_spool_path, buffer_size, core::crc32_final(buffer_crc),
+                block_options, operation, block_options.encoded_bytes_progress);
+            completed_bytes = block_base + buffer_size;
+            operation_checkpoint(operation);
+            new_blocks.push_back({written, streamed.payload_size, buffer_size,
+                                  streamed.subframes});
+
+            TempFileGuard payload_guard(streamed.payload_path);
+            std::ifstream payload(streamed.payload_path, std::ios::binary);
+            if (!payload) {
+                throw std::runtime_error("cannot reopen staged large LZMA2 block");
+            }
+            std::vector<char> copy_buffer(effective_io_buffer_size(options.io_buffer_size));
+            std::uint64_t remaining = streamed.payload_size;
+            while (remaining > 0) {
+                const auto want = static_cast<std::streamsize>(
+                    std::min<std::uint64_t>(remaining, copy_buffer.size()));
+                payload.read(copy_buffer.data(), want);
+                if (payload.gcount() != want) {
+                    throw FormatError("staged large LZMA2 block is truncated");
+                }
+                out.write(copy_buffer.data(), want);
+                if (!out) {
+                    throw std::runtime_error("failed while writing archive blocks");
+                }
+                remaining -= static_cast<std::uint64_t>(want);
+            }
+            payload.close();
+            if (!payload) {
+                throw std::runtime_error("failed to close staged large LZMA2 block");
+            }
+            std::error_code payload_error;
+            fs::remove(streamed.payload_path, payload_error);
+            if (payload_error) {
+                throw fs::filesystem_error(
+                    "failed to remove staged large LZMA2 block",
+                    streamed.payload_path, payload_error);
+            }
+            payload_guard.dismiss();
+            written += streamed.payload_size;
+        } else {
+            auto compressed = compress(buffer, block_options);
+            auto subframes = !key ? make_subframe_map(compressed)
+                                  : std::vector<SubframeRec>{};
+            completed_bytes = block_base + buffer_size;
+            if (key) {
+                compressed = core::aead_seal(
+                    *key, compressed, block_associated_data(new_blocks.size()));
+            }
+            operation_checkpoint(operation);
+            new_blocks.push_back({written, static_cast<std::uint64_t>(compressed.size()),
+                                  buffer_size, std::move(subframes)});
+            out.write(reinterpret_cast<const char*>(compressed.data()),
+                      static_cast<std::streamsize>(compressed.size()));
+            if (!out) {
+                throw std::runtime_error("failed while writing archive blocks");
+            }
+            written += compressed.size();
         }
-        operation_checkpoint(operation);
-        new_blocks.push_back({written, static_cast<std::uint64_t>(compressed.size()),
-                              static_cast<std::uint64_t>(buffer.size()),
-                              std::move(subframes)});
-        out.write(reinterpret_cast<const char*>(compressed.data()),
-                  static_cast<std::streamsize>(compressed.size()));
-        if (!out) {
-            throw std::runtime_error("failed while writing archive blocks");
-        }
-        written += compressed.size();
         ++current_block;
         buffer.clear();
+        buffer_size = 0;
+        buffer_crc = core::crc32_init();
+        buffer_spool_path.clear();
+        buffer_spool = std::ofstream{};
+        buffer_spool_guard.reset();
     };
 
     for (const auto& entry : index.entries) {
@@ -5618,12 +6166,38 @@ void rebuild_archive_keeping(const fs::path& archive_path,
         }
         if (entry.type == kEntryFile) {
             out_entry.first_block = current_block;
-            out_entry.offset = buffer.size();
+            out_entry.offset = buffer_size;
             read_file_bytes(source, index.blocks.size(), entry, operation,
                             [&](std::span<const std::uint8_t> chunk) {
-                                buffer.insert(buffer.end(), chunk.begin(), chunk.end());
+                                if (buffer_size == 0 && spool_large_blocks) {
+                                    buffer_spool_path = core::unique_sibling_path(
+                                        fs::temp_directory_path() /
+                                            L"AxiomCompress-large-repack",
+                                        L"raw");
+                                    buffer_spool_guard =
+                                        std::make_unique<TempFileGuard>(buffer_spool_path);
+                                    buffer_spool.open(buffer_spool_path,
+                                                      std::ios::binary | std::ios::trunc);
+                                    if (!buffer_spool) {
+                                        throw std::runtime_error(
+                                            "cannot create staged raw solid block");
+                                    }
+                                }
+                                buffer_crc = core::crc32_update(buffer_crc, chunk);
+                                if (spool_large_blocks) {
+                                    buffer_spool.write(
+                                        reinterpret_cast<const char*>(chunk.data()),
+                                        static_cast<std::streamsize>(chunk.size()));
+                                    if (!buffer_spool) {
+                                        throw std::runtime_error(
+                                            "failed while staging raw solid block");
+                                    }
+                                } else {
+                                    buffer.insert(buffer.end(), chunk.begin(), chunk.end());
+                                }
+                                buffer_size += chunk.size();
                                 // Counted when the block compresses, not here.
-                                if (buffer.size() >= block_size) {
+                                if (buffer_size >= block_size) {
                                     flush_block();
                                 }
                             },
@@ -5766,6 +6340,9 @@ void append_items_to_archive_indexed(
                      completed_items, total_items);
 
     const auto block_size = effective_solid_block_size(options);
+    validate_large_solid_block_options(options, block_size);
+    result_meta.large_solid_blocks =
+        result_meta.large_solid_blocks || requests_large_solid_blocks(block_size);
 
     // A direct generation append can retain the existing header only when the
     // new directory needs the same feature flags. Metadata and sparse capture
@@ -6708,6 +7285,7 @@ void create_archive(const std::vector<std::filesystem::path>& inputs,
                      completed_items, total_items);
 
     const auto block_size = effective_solid_block_size(options);
+    validate_large_solid_block_options(options, block_size);
 
     fs::path temp_path = archive_path;
     temp_path += ".tmp";
@@ -6721,6 +7299,7 @@ void create_archive(const std::vector<std::filesystem::path>& inputs,
     // Encryption (optional). Derive the key + key-check first so we can flag the
     // header and, for a sealed directory, emit the plaintext parameter preamble.
     ArchiveMeta meta;
+    meta.large_solid_blocks = requests_large_solid_blocks(block_size);
     core::CryptoKey key{};
     const core::CryptoKey* key_ptr = nullptr;
     const bool encrypt_dir = !options.password.empty() && options.encrypt_header;
@@ -7240,7 +7819,11 @@ void create_archive_to_stream(
     report_operation(operation, OperationStage::reading, completed_bytes, total_bytes,
                      completed_items, total_items);
 
+    const auto block_size = effective_solid_block_size(options);
+    validate_large_solid_block_options(options, block_size);
+
     ArchiveMeta meta;
+    meta.large_solid_blocks = requests_large_solid_blocks(block_size);
     core::CryptoKey key{};
     struct KeyWipeGuard {
         core::CryptoKey& key;
@@ -7266,7 +7849,9 @@ void create_archive_to_stream(
     const auto header = archive_header_bytes(
         kArchiveVersion5,
         static_cast<std::uint16_t>(archive_header_flags({}, meta) |
-                                    stream_feature_flags));
+                                    stream_feature_flags |
+                                    (meta.large_solid_blocks
+                                         ? kFlagLargeSolidBlocks : 0)));
     CountedOutput sink(output);
     std::uint64_t written = 0;
     sink.write(reinterpret_cast<const char*>(header.data()),
@@ -7285,7 +7870,7 @@ void create_archive_to_stream(
     std::vector<BlockRec> blocks;
     std::vector<EntryRec> entries;
     compress_items_into(sink, written, blocks, entries, items,
-                        options, effective_solid_block_size(options), operation,
+                        options, block_size, operation,
                         total_bytes, total_items, completed_bytes, completed_items,
                         options.skip_unreadable_files, key_ptr, &meta);
 
@@ -9172,7 +9757,8 @@ void test_archive(const std::filesystem::path& archive_path,
     };
 
     if (!use_parallel_test_decode) {
-        BlockSource source(bytes, index, options.thread_count, operation, loaded.key);
+        BlockSource source(bytes, index, options.thread_count, operation, loaded.key,
+                           index.meta.large_solid_blocks);
         if (index.meta.chunk_table) {
             for (std::uint64_t chunk_index = 0; chunk_index < index.chunks.size();
                  ++chunk_index) {
@@ -9366,7 +9952,7 @@ void extract_entries_impl(const std::filesystem::path& archive_path,
         throw FormatError("archive contains source-capture warnings");
     }
     BlockSource source(bytes, index, options.thread_count, operation, loaded.key,
-                       requested_entries != nullptr);
+                       requested_entries != nullptr || index.meta.large_solid_blocks);
 
     LazyPathIndex entry_by_path(index.entries);
     std::vector<bool> selected(index.entries.size(), requested_entries == nullptr);
@@ -9798,7 +10384,8 @@ namespace detail {
 void fuzz_read_archive(std::span<const std::uint8_t> bytes) {
     const ByteSource source(bytes);
     const auto index = read_index(source);
-    BlockSource blocks(source, index, 0, nullptr);
+    BlockSource blocks(source, index, 0, nullptr, std::nullopt,
+                       index.meta.large_solid_blocks);
     for (const auto& entry : index.entries) {
         if (entry.type == kEntryDir) {
             continue;

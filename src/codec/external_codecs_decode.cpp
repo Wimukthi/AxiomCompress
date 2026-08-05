@@ -23,7 +23,8 @@ constexpr std::size_t kRecordHeaderSize = 12;
 constexpr std::uint8_t kStoredChunk = 1;
 constexpr std::size_t kMinChunkSize = std::size_t{256} << 10;
 constexpr std::size_t kMaxFastCodecChunkSize = std::size_t{4} << 20;
-constexpr std::size_t kMaxLzmaChunkSize = std::size_t{512} << 20;
+constexpr std::size_t kMaxLzmaChunkSize = kMaxLzmaDictionarySize;
+constexpr std::size_t kMinLzmaDictionarySize = std::size_t{1} << 12;
 constexpr std::size_t kMaxPropertySize = 16;
 
 std::uint16_t read_u16(std::span<const std::uint8_t> input, std::size_t& cursor) {
@@ -108,6 +109,19 @@ void lzma_free(ISzAllocPtr, void* address) { std::free(address); }
 
 const ISzAlloc kLzmaAllocator{lzma_alloc, lzma_free};
 
+void validate_lzma2_property(std::uint8_t property, std::size_t chunk_size) {
+    if (property > 40) {
+        throw FormatError("LZMA2 dictionary property is invalid");
+    }
+    const std::uint64_t dictionary_size = property == 40
+        ? std::numeric_limits<std::uint32_t>::max()
+        : (static_cast<std::uint64_t>(2u | (property & 1u))
+           << (property / 2u + 11u));
+    if (dictionary_size > std::max(chunk_size, kMinLzmaDictionarySize)) {
+        throw FormatError("LZMA2 dictionary exceeds the chunk memory bound");
+    }
+}
+
 ByteVector decode_lzma2(std::span<const std::uint8_t> input,
                         std::size_t expected_size,
                         std::uint8_t property) {
@@ -133,6 +147,14 @@ ByteVector decode_lzma2(std::span<const std::uint8_t> input,
 ByteVector encode_external_codec(std::span<const std::uint8_t>,
                                  CompressionMethod,
                                  const CompressionOptions&) {
+    throw std::runtime_error("external compression is unavailable in the SFX decode runtime");
+}
+
+ByteVector encode_external_codec_with_dictionary_bound(
+    std::span<const std::uint8_t>,
+    CompressionMethod,
+    const CompressionOptions&,
+    std::size_t) {
     throw std::runtime_error("external compression is unavailable in the SFX decode runtime");
 }
 
@@ -173,14 +195,7 @@ ByteVector decode_external_codec(std::span<const std::uint8_t> payload,
     }
     if (method == CompressionMethod::lzma2) {
         const std::uint8_t property = properties.front();
-        if (property > 40) throw FormatError("LZMA2 dictionary property is invalid");
-        const std::uint64_t dictionary_size = property == 40
-            ? std::numeric_limits<std::uint32_t>::max()
-            : (static_cast<std::uint64_t>(2u | (property & 1u))
-               << (property / 2u + 11u));
-        if (dictionary_size > std::max(chunk_size, std::size_t{1} << 12)) {
-            throw FormatError("LZMA2 dictionary exceeds the chunk memory bound");
-        }
+        validate_lzma2_property(property, chunk_size);
     }
 
     ByteVector output;
@@ -274,9 +289,7 @@ std::vector<ExternalCodecFrame> inspect_external_codec_frames(
     std::uint8_t lzma_property = 0;
     if (method == CompressionMethod::lzma2) {
         lzma_property = properties.front();
-        if (lzma_property > 40) {
-            throw FormatError("LZMA2 dictionary property is invalid");
-        }
+        validate_lzma2_property(lzma_property, chunk_size);
     }
 
     std::vector<ExternalCodecFrame> frames;

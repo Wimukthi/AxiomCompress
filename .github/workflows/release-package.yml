@@ -56,6 +56,7 @@ jobs:
           Copy-Item -LiteralPath ".\out\Release\Axiom.exe" -Destination $stage
           Copy-Item -LiteralPath ".\out\Release\axiomc.exe" -Destination $stage
           Copy-Item -LiteralPath ".\out\Release\AxiomSfx.bin" -Destination $stage
+          Copy-Item -LiteralPath ".\out\Release\AxiomSfxMini.bin" -Destination $stage
           Copy-Item -LiteralPath ".\out\Release\backends" -Destination (Join-Path $stage "backends") -Recurse
           Copy-Item -LiteralPath ".\README.md" -Destination $stage
           Copy-Item -LiteralPath ".\CHANGELOG.md" -Destination $stage

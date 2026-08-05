@@ -8,6 +8,38 @@ a four-part `major.minor.patch.build` version scheme described in
 Entries are condensed from the
 [GitHub releases](https://github.com/Wimukthi/AxiomCompress/releases).
 
+## [0.9.2.2] - 2026-08-06
+
+Large-window and large-solid-block release.
+
+### Added
+
+- Added native Axiom and LZMA2 dictionary/window controls through the 4 GiB
+  user-facing limit, with the 32-bit wire ceiling validated consistently by
+  the library, CLI, GUI, and external-codec reader.
+- Added the AXAR large-solid profile for LZMA2 blocks from above 4 GiB through
+  64 GiB, using temporary-file staging and bounded AXEC subframes with a
+  required compatibility flag.
+- Added boundary, malformed-geometry, stable-final-chunk, and CLI smoke
+  regression coverage for the new limits.
+
+### Fixed
+
+- Kept one LZMA2 property across every external-codec frame, including a short
+  final frame, preventing release-runtime aborts during large-dictionary
+  streams.
+- Rejected oversized size arguments and out-of-range match distances before
+  narrowing or allocation.
+- Included both full and Mini SFX runtime modules in installer and portable
+  packages so every documented `--stub` tier works after installation.
+
+### Validation
+
+- Release MSVC solution build and complete codec/archive/safety/fuzz suite
+  passed, including the 4 GiB boundary coverage.
+- Release CLI 4 GiB LZMA2 creation smoke test passed and left no temporary
+  artifact.
+
 ## [0.9.2.0] - 2026-08-05
 
 Reliability and interface refinement release.
@@ -409,6 +441,7 @@ First published release: the Inno Setup installer and portable zip, carrying
 update/repair/remove maintenance handling, and dynamic light/dark setup
 styling.
 
+[0.9.2.2]: https://github.com/Wimukthi/AxiomCompress/releases/tag/0.9.2.2
 [0.9.1.0]: https://github.com/Wimukthi/AxiomCompress/releases/tag/0.9.1.0
 [0.9.0.0]: https://github.com/Wimukthi/AxiomCompress/releases/tag/0.9.0.0
 [0.8.0.0]: https://github.com/Wimukthi/AxiomCompress/releases/tag/0.8.0.0

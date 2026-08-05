@@ -22,6 +22,7 @@
 #include <filesystem>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -104,11 +105,12 @@ void print_usage() {
         "  --codec-level N     native level: zstd -5..22; lzma2/deflate 0..9\n"
         "  --fast (=1)         --max (=9)\n"
         "  --threads N        --block-size SIZE   --parallel\n"
+        "                      LZMA2 solid blocks >4 GiB through 64 GiB are disk-staged\n"
         "  --chain-depth N    --nice N            (Axiom search / LZMA2 fast bytes)\n"
         "  --lazy / --no-lazy  --fast-entropy     (override level knobs)\n"
         "  --profile                              c only: print codec phase timings\n"
         "  --fast-lz          --no-filters        (byte-token profile / disable file filters)\n"
-        "  --window SIZE                          (Axiom window / LZMA2 dictionary, max 512 MiB)\n"
+        "  --window SIZE                          (Axiom window / LZMA2 dictionary, up to 4 GiB)\n"
         "  --lzma-mf MODE                         LZMA2 match finder: bt4 or hc4\n"
         "  --swarm                                (levels 1-6, 8-9: cores cooperate\n"
         "                                          inside large blocks; level 7 ignores it)\n"
@@ -625,7 +627,12 @@ std::size_t parse_size(const std::string& value) {
             digits.pop_back();
         }
     }
-    return static_cast<std::size_t>(std::stoull(digits) * multiplier);
+    const auto parsed_value = std::stoull(digits);
+    if (multiplier != 0 &&
+        parsed_value > std::numeric_limits<std::size_t>::max() / multiplier) {
+        throw std::invalid_argument("size exceeds this build's address space");
+    }
+    return static_cast<std::size_t>(parsed_value * multiplier);
 }
 
 template <std::size_t Size>
@@ -763,6 +770,11 @@ bool take_compression_flags(std::vector<std::string>& args,
             options.lzma_fast_bytes = options.nice_length;
         } else if (arg == "--window") {
             options.window_size = parse_size(next("--window"));
+            if (static_cast<std::uint64_t>(options.window_size) >
+                (std::uint64_t{1} << 32)) {
+                throw std::runtime_error(
+                    "--window must be no larger than 4 GiB");
+            }
             options.lzma_dictionary_size = options.window_size;
         } else if (arg == "--lzma-mf") {
             const auto mode = next("--lzma-mf");

@@ -28,7 +28,13 @@ volumes, signatures, and self-extracting output. The single-stream format is
   blocks for cross-file redundancy, but every block stays independently
   decodable, so extracting one file never decodes the whole archive.
 - **Five block methods.** Axiom adaptive (default), Zstandard, LZMA2, Deflate,
-  and Store. Container features are identical whichever you pick.
+  and Store. The normal container services are method-independent; the
+  streamed large-solid profile is the documented LZMA2-only exception.
+- **Long-range codec settings.** Native Axiom and LZMA2 accept windows or
+  dictionaries up to 4 GiB (the encoded ceiling is 4 GiB−1). AXAR LZMA2
+  archives can also use above-4 GiB through 64 GiB streamed solid blocks with bounded codec
+  chunks; that required profile is currently incompatible with encryption and
+  recovery records.
 - **Fast, bounded decode.** Decompression does no searching, runs no adaptive
   model, and takes its memory ceiling from the block header. Decode time is
   roughly flat across compression levels.
@@ -51,9 +57,10 @@ Download the latest [release](https://github.com/Wimukthi/AxiomCompress/releases
 | `AxiomSetup-<version>-win-x64.exe` | Inno Setup installer, with Start Menu entry and App Paths registration |
 | `Axiom-<version>-win-x64.zip` | Portable; unzip and run |
 
-Keep `AxiomSfx.bin` and the `backends\` folder beside `Axiom.exe` and
-`axiomc.exe`. `AxiomSfx.bin` is the SFX runtime and is not a launchable
-program; `backends\7zip\` provides read-only 7z/RAR/ISO/CAB support.
+Keep `AxiomSfx.bin`, `AxiomSfxMini.bin`, and the `backends\` folder beside
+`Axiom.exe` and `axiomc.exe`. The two SFX modules are runtime payloads and are
+not launchable programs; `backends\7zip\` provides read-only 7z/RAR/ISO/CAB
+support.
 
 To build from source instead, see [Building](#building).
 
@@ -107,6 +114,14 @@ One `--level 1..9` knob picks the speed/ratio operating point. The default is
 Levels 8 and 9 run a dynamic-programming optimal parser fed by the binary tree.
 Individual flags (`--chain-depth`, `--nice`, `--bt`, `--window`, `--optimal…`)
 override the preset — a level is only a starting point.
+
+The explicit native Axiom window and LZMA2 dictionary controls accept up to
+4 GiB; a 4 GiB setting is represented on the wire by the largest 32-bit value,
+4 GiB−1. For AXAR, an LZMA2 `--block-size` above 4 GiB through 64 GiB selects a
+disk-staged large-solid profile. It keeps codec chunks bounded (512 MiB by
+default, or up to the selected dictionary), so the outer solid-block size does
+not require an equally large allocation. See [FORMAT.md](FORMAT.md) and the
+[CLI guide](CLI_GUIDE.md#block-size) for compatibility and memory details.
 
 ## Performance
 

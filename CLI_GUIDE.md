@@ -572,7 +572,7 @@ These apply to commands that create or recompress data: `add`, `update`,
 |---|---|---|
 | Axiom adaptive (default) | `axiom` | `--level 1..9`, window, nice length, threading model |
 | Zstandard | `zstd` | native level `-5..22` |
-| LZMA2 | `lzma2` | native level `0..9`, 4 KiB–512 MiB dictionary, 5–273 fast bytes, HC4/BT4 |
+| LZMA2 | `lzma2` | native level `0..9`, 4 KiB–4 GiB dictionary, 5–273 fast bytes, HC4/BT4 |
 | Deflate | `deflate` | native level `0..9`; fixed 32 KiB window, 258-byte max match |
 | Store | `store` | none |
 
@@ -588,9 +588,14 @@ LZMA2 and Deflate use the portable value directly.
 
 For LZMA2, `--window` and `--nice` become the dictionary and fast-bytes
 settings. The dictionary is clamped to the independently decoded AXC chunk
-(the effective `--block-size`) and cannot exceed 512 MiB — large dictionaries
-can use several times their size in encoder memory. `--lzma-mf hc4` favors
-speed, `bt4` favors ratio.
+(the effective `--block-size`) and to a stable bound for the input represented
+by that payload. Values up to 4 GiB
+are accepted; the on-stream ceiling is 4 GiB−1. To request a 4 GiB LZMA2
+window for ordinary streams, select both `--window 4G` and `--block-size 4G`.
+Large dictionaries can use several times their size in encoder memory, so a
+small payload is automatically capped to its own size while multi-chunk
+payloads retain one property across their final short chunk. `--lzma-mf hc4`
+favors speed, `bt4` favors ratio.
 
 ZIP creation supports only `deflate` and `store`. Omitting `--method` keeps the
 established ZIP Deflate behavior.
@@ -598,7 +603,10 @@ established ZIP Deflate behavior.
 Every external-codec payload is split into independently bounded chunks. Pause,
 cancel, and progress checkpoints happen between chunks, and an incompressible
 chunk is stored rather than expanded. Encryption, recovery, signing, metadata,
-volumes, and SFX are container services and do not vary with the method.
+volumes, and SFX are container services and do not vary with the method for
+ordinary blocks. The large-solid LZMA2 profile is the exception: it currently
+does not allow encryption or recovery records because those paths require
+whole-block buffers.
 
 ### Levels
 
@@ -668,12 +676,25 @@ large enough for ratio, and the codec layer splits it into enough internal
 blocks to feed the workers. Supplying `--block-size` disables that, which is
 what you want for repeatable benchmarks and deliberate memory tuning.
 
+For LZMA2, values larger than `4G` through `64G` select AXAR's large solid-block
+profile. The raw solid block is staged in a temporary file and encoded as
+independently decoded codec chunks of at most 512 MiB by default, so the outer
+block size does not require a matching allocation or dictionary. If `--window`
+is raised, the large-block writer raises its codec chunk up to that requested
+dictionary (maximum 4 GiB−1); the raw staging buffer still grows only to the
+current chunk's input size. This profile requires LZMA2, disables file-aware
+filters, and cannot be combined with encryption or recovery records. The
+resulting AXAR required feature flag makes older readers reject the archive
+instead of attempting an unsafe legacy decode.
+
 #### Window
 
-`--window` is the dictionary/match window. Larger windows reach more distant
-repetition and cost memory, especially with `--bt`: the binary-tree matcher
-uses roughly `2 × min(window, block) × 4` bytes for tree links, on top of
-input, output, and other codec memory.
+`--window` is the dictionary/match window. Native Axiom and LZMA2 accept up to
+4 GiB (4 GiB−1 is the largest encoded distance/property). Larger windows reach
+more distant repetition and cost memory, especially with `--bt`: the
+binary-tree matcher uses roughly `2 × min(window, block) × 4` bytes for tree
+links, on top of input, output, and other codec memory. The level-1 `--fast-lz`
+profile remains limited to a 16 MiB distance.
 
 #### Threading model
 

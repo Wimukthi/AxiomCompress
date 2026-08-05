@@ -26,7 +26,10 @@ constexpr std::size_t kRecordHeaderSize = 12;
 constexpr std::uint8_t kStoredChunk = 1;
 constexpr std::size_t kMinChunkSize = std::size_t{256} << 10;
 constexpr std::size_t kMaxFastCodecChunkSize = std::size_t{4} << 20;
-constexpr std::size_t kMaxLzmaChunkSize = std::size_t{512} << 20;
+// AXEC stores chunk sizes as u32. LZMA2 uses the full representable range;
+// Zstandard and Deflate intentionally keep their smaller independent limits.
+constexpr std::size_t kMaxLzmaChunkSize = kMaxLzmaDictionarySize;
+constexpr std::size_t kMinLzmaDictionarySize = std::size_t{1} << 12;
 constexpr std::size_t kMaxPropertySize = 16;
 
 struct EncodedChunk {
@@ -99,6 +102,19 @@ std::size_t default_lzma_dictionary_size(int level) {
 
 std::size_t default_lzma_fast_bytes(int level) {
     return level < 7 ? 32 : 64;
+}
+
+void validate_lzma2_property(std::uint8_t property, std::size_t chunk_size) {
+    if (property > 40) {
+        throw FormatError("LZMA2 dictionary property is invalid");
+    }
+    const std::uint64_t dictionary_size = property == 40
+        ? std::numeric_limits<std::uint32_t>::max()
+        : (static_cast<std::uint64_t>(2u | (property & 1u))
+           << (property / 2u + 11u));
+    if (dictionary_size > std::max(chunk_size, kMinLzmaDictionarySize)) {
+        throw FormatError("LZMA2 dictionary exceeds the chunk memory bound");
+    }
 }
 
 void checkpoint(const std::shared_ptr<OperationControl>& operation) {
@@ -241,7 +257,8 @@ SRes lzma_progress(ICompressProgressPtr progress, UInt64, UInt64) {
 std::pair<ByteVector, std::uint8_t> encode_lzma2(
     std::span<const std::uint8_t> input,
     const CompressionOptions& options,
-    std::size_t dictionary_limit) {
+    std::size_t dictionary_limit,
+    std::size_t dictionary_input_bound) {
     CLzma2EncHandle encoder = Lzma2Enc_Create(&kLzmaAllocator, &kLzmaAllocator);
     if (encoder == nullptr) {
         throw std::bad_alloc();
@@ -252,12 +269,28 @@ std::pair<ByteVector, std::uint8_t> encode_lzma2(
         Lzma2EncProps_Init(&properties);
         const int level = effective_level(CompressionMethod::lzma2, options);
         properties.lzmaProps.level = level;
+        if (options.lzma_dictionary_size != 0 &&
+            static_cast<std::uint64_t>(options.lzma_dictionary_size) >
+                (std::uint64_t{1} << 32)) {
+            throw std::invalid_argument(
+                "LZMA2 dictionary exceeds the 4 GiB limit");
+        }
         const std::size_t dictionary = options.lzma_dictionary_size == 0
             ? default_lzma_dictionary_size(level)
             : options.lzma_dictionary_size;
-        properties.lzmaProps.dictSize = static_cast<UInt32>(std::clamp<std::size_t>(
-            dictionary, std::size_t{1} << 12,
-            std::max(dictionary_limit, std::size_t{1} << 12)));
+        const auto maximum_dictionary = std::min(
+            std::max(dictionary_limit, kMinLzmaDictionarySize),
+            kMaxLzmaDictionarySize);
+        const auto bounded_dictionary = std::clamp(
+            dictionary, kMinLzmaDictionarySize, maximum_dictionary);
+        // AXEC stores one LZMA2 property for the whole payload, so every frame
+        // must use the same dictionary even when the final frame is short. The
+        // caller supplies a stable payload/working-chunk bound to avoid a
+        // multi-gigabyte SDK allocation for a genuinely small input.
+        const auto effective_dictionary = std::min(
+            bounded_dictionary,
+            std::max(dictionary_input_bound, kMinLzmaDictionarySize));
+        properties.lzmaProps.dictSize = static_cast<UInt32>(effective_dictionary);
         const std::size_t fast_bytes = options.lzma_fast_bytes == 0
             ? default_lzma_fast_bytes(level)
             : options.lzma_fast_bytes;
@@ -320,7 +353,11 @@ EncodedChunk make_chunk(std::span<const std::uint8_t> input,
                         CompressionMethod method,
                         const CompressionOptions& options,
                         std::size_t dictionary_limit,
+                        std::size_t dictionary_input_bound,
                         std::vector<std::uint8_t>& properties) {
+    if (input.size() > kMaxLzmaChunkSize) {
+        throw std::runtime_error("external codec chunk exceeds the 4 GiB format limit");
+    }
     EncodedChunk chunk;
     chunk.raw_size = static_cast<std::uint32_t>(input.size());
     if (method == CompressionMethod::zstandard) {
@@ -328,7 +365,8 @@ EncodedChunk make_chunk(std::span<const std::uint8_t> input,
             input, effective_level(CompressionMethod::zstandard, options));
     } else if (method == CompressionMethod::lzma2) {
         auto [bytes, property] =
-            encode_lzma2(input, options, dictionary_limit);
+            encode_lzma2(
+                input, options, dictionary_limit, dictionary_input_bound);
         if (properties.empty()) {
             properties.push_back(property);
         } else if (properties.front() != property) {
@@ -350,19 +388,27 @@ EncodedChunk make_chunk(std::span<const std::uint8_t> input,
 
 }  // namespace
 
-ByteVector encode_external_codec(std::span<const std::uint8_t> input,
-                                 CompressionMethod method,
-                                 const CompressionOptions& options) {
+ByteVector encode_external_codec_impl(
+    std::span<const std::uint8_t> input,
+    CompressionMethod method,
+    const CompressionOptions& options,
+    std::size_t dictionary_input_bound) {
     if (method != CompressionMethod::zstandard &&
         method != CompressionMethod::lzma2 &&
         method != CompressionMethod::deflate) {
         throw std::invalid_argument("method is not an external AXC codec");
     }
+    if (method == CompressionMethod::lzma2 &&
+        static_cast<std::uint64_t>(options.lzma_dictionary_size) >
+            (std::uint64_t{1} << 32)) {
+        throw std::invalid_argument("LZMA2 dictionary exceeds the 4 GiB limit");
+    }
 
     const std::size_t maximum_chunk = method == CompressionMethod::lzma2
         ? kMaxLzmaChunkSize : kMaxFastCodecChunkSize;
-    const std::size_t requested = options.block_size == 0
-        ? maximum_chunk : options.block_size;
+    const std::size_t requested = options.external_codec_chunk_size != 0
+        ? options.external_codec_chunk_size
+        : (options.block_size == 0 ? maximum_chunk : options.block_size);
     const std::size_t chunk_size =
         std::clamp(requested, kMinChunkSize, maximum_chunk);
     const std::size_t chunk_count =
@@ -380,7 +426,7 @@ ByteVector encode_external_codec(std::span<const std::uint8_t> input,
         const std::size_t size = std::min(chunk_size, input.size() - offset);
         chunks.push_back(make_chunk(
             input.subspan(offset, size), method, options, chunk_size,
-            properties));
+            dictionary_input_bound, properties));
         report_encoded(options, static_cast<std::uint64_t>(offset + size));
     }
 
@@ -414,6 +460,22 @@ ByteVector encode_external_codec(std::span<const std::uint8_t> input,
         output.insert(output.end(), chunk.bytes.begin(), chunk.bytes.end());
     }
     return output;
+}
+
+ByteVector encode_external_codec(std::span<const std::uint8_t> input,
+                                 CompressionMethod method,
+                                 const CompressionOptions& options) {
+    return encode_external_codec_impl(input, method, options, input.size());
+}
+
+ByteVector encode_external_codec_with_dictionary_bound(
+    std::span<const std::uint8_t> input,
+    CompressionMethod method,
+    const CompressionOptions& options,
+    std::size_t dictionary_input_bound) {
+    return encode_external_codec_impl(
+        input, method, options,
+        dictionary_input_bound == 0 ? input.size() : dictionary_input_bound);
 }
 
 ByteVector decode_external_codec(std::span<const std::uint8_t> payload,
@@ -452,17 +514,7 @@ ByteVector decode_external_codec(std::span<const std::uint8_t> payload,
         throw FormatError("external codec properties do not match the codec");
     }
     if (method == CompressionMethod::lzma2) {
-        const std::uint8_t property = properties.front();
-        if (property > 40) {
-            throw FormatError("LZMA2 dictionary property is invalid");
-        }
-        const std::uint64_t dictionary_size = property == 40
-            ? std::numeric_limits<std::uint32_t>::max()
-            : (static_cast<std::uint64_t>(2u | (property & 1u))
-               << (property / 2u + 11u));
-        if (dictionary_size > std::max(chunk_size, std::size_t{1} << 12)) {
-            throw FormatError("LZMA2 dictionary exceeds the chunk memory bound");
-        }
+        validate_lzma2_property(properties.front(), chunk_size);
     }
 
     ByteVector output;
@@ -557,9 +609,7 @@ std::vector<ExternalCodecFrame> inspect_external_codec_frames(
     std::uint8_t lzma_property = 0;
     if (method == CompressionMethod::lzma2) {
         lzma_property = properties.front();
-        if (lzma_property > 40) {
-            throw FormatError("LZMA2 dictionary property is invalid");
-        }
+        validate_lzma2_property(lzma_property, chunk_size);
     }
 
     std::vector<ExternalCodecFrame> frames;
@@ -628,9 +678,11 @@ ByteVector decode_external_codec_frame(std::span<const std::uint8_t> frame,
         return decode_zstandard(encoded, expected_size);
     }
     if (method == CompressionMethod::lzma2) {
-        if (lzma_property > 40) {
-            throw FormatError("LZMA2 dictionary property is invalid");
-        }
+        // The enclosing AXEC header carries the independently decoded chunk
+        // bound. A final short frame may legitimately use a dictionary larger
+        // than its own raw size, so validate against the format ceiling here;
+        // the complete-payload path validates the declared chunk geometry.
+        validate_lzma2_property(lzma_property, kMaxLzmaChunkSize);
         return decode_lzma2(encoded, expected_size, lzma_property);
     }
     if (method == CompressionMethod::deflate) {

@@ -37,6 +37,14 @@ ByteVector encode_external_codec(std::span<const std::uint8_t> input,
                                  CompressionMethod method,
                                  const CompressionOptions& options);
 
+// Variant used by the disk-streamed large-solid writer. The bound is stable
+// across separately encoded chunks that share one AXEC property byte.
+ByteVector encode_external_codec_with_dictionary_bound(
+    std::span<const std::uint8_t> input,
+    CompressionMethod method,
+    const CompressionOptions& options,
+    std::size_t dictionary_input_bound);
+
 ByteVector decode_external_codec(std::span<const std::uint8_t> payload,
                                  CompressionMethod method,
                                  std::size_t expected_size,

@@ -5,6 +5,7 @@
 #include "sfx/sfx_config.hpp"
 #include "sfx/sfx_options.hpp"
 #include "codec/block.hpp"
+#include "codec/external_codecs.hpp"
 #include "codec/fast_lz.hpp"
 #include "codec/lz77.hpp"
 #include "codec/lz77_split.hpp"
@@ -60,6 +61,14 @@
 #include <vector>
 
 namespace {
+
+std::uint32_t test_read_le32(const std::vector<std::uint8_t>& bytes,
+                             std::size_t offset);
+
+template <typename Fn>
+void expect_throws(
+    Fn&& fn,
+    const std::source_location& where = std::source_location::current());
 
 #if defined(_WIN32)
 std::optional<std::filesystem::path> bundled_7z_for_tests();
@@ -530,6 +539,75 @@ void expect_lzma_multichunk_settings_roundtrip() {
     AXIOM_CHECK(axiom::decompress(archive) == input);
 }
 
+void test_four_gib_dictionary_boundaries() {
+    std::vector<std::uint8_t> input(2u << 20);
+    for (std::size_t index = 0; index < input.size(); ++index) {
+        input[index] = static_cast<std::uint8_t>(
+            ((index / 4096) * 29 + (index % 251)) & 0xFFu);
+    }
+
+    // The native Axiom path accepts the conventional 4 GiB setting, but the
+    // emitted distances remain capped at the largest u32 value.
+    axiom::CompressionOptions axiom_options;
+    axiom::apply_compression_level(axiom_options, 5);
+    axiom_options.method = axiom::CompressionMethod::axiom;
+    axiom_options.use_tree_matcher = true;
+    axiom_options.enable_optimal_parser = false;
+    axiom_options.thread_count = 1;
+    axiom_options.auto_block_size_for_threads = false;
+    axiom_options.enable_file_filters = false;
+    axiom_options.block_size = std::size_t{4} << 30;
+    axiom_options.window_size = std::size_t{4} << 30;
+    const auto axiom_archive = axiom::compress(input, axiom_options);
+    AXIOM_CHECK(axiom::decompress(axiom_archive) == input);
+
+    auto invalid_axiom = axiom_options;
+    invalid_axiom.window_size = (std::size_t{4} << 30) + 1;
+    expect_throws([&] {
+        (void)axiom::codec::encode_lz77(input, invalid_axiom);
+    });
+
+    // An explicit 4 GiB LZMA2 dictionary raises the AXEC chunk geometry to the
+    // same u32 ceiling. The short test input keeps the effective SDK allocation
+    // small while still exercising the large on-stream chunk_size field.
+    axiom::CompressionOptions lzma_options;
+    lzma_options.method = axiom::CompressionMethod::lzma2;
+    lzma_options.codec_level = 1;
+    lzma_options.lzma_dictionary_size = axiom::kMaxLzmaDictionarySize;
+    lzma_options.block_size = axiom::kMaxLzmaDictionarySize;
+    lzma_options.thread_count = 1;
+    lzma_options.auto_block_size_for_threads = false;
+    lzma_options.enable_file_filters = false;
+    const auto lzma_archive = axiom::compress(input, lzma_options);
+    const auto lzma_header = axiom::core::read_archive_header(lzma_archive);
+    AXIOM_CHECK(lzma_header.codec == axiom::core::CodecId::lzma2);
+    AXIOM_CHECK(test_read_le32(lzma_archive, lzma_header.payload_offset + 8) ==
+                std::numeric_limits<std::uint32_t>::max());
+    AXIOM_CHECK(axiom::decompress(lzma_archive) == input);
+
+    auto invalid_lzma = lzma_options;
+    invalid_lzma.lzma_dictionary_size = (std::size_t{4} << 30) + 1;
+    expect_throws([&] {
+        (void)axiom::codec::encode_external_codec(
+            input, axiom::CompressionMethod::lzma2, invalid_lzma);
+    });
+
+    // Property 40 is the LZMA2 encoding of UINT32_MAX. A zero-chunk payload
+    // avoids allocating a dictionary while proving both full and frame-index
+    // readers accept the new maximum geometry.
+    const std::vector<std::uint8_t> maximum_property_payload{
+        'A', 'X', 'E', 'C', 1, 1, 0, 0,
+        0xFF, 0xFF, 0xFF, 0xFF,
+        0, 0, 0, 0,
+        40};
+    const auto frames = axiom::codec::inspect_external_codec_frames(
+        maximum_property_payload, axiom::CompressionMethod::lzma2, 0);
+    AXIOM_CHECK(frames.empty());
+    AXIOM_CHECK(axiom::codec::decode_external_codec(
+                    maximum_property_payload, axiom::CompressionMethod::lzma2, 0, {})
+                .empty());
+}
+
 void test_swarm_extended_levels() {
     // More than two fixed swarm segments, with recurring pages that exercise
     // both local matches and lookups into completed earlier segments.
@@ -992,7 +1070,7 @@ fs::path make_temp_dir() {
 template <typename Fn>
 void expect_throws(
     Fn&& fn,
-    const std::source_location& where = std::source_location::current()) {
+    const std::source_location& where) {
     bool threw = false;
     try {
         fn();
@@ -1537,6 +1615,87 @@ void test_external_codec_axar_roundtrip() {
         axiom::extract_archive(archive, destination, {});
         AXIOM_CHECK(read_all(destination / source.filename()) == original);
     }
+
+    std::error_code ec;
+    fs::remove_all(root, ec);
+}
+
+void test_large_lzma2_solid_profile() {
+    const auto root = make_temp_dir();
+    const auto source = root / "large-profile.bin";
+    std::vector<std::uint8_t> original(2u << 20);
+    for (std::size_t index = 0; index < original.size(); ++index) {
+        original[index] = static_cast<std::uint8_t>(
+            ((index / 4096) * 17 + (index % 257)) & 0xFFu);
+    }
+    write_all(source, original);
+
+    axiom::CompressionOptions options;
+    options.method = axiom::CompressionMethod::lzma2;
+    options.codec_level = 1;
+    options.lzma_dictionary_size = axiom::kMaxLzmaDictionarySize;
+    options.lzma_fast_bytes = 32;
+    options.thread_count = 1;
+    options.auto_block_size_for_threads = false;
+    options.enable_file_filters = false;
+    options.block_size = std::size_t{8} << 30;
+
+    const auto archive = root / "large-profile.axar";
+    axiom::create_archive({source}, archive, options);
+    const auto archive_bytes = read_all(archive);
+    AXIOM_CHECK(test_read_le16(archive_bytes, 8) == 5);
+    AXIOM_CHECK((test_read_le16(archive_bytes, 10) & 0x0040u) != 0);
+    const auto external_header = find_bytes(archive_bytes, "AXEC");
+    AXIOM_CHECK(test_read_le32(archive_bytes, external_header + 8) ==
+                std::numeric_limits<std::uint32_t>::max());
+    const auto entries = axiom::list_archive(archive);
+    AXIOM_CHECK(std::any_of(entries.begin(), entries.end(), [](const auto& entry) {
+        return entry.path == "large-profile.bin" && !entry.subframes.empty();
+    }));
+    axiom::test_archive(archive);
+
+    const auto selected = root / "selected";
+    axiom::extract_entries(archive, {"large-profile.bin"}, selected, {});
+    AXIOM_CHECK(read_all(selected / "large-profile.bin") == original);
+
+    // Repacking must be able to read the streamed profile and preserve it when
+    // the large solid-block option remains selected.
+    axiom::repack_archive(archive, options);
+    AXIOM_CHECK((test_read_le16(read_all(archive), 10) & 0x0040u) != 0);
+    axiom::test_archive(archive);
+
+    // A normal-size repack is an explicit conversion back to the legacy
+    // profile; it must not leave a stale required feature flag behind.
+    auto normal_repack = options;
+    normal_repack.block_size = 4u << 20;
+    axiom::repack_archive(archive, normal_repack);
+    AXIOM_CHECK((test_read_le16(read_all(archive), 10) & 0x0040u) == 0);
+    axiom::test_archive(archive);
+
+    std::ostringstream stream_output(std::ios::out | std::ios::binary);
+    axiom::create_archive_to_stream(stream_output, {source}, options);
+    const auto stream_archive = root / "large-profile-stream.axar";
+    const auto stream_bytes = stream_output.str();
+    write_all(stream_archive, std::vector<std::uint8_t>(
+        stream_bytes.begin(), stream_bytes.end()));
+    AXIOM_CHECK((test_read_le16(read_all(stream_archive), 10) & 0x0040u) != 0);
+    axiom::test_archive(stream_archive);
+
+    auto invalid_method = options;
+    invalid_method.method = axiom::CompressionMethod::zstandard;
+    expect_throws([&] {
+        axiom::create_archive({source}, root / "invalid-method.axar", invalid_method);
+    });
+    auto encrypted = options;
+    encrypted.password = "not supported in this profile";
+    expect_throws([&] {
+        axiom::create_archive({source}, root / "invalid-encryption.axar", encrypted);
+    });
+    auto recovery = options;
+    recovery.recovery_percent = 1;
+    expect_throws([&] {
+        axiom::create_archive({source}, root / "invalid-recovery.axar", recovery);
+    });
 
     std::error_code ec;
     fs::remove_all(root, ec);
@@ -4879,6 +5038,10 @@ void test_compression_estimator() {
     }
     auto confidence_curve_options = adaptive;
     confidence_curve_options.stop_when_high_confidence = true;
+    // This assertion is sampling-bound rather than wall-clock-bound. A Debug
+    // build can take longer per probe, so leave the estimator's hard sample
+    // budget in control while checking early confidence stopping.
+    confidence_curve_options.time_budget = std::chrono::milliseconds(0);
     const auto confidence_curve = axiom::estimate_compression_curve(
         {uniform}, confidence_curve_options, confidence_curve_candidates, {});
     AXIOM_CHECK(confidence_curve.complete);
@@ -5496,6 +5659,7 @@ int main() {
     expect_roundtrip(bytes_from_string(repeated));
     expect_external_codec_roundtrip(bytes_from_string(repeated));
     expect_lzma_multichunk_settings_roundtrip();
+    test_four_gib_dictionary_boundaries();
     expect_huffman_roundtrip(bytes_from_string(repeated));
     expect_order1_roundtrip(bytes_from_string(repeated));
     expect_rans_roundtrip(bytes_from_string(repeated));
@@ -5617,6 +5781,7 @@ int main() {
     test_archive_roundtrip();
     test_axar_version_fixtures_and_validation();
     test_external_codec_axar_roundtrip();
+    test_large_lzma2_solid_profile();
     test_axar_seekable_extraction();
     test_archive_provider_layer();
     test_zip_provider_layer();

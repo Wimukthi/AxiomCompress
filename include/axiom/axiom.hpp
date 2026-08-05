@@ -7,6 +7,7 @@
 #include <condition_variable>
 #include <filesystem>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -510,6 +511,15 @@ enum class CompressionMethod : std::uint8_t {
 
 inline constexpr int kAutomaticCodecLevel = -100;
 
+// Native Axiom distances and LZMA2 dictionary properties are represented by
+// 32-bit values on the wire. A user-facing 4 GiB setting therefore means the
+// largest representable value, 4 GiB - 1; keeping the limit public lets the
+// library, CLI, and native Win32 UI validate the same boundary.
+inline constexpr std::size_t kMaxAxiomWindowSize =
+    static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max());
+inline constexpr std::size_t kMaxLzmaDictionarySize =
+    static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max());
+
 // Optional coarse-grained compression diagnostics. Events are emitted only at
 // phase boundaries, never from the match-finder hot loop. The callback may run
 // concurrently on compression workers and must be cheap, thread-safe, and
@@ -546,10 +556,14 @@ struct CompressionOptions {
     // LZMA2-specific match finder. true = BT4 (ratio), false = HC4 (speed).
     bool lzma_binary_tree = true;
     // LZMA2-specific dictionary and fast-bytes settings. Zero lets the codec
-    // derive its normal value from codec_level. The AXC external-codec envelope
-    // bounds the effective dictionary to its independently decoded solid chunk.
+    // derive its normal value from codec_level. The effective dictionary is
+    // bounded by the independently decoded solid chunk and by a stable input
+    // bound chosen for the payload; kMaxLzmaDictionarySize is the largest
+    // representable on-stream value.
     std::size_t lzma_dictionary_size = 0;
     std::size_t lzma_fast_bytes = 0;
+    // Native Axiom's match window. A 4 GiB setting is accepted as the largest
+    // representable 32-bit distance (4 GiB - 1); values above that are invalid.
     std::size_t window_size = 1u << 20;
     std::size_t max_match = 273;
     // Balanced default (CLI level 5): a moderate chain plus lazy matching reaches
@@ -564,6 +578,10 @@ struct CompressionOptions {
     std::size_t max_parser_candidates = 8;
     std::size_t optimal_parse_limit = 64u << 20;
     std::size_t block_size = 4u << 20;
+    // External codecs normally derive their independently decoded chunk size
+    // from block_size. Large AXAR solid blocks override that outer grouping
+    // with a bounded codec chunk; zero keeps the codec's normal maximum.
+    std::size_t external_codec_chunk_size = 0;
     std::size_t thread_count = 0;
     std::size_t io_buffer_size = 0;  // 0 = automatic.
     // When thread_count is zero, the CLI/library default is "use the machine".

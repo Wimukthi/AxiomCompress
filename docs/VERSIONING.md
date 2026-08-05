@@ -31,7 +31,14 @@ The executable version and the AXAR container version are separate contracts.
 The current archive baseline is AXAR v4, and readers must continue to open v4
 archives. AXAR v5 is an additive revision used when a required fidelity feature
 cannot be represented safely by the v4 baseline; this includes the encryption-v2
-password-slot profile. Legacy v4 encryption remains readable indefinitely.
+password-slot, snapshot-repository, and large-solid-block profiles. Legacy v4
+encryption remains readable indefinitely.
+
+The large-solid profile uses required header flag `0x0040`. It permits AXAR
+LZMA2 solid blocks from above 4 GiB through 64 GiB while keeping the AXEC
+subframes bounded; it does not change the ordinary v4/v5 block ceiling. A
+reader that does not implement the profile must reject the required flag, and
+older archives never acquire it during normal reads or updates.
 
 Phase-3 append generations are additive and do not introduce AXAR v6. An
 append-compatible update retains the previous complete archive bytes and adds

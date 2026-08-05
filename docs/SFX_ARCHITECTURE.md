@@ -339,6 +339,11 @@ from the full image. The full stub still links the general archive library for
 its archive-browser dialog compatibility path; its extraction runtime uses the
 same read-only facade as Mini.
 
+Portable and installed Axiom packages ship both module files beside
+`Axiom.exe` and `axiomc.exe`. The CLI's `--stub full|mini` choice selects which
+file is embedded into the generated self-extractor; omitting either file makes
+that tier unavailable even though the other tier still works.
+
 The decode-only library (`AxiomSfxDecodeLib`) keeps the behavior that users
 expect from an SFX while excluding write-side code:
 

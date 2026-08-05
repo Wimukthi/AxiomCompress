@@ -44,7 +44,8 @@ Both assets carry the same payload:
 |---|---|
 | `Axiom.exe` | GUI |
 | `axiomc.exe` | CLI |
-| `AxiomSfx.bin` | SFX runtime; must stay beside the executables |
+| `AxiomSfx.bin` | Full-window SFX runtime; must stay beside the executables |
+| `AxiomSfxMini.bin` | Decode-only console SFX runtime; required by `--stub mini` |
 | `backends\7zip\` | Bundled read-only 7z/RAR/ISO/CAB engine |
 | `README.md`, `CHANGELOG.md`, `CLI_GUIDE.md`, `ARCHITECTURE.md`, `FORMAT.md` | User and developer docs |
 | `LICENSE`, `THIRD_PARTY_NOTICES.md` | Licensing |
@@ -52,8 +53,9 @@ Both assets carry the same payload:
 | `licenses\source\darkmodelib\` | Complete corresponding Darkmodelib source, as MPL-2.0 requires |
 | `docs\` | The rest of the documentation set |
 
-`AxiomSfx.bin` is not a launchable program. It is read only when an SFX archive
-is created, and it must remain beside `Axiom.exe` and `axiomc.exe`.
+`AxiomSfx.bin` and `AxiomSfxMini.bin` are not launchable programs. They are read
+only when an SFX archive is created, and both must remain beside `Axiom.exe` and
+`axiomc.exe`; the CLI selects the full or Mini module with `--stub full|mini`.
 
 The portable zip is named `Axiom-<version>-win-x64.zip` and is produced by the
 `release-package` workflow. It exists for users who do not want an installer or

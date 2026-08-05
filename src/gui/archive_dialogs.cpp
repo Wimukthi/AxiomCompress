@@ -186,23 +186,28 @@ constexpr std::array<const wchar_t*, 9> kLevelNames{
     L"1 - Fastest", L"2 - Very fast", L"3 - Fast", L"4 - Normal",
     L"5 - Balanced", L"6 - Strong", L"7 - High", L"8 - Very high",
     L"9 - Maximum"};
-constexpr std::array<const wchar_t*, 13> kDictionaryNames{
+constexpr std::array<const wchar_t*, 16> kDictionaryNames{
     L"Default for level", L"64 KiB", L"256 KiB", L"1 MiB", L"2 MiB",
     L"4 MiB", L"8 MiB", L"16 MiB", L"32 MiB", L"64 MiB",
-    L"128 MiB", L"256 MiB", L"512 MiB"};
-constexpr std::array<std::size_t, 13> kDictionaryValues{
+    L"128 MiB", L"256 MiB", L"512 MiB", L"1 GiB", L"2 GiB", L"4 GiB"};
+constexpr std::array<std::size_t, 16> kDictionaryValues{
     0, 64u << 10, 256u << 10, 1u << 20, 2u << 20, 4u << 20,
     8u << 20, 16u << 20, 32u << 20, 64u << 20, 128u << 20,
-    256u << 20, 512u << 20};
+    256u << 20, 512u << 20, 1u << 30, 2u << 30,
+    axiom::kMaxAxiomWindowSize};
 constexpr std::array<const wchar_t*, 6> kWordSizeNames{
     L"Default for level", L"32", L"64", L"128", L"192", L"273"};
 constexpr std::array<std::size_t, 6> kWordSizeValues{0, 32, 64, 128, 192, 273};
-constexpr std::array<const wchar_t*, 10> kSolidBlockNames{
+constexpr std::array<const wchar_t*, 17> kSolidBlockNames{
     L"Default for level", L"1 MiB", L"4 MiB", L"8 MiB", L"16 MiB",
-    L"32 MiB", L"64 MiB", L"128 MiB", L"256 MiB", L"512 MiB"};
-constexpr std::array<std::size_t, 10> kSolidBlockValues{
+    L"32 MiB", L"64 MiB", L"128 MiB", L"256 MiB", L"512 MiB",
+    L"1 GiB", L"2 GiB", L"4 GiB", L"8 GiB", L"16 GiB", L"32 GiB", L"64 GiB"};
+constexpr std::array<std::size_t, 17> kSolidBlockValues{
     0, 1u << 20, 4u << 20, 8u << 20, 16u << 20, 32u << 20,
-    64u << 20, 128u << 20, 256u << 20, 512u << 20};
+    64u << 20, 128u << 20, 256u << 20, 512u << 20,
+    std::size_t{1} << 30, std::size_t{2} << 30, std::size_t{4} << 30,
+    std::size_t{8} << 30, std::size_t{16} << 30, std::size_t{32} << 30,
+    std::size_t{64} << 30};
 constexpr std::array<const wchar_t*, 2> kThreadModelNames{
     L"Split blocks (default)", L"Swarm (cores share each block)"};
 constexpr std::array<const wchar_t*, 5> kCompressionMethodNames{
@@ -5015,21 +5020,32 @@ private:
                     const int action_width = scale(56);
                     const int action_gap = scale(6);
                     const int profile_value_x = compression_label_width;
-                    const int profile_combo_width = std::max(
-                        scale(120), form_width - compression_label_width -
-                                        action_width * 2 - action_gap * 2);
+                    const auto compression_value_width =
+                        [&](int requested_width = 260) {
+                            return std::min(
+                                scale(requested_width),
+                                std::max(scale(120),
+                                         form_width - compression_label_width));
+                        };
+                    // Keep the editable profile field aligned with every other
+                    // compression value. Its actions use a compact row below it
+                    // instead of squeezing the field beside two buttons.
+                    const int profile_combo_width = compression_value_width();
                     move_page_control(compression_profile_combo_,
                                       profile_value_x, y, profile_combo_width,
                                       scale(260), scroll_offset);
+                    const int profile_action_width = action_width * 2 + action_gap;
+                    const int profile_actions_x = profile_value_x + std::max(
+                        0, profile_combo_width - profile_action_width);
+                    const int profile_actions_y = y + row + gap;
                     move_page_control(save_compression_profile_,
-                                      profile_value_x + profile_combo_width +
-                                          action_gap,
-                                      y, action_width, row, scroll_offset);
+                                      profile_actions_x, profile_actions_y,
+                                      action_width, row, scroll_offset);
                     move_page_control(delete_compression_profile_,
-                                      profile_value_x + profile_combo_width +
-                                          action_gap * 2 + action_width,
-                                      y, action_width, row, scroll_offset);
-                    y += row + gap;
+                                      profile_actions_x + action_width + action_gap,
+                                      profile_actions_y, action_width, row,
+                                      scroll_offset);
+                    y = profile_actions_y + row + gap;
 
                     const auto compression_row = [&](HWND label_window,
                                                      HWND value,
@@ -5038,10 +5054,7 @@ private:
                                           compression_label_width, row,
                                           scroll_offset);
                         move_page_control(value, compression_label_width, y,
-                                          std::min(scale(value_width),
-                                                   std::max(scale(120),
-                                                            form_width -
-                                                                compression_label_width)),
+                                          compression_value_width(value_width),
                                           scale(240), scroll_offset);
                         y += row + gap;
                     };
@@ -5050,7 +5063,7 @@ private:
                     compression_row(dictionary_label_, dictionary_combo_);
                     compression_row(word_size_label_, word_size_combo_);
                     compression_row(solid_block_label_, solid_block_combo_);
-                    compression_row(threads_label_, threads_combo_, 230);
+                    compression_row(threads_label_, threads_combo_);
                     compression_row(thread_model_label_, thread_model_combo_);
                     y += scale(4);
                     move_page_wrapped(compression_info_, 0, y,
@@ -5546,15 +5559,17 @@ private:
                 add(word_combo, kWordSizeNames[index], kWordSizeValues[index]);
             }
         } else if (method == axiom::CompressionMethod::lzma2) {
-            constexpr std::array<const wchar_t*, 15> names{
+            constexpr std::array<const wchar_t*, 18> names{
                 L"Default for LZMA2 level", L"4 KiB", L"16 KiB", L"64 KiB",
                 L"256 KiB", L"1 MiB", L"2 MiB", L"4 MiB", L"8 MiB",
                 L"16 MiB", L"32 MiB", L"64 MiB", L"128 MiB", L"256 MiB",
-                L"512 MiB"};
-            constexpr std::array<std::size_t, 15> values{
+                L"512 MiB", L"1 GiB", L"2 GiB", L"4 GiB"};
+            constexpr std::array<std::size_t, 18> values{
                 0, 4u << 10, 16u << 10, 64u << 10, 256u << 10,
                 1u << 20, 2u << 20, 4u << 20, 8u << 20, 16u << 20,
-                32u << 20, 64u << 20, 128u << 20, 256u << 20, 512u << 20};
+                32u << 20, 64u << 20, 128u << 20, 256u << 20,
+                512u << 20, 1u << 30, 2u << 30,
+                axiom::kMaxLzmaDictionarySize};
             constexpr std::array<const wchar_t*, 8> fast_names{
                 L"Default for LZMA2 level", L"5", L"16", L"32",
                 L"64", L"128", L"192", L"273"};
@@ -5941,10 +5956,14 @@ private:
                 ? L"Zstandard levels -5 through 22 trade speed for ratio. AXAR chunks remain "
                   L"bounded and independently cancellable; dictionary and word size do not apply."
             : lzma_method
-                ? L"LZMA2 uses a 4 KiB to 512 MiB dictionary, 5 to 273 fast bytes, and the "
+                ? L"LZMA2 uses a 4 KiB to 4 GiB dictionary, 5 to 273 fast bytes, and the "
                   L"HC4/BT4 match finder. The effective dictionary cannot exceed the selected "
                   L"solid-block size. Large dictionaries can require several times their size "
-                  L"in encoder memory; BT4 favors ratio and HC4 favors speed."
+                  L"in encoder memory; BT4 favors ratio and HC4 favors speed. Solid blocks "
+                  L"above 4 GiB are staged on disk and use 512 MiB codec chunks by default; "
+                  L"select a larger solid block to enable a larger independently decoded chunk. "
+                  L"file-aware filters, encryption, and recovery records are unavailable "
+                  L"for that profile."
             : method == axiom::CompressionMethod::deflate
                 ? L"Deflate levels 0 through 9 use the format-defined 32 KiB window and "
                   L"258-byte maximum match. Those fixed values are shown but cannot be changed."
@@ -7013,6 +7032,41 @@ private:
             return;
         }
 
+        const bool large_solid_block =
+            static_cast<std::uint64_t>(create_options.solid_block_size) >
+            (std::uint64_t{4} << 30);
+        if (create_options.archive_format == axiom::ArchiveFormat::axar &&
+            large_solid_block &&
+            create_options.method != axiom::CompressionMethod::lzma2) {
+            select_create_page(0);
+            show_message_dialog(
+                window_, instance_, dpi_, palette_.dark,
+                L"Compression options",
+                L"Solid blocks above 4 GiB currently require the LZMA2 method.",
+                MessageDialogIcon::warning);
+            return;
+        }
+        if (create_options.archive_format == axiom::ArchiveFormat::axar &&
+            large_solid_block && create_options.features.recovery_percent != 0) {
+            select_create_page(3);
+            show_message_dialog(
+                window_, instance_, dpi_, palette_.dark,
+                L"Recovery and volumes",
+                L"Recovery records are not available with solid blocks above 4 GiB yet.",
+                MessageDialogIcon::warning);
+            return;
+        }
+        if (create_options.archive_format == axiom::ArchiveFormat::axar &&
+            large_solid_block && create_options.features.encrypt_data) {
+            select_create_page(2);
+            show_message_dialog(
+                window_, instance_, dpi_, palette_.dark,
+                L"Archive security",
+                L"Encryption is not available with solid blocks above 4 GiB yet.",
+                MessageDialogIcon::warning);
+            return;
+        }
+
         if (create_options.features.encrypt_data) {
             const std::wstring password = window_text(password_edit_);
             if (password.empty()) {
@@ -7027,6 +7081,16 @@ private:
                 show_message_dialog(window_, instance_, dpi_, palette_.dark,
                                     L"Archive security", L"The passwords do not match.",
                                     MessageDialogIcon::warning);
+                return;
+            }
+            if (create_options.archive_format == axiom::ArchiveFormat::axar &&
+                large_solid_block) {
+                select_create_page(0);
+                show_message_dialog(
+                    window_, instance_, dpi_, palette_.dark,
+                    L"Compression options",
+                    L"Encryption is not available with solid blocks above 4 GiB yet.",
+                    MessageDialogIcon::warning);
                 return;
             }
             if (create_options.features.encrypt_names &&

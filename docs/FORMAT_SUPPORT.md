@@ -25,13 +25,24 @@ The native container. Selectable Axiom, Zstandard, LZMA2, Deflate, or Store
 block streams; encryption, recovery records, directly readable read-only split
 volumes, comments, locking, signatures, metadata, links, and SFX packaging.
 
-Codec selection changes only the independently decoded AXC payload inside each
-solid block — container capabilities are identical for every method. Native
-payloads use AXC v9, and bundled Zstandard/LZMA2/Deflate payloads use the
-bounded AXC v10 external-codec envelope. Store bypasses entropy coding.
+Codec selection normally changes only the independently decoded AXC payload
+inside each solid block. Native payloads use AXC v9, and bundled
+Zstandard/LZMA2/Deflate payloads use the bounded AXC v10 external-codec
+envelope. Store bypasses entropy coding. The large-solid LZMA2 profile is the
+explicit exception: it uses disk-staged AXEC subframes and currently does not
+combine with encryption or recovery records.
 
 Because files share solid blocks, per-file Packed values are proportional
 estimates, marked `≈` in the GUI. Archive-level size and ratio are exact.
+
+Native Axiom windows and LZMA2 dictionaries are supported up to the 4 GiB
+user-facing setting; their encoded 32-bit ceiling is 4 GiB−1. LZMA2 AXEC
+chunks use the same ceiling. Selecting an AXAR solid block above 4 GiB through
+64 GiB enables the required large-solid profile, which stages the raw block on
+disk and uses independently decoded bounded chunks (512 MiB by default).
+Large-solid archives require a reader that understands the profile and
+currently cannot combine it with archive encryption or recovery records.
+Existing AXAR v4/v5 archives are unaffected.
 
 ### ZIP
 

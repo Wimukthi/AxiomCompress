@@ -18,6 +18,7 @@
 #include <limits>
 #include <numeric>
 #include <optional>
+#include <stdexcept>
 #include <vector>
 
 #if defined(_MSC_VER)
@@ -92,6 +93,19 @@ constexpr std::size_t kMinMatch = 4;
 constexpr std::size_t kHashBits = 20;
 constexpr std::size_t kHashSize = 1u << kHashBits;
 constexpr std::size_t kParserCandidateLimit = 64;
+
+std::size_t effective_axiom_window_size(std::size_t requested) {
+    // The public CLI accepts the conventional exact 4 GiB spelling, while
+    // token distances themselves can encode only 4 GiB - 1. Normalize that
+    // endpoint and reject larger values before any narrowing can occur.
+    constexpr std::uint64_t kMaxRequestedWindow = std::uint64_t{1} << 32;
+    if (static_cast<std::uint64_t>(requested) > kMaxRequestedWindow) {
+        throw std::invalid_argument(
+            "Axiom window exceeds the 4 GiB distance limit");
+    }
+    return std::max<std::size_t>(
+        kMinMatch, std::min(requested, kMaxAxiomWindowSize));
+}
 
 struct Match {
     std::uint16_t length;
@@ -352,8 +366,12 @@ void add_match_candidate(MatchList& matches,
 
     const auto narrowed_length = static_cast<std::uint16_t>(
         std::min<std::size_t>(length, std::numeric_limits<std::uint16_t>::max()));
-    const auto narrowed_distance = static_cast<std::uint32_t>(
-        std::min<std::size_t>(distance, std::numeric_limits<std::uint32_t>::max()));
+    if (distance > kMaxAxiomWindowSize) {
+        // A match beyond the representable on-stream distance cannot be
+        // truncated safely: doing so would decode from the wrong source.
+        return;
+    }
+    const auto narrowed_distance = static_cast<std::uint32_t>(distance);
 
     for (std::size_t i = 0; i < matches.count; ++i) {
         auto& match = matches.values[i];
@@ -564,7 +582,7 @@ ByteVector encode_lz77_impl(std::span<const std::uint8_t> input,
     hash_heads.assign(kHashSize, kNoPos);
     previous.resize(input.size());
 
-    const auto window_size = std::max<std::size_t>(kMinMatch, options.window_size);
+    const auto window_size = effective_axiom_window_size(options.window_size);
     const auto max_match = std::max<std::size_t>(kMinMatch, options.max_match);
     const auto max_chain_depth = std::max<std::size_t>(1, options.max_chain_depth);
     const auto nice_length = std::max<std::size_t>(kMinMatch, options.nice_length);
@@ -871,7 +889,7 @@ ByteVector encode_lz77_swarm_impl(std::span<const std::uint8_t> input,
         return encode_lz77_impl<Index>(input, options);
     }
 
-    const auto window_size = std::max<std::size_t>(kMinMatch, options.window_size);
+    const auto window_size = effective_axiom_window_size(options.window_size);
     const auto max_match = std::max<std::size_t>(kMinMatch, options.max_match);
     const auto max_chain_depth = std::max<std::size_t>(1, options.max_chain_depth);
     const auto nice_length = std::max<std::size_t>(kMinMatch, options.nice_length);
@@ -1201,7 +1219,7 @@ ByteVector encode_lz77_tree(std::span<const std::uint8_t> input,
         return output;
     }
 
-    const auto window_size = std::max<std::size_t>(kMinMatch, options.window_size);
+    const auto window_size = effective_axiom_window_size(options.window_size);
     // The cyclic buffer holds one slot per in-window position. When the window is
     // as large as the input there is no wrap (cyclic_size == n), so this degrades
     // to the original full-window tree; otherwise memory is bounded to the window.
@@ -1716,7 +1734,7 @@ ByteVector encode_lz77_tree_swarm_impl(std::span<const std::uint8_t> input,
     const auto segment_end = [segment_size, &input](std::size_t segment) {
         return std::min(input.size(), (segment + 1) * segment_size);
     };
-    const auto window_size = std::max<std::size_t>(kMinMatch, options.window_size);
+    const auto window_size = effective_axiom_window_size(options.window_size);
     const auto max_match = std::max<std::size_t>(kMinMatch, options.max_match);
     const auto depth_limit = std::max<std::size_t>(1, options.max_chain_depth);
     // The local tree retains the preset's full greedy depth. Cross-segment hash
@@ -1928,7 +1946,7 @@ ByteVector optimal_parse_with_costs(std::span<const std::uint8_t> input,
         options, CompressionTelemetryPhase::lz77_optimal, input.size());
     constexpr std::uint64_t kInf = std::numeric_limits<std::uint64_t>::max() / 4;
 
-    const auto window_size = std::max<std::size_t>(kMinMatch, options.window_size);
+    const auto window_size = effective_axiom_window_size(options.window_size);
     const auto max_match = std::max<std::size_t>(kMinMatch, options.max_match);
     const auto max_chain_depth = std::max<std::size_t>(1, options.optimal_chain_depth);
     const auto max_candidates =
@@ -2554,7 +2572,7 @@ std::optional<ByteVector> encode_lz77_optimal_checkpointed(
         return std::nullopt;
     }
 
-    const auto window_size = std::max<std::size_t>(kMinMatch, options.window_size);
+    const auto window_size = effective_axiom_window_size(options.window_size);
     const auto max_match = std::max<std::size_t>(kMinMatch, options.max_match);
     const auto chain_depth = std::max<std::size_t>(1, options.optimal_chain_depth);
     const auto max_candidates =

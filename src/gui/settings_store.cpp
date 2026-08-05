@@ -22,6 +22,19 @@ DWORD read_dword(HKEY key, const wchar_t* name, DWORD fallback) {
     return value;
 }
 
+std::uint64_t read_qword(HKEY key, const wchar_t* name, std::uint64_t fallback) {
+    ULONGLONG value = static_cast<ULONGLONG>(fallback);
+    DWORD size = sizeof(value);
+    if (RegGetValueW(key, nullptr, name, RRF_RT_REG_QWORD, nullptr, &value, &size) ==
+        ERROR_SUCCESS && size == sizeof(value)) {
+        return static_cast<std::uint64_t>(value);
+    }
+    // Settings written by older builds used REG_DWORD for this field. Preserve
+    // those defaults while allowing the new GiB presets to survive a restart.
+    return read_dword(key, name, static_cast<DWORD>(std::min<std::uint64_t>(
+        fallback, std::numeric_limits<DWORD>::max())));
+}
+
 std::wstring read_string(HKEY key, const wchar_t* name) {
     DWORD size = 0;
     if (RegGetValueW(key, nullptr, name, RRF_RT_REG_SZ, nullptr, nullptr, &size) != ERROR_SUCCESS ||
@@ -63,6 +76,12 @@ std::vector<std::wstring> read_string_list(HKEY key, const wchar_t* name) {
 void write_dword(HKEY key, const wchar_t* name, DWORD value) {
     RegSetValueExW(key, name, 0, REG_DWORD,
                    reinterpret_cast<const BYTE*>(&value), sizeof(value));
+}
+
+void write_qword(HKEY key, const wchar_t* name, std::uint64_t value) {
+    const ULONGLONG stored = static_cast<ULONGLONG>(value);
+    RegSetValueExW(key, name, 0, REG_QWORD,
+                   reinterpret_cast<const BYTE*>(&stored), sizeof(stored));
 }
 
 void write_string(HKEY key, const wchar_t* name, const std::wstring& value) {
@@ -297,7 +316,8 @@ PersistedGuiSettings load_gui_settings() {
     settings.application.default_thread_count = read_dword(key, L"ThreadCount", 0);
     settings.application.default_dictionary_size = read_dword(key, L"DictionarySize", 0);
     settings.application.default_word_size = read_dword(key, L"WordSize", 0);
-    settings.application.default_solid_block_size = read_dword(key, L"SolidBlockSize", 0);
+    settings.application.default_solid_block_size =
+        static_cast<std::size_t>(read_qword(key, L"SolidBlockSize", 0));
     settings.application.default_thread_model = read_clamped_int(key, L"ThreadModel", 0, 0, 1);
     settings.application.default_update_mode = read_clamped_int(key, L"UpdateMode", 0, 0, 4);
     settings.application.default_volume_size = read_string(key, L"VolumeSize");
@@ -478,8 +498,8 @@ void save_gui_settings(const PersistedGuiSettings& settings) {
         settings.application.default_dictionary_size, MAXDWORD)));
     write_dword(key, L"WordSize", static_cast<DWORD>(std::min<std::size_t>(
         settings.application.default_word_size, MAXDWORD)));
-    write_dword(key, L"SolidBlockSize", static_cast<DWORD>(std::min<std::size_t>(
-        settings.application.default_solid_block_size, MAXDWORD)));
+    write_qword(key, L"SolidBlockSize", static_cast<std::uint64_t>(
+        settings.application.default_solid_block_size));
     write_dword(key, L"ThreadModel",
                 static_cast<DWORD>(std::clamp(settings.application.default_thread_model, 0, 1)));
     write_dword(key, L"UpdateMode",

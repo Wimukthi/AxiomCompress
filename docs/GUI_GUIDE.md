@@ -109,6 +109,13 @@ that mean something: Axiom exposes its threading model, LZMA2 exposes
 dictionary and word size plus HC4/BT4, and Zstandard and Deflate keep their
 native levels. ZIP creation is deliberately limited to Deflate and Store.
 
+The Axiom and LZMA2 dictionary controls go up to 4 GiB. The 4 GiB choice is
+the user-facing form of the largest 32-bit encoded distance/property value
+(4 GiB−1). LZMA2 solid-block choices from 8 GiB through 64 GiB use the
+disk-staged large-solid profile: codec chunks remain 512 MiB by default and
+can grow with the selected dictionary. That profile is LZMA2-only and the
+dialog rejects encryption or recovery records for it.
+
 If SFX is enabled, the output path becomes the final merged `.exe` — Axiom does
 not leave a separate archive beside it.
 

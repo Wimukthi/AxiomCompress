@@ -58,13 +58,18 @@ decode:  container reader → entropy decoder → token decoder
               → inverse transforms → output
 ```
 
-The container embeds one `axiom::compress` `.axc` stream per solid block, so
-the single-stream codec and the archive share exactly the same encode and
-decode path.
+The container embeds one AXC payload per solid block. Native Axiom blocks use
+the `axiom::compress` path; Zstandard, LZMA2, and Deflate use the bounded AXC
+v10 external-codec envelope. The archive and single-stream layers therefore
+share the same codec adapters while retaining independent chunk geometry for
+external backends.
 
 Codec selection sits *below* the AXAR service boundary. Encryption, signatures,
 recovery records, split volumes, metadata, directory layout, and SFX packaging
-all wrap completed AXC bytes, so none of them need codec-specific branches.
+normally wrap completed AXC bytes, so ordinary method selection needs no
+codec-specific service branches. The explicit large-solid LZMA2 profile is the
+exception: its disk-streamed writer has a required AXAR flag and currently
+does not combine with encryption or recovery records.
 
 ## Codec
 
@@ -198,7 +203,10 @@ Notable details:
   allocates only the header-declared bounded output, requires exact input
   consumption, and rejects trailing data. Chunk boundaries are also the
   pause/cancel and progress checkpoints, keeping progress independent of
-  backend callback frequency.
+  backend callback frequency. LZMA2 uses a 32-bit dictionary/chunk ceiling;
+  the public 4 GiB setting maps to 4 GiB−1 on the wire. The encoder keeps one
+  stable LZMA2 property across a payload, including a short final chunk, so
+  the decoder never needs to infer changing dictionary geometry.
 
 Level-9 automatic block planning recognizes validated POSIX ustar members and
 uses their boundaries as static match-window and entropy-table reset points.
@@ -412,6 +420,15 @@ By default the archive layer raises the target solid-block size to at least
 layer then shrinks the internal block size as needed, down to a 1 MiB minimum
 of useful work. One large solid block can therefore still feed many workers.
 An explicit `--block-size` disables this for repeatable tuning runs.
+
+AXAR LZMA2 can deliberately select an 8–64 GiB outer solid block. That
+large-solid profile stages raw bytes in a temporary file and streams bounded
+AXEC chunks instead of materializing the complete block. It defaults to
+512 MiB codec chunks and can raise them to the selected dictionary, while the
+outer block and codec chunk remain separate limits. The profile carries a
+required AXAR flag, uses no file-aware transforms, and currently excludes
+encryption and recovery records; old readers reject it before ordinary block
+decoding.
 
 Parallel blocks are independent by design, which sacrifices cross-block
 matches. The archive selector still keeps the smallest single-stream result
