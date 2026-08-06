@@ -1,113 +1,134 @@
-# Versioning
+# Versioning and releases
 
-Axiom uses a four-part version:
+Axiom uses a four-part version number:
 
 ```text
 major.minor.patch.build
 ```
 
-The executable resource in `src\gui\axiom_gui.rc` is the **source of truth**.
-The About dialog reads the file version from that resource at runtime, and the
-installer reads the same value when naming release artifacts.
+The executable resource in `src\gui\axiom_gui.rc` is the **single source of
+truth**. The About dialog reads the file version from that resource at runtime,
+and the installer reads the same value when it names release files.
 
-## Rules
+## When each part changes
 
-| Component | Increment when |
+| Part | Increment it when |
 |---|---|
-| `major` | Compatibility-breaking behavior or a major architecture change |
-| `minor` | User-visible features that preserve existing behavior |
+| `major` | Behaviour breaks compatibility, or the architecture changes substantially |
+| `minor` | A user-visible feature lands that doesn't break existing behaviour |
 | `patch` | Bug fixes, polish, reliability, and performance work |
-| `build` | Every Visual Studio GUI build — MSBuild does this automatically |
+| `build` | Every Visual Studio GUI build — MSBuild does this on its own |
 
-When a component changes, reset everything to its right:
+Changing a part resets everything to its right:
 
 - `0.1.0.14` → `0.1.1.0` for a patch release
 - `0.1.1.8` → `0.2.0.0` for a minor feature release
 - `0.9.4.3` → `1.0.0.0` for a major release
 
-## AXAR format compatibility
+## Archive format compatibility
 
 The executable version and the AXAR container version are separate contracts.
-The current archive baseline is AXAR v4, and readers must continue to open v4
-archives. AXAR v5 is an additive revision used when a required fidelity feature
-cannot be represented safely by the v4 baseline; this includes the encryption-v2
-password-slot, snapshot-repository, and large-solid-block profiles. Legacy v4
-encryption remains readable indefinitely.
+A newer Axiom must keep reading older archives; that obligation does not expire
+when the product version goes up.
 
-The large-solid profile uses required header flag `0x0040`. It permits AXAR
-LZMA2 solid blocks from above 4 GiB through 64 GiB while keeping the AXEC
-subframes bounded; it does not change the ordinary v4/v5 block ceiling. A
-reader that does not implement the profile must reject the required flag, and
-older archives never acquire it during normal reads or updates.
+The baseline is **AXAR v4**, and readers must continue to open v4 archives
+indefinitely. **AXAR v5** is an additive revision, used when a required
+fidelity feature can't be represented safely in v4. It currently covers the
+encryption-v2 password slots, snapshot repositories, and the large solid-block
+profile. Legacy v4 encryption stays readable forever.
 
-Phase-3 append generations are additive and do not introduce AXAR v6. An
-append-compatible update retains the previous complete archive bytes and adds
-new blocks, a directory, a version-1 64-byte `AXIOMGF` generation extension,
-optional recovery data, and the existing 24-byte footer shape. The extension
-links the new directory to the previous footer and generation. Readers that
-understand the extension can scan backward to the previous valid footer after a
-torn append; older v4/v5 readers can still locate the current directory from an
-intact final legacy footer, but do not expose generation history or fallback.
+### Required flags are requirements, not hints
 
-Recovery protects the generation extension as part of the new directory
-generation. Signatures include the canonical generation history, and signing
-an existing archive creates a new generation. Operations that require header
-changes or compaction continue to use the atomic temporary-replacement path.
+An AXAR header feature flag means "you must understand this to read the file
+correctly". A reader must **reject** a required flag it doesn't implement,
+rather than trying its luck. A v4 header must never claim a v5-only flag.
 
-New password-protected archives use a random archive data key wrapped by one or
-more independent password slots. Adding, changing, or removing a slot rewrites
-the encryption metadata and directory while preserving compressed/encrypted
-block bytes. The first slot operation on a legacy v4 encrypted archive migrates
-its metadata to the v5 encryption-v2 profile without re-encrypting those blocks.
-Password mutations invalidate signatures and rebuild recovery data against the
-new layout.
+| Flag | Profile |
+|---:|---|
+| `0x0020` | Snapshot chunk table and manifest |
+| `0x0040` | Large solid blocks (LZMA2, above 4 GiB through 64 GiB) |
 
-The AXAR v5 snapshot repository profile uses required header flag `0x0020`.
-Its chunk table and named snapshot manifest are additive directory extensions,
-but the live entry addresses are chunk references rather than one contiguous
-solid-file range. A v4 reader, or any reader that does not understand this
-required flag, must reject the repository instead of attempting a potentially
-incorrect restore. Snapshot generations use the existing `AXIOMGF` append
-extension; pruning and adding snapshots therefore retain the same crash
-fallback and recovery rules as other append-compatible metadata updates.
+The large-solid profile permits LZMA2 solid blocks above 4 GiB and up to 64 GiB
+while keeping the pieces inside them bounded. It does not change the ordinary
+v4/v5 block ceiling, and an existing archive never picks up the flag during a
+normal read or update.
 
-Plaintext AXAR blocks may also carry an optional type-1 block-extra subframe
-map. It records entry-independent frame boundaries for the parallel AXC and
-external-codec envelopes, allowing selected extraction to fetch only the
-intersecting compressed frames. The map is additive, length-delimited directory
-data: it does not change the AXAR v4/v5 header version or required feature flags,
-and readers that do not implement it can skip the block extra area. Maps are
-omitted for encrypted, transformed, serial, or otherwise non-seekable blocks.
-Signed archives include the map in the canonical directory digest. A reader
-that cannot use a map must remain correct by decoding the complete solid block.
+The snapshot profile's chunk table and named manifests are additive directory
+extensions, but its live entry addresses are chunk references rather than one
+contiguous range. A reader that doesn't understand flag `0x0020` must reject
+the repository rather than attempt a restore that would be wrong.
 
-AXAR header feature flags are required capabilities, not hints. A reader must
-reject an unknown required flag, and a v4 header must not claim a v5-only flag.
-Within entry and archive extension areas, unknown TLV records remain safely
-skippable because every record carries its own bounded payload length. This
-allows optional metadata to evolve without changing the core record layout.
+Inside entry and archive extension areas, unknown TLV records stay safely
+skippable, because every record carries its own bounded payload length. That's
+what lets optional metadata evolve without touching the core record layout.
+
+### Append generations
+
+Phase-3 append generations are additive and do **not** introduce AXAR v6.
+
+An append-compatible update keeps the previous archive bytes exactly where they
+are and adds new blocks, a new directory, a 64-byte `AXIOMGF` generation
+extension, optional recovery data, and the existing 24-byte footer shape. The
+extension links the new directory back to the previous footer and generation.
+
+A reader that understands the extension can scan backwards to the last valid
+footer after an interrupted append. Older v4/v5 readers can still find the
+current directory from an intact final footer, but they don't get the
+generation history or the crash fallback.
+
+Recovery data protects the generation extension as part of the new generation.
+Signatures cover the canonical generation history, and signing an existing
+archive creates a new generation. Anything that must change the header, or that
+compacts the archive, keeps using the atomic temporary-file replacement path.
+
+### Password slots
+
+New password-protected archives encrypt data with a random archive key, which
+is then wrapped by one or more independent password slots. Adding, changing, or
+removing a slot rewrites the encryption metadata and the directory, and
+preserves every compressed and encrypted block byte.
+
+The first slot operation on a legacy v4 encrypted archive migrates its metadata
+to the v5 scheme without re-encrypting anything. Password changes invalidate
+signatures and rebuild recovery data against the new layout.
+
+### Subframe maps
+
+Plaintext AXAR blocks may carry an optional type-1 block-extra subframe map,
+recording where independently decodable pieces begin. Selected extraction uses
+it to fetch only the pieces it needs.
+
+The map is additive, length-delimited directory data. It doesn't change the
+header version or add a required flag, and a reader that doesn't implement it
+can skip the block-extra area and decode whole blocks — still correct, just
+slower. Maps are omitted for encrypted, transformed, serial, and otherwise
+non-seekable blocks. Signed archives include the map in the canonical directory
+digest.
+
+### Testing the rules
 
 Every format revision is covered by a checked-in golden fixture under
 `tests/fixtures/`, plus negative tests for reserved fields, unknown required
-flags, malformed TLV lengths, and truncation. Changes to these rules require a
-deliberate format review and an update to `FORMAT.md`.
+flags, malformed TLV lengths, and truncation.
 
-## Automatic build increment
+Changing any of these rules requires a deliberate format review and a matching
+update to [FORMAT.md](../FORMAT.md).
 
-The `AxiomSfx.vcxproj` prerequisite runs `tools\Update-AxiomVersion.ps1` before
-the product executables build. Running it in that shared prerequisite
-guarantees the embedded SFX module, GUI, and CLI all see the same version in
-one build.
+## The automatic build number
 
-The script increments only the fourth component and updates every resource
-field together — `FILEVERSION`, `PRODUCTVERSION`, `FileVersion`, and
-`ProductVersion` — then mirrors the result into the CLI and SFX-module
-resources, so generated self-extractors report the same product version.
+`AxiomSfx.vcxproj` runs `tools\Update-AxiomVersion.ps1` as a prerequisite,
+before the product executables build. Putting it in that shared prerequisite is
+what guarantees the SFX module, the GUI, and the CLI all see one version in a
+single build.
 
-This deliberately modifies `src\gui\axiom_gui.rc`, so a successful local GUI
-build leaves a version change in the working tree.
+The script increments only the fourth part, and updates every resource field
+together — `FILEVERSION`, `PRODUCTVERSION`, `FileVersion`, and
+`ProductVersion` — then mirrors the result into the CLI and SFX module
+resources, so a generated self-extractor reports the same product version.
 
-To build without touching the version:
+This deliberately modifies `src\gui\axiom_gui.rc`, which means a successful
+local GUI build leaves a version change in your working tree. To build without
+that:
 
 ```powershell
 .\tools\build_msvc.ps1 -Configuration Release -AutoIncrementVersion:$false
@@ -119,39 +140,39 @@ or, driving MSBuild directly:
 MSBuild.exe .\AxiomCompress.sln /p:Configuration=Release /p:Platform=x64 /p:AutoIncrementVersion=false /m
 ```
 
-Keeping auto-increment on is fine for day-to-day builds. Disabling it for
-releases avoids turning a planned `0.1.1.0` into `0.1.1.1` during packaging.
+Leave auto-increment on for day-to-day work. Turn it off for a release, so
+packaging doesn't quietly turn a planned `0.1.1.0` into `0.1.1.1`.
 
-## Release procedure
+## Making a release
 
 1. Update `major`, `minor`, or `patch` in `src\gui\axiom_gui.rc` if the release
    warrants it, and set the full four-part version to the exact tag you intend
    to ship.
-2. Update [`CHANGELOG.md`](../CHANGELOG.md) with the release entry.
+2. Add the release entry to [`CHANGELOG.md`](../CHANGELOG.md).
 3. Build and test with auto-increment disabled:
 
    ```powershell
    .\tools\test_msvc.ps1 -Configuration Release -AutoIncrementVersion:$false
    ```
 
-4. Package from the already-built binaries:
+4. Package from the binaries you just built:
 
    ```powershell
    .\installer\build-installer.ps1 -SkipBuild -SkipTests -Version <version>
    ```
 
-5. Build the matching portable zip asset.
+5. Build the matching portable zip.
 6. Tag the release with the exact resource version.
 
-### Before pushing the tag
+### Before you push the tag
 
-- `git status` contains only the intended release commit.
-- `tools\Update-AxiomVersion.ps1 -PrintVersion` exactly matches the proposed
-  tag.
+- `git status` shows only the intended release commit.
+- `tools\Update-AxiomVersion.ps1 -PrintVersion` matches the proposed tag
+  exactly.
 - CI passes on Windows, Linux, and macOS for the tagged commit.
 
 ### After publishing
 
-- The GitHub release is neither draft nor prerelease.
-- Both Windows assets are present.
-- Their SHA-256 digests match the locally packaged files.
+- The GitHub release is neither a draft nor a prerelease.
+- Both Windows assets are attached.
+- Their SHA-256 digests match the files you packaged locally.

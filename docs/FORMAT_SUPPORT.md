@@ -1,135 +1,166 @@
-# Archive format support
+# What Axiom can do with each archive format
 
-Axiom uses one internal provider interface for every archive format. The GUI
-and CLI ask the active provider for its capabilities and enable only the
-commands that are safe for that format.
+Axiom talks to every archive format through one internal interface. Before
+enabling a command, the app and the CLI ask that interface what the format can
+actually do — so a command that wouldn't work is greyed out, rather than
+failing after you've clicked it.
 
-## Current support
+## The short version
 
-| Format | Browse | Extract | Test | Create | Add/update/sync | Delete | Move | Packed sizes |
+| Format | Browse | Extract | Test | Create | Add / update / sync | Delete | Move | Per-file packed size |
 |---|:--:|:--:|:--:|:--:|:--:|:--:|:--:|---|
 | AXAR | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | Estimated |
-| ZIP | ✓ | ✓ | ✓ | ✓ | Plaintext only | Plaintext only | Plaintext only | Exact |
+| ZIP | ✓ | ✓ | ✓ | ✓ | Unencrypted only | Unencrypted only | Unencrypted only | Exact |
 | 7z | Win | Win | Win | — | — | — | — | Exact |
 | RAR / RAR5 | Win | Win | Win | — | — | — | — | Exact |
 | ISO | Win | Win | Win | — | — | — | — | Partial |
 | CAB | Win | Win | Win | — | — | — | — | Partial |
 | TAR family | Win | Win | Win | — | — | — | — | — |
 
-"Win" means Windows only, through the bundled `7z.dll` engine or Windows
+"Win" means Windows only, through the bundled `7z.dll` engine or Windows' own
 `tar.exe`.
 
-### AXAR
+## AXAR
 
-The native container. Selectable Axiom, Zstandard, LZMA2, Deflate, or Store
-block streams; encryption, recovery records, directly readable read-only split
-volumes, comments, locking, signatures, metadata, links, and SFX packaging.
+Axiom's own format, and the only one where everything is available.
 
-Codec selection normally changes only the independently decoded AXC payload
-inside each solid block. Native payloads use AXC v9, and bundled
-Zstandard/LZMA2/Deflate payloads use the bounded AXC v10 external-codec
-envelope. Store bypasses entropy coding. The large-solid LZMA2 profile is the
-explicit exception: it uses disk-staged AXEC subframes and currently does not
-combine with encryption or recovery records.
+You can choose Axiom's adaptive method, Zstandard, LZMA2, Deflate, or Store for
+the compressed data, and separately turn on encryption, recovery records, split
+volumes, comments, locking, signatures, extended metadata, links, and
+self-extracting output.
 
-Because files share solid blocks, per-file Packed values are proportional
-estimates, marked `≈` in the GUI. Archive-level size and ratio are exact.
+Changing the compression method normally changes only the compressed payload
+inside each solid block, nothing else. Axiom's own payloads use AXC v9; the
+bundled Zstandard, LZMA2, and Deflate payloads use the bounded AXC v10 envelope.
+Store skips compression entirely.
 
-Native Axiom windows and LZMA2 dictionaries are supported up to the 4 GiB
-user-facing setting; their encoded 32-bit ceiling is 4 GiB−1. LZMA2 AXEC
-chunks use the same ceiling. Selecting an AXAR solid block above 4 GiB through
-64 GiB enables the required large-solid profile, which stages the raw block on
-disk and uses independently decoded bounded chunks (512 MiB by default).
-Large-solid archives require a reader that understands the profile and
-currently cannot combine it with archive encryption or recovery records.
-Existing AXAR v4/v5 archives are unaffected.
+The one exception is the large-solid LZMA2 profile, which stages data on disk
+and currently cannot be combined with encryption or recovery records.
 
-### ZIP
+### Why per-file sizes are estimates
 
-Stored and Deflate entries, WinZip AES-256 creation, SFX packaging, and
-standard split volumes. Edits are atomic rewrites that clone unchanged
-plaintext entries, preserving their Deflate data, metadata, and CRCs.
+Files share solid blocks — that sharing is what makes AXAR small. There is
+therefore no honest answer to "how many bytes does this one file take", so
+Axiom shows a proportional estimate and marks it `≈` in the app. The
+archive-level size and ratio are exact.
+
+### Size limits
+
+Axiom windows and LZMA2 dictionaries go up to the 4 GiB user-facing setting;
+the value actually stored is 4 GiB−1, which is the largest a 32-bit field
+holds. LZMA2 chunks use the same ceiling.
+
+Choosing an AXAR solid block above 4 GiB and up to 64 GiB switches on the
+large-solid profile. It stages the raw block on disk and compresses it in
+independently decoded pieces, 512 MiB by default. Such an archive requires a
+reader that understands the profile, and can't currently carry encryption or
+recovery records. Existing AXAR v4 and v5 archives are unaffected.
+
+## ZIP
+
+Full read and write for stored and Deflate entries, with WinZip AES-256 for new
+encrypted archives, SFX packaging, and standard split volumes.
+
+Edits are atomic rewrites. Entries you didn't touch are cloned across intact —
+their Deflate data, metadata, and CRCs are preserved rather than recompressed.
 
 Current limits:
 
-- Existing encrypted ZIPs can be listed, tested, and extracted with a password,
-  but not updated, deleted from, or renamed in place.
+- An **existing** encrypted ZIP can be listed, tested, and extracted with its
+  password, but not updated, deleted from, or renamed in place.
 - Split `.z01`, `.z02`, …, `.zip` sets can be created, browsed, tested, and
-  extracted, including AES-256 entries, but not edited — recreate the set to
-  change its contents.
-- ZIP does not expose AXAR-only services: archive comments, locking, recovery
-  records and volumes, signatures, encrypted names, and Axiom metadata.
-- ZIP creation is limited to the interoperable Store and Deflate methods.
+  extracted — including AES-256 entries — but not edited. Recreate the set to
+  change what's in it.
+- ZIP has no equivalent of AXAR's archive comments, locking, recovery records
+  and volumes, signatures, encrypted file names, or Axiom metadata, so those
+  are unavailable.
+- ZIP creation is limited to Store and Deflate, which is what keeps the result
+  readable everywhere else.
 
-### Read-only formats
+## The read-only formats
 
-The Windows system provider is intentionally read-only. It loads the bundled
-`7z.dll` engine directly for 7z, RAR/RAR5, ISO/UDF, and CAB, and uses Windows
+The Windows system provider is deliberately read-only. It loads the bundled
+`7z.dll` engine directly for 7z, RAR/RAR5, ISO/UDF, and CAB, and uses Windows'
 `tar.exe` for `.tar`, `.tar.gz`, `.tgz`, `.tar.xz`, `.txz`, `.tar.bz2`,
 `.tbz2`, `.tar.zst`, and `.tzst`.
 
-It uses signature checks where possible, falls back to extensions for
-wrapped and compressed TAR names, and routes extraction through a temporary
-staging directory before copying into the requested destination. The DLL path
-exposes structured metadata and progress callbacks without a helper process.
+Format detection reads file signatures where it can, falling back to the
+extension for wrapped and compressed TAR names. Extraction goes through a
+temporary staging directory before anything is copied into the destination you
+asked for. The `7z.dll` path exposes structured metadata and progress callbacks
+directly — no helper process, no parsing console text.
 
-Encrypted 7z archives prompt for a password, and numbered 7z split volumes are
-read as one logical stream. Pure ISO9660/Joliet images use Axiom's native
-directory reader for immediate display; hybrid images use the authoritative UDF
-catalog through `7z.dll`, so bridge-only trees are not mistaken for the
-complete disc.
+Encrypted 7z archives prompt for a password. Numbered 7z split volumes are read
+as one logical stream.
 
-These formats never appear as creation targets.
+ISO images get special handling. A plain ISO9660 or Joliet image uses Axiom's
+own directory reader, so it displays immediately. A hybrid image uses the
+authoritative UDF catalog through `7z.dll`, which means a bridge-only tree is
+never mistaken for the complete disc.
+
+None of these formats ever appears as something you can create.
 
 ## Roadmap
 
 AXAR and ZIP are the supported creation targets. Other formats stay read-only
-unless there is a clear compatibility and maintenance reason to expand them.
+unless there's a clear compatibility or maintenance reason to expand them.
 
-### Possible: direct TAR backend
+### Possible: a direct TAR backend
 
 If Axiom needs first-class TAR creation and editing, TAR is the most realistic
-next full-support provider: a simple sequential container, no codec licensing
-issue, a clean map onto the provider model, edits implementable as atomic
-rewrites like ZIP, and useful metadata through ustar/pax records.
+next candidate. It is a simple sequential container with no codec licensing
+problem, it maps cleanly onto the existing provider model, its edits can be
+atomic rewrites exactly like ZIP's, and ustar/pax records carry useful
+metadata.
 
-Initial scope would be `.tar`; ustar and pax path/name records; regular files
-and directories first; symlinks where safe to extract; create, add/update/sync,
-delete, and move/rename by full rewrite; no sparse files.
+The initial scope would be plain `.tar`; ustar and pax path and name records;
+regular files and directories first; symlinks where extraction is safe; create,
+add/update/sync, delete, and move by full rewrite; no sparse files.
 
 ### Possible: TAR plus external compression
 
-After plain TAR is stable: `.tar.gz` / `.tgz`, `.tar.zst` / `.tzst`, and
-`.tar.xz` once a codec backend is chosen. The first implementation should be
-view/extract/test/create only — in-place add, update, delete, and move require
-decompressing and recompressing the complete stream.
+Once plain TAR is stable: `.tar.gz` / `.tgz`, `.tar.zst` / `.tzst`, and
+`.tar.xz` once a codec backend is chosen. The first version should be
+view, extract, test, and create only — in-place add, update, delete, and move
+require decompressing and recompressing the whole stream, which is a different
+kind of commitment.
 
 ### Staying read-only
 
-| Format | Reason |
+| Format | Why |
 |---|---|
-| 7z | Implemented through `7z.dll` with structured properties and callbacks; no helper process |
+| 7z | Already implemented through `7z.dll` with structured properties and callbacks, and no helper process |
 | RAR | Creation is proprietary and will remain unsupported |
-| ISO | Creation is a separate authoring workflow, not an archiving one |
-| CAB | Implemented through `7z.dll` |
-| GZip / BZip2 / XZ single streams | These are compressed streams, not multi-file archives. Surface them as single-file operations or as TAR codecs |
+| ISO | Creating one is a disc-authoring workflow, not an archiving one |
+| CAB | Already implemented through `7z.dll` |
+| GZip / BZip2 / XZ single streams | These are compressed streams, not multi-file archives. They belong as single-file operations or as TAR codecs |
 
-## Provider contract
+## How the interface works
 
-Visible controls should derive from the selected provider:
+Which controls you see should follow from the format you picked, not from
+guesswork:
 
 - **AXAR** — method-aware level and codec controls, the live level-curve
-  preview, and all container options.
-- **ZIP** — Store/Deflate level preview, update mode, and optional file-data
-  password encryption. AXAR-only features hidden or disabled, including
+  preview, and every container option.
+- **ZIP** — a Store/Deflate level preview, update mode, and optional password
+  encryption of file data. AXAR-only features are hidden or disabled, including
   encrypted names.
-- **TAR** (if implemented) — metadata-focused options; no compression level for
-  plain `.tar`.
-- **Compressed TAR** (if implemented) — show the outer codec and level, and
-  explain that edits rebuild the complete stream.
-- **Read-only providers** — never appear as creation targets, even though the
-  Open dialog can browse them.
+- **TAR**, if it is ever implemented — metadata-focused options, and no
+  compression level at all for plain `.tar`.
+- **Compressed TAR**, if it is ever implemented — show the outer codec and
+  level, and be explicit that an edit rebuilds the whole stream.
+- **Read-only providers** — never offered as a creation target, even though the
+  Open dialog will happily browse them.
 
-The browser uses the same capability flags for commands, drag and drop, archive
-information, and context menus. Unsupported actions stay disabled rather than
-producing a late failure dialog.
+The browser uses the same capability flags for its commands, drag and drop,
+archive information, and context menus. An action that isn't supported stays
+disabled, rather than producing a failure dialog after the fact.
+
+## Extending this
+
+The provider layer is plug-in shaped, but it is **not** externally pluggable,
+and that is on purpose. A new format should land as a compiled-in provider
+first. That lets the capability model, password prompts, drag-and-drop
+behaviour, and command enabling settle before anyone commits to a public C ABI,
+a DLL loading policy, a sandboxing story, and a trust model for third-party
+parsers.

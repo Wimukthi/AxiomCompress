@@ -1,20 +1,22 @@
-# Benchmarking
+# How to benchmark Axiom
 
-How to measure Axiom when changing compression speed, decompression speed,
-memory use, or presets. The benchmark tooling never changes the archive format
-— it runs codecs, verifies round-trips, and writes CSV.
+This is the guide for measuring Axiom when you change compression speed,
+decompression speed, memory use, or a preset. The benchmark tooling never
+touches the archive format — it runs codecs, verifies round-trips, and writes
+CSV.
 
 Published results live in [PERFORMANCE.md](PERFORMANCE.md).
 
-## Rules
+## Four rules
 
-1. **Release builds only.** Debug distorts both throughput and memory.
-2. **Verify every row.** All harnesses here round-trip and compare before
-   recording a result. Never publish an unverified number.
-3. **More than one corpus.** A single file can make a change look far better
-   than it is.
-4. **Medians over repeats.** Use at least three repeats for any real
-   comparison.
+1. **Release builds only.** Debug distorts both throughput and memory badly
+   enough to make a comparison meaningless.
+2. **Verify every row.** Every harness here round-trips and compares before it
+   records a result. Never publish an unverified number.
+3. **More than one corpus.** A single file can easily make a change look far
+   better than it is.
+4. **Medians over repeats.** Use at least three repeats for any comparison you
+   intend to act on.
 
 ```powershell
 .\tools\build_msvc.ps1 -Configuration Release -AutoIncrementVersion:$false
@@ -25,16 +27,16 @@ The CLI lands at `out\Release\axiomc.exe`.
 
 ## Corpora
 
-Standing corpora for published comparisons:
+Two standing corpora are used for published comparisons:
 
-| Corpus | Size | Use |
+| Corpus | Size | What it exercises |
 |---|---|---|
 | [enwik8](https://mattmahoney.net/dc/textdata.html) | 100 MB | Text ratio; the de-facto LZMA-class benchmark |
 | [Silesia](https://sun.aei.polsl.pl/~sdeor/index.php?page=silesia) | ~212 MB | Mixed text, binary, medical, and database data |
 
 Silesia is benchmarked as **one uncompressed tar**, which is what zstd and most
-modern codecs report against. Feed that same tar to every codec so container
-overhead and file grouping cannot skew the comparison:
+modern codecs report against. Feed that same tar to every codec, so container
+overhead and file grouping can't skew the comparison:
 
 ```powershell
 cd D:\Silesia
@@ -43,14 +45,17 @@ tar --format=ustar -b 1 -cf D:\tests\axiom-perf\silesia.tar `
 ```
 
 Alphabetical order with blocking factor 1 produces exactly 211,948,032 bytes,
-matching the published input. **Check the byte count, not a hash.** Tar
-implementations write different uid/gid/uname/gname header fields, so two
-correct Silesia tars can differ by a few hundred bytes after compression while
-both being exactly 211,948,032 bytes long. That is the only portable check.
+matching the published input.
+
+**Check the byte count, not a hash.** Tar implementations write different
+uid/gid/uname/gname header fields, so two perfectly correct Silesia tars can
+differ by a few hundred bytes after compression while both being exactly
+211,948,032 bytes long. The byte count is the only portable check.
 
 The `tar` on `PATH` in Windows PowerShell is bsdtar, which is what the command
 above assumes. GNU tar additionally needs `--force-local`, or it reads the `D:`
-in the output path as a remote host name; bsdtar rejects that flag outright.
+in the output path as a remote host name — and bsdtar rejects that flag
+outright.
 
 For local engineering work, keep a directory covering four shapes:
 
@@ -64,11 +69,11 @@ D:\tests\axiom-perf\
   results\
 ```
 
-## Cross-codec comparison
+## Comparing against other compressors
 
 `bench/bench_codecs.py` is the codec-neutral harness behind the published
-tables. It runs Axiom levels 1–9 plus any available LZ4, zstd, Deflate, bzip2,
-LZMA2, and WinRAR RAR5 profiles against the same byte stream.
+tables. It runs Axiom levels 1–9 plus whichever LZ4, zstd, Deflate, bzip2,
+LZMA2, and WinRAR RAR5 profiles it can find, against the same byte stream.
 
 ```powershell
 python .\bench\bench_codecs.py `
@@ -78,25 +83,25 @@ python .\bench\bench_codecs.py `
   --output D:\tests\axiom-perf\results\silesia-codecs.csv
 ```
 
-- Reference tools are auto-detected on `PATH` and in common Windows install
+- Reference tools are auto-detected on `PATH` and in the usual Windows install
   locations. Override with `--lz4`, `--zstd`, `--sevenzip`, `--winrar`.
 - Missing reference tools are reported and skipped. Axiom is always required.
-- Default protocol is best-of-two compression and best-of-three decompression,
-  with every restore compared byte-for-byte.
+- The default protocol is best-of-two compression and best-of-three
+  decompression, with every restore compared byte-for-byte.
 - `--quick` selects a short smoke-test profile.
 - WinRAR profiles are RAR5 normal (`-m3`) and best with a fixed 128 MiB
   dictionary (`-m5 -md128m`).
-- The CSV is rewritten after every verified row, so a late external-tool
-  failure does not discard completed measurements.
+- The CSV is rewritten after every verified row, so a reference tool failing
+  late doesn't throw away the measurements already completed.
 
 For folders, the harness builds a deterministic byte stream of relative paths
 and file bytes and feeds that identical stream to every codec.
 
-### enwik8 sweep
+### The enwik8 sweep
 
 `tools\bench_enwik8.ps1` downloads enwik8 on first run, sweeps Axiom's match
-finders and window sizes from 1 MiB through the full input, and verifies every
-row by round-trip before reporting a ratio.
+finders and window sizes from 1 MiB up through the full input, and round-trips
+every row before reporting a ratio.
 
 ```powershell
 .\tools\bench_enwik8.ps1
@@ -108,12 +113,13 @@ Leave `-Scratch` at its default unless you know the replacement is equally
 fast. This sweep writes the full decoded corpus once per row and times it, so
 pointing it at a hard disk halves the reported decompression throughput while
 leaving every ratio untouched. To skip the download, drop a known-good `enwik8`
-into `%LOCALAPPDATA%\axiom-bench\corpus\` instead of relocating the scratch
+into `%LOCALAPPDATA%\axiom-bench\corpus\` rather than relocating the scratch
 directory.
 
 ## Comparing two builds
 
-Keep a known-good `axiomc.exe` outside the build output, then compare:
+This is the measurement that actually tells you whether your change helped.
+Keep a known-good `axiomc.exe` outside the build output, then:
 
 ```powershell
 .\tools\bench_axiom_levels.ps1 `
@@ -125,9 +131,10 @@ Keep a known-good `axiomc.exe` outside the build output, then compare:
   -Repeats 3
 ```
 
-Omit `-BaselineAxiomc` to run the current build only — useful for a quick sweep
-before a full baseline comparison. Add `-GenerateSampleCorpora -SampleSizeMiB 8`
-to let the script create deterministic sample files for a smoke test.
+Omit `-BaselineAxiomc` to run the current build only, which is useful for a
+quick sweep before committing to a full baseline comparison. Add
+`-GenerateSampleCorpora -SampleSizeMiB 8` to have the script create
+deterministic sample files for a smoke test.
 
 ### Custom profiles
 
@@ -149,23 +156,23 @@ Use `-Profiles` to test non-default arguments or candidate presets, written as
   -Repeats 3
 ```
 
-### Output
+### What it writes
 
 | File | Contents |
 |---|---|
 | `axiom-levels-raw.csv` | One row per run, corpus, profile, tool, and repeat |
 | `axiom-levels-summary.csv` | Median archive size, ratio, compress speed, decompress speed |
-| `axiom-levels-delta.csv` | Current-vs-baseline deltas, when a baseline is given |
+| `axiom-levels-delta.csv` | Current-versus-baseline deltas, when a baseline was given |
 
-Positive deltas always mean the current build is better: `RatioDeltaPct`
-positive means a smaller archive, `CompressDeltaPct` and `DecompressDeltaPct`
-positive mean faster. Negative values are regressions.
+**Positive deltas always mean the current build is better.** A positive
+`RatioDeltaPct` means a smaller archive; positive `CompressDeltaPct` and
+`DecompressDeltaPct` mean faster. Negative values are regressions.
 
 Decompressed output is verified with SHA-256 before any result is recorded.
 
-### Codec phase profiling
+## Profiling a single stream
 
-For a single Axiom stream, `--profile` reports coarse codec phase timings:
+`--profile` reports coarse per-phase timings for one Axiom stream:
 
 ```powershell
 .\out\Release\axiomc.exe c --level 5 --profile `
@@ -173,31 +180,35 @@ For a single Axiom stream, `--profile` reports coarse codec phase timings:
   D:\tests\axiom-perf\results\profile-enwik8-l5.axc
 ```
 
-The report includes block scheduling, greedy LZ77, optimal parsing, candidate
+The report covers block scheduling, greedy LZ77, optimal parsing, candidate
 encoding, and entropy encoding. When the tiled optimal parser is active, it also
-breaks optimal parsing into `lz77-optimal-dp`,
-`lz77-optimal-candidates`, and `lz77-optimal-reconstruction`. The candidate row
-is the aggregate CPU time of producer tiles and can overlap the DP row; it is
-omitted when the parser uses the serial tree path. It is diagnostic only: the
-callback is opt-in, does not change the AXC wire format, and is currently
-accepted only by the single-stream `c` command with `--method axiom`. The public
-C++ equivalent is `CompressionOptions::compression_telemetry`.
+breaks optimal parsing into `lz77-optimal-dp`, `lz77-optimal-candidates`, and
+`lz77-optimal-reconstruction`. The candidate row is the aggregate CPU time of
+producer tiles and can overlap the DP row; it is omitted when the parser uses
+the serial tree path.
 
-Timings for `block-total`, `lz77-greedy`, `lz77-optimal`,
+This is diagnostic only. The callback is opt-in, it does not change the AXC wire
+format, and it is currently accepted only by the single-stream `c` command with
+`--method axiom`. The public C++ equivalent is
+`CompressionOptions::compression_telemetry`.
+
+**Read the timings carefully.** `block-total`, `lz77-greedy`, `lz77-optimal`,
 `lz77-optimal-candidates`, and `candidate-encoding` are sums of worker events,
-so they represent aggregate CPU work and can overlap. `parallel-blocks` and
-`lz77-optimal-dp` are enclosing wall-time-like phases for their respective
-scopes. Use the profile to choose a hot path, then use the two-build harness
-above to decide whether a change is a real throughput win. Keep archive bytes,
-ratio, and round-trip hashes as hard gates; a faster parse that changes the
-selected token stream or loses ratio is not an acceptable preset change.
+so they represent aggregate CPU work and can overlap each other.
+`parallel-blocks` and `lz77-optimal-dp` are enclosing wall-time-like phases for
+their respective scopes.
+
+Use the profile to *choose* a hot path, then use the two-build harness above to
+decide whether your change is a real throughput win. Keep archive bytes, ratio,
+and round-trip hashes as hard gates: a faster parse that changes the selected
+token stream or loses ratio is not an acceptable preset change.
 
 ## CPU scaling
 
-Test throughput changes with the default automatic thread count **and** at
-least one fixed high thread count. This catches the two recurring regressions:
-too few blocks to feed the CPU, and serial work — whole-buffer CRC, input I/O —
-dominating the threaded codec.
+Test throughput changes with the default automatic thread count **and** at least
+one fixed high thread count. That combination catches the two regressions that
+keep recurring: too few blocks to feed the CPU, and serial work — whole-buffer
+CRC, input I/O — dominating the threaded codec.
 
 ```powershell
 .\tools\bench_axiom_levels.ps1 `
@@ -215,22 +226,24 @@ dominating the threaded codec.
 ```
 
 **Do not pass `--block-size` for the default scaling check.** An explicit block
-size disables automatic block sizing and hides whether the normal CLI and GUI
-path is feeding enough work to all available cores.
+size disables automatic block sizing, which hides whether the normal CLI and GUI
+path is feeding enough work to all available cores — the exact thing you were
+trying to measure.
 
 Low CPU utilization is not automatically a regression. Level 1 can become
 limited by memory bandwidth and archive I/O on easy corpora, and ordered match
-discovery at levels 8–9 means one busy thread per physical core is sometimes
-the fastest schedule. Treat low utilization as a regression only when
+discovery at levels 8–9 means one busy thread per physical core is sometimes the
+fastest schedule available. Treat low utilization as a regression only when
 throughput *also* fails to scale on larger or harder corpora.
 
-Automatic block geometry follows physical cores even when `--threads` requests
-more logical SMT workers. This keeps independent blocks large enough to retain
-match history; the requested thread budget remains available to nested codec
-work and independent archive operations. Validate oversubscribed runs against
-the automatic or physical-core profile for both archive bytes and throughput.
+Automatic block geometry follows physical cores even when `--threads` asks for
+more logical SMT workers. That keeps independent blocks large enough to retain
+match history, while the requested thread budget stays available for nested
+codec work and independent archive operations. Validate oversubscribed runs
+against the automatic or physical-core profile for both archive bytes and
+throughput.
 
-## Preset changes
+## Changing a preset
 
 Level 9 currently uses a 64 MiB block and window maximum. Larger 96 MiB and
 128 MiB configurations help pathological long-distance corpora but cost more
@@ -246,38 +259,37 @@ Two rules for preset work:
 
 - Only promote a profile when it improves the **overall corpus set**, not one
   synthetic case.
-- When comparing explicit block-size profiles, keep a matching
-  no-`--block-size` profile in the same run. The no-override row is the
-  user-facing default and the only one that exercises automatic CPU-aware block
-  sizing.
+- When comparing explicit block-size profiles, keep a matching no-`--block-size`
+  profile in the same run. The no-override row is the user-facing default, and
+  the only one that exercises automatic CPU-aware block sizing.
 
-## Stream accounting
+## Where the compressed bytes went
 
-To see where compressed bytes actually go inside an archive:
+To see how an archive's compressed bytes are distributed across streams:
 
 ```powershell
 py bench\axc_inspect.py path\to\archive.axc
 ```
 
 It reports per-stream raw and coded sizes, bits per raw byte, share of the
-payload, and the selected coder. `bench/gap_analysis.py` drives the full
+payload, and which coder was selected. `bench/gap_analysis.py` drives the full
 per-member sweep used for ratio research. The measured analysis of the LZMA2
 ratio gap is in [GAP_ANALYSIS_LZMA2.md](GAP_ANALYSIS_LZMA2.md).
 
-## GUI benchmark
+## The in-app benchmark
 
-`Tools > Benchmark…` measures the native Axiom method at a selected portable
-level, entirely in memory. It is the right tool for a quick throughput check on
-a specific machine; it is not a substitute for the harnesses above, which store
-raw data and support baseline builds. See
-[GUI_GUIDE.md](GUI_GUIDE.md#benchmark).
+**Tools > Benchmark…** measures Axiom's own method at a selected level,
+entirely in memory. It is the right tool for a quick throughput check on a
+specific machine.
 
-## Publishing results
+It is not a substitute for the harnesses above, which store raw data and support
+baseline builds. See
+[GUI_GUIDE.md](GUI_GUIDE.md#measuring-speed-on-your-machine).
 
-When refreshing the published snapshot:
+## Publishing a new snapshot
 
 1. Run the cross-codec harness on both standing corpora.
-2. Commit the verified CSVs under `bench/results/` with the version in the
+2. Commit the verified CSVs under `bench/results/`, with the version in the
    filename.
 3. Regenerate the charts: `python tools\generate_readme_charts.py`.
 4. Update the tables in [PERFORMANCE.md](PERFORMANCE.md) and the headline table
@@ -285,4 +297,4 @@ When refreshing the published snapshot:
 
 Keep all four in sync. The chart generator reads the CSVs directly and rejects
 missing, unknown, or unverified rows, so the charts and the raw data cannot
-drift — but the prose tables can, and only discipline prevents it.
+drift apart — but the prose tables can, and only discipline prevents it.

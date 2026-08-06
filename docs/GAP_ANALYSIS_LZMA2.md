@@ -1,9 +1,23 @@
 # Closing the LZMA2 ratio gap on Silesia
 
-> **Research log, not a specification.** This records the measured analysis and
-> each implementation step so the work can continue on any machine. It is a
-> point-in-time record — numbers here are not the published benchmark results,
-> which live in [PERFORMANCE.md](PERFORMANCE.md).
+> **This is a research log, not a specification, and not a guide.** It records
+> the measured analysis and each implementation step so the work can be picked
+> up again on any machine. It is deliberately a point-in-time record: the
+> numbers here are *not* the published benchmark results, which live in
+> [PERFORMANCE.md](PERFORMANCE.md).
+>
+> Entries are kept as written, including the ideas that were measured and
+> rejected. A rejected experiment is a result, and deleting it would mean
+> someone repeats it.
+
+## What this is about, in short
+
+On the Silesia corpus, Axiom at level 9 produces an archive about 5–7% larger
+than LZMA2 does, while compressing roughly twice as fast and decompressing
+about five times as fast. This log tracks the attempt to close the size gap
+without giving up either speed advantage.
+
+Terminology used throughout is defined in [GLOSSARY.md](GLOSSARY.md).
 
 **Status as of 2026-07-18:** Phase 0 complete. Items 1–3, 6, and 7 landed;
 item 4 was measured and rejected; item 5 was corrected and measured neutral on

@@ -1,12 +1,16 @@
 # Changelog
 
-All notable changes to AxiomCompress. The format follows
-[Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
-a four-part `major.minor.patch.build` version scheme described in
+Everything worth knowing about each AxiomCompress release, newest first.
+
+The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
+Version numbers are four parts, `major.minor.patch.build`, explained in
 [docs/VERSIONING.md](docs/VERSIONING.md).
 
 Entries are condensed from the
 [GitHub releases](https://github.com/Wimukthi/AxiomCompress/releases).
+
+> **The archive format is still pre-release** and can change between minor
+> versions. Where a release changes what Axiom writes, the entry says so.
 
 ## [0.9.2.2] - 2026-08-06
 

@@ -1,270 +1,387 @@
-# Axiom for Windows
+# Using Axiom for Windows
 
-`Axiom.exe` is a native Win32 archive manager. It is plain Visual C++ and Win32
-— no Qt, .NET, WinUI, or embedded browser — and it drives the same library the
-[command-line tool](../CLI_GUIDE.md) uses.
+`Axiom.exe` is the Windows app. It browses folders and archives in one window,
+and it runs the same engine as the [command-line tool](../CLI_GUIDE.md), so
+anything you do here you can also script later.
 
-![The Axiom archive browser in dark mode](images/axiom-gui.png)
+It is written directly against Win32 — no Qt, .NET, WinUI, or embedded
+browser — which is why it starts instantly and why it themes itself the way
+Windows does.
 
-## Main window
+New to the terminology? [GLOSSARY.md](GLOSSARY.md) explains the words in plain
+language.
 
-The window behaves like a file manager. It browses filesystem folders and
-archives through the same view:
+![The Axiom archive browser showing an open archive in dark mode](images/axiom-gui.png)
 
-- Open `.axar` and `.zip` archives for browsing, testing, extraction, and
-  editing; open 7z, RAR, ISO, CAB, and TAR-family archives read-only.
-- Navigate with the editable address dropdown — paths, drives, shell locations,
-  favorites, recent folders, and history.
-- Sort, resize, reorder, show, and hide columns; widths and order persist.
-- Drag files in from Explorer, drag entries out to Explorer, and move entries
-  between folders inside an archive.
-- Drop an archive onto the window to open it.
+## Contents
 
-The status bar reports the selection, unpacked and packed totals, and the
-active archive.
+- [The main window](#the-main-window)
+- [Creating an archive](#creating-an-archive)
+- [Getting files back out](#getting-files-back-out)
+- [Checking and repairing an archive](#checking-and-repairing-an-archive)
+- [Protecting an archive](#protecting-an-archive)
+- [Making a self-extracting .exe](#making-a-self-extracting-exe)
+- [Keeping an archive up to date](#keeping-an-archive-up-to-date)
+- [Settings](#settings)
+- [Measuring speed on your machine](#measuring-speed-on-your-machine)
+- [Keyboard shortcuts](#keyboard-shortcuts)
+- [Starting Axiom from a command or from Explorer](#starting-axiom-from-a-command-or-from-explorer)
+- [Housekeeping](#housekeeping)
 
-### Menus
+## The main window
 
-| Menu | Contains |
+The window works like a file manager. The same list shows folders on your disk
+and the contents of an open archive, so moving between the two feels the same.
+
+You can:
+
+- Open `.axar` and `.zip` archives to browse, test, extract, and edit them.
+  Open 7z, RAR, ISO, CAB, and TAR-family archives to browse, test, and extract
+  only — Axiom will not modify those.
+- Type or pick a location in the address bar. It accepts paths, drives, shell
+  locations such as Documents, your favorites, recent folders, and history.
+- Sort by any column, and show, hide, resize, or reorder columns. Your layout
+  is remembered.
+- Drag files in from Explorer to add them, drag entries out to extract them,
+  and drag entries between folders inside an archive to move them.
+- Drop an archive file onto the window to open it.
+
+The status bar along the bottom shows what you have selected, the unpacked and
+packed totals, and which archive is open.
+
+### The menus
+
+| Menu | What's in it |
 |---|---|
-| File | Open, single-stream compress/decompress, Information, Exit |
+| File | Open, compress or decompress a single file, Information, Exit |
 | Edit | Select all, Find, Delete, copy path, copy CRC-32 |
 | Archive | Add, Extract, Test, Update, Freshen, Synchronize, Repack, Split, Join, comment, lock, recovery, repair, sign, verify, SFX |
 | View | Navigation, refresh, tree pane, favorites, column layout |
 | Tools | Benchmark, Generate signing key, Delete Axiom temporary files, Settings |
 | Help | Check for updates, About Axiom |
 
-### Packed sizes
+The toolbar shows the commands you use most. Which buttons appear, their order,
+and whether they show labels or just icons are all set on the **Toolbar** page
+in Settings.
 
-ZIP reports exact per-entry compressed sizes from its central directory. AXAR
-files share solid blocks, so per-file Packed values are proportional estimates
-and are marked with `≈`. Archive-level size and ratio are always exact.
+### Why some sizes have a ≈ in front of them
 
-## Archive operations
+A ZIP file records exactly how many bytes each entry takes, so Axiom shows the
+real number.
 
-Add, extract, test, delete entries, edit the archive comment, lock, repair from
-recovery data, split and join volumes, sign and verify, and build a
-self-extracting `.exe`.
+An AXAR archive compresses groups of files together in a *solid block*, which
+is what makes it smaller — but it also means there is no honest per-file
+answer, because the files share their compressed bytes. Axiom shows a
+proportional estimate and marks it with `≈` so you know it is one.
 
-AXAR snapshot repositories are identified in the archive capability summary as
-**Snapshot repository**. The GUI browses, tests, and extracts their current
-snapshot through the normal archive view, while content-changing Add, Update,
-Freshen, Synchronize, Delete, Move, and ordinary Repack commands stay guarded
-by the snapshot profile rather than risking the historical manifest. Use the
-`axiomc snapshot` commands documented in
-[CLI_GUIDE.md](../CLI_GUIDE.md#snapshot-repositories), or the public archive
-API, for snapshot create/add/list/diff/restore/prune and snapshot garbage
-collection. This keeps the native GUI's existing file-manager workflows safe
-while making the repository type visible instead of presenting incompatible
-legacy controls.
+The archive's overall size and ratio are always exact.
 
-Long operations run on worker threads. The window stays responsive, and
-progress shows byte counts, throughput, ETA, output size, and compression ratio
-where available. Pause, resume, and cancel use the same cooperative
-`OperationControl` path as the CLI, so cancelling leaves no partial output.
+## Creating an archive
 
-Selecting individual AXAR entries uses seekable extraction automatically when
-the archive contains an optional subframe map. The operation window reports the
-physical archive bytes read while testing or extracting, so a selected restore
-can be compared with the archive size. Older archives and blocks that are
-encrypted, transformed, or not independently framed continue through the
-whole-block path without requiring a setting.
+Select the files and folders you want, then press **Add** on the toolbar, or
+`Ctrl+N`, or right-click them in Explorer and use the Axiom submenu.
 
-Update, freshen, and synchronize run as a single planned transaction: unchanged
-compressed blocks are copied directly, changed and new files are compressed
-once, removed files are dropped in the same rewrite, and recovery data is
-rebuilt once at the end. Progress reports the compare, copy, compress,
-recovery, and commit phases separately. If the source already matches the
-archive, nothing is rewritten.
+![The Add to archive dialog, showing compression settings and a live size preview](images/axiom-add-to-archive.png)
 
-Complete numbered volume sets open directly; reconstruction is only needed when
-data parts are missing or damaged.
+Everything lives in one resizable dialog. What you selected, the format, and
+the output path stay pinned at the top while the rest scrolls. The five option
+pages are listed down the left side:
 
-## Add to archive
-
-Archive creation is one resizable page dialog. The item summary, format, and
-output path stay visible while the page body scrolls. Its navigation follows
-the compact Settings layout, with the five option pages listed down the left.
-The Compression page keeps the live preview beside the form when there is
-enough width and moves it out of the way on narrower windows.
-
-| Page | Contains |
+| Page | What you set there |
 |---|---|
 | Compression | Method, level, dictionary and word size, solid block size, threads, threading model |
 | General | Update mode, archive comment, metadata notes |
 | Security | Password, filename encryption, show-password toggle, archive signing |
 | Recovery & volumes | Recovery record percentage, split volume size, recovery volumes |
-| SFX | Self-extracting output and everything the generated extractor does |
+| SFX | Whether to produce a self-extracting `.exe`, and what it does when run |
 
-AXAR metadata capture is automatic. File attributes/timestamps, sparse layout,
-alternate streams, and supported security or extended attributes are collected
-when the source permits them. If a source item or a restore step is incomplete,
-the operation result reports the affected paths and the warning text; the result
-dialog keeps the operation successful when the loss is best-effort. Use the CLI
-or library `strict_metadata` option when metadata loss must fail the operation.
+If you change nothing at all, you get an AXAR archive at level 5 using Axiom's
+own method — a reasonable default for almost anything.
 
-For AXAR the Method list offers Axiom adaptive, Zstandard, LZMA2, Deflate, and
-Store. Choosing a method rebuilds the level list and enables only the controls
-that mean something: Axiom exposes its threading model, LZMA2 exposes
-dictionary and word size plus HC4/BT4, and Zstandard and Deflate keep their
-native levels. ZIP creation is deliberately limited to Deflate and Store.
+### Choosing a method and level
 
-The Axiom and LZMA2 dictionary controls go up to 4 GiB. The 4 GiB choice is
-the user-facing form of the largest 32-bit encoded distance/property value
-(4 GiB−1). LZMA2 solid-block choices from 8 GiB through 64 GiB use the
-disk-staged large-solid profile: codec chunks remain 512 MiB by default and
-can grow with the selected dictionary. That profile is LZMA2-only and the
-dialog rejects encryption or recovery records for it.
+For AXAR, the **Compression method** list offers Axiom adaptive, Zstandard,
+LZMA2, Deflate, and Store. Picking one rebuilds the level list and greys out
+the controls that don't apply to it, so you never set something that will be
+ignored: Axiom exposes its threading model, LZMA2 exposes dictionary and word
+size plus its HC4/BT4 match finder, and Zstandard and Deflate keep their own
+native level numbers.
 
-If SFX is enabled, the output path becomes the final merged `.exe` — Axiom does
-not leave a separate archive beside it.
+ZIP archives can only use Deflate or Store. That's a deliberate limit — those
+are what every other tool can read.
 
-### SFX
+The dictionary controls for Axiom and LZMA2 go up to 4 GiB. Choosing 4 GiB
+gives you the largest value the file format can hold, which is one byte short
+of 4 GiB.
 
-Signing lives on the Security page with the other authenticity controls, so the
-SFX page is only about self-extracting output. Enabling **Create one
-self-extracting Windows executable** turns on the rest of the page, which
-configures what the finished `.exe` does when someone runs it. The settings are
-stored inside the executable itself.
+For LZMA2 only, solid block sizes from 8 GiB to 64 GiB switch on a disk-staged
+mode: the raw data goes to a temporary file and is compressed in bounded
+pieces, so a huge block doesn't need a huge amount of memory. The dialog will
+not let you combine that mode with encryption or recovery records.
 
-| Setting | Effect |
-|---|---|
-| Extractor type | Full window shows dialogs; Console only (unattended) uses the smaller decode-only runtime and never prompts. Selecting it disables window title, description, appearance, destination editing, opening the destination, and interface settings |
-| Window title | Replaces the default extractor title |
-| Default destination | Editable drop-down with common templates such as `%TEMP%\%SFXNAME%`, `%LOCALAPPDATA%\%SFXNAME%`, and `%PROGRAMFILES%\%SFXNAME%`; custom absolute paths and templates are also accepted. `%SFXDIR%` means beside the executable, and an empty value has the same effect |
-| Existing files | Replace, skip, or stop |
-| Interface | Interactive, silent, or no window |
-| Elevation | Never, when the destination needs it, or always |
-| Run after extracting | An archive-relative regular file to launch once extraction finishes, plus its arguments; paths cannot escape through `..` or reparse points |
-| License text | Shown before extraction when acceptance is required |
+### Watching the size before you commit
 
-For the Console only tier, the extraction settings remain available: default
-destination, overwrite behavior, elevation, run-after-extract, and license
-handling. The window title, description, appearance, interface mode, destination
-editing, and Explorer-open options are disabled because the console runtime does
-not use them. Its interface mode is fixed to **No window**.
+For AXAR and ZIP, the right-hand side of the Compression page predicts the
+result at every level the chosen method supports, while you are still deciding.
 
-For the Full window tier, three checkboxes control whether the user may edit the
-destination, whether the license must be accepted, and whether the destination
-opens when extraction finishes.
+Blue is the predicted compressed size, green is the predicted saving, and the
+pale band around them is how uncertain the estimate still is. Click any point
+to select that level.
 
-Shell folders resolve through the Windows known-folder API rather than
-environment variables, so `%ProgramFiles%` cannot be redirected by a variable
-set before launch. The program named under **Run after extracting** must be a
-regular file the extraction produced; absolute paths, `..`, alternate-data-
-stream syntax, and symlink/reparse-point components are rejected. The runtime
-also caps worker counts at 4096. Combinations the
-extractor would refuse — requiring acceptance with no license text, arguments
-with no program, or an unattended elevated run-after chain — are reported when
-you select OK rather than failing on the recipient's machine.
+All the points come from the same sampled regions of your files, so the curve
+compares *levels* rather than comparing different parts of your data. Changing
+something that affects which bytes are read cancels the estimate and restarts
+it after a short pause; changing only the level just moves the marker.
 
-Everything on this page is also available from the command line through
-`axiomc sfx --config`, documented in
-[CLI_GUIDE.md](../CLI_GUIDE.md#configuring-an-extractor).
+The preview keeps sampling until every visible level is confident, or until it
+hits its own time and sample limits. If the limits win, it says the confidence
+is bounded rather than presenting a guess as a fact.
 
-### Compression profiles
+### Profiles
 
-Five built-in profiles cover text and source, executables, structured data,
-already-compressed media, and mixed folders. They are tuned as practical
-defaults: level 7 for text, structured data, and binaries; level 1 fast
-rejection for pre-compressed media; and balanced level 5 for mixed folders.
-Levels 8 and 9 stay explicit choices rather than hiding inside a profile.
+Five built-in profiles cover text and source code, executables, structured
+data, already-compressed media, and mixed folders. They use level 7 for text,
+structured data, and binaries; level 1 for pre-compressed media, where the
+point is to give up quickly rather than waste CPU; and level 5 for mixed
+folders.
 
-Saved user profiles also preserve the method, native codec level, LZMA2 match
+Levels 8 and 9 are deliberately not hidden inside a profile. If you want to
+spend that much time, say so.
+
+Saving your own profile keeps the method, native codec level, LZMA2 match
 finder, dictionary and word size, solid block size, thread count, and threading
 model.
 
-### Compression preview
+### What Axiom records about your files
 
-For AXAR and ZIP, the right side of the Compression page shows a live prediction
-across every level the selected method supports. All points come from the same
-sampled source regions, so the curve compares codecs rather than sampling
-noise.
+For AXAR archives this happens automatically: file attributes and timestamps,
+sparse file layout, NTFS alternate data streams, and supported security or
+extended attributes are all captured when the source allows it.
 
-Blue is predicted compressed bytes, green is predicted saving, and the neutral
-band is the uncertainty range. Click a point to select that level. Changing a
-setting that affects the source cancels and re-runs the estimate after a short
-pause; changing only the level moves the marker without rescanning.
+If some item couldn't be read, or a piece of metadata couldn't be captured, the
+result dialog lists the affected paths and explains what was lost. The
+operation still counts as successful when the loss was best-effort. If losing
+metadata should instead fail the whole operation, use the CLI's
+`--strict-metadata` option.
 
-The preview keeps sampling until every visible level reaches high confidence,
-or until its bounded sample/time safety limits are reached. When the limits
-win, the preview says that confidence is bounded instead of presenting the
-result as exact.
+## Getting files back out
+
+Select what you want and press **Extract**, or `Ctrl+E`. Selecting a folder
+takes everything inside it. You can also just drag entries out of the window
+into Explorer.
+
+Long operations run on background threads, so the window stays usable. Progress
+shows byte counts, throughput, an estimated time remaining, output size, and
+compression ratio where those make sense. Pause, resume, and cancel all work,
+and cancelling never leaves a half-written file behind.
+
+When you extract a few files from a large AXAR archive, Axiom reads only the
+compressed pieces those files actually need, provided the archive records where
+its pieces begin. The progress window reports how many bytes it read from the
+archive, so you can see the saving. Older archives, and blocks that are
+encrypted or filtered, fall back to reading the whole block — nothing to
+configure, it just happens.
+
+If an archive was split into numbered volumes and you still have all the data
+parts, open any one of them and Axiom reads the set directly. You only need to
+rejoin it when a part is missing or damaged.
+
+## Checking and repairing an archive
+
+**Test** (`Ctrl+T`) decompresses everything and verifies every checksum without
+writing any files. It is the right thing to run after making a backup and
+before deleting the previous one.
+
+If a test reports damage and the archive has a recovery record, **Repair**
+(`Ctrl+Shift+P`) rebuilds the damaged parts. A recovery record can only absorb
+so much: it is protection against a few bad sectors, not against a failed
+drive. Keep a second copy elsewhere.
+
+Add or change a recovery record from the **Archive** menu, or on the
+**Recovery & volumes** page when you create the archive.
+
+## Protecting an archive
+
+The **Security** page of the Add dialog covers passwords and signing.
+
+**A password** encrypts the file data. Anyone can still see the file names,
+sizes, and checksums unless you also switch on filename encryption, which seals
+the archive's index too. With that on, even listing the archive needs the
+password.
+
+Axiom derives the encryption key with Argon2id and encrypts with
+XChaCha20-Poly1305. ZIP archives use WinZip AES-256 instead, and ZIP file names
+are always visible — if names must be hidden, use AXAR.
+
+**Signing** proves an archive came from you and hasn't been altered since.
+Generate a key pair from **Tools > Generate signing key**, sign with the secret
+key, and give people the public key to verify with. Editing a signed archive
+invalidates the signature, which is the point.
+
+### Snapshot repositories
+
+An AXAR archive can also be a *snapshot repository*: several dated versions of
+the same folder, stored without duplicating the unchanged parts. Axiom
+identifies these in the archive information as **Snapshot repository**.
+
+The Windows app browses, tests, and extracts the current snapshot through the
+normal window. It deliberately blocks the commands that change content — Add,
+Update, Freshen, Synchronize, Delete, Move, and ordinary Repack — because those
+were designed for ordinary archives and would discard the history.
+
+Create, append to, list, compare, restore, and prune snapshots with the
+`axiomc snapshot` commands, documented in
+[CLI_GUIDE.md](../CLI_GUIDE.md#snapshot-repositories).
+
+## Making a self-extracting .exe
+
+A self-extracting archive is your archive glued onto a small extractor program,
+so the whole thing is one `.exe`. Whoever receives it doesn't need Axiom.
+
+Switch on **Create one self-extracting Windows executable** on the SFX page.
+The output path then becomes the finished `.exe` — Axiom does not leave a
+separate archive next to it. All the settings below are stored inside the
+executable, so they travel with it.
+
+| Setting | What it does |
+|---|---|
+| Extractor type | **Full window** shows dialogs. **Console only (unattended)** uses a much smaller runtime and never prompts, which suits something a script unpacks. Choosing it disables the settings that only a window can use |
+| Window title | Replaces the default title |
+| Default destination | A drop-down with common templates such as `%TEMP%\%SFXNAME%`, `%LOCALAPPDATA%\%SFXNAME%`, and `%PROGRAMFILES%\%SFXNAME%`. You can type your own absolute path too. `%SFXDIR%` means "next to the executable", and leaving it empty means the same |
+| Existing files | Replace them, skip them, or stop |
+| Interface | Interactive, silent, or no window at all |
+| Elevation | Never ask for administrator rights, ask only when the destination needs them, or always ask |
+| Run after extracting | A file from inside the archive to launch once extraction finishes, plus its arguments |
+| License text | Shown before extraction, when acceptance is required |
+
+For **Console only**, the extraction behaviour is all still available —
+destination, overwrite policy, elevation, run-after-extract, and the license.
+Only the window-related settings are disabled, and the interface mode is fixed
+to **No window**.
+
+For **Full window**, three checkboxes control whether the recipient may change
+the destination, whether they must accept the license, and whether the
+destination folder opens when extraction finishes.
+
+### The safety rules it enforces
+
+Shell folders such as `%ProgramFiles%` are resolved through the Windows
+known-folder API rather than through environment variables, so somebody can't
+redirect the destination by setting a variable before launching the extractor.
+
+The program named under **Run after extracting** must be a real file that the
+extraction itself produced. Absolute paths, `..`, alternate-data-stream syntax,
+and anything passing through a symbolic link or junction are all rejected.
+
+Combinations the extractor would refuse are caught when you press OK, not on
+the recipient's machine: requiring acceptance with no license text, arguments
+with no program, or a completely unattended chain that also elevates and runs
+something.
+
+Everything on this page is available from the command line too, through
+`axiomc sfx --config`, documented in
+[CLI_GUIDE.md](../CLI_GUIDE.md#configuring-an-extractor).
+
+## Keeping an archive up to date
+
+Three commands refresh an existing archive from its source folder:
+
+| Command | Adds new files | Replaces changed files | Removes deleted files |
+|---|:--:|:--:|:--:|
+| Update | ✓ | ✓ | — |
+| Freshen | — | ✓ | — |
+| Synchronize | ✓ | ✓ | ✓ |
+
+All three run as one planned pass. Files that haven't changed are copied across
+still compressed — they are never decompressed and recompressed. Changed and
+new files are compressed once. Deleted files are dropped in the same rewrite,
+and any recovery record is rebuilt once at the end.
+
+Progress reports the compare, copy, compress, recovery, and commit stages
+separately, so a long run tells you which part it is in. If the source already
+matches the archive, nothing is rewritten at all.
+
+**Repack** rebuilds an archive to reclaim the space left by earlier deletions
+and replacements, and merges duplicate file contents into a single stored copy.
 
 ## Settings
 
-![The Axiom settings dialog](images/axiom-settings.png)
+![The Axiom settings dialog, showing the General page](images/axiom-settings.png)
 
-Settings are stored per user under `HKCU\Software\AxiomCompress\GUI`, across
-eleven pages:
+Settings live under your own Windows user account, in the registry at
+`HKCU\Software\AxiomCompress\GUI`. There are eleven pages:
 
-| Page | Covers |
+| Page | What it covers |
 |---|---|
 | General | Theme, accent color, icon colors, startup location, confirmations |
 | Compression | Default method, level, and threading model |
 | Paths | Default output, extraction, and temporary locations |
-| File list | Column visibility and order, sorting, display options |
-| Viewer | How entries open for preview |
+| File list | Which columns show, in what order, and how the list sorts |
+| Viewer | How entries open when you preview them |
 | Security | Password handling and encryption defaults |
-| Integration | Per-user file associations and the Explorer submenu |
+| Integration | File associations and the Explorer right-click submenu |
 | Updates | Automatic update checks |
-| Shortcuts | Rebindable keyboard shortcuts |
-| Toolbar | Button labels or icons-only mode, which buttons appear, and their order |
-| Advanced | Diagnostics and low-level behavior |
+| Shortcuts | Every keyboard shortcut, rebindable |
+| Toolbar | Labels or icons-only, which buttons appear, and their order |
+| Advanced | Diagnostics and low-level behaviour |
 
-The General page can follow the Windows accent, use an Axiom preset, or take a
-custom color from a DPI-aware picker. The accent applies to selections,
-progress indicators, buttons, and optional accent-colored icons.
+The **General** page can follow the Windows accent color, use one of Axiom's
+presets, or take a custom color from a DPI-aware picker. The accent shows up in
+selections, progress indicators, buttons, and — if you want — the icons.
 
-The Integration page registers per-user associations for AXAR, ZIP/JAR/WAR/APK,
-7z, RAR, TAR-family, ISO, and CAB. Read-only formats use embedded Axiom icons
-and open into the browser for viewing, testing, and extraction.
+The **Integration** page registers file associations for AXAR, ZIP (including
+JAR, WAR, and APK), 7z, RAR, the TAR family, ISO, and CAB. These are registered
+for your user account only. Read-only formats get Axiom's icons and open into
+the browser for viewing, testing, and extracting.
 
-Options are wired only where the engine or GUI actually has the behavior.
-Unsupported future options are disabled rather than silently stored.
+Options are only present where the engine actually implements the behaviour.
+Anything not yet supported is disabled rather than quietly stored and ignored.
 
-The Toolbar page can keep command labels beside their icons or switch the main
-command toolbar to **Icons only**. Tooltips retain the full command names, and
-buttons highlight on hover while preserving separate focused, pressed, and
-disabled states.
+## Measuring speed on your machine
 
-## Benchmark
+![The Axiom benchmark window after a completed run](images/axiom-benchmark.png)
 
-![The Axiom benchmark window](images/axiom-benchmark.png)
+**Tools > Benchmark…** (`Ctrl+B`) measures how fast Axiom compresses and
+extracts on the machine you're sitting at. It uses either a generated test
+corpus or a file or folder you choose.
 
-`Tools > Benchmark…` measures Axiom compression and extraction throughput. It
-uses either a generated corpus or a folder or file you choose.
+Everything happens in RAM. Generated data is created there directly, and a file
+or folder you pick is loaded once before timing starts, so compression,
+decompression, and the byte-for-byte verification after each pass all run in
+memory. Your disk speed never contaminates the result.
 
-Generated data is created directly in RAM and custom input is preloaded once
-before timing, so every compression, decompression, and byte-for-byte
-verification pass runs entirely in memory — storage throughput never
-contaminates the codec result.
+The generated corpus is not a trivially repeating string — it uses
+deterministic literal data with backward matches spread across the window, so
+the match finder has real work to do. Sizing adjusts to the level you picked
+and the memory you have, and each phase repeats enough times to average out
+timer noise.
 
-The default synthetic corpus uses deterministic literals and log-distributed
-backward matches to exercise the match finder across the active window, rather
-than timing a trivially repeated string. Automatic sizing fits the selected
-level and available memory, and each measured phase repeats enough to reduce
-timer noise. Continuous mode runs until **Stop**, keeping recent-pass detail
-plus lifetime throughput, rolling variation, and a stability indicator.
+Continuous mode runs until you press **Stop**, keeping per-pass detail
+alongside lifetime throughput, how much the numbers are varying, and a
+stability indicator.
 
-The window measures the native Axiom method only. For cross-codec comparisons
-see [BENCHMARKING.md](BENCHMARKING.md).
+This window measures Axiom's own method only. To compare against zstd, LZMA2,
+WinRAR, and others, see [BENCHMARKING.md](BENCHMARKING.md).
 
-## Appearance and DPI
+## How it looks
 
-System light/dark detection, High Contrast handling, native title bars, and
+Light and dark detection, High Contrast handling, native title bars, and
 standard control theming come from the shared `Wimukthi.Win32Theme` framework.
-Axiom keeps its own accent palette and owner drawing on top:
+Axiom layers its own work on top:
 
 - Dark title bars, menus, dialogs, list views, progress controls, combo boxes,
-  and custom message boxes.
-- Per-monitor DPI-scaled fonts, icons, spacing, and dialog layout.
-- Owner-drawn controls where common controls do not dark-theme correctly.
-- Shared command IDs across menus, toolbar, shortcuts, and context actions.
+  and message boxes.
+- Fonts, icons, spacing, and dialog layout that rescale per monitor, so moving
+  the window to a different display redraws it correctly.
+- Hand-drawn controls wherever the standard Windows ones don't dark-theme
+  properly.
+- One set of command identifiers shared by the menus, toolbar, shortcuts, and
+  context menus, so a command behaves the same however you reach it.
 
 ## Keyboard shortcuts
 
-All shortcuts are rebindable on the Settings > Shortcuts page. Defaults:
+Every one of these can be rebound on the **Settings > Shortcuts** page. The
+defaults:
 
 | Action | Shortcut |
 |---|---|
@@ -281,7 +398,7 @@ All shortcuts are rebindable on the Settings > Shortcuts page. Defaults:
 | Generate signing key | `Ctrl+Shift+K` |
 | Sign / Verify | `Ctrl+Shift+G` / `Ctrl+Shift+V` |
 | Create self-extracting archive | `Ctrl+Shift+X` |
-| Compress / decompress single stream | `Ctrl+Alt+Z` / `Ctrl+Alt+X` |
+| Compress / decompress a single file | `Ctrl+Alt+Z` / `Ctrl+Alt+X` |
 | Information | `Alt+Enter` |
 | Find files | `Ctrl+F` |
 | Benchmark | `Ctrl+B` |
@@ -290,33 +407,33 @@ All shortcuts are rebindable on the Settings > Shortcuts page. Defaults:
 | Select all / Delete | `Ctrl+A` / `Delete` |
 | Copy path / Copy CRC-32 | `Ctrl+Shift+C` / `Ctrl+Alt+C` |
 | Back / Forward / Up | `Alt+Left` / `Alt+Right` / `Alt+Up` |
-| Focus address bar | `Ctrl+L` |
+| Focus the address bar | `Ctrl+L` |
 | Refresh | `F5` |
-| Show/hide tree pane | `F9` |
+| Show or hide the tree pane | `F9` |
 | Add / remove favorite | `Ctrl+D` / `Ctrl+Shift+D` |
 | Check for updates | `Ctrl+Alt+Shift+U` |
 | About Axiom | `F1` |
 
-## Command line entry points
+## Starting Axiom from a command or from Explorer
 
-`Axiom.exe` accepts a few startup commands, which is how the Explorer
-integration drives it:
+`Axiom.exe` accepts a few startup commands. This is how the Explorer
+integration drives it, and you can use them yourself:
 
 ```text
-Axiom.exe <archive>              open the archive in the browser
+Axiom.exe <archive>              open that archive in the browser
 Axiom.exe --add <path>...        open Add to archive for those paths
-Axiom.exe --extract <archive>    open the extraction flow
-Axiom.exe --test <archive>       open the test flow
+Axiom.exe --extract <archive>    start the extraction flow
+Axiom.exe --test <archive>       start the test flow
 ```
 
-Concurrent `--add` invocations from an Explorer multi-selection are coalesced
-into one dialog.
+If Explorer fires several `--add` calls at once because you selected many
+files, they are merged into one dialog rather than opening several.
 
 ## Housekeeping
 
-`Tools > Delete Axiom temporary files` clears Axiom's staging directory, skips
-anything an active operation is using, optionally wipes securely, runs in the
-background, and reports the space reclaimed.
+**Tools > Delete Axiom temporary files** clears Axiom's staging folder. It
+skips anything an operation is currently using, can wipe securely if you ask
+it to, runs in the background, and tells you how much space it reclaimed.
 
-Update checks are silent on startup and retry cleanly after a failed check.
-`Help > Check for updates` runs one on demand.
+Update checks run quietly at startup and retry cleanly if one fails.
+**Help > Check for updates** runs one immediately.

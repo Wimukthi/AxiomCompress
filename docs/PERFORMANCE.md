@@ -1,15 +1,35 @@
 # Published benchmark results
 
-Measured results for Axiom against reference codecs. To reproduce these on your
-own hardware, or to measure a change you are making, see
-[BENCHMARKING.md](BENCHMARKING.md).
+Measured results for Axiom against reference compressors, plus the engineering
+log of optimization checkpoints.
 
-> **Snapshot: Axiom 0.8.0.0**, measured 2026-07-31. On enwik8 every Axiom
-> archive is byte-for-byte the same size as in the 0.4.0.0 snapshot, at all
-> nine levels — as expected, since 0.7.0.0 made the extra block methods opt-in
-> through `--method` and 0.7.1.0 retuned the *automatic* file-type profiles,
-> and neither path changes what an explicit `--level N` emits. The exact rows
-> behind every table and chart are versioned in
+To reproduce these on your own hardware, or to measure a change you are making,
+see [BENCHMARKING.md](BENCHMARKING.md).
+
+## How to read these numbers
+
+**Ratio** is original size divided by compressed size. 4.00x means the archive
+is a quarter of the original. Bigger is better.
+
+**Ratios travel between machines. Timings do not.** Throughput depends on CPU,
+memory bandwidth, storage, corpus shape, and build settings. If you need numbers
+for your own hardware, run the harnesses in [BENCHMARKING.md](BENCHMARKING.md)
+rather than scaling these.
+
+**Timings are comparable within a snapshot, not across snapshots.** Between the
+0.4.0.0 and 0.8.0.0 runs, reference binaries that had not changed at all moved
+by 3–18% on identical input. That is machine state, not code. Attribute a speed
+change to Axiom only from a controlled A/B run of two builds — which is exactly
+what `tools\bench_axiom_levels.ps1` exists for.
+
+> **Current snapshot: Axiom 0.8.0.0**, measured 2026-07-31.
+>
+> On enwik8, every Axiom archive is byte-for-byte the same size as in the
+> 0.4.0.0 snapshot, at all nine levels. That is expected: 0.7.0.0 made the extra
+> block methods opt-in through `--method`, and 0.7.1.0 retuned the *automatic*
+> file-type profiles. Neither path changes what an explicit `--level N` emits.
+>
+> The exact rows behind every table and chart are versioned in
 > [`../bench/results/`](../bench/results/).
 
 ## Test environment
@@ -23,23 +43,11 @@ own hardware, or to measure a change you are making, see
 | Axiom settings | Default `--threads 0` |
 | References | zstd 1.5.7 (`-T0`), LZ4 1.10.0, 7-Zip 26.02 (`-mmt=on`) for LZMA2/bzip2/gzip, WinRAR 7.23 RAR5 (`-m3`, `-m5 -md128m`) |
 
-Timings are comparable **within** a snapshot, not across snapshots. Between the
-0.4.0.0 and 0.8.0.0 runs, unchanged reference binaries moved by 3–18% on
-identical input — machine state, not code. Attribute a speed change to Axiom
-only from a controlled A/B run of two builds, which is what
-`tools\bench_axiom_levels.ps1` and [BENCHMARKING.md](BENCHMARKING.md) are for.
-
 ## Silesia
 
 The twelve Silesia files packed into one 211.9 MB uncompressed tar, so every
 codec sees byte-identical input. Axiom's rows include its default validated-tar
-member transforms, exactly as a normal `axiomc c --level N` run would.
-
-Sizes here differ from `silesia-0.4.0.0.csv` by up to 3.8 KB — including for
-reference codecs that have not changed at all. Both tars are exactly
-211,948,032 bytes, but they were written by different `tar` builds, whose
-headers differ; see [BENCHMARKING.md](BENCHMARKING.md#corpora). Compare Axiom
-against the other codecs *within* a snapshot, not against a previous one.
+member transforms — exactly what a normal `axiomc c --level N` run would do.
 
 ![Silesia compression ratio by codec](images/silesia-compression-ratio.svg)
 
@@ -72,9 +80,9 @@ against the other codecs *within* a snapshot, not against a previous one.
 
 Raw data: [`silesia-0.8.0.0.csv`](../bench/results/silesia-0.8.0.0.csv).
 
-### Reading the table
+### What the table says
 
-- Axiom's fast presets trade zstd's throughput for a smaller result; levels 2–7
+- Axiom's fast presets trade zstd's throughput for a smaller result. Levels 2–7
   cover the range between zstd -3 and WinRAR normal.
 - Axiom -9 is 2.8% smaller than zstd -19 at comparable encode time, and 1.7%
   smaller than zstd -22 while encoding 5.2x faster.
@@ -83,12 +91,22 @@ Raw data: [`silesia-0.8.0.0.csv`](../bench/results/silesia-0.8.0.0.csv).
 - Axiom -9 is 5.6% larger than LZMA2 -mx9, but encodes 2.2x faster and decodes
   5.1x faster.
 - Levels 8 and 9 sit close together here: level 8 saves 5.5% of the encode time
-  for a 2.0% larger archive. On enwik8 they converge completely — see below —
-  so level 8 earns its place mainly through its smaller 32 MiB window, not
-  through speed.
+  for a 2.0% larger archive. On enwik8 they converge completely, so level 8
+  earns its place mainly through its smaller 32 MiB window rather than through
+  speed.
 
-Closing the remaining LZMA2 ratio gap is active work; the measured analysis is
+Closing the remaining LZMA2 ratio gap is active work. The measured analysis is
 in [GAP_ANALYSIS_LZMA2.md](GAP_ANALYSIS_LZMA2.md).
+
+### A note on the input tar
+
+Sizes here differ from `silesia-0.4.0.0.csv` by up to 3.8 KB — including for
+reference codecs that have not changed at all. Both tars are exactly
+211,948,032 bytes, but they were written by different `tar` builds, whose
+headers differ. See [BENCHMARKING.md](BENCHMARKING.md#corpora).
+
+Compare Axiom against the other codecs *within* a snapshot, not against a
+previous one.
 
 ## enwik8
 
@@ -117,7 +135,7 @@ LZMA2 -mx9, while LZMA2 remains 12.9% smaller.
 Levels 8 and 9 are indistinguishable in cost on this corpus. They landed within
 3% of each other in both the 0.4.0.0 and the 0.8.0.0 run, in opposite
 directions, so level 9's 0.9% smaller archive is effectively free on text.
-Prefer level 8 here only when its smaller window is needed for memory.
+Prefer level 8 here only when you need its smaller window for memory reasons.
 
 Raw data: [`enwik8-0.8.0.0.csv`](../bench/results/enwik8-0.8.0.0.csv).
 
@@ -138,227 +156,219 @@ python tools\generate_readme_charts.py
 ```
 
 Regenerate them whenever the snapshot CSVs are refreshed, and update the tables
-here in the same change so the numbers and charts never disagree.
+here in the same change, so the numbers and the charts can never disagree.
 
-## A note on throughput
+---
 
-Throughput depends on CPU, memory bandwidth, storage, corpus shape, and build
-settings. Ratios are far more portable between machines than timings. If you
-need numbers for your own hardware, run the harnesses described in
-[BENCHMARKING.md](BENCHMARKING.md) rather than scaling these.
+# Optimization log
 
-## 2026-08-02 ratio-neutral optimization checkpoint
+The entries below are engineering checkpoints, not published comparisons. Each
+one records a specific change, what it did to measured phase timings, and — the
+part that matters most — proof that the archive bytes did not change.
 
-This controlled A/B checkpoint compares the current Release x64 build with
-`HEAD` (`37dd9906`) on the same host, using the two-repetition harness and
-round-trip verification for every row. It is an engineering measurement, not a
-replacement for the published cross-codec snapshot above.
+Every entry ran on the same Release x64 host as the snapshot above. Unless a
+row says otherwise, these are **directional, single-host measurements**. Repeat
+the profiling workflow before making any cross-machine throughput claim.
 
-| Corpus | Levels | Archive ratio delta | Compression-speed delta | Decompression-speed delta |
+## 2026-08-03 — All-level regression checkpoint
+
+The current Release x64 build compared against the last pushed baseline
+(`37dd990`) on the same host, with three repeats of every level on both
+standing corpora. The full 108-run matrix: two builds, two corpora, nine levels,
+compression and decompression, SHA-256 verified on every row.
+
+| Corpus | Levels | Archive-byte delta | Compression speed | Decompression speed |
 |---|---:|---:|---:|---:|
-| enwik8 | 1–9 | 0.00% at every level | −3.4% to +12.3% | −14.2% to +12.4% |
-| Silesia tar | 1–9 | 0.00% at every level | −0.6% to +22.4% | −8.2% to +7.6% |
+| enwik8 | 1–9 | 0 bytes at every level | −4.04% to +9.20% | −3.32% to +5.54% |
+| Silesia tar | 1–9 | 0 bytes at levels 1–8; +71 bytes at level 9 | −10.12% to +23.64% | −1.78% to +0.69% |
 
-The run used `tools\bench_axiom_levels.ps1` with the corpus under
-`D:\tests\axiom-perf`. Raw, summary, and delta CSVs are written to
-`D:\tests\axiom-perf\results\speed-baseline-compare-all-2026-08-02`.
+The level-9 Silesia change is 71 bytes out of 211,948,032 input bytes. It is
+reported as a ratio guard, not as a promoted improvement.
 
-## 2026-08-02 profiling and matcher checkpoint
+Raw, summary, and delta CSVs:
+`D:\tests\axiom-perf\results\all-level-regression-20260803`.
 
-The codec now exposes opt-in phase timing through `axiomc c --profile`; the
-workflow and interpretation rules are in [BENCHMARKING.md](BENCHMARKING.md#codec-phase-profiling).
-Profiling the balanced path showed greedy LZ77 as the dominant phase, while the
-maximum path split its time between greedy candidate discovery and optimal
-parsing. The retained optimization hoists a repeated cyclic-slot division out
-of the level-7 tree matcher's lazy-lookahead descent. It changes no token or
-decoder behavior.
+**Next target.** The hash-chain greedy matcher used by levels 1–6, specifically
+`encode_lz77_impl` and its `find_best` walk in `src/codec/lz77.cpp`. Level 6 is
+the clearest signal — it is the only material compression regression in the
+matrix while producing identical archive bytes. Profiling the Silesia level-6
+path reports 70.629 s of aggregate greedy worker time, against 7.392 s for
+candidate encoding and 1.143 s for entropy encoding.
 
-A controlled Release x64 comparison against `f38f3a6` (the previous pass) gave
-identical archive bytes at every level on both enwik8 and the Silesia tar:
+The next pass should preserve candidate traversal order, chain depth,
+nice-length cutoff, token decisions, and archive bytes, while removing only
+redundant work from that walk. Exact archive-byte comparison and round-trip
+hashes remain hard gates before any preset change is even considered.
 
-| Corpus | Levels | Archive-byte delta | Round trips | Level-7 compression delta (3 repeats) |
-|---|---:|---:|---:|---:|
-| enwik8 | 1–9 | 0 bytes at every level | all passed | +0.56% |
-| Silesia tar | 1–9 | 0 bytes at every level | all passed | +1.05% |
+## 2026-08-03 — Level-9 greedy depth
 
-The all-level sweep used one repeat per build; its timings are directional only.
-The level-7 figures use the three-repeat targeted sweep. Raw, summary, and delta
-CSVs are in `D:\tests\axiom-perf\results\final-all-level-compare-2026-08-02`
-and `D:\tests\axiom-perf\results\tree-modulo-compare-2026-08-02`.
+The level-9 preset's greedy tree search depth is now 384 instead of 512. This
+shortens only the greedy cost-model pass; the optimal parser keeps its existing
+depth, and the AXC format and decoder are unchanged.
 
-## 2026-08-02 optimal-DP indexing checkpoint
+With 32 threads and one 64 MiB block, the final five-corpus run produced:
 
-The level-9 optimal parser's bounded cost frontier now advances ring slots with
-explicit wrap checks instead of recalculating a runtime modulo for every parser
-edge. This is an internal scheduling/indexing change: it preserves the DP
-decisions, AXC bytes, decoder behavior, and archive format.
-
-On the same Release x64 host, profiling 100 MiB enwik8 changed the measured
-phases as follows:
-
-| Phase | Previous pass | Current pass | Delta |
+| Corpus | Depth 512 control | Depth 384 default | Delta |
 |---|---:|---:|---:|
-| Block total | 104.373 s | 101.157 s | -3.08% |
-| Optimal parsing | 60.790 s | 57.782 s | -4.95% |
+| dickens | 2,888,466 | 2,888,466 | 0 |
+| nci | 1,533,618 | 1,533,618 | 0 |
+| mozilla | 15,405,821 | 15,405,795 | −26 |
+| samba | 4,088,518 | 4,088,359 | −159 |
+| webster | 8,538,616 | 8,538,595 | −21 |
 
-The enwik8 AXC remained exactly 28,477,916 bytes with the same SHA-256. A
-Silesia-directory archive remained 54,362,481 bytes; all 12 extracted files
-matched the previous archive byte-for-byte, and the new archive passed
-`axiomc t`. The measurements are single-run directional results; repeat the profiling
-workflow before publishing cross-machine throughput claims.
+The greedy phase was faster in every final profile: measured depth-384 greedy
+times were 2.397 s, 6.528 s, 12.334 s, 4.597 s, and 11.385 s respectively. All
+five compressed streams were decompressed and matched their source SHA-256
+exactly.
 
-## 2026-08-02 CPU-scaling checkpoint
+## 2026-08-02 — Optimal-DP ring mask
 
-The first scaling sweep found that explicit SMT geometry was over-splitting
-solid input: on the 16-core/32-thread test machine, `--threads 32` created
-smaller independent blocks and lost ratio at the stronger levels. Block and
-archive geometry now caps its planning count at physical cores; the executor
-can still use the requested logical-thread budget for nested work.
+The optimal parser's live-cost ring now uses the next power-of-two size above
+the maximum transition distance. Frontier clearing keeps the same
+`max_transition` safety invariant, while literal and match edges use a mask
+instead of a compare-and-wrap branch. The larger ring costs only a few KiB and
+does not alter DP reachability or decisions.
 
-The fixed-32 all-level sweep restored the automatic profile's archive bytes at
-all 18 corpus/level pairs:
+Two-run averages on the Dickens profile:
 
-| Corpus | Levels | Archive-byte delta versus automatic | Round trips |
+| Phase | Fused-cost baseline | Current | Delta |
 |---|---:|---:|---:|
-| enwik8 | 1–9 | 0 bytes at every level | all passed |
-| Silesia tar | 1–9 | 0 bytes at every level | all passed |
+| Optimal LZ77 | 3.636 s | 3.480 s | −4.3% |
+| Sum of profiled phases | 7.308 s | 7.143 s | −2.3% |
 
-Raw, summary, and delta CSVs are in
-`D:\tests\axiom-perf\results\scaling-cap-all-levels-2026-08-02`. The original
-orientation sweep is in `D:\tests\axiom-perf\results\scaling-next-phase-2026-08-02`.
+Both runs remained 2,888,466 bytes with SHA-256
+`5BD317E7B2864CB03DE9E4385123180CF1FC6A6D77030257687E28E52205EE6F`.
 
-## 2026-08-02 candidate-pipeline tile checkpoint
+## 2026-08-02 — Measured distance cost
+
+Measured DP match transitions previously derived the distance slot and the
+distance footer width through two helpers, recalculating the same bit width
+twice. The parser now derives both values from one distance-width calculation.
+The unmeasured cost model and the coded token stream are unchanged.
+
+| Phase | Candidate-list baseline | Current | Delta |
+|---|---:|---:|---:|
+| Optimal LZ77 | 3.737 s | 3.636 s | −2.7% |
+| Sum of profiled phases | 7.512 s | 7.308 s | −2.7% |
+
+Both runs remained 2,888,466 bytes with the same SHA-256 as above.
+
+## 2026-08-02 — Candidate-list initialization
+
+`MatchList` keeps a fixed 64-entry backing array, but only its `count` entries
+are ever read. The backing `Match` records therefore no longer carry default
+initializers, which avoids a 512-byte clear for every position in the pipelined
+tree matcher. Every inserted record is still fully assigned before it can be
+observed.
+
+| Phase | Initialized reference | Current | Delta |
+|---|---:|---:|---:|
+| Greedy LZ77 | 3.723 s | 3.373 s | −9.4% |
+| Optimal LZ77 | 4.383 s | 3.737 s | −14.7% |
+| Candidate encoding | 0.322 s | 0.316 s | −1.9% |
+| Entropy encoding | 0.091 s | 0.086 s | −5.5% |
+| Sum of profiled phases | 8.519 s | 7.512 s | −11.8% |
+
+Both runs produced 2,888,466 bytes with the same SHA-256, identical to the
+initialized reference.
+
+## 2026-08-02 — Candidate-pipeline tile size
 
 The tree matcher's producer/consumer candidate pipeline now batches 1 MiB of
-positions per tile instead of 256 KiB. Tile production still advances the
-match tree in the same order, so this is a scheduling change only: it does not
-change match decisions, AXC bytes, or the archive format.
+positions per tile instead of 256 KiB. Tile production still advances the match
+tree in the same order, so this is a scheduling change only — it changes no
+match decisions, no AXC bytes, and no archive format.
 
-On the same Release x64 host, level 9 with 32 threads and one 64 MiB block for
-the 10,192,446-byte Silesia `dickens` file, the reference 256 KiB profile and
-the 1 MiB two-run average were:
+Level 9, 32 threads, one 64 MiB block, on the 10,192,446-byte Silesia `dickens`
+file. The reference 256 KiB profile against the 1 MiB two-run average:
 
 | Tile size | Greedy LZ77 | Optimal LZ77 | Candidate encoding | Entropy encoding | Archive bytes |
 |---:|---:|---:|---:|---:|---:|
 | 256 KiB | 3.940 s | 4.301 s | 0.316 s | 0.090 s | 2,888,466 |
 | 1 MiB | 3.723 s | 4.383 s | 0.322 s | 0.091 s | 2,888,466 |
 
-The summed profiled phases improved by about 1.5% in this directional
-measurement. Both 1 MiB runs produced SHA-256
-`5BD317E7B2864CB03DE9E4385123180CF1FC6A6D77030257687E28E52205EE6F`, matching
-the 256 KiB output exactly. Repeat the profiling workflow before making
-cross-machine throughput claims.
+The summed profiled phases improved by about 1.5%. Both 1 MiB runs produced
+SHA-256 `5BD317E7B2864CB03DE9E4385123180CF1FC6A6D77030257687E28E52205EE6F`,
+matching the 256 KiB output exactly.
 
-## 2026-08-02 candidate-list initialization checkpoint
+## 2026-08-02 — CPU scaling cap
 
-`MatchList` keeps a fixed 64-entry backing array, but only its `count` entries
-are ever read. The backing `Match` records therefore no longer carry default
-initializers, avoiding a 512-byte clear for every position in the pipelined
-tree matcher. Every inserted record is still fully assigned before it can be
-observed.
+The first scaling sweep found that explicit SMT geometry was over-splitting
+solid input: on the 16-core / 32-thread test machine, `--threads 32` created
+smaller independent blocks and lost ratio at the stronger levels.
 
-On the same Release x64 host and Dickens profile as above, the two-run averages
-were:
+Block and archive geometry now caps its planning count at physical cores. The
+executor can still use the requested logical-thread budget for nested work.
 
-| Phase | Initialized reference | Current | Delta |
+The fixed-32 all-level sweep restored the automatic profile's archive bytes at
+all 18 corpus/level pairs:
+
+| Corpus | Levels | Archive-byte delta vs automatic | Round trips |
 |---|---:|---:|---:|
-| Greedy LZ77 | 3.723 s | 3.373 s | -9.4% |
-| Optimal LZ77 | 4.383 s | 3.737 s | -14.7% |
-| Candidate encoding | 0.322 s | 0.316 s | -1.9% |
-| Entropy encoding | 0.091 s | 0.086 s | -5.5% |
-| Sum of profiled phases | 8.519 s | 7.512 s | -11.8% |
+| enwik8 | 1–9 | 0 bytes at every level | all passed |
+| Silesia tar | 1–9 | 0 bytes at every level | all passed |
 
-The current two runs both produced 2,888,466 bytes with SHA-256
-`5BD317E7B2864CB03DE9E4385123180CF1FC6A6D77030257687E28E52205EE6F`, identical
-to the initialized reference. The timings remain host-specific and
-directional.
+Raw, summary, and delta CSVs are in
+`D:\tests\axiom-perf\results\scaling-cap-all-levels-2026-08-02`. The original
+orientation sweep is in
+`D:\tests\axiom-perf\results\scaling-next-phase-2026-08-02`.
 
-## 2026-08-02 measured distance-cost checkpoint
+## 2026-08-02 — Optimal-DP indexing
 
-Measured DP match transitions previously derived the distance slot and the
-distance footer width through two helpers, recalculating the same bit width.
-The parser now derives both values from one distance-width calculation. The
-unmeasured cost model and the coded token stream are unchanged.
+The level-9 optimal parser's bounded cost frontier now advances ring slots with
+explicit wrap checks, instead of recalculating a runtime modulo for every parser
+edge. This is an internal scheduling and indexing change: it preserves the DP
+decisions, the AXC bytes, the decoder behaviour, and the archive format.
 
-On the same Release x64 host and Dickens profile, the two-run averages were:
+Profiling 100 MiB of enwik8:
 
-| Phase | Candidate-list baseline | Current | Delta |
+| Phase | Previous pass | Current pass | Delta |
 |---|---:|---:|---:|
-| Optimal LZ77 | 3.737 s | 3.636 s | -2.7% |
-| Sum of profiled phases | 7.512 s | 7.308 s | -2.7% |
+| Block total | 104.373 s | 101.157 s | −3.08% |
+| Optimal parsing | 60.790 s | 57.782 s | −4.95% |
 
-Both current runs remained 2,888,466 bytes with SHA-256
-`5BD317E7B2864CB03DE9E4385123180CF1FC6A6D77030257687E28E52205EE6F`. This is
-a directional single-host measurement; repeat the profile before making
-general throughput claims.
+The enwik8 AXC remained exactly 28,477,916 bytes with the same SHA-256. A
+Silesia-directory archive remained 54,362,481 bytes; all 12 extracted files
+matched the previous archive byte-for-byte, and the new archive passed
+`axiomc t`.
 
-## 2026-08-02 optimal-DP ring-mask checkpoint
+## 2026-08-02 — Profiling and matcher tuning
 
-The optimal parser's live-cost ring now uses the next power-of-two size above
-the maximum transition distance. Frontier clearing keeps the same
-`max_transition` safety invariant, while literal and match edges use a mask
-instead of a compare-and-wrap branch. The larger ring is only a few KiB and
-does not alter DP reachability or decisions.
+The codec now exposes opt-in phase timing through `axiomc c --profile`; the
+workflow and the rules for interpreting it are in
+[BENCHMARKING.md](BENCHMARKING.md#profiling-a-single-stream).
 
-On the same Release x64 host and Dickens profile, the two-run averages were:
+Profiling the balanced path showed greedy LZ77 as the dominant phase, while the
+maximum path split its time between greedy candidate discovery and optimal
+parsing. The retained optimization hoists a repeated cyclic-slot division out of
+the level-7 tree matcher's lazy-lookahead descent. It changes no token and no
+decoder behaviour.
 
-| Phase | Fused-cost baseline | Current | Delta |
-|---|---:|---:|---:|
-| Optimal LZ77 | 3.636 s | 3.480 s | -4.3% |
-| Sum of profiled phases | 7.308 s | 7.143 s | -2.3% |
+A controlled Release x64 comparison against `f38f3a6` gave identical archive
+bytes at every level, on both enwik8 and the Silesia tar:
 
-Both current runs remained 2,888,466 bytes with SHA-256
-`5BD317E7B2864CB03DE9E4385123180CF1FC6A6D77030257687E28E52205EE6F`. The
-timings are directional and host-specific.
-
-## 2026-08-03 level-9 greedy-depth checkpoint
-
-The level-9 preset's greedy tree search depth is now 384 instead of 512. This
-only shortens the greedy cost-model pass; the optimal parser still uses its
-existing depth and the AXC format and decoder are unchanged.
-
-On the same Release x64 host, with 32 threads and one 64 MiB block, the final
-five-corpus run produced these archive sizes:
-
-| Corpus | Depth 512 control | Depth 384 default | Delta |
-|---|---:|---:|---:|
-| dickens | 2,888,466 | 2,888,466 | 0 |
-| nci | 1,533,618 | 1,533,618 | 0 |
-| mozilla | 15,405,821 | 15,405,795 | -26 |
-| samba | 4,088,518 | 4,088,359 | -159 |
-| webster | 8,538,616 | 8,538,595 | -21 |
-
-The greedy phase was faster in each final profile; measured depth-384 greedy
-times were 2.397 s, 6.528 s, 12.334 s, 4.597 s, and 11.385 s respectively.
-All five compressed streams were decompressed and matched their source
-SHA-256 exactly. The timings are host-specific and directional; repeat the
-controlled profile workflow before making cross-machine claims.
-
-## 2026-08-03 all-level regression checkpoint
-
-The current Release x64 build was compared with the last pushed baseline
-(`37dd990`) on the same host using three repeats of every level on both
-standing corpora. This was the full 108-run matrix: two builds, two corpora,
-nine levels, and compression plus decompression with SHA-256 verification for
-every row.
-
-| Corpus | Levels | Archive-byte delta | Compression-speed delta | Decompression-speed delta |
+| Corpus | Levels | Archive-byte delta | Round trips | Level-7 compression delta (3 repeats) |
 |---|---:|---:|---:|---:|
-| enwik8 | 1-9 | 0 bytes at every level | -4.04% to +9.20% | -3.32% to +5.54% |
-| Silesia tar | 1-9 | 0 bytes at levels 1-8; +71 bytes at level 9 | -10.12% to +23.64% | -1.78% to +0.69% |
+| enwik8 | 1–9 | 0 bytes at every level | all passed | +0.56% |
+| Silesia tar | 1–9 | 0 bytes at every level | all passed | +1.05% |
 
-The level-9 Silesia change is 71 bytes out of 211,948,032 input bytes and is
-reported as a ratio guard, not a promoted ratio improvement. The raw, summary,
-and delta CSVs are in
-`D:\tests\axiom-perf\results\all-level-regression-20260803`.
+The all-level sweep used one repeat per build, so its timings are directional
+only. The level-7 figures come from the three-repeat targeted sweep. Raw,
+summary, and delta CSVs are in
+`D:\tests\axiom-perf\results\final-all-level-compare-2026-08-02` and
+`D:\tests\axiom-perf\results\tree-modulo-compare-2026-08-02`.
 
-The next ratio-neutral target is the hash-chain greedy matcher used by levels
-1-6, specifically `encode_lz77_impl` and its `find_best` walk in
-`src/codec/lz77.cpp`. Level 6 is the clearest signal: it is the only material
-compression regression in the matrix while producing identical archive bytes.
-Current profiling of the Silesia level-6 path reports 70.629 s of aggregate
-greedy worker time, compared with 7.392 s for candidate encoding and 1.143 s
-for entropy encoding. The next pass should preserve candidate traversal order,
-chain depth, nice-length cutoff, token decisions, and archive bytes while
-removing only redundant work from that walk. Exact archive-byte comparison and
-round-trip hashes remain hard gates before any preset change is considered.
+## 2026-08-02 — Ratio-neutral optimization baseline
+
+A controlled A/B comparison of the then-current Release x64 build against `HEAD`
+(`37dd9906`) on the same host, using the two-repetition harness with round-trip
+verification for every row.
+
+| Corpus | Levels | Archive ratio delta | Compression speed | Decompression speed |
+|---|---:|---:|---:|---:|
+| enwik8 | 1–9 | 0.00% at every level | −3.4% to +12.3% | −14.2% to +12.4% |
+| Silesia tar | 1–9 | 0.00% at every level | −0.6% to +22.4% | −8.2% to +7.6% |
+
+Run with `tools\bench_axiom_levels.ps1` against the corpus under
+`D:\tests\axiom-perf`. Raw, summary, and delta CSVs are in
+`D:\tests\axiom-perf\results\speed-baseline-compare-all-2026-08-02`.
