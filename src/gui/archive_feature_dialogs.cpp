@@ -57,7 +57,7 @@ struct SimplePasswordDialogState {
     HWND show{};
     HWND ok{};
     HWND cancel{};
-    HWND tooltip{};
+    TooltipManager tooltip;
     HINSTANCE instance{};
     HFONT font{};
     HBRUSH background_brush{};
@@ -113,6 +113,7 @@ void apply_simple_password_theme(SimplePasswordDialogState* state) {
     for (HWND control : simple_password_controls(state)) {
         apply_dialog_control_theme(control, state->dark);
     }
+    state->tooltip.apply_theme(state->dark);
 }
 
 LRESULT simple_dialog_control_color(HWND, HBRUSH background, HBRUSH control,
@@ -180,7 +181,7 @@ LRESULT CALLBACK simple_password_dialog_proc(HWND hwnd, UINT message,
             for (HWND control : simple_password_controls(state)) {
                 set_dialog_control_font(control, state->font);
             }
-            state->tooltip = create_dialog_tooltip(hwnd);
+            state->tooltip.create(hwnd, state->dpi, state->dark);
             add_dialog_tooltip(
                 state->tooltip, state->edit,
                 L"Unicode password text used to decrypt this archive. It is not stored in GUI settings.");
@@ -206,6 +207,7 @@ LRESULT CALLBACK simple_password_dialog_proc(HWND hwnd, UINT message,
                          SWP_NOZORDER | SWP_NOACTIVATE);
             apply_axiom_window_icons(hwnd, state->instance);
             rebuild_simple_password_fonts(state);
+            state->tooltip.update_dpi(state->dpi);
             layout_simple_password_dialog(state);
             return 0;
         }
@@ -312,7 +314,7 @@ struct SimpleCommentDialogState {
     HWND edit{};
     HWND ok{};
     HWND cancel{};
-    HWND tooltip{};
+    TooltipManager tooltip;
     HINSTANCE instance{};
     HFONT font{};
     HBRUSH background_brush{};
@@ -365,6 +367,7 @@ void apply_simple_comment_theme(SimpleCommentDialogState* state) {
     for (HWND control : simple_comment_controls(state)) {
         apply_dialog_control_theme(control, state->dark);
     }
+    state->tooltip.apply_theme(state->dark);
 }
 
 LRESULT CALLBACK simple_comment_dialog_proc(HWND hwnd, UINT message,
@@ -415,7 +418,7 @@ LRESULT CALLBACK simple_comment_dialog_proc(HWND hwnd, UINT message,
             for (HWND control : simple_comment_controls(state)) {
                 set_dialog_control_font(control, state->font);
             }
-            state->tooltip = create_dialog_tooltip(hwnd);
+            state->tooltip.create(hwnd, state->dpi, state->dark);
             add_dialog_tooltip(state->tooltip, state->edit,
                                L"Unicode text stored in the archive comment field.");
             apply_simple_comment_theme(state);
@@ -437,6 +440,7 @@ LRESULT CALLBACK simple_comment_dialog_proc(HWND hwnd, UINT message,
                          SWP_NOZORDER | SWP_NOACTIVATE);
             apply_axiom_window_icons(hwnd, state->instance);
             rebuild_simple_comment_fonts(state);
+            state->tooltip.update_dpi(state->dpi);
             layout_simple_comment_dialog(state);
             return 0;
         }

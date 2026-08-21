@@ -186,7 +186,7 @@ private:
 
     void create_controls() {
         font_ = create_dialog_font(dpi_);
-        tooltip_ = create_dialog_tooltip(window_);
+        tooltip_.create(window_, dpi_, dark_);
         const std::wstring heading = summary_.banner_text.empty()
             ? L"Extract " + summary_.archive_name
             : summary_.banner_text;
@@ -316,6 +316,7 @@ private:
         recreate_brushes();
         apply_dialog_dark_frame(window_, dark_);
         for (HWND control : controls_) apply_dialog_control_theme(control, dark_);
+        tooltip_.apply_theme(dark_);
         InvalidateRect(window_, nullptr, TRUE);
     }
 
@@ -358,6 +359,7 @@ private:
                    button_width, button_height, TRUE);
         MoveWindow(extract_button_, client.right - margin - button_width * 2 - scale(10), button_y,
                    button_width, button_height, TRUE);
+        tooltip_.update_layout();
     }
 
     void toggle_checkbox(int id) {
@@ -416,6 +418,7 @@ private:
                              SWP_NOZORDER | SWP_NOACTIVATE);
                 apply_axiom_window_icons(window_, instance_);
                 rebuild_font();
+                tooltip_.update_dpi(dpi_);
                 layout();
                 return 0;
             }
@@ -501,7 +504,7 @@ private:
     HFONT font_{};
     HBRUSH background_brush_{};
     HBRUSH control_brush_{};
-    HWND tooltip_{};
+    TooltipManager tooltip_;
     std::vector<HWND> controls_;
     std::vector<std::size_t> thread_values_;
     HWND heading_{};

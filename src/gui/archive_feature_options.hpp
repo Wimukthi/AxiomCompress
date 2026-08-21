@@ -1,5 +1,8 @@
 #pragma once
 
+#include "axiom/axiom.hpp"
+
+#include <cstddef>
 #include <filesystem>
 #include <string>
 
@@ -25,6 +28,13 @@ struct ArchiveFeatureOptions {
     bool lock_archive = false;
     bool repack_after_update = false;
     std::wstring comment;
+
+    // Live content deduplication is selected only when creating a new AXAR.
+    // Existing archives retain their persisted profile and chunk geometry.
+    bool enable_content_dedup = false;
+    std::size_t dedup_min_chunk_size = 256u << 10;
+    std::size_t dedup_average_chunk_size = 1u << 20;
+    std::size_t dedup_max_chunk_size = 4u << 20;
 
     bool encrypt_data = false;
     bool encrypt_names = false;
@@ -63,6 +73,18 @@ struct ArchiveFeatureOptions {
     bool sfx_open_destination = true;
     bool sfx_run_after_extract = false;
 };
+
+inline void apply_content_dedup_options(
+    const ArchiveFeatureOptions& features,
+    bool creating_new_axar,
+    axiom::CompressionOptions& options) {
+    options.enable_content_dedup =
+        creating_new_axar && features.enable_content_dedup;
+    if (!options.enable_content_dedup) return;
+    options.snapshot_min_chunk_size = features.dedup_min_chunk_size;
+    options.snapshot_average_chunk_size = features.dedup_average_chunk_size;
+    options.snapshot_max_chunk_size = features.dedup_max_chunk_size;
+}
 
 struct ExtractFeatureOptions {
     bool restore_windows_attributes = true;

@@ -213,6 +213,7 @@ struct CreateArchiveDialogOptions {
     std::filesystem::path archive_path;
     axiom::ArchiveFormat archive_format = axiom::ArchiveFormat::axar;
     bool fixed_archive_format = false;
+    bool existing_archive = false;
     int level = 5;
     axiom::CompressionMethod method = axiom::CompressionMethod::axiom;
     int codec_level = axiom::kAutomaticCodecLevel;

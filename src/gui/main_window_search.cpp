@@ -642,6 +642,7 @@ void FileSearchDialog::layout() {
     MoveWindow(results_.hwnd(), margin, results_top,
                client.right - margin * 2,
                button_top - results_top - scale(12), TRUE);
+    tooltip_.update_layout();
     InvalidateRect(hwnd_, nullptr, FALSE);
 }
 
@@ -649,7 +650,7 @@ void FileSearchDialog::create_controls() {
     background_brush_ = CreateSolidBrush(theme_.window);
     edit_brush_ = CreateSolidBrush(theme_.edit);
     font_ = axiom::gui::create_dialog_font(dpi_);
-    tooltip_ = axiom::gui::create_dialog_tooltip(hwnd_);
+    tooltip_.create(hwnd_, dpi_, theme_.dark);
     title_ = make_control(L"STATIC", L"Find files and folders", SS_NOPREFIX);
     scope_label_ = make_control(L"STATIC", scope_.c_str(), SS_NOPREFIX);
     query_label_ = make_control(L"STATIC", L"Name/path text", SS_NOPREFIX);
@@ -781,6 +782,7 @@ void FileSearchDialog::create_controls() {
     }
     EnableWindow(go_to_button_, FALSE);
     axiom::gui::apply_dialog_dark_frame(hwnd_, theme_.dark);
+    tooltip_.apply_theme(theme_.dark);
     layout();
     set_text(result_count_, L"Enter a name/path, then choose Search. An empty name lists everything.");
     SetFocus(search_edit_);
@@ -833,6 +835,7 @@ LRESULT FileSearchDialog::handle_message(UINT message, WPARAM wparam, LPARAM lpa
                          SWP_NOZORDER | SWP_NOACTIVATE);
             axiom::gui::apply_axiom_window_icons(hwnd_, instance_);
             rebuild_font_for_dpi();
+            tooltip_.update_dpi(dpi_);
             layout();
             return 0;
         }

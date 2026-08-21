@@ -21,6 +21,7 @@
 #include "core/task_executor.hpp"
 #include "entropy/huffman.hpp"
 #include "entropy/range.hpp"
+#include "gui/archive_feature_options.hpp"
 #include "third_party/miniz/miniz.h"
 
 #include "check.hpp"
@@ -3261,6 +3262,28 @@ void test_archive_content_reuse() {
     fs::remove_all(root, ec);
 }
 
+void test_gui_live_dedup_option_mapping() {
+    axiom::gui::ArchiveFeatureOptions features;
+    features.enable_content_dedup = true;
+    features.dedup_min_chunk_size = 4u << 10;
+    features.dedup_average_chunk_size = 8u << 10;
+    features.dedup_max_chunk_size = 16u << 10;
+
+    axiom::CompressionOptions options;
+    axiom::gui::apply_content_dedup_options(features, false, options);
+    AXIOM_CHECK(!options.enable_content_dedup);
+
+    axiom::gui::apply_content_dedup_options(features, true, options);
+    AXIOM_CHECK(options.enable_content_dedup);
+    AXIOM_CHECK(options.snapshot_min_chunk_size == (4u << 10));
+    AXIOM_CHECK(options.snapshot_average_chunk_size == (8u << 10));
+    AXIOM_CHECK(options.snapshot_max_chunk_size == (16u << 10));
+
+    features.enable_content_dedup = false;
+    axiom::gui::apply_content_dedup_options(features, true, options);
+    AXIOM_CHECK(!options.enable_content_dedup);
+}
+
 void test_archive_live_dedup() {
     const auto root = make_temp_dir();
     const auto source = root / "source";
@@ -5950,6 +5973,7 @@ int main() {
     test_archive_hardlinks();
     test_archive_add();
     test_archive_content_reuse();
+    test_gui_live_dedup_option_mapping();
     test_archive_live_dedup();
     test_archive_snapshots();
     test_archive_file_manager_apis();

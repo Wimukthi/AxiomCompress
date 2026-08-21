@@ -1136,64 +1136,198 @@ void set_dialog_control_font(HWND control, HFONT font) {
     }
 }
 
-HWND create_dialog_tooltip(HWND owner) {
-    if (owner == nullptr) return nullptr;
-    HWND tooltip = CreateWindowExW(
-        WS_EX_TOPMOST, TOOLTIPS_CLASSW, nullptr,
-        WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX | TTS_BALLOON,
-        CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
-        owner, nullptr, GetModuleHandleW(nullptr), nullptr);
-    if (tooltip != nullptr) {
-        SetWindowPos(tooltip, HWND_TOPMOST, 0, 0, 0, 0,
-                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-        SendMessageW(tooltip, TTM_SETMAXTIPWIDTH, 0, 420);
-        SendMessageW(tooltip, TTM_SETDELAYTIME, TTDT_AUTOPOP, 12000);
-    }
-    return tooltip;
+TooltipManager::~TooltipManager() {
+    destroy();
 }
 
-void add_dialog_tooltip(HWND tooltip, HWND control, const wchar_t* text) {
-    if (tooltip == nullptr || control == nullptr || text == nullptr || *text == L'\0') {
-        return;
+bool TooltipManager::create(HWND owner, UINT layout_dpi, bool dark) {
+    destroy();
+    if (owner == nullptr) return false;
+    owner_ = owner;
+    hwnd_ = CreateWindowExW(
+        WS_EX_TOPMOST, TOOLTIPS_CLASSW, nullptr,
+        WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX,
+        CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
+        owner, nullptr, GetModuleHandleW(nullptr), nullptr);
+    if (hwnd_ == nullptr) {
+        owner_ = nullptr;
+        return false;
     }
-    HWND registered[3]{};
-    std::size_t registered_count = 0;
-    const auto add_tool = [&](HWND target) {
-        if (target == nullptr || !IsWindow(target)) return;
-        for (std::size_t index = 0; index < registered_count; ++index) {
-            if (registered[index] == target) return;
-        }
-        registered[registered_count++] = target;
-        TOOLINFOW tool{};
-        // Axiom currently runs with the system comctl32 activation context.
-        // Its tooltip control rejects the newer TOOLINFO tail fields, so use
-        // the documented v1 size for compatibility with both v5 and v6.
-        tool.cbSize = TTTOOLINFOW_V1_SIZE;
-        tool.uFlags = TTF_IDISHWND | TTF_SUBCLASS;
-        // Composite controls such as drop-down-list combos route pointer input
-        // through child and popup windows. Keep one notification owner while
-        // subclassing each surface that can actually receive the mouse.
-        tool.hwnd = GetWindow(tooltip, GW_OWNER);
-        if (tool.hwnd == nullptr) tool.hwnd = GetParent(tooltip);
-        if (tool.hwnd == nullptr) tool.hwnd = GetParent(control);
-        tool.uId = reinterpret_cast<UINT_PTR>(target);
-        tool.lpszText = const_cast<wchar_t*>(text);
-        SendMessageW(tooltip, TTM_ADDTOOLW, 0, reinterpret_cast<LPARAM>(&tool));
-    };
-    add_tool(control);
+    SetWindowSubclass(owner_, &TooltipManager::owner_subclass_proc,
+                      reinterpret_cast<UINT_PTR>(this),
+                      reinterpret_cast<DWORD_PTR>(this));
+    SetWindowPos(hwnd_, HWND_TOPMOST, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    SendMessageW(hwnd_, TTM_SETDELAYTIME, TTDT_INITIAL, 500);
+    SendMessageW(hwnd_, TTM_SETDELAYTIME, TTDT_RESHOW, 100);
+    SendMessageW(hwnd_, TTM_SETDELAYTIME, TTDT_AUTOPOP, 20000);
+    update_dpi(layout_dpi);
+    apply_dialog_control_theme(hwnd_, dark);
+    return true;
+}
 
+bool TooltipManager::add(HWND control, const wchar_t* text) {
+    if (hwnd_ == nullptr || control == nullptr || text == nullptr ||
+        *text == L'\0') {
+        return false;
+    }
+    // Plain STATIC controls normally return HTTRANSPARENT, so the parent
+    // receives their mouse input and TTF_SUBCLASS never sees a hover. SS_NOTIFY
+    // makes labels and status text behave as tooltip tools without repainting.
     wchar_t class_name[32]{};
-    GetClassNameW(control, class_name,
-                  static_cast<int>(sizeof(class_name) / sizeof(class_name[0])));
-    if (lstrcmpiW(class_name, L"ComboBox") == 0) {
-        COMBOBOXINFO info{sizeof(info)};
-        if (GetComboBoxInfo(control, &info)) {
-            // CBS_DROPDOWNLIST uses a STATIC item window, editable combos use
-            // an EDIT, and the expanded list is a separate popup window.
-            add_tool(info.hwndItem);
-            add_tool(info.hwndList);
+    if (GetClassNameW(control, class_name,
+                      static_cast<int>(std::size(class_name))) > 0 &&
+        lstrcmpiW(class_name, L"STATIC") == 0) {
+        const LONG_PTR style = GetWindowLongPtrW(control, GWL_STYLE);
+        SetWindowLongPtrW(control, GWL_STYLE, style | SS_NOTIFY);
+    }
+
+    TOOLINFOW tool{};
+    // Axiom uses the system common-controls activation context. Its tooltip
+    // control needs the documented v1 size, whose fields cover this manager.
+    tool.cbSize = TTTOOLINFOW_V1_SIZE;
+    tool.uFlags = TTF_IDISHWND | TTF_SUBCLASS;
+    tool.hwnd = owner_;
+    tool.uId = reinterpret_cast<UINT_PTR>(control);
+    tool.lpszText = const_cast<wchar_t*>(text);
+    const bool child_tool_added =
+        SendMessageW(hwnd_, TTM_ADDTOOLW, 0,
+                     reinterpret_cast<LPARAM>(&tool)) != FALSE;
+
+    // Disabled child windows cannot activate HWND-based tools. Register the
+    // same text as a rectangle on the enabled owner and relay owner mouse input
+    // so unavailable controls remain self-explanatory.
+    ToolEntry entry{control, overlay_id(control)};
+    TOOLINFOW overlay{};
+    overlay.cbSize = TTTOOLINFOW_V1_SIZE;
+    overlay.hwnd = owner_;
+    overlay.uId = entry.id;
+    overlay.lpszText = const_cast<wchar_t*>(text);
+    update_rect(overlay, control);
+    const bool overlay_added =
+        SendMessageW(hwnd_, TTM_ADDTOOLW, 0,
+                     reinterpret_cast<LPARAM>(&overlay)) != FALSE;
+    if (overlay_added) tools_.push_back(entry);
+    return child_tool_added || overlay_added;
+}
+
+void TooltipManager::remove(HWND control) {
+    if (hwnd_ == nullptr || control == nullptr) return;
+    TOOLINFOW tool{};
+    tool.cbSize = TTTOOLINFOW_V1_SIZE;
+    tool.uFlags = TTF_IDISHWND;
+    tool.hwnd = owner_;
+    tool.uId = reinterpret_cast<UINT_PTR>(control);
+    SendMessageW(hwnd_, TTM_DELTOOLW, 0, reinterpret_cast<LPARAM>(&tool));
+
+    const auto entry = std::find_if(
+        tools_.begin(), tools_.end(),
+        [control](const ToolEntry& value) { return value.control == control; });
+    if (entry != tools_.end()) {
+        TOOLINFOW overlay{};
+        overlay.cbSize = TTTOOLINFOW_V1_SIZE;
+        overlay.hwnd = owner_;
+        overlay.uId = entry->id;
+        SendMessageW(hwnd_, TTM_DELTOOLW, 0,
+                     reinterpret_cast<LPARAM>(&overlay));
+        tools_.erase(entry);
+    }
+}
+
+void TooltipManager::update_dpi(UINT layout_dpi) {
+    if (hwnd_ == nullptr) return;
+    const UINT dpi = layout_dpi == 0 ? USER_DEFAULT_SCREEN_DPI : layout_dpi;
+    SendMessageW(hwnd_, TTM_SETMAXTIPWIDTH, 0,
+                 static_cast<LPARAM>(MulDiv(460, static_cast<int>(dpi), 96)));
+    update_layout();
+}
+
+void TooltipManager::update_layout() const {
+    if (hwnd_ == nullptr || owner_ == nullptr) return;
+    for (const ToolEntry& entry : tools_) {
+        TOOLINFOW overlay{};
+        overlay.cbSize = TTTOOLINFOW_V1_SIZE;
+        overlay.hwnd = owner_;
+        overlay.uId = entry.id;
+        update_rect(overlay, entry.control);
+        SendMessageW(hwnd_, TTM_NEWTOOLRECTW, 0,
+                     reinterpret_cast<LPARAM>(&overlay));
+    }
+}
+
+void TooltipManager::apply_theme(bool dark) {
+    if (hwnd_ != nullptr) apply_dialog_control_theme(hwnd_, dark);
+}
+
+void TooltipManager::destroy() {
+    if (owner_ != nullptr && IsWindow(owner_)) {
+        RemoveWindowSubclass(owner_, &TooltipManager::owner_subclass_proc,
+                             reinterpret_cast<UINT_PTR>(this));
+    }
+    if (hwnd_ != nullptr && IsWindow(hwnd_)) DestroyWindow(hwnd_);
+    hwnd_ = nullptr;
+    owner_ = nullptr;
+    tools_.clear();
+}
+
+UINT_PTR TooltipManager::overlay_id(HWND control) {
+    constexpr UINT_PTR high_bit =
+        static_cast<UINT_PTR>(1) << (sizeof(UINT_PTR) * 8 - 1);
+    return reinterpret_cast<UINT_PTR>(control) ^ high_bit;
+}
+
+void TooltipManager::update_rect(TOOLINFOW& tool, HWND control) const {
+    RECT rect{};
+    if (control != nullptr && IsWindow(control) &&
+        (GetWindowLongPtrW(control, GWL_STYLE) & WS_VISIBLE) != 0 &&
+        GetWindowRect(control, &rect)) {
+        MapWindowPoints(HWND_DESKTOP, owner_, reinterpret_cast<POINT*>(&rect), 2);
+    }
+    tool.rect = rect;
+}
+
+LRESULT CALLBACK TooltipManager::owner_subclass_proc(
+    HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam,
+    UINT_PTR subclass_id, DWORD_PTR reference) {
+    auto* self = reinterpret_cast<TooltipManager*>(reference);
+    if (message == WM_NCDESTROY) {
+        RemoveWindowSubclass(hwnd, &TooltipManager::owner_subclass_proc,
+                             subclass_id);
+        if (self != nullptr) self->owner_ = nullptr;
+        return DefSubclassProc(hwnd, message, wparam, lparam);
+    }
+    if (message == WM_SIZE) {
+        const LRESULT result = DefSubclassProc(hwnd, message, wparam, lparam);
+        if (self != nullptr) self->update_layout();
+        return result;
+    }
+    if (self != nullptr && self->hwnd_ != nullptr && IsWindow(self->hwnd_)) {
+        switch (message) {
+            case WM_MOUSEMOVE:
+            case WM_LBUTTONDOWN:
+            case WM_LBUTTONUP:
+            case WM_RBUTTONDOWN:
+            case WM_RBUTTONUP:
+            case WM_MBUTTONDOWN:
+            case WM_MBUTTONUP: {
+                MSG relay{};
+                relay.hwnd = hwnd;
+                relay.message = message;
+                relay.wParam = wparam;
+                relay.lParam = lparam;
+                relay.time = static_cast<DWORD>(GetMessageTime());
+                const DWORD cursor = GetMessagePos();
+                relay.pt.x = static_cast<short>(LOWORD(cursor));
+                relay.pt.y = static_cast<short>(HIWORD(cursor));
+                SendMessageW(self->hwnd_, TTM_RELAYEVENT, 0,
+                             reinterpret_cast<LPARAM>(&relay));
+                break;
+            }
+            default:
+                break;
         }
     }
+    return DefSubclassProc(hwnd, message, wparam, lparam);
 }
 
 void apply_dialog_input_filter(HWND control, DialogInputFilter filter,

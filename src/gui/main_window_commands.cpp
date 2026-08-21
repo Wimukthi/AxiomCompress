@@ -965,6 +965,15 @@ void MainWindow::on_info() {
                         details.push_back({L"State",
                             axiom::archive_is_locked(path, password)
                                 ? L"Locked (read-only)" : L"Editable"});
+                        details.push_back({
+                            L"Deduplication",
+                            capabilities.deduplicated_archive
+                                ? L"Live content deduplication"
+                                : L"Not active"});
+                        details.push_back({
+                            L"Snapshot repository",
+                            capabilities.snapshot_repository
+                                ? L"Active" : L"Not active"});
                         comment = widen(axiom::archive_comment(path, password));
                     } else {
                         const bool can_write = capabilities.create || capabilities.update ||

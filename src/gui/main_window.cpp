@@ -175,15 +175,8 @@ void MainWindow::apply_edit_margins() const {
     }
 }
 
-void MainWindow::add_tooltip(HWND control, const wchar_t* text) const {
-    if (tooltip_ == nullptr || control == nullptr) return;
-    TOOLINFOW tool{};
-    tool.cbSize = TTTOOLINFOW_V1_SIZE;
-    tool.uFlags = TTF_IDISHWND | TTF_SUBCLASS;
-    tool.hwnd = hwnd_;
-    tool.uId = reinterpret_cast<UINT_PTR>(control);
-    tool.lpszText = const_cast<wchar_t*>(text);
-    SendMessageW(tooltip_, TTM_ADDTOOLW, 0, reinterpret_cast<LPARAM>(&tool));
+void MainWindow::add_tooltip(HWND control, const wchar_t* text) {
+    tooltip_.add(control, text);
 }
 
 UINT MainWindow::toolbar_command_for_action(std::wstring_view action) {
@@ -417,10 +410,7 @@ void MainWindow::on_create() {
     });
     SetWindowTextW(tree_view_.hwnd(), L"Folders and archive directories");
 
-    tooltip_ = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, nullptr,
-                               WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX,
-                               CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
-                               hwnd_, nullptr, instance_, nullptr);
+    tooltip_.create(hwnd_, dpi_, theme_.dark);
     for (const axiom::gui::ToolbarCommandInfo& command : kToolbarCommandCatalog) {
         if (HWND button = toolbar_button(toolbar_command_for_action(command.id))) {
             add_tooltip(button, command.label);
@@ -689,6 +679,7 @@ void MainWindow::layout() {
         }
     }
     layout_browser_panes(client, y, false);
+    tooltip_.update_layout();
     InvalidateRect(hwnd_, nullptr, FALSE);
 }
 

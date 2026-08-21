@@ -205,7 +205,7 @@ struct BenchmarkDialogState {
     HFONT fixed_font{};
     HBRUSH background_brush{};
     HBRUSH edit_brush{};
-    HWND tooltip{};
+    TooltipManager tooltip;
     HWND corpus{};
     HWND size{};
     HWND level{};
@@ -1317,6 +1317,7 @@ void apply_theme(BenchmarkDialogState* state) {
         apply_dialog_control_theme(control, state->dark);
     }
     apply_dialog_control_theme(state->close, state->dark);
+    state->tooltip.apply_theme(state->dark);
 }
 
 void layout(BenchmarkDialogState* state) {
@@ -1375,6 +1376,7 @@ void layout(BenchmarkDialogState* state) {
     MoveWindow(state->pause, x, button_top, button_width, button_height, TRUE);
     x -= button_width + button_gap;
     MoveWindow(state->start, x, button_top, button_width, button_height, TRUE);
+    state->tooltip.update_layout();
     InvalidateRect(state->hwnd, nullptr, TRUE);
 }
 
@@ -1771,7 +1773,7 @@ LRESULT CALLBACK benchmark_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM l
             state->background_brush = CreateSolidBrush(dialog_colors(state->dark).background);
             state->edit_brush = CreateSolidBrush(dialog_colors(state->dark).control_background);
             state->font = create_dialog_font(state->dpi);
-            state->tooltip = create_dialog_tooltip(hwnd);
+            state->tooltip.create(hwnd, state->dpi, state->dark);
             auto make = [&](const wchar_t* cls, const wchar_t* text, DWORD style, int id) {
                 HWND control = CreateWindowExW(
                     0, cls, text, WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | style,
@@ -1875,6 +1877,7 @@ LRESULT CALLBACK benchmark_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM l
                          SWP_NOZORDER | SWP_NOACTIVATE);
             apply_axiom_window_icons(hwnd, state->instance);
             rebuild_fonts(state);
+            state->tooltip.update_dpi(state->dpi);
             layout(state);
             return 0;
         }

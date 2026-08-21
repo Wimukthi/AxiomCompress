@@ -1,10 +1,12 @@
 #pragma once
 
 #include <windows.h>
+#include <commctrl.h>
 
 #include <filesystem>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace axiom::gui {
 
@@ -70,8 +72,49 @@ int dialog_icon_style();
 void apply_dialog_dark_frame(HWND window, bool dark);
 void apply_dialog_control_theme(HWND control, bool dark);
 void set_dialog_control_font(HWND control, HFONT font);
-HWND create_dialog_tooltip(HWND owner);
-void add_dialog_tooltip(HWND tooltip, HWND control, const wchar_t* text);
+
+// One tooltip manager per top-level UI surface. In addition to ordinary
+// TTF_SUBCLASS tools, this registers owner-relative overlays so disabled
+// controls can still explain why they are unavailable.
+class TooltipManager {
+public:
+    TooltipManager() = default;
+    ~TooltipManager();
+
+    TooltipManager(const TooltipManager&) = delete;
+    TooltipManager& operator=(const TooltipManager&) = delete;
+
+    bool create(HWND owner, UINT layout_dpi, bool dark);
+    bool add(HWND control, const wchar_t* text);
+    void remove(HWND control);
+    void update_dpi(UINT layout_dpi);
+    void update_layout() const;
+    void apply_theme(bool dark);
+    void destroy();
+
+    HWND hwnd() const { return hwnd_; }
+
+private:
+    struct ToolEntry {
+        HWND control;
+        UINT_PTR id;
+    };
+
+    static UINT_PTR overlay_id(HWND control);
+    void update_rect(TOOLINFOW& tool, HWND control) const;
+    static LRESULT CALLBACK owner_subclass_proc(
+        HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam,
+        UINT_PTR subclass_id, DWORD_PTR reference);
+
+    HWND hwnd_ = nullptr;
+    HWND owner_ = nullptr;
+    std::vector<ToolEntry> tools_;
+};
+
+inline void add_dialog_tooltip(TooltipManager& tooltips, HWND control,
+                               const wchar_t* text) {
+    tooltips.add(control, text);
+}
 void apply_dialog_input_filter(HWND control, DialogInputFilter filter,
                                UINT maximum_characters = 0);
 std::wstring trim_dialog_input(std::wstring text);

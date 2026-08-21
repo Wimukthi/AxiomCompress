@@ -242,7 +242,7 @@ struct CommandInputDialogState {
     std::vector<HWND> edits;
     HWND ok{};
     HWND cancel{};
-    HWND tooltip{};
+    TooltipManager tooltip;
     HINSTANCE instance{};
     HFONT font{};
     HBRUSH background_brush{};
@@ -310,6 +310,7 @@ void layout_command_input_dialog(CommandInputDialogState* state) {
                button_width, button_height, TRUE);
     MoveWindow(state->ok, client.right - margin - button_width * 2 - button_gap,
                button_top, button_width, button_height, TRUE);
+    state->tooltip.update_layout();
     InvalidateRect(state->window, nullptr, TRUE);
 }
 
@@ -327,6 +328,7 @@ void apply_command_input_theme(CommandInputDialogState* state) {
     for (HWND control : command_input_controls(state)) {
         apply_dialog_control_theme(control, state->dark);
     }
+    state->tooltip.apply_theme(state->dark);
 }
 
 LRESULT CALLBACK command_input_dialog_proc(HWND hwnd, UINT message,
@@ -350,7 +352,7 @@ LRESULT CALLBACK command_input_dialog_proc(HWND hwnd, UINT message,
             state->background_brush = CreateSolidBrush(colors.background);
             state->control_brush = CreateSolidBrush(colors.control_background);
             state->font = create_dialog_font(state->dpi);
-            state->tooltip = create_dialog_tooltip(hwnd);
+            state->tooltip.create(hwnd, state->dpi, state->dark);
             state->heading = CreateWindowExW(
                 0, L"STATIC", state->heading_text.c_str(),
                 WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | SS_NOPREFIX,
@@ -417,6 +419,7 @@ LRESULT CALLBACK command_input_dialog_proc(HWND hwnd, UINT message,
                          SWP_NOZORDER | SWP_NOACTIVATE);
             apply_axiom_window_icons(hwnd, state->instance);
             rebuild_command_input_fonts(state);
+            state->tooltip.update_dpi(state->dpi);
             layout_command_input_dialog(state);
             return 0;
         }
@@ -2042,11 +2045,16 @@ void MainWindow::create_archive_from_paths(
     dialog_options.archive_format = dialog_options.archive_path.extension() == L".zip"
         ? axiom::ArchiveFormat::zip : axiom::ArchiveFormat::axar;
     dialog_options.fixed_archive_format = target_archive.has_value();
+    dialog_options.existing_archive = target_archive.has_value();
     if (target_archive) {
         const auto active = active_archive_path();
         const auto* target_provider = active &&
                 same_filesystem_path(*active, *target_archive)
             ? active_archive_provider() : nullptr;
+        if (target_provider != nullptr && target_provider->info().native) {
+            dialog_options.features.enable_content_dedup =
+                active_archive_capabilities().deduplicated_archive;
+        }
         if (target_provider != nullptr && !target_provider->info().native) {
             dialog_options.archive_format = target_provider->info().format;
             dialog_options.feature_availability =
@@ -3104,6 +3112,11 @@ void MainWindow::on_compress() {
     const auto mapped_inputs = mapped_inputs_;
     auto options = compression_options();
     const auto mode = pending_archive_features_.update_mode;
+    axiom::gui::apply_content_dedup_options(
+        pending_archive_features_,
+        output_format == axiom::ArchiveFormat::axar &&
+            mode == axiom::gui::ArchiveUpdateMode::create_new,
+        options);
     options.skip_unreadable_files =
         mode == axiom::gui::ArchiveUpdateMode::create_new;
     options.encrypt_header = pending_archive_features_.encrypt_names;

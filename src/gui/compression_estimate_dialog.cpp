@@ -303,7 +303,7 @@ struct EstimateDialogState {
     HWND estimate_button{};
     HWND close_button{};
     HWND level_combo{};
-    HWND tooltip{};
+    TooltipManager tooltip;
     HINSTANCE instance{};
     HFONT font{};
     UINT dpi{USER_DEFAULT_SCREEN_DPI};
@@ -362,6 +362,7 @@ void layout_dialog(EstimateDialogState& state) {
                button_width, button_height, TRUE);
     MoveWindow(state.level_combo, client.right - margin - scale(state, 150),
                scale(state, 326), scale(state, 150), scale(state, 250), TRUE);
+    state.tooltip.update_layout();
     // Match the About dialog: a DPI relayout must repaint every owner-drawn row,
     // otherwise pixels rendered with the previous monitor's scale can survive.
     InvalidateRect(state.hwnd, nullptr, TRUE);
@@ -372,6 +373,7 @@ void apply_theme(EstimateDialogState& state) {
     apply_dialog_control_theme(state.estimate_button, state.dark);
     apply_dialog_control_theme(state.close_button, state.dark);
     apply_dialog_control_theme(state.level_combo, state.dark);
+    state.tooltip.apply_theme(state.dark);
     InvalidateRect(state.hwnd, nullptr, TRUE);
 }
 
@@ -844,7 +846,7 @@ LRESULT CALLBACK estimate_dialog_proc(HWND hwnd, UINT message,
             set_dialog_control_font(state->estimate_button, state->font);
             set_dialog_control_font(state->close_button, state->font);
             set_dialog_control_font(state->level_combo, state->font);
-            state->tooltip = create_dialog_tooltip(hwnd);
+            state->tooltip.create(hwnd, state->dpi, state->dark);
             add_dialog_tooltip(
                 state->tooltip, state->level_combo,
                 L"Select compression level 1 (fastest) through 9 (maximum ratio) for the next estimate.");
@@ -875,6 +877,7 @@ LRESULT CALLBACK estimate_dialog_proc(HWND hwnd, UINT message,
                          SWP_NOZORDER | SWP_NOACTIVATE);
             apply_axiom_window_icons(hwnd, state->instance);
             rebuild_font(*state);
+            state->tooltip.update_dpi(state->dpi);
             layout_dialog(*state);
             return 0;
         }

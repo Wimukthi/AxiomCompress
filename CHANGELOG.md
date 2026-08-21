@@ -14,6 +14,22 @@ Entries are condensed from the
 
 ## [Unreleased]
 
+## [0.10.0.0] - 2026-08-21
+
+AXAR deduplication GUI and tooltip consistency release.
+
+### Added
+
+- Exposed live AXAR deduplication in the Windows Add to archive dialog, including
+  validated minimum, average, and maximum content-defined chunk sizes. The
+  normal Information dialog now reports live-deduplication and snapshot state.
+
+### Changed
+
+- Unified Windows tooltips behind the XactCopy Native tooltip-manager pattern.
+  Tooltips now follow dialog DPI and theme changes, cover labels reliably, and
+  remain available on disabled controls so unavailable options can explain why.
+
 ## [0.9.2.3] - 2026-08-21
 
 Live content deduplication and progress reporting release.
@@ -505,7 +521,8 @@ First published release: the Inno Setup installer and portable zip, carrying
 update/repair/remove maintenance handling, and dynamic light/dark setup
 styling.
 
-[Unreleased]: https://github.com/Wimukthi/AxiomCompress/compare/0.9.2.3...HEAD
+[Unreleased]: https://github.com/Wimukthi/AxiomCompress/compare/0.10.0.0...HEAD
+[0.10.0.0]: https://github.com/Wimukthi/AxiomCompress/releases/tag/0.10.0.0
 [0.9.2.3]: https://github.com/Wimukthi/AxiomCompress/releases/tag/0.9.2.3
 [0.9.2.2]: https://github.com/Wimukthi/AxiomCompress/releases/tag/0.9.2.2
 [0.9.1.0]: https://github.com/Wimukthi/AxiomCompress/releases/tag/0.9.1.0

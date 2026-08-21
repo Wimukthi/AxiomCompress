@@ -84,7 +84,7 @@ Select the files and folders you want, then press **Add** on the toolbar, or
 ![The Add to archive dialog, showing compression settings and a live size preview](images/axiom-add-to-archive.png)
 
 Everything lives in one resizable dialog. What you selected, the format, and
-the output path stay pinned at the top while the rest scrolls. The five option
+the output path stay pinned at the top while the rest scrolls. The six option
 pages are listed down the left side:
 
 | Page | What you set there |
@@ -94,6 +94,7 @@ pages are listed down the left side:
 | Security | Password, filename encryption, show-password toggle, archive signing |
 | Recovery & volumes | Recovery record percentage, split volume size, recovery volumes |
 | SFX | Whether to produce a self-extracting `.exe`, and what it does when run |
+| Deduplication | Live content deduplication and its minimum, average, and maximum chunk sizes |
 
 If you change nothing at all, you get an AXAR archive at level 5 using Axiom's
 own method — a reasonable default for almost anything.
@@ -151,6 +152,23 @@ spend that much time, say so.
 Saving your own profile keeps the method, native codec level, LZMA2 match
 finder, dictionary and word size, solid block size, thread count, and threading
 model.
+
+### Deduplicating repeated content
+
+On the **Deduplication** page, switch on **Store repeated file content once**
+to create an AXAR whose files share repeated and unchanged regions. This is
+useful for source trees, virtual-machine images, and rolling backups where a
+small edit would otherwise make another large copy.
+
+The default 256 KiB minimum, 1 MiB average, and 4 MiB maximum chunk sizes suit
+general backups. Smaller chunks can discover more overlap at the cost of more
+directory records. The three values must stay in order and within 4 KiB through
+64 MiB.
+
+Deduplication is selected only when creating a new AXAR. When you later use
+Add, Update, Freshen, Synchronize, Delete, Move, or Repack, Axiom detects the
+archive's stored profile and preserves its original chunk geometry. Open
+**Information** to see whether **Live content deduplication** is active.
 
 ### What Axiom records about your files
 

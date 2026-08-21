@@ -440,6 +440,11 @@ private:
 
         auto options = compression_options(dialog_options);
         const auto mode = dialog_options.features.update_mode;
+        axiom::gui::apply_content_dedup_options(
+            dialog_options.features,
+            output_format == axiom::ArchiveFormat::axar &&
+                mode == axiom::gui::ArchiveUpdateMode::create_new,
+            options);
         options.skip_unreadable_files =
             mode == axiom::gui::ArchiveUpdateMode::create_new;
         options.encrypt_header = dialog_options.features.encrypt_names;

@@ -859,7 +859,7 @@ private:
 
     HBRUSH edit_brush_ = nullptr;
 
-    HWND tooltip_ = nullptr;
+    TooltipManager tooltip_;
 
     bool match_case_checked_ = false;
 
@@ -1028,7 +1028,7 @@ private:
                       int id,
                       DWORD ex_style = 0);
     void apply_edit_margins() const;
-    void add_tooltip(HWND control, const wchar_t* text) const;
+    void add_tooltip(HWND control, const wchar_t* text);
     static UINT toolbar_command_for_action(std::wstring_view action);
     static int toolbar_button_width(UINT command);
     static LRESULT CALLBACK toolbar_button_subclass_proc(
@@ -1312,7 +1312,7 @@ private:
 
     HWND settings_ = nullptr;
 
-    HWND tooltip_ = nullptr;
+    TooltipManager tooltip_;
 
     HWND list_ = nullptr;
 

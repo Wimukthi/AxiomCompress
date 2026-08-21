@@ -167,7 +167,7 @@ void MainWindow::apply_fonts() {
         list_, status_,
         navigate_back_, navigate_forward_, navigate_up_, navigate_refresh_,
         address_edit_, address_go_,
-        tooltip_,
+        tooltip_.hwnd(),
     };
     for (HWND control : controls) {
         set_control_font(control);
@@ -200,6 +200,7 @@ void MainWindow::update_dpi(UINT dpi) {
     table_.set_dpi(dpi_);
     tree_view_.set_dpi(dpi_);
     tree_width_ = logical_tree_width > 0 ? scale(logical_tree_width) : 0;
+    tooltip_.update_dpi(dpi_);
     apply_fonts();
     apply_edit_margins();
 }
@@ -242,7 +243,6 @@ void MainWindow::apply_theme() {
         list_, status_,
         navigate_back_, navigate_forward_, navigate_up_, navigate_refresh_,
         address_edit_, address_go_,
-        tooltip_,
     };
     for (HWND control : controls) {
         apply_theme_to_control(control);
@@ -250,6 +250,7 @@ void MainWindow::apply_theme() {
     for (const ToolbarButton& button : toolbar_buttons_) {
         apply_theme_to_control(button.window);
     }
+    tooltip_.apply_theme(theme_.dark);
     menu_bar_.set_theme({
         theme_.dark ? RGB(31, 31, 31) : theme_.panel,
         theme_.button_hot,

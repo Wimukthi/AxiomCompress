@@ -85,6 +85,10 @@ constexpr int kSfxRequireAccept = 2154;
 constexpr int kSfxOpenDestination = 2155;
 constexpr int kSfxDescription = 2156;
 constexpr int kSfxTheme = 2157;
+constexpr int kContentDedup = 2160;
+constexpr int kDedupMinChunk = 2161;
+constexpr int kDedupAverageChunk = 2162;
+constexpr int kDedupMaxChunk = 2163;
 constexpr int kSettingsTabs = 2200;
 constexpr int kSettingsTabBase = 2210;
 constexpr int kThemeMode = 2230;
@@ -256,8 +260,9 @@ bool is_built_in_profile_name(std::wstring_view name) {
             return profile_names_equal(profile.name, name);
         });
 }
-constexpr std::array<const wchar_t*, 5> kCreateTabNames{
-    L"Compression", L"General", L"Security", L"Recovery & volumes", L"SFX"};
+constexpr std::array<const wchar_t*, 6> kCreateTabNames{
+    L"Compression", L"General", L"Security", L"Recovery & volumes", L"SFX",
+    L"Deduplication"};
 constexpr std::array<const wchar_t*, 2> kSfxStubTierNames{
     L"Full window (dialogs)", L"Console only (unattended)"};
 constexpr std::array<const wchar_t*, 9> kSfxDefaultPathNames{
@@ -651,6 +656,25 @@ std::optional<std::uint64_t> parse_size_text(std::wstring text) {
         return std::nullopt;
     }
     return value * multiplier;
+}
+
+std::wstring format_size_text(std::size_t bytes) {
+    struct Unit {
+        std::size_t bytes;
+        const wchar_t* suffix;
+    };
+    constexpr std::array<Unit, 4> units{{
+        {std::size_t{1} << 30, L"GiB"},
+        {std::size_t{1} << 20, L"MiB"},
+        {std::size_t{1} << 10, L"KiB"},
+        {1, L"B"},
+    }};
+    for (const auto& unit : units) {
+        if (bytes >= unit.bytes && bytes % unit.bytes == 0) {
+            return std::to_wstring(bytes / unit.bytes) + L" " + unit.suffix;
+        }
+    }
+    return std::to_wstring(bytes) + L" B";
 }
 
 std::optional<std::uint64_t> parse_integer_size_with_unit(
@@ -2389,15 +2413,6 @@ public:
         }
         MSG message{};
         while (IsWindow(window_) && GetMessageW(&message, nullptr, 0, 0) > 0) {
-            if (tooltip_ != nullptr && message.message >= WM_MOUSEFIRST &&
-                message.message <= WM_MOUSELAST &&
-                (message.hwnd == window_ || IsChild(window_, message.hwnd))) {
-                // Relay explicitly as well as using TTF_SUBCLASS. Editable
-                // combo children and owner-drawn settings controls do not
-                // consistently forward hover tracking through IsDialogMessage.
-                SendMessageW(tooltip_, TTM_RELAYEVENT, 0,
-                             reinterpret_cast<LPARAM>(&message));
-            }
             if (mode_ == DialogMode::settings &&
                 toolbar_list_.hwnd() != nullptr &&
                 message.message == WM_KEYDOWN &&
@@ -3488,6 +3503,20 @@ private:
         sfx_open_destination_ = page_checkbox(
             4, kSfxOpenDestination, L"Open the destination when finished");
 
+        content_dedup_ = page_checkbox(
+            5, kContentDedup,
+            L"Store repeated file content once using live deduplication");
+        dedup_min_chunk_label_ = page_label(5, L"Minimum chunk size");
+        dedup_min_chunk_edit_ = page_edit(5, kDedupMinChunk);
+        dedup_average_chunk_label_ = page_label(5, L"Average chunk size");
+        dedup_average_chunk_edit_ = page_edit(5, kDedupAverageChunk);
+        dedup_max_chunk_label_ = page_label(5, L"Maximum chunk size");
+        dedup_max_chunk_edit_ = page_edit(5, kDedupMaxChunk);
+        dedup_info_ = page_label(
+            5,
+            L"Live deduplication splits files at content-defined boundaries so unchanged and repeated regions share storage. The defaults suit general backups; smaller chunks find more overlap but add directory overhead.",
+            true);
+
         SendMessageW(path_edit_, EM_SETLIMITTEXT, 32767, 0);
         SendMessageW(comment_edit_, EM_SETLIMITTEXT, 65535, 0);
         SendMessageW(password_edit_, EM_SETLIMITTEXT, 1024, 0);
@@ -3499,6 +3528,12 @@ private:
                                   DialogInputFilter::unsigned_integer, 20);
         apply_dialog_input_filter(recovery_percent_edit_,
                                   DialogInputFilter::unsigned_integer, 3);
+        apply_dialog_input_filter(dedup_min_chunk_edit_,
+                                  DialogInputFilter::byte_size, 24);
+        apply_dialog_input_filter(dedup_average_chunk_edit_,
+                                  DialogInputFilter::byte_size, 24);
+        apply_dialog_input_filter(dedup_max_chunk_edit_,
+                                  DialogInputFilter::byte_size, 24);
         add_dialog_tooltip(tooltip_, path_edit_,
                            L"Windows file path for the archive or self-extracting executable.");
         add_dialog_tooltip(tooltip_, browse_,
@@ -3540,6 +3575,18 @@ private:
                            L"Choose an existing Axiom signing-key file.");
         add_dialog_tooltip(tooltip_, create_sfx_,
                            L"Build one Windows .exe containing the selected archive format and extraction stub.");
+        add_dialog_tooltip(
+            tooltip_, content_dedup_,
+            L"Select the AXAR v5 live content-deduplication profile for a new archive. Existing archives preserve their established profile automatically.");
+        add_dialog_tooltip(
+            tooltip_, dedup_min_chunk_edit_,
+            L"Smallest content-defined chunk. Enter 4 KiB through 64 MiB; it cannot exceed the average size.");
+        add_dialog_tooltip(
+            tooltip_, dedup_average_chunk_edit_,
+            L"Target content-defined chunk size. It must be between the minimum and maximum sizes.");
+        add_dialog_tooltip(
+            tooltip_, dedup_max_chunk_edit_,
+            L"Largest content-defined chunk. Enter up to 64 MiB and no less than the average size.");
         SendMessageW(sfx_title_edit_, EM_SETLIMITTEXT, 1024, 0);
         SendMessageW(sfx_description_edit_, EM_SETLIMITTEXT, 4096, 0);
         SendMessageW(sfx_default_path_combo_, CB_LIMITTEXT, 32767, 0);
@@ -3592,7 +3639,7 @@ private:
         palette_ = make_palette();
         set_dark_title(window_, palette_.dark);
         apply_axiom_window_icons(window_, instance_);
-        tooltip_ = create_dialog_tooltip(window_);
+        tooltip_.create(window_, dpi_, palette_.dark);
         window_brush_ = CreateSolidBrush(palette_.window);
         edit_brush_ = CreateSolidBrush(palette_.edit);
         NONCLIENTMETRICSW metrics{sizeof(metrics)};
@@ -4544,6 +4591,7 @@ private:
         SetWindowPos(window_, nullptr, 0, 0, 0, 0,
                      SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER |
                          SWP_NOACTIVATE | SWP_FRAMECHANGED);
+        tooltip_.apply_theme(palette_.dark);
         RedrawWindow(window_, nullptr, nullptr,
                      RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_UPDATENOW);
     }
@@ -4626,6 +4674,7 @@ private:
         MoveWindow(cancel_, client.right - margin - button_width, button_y, button_width, row_height, TRUE);
         MoveWindow(accept_, client.right - margin - button_width * 2 - scale(8),
                    button_y, button_width, row_height, TRUE);
+        tooltip_.update_layout();
     }
 
     void layout_settings() {
@@ -4864,6 +4913,7 @@ private:
             RedrawWindow(settings_viewport_, nullptr, nullptr,
                          RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);
         }
+        tooltip_.update_layout();
     }
 
     int wrapped_height(HWND control_window, int width, int minimum) const {
@@ -5243,6 +5293,22 @@ private:
                     content_height = y;
                     break;
                 }
+                case 5: {
+                    move_page_control(content_dedup_, 0, y, content_width, row,
+                                      scroll_offset);
+                    y += row + scale(14);
+                    row_pair(dedup_min_chunk_label_, dedup_min_chunk_edit_,
+                             240, false);
+                    row_pair(dedup_average_chunk_label_,
+                             dedup_average_chunk_edit_, 240, false);
+                    row_pair(dedup_max_chunk_label_, dedup_max_chunk_edit_,
+                             240, false);
+                    y += scale(8);
+                    move_page_wrapped(dedup_info_, 0, y, content_width,
+                                      72, scroll_offset, 10);
+                    content_height = y;
+                    break;
+                }
             }
             return std::max(content_height, y + scale(10));
         };
@@ -5268,6 +5334,7 @@ private:
             scroll_offset;
 
         SendMessageW(window_, WM_SETREDRAW, TRUE, 0);
+        tooltip_.update_layout();
         RedrawWindow(window_, nullptr, nullptr,
                      RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);
     }
@@ -5668,6 +5735,15 @@ private:
         set_window_text(recovery_percent_edit_,
                         std::to_wstring(create_options.features.recovery_percent));
         set_window_text(signing_key_edit_, create_options.features.signing_key.wstring());
+        set_window_text(
+            dedup_min_chunk_edit_,
+            format_size_text(create_options.features.dedup_min_chunk_size));
+        set_window_text(
+            dedup_average_chunk_edit_,
+            format_size_text(create_options.features.dedup_average_chunk_size));
+        set_window_text(
+            dedup_max_chunk_edit_,
+            format_size_text(create_options.features.dedup_max_chunk_size));
         clear_options_unsupported_by_selected_format();
         rebuild_compression_profile_combo(true);
     }
@@ -5821,6 +5897,7 @@ private:
         create_options.features.create_recovery_volumes = false;
         create_options.features.sign_archive = false;
         create_options.features.signing_key.clear();
+        create_options.features.enable_content_dedup = false;
         if (!zip) {
             create_options.features.create_sfx = false;
             create_options.features.sfx_destination.clear();
@@ -5913,6 +5990,7 @@ private:
         const bool native = selected_format_is_native();
         const std::wstring previous_compression_info =
             window_text(compression_info_);
+        const std::wstring previous_dedup_info = window_text(dedup_info_);
         const auto method = method_from_combo(
             method_combo_, native ? axiom::CompressionMethod::axiom
                                   : axiom::CompressionMethod::deflate);
@@ -5985,6 +6063,31 @@ private:
         EnableWindow(comment_edit_, available.comments);
         EnableWindow(lock_archive_, available.lock);
         EnableWindow(repack_after_update_, available.update && updating);
+
+        const bool can_select_dedup =
+            native && !updating && !create_options.existing_archive;
+        EnableWindow(content_dedup_, can_select_dedup);
+        const bool can_tune_dedup =
+            can_select_dedup && create_options.features.enable_content_dedup;
+        for (HWND control : {dedup_min_chunk_label_, dedup_min_chunk_edit_,
+                             dedup_average_chunk_label_,
+                             dedup_average_chunk_edit_,
+                             dedup_max_chunk_label_, dedup_max_chunk_edit_}) {
+            EnableWindow(control, can_tune_dedup);
+        }
+        set_window_text(
+            dedup_info_,
+            create_options.existing_archive
+                ? create_options.features.enable_content_dedup
+                    ? L"This archive already uses live content deduplication. Its persisted chunk geometry is preserved automatically for add, update, synchronize, delete, move, and repack operations."
+                    : L"This archive uses ordinary AXAR storage. Its content profile cannot be converted from this update dialog; create a new archive to opt into live deduplication."
+            : !native
+                ? L"Live content deduplication is an AXAR-only profile. Choose Axiom archive format to enable it."
+            : updating
+                ? L"Live content deduplication is selected only while creating a new archive. Existing archives preserve their established profile automatically."
+            : create_options.features.enable_content_dedup
+                ? L"Files will be split at content-defined boundaries and repeated chunks stored once. Valid geometry is 4 KiB <= minimum <= average <= maximum <= 64 MiB."
+                : L"Enable live deduplication to share repeated and unchanged file regions. The default 256 KiB / 1 MiB / 4 MiB geometry suits general backup archives.");
 
         EnableWindow(encrypt_data_, available.encryption);
         EnableWindow(encrypt_names_, available.encryption && available.header_encryption &&
@@ -6064,7 +6167,8 @@ private:
                      sfx_options_enabled &&
                          !trim_dialog_input(window_text(sfx_license_edit_)).empty());
         if (mode_ == DialogMode::create_archive &&
-            previous_compression_info != window_text(compression_info_)) {
+            (previous_compression_info != window_text(compression_info_) ||
+             previous_dedup_info != window_text(dedup_info_))) {
             // The description is wrapped and its height depends on the active
             // method and available width. Recompute the page metrics after a
             // method/format change so the viewport cannot clip the last line.
@@ -6983,6 +7087,43 @@ private:
             selection != CB_ERR) {
             create_options.features.update_mode = static_cast<ArchiveUpdateMode>(selection);
         }
+        const bool create_with_dedup =
+            create_options.archive_format == axiom::ArchiveFormat::axar &&
+            create_options.features.update_mode == ArchiveUpdateMode::create_new &&
+            !create_options.existing_archive &&
+            create_options.features.enable_content_dedup;
+        if (create_with_dedup) {
+            const auto minimum = parse_size_text(window_text(dedup_min_chunk_edit_));
+            const auto average = parse_size_text(window_text(dedup_average_chunk_edit_));
+            const auto maximum = parse_size_text(window_text(dedup_max_chunk_edit_));
+            constexpr std::uint64_t kMinimumChunkSize = 4u << 10;
+            constexpr std::uint64_t kMaximumChunkSize = 64u << 20;
+            const std::uint64_t size_t_limit =
+                static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max());
+            if (!minimum || !average || !maximum ||
+                *minimum < kMinimumChunkSize || *minimum > *average ||
+                *average > *maximum || *maximum > kMaximumChunkSize ||
+                *maximum > size_t_limit) {
+                select_create_page(5);
+                show_message_dialog(
+                    window_, instance_, dpi_, palette_.dark,
+                    L"Deduplication",
+                    L"Chunk sizes must satisfy 4 KiB <= minimum <= average <= maximum <= 64 MiB. Examples: 256 KiB, 1 MiB, and 4 MiB.",
+                    MessageDialogIcon::warning);
+                SetFocus(!minimum ? dedup_min_chunk_edit_
+                                  : !average ? dedup_average_chunk_edit_
+                                             : dedup_max_chunk_edit_);
+                return;
+            }
+            create_options.features.dedup_min_chunk_size =
+                static_cast<std::size_t>(*minimum);
+            create_options.features.dedup_average_chunk_size =
+                static_cast<std::size_t>(*average);
+            create_options.features.dedup_max_chunk_size =
+                static_cast<std::size_t>(*maximum);
+        } else {
+            create_options.features.enable_content_dedup = false;
+        }
         create_options.features.comment = window_text(comment_edit_);
         create_options.features.volume_size =
             trim_dialog_input(window_text(volume_size_edit_));
@@ -7253,6 +7394,7 @@ private:
             case kVerboseLogging: return application_options.verbose_logging;
             case kLockArchive: return create_options.features.lock_archive;
             case kRepackAfterUpdate: return create_options.features.repack_after_update;
+            case kContentDedup: return create_options.features.enable_content_dedup;
             case kEncryptData: return create_options.features.encrypt_data;
             case kEncryptNames: return create_options.features.encrypt_names;
             case kShowPassword: return create_show_password_;
@@ -7404,6 +7546,10 @@ private:
                 create_options.features.repack_after_update =
                     !create_options.features.repack_after_update;
                 break;
+            case kContentDedup:
+                create_options.features.enable_content_dedup =
+                    !create_options.features.enable_content_dedup;
+                break;
             case kEncryptData:
                 create_options.features.encrypt_data = !create_options.features.encrypt_data;
                 if (!create_options.features.encrypt_data) {
@@ -7496,6 +7642,7 @@ private:
             case kVerboseLogging:
             case kLockArchive:
             case kRepackAfterUpdate:
+            case kContentDedup:
             case kEncryptData:
             case kEncryptNames:
             case kShowPassword:
@@ -7665,6 +7812,7 @@ private:
                              SWP_NOZORDER | SWP_NOACTIVATE);
                 apply_axiom_window_icons(window_, instance_);
                 rebuild_font_for_dpi();
+                tooltip_.update_dpi(dpi_);
                 layout();
                 return 0;
             }
@@ -7930,6 +8078,8 @@ private:
                     case kLockArchive: toggle(kLockArchive, lock_archive_); return 0;
                     case kRepackAfterUpdate:
                         toggle(kRepackAfterUpdate, repack_after_update_); return 0;
+                    case kContentDedup:
+                        toggle(kContentDedup, content_dedup_); return 0;
                     case kEncryptData: toggle(kEncryptData, encrypt_data_); return 0;
                     case kEncryptNames: toggle(kEncryptNames, encrypt_names_); return 0;
                     case kShowPassword: toggle(kShowPassword, show_password_); return 0;
@@ -7984,7 +8134,7 @@ private:
     HBRUSH window_brush_ = nullptr;
     HBRUSH edit_brush_ = nullptr;
     HFONT font_ = nullptr;
-    HWND tooltip_ = nullptr;
+    TooltipManager tooltip_;
     bool accepted_ = false;
     int level_ = 5;
     bool overwrite_checked_ = false;
@@ -8087,6 +8237,14 @@ private:
     HWND sfx_description_edit_ = nullptr;
     HWND sfx_theme_label_ = nullptr;
     HWND sfx_theme_combo_ = nullptr;
+    HWND content_dedup_ = nullptr;
+    HWND dedup_min_chunk_label_ = nullptr;
+    HWND dedup_min_chunk_edit_ = nullptr;
+    HWND dedup_average_chunk_label_ = nullptr;
+    HWND dedup_average_chunk_edit_ = nullptr;
+    HWND dedup_max_chunk_label_ = nullptr;
+    HWND dedup_max_chunk_edit_ = nullptr;
+    HWND dedup_info_ = nullptr;
     HWND overwrite_ = nullptr;
     HWND restore_time_ = nullptr;
     HWND confirm_delete_ = nullptr;
