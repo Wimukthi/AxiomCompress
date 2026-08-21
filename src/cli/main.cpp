@@ -116,9 +116,10 @@ void print_usage() {
         "  --swarm                                (levels 1-6, 8-9: cores cooperate\n"
         "                                          inside large blocks; level 7 ignores it)\n"
         "  --recovery N                           add 1..100% Reed-Solomon recovery data\n"
-        "  --keyed-chunks / --plain-chunks        snapshot IDs keyed by the archive password (default: keyed)\n"
+        "  --dedup                                create an AXAR with live content-defined deduplication\n"
+        "  --keyed-chunks / --plain-chunks        chunk IDs keyed by the archive password (default: keyed)\n"
         "  --chunk-min SIZE --chunk-average SIZE  --chunk-max SIZE\n"
-        "                                          snapshot content-defined chunk geometry\n"
+        "                                          content-defined chunk geometry\n"
         "  --no-sparse                             do not capture sparse allocation maps\n"
         "  --strict-metadata                       fail if source metadata cannot be captured\n"
         "  --bt                                   (binary-tree match finder)\n"
@@ -666,7 +667,8 @@ void write_key(const fs::path& path, const std::array<std::uint8_t, Size>& key) 
 // Pulls recognized compression flags out of args, leaving positional arguments.
 bool take_compression_flags(std::vector<std::string>& args,
                             axiom::CompressionOptions& options,
-                            bool* profile = nullptr) {
+                            bool* profile = nullptr,
+                            bool allow_content_dedup = false) {
     // First pass: pick the effort level (default 5) and apply its preset, so the
     // remaining explicit flags below act as overrides regardless of ordering.
     int level = 5;
@@ -748,6 +750,12 @@ bool take_compression_flags(std::vector<std::string>& args,
             if (options.recovery_percent > 100) {
                 throw std::runtime_error("--recovery must be between 0 and 100");
             }
+        } else if (arg == "--dedup") {
+            if (!allow_content_dedup) {
+                throw std::invalid_argument(
+                    "--dedup is only supported by 'axiomc a' when creating a new AXAR");
+            }
+            options.enable_content_dedup = true;
         } else if (arg == "--keyed-chunks") {
             options.keyed_chunk_ids = true;
         } else if (arg == "--plain-chunks") {
@@ -878,7 +886,7 @@ std::string format_time(std::int64_t seconds) {
 
 int run_add(std::vector<std::string> args) {
     axiom::CompressionOptions options;
-    if (!take_compression_flags(args, options)) {
+    if (!take_compression_flags(args, options, nullptr, true)) {
         return 2;
     }
     if (args.size() < 2) {
@@ -889,6 +897,10 @@ int run_add(std::vector<std::string> args) {
     const fs::path archive = args.front();
     std::vector<fs::path> inputs(args.begin() + 1, args.end());
     if (archive == fs::path("-")) {
+        if (options.enable_content_dedup) {
+            throw std::invalid_argument(
+                "--dedup requires a seekable AXAR file, not stdout");
+        }
         if (stream_is_terminal(stdout)) {
             throw std::invalid_argument(
                 "archive stdout must be redirected to a file or pipe");
@@ -907,6 +919,10 @@ int run_add(std::vector<std::string> args) {
     options.operation = progress.operation();
     // `a` creates a new archive, or adds to (and updates entries in) an existing one.
     if (fs::exists(archive)) {
+        if (options.enable_content_dedup) {
+            throw std::invalid_argument(
+                "--dedup selects the format when creating a new AXAR; existing archives retain their profile");
+        }
         axiom::add_to_archive(inputs, archive, options);
     } else {
         axiom::create_archive(inputs, archive, options);
@@ -923,6 +939,10 @@ int run_update(std::vector<std::string> args, bool fresh_only) {
     if (args.size() < 2) {
         print_usage();
         return 2;
+    }
+    if (options.enable_content_dedup) {
+        throw std::invalid_argument(
+            "--dedup is only used when creating a new AXAR; updates preserve the archive profile");
     }
     const fs::path archive = args.front();
     std::vector<fs::path> inputs(args.begin() + 1, args.end());
@@ -942,6 +962,10 @@ int run_sync(std::vector<std::string> args) {
     if (args.size() < 2) {
         print_usage();
         return 2;
+    }
+    if (options.enable_content_dedup) {
+        throw std::invalid_argument(
+            "--dedup is only used when creating a new AXAR; sync preserves the archive profile");
     }
     const fs::path archive = args.front();
     std::vector<fs::path> inputs(args.begin() + 1, args.end());

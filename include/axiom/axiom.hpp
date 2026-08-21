@@ -693,6 +693,10 @@ struct CompressionOptions {
     // bytes. Zero disables the recovery service record; valid enabled values are
     // 1..100. Applies only to the multi-file archive container.
     unsigned recovery_percent = 0;
+    // Create an ordinary AXAR whose live files use content-defined chunk
+    // references. Existing archives keep their established content layout;
+    // update operations read the layout and chunk geometry from the archive.
+    bool enable_content_dedup = false;
     // Snapshot profile. The public snapshot APIs enable this profile explicitly;
     // keeping the switch here lets archive frontends pass one options object
     // through the existing compression/update plumbing.

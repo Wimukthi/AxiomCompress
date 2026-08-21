@@ -1553,6 +1553,7 @@ void show_archive_feature_summary_dialog(
         {L"Encryption state", capabilities.encrypted ? L"Encrypted" : L"Not encrypted"},
         {L"Lock state", capabilities.locked ? L"Locked" : L"Not locked"},
         {L"Snapshot state", capabilities.snapshot_repository ? L"Active" : L"Not active"},
+        {L"Deduplication", capabilities.deduplicated_archive ? L"Live content dedup" : L"Not active"},
     };
     data.capabilities = summary_capabilities(capabilities);
     show_archive_summary_dialog(owner, std::move(data));

@@ -29,6 +29,12 @@ the compressed data, and separately turn on encryption, recovery records, split
 volumes, comments, locking, signatures, extended metadata, links, and
 self-extracting output.
 
+New AXAR archives can also select live content-defined deduplication. Repeated
+chunks are stored once, ordinary add/update/sync/delete/move operations remain
+available, and `repack` garbage-collects chunks no longer referenced by the
+live directory. Snapshot repositories use the same chunk engine but retain
+named historical directories instead of allowing ordinary mutation.
+
 Changing the compression method normally changes only the compressed payload
 inside each solid block, nothing else. Axiom's own payloads use AXC v9; the
 bundled Zstandard, LZMA2, and Deflate payloads use the bounded AXC v10 envelope.

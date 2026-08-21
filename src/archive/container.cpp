@@ -33,6 +33,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <numeric>
 #include <optional>
 #include <sstream>
 #include <span>
@@ -121,13 +122,19 @@ constexpr std::uint16_t kFlagChunkTable = 0x0020;
 // subframes. Older readers must reject this profile because their block-size
 // safety limit is intentionally lower and they do not know the streaming path.
 constexpr std::uint16_t kFlagLargeSolidBlocks = 0x0040;
+// Ordinary deduplicated archives use the same chunk table and entry references
+// as snapshot repositories, but have one mutable live directory and no history.
+// Keeping a distinct required bit lets old readers reject the non-contiguous
+// addressing without conflating it with snapshot-history semantics.
+constexpr std::uint16_t kFlagLiveDedup = 0x0080;
 constexpr std::uint16_t kKnownArchiveFlags = kFlagEncryptedDirectory |
                                                kFlagSparseEntries |
                                                kFlagCaptureReport |
                                                kFlagExtendedMetadata |
                                                kFlagEncryptionV2 |
                                                kFlagChunkTable |
-                                               kFlagLargeSolidBlocks;
+                                               kFlagLargeSolidBlocks |
+                                               kFlagLiveDedup;
 
 // Optional block-extra profile. Older AXAR readers already skip the reserved
 // block-extra byte range, so this remains additive and does not require a new
@@ -279,6 +286,7 @@ constexpr std::uint64_t kArchiveCaptureReport = 5; // omitted/lossy source captu
 constexpr std::uint64_t kArchiveEncryptionV2 = 6; // key id + password slots
 constexpr std::uint64_t kArchiveChunkTable = 7; // content-defined chunk index
 constexpr std::uint64_t kArchiveSnapshotManifest = 8; // named snapshot entry manifests
+constexpr std::uint64_t kArchiveDedupProfile = 9; // immutable content-defined chunk geometry
 
 // ---- little-endian serialization -------------------------------------------
 
@@ -667,6 +675,17 @@ struct ArchiveReuseStats {
     std::uint64_t reused_bytes = 0;
 };
 
+struct DedupProfile {
+    bool present = false;
+    std::uint64_t chunker = 1;          // gear64
+    std::uint64_t chunker_version = 1;
+    std::uint64_t minimum_size = 256u << 10;
+    std::uint64_t average_size = 1u << 20;
+    std::uint64_t maximum_size = 4u << 20;
+    std::uint64_t table_id = 1;
+    std::uint64_t packing = 0;          // one independently coded block per chunk
+};
+
 using ArchiveReuseByPath = std::unordered_map<std::string, ReuseCandidate>;
 
 ContentIdentity content_identity(const EntryRec& entry) {
@@ -713,8 +732,10 @@ struct ArchiveMeta {
     std::array<std::uint8_t, 64> signature{};
     std::vector<OperationWarning> capture_warnings;
     bool chunk_table = false;
+    bool live_dedup = false;
     bool keyed_chunk_ids = false;
     bool large_solid_blocks = false;
+    DedupProfile dedup_profile;
     std::vector<SnapshotRec> snapshots;
 };
 
@@ -732,11 +753,14 @@ struct ArchiveIndex {
 
 constexpr std::uint64_t kSnapshotManifestVersion = 1;
 constexpr std::uint64_t kChunkTableVersion = 1;
+constexpr std::uint64_t kDedupProfileVersion = 1;
 constexpr std::uint64_t kMaxSnapshotCount = 1u << 16;
 constexpr std::uint64_t kMaxSnapshotEntries = 1u << 24;
 constexpr std::uint64_t kMaxChunkCount = 1u << 24;
 constexpr std::uint64_t kMaxChunkRefsPerEntry = 1u << 20;
 constexpr std::size_t kMaxSnapshotNameBytes = 256;
+
+void validate_dedup_profile(const DedupProfile& profile, bool format_error);
 
 // These are the smallest serialized records that can reach the corresponding
 // parsers. Count fields are untrusted, so they must not authorize more records
@@ -892,6 +916,27 @@ void validate_snapshot_chunk_sizes(const CompressionOptions& options) {
         throw std::invalid_argument(
             "snapshot chunk sizes must satisfy 4 KiB <= min <= average <= max <= 64 MiB");
     }
+}
+
+DedupProfile dedup_profile_from_options(const CompressionOptions& options) {
+    validate_snapshot_chunk_sizes(options);
+    DedupProfile profile;
+    profile.present = true;
+    profile.minimum_size = options.snapshot_min_chunk_size;
+    profile.average_size = options.snapshot_average_chunk_size;
+    profile.maximum_size = options.snapshot_max_chunk_size;
+    validate_dedup_profile(profile, false);
+    return profile;
+}
+
+CompressionOptions options_for_dedup_profile(const CompressionOptions& options,
+                                             const DedupProfile& profile) {
+    validate_dedup_profile(profile, true);
+    auto result = options;
+    result.snapshot_min_chunk_size = static_cast<std::size_t>(profile.minimum_size);
+    result.snapshot_average_chunk_size = static_cast<std::size_t>(profile.average_size);
+    result.snapshot_max_chunk_size = static_cast<std::size_t>(profile.maximum_size);
+    return result;
 }
 
 template <typename Callback>
@@ -1334,7 +1379,15 @@ std::uint16_t archive_header_flags(const std::vector<EntryRec>& entries,
     if (has_sparse_entries(entries)) flags |= kFlagSparseEntries;
     if (!meta.capture_warnings.empty()) flags |= kFlagCaptureReport;
     if (has_extended_metadata(entries)) flags |= kFlagExtendedMetadata;
-    if (meta.chunk_table) flags |= kFlagChunkTable;
+    if (!meta.snapshots.empty()) flags |= kFlagChunkTable;
+    if (meta.live_dedup) {
+        flags |= kFlagLiveDedup;
+        // A live deduplicated archive is an explicitly selected v5 profile.
+        // Reserve the fidelity bits at creation so later chunk-only appends can
+        // add sparse/capture/extended records without rewriting the immutable
+        // header and existing block region.
+        flags |= kFlagSparseEntries | kFlagCaptureReport | kFlagExtendedMetadata;
+    }
     if (meta.large_solid_blocks) flags |= kFlagLargeSolidBlocks;
     return flags;
 }
@@ -1343,7 +1396,7 @@ std::uint16_t archive_header_version(const std::vector<EntryRec>& entries,
                                      const ArchiveMeta& meta) {
     return meta.encryption.v2 || has_sparse_entries(entries) ||
            !meta.capture_warnings.empty() || has_extended_metadata(entries) ||
-           meta.chunk_table || meta.large_solid_blocks
+            meta.chunk_table || meta.live_dedup || meta.large_solid_blocks
         ? kArchiveVersion5 : kArchiveVersion4;
 }
 
@@ -2259,7 +2312,8 @@ ArchiveLayout read_layout(const ByteSource& source) {
     if (layout.version < kArchiveVersion5 &&
         (layout.flags & (kFlagSparseEntries | kFlagCaptureReport |
                          kFlagExtendedMetadata | kFlagEncryptionV2 |
-                         kFlagChunkTable | kFlagLargeSolidBlocks)) != 0) {
+                         kFlagChunkTable | kFlagLargeSolidBlocks |
+                         kFlagLiveDedup)) != 0) {
         throw FormatError("archive uses v5 features with an older version header");
     }
 
@@ -3070,6 +3124,7 @@ ArchiveIndex parse_directory(const ByteVector& directory, std::uint64_t director
     Reader reader(directory);
 
     ArchiveIndex index;
+    index.meta.live_dedup = (archive_flags & kFlagLiveDedup) != 0;
     const auto block_count = reader.vint();
     index.blocks.reserve(static_cast<std::size_t>(std::min<std::uint64_t>(block_count, 1u << 16)));
     for (std::uint64_t i = 0; i < block_count; ++i) {
@@ -3448,6 +3503,25 @@ ArchiveIndex parse_directory(const ByteVector& directory, std::uint64_t director
             if (payload.has_more()) {
                 throw FormatError("snapshot manifest has trailing data");
             }
+        } else if (record_type == kArchiveDedupProfile) {
+            if (index.meta.dedup_profile.present) {
+                throw FormatError("archive has duplicate deduplication profiles");
+            }
+            auto& profile = index.meta.dedup_profile;
+            if (payload.vint() != kDedupProfileVersion) {
+                throw FormatError("unsupported deduplication profile version");
+            }
+            profile.present = true;
+            profile.chunker = payload.vint();
+            profile.chunker_version = payload.vint();
+            profile.minimum_size = payload.vint();
+            profile.average_size = payload.vint();
+            profile.maximum_size = payload.vint();
+            profile.table_id = payload.vint();
+            profile.packing = payload.vint();
+            if (payload.has_more()) {
+                throw FormatError("deduplication profile has trailing data");
+            }
         }
     }
 
@@ -3461,19 +3535,50 @@ ArchiveIndex parse_directory(const ByteVector& directory, std::uint64_t director
     return index;
 }
 
-void validate_snapshot_index(const ArchiveIndex& index, const ArchiveLayout& layout) {
-    const bool chunk_flag = (layout.flags & kFlagChunkTable) != 0;
+void validate_dedup_profile(const DedupProfile& profile, bool format_error) {
+    const bool valid = profile.present && profile.chunker == 1 &&
+        profile.chunker_version == 1 && profile.table_id == 1 &&
+        profile.packing == 0 && profile.minimum_size >= (4u << 10) &&
+        profile.average_size >= profile.minimum_size &&
+        profile.maximum_size >= profile.average_size &&
+        profile.maximum_size <= (64u << 20) &&
+        profile.maximum_size <= std::numeric_limits<std::size_t>::max();
+    if (!valid) {
+        if (format_error) throw FormatError("archive has an invalid deduplication profile");
+        throw std::invalid_argument("invalid deduplication profile");
+    }
+}
+
+void validate_chunk_index(const ArchiveIndex& index, const ArchiveLayout& layout) {
+    const bool snapshot_flag = (layout.flags & kFlagChunkTable) != 0;
+    const bool live_flag = (layout.flags & kFlagLiveDedup) != 0;
+    if (snapshot_flag && live_flag) {
+        throw FormatError("archive cannot combine live deduplication and snapshot history");
+    }
+    const bool chunk_flag = snapshot_flag || live_flag;
     if (chunk_flag != index.meta.chunk_table) {
         throw FormatError("chunk-table header flag does not match directory metadata");
     }
     if (!index.meta.chunk_table) {
-        if (!index.chunks.empty() || !index.meta.snapshots.empty()) {
-            throw FormatError("ordinary archive contains snapshot-only metadata");
+        if (!index.chunks.empty() || !index.meta.snapshots.empty() ||
+            index.meta.dedup_profile.present || index.meta.live_dedup) {
+            throw FormatError("ordinary archive contains chunk-addressed metadata");
         }
         return;
     }
-    if (layout.version < kArchiveVersion5 || index.meta.snapshots.empty()) {
-        throw FormatError("snapshot archive is missing its v5 manifest");
+    if (layout.version < kArchiveVersion5) {
+        throw FormatError("chunk-addressed archive requires AXAR v5");
+    }
+    if (snapshot_flag != !index.meta.snapshots.empty()) {
+        throw FormatError("snapshot-history flag does not match its manifest");
+    }
+    if (live_flag != index.meta.live_dedup) {
+        throw FormatError("live-deduplication flag does not match archive metadata");
+    }
+    if (live_flag) {
+        validate_dedup_profile(index.meta.dedup_profile, true);
+    } else if (index.meta.dedup_profile.present) {
+        validate_dedup_profile(index.meta.dedup_profile, true);
     }
     if (index.meta.keyed_chunk_ids && !index.meta.encryption.enabled) {
         throw FormatError("keyed chunk identifiers require archive encryption");
@@ -3494,23 +3599,23 @@ void validate_snapshot_index(const ArchiveIndex& index, const ArchiveLayout& lay
         for (const auto& entry : entries) {
             if (entry.type != kEntryFile) {
                 if (!entry.chunk_refs.empty()) {
-                    throw FormatError("non-file snapshot entry has chunk references");
+                    throw FormatError("non-file chunk-addressed entry has chunk references");
                 }
                 continue;
             }
             std::uint64_t total = 0;
             for (const auto ref : entry.chunk_refs) {
                 if (ref >= index.chunks.size()) {
-                    throw FormatError("snapshot entry points outside the chunk table");
+                    throw FormatError("entry points outside the chunk table");
                 }
                 const auto size = index.chunks[static_cast<std::size_t>(ref)].identity.size;
                 if (total > entry.size || size > entry.size - total) {
-                    throw FormatError("snapshot chunk sizes overflow the file");
+                    throw FormatError("chunk sizes overflow the file");
                 }
                 total += size;
             }
             if (total != entry.size) {
-                throw FormatError("snapshot chunks do not cover the file");
+                throw FormatError("chunks do not cover the file");
             }
         }
     };
@@ -3553,7 +3658,7 @@ ArchiveIndex read_index(const ByteSource& source) {
     if (v2_flag != index.meta.encryption.v2) {
         throw FormatError("archive encryption-v2 flag does not match its directory metadata");
     }
-    validate_snapshot_index(index, layout);
+    validate_chunk_index(index, layout);
     return index;
 }
 
@@ -4187,6 +4292,12 @@ void compress_items_into(Output& out, std::uint64_t& written,
     // Maps a file's on-disk identity to the archive path under which its bytes were
     // first stored; later paths sharing that identity become hardlink entries.
     std::map<std::tuple<std::uint64_t, std::uint64_t, std::uint64_t>, std::string> hardlinks;
+    // Content identities completed earlier in this same writer pass. A later
+    // same-sized input is hashed before it enters the solid buffer and can reuse
+    // the earlier range. This makes initial creation and one add batch coalesce
+    // duplicate files without changing ordinary AXAR directory semantics.
+    std::map<ContentIdentity, ArchiveDataReference> batch_reuse_candidates;
+    std::unordered_set<std::uint64_t> batch_candidate_sizes;
 
     // The usual pipeline overlaps one reader with a codec that consumes all
     // cores. Thorough profiles are different: their ratio is limited by the
@@ -4714,6 +4825,8 @@ void compress_items_into(Output& out, std::uint64_t& written,
             file_total = 0;
         }
         const ReuseCandidate* reuse_candidate = nullptr;
+        ReuseCandidate batch_reuse_candidate;
+        bool reuse_candidate_verified = false;
         if (reuse_by_path != nullptr && !size_error && source_stamp_valid) {
             const auto found = reuse_by_path->find(item.archive_path);
             if (found != reuse_by_path->end() &&
@@ -4722,7 +4835,31 @@ void compress_items_into(Output& out, std::uint64_t& written,
                 reuse_candidate = &found->second;
             }
         }
-        if (reuse_candidate != nullptr) {
+        if (reuse_candidate == nullptr && !size_error && source_stamp_valid &&
+            batch_candidate_sizes.contains(file_total)) {
+            std::ifstream comparison;
+            if (open_input_with_retry(comparison, item.absolute,
+                                      options.input_open_retries, operation)) {
+                const auto identity = try_hash_input_stream(
+                    comparison, file_total, options, operation);
+                std::error_code comparison_stamp_error;
+                const auto comparison_stamp =
+                    fs::last_write_time(item.absolute, comparison_stamp_error);
+                const bool stamp_unchanged = !comparison_stamp_error &&
+                    static_cast<std::int64_t>(
+                        comparison_stamp.time_since_epoch().count()) == source_stamp;
+                if (identity && stamp_unchanged) {
+                    const auto found = batch_reuse_candidates.find(*identity);
+                    if (found != batch_reuse_candidates.end()) {
+                        batch_reuse_candidate = {
+                            *identity, found->second, source_stamp};
+                        reuse_candidate = &batch_reuse_candidate;
+                        reuse_candidate_verified = true;
+                    }
+                }
+            }
+        }
+        if (reuse_candidate != nullptr && !reuse_candidate_verified) {
             // The comparison pass runs before the archive is staged. Rehash a
             // candidate through a fresh handle so a same-size source mutation
             // between those phases cannot make the directory point at the wrong
@@ -4932,6 +5069,10 @@ void compress_items_into(Output& out, std::uint64_t& written,
         entry.blake3 = hasher.finalize();
         entry.has_blake3 = true;
         entry.ads = core::capture_ads(item.absolute);  // NTFS named streams (Win32 only)
+        batch_reuse_candidates.emplace(
+            content_identity(entry),
+            ArchiveDataReference{entry.first_block, entry.offset});
+        batch_candidate_sizes.insert(entry.size);
         entries.push_back(std::move(entry));
         ++completed_items;
         report_operation(operation, OperationStage::reading, displayed_progress(), total_bytes,
@@ -5212,7 +5353,7 @@ LoadedArchive load_index(const ByteSource& source, const std::string& password) 
         loaded.index = parse_directory(plain, layout.directory_offset, layout.flags);
         loaded.index.meta.encryption = enc;
         loaded.key = key;
-        validate_snapshot_index(loaded.index, layout);
+        validate_chunk_index(loaded.index, layout);
     } else {
         const auto directory = source.read(layout.directory_offset, layout.directory_size);
         loaded.index = parse_directory(directory, layout.directory_offset, layout.flags);
@@ -5227,7 +5368,7 @@ LoadedArchive load_index(const ByteSource& source, const std::string& password) 
         if (loaded.index.meta.encryption.enabled && !password.empty()) {
             loaded.key = derive_archive_key(loaded.index.meta.encryption, password);
         }
-        validate_snapshot_index(loaded.index, layout);
+        validate_chunk_index(loaded.index, layout);
     }
     loaded.index.meta.large_solid_blocks =
         (layout.flags & kFlagLargeSolidBlocks) != 0;
@@ -5367,6 +5508,9 @@ core::Blake3Digest archive_signature_digest(const ByteSource& source,
         }
     }
     if (index.meta.chunk_table) {
+        // Keep the legacy snapshot manifest prefix byte-for-byte stable so
+        // signatures made before the live-dedup profile was introduced remain
+        // verifiable. New profile fields are an optional suffix below.
         put_vint(manifest, index.meta.keyed_chunk_ids ? 1 : 0);
         put_vint(manifest, index.chunks.size());
         for (const auto& chunk : index.chunks) {
@@ -5388,6 +5532,20 @@ core::Blake3Digest archive_signature_digest(const ByteSource& source,
                 put_vint(manifest, body.size());
                 manifest.insert(manifest.end(), body.begin(), body.end());
             }
+        }
+        if (index.meta.live_dedup || index.meta.dedup_profile.present) {
+            put_vint(manifest, index.meta.live_dedup ? 1 : 0);
+            put_vint(manifest, index.meta.dedup_profile.present ? 1 : 0);
+        }
+        if (index.meta.dedup_profile.present) {
+            const auto& profile = index.meta.dedup_profile;
+            put_vint(manifest, profile.chunker);
+            put_vint(manifest, profile.chunker_version);
+            put_vint(manifest, profile.minimum_size);
+            put_vint(manifest, profile.average_size);
+            put_vint(manifest, profile.maximum_size);
+            put_vint(manifest, profile.table_id);
+            put_vint(manifest, profile.packing);
         }
     }
     put_vint(manifest, index.meta.comment.size());
@@ -5609,8 +5767,9 @@ DirectoryWriteResult write_directory_and_footer(
     bool write_footer = true,
     const std::vector<ChunkRec>* chunk_table = nullptr) {
     if (meta.chunk_table) {
-        if (chunk_table == nullptr || meta.snapshots.empty()) {
-            throw std::runtime_error("snapshot archive is missing its chunk table or manifest");
+        if (chunk_table == nullptr || (meta.live_dedup == !meta.snapshots.empty())) {
+            throw std::runtime_error(
+                "chunk-addressed archive has an invalid live/history mode");
         }
         if (meta.snapshots.size() > kMaxSnapshotCount ||
             chunk_table->size() > kMaxChunkCount) {
@@ -5618,6 +5777,9 @@ DirectoryWriteResult write_directory_and_footer(
         }
         if (meta.keyed_chunk_ids && !meta.encryption.enabled) {
             throw std::runtime_error("keyed chunk identifiers require archive encryption");
+        }
+        if (meta.live_dedup || meta.dedup_profile.present) {
+            validate_dedup_profile(meta.dedup_profile, false);
         }
         const auto validate_chunks = [&]() {
             for (const auto& chunk : *chunk_table) {
@@ -5637,28 +5799,28 @@ DirectoryWriteResult write_directory_and_footer(
                 if (entry.type != kEntryFile) {
                     if (!entry.chunk_refs.empty()) {
                         throw std::runtime_error(
-                            "non-file snapshot entry has chunk references");
+                            "non-file chunk-addressed entry has chunk references");
                     }
                     continue;
                 }
                 if (entry.chunk_refs.size() > kMaxChunkRefsPerEntry) {
-                    throw std::runtime_error("snapshot entry has too many chunk references");
+                        throw std::runtime_error("entry has too many chunk references");
                 }
                 std::uint64_t total = 0;
                 for (const auto ref : entry.chunk_refs) {
                     if (ref >= chunk_table->size()) {
                         throw std::runtime_error(
-                            "snapshot entry points outside the chunk table");
+                            "entry points outside the chunk table");
                     }
                     const auto size = (*chunk_table)[static_cast<std::size_t>(ref)]
                                           .identity.size;
                     if (total > entry.size || size > entry.size - total) {
-                        throw std::runtime_error("snapshot chunk sizes overflow the file");
+                        throw std::runtime_error("chunk sizes overflow the file");
                     }
                     total += size;
                 }
                 if (total != entry.size) {
-                    throw std::runtime_error("snapshot chunks do not cover the file");
+                    throw std::runtime_error("chunks do not cover the file");
                 }
             }
         };
@@ -5670,8 +5832,9 @@ DirectoryWriteResult write_directory_and_footer(
             }
             validate_entries(snapshot.entries);
         }
-    } else if (meta.keyed_chunk_ids || !meta.snapshots.empty()) {
-        throw std::runtime_error("snapshot metadata requires a chunk table");
+    } else if (meta.keyed_chunk_ids || !meta.snapshots.empty() || meta.live_dedup ||
+               meta.dedup_profile.present) {
+        throw std::runtime_error("chunk-addressed metadata requires a chunk table");
     }
     ByteVector directory;
     put_vint(directory, blocks.size());
@@ -5875,7 +6038,7 @@ DirectoryWriteResult write_directory_and_footer(
     }
     if (meta.chunk_table) {
         if (chunk_table == nullptr) {
-            throw std::runtime_error("snapshot archive is missing its chunk table");
+            throw std::runtime_error("chunk-addressed archive is missing its chunk table");
         }
         ByteVector payload;
         put_vint(payload, kChunkTableVersion);
@@ -5889,6 +6052,21 @@ DirectoryWriteResult write_directory_and_footer(
             put_vint(payload, chunk.offset);
         }
         put_vint(archive_extras, kArchiveChunkTable);
+        put_vint(archive_extras, payload.size());
+        archive_extras.insert(archive_extras.end(), payload.begin(), payload.end());
+        ++archive_extra_count;
+    }
+    if (meta.dedup_profile.present) {
+        ByteVector payload;
+        put_vint(payload, kDedupProfileVersion);
+        put_vint(payload, meta.dedup_profile.chunker);
+        put_vint(payload, meta.dedup_profile.chunker_version);
+        put_vint(payload, meta.dedup_profile.minimum_size);
+        put_vint(payload, meta.dedup_profile.average_size);
+        put_vint(payload, meta.dedup_profile.maximum_size);
+        put_vint(payload, meta.dedup_profile.table_id);
+        put_vint(payload, meta.dedup_profile.packing);
+        put_vint(archive_extras, kArchiveDedupProfile);
         put_vint(archive_extras, payload.size());
         archive_extras.insert(archive_extras.end(), payload.begin(), payload.end());
         ++archive_extra_count;
@@ -6253,6 +6431,14 @@ void rebuild_archive_keeping(const fs::path& archive_path,
                      total_bytes, reuse_stats.reused_items, reuse_stats.reused_bytes);
 }
 
+void append_live_dedup_items_to_archive_indexed(
+    const fs::path& archive_path, const std::vector<ScanItem>& items,
+    const CompressionOptions& options, ArchiveIndex existing,
+    unsigned existing_recovery_percent,
+    const std::unordered_set<std::string>* desired_paths,
+    bool phased_update,
+    const ArchiveSyncFinalization* finalization);
+
 // Append already-scanned items to an existing archive: existing block bytes are
 // copied verbatim and the items become new blocks, with same-path items replacing
 // the existing entry. Shared by add/update/sync. `meta_override`, when non-null,
@@ -6272,6 +6458,13 @@ void append_items_to_archive_indexed(
         throw std::runtime_error("archive is locked (read-only)");
     }
     if (existing.meta.chunk_table && !items.empty()) {
+        if (existing.meta.live_dedup && existing.meta.snapshots.empty()) {
+            append_live_dedup_items_to_archive_indexed(
+                archive_path, items, options, std::move(existing),
+                existing_recovery_percent, desired_paths, phased_update,
+                finalization);
+            return;
+        }
         throw std::runtime_error(
             "snapshot repositories require snapshot add for content changes");
     }
@@ -6728,7 +6921,7 @@ void rewrite_archive_directory(const fs::path& archive_path, ArchiveIndex index,
     if (index.meta.locked) {
         throw std::runtime_error("archive is locked (read-only)");
     }
-    if (index.meta.chunk_table) {
+    if (index.meta.chunk_table && !index.meta.snapshots.empty()) {
         throw std::runtime_error(
             "snapshot repositories do not support archive entry moves");
     }
@@ -6775,7 +6968,8 @@ void rewrite_archive_directory(const fs::path& archive_path, ArchiveIndex index,
     const core::CryptoKey* directory_key =
         index.meta.encryption.encrypt_directory && key ? &*key : nullptr;
     write_directory_and_footer(out, block_region_end, index.blocks, index.entries,
-                               index.meta, directory_key);
+                               index.meta, directory_key, true,
+                               index.meta.chunk_table ? &index.chunks : nullptr);
     if (key) {
         core::secure_wipe(*key);
     }
@@ -6797,7 +6991,19 @@ void rewrite_archive_directory(const fs::path& archive_path, ArchiveIndex index,
                      total_items, total_items);
 }
 
-using SnapshotChunkLookup = std::map<ChunkIdentity, std::uint64_t>;
+struct ChunkIdentityHash {
+    std::size_t operator()(const ChunkIdentity& identity) const noexcept {
+        std::size_t hash = static_cast<std::size_t>(identity.size);
+        for (const auto byte : identity.id) {
+            hash ^= static_cast<std::size_t>(byte) + 0x9e3779b9u +
+                    (hash << 6) + (hash >> 2);
+        }
+        return hash;
+    }
+};
+
+using SnapshotChunkLookup =
+    std::unordered_map<ChunkIdentity, std::uint64_t, ChunkIdentityHash>;
 
 SnapshotChunkLookup build_snapshot_chunk_lookup(const std::vector<ChunkRec>& chunks) {
     SnapshotChunkLookup lookup;
@@ -6833,6 +7039,7 @@ std::uint64_t append_snapshot_chunk(
 
     operation_checkpoint(operation);
     auto chunk_options = options;
+    chunk_options.enable_content_dedup = false;
     chunk_options.enable_snapshot_dedup = false;
     chunk_options.transform_ranges.clear();
     chunk_options.task_executor.reset();
@@ -6858,7 +7065,7 @@ std::uint64_t append_snapshot_chunk(
 }
 
 template <typename Output>
-std::vector<EntryRec> build_snapshot_entries(
+std::vector<EntryRec> build_chunked_entries(
     Output& out, std::uint64_t& written, std::vector<BlockRec>& blocks,
     std::vector<ChunkRec>& chunks, SnapshotChunkLookup& lookup,
     const std::vector<ScanItem>& items, const CompressionOptions& options,
@@ -7025,6 +7232,213 @@ std::vector<EntryRec> build_snapshot_entries(
     return entries;
 }
 
+void append_live_dedup_items_to_archive_indexed(
+    const fs::path& archive_path, const std::vector<ScanItem>& items,
+    const CompressionOptions& options, ArchiveIndex existing,
+    unsigned existing_recovery_percent,
+    const std::unordered_set<std::string>* desired_paths,
+    bool phased_update,
+    const ArchiveSyncFinalization* finalization) {
+    reject_volume_mutation(archive_path);
+    if (!existing.meta.live_dedup || !existing.meta.chunk_table ||
+        !existing.meta.snapshots.empty()) {
+        throw std::runtime_error("archive is not a live deduplicated archive");
+    }
+    if (existing.meta.locked) {
+        throw std::runtime_error("archive is locked (read-only)");
+    }
+
+    std::uint64_t physical_size = 0;
+    auto input = open_archive(archive_path, physical_size);
+    const ByteSource source(input, physical_size);
+    const auto layout = read_layout(source);
+    if (layout.footer_offset > std::numeric_limits<std::uint64_t>::max() - kFooterSize) {
+        throw FormatError("archive footer offset overflows append position");
+    }
+    const auto previous_end = layout.footer_offset + kFooterSize;
+    if (physical_size < previous_end) {
+        throw FormatError("archive is truncated before its selected footer");
+    }
+    if (layout.generation == std::numeric_limits<std::uint64_t>::max()) {
+        throw FormatError("archive generation number is exhausted");
+    }
+
+    std::optional<core::CryptoKey> key;
+    if (existing.meta.encryption.enabled) {
+        key = derive_archive_key(existing.meta.encryption, options.password);
+    }
+    OptionalKeyWipeGuard key_wipe{key};
+
+    auto meta = std::move(existing.meta);
+    meta.has_signature = false;
+    if (finalization != nullptr) {
+        if (finalization->comment) meta.comment = *finalization->comment;
+        if (finalization->lock_archive) meta.locked = true;
+    }
+    validate_dedup_profile(meta.dedup_profile, false);
+
+    std::unordered_set<std::string> new_paths;
+    new_paths.reserve(items.size());
+    for (const auto& item : items) new_paths.insert(item.archive_path);
+
+    std::vector<EntryRec> entries;
+    entries.reserve(existing.entries.size() + items.size());
+    for (auto& entry : existing.entries) {
+        const bool desired = desired_paths == nullptr ||
+            desired_paths->contains(entry.path);
+        if (desired && !new_paths.contains(entry.path)) {
+            entries.push_back(std::move(entry));
+        }
+    }
+    if (desired_paths != nullptr) {
+        std::unordered_set<std::string> retained;
+        retained.reserve(entries.size() + items.size());
+        for (const auto& entry : entries) retained.insert(entry.path);
+        for (const auto& item : items) retained.insert(item.archive_path);
+        std::erase_if(entries, [&retained](const EntryRec& entry) {
+            return entry.type == kEntryHardlink &&
+                   !retained.contains(entry.link_target);
+        });
+    }
+
+    auto blocks = std::move(existing.blocks);
+    auto chunks = std::move(existing.chunks);
+    auto lookup = build_snapshot_chunk_lookup(chunks);
+    const auto generation = layout.generation + 1;
+    const auto previous_footer_offset = layout.footer_offset;
+    const auto previous_directory_offset = layout.directory_offset;
+    const auto previous_directory_size = layout.directory_size;
+    const auto previous_generation_offset = layout.generation_offset;
+    const unsigned recovery_percent = options.recovery_percent != 0
+        ? options.recovery_percent : existing_recovery_percent;
+    input.close();
+
+    try {
+        if (physical_size != previous_end) {
+            std::error_code trim_error;
+            fs::resize_file(archive_path, previous_end, trim_error);
+            if (trim_error) {
+                throw fs::filesystem_error(
+                    "failed to discard an incomplete archive generation",
+                    archive_path, trim_error);
+            }
+        }
+
+        std::ofstream out(archive_path, std::ios::binary | std::ios::app);
+        if (!out) {
+            throw std::runtime_error("cannot open deduplicated archive for append");
+        }
+        if (phased_update && options.operation) options.operation->set_progress_phase(3, 6);
+        std::uint64_t written = previous_end;
+        ArchiveReuseStats reuse_stats;
+        auto chunk_options = options_for_dedup_profile(options, meta.dedup_profile);
+        chunk_options.enable_content_dedup = true;
+        chunk_options.enable_snapshot_dedup = false;
+        chunk_options.keyed_chunk_ids = meta.keyed_chunk_ids;
+        auto added_entries = build_chunked_entries(
+            out, written, blocks, chunks, lookup, items, chunk_options,
+            options.operation, key ? &*key : nullptr, meta.keyed_chunk_ids,
+            meta, reuse_stats);
+        entries.insert(entries.end(),
+                       std::make_move_iterator(added_entries.begin()),
+                       std::make_move_iterator(added_entries.end()));
+        validate_snapshot_entry_paths_for_write(entries);
+
+        const auto actual_version = archive_header_version(entries, meta);
+        const auto actual_flags = archive_header_flags(entries, meta);
+        if (actual_version != layout.version || actual_flags != layout.flags) {
+            throw std::runtime_error(
+                "deduplicated append requires an unexpected header feature change");
+        }
+
+        const core::CryptoKey* directory_key =
+            meta.encryption.encrypt_directory && key ? &*key : nullptr;
+        const auto unsigned_directory = write_directory_and_footer(
+            out, written, blocks, entries, meta, directory_key, false, &chunks);
+        out.close();
+        if (!out) throw std::runtime_error("failed to close deduplicated archive directory");
+
+        if (finalization != nullptr && finalization->signing_key != nullptr) {
+            append_generation_trailer(
+                archive_path, unsigned_directory.directory_offset,
+                unsigned_directory.directory_size, generation,
+                previous_footer_offset, previous_directory_offset,
+                previous_directory_size, previous_generation_offset, 0,
+                options.operation, options.thread_count, previous_end);
+
+            std::uint64_t staged_size = 0;
+            auto staged_input = open_archive(archive_path, staged_size);
+            const ByteSource staged_source(staged_input, staged_size);
+            const ArchiveLayout staged_layout = read_layout(staged_source);
+            ArchiveIndex signing_index{blocks, entries, chunks, meta};
+            const auto digest = archive_signature_digest(
+                staged_source, staged_layout, signing_index);
+            const auto signature = core::sign_message(
+                finalization->signing_key->secret_key, digest);
+            if (!core::verify_message(
+                    finalization->signing_key->public_key, signature, digest)) {
+                throw std::invalid_argument(
+                    "signing key public and secret components do not match");
+            }
+            staged_input.close();
+            meta.has_signature = true;
+            meta.signature_public_key = finalization->signing_key->public_key;
+            meta.signature = signature;
+
+            std::error_code truncate_error;
+            fs::resize_file(archive_path, unsigned_directory.directory_offset,
+                            truncate_error);
+            if (truncate_error) {
+                throw fs::filesystem_error(
+                    "failed to stage deduplicated archive signature",
+                    archive_path, truncate_error);
+            }
+            std::ofstream signed_output(
+                archive_path, std::ios::binary | std::ios::app);
+            if (!signed_output) {
+                throw std::runtime_error(
+                    "cannot reopen deduplicated archive for signing");
+            }
+            const auto signed_directory = write_directory_and_footer(
+                signed_output, unsigned_directory.directory_offset, blocks,
+                entries, meta, directory_key, false, &chunks);
+            signed_output.close();
+            append_generation_trailer(
+                archive_path, signed_directory.directory_offset,
+                signed_directory.directory_size, generation,
+                previous_footer_offset, previous_directory_offset,
+                previous_directory_size, previous_generation_offset,
+                recovery_percent, options.operation, options.thread_count,
+                previous_end);
+        } else {
+            append_generation_trailer(
+                archive_path, unsigned_directory.directory_offset,
+                unsigned_directory.directory_size, generation,
+                previous_footer_offset, previous_directory_offset,
+                previous_directory_size, previous_generation_offset,
+                recovery_percent, options.operation, options.thread_count,
+                previous_end);
+        }
+
+        if (phased_update && options.operation) options.operation->set_progress_phase(5, 6);
+        const auto logical_bytes = std::accumulate(
+            entries.begin(), entries.end(), std::uint64_t{0},
+            [](std::uint64_t total, const EntryRec& entry) {
+                return entry.type == kEntryFile ? total + entry.size : total;
+            });
+        const auto source_bytes = scanned_file_bytes(items);
+        report_operation(
+            options.operation, OperationStage::finalizing, source_bytes,
+            source_bytes, items.size(), items.size(), {}, 0, 0, source_bytes,
+            static_cast<std::uint64_t>(fs::file_size(archive_path)),
+            logical_bytes, reuse_stats.reused_items, reuse_stats.reused_bytes);
+    } catch (...) {
+        std::error_code rollback_error;
+        fs::resize_file(archive_path, previous_end, rollback_error);
+        throw;
+    }
+}
+
 std::int64_t snapshot_now() {
     return std::chrono::duration_cast<std::chrono::seconds>(
                std::chrono::system_clock::now().time_since_epoch())
@@ -7046,6 +7460,12 @@ void require_snapshot_profile(const ArchiveIndex& index) {
     if (!index.meta.chunk_table || index.meta.snapshots.empty()) {
         throw std::runtime_error(
             "archive is not a snapshot repository; create one with the snapshot command");
+    }
+}
+
+void require_chunk_profile(const ArchiveIndex& index) {
+    if (!index.meta.chunk_table) {
+        throw std::runtime_error("archive does not use chunk-addressed content");
     }
 }
 
@@ -7262,11 +7682,117 @@ void rewrite_archive_password(const fs::path& archive_path,
     temp_guard.dismiss();
 }
 
+void create_chunked_archive_impl(
+    const std::vector<std::filesystem::path>& inputs,
+    const fs::path& archive_path,
+    const std::optional<std::string>& snapshot_name,
+    const CompressionOptions& options) {
+    reject_volume_mutation(archive_path);
+    if (snapshot_name) validate_snapshot_name(*snapshot_name);
+
+    const auto operation = options.operation;
+    report_operation(operation, OperationStage::scanning, 0, 0, 0, inputs.size());
+    std::vector<ScanItem> items;
+    for (const auto& input : inputs) {
+        operation_checkpoint(operation);
+        scan_input(input, items);
+    }
+
+    CompressionOptions chunk_options = options;
+    chunk_options.enable_content_dedup = !snapshot_name.has_value();
+    chunk_options.enable_snapshot_dedup = snapshot_name.has_value();
+    const bool keyed = !options.password.empty() && options.keyed_chunk_ids;
+
+    fs::path temp_path = archive_path;
+    temp_path += ".tmp";
+    TempFileGuard temp_guard(temp_path);
+    std::ofstream out(temp_path, std::ios::binary | std::ios::trunc);
+    if (!out) {
+        throw std::runtime_error("cannot create deduplicated archive: " +
+                                 core::path_to_utf8(temp_path));
+    }
+
+    ArchiveMeta meta;
+    meta.chunk_table = true;
+    meta.live_dedup = !snapshot_name.has_value();
+    meta.keyed_chunk_ids = keyed;
+    meta.dedup_profile = dedup_profile_from_options(chunk_options);
+    core::CryptoKey key{};
+    struct KeyWipeGuard {
+        core::CryptoKey& key;
+        ~KeyWipeGuard() { core::secure_wipe(key); }
+    } key_wipe{key};
+    const core::CryptoKey* key_ptr = nullptr;
+    const bool encrypt_dir = !options.password.empty() && options.encrypt_header;
+    if (!options.password.empty()) {
+        auto [enc, derived] = options.use_encryption_v2
+            ? make_encryption_v2(options.password)
+            : make_encryption(options.password);
+        enc.encrypt_directory = encrypt_dir;
+        meta.encryption = std::move(enc);
+        key = derived;
+        key_ptr = &key;
+    }
+
+    auto header = archive_header_bytes(
+        archive_header_version({}, meta), archive_header_flags({}, meta));
+    out.write(reinterpret_cast<const char*>(header.data()),
+              static_cast<std::streamsize>(header.size()));
+    std::uint64_t written = header.size();
+    if (encrypt_dir) {
+        const auto preamble = serialize_encryption_preamble(meta.encryption);
+        out.write(reinterpret_cast<const char*>(preamble.data()),
+                  static_cast<std::streamsize>(preamble.size()));
+        written += preamble.size();
+    }
+    if (!out) throw std::runtime_error("failed to write deduplicated archive header");
+
+    std::vector<BlockRec> blocks;
+    std::vector<ChunkRec> chunks;
+    SnapshotChunkLookup lookup;
+    ArchiveReuseStats reuse_stats;
+    const auto entries = build_chunked_entries(
+        out, written, blocks, chunks, lookup, items, chunk_options, operation,
+        key_ptr, keyed, meta, reuse_stats);
+    if (snapshot_name) {
+        meta.snapshots.push_back({*snapshot_name, 0, snapshot_now(), entries});
+    }
+
+    out.seekp(0, std::ios::beg);
+    header = archive_header_bytes(archive_header_version(entries, meta),
+                                  archive_header_flags(entries, meta));
+    out.write(reinterpret_cast<const char*>(header.data()),
+              static_cast<std::streamsize>(header.size()));
+    out.seekp(0, std::ios::end);
+    if (!out) throw std::runtime_error("failed to finalize deduplicated archive header");
+    const auto source_bytes = scanned_file_bytes(items);
+    report_operation(operation, OperationStage::finalizing, source_bytes, source_bytes,
+                     items.size(), items.size(), {}, 0, 0, source_bytes, written,
+                     source_bytes, reuse_stats.reused_items, reuse_stats.reused_bytes);
+    write_directory_and_footer(out, written, blocks, entries, meta,
+                               encrypt_dir ? key_ptr : nullptr, true, &chunks);
+    core::secure_wipe(key);
+    if (options.recovery_percent != 0) {
+        append_recovery_to_staged_archive(
+            temp_path, options.recovery_percent, operation, options.thread_count);
+    }
+    replace_archive_file(temp_path, archive_path);
+    temp_guard.dismiss();
+    report_operation(operation, OperationStage::finalizing, source_bytes, source_bytes,
+                     items.size(), items.size(), {}, 0, 0, source_bytes,
+                     static_cast<std::uint64_t>(fs::file_size(archive_path)),
+                     source_bytes, reuse_stats.reused_items, reuse_stats.reused_bytes);
+}
+
 }  // namespace
 
 void create_archive(const std::vector<std::filesystem::path>& inputs,
-                    const std::filesystem::path& archive_path,
-                    const CompressionOptions& options) {
+                     const std::filesystem::path& archive_path,
+                     const CompressionOptions& options) {
+    if (options.enable_content_dedup) {
+        create_chunked_archive_impl(inputs, archive_path, std::nullopt, options);
+        return;
+    }
     reject_volume_mutation(archive_path);
     const auto operation = options.operation;
     report_operation(operation, OperationStage::scanning, 0, 0, 0, inputs.size());
@@ -7327,16 +7853,18 @@ void create_archive(const std::vector<std::filesystem::path>& inputs,
 
     std::vector<BlockRec> blocks;
     std::vector<EntryRec> entries;
+    ArchiveReuseStats reuse_stats;
     compress_items_into(out, written, blocks, entries, items, options, block_size, operation,
                         total_bytes, total_items, completed_bytes, completed_items,
-                        options.skip_unreadable_files, key_ptr, &meta);
+                        options.skip_unreadable_files, key_ptr, &meta, nullptr, &reuse_stats);
 
     patch_archive_header(out, archive_header_version(entries, meta),
                          archive_header_flags(entries, meta));
 
     report_operation(operation, OperationStage::finalizing, completed_bytes, total_bytes,
                      completed_items, total_items, {}, 0, 0, completed_bytes,
-                     written, completed_bytes);
+                     written, completed_bytes, reuse_stats.reused_items,
+                     reuse_stats.reused_bytes);
     write_directory_and_footer(out, written, blocks, entries, meta,
                                encrypt_dir ? key_ptr : nullptr);
     core::secure_wipe(key);
@@ -7354,7 +7882,7 @@ void create_archive(const std::vector<std::filesystem::path>& inputs,
     report_operation(operation, OperationStage::finalizing, total_bytes, total_bytes,
                      total_items, total_items, {}, 0, 0, total_bytes,
                      static_cast<std::uint64_t>(fs::file_size(archive_path)),
-                     total_bytes);
+                     total_bytes, reuse_stats.reused_items, reuse_stats.reused_bytes);
 }
 
 void create_snapshot_archive(
@@ -7362,99 +7890,8 @@ void create_snapshot_archive(
     const std::filesystem::path& archive_path,
     const std::string& snapshot_name,
     const CompressionOptions& options) {
-    reject_volume_mutation(archive_path);
-    validate_snapshot_name(snapshot_name);
     if (inputs.empty()) throw std::invalid_argument("snapshot needs at least one input");
-
-    const auto operation = options.operation;
-    report_operation(operation, OperationStage::scanning, 0, 0, 0, inputs.size());
-    std::vector<ScanItem> items;
-    for (const auto& input : inputs) {
-        operation_checkpoint(operation);
-        scan_input(input, items);
-    }
-
-    CompressionOptions snapshot_options = options;
-    snapshot_options.enable_snapshot_dedup = true;
-    const bool keyed = !options.password.empty() && options.keyed_chunk_ids;
-
-    fs::path temp_path = archive_path;
-    temp_path += ".tmp";
-    TempFileGuard temp_guard(temp_path);
-    std::ofstream out(temp_path, std::ios::binary | std::ios::trunc);
-    if (!out) {
-        throw std::runtime_error("cannot create snapshot archive: " +
-                                 core::path_to_utf8(temp_path));
-    }
-
-    ArchiveMeta meta;
-    meta.chunk_table = true;
-    meta.keyed_chunk_ids = keyed;
-    core::CryptoKey key{};
-    struct KeyWipeGuard {
-        core::CryptoKey& key;
-        ~KeyWipeGuard() { core::secure_wipe(key); }
-    } key_wipe{key};
-    const core::CryptoKey* key_ptr = nullptr;
-    const bool encrypt_dir = !options.password.empty() && options.encrypt_header;
-    if (!options.password.empty()) {
-        auto [enc, derived] = options.use_encryption_v2
-            ? make_encryption_v2(options.password)
-            : make_encryption(options.password);
-        enc.encrypt_directory = encrypt_dir;
-        meta.encryption = std::move(enc);
-        key = derived;
-        key_ptr = &key;
-    }
-
-    auto header = archive_header_bytes(
-        archive_header_version({}, meta), archive_header_flags({}, meta));
-    out.write(reinterpret_cast<const char*>(header.data()),
-              static_cast<std::streamsize>(header.size()));
-    std::uint64_t written = header.size();
-    if (encrypt_dir) {
-        const auto preamble = serialize_encryption_preamble(meta.encryption);
-        out.write(reinterpret_cast<const char*>(preamble.data()),
-                  static_cast<std::streamsize>(preamble.size()));
-        written += preamble.size();
-    }
-    if (!out) throw std::runtime_error("failed to write snapshot archive header");
-
-    std::vector<BlockRec> blocks;
-    std::vector<ChunkRec> chunks;
-    SnapshotChunkLookup lookup;
-    ArchiveReuseStats reuse_stats;
-    const auto entries = build_snapshot_entries(
-        out, written, blocks, chunks, lookup, items, snapshot_options, operation,
-        key_ptr, keyed, meta, reuse_stats);
-    meta.snapshots.push_back({snapshot_name, 0, snapshot_now(), entries});
-
-    out.seekp(0, std::ios::beg);
-    header = archive_header_bytes(archive_header_version(entries, meta),
-                                  archive_header_flags(entries, meta));
-    out.write(reinterpret_cast<const char*>(header.data()),
-              static_cast<std::streamsize>(header.size()));
-    out.seekp(0, std::ios::end);
-    if (!out) throw std::runtime_error("failed to finalize snapshot archive header");
-    report_operation(operation, OperationStage::finalizing, scanned_file_bytes(items),
-                     scanned_file_bytes(items), items.size(), items.size(), {}, 0, 0,
-                     scanned_file_bytes(items), written, scanned_file_bytes(items),
-                     reuse_stats.reused_items, reuse_stats.reused_bytes);
-    write_directory_and_footer(out, written, blocks, entries, meta,
-                               encrypt_dir ? key_ptr : nullptr, true, &chunks);
-    core::secure_wipe(key);
-    if (options.recovery_percent != 0) {
-        append_recovery_to_staged_archive(
-            temp_path, options.recovery_percent, operation, options.thread_count);
-    }
-    replace_archive_file(temp_path, archive_path);
-    temp_guard.dismiss();
-    report_operation(operation, OperationStage::finalizing, scanned_file_bytes(items),
-                     scanned_file_bytes(items), items.size(), items.size(), {}, 0, 0,
-                     scanned_file_bytes(items),
-                     static_cast<std::uint64_t>(fs::file_size(archive_path)),
-                     scanned_file_bytes(items), reuse_stats.reused_items,
-                     reuse_stats.reused_bytes);
+    create_chunked_archive_impl(inputs, archive_path, snapshot_name, options);
 }
 
 void add_archive_snapshot(
@@ -7531,9 +7968,11 @@ void add_archive_snapshot(
         std::ofstream out(archive_path, std::ios::binary | std::ios::app);
         if (!out) throw std::runtime_error("cannot open snapshot repository for append");
         std::uint64_t written = previous_end;
-        CompressionOptions snapshot_options = options;
+        CompressionOptions snapshot_options = meta.dedup_profile.present
+            ? options_for_dedup_profile(options, meta.dedup_profile)
+            : options;
         snapshot_options.enable_snapshot_dedup = true;
-        const auto entries = build_snapshot_entries(
+        const auto entries = build_chunked_entries(
             out, written, blocks, chunks, lookup, items, snapshot_options, operation,
             loaded.key ? &*loaded.key : nullptr, keyed, meta, reuse_stats);
         meta.snapshots.push_back({snapshot_name, generation, snapshot_now(), entries});
@@ -7803,6 +8242,10 @@ void create_archive_to_stream(
         throw std::invalid_argument(
             "stream archive output does not support recovery records; write a file archive first");
     }
+    if (options.enable_content_dedup) {
+        throw std::invalid_argument(
+            "deduplicated AXAR output requires a seekable file archive");
+    }
 
     const auto operation = options.operation;
     report_operation(operation, OperationStage::scanning, 0, 0, 0, inputs.size());
@@ -7952,6 +8395,27 @@ void delete_from_archive(const std::filesystem::path& archive_path,
         }
         return false;
     };
+    ArchiveIndex index;
+    {
+        std::uint64_t file_size = 0;
+        auto input = open_archive(archive_path, file_size);
+        const ByteSource source(input, file_size);
+        index = load_index(source, options.password).index;
+    }
+    if (index.meta.live_dedup) {
+        std::erase_if(index.entries, [&](const EntryRec& entry) {
+            return is_deleted(entry.path);
+        });
+        std::unordered_set<std::string> kept_paths;
+        kept_paths.reserve(index.entries.size());
+        for (const auto& entry : index.entries) kept_paths.insert(entry.path);
+        std::erase_if(index.entries, [&kept_paths](const EntryRec& entry) {
+            return entry.type == kEntryHardlink &&
+                   !kept_paths.contains(entry.link_target);
+        });
+        rewrite_archive_directory(archive_path, std::move(index), options);
+        return;
+    }
     rebuild_archive_keeping(
         archive_path, [&](const EntryRec& entry) { return !is_deleted(entry.path); }, options);
 }
@@ -7968,10 +8432,10 @@ void repack_snapshot_archive(const std::filesystem::path& archive_path,
     const auto recovery = read_recovery_service(source, layout);
     auto loaded = load_index(source, options.password);
     OptionalKeyWipeGuard key_wipe{loaded.key};
-    require_snapshot_profile(loaded.index);
+    require_chunk_profile(loaded.index);
     if (loaded.index.meta.locked) throw std::runtime_error("archive is locked (read-only)");
     if (loaded.index.meta.encryption.enabled && !loaded.key) {
-        throw std::runtime_error("encrypted snapshot repository requires a password to repack");
+        throw std::runtime_error("encrypted chunk-addressed archive requires a password to repack");
     }
 
     try {
@@ -8627,6 +9091,13 @@ ArchiveEncryptionMode archive_encryption_mode(const std::filesystem::path& archi
 
 bool archive_is_encrypted(const std::filesystem::path& archive_path) {
     return archive_encryption_mode(archive_path) != ArchiveEncryptionMode::none;
+}
+
+bool archive_is_deduplicated(const std::filesystem::path& archive_path) {
+    std::uint64_t file_size = 0;
+    auto in = open_archive(archive_path, file_size);
+    const ByteSource source(in, file_size);
+    return (read_layout(source).flags & kFlagLiveDedup) != 0;
 }
 
 bool archive_is_snapshot_repository(const std::filesystem::path& archive_path) {

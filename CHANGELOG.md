@@ -14,6 +14,15 @@ Entries are condensed from the
 
 ## [Unreleased]
 
+### Added
+
+- Added an opt-in AXAR v5 live-deduplication profile (`axiomc a --dedup`) with
+  persisted content-defined chunk geometry, keyed identities for encrypted
+  archives, mutable add/update/sync/delete/move workflows, and repack garbage
+  collection. Snapshot repositories now share the same versioned chunk engine.
+- Coalesced exact whole-file duplicates during an ordinary archive's initial
+  create pass instead of waiting for a later add or repack.
+
 ### Changed
 
 - Simplified the operation progress window. It now shows six lines and two

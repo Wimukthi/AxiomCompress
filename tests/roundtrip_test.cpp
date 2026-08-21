@@ -2960,7 +2960,7 @@ void test_axar_version_fixtures_and_validation() {
     // Unknown required flags must never be silently downgraded to v4 behavior.
     {
         auto bytes = v4_bytes;
-        bytes[10] = 0x80;
+        bytes[11] = 0x01;
         write_all(bad, bytes);
         expect_throws([&] { (void)axiom::list_archive(bad); });
     }
@@ -2974,6 +2974,13 @@ void test_axar_version_fixtures_and_validation() {
     {
         auto bytes = v4_bytes;
         bytes[10] = 0x08;
+        write_all(bad, bytes);
+        expect_throws([&] { (void)axiom::list_archive(bad); });
+    }
+    // Live deduplication is v5 and requires both its table and persisted profile.
+    {
+        auto bytes = v5_bytes;
+        bytes[10] |= 0x80;
         write_all(bad, bytes);
         expect_throws([&] { (void)axiom::list_archive(bad); });
     }
@@ -3220,14 +3227,22 @@ void test_archive_content_reuse() {
     axiom::extract_archive(encrypted, encrypted_output, encrypted_extract);
     AXIOM_CHECK(read_all(encrypted_output / "copies" / "duplicate.bin") == payload);
 
-    // A newly-created archive can contain duplicate entries; repack should
-    // coalesce them using the directory's existing BLAKE3 identities.
+    // Duplicate inputs in the same create pass should share their range
+    // immediately; repack retains that identity-based coalescing.
     const auto repack_first = root / "repack-first.bin";
     const auto repack_second = root / "repack-second.bin";
     write_all(repack_first, payload);
     write_all(repack_second, payload);
     const auto repack_archive = root / "reuse-repack.axar";
-    axiom::create_archive({repack_first, repack_second}, repack_archive, {});
+    auto create_operation = std::make_shared<axiom::OperationControl>();
+    axiom::CompressionOptions create_options;
+    create_options.operation = create_operation;
+    axiom::create_archive(
+        {repack_first, repack_second}, repack_archive, create_options);
+    const auto create_progress = create_operation->latest_progress();
+    AXIOM_CHECK(create_progress.has_value());
+    AXIOM_CHECK(create_progress->reused_items == 1);
+    AXIOM_CHECK(create_progress->reused_bytes == payload.size());
     auto repack_operation = std::make_shared<axiom::OperationControl>();
     axiom::CompressionOptions repack_options;
     repack_options.operation = repack_operation;
@@ -3241,6 +3256,141 @@ void test_archive_content_reuse() {
     axiom::extract_archive(repack_archive, repack_output, {});
     AXIOM_CHECK(read_all(repack_output / "repack-first.bin") == payload);
     AXIOM_CHECK(read_all(repack_output / "repack-second.bin") == payload);
+
+    std::error_code ec;
+    fs::remove_all(root, ec);
+}
+
+void test_archive_live_dedup() {
+    const auto root = make_temp_dir();
+    const auto source = root / "source";
+    fs::create_directories(source);
+
+    const auto make_payload = [](std::size_t size, std::uint32_t seed) {
+        std::vector<std::uint8_t> bytes(size);
+        std::uint32_t state = seed;
+        for (auto& byte : bytes) {
+            state = state * 1664525u + 1013904223u;
+            byte = static_cast<std::uint8_t>(state >> 24);
+        }
+        return bytes;
+    };
+    const auto shared = make_payload(192u << 10, 0xD3D0A11u);
+    const auto other = make_payload(96u << 10, 0x51ECA11u);
+    write_all(source / "a.bin", shared);
+    write_all(source / "b.bin", shared);
+    write_all(source / "other.bin", other);
+
+    axiom::CompressionOptions options;
+    options.enable_content_dedup = true;
+    options.thread_count = 1;
+    options.snapshot_min_chunk_size = 4u << 10;
+    options.snapshot_average_chunk_size = 8u << 10;
+    options.snapshot_max_chunk_size = 16u << 10;
+    options.operation = std::make_shared<axiom::OperationControl>();
+    const auto archive = root / "live-dedup.axar";
+    axiom::create_archive({source}, archive, options);
+
+    AXIOM_CHECK(axiom::archive_is_deduplicated(archive));
+    AXIOM_CHECK(!axiom::archive_is_snapshot_repository(archive));
+    const auto* provider = axiom::archive_provider_for_path(archive);
+    AXIOM_CHECK(provider != nullptr);
+    AXIOM_CHECK(provider->capabilities(archive).deduplicated_archive);
+    const auto created_progress = options.operation->latest_progress();
+    AXIOM_CHECK(created_progress.has_value());
+    AXIOM_CHECK(created_progress->reused_bytes >= shared.size());
+    axiom::test_archive(archive);
+
+    // History and live-mutation profiles are intentionally mutually exclusive.
+    {
+        auto malformed = read_all(archive);
+        malformed[10] |= 0x20;
+        const auto bad = root / "live-and-snapshot.axar";
+        write_all(bad, malformed);
+        expect_throws([&] { (void)axiom::list_archive(bad); });
+    }
+
+    const auto duplicate = root / "duplicate.bin";
+    write_all(duplicate, shared);
+    axiom::CompressionOptions add_options;
+    add_options.operation = std::make_shared<axiom::OperationControl>();
+    axiom::add_to_archive(
+        std::vector<axiom::ArchiveInput>{{duplicate, "copies/a.bin"}},
+        archive, add_options);
+    const auto add_progress = add_options.operation->latest_progress();
+    AXIOM_CHECK(add_progress.has_value());
+    AXIOM_CHECK(add_progress->reused_bytes == shared.size());
+
+    auto changed = shared;
+    for (std::size_t index = 71u << 10; index < (75u << 10); ++index) {
+        changed[index] ^= static_cast<std::uint8_t>(0x5Au + (index & 7u));
+    }
+    write_all(duplicate, changed);
+    axiom::add_to_archive(
+        std::vector<axiom::ArchiveInput>{{duplicate, "source/a.bin"}},
+        archive, {});
+    axiom::move_archive_entries(
+        archive, {axiom::ArchiveMove{"copies/a.bin", "moved/a.bin"}}, {});
+    axiom::delete_from_archive(archive, {"source/b.bin"}, {});
+
+    axiom::test_archive(archive);
+
+    const auto output = root / "output";
+    axiom::extract_archive(archive, output, {});
+    AXIOM_CHECK(read_all(output / "source" / "a.bin") == changed);
+    AXIOM_CHECK(read_all(output / "source" / "other.bin") == other);
+    AXIOM_CHECK(read_all(output / "moved" / "a.bin") == shared);
+    AXIOM_CHECK(!fs::exists(output / "source" / "b.bin"));
+
+    // A mapped sync keeps the archive in the same profile, adds new chunks,
+    // and removes every live path outside the desired source tree.
+    write_all(source / "a.bin", changed);
+    fs::remove(source / "b.bin");
+    fs::remove(source / "other.bin");
+    const auto synced = make_payload(80u << 10, 0xA11CE55u);
+    write_all(source / "new.bin", synced);
+    axiom::sync_archive(
+        std::vector<axiom::ArchiveInput>{{source, "source"}}, archive, {});
+    const auto before_repack = fs::file_size(archive);
+    axiom::repack_archive(archive, {});
+    AXIOM_CHECK(fs::file_size(archive) <= before_repack);
+    AXIOM_CHECK(axiom::archive_is_deduplicated(archive));
+    axiom::test_archive(archive);
+    const auto sync_output = root / "sync-output";
+    axiom::extract_archive(archive, sync_output, {});
+    AXIOM_CHECK(read_all(sync_output / "source" / "a.bin") == changed);
+    AXIOM_CHECK(read_all(sync_output / "source" / "new.bin") == synced);
+    AXIOM_CHECK(!fs::exists(sync_output / "moved"));
+    AXIOM_CHECK(!fs::exists(sync_output / "source" / "other.bin"));
+
+    const auto signing_key = axiom::generate_archive_signing_key();
+    axiom::sign_archive(archive, signing_key);
+    const auto signature = axiom::verify_archive_signature(
+        archive, {}, signing_key.public_key);
+    AXIOM_CHECK(signature.present && signature.valid && signature.trusted_key);
+    axiom::add_to_archive(
+        std::vector<axiom::ArchiveInput>{{duplicate, "post-sign.bin"}},
+        archive, {});
+    AXIOM_CHECK(!axiom::verify_archive_signature(archive).present);
+    axiom::test_archive(archive);
+
+    axiom::CompressionOptions encrypted = options;
+    encrypted.operation.reset();
+    encrypted.password = "live-dedup-password";
+    encrypted.encrypt_header = true;
+    encrypted.use_encryption_v2 = true;
+    const auto encrypted_archive = root / "live-dedup-encrypted.axar";
+    axiom::create_archive({source}, encrypted_archive, encrypted);
+    axiom::CompressionOptions encrypted_add = encrypted;
+    encrypted_add.enable_content_dedup = false;
+    axiom::add_to_archive(
+        std::vector<axiom::ArchiveInput>{{duplicate, "encrypted-copy.bin"}},
+        encrypted_archive, encrypted_add);
+    axiom::DecompressionOptions encrypted_read;
+    encrypted_read.password = encrypted.password;
+    axiom::test_archive(encrypted_archive, encrypted_read);
+    axiom::repack_archive(encrypted_archive, encrypted_add);
+    axiom::test_archive(encrypted_archive, encrypted_read);
 
     std::error_code ec;
     fs::remove_all(root, ec);
@@ -5800,6 +5950,7 @@ int main() {
     test_archive_hardlinks();
     test_archive_add();
     test_archive_content_reuse();
+    test_archive_live_dedup();
     test_archive_snapshots();
     test_archive_file_manager_apis();
     test_archive_delete_repack();

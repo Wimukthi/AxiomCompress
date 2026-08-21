@@ -222,6 +222,7 @@ public:
         // reports the precise error.
         try {
             result.snapshot_repository = archive_is_snapshot_repository(archive_path);
+            result.deduplicated_archive = archive_is_deduplicated(archive_path);
             const auto encryption_mode = archive_encryption_mode(archive_path);
             result.encrypted = encryption_mode != ArchiveEncryptionMode::none;
             result.directory_encrypted =

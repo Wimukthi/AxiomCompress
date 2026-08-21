@@ -61,8 +61,8 @@ struct ArchiveEntry {
     bool has_reparse_data = false;
     std::uint32_t reparse_tag = 0;
     std::vector<std::uint8_t> reparse_data;
-    // Number of content-defined chunks used by a snapshot entry. Zero means
-    // either an empty file or the ordinary solid-block profile.
+    // Number of content-defined chunks used by a live-dedup or snapshot entry.
+    // Zero means either an empty file or the ordinary solid-block profile.
     std::uint64_t chunk_count = 0;
     std::vector<ArchiveSubframeRange> subframes;
 };
@@ -241,6 +241,9 @@ struct ArchiveCapabilities {
     // Path-specific state: true when this existing AXAR uses the snapshot
     // chunk-table profile. Snapshot content changes must use snapshot APIs.
     bool snapshot_repository = false;
+    // Path-specific state: true when the live directory is chunk-addressed and
+    // ordinary mutations preserve that deduplication profile.
+    bool deduplicated_archive = false;
     bool sfx = false;
     bool locked = false;
     bool encrypted = false;
@@ -506,12 +509,12 @@ CompressionEstimateCurveResult estimate_compression_curve(
     const std::function<void(const CompressionEstimateCurveResult&)>&
         progress_callback = {});
 
-// Add files/directories to an existing archive. Existing files are not
-// recompressed — their solid blocks are copied verbatim and new files become new
-// blocks appended after them, then the directory is rebuilt. An added path that
-// matches an existing entry replaces it (the old data remains as dead space until a
-// future repack). Compatible updates append a generation and retain the previous
-// footer; header-changing cases use the atomic temporary-file path.
+// Add files/directories to an existing archive. Ordinary AXAR retains existing
+// solid blocks; a live-deduplicated AXAR reuses its content-defined chunks and
+// appends only new identities. An added path that matches an existing entry
+// replaces it (unreachable data remains until repack). Compatible updates append
+// a generation and retain the previous footer; header-changing cases use the
+// atomic temporary-file path.
 void add_to_archive(const std::vector<std::filesystem::path>& inputs,
                     const std::filesystem::path& archive_path,
                     const CompressionOptions& options = {});
@@ -522,16 +525,17 @@ void add_to_archive(const std::vector<ArchiveInput>& inputs,
                     const std::filesystem::path& archive_path,
                     const CompressionOptions& options = {});
 
-// Remove entries from an archive. A directory path removes its whole subtree. The
-// archive is rebuilt keeping only the surviving entries, so the removed data's space
-// is reclaimed (live files are re-solidified into fresh blocks). A hard link whose
-// target is removed is dropped. Written atomically.
+// Remove entries from an archive. A directory path removes its whole subtree. An
+// ordinary archive is rebuilt and reclaims removed data immediately; live dedup
+// rewrites the directory while retaining unreachable chunks for repack. A hard
+// link whose target is removed is dropped.
 void delete_from_archive(const std::filesystem::path& archive_path,
                          const std::vector<std::string>& paths,
                          const CompressionOptions& options = {});
 
 // Rebuild an archive in place, reclaiming dead space left by earlier replace/delete
-// operations and re-solidifying the surviving files. Content is unchanged.
+// operations. Ordinary files are re-solidified; chunk-addressed archives run a
+// mark/copy/remap garbage collection pass. Content is unchanged.
 void repack_archive(const std::filesystem::path& archive_path,
                     const CompressionOptions& options = {});
 
@@ -639,6 +643,9 @@ ArchiveCaptureReport archive_capture_report(
 // Whether the archive is password-encrypted (block contents, and possibly the
 // directory). Never needs a password itself.
 bool archive_is_encrypted(const std::filesystem::path& archive_path);
+// Whether the AXAR stores its live entry set as content-defined chunk references.
+// This is distinct from a snapshot repository, whose chunk table retains history.
+bool archive_is_deduplicated(const std::filesystem::path& archive_path);
 bool archive_is_snapshot_repository(const std::filesystem::path& archive_path);
 
 // Distinguish block-only encryption from encrypted-directory mode, which requires

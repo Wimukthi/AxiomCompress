@@ -24,6 +24,7 @@ them in plain language.
 - [The interactive shell](#the-interactive-shell)
 - [Every command at a glance](#every-command-at-a-glance)
 - [Creating and updating archives](#creating-and-updating-archives)
+- [Deduplicated archives](#deduplicated-archives)
 - [Snapshot repositories](#snapshot-repositories)
 - [Writing to standard output](#writing-to-standard-output)
 - [Listing, testing, and extracting](#listing-testing-and-extracting)
@@ -176,6 +177,31 @@ rename it into place atomically.
 If an append is interrupted halfway, readers that understand generations ignore
 the incomplete tail and fall back to the previous valid footer. The archive
 survives.
+
+## Deduplicated archives
+
+Use `--dedup` when creating an AXAR whose live contents contain repeated or
+mostly-similar files. Axiom cuts files at content-defined boundaries and stores
+each distinct chunk once:
+
+```powershell
+axiomc a --dedup backup.axar "D:\Projects"
+```
+
+This is an archive profile chosen at creation time. Later `a`, `u`, `f`, `s`,
+`delete`, and move operations detect it automatically; do not repeat `--dedup`.
+New and changed files append only chunks that are not already in the archive.
+Deleted and replaced chunks become unreachable but remain on disk until
+`axiomc repack backup.axar` performs garbage collection.
+
+Tune the stable per-archive chunk geometry with `--chunk-min SIZE`,
+`--chunk-average SIZE`, and `--chunk-max SIZE`. The defaults are 256 KiB,
+1 MiB, and 4 MiB. For encrypted archives, chunk identities are keyed with the
+archive key by default; `--plain-chunks` deliberately exposes equality instead.
+
+`--dedup` requires a seekable AXAR file and cannot be combined with stdout
+archive output. It does not add history: use a snapshot repository when old
+filesystem views must remain restorable.
 
 ## Snapshot repositories
 
@@ -730,6 +756,11 @@ in.
 | `--no-sparse` | Don't capture sparse allocation maps |
 | `--strict-metadata` | Fail if source metadata or sparse layout can't be captured |
 | `--recovery N` | Add `1..100`% recovery data |
+| `--dedup` | Select live content-defined deduplication when creating a new AXAR |
+| `--chunk-min SIZE` | Minimum content-defined chunk size |
+| `--chunk-average SIZE` | Target content-defined chunk size |
+| `--chunk-max SIZE` | Maximum content-defined chunk size |
+| `--keyed-chunks` / `--plain-chunks` | Hide or expose equality in encrypted chunk identities |
 
 #### Threads
 

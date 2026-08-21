@@ -305,29 +305,34 @@ selection or hard-link resolution needs it. Shared reader statistics count the
 physical archive bytes fetched, so the CLI and the progress window can show
 what a selected restore actually cost.
 
-### Snapshot deduplication
+### Content-addressed deduplication
 
-The snapshot profile is isolated behind the AXAR v5 required chunk-table flag,
-which keeps it from leaking into ordinary archive paths.
+The shared chunk engine has two isolated AXAR v5 profiles: snapshot history
+behind required flag `0x0020`, and a mutable live archive behind `0x0080`.
+The flags are mutually exclusive, so old readers fail closed and ordinary AXAR
+archives are never silently converted.
 
-`build_snapshot_entries` scans each regular file once, feeds bounded
+`build_chunked_entries` scans each regular file once, feeds bounded
 content-defined chunks to the normal block writer, and consults a stable
-`(logical_size, BLAKE3)` identity table before writing a new chunk. Encrypted
+hash table keyed by `(logical_size, BLAKE3)` before writing a new chunk. Encrypted
 repositories use a keyed BLAKE3 identity derived from the archive data key by
 default, so an observer can't learn chunk equality from the table.
-`EntryRec::chunk_refs` is the only content address a snapshot entry uses, and
-`BlockSource::chunk` validates both the stored CRC and the identity before
+`EntryRec::chunk_refs` is the only content address a chunk-addressed entry uses,
+and `BlockSource::chunk` validates both the stored CRC and the identity before
 exposing bytes to extraction, testing, or restore.
 
-The archive metadata carries both the live directory and bounded historical
+Snapshot metadata carries both the live directory and bounded historical
 manifests. `add_archive_snapshot` appends new chunk blocks and one generation
 directory, while list and diff operate purely on manifest data and never decode
 unchanged content. `restore_archive_snapshot` temporarily selects a historical
 entry catalogue while keeping the same chunk table and reader validation.
 
-Ordinary content-mutation paths reject a chunk-table archive outright. That
-prevents a legacy update, sync, delete, or move from silently dropping history.
-Metadata-only directory rewrites preserve the chunk table.
+Snapshot repositories reject ordinary mutation so update, sync, delete, or move
+cannot silently drop history. Live-dedup archives route those same operations
+through the chunk catalogue: additions and replacements append only new
+identities, directory-only changes retain existing references, and deletions
+leave unreachable chunks for garbage collection. The archive-level profile
+persists chunker version and geometry so later writes cannot drift.
 
 `prune_archive_snapshots` appends a manifest-only generation and protects the
 current snapshot from deletion. `repack_snapshot_archive` marks every chunk
@@ -336,7 +341,8 @@ blocks, remaps chunk and entry addresses, re-seals encrypted blocks with their
 new block-index associated data, and rebuilds recovery data. Snapshot
 repositories therefore get an explicit garbage-collection boundary, without
 changing old archives and without pretending historical chunks are ordinary
-dead solid ranges.
+dead solid ranges. The same mark/copy/remap engine compacts a live-dedup archive
+from its current catalogue alone.
 
 ### Providers
 

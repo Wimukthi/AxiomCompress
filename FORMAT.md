@@ -20,7 +20,7 @@ is being wrong.
 
 > **Compatibility baseline.** AXAR v4 remains readable indefinitely. AXAR v5 is
 > an additive container revision for required fidelity metadata, encryption-v2,
-> snapshot repositories, and the large solid-block profile; readers reject
+> snapshot repositories, live content deduplication, and the large solid-block profile; readers reject
 > required features they do not understand instead of silently losing them. The
 > append-generation record described below is an additive v4/v5 extension and
 > does not change the header version. The current v4 and v5 golden fixtures
@@ -89,7 +89,7 @@ scanning.
 |---|---|---|
 | `magic` | `u8[8]` | `"AXIOMAR\0"` |
 | `version` | `u16` | `4` for the baseline container, `5` when v5 fidelity metadata or encryption-v2 is present |
-| `flags` | `u16` | Required-feature flags. `0x0001` = encrypted directory, `0x0002` = sparse entry maps, `0x0004` = source-capture warning report, `0x0008` = extended metadata (ACL/xattr/reparse payloads), `0x0010` = encryption-v2 password slots, `0x0020` = snapshot chunk table and manifest, `0x0040` = large solid-block profile. **A reader must reject any bit it does not understand** |
+| `flags` | `u16` | Required-feature flags. `0x0001` = encrypted directory, `0x0002` = sparse entry maps, `0x0004` = source-capture warning report, `0x0008` = extended metadata (ACL/xattr/reparse payloads), `0x0010` = encryption-v2 password slots, `0x0020` = snapshot chunk table and manifest, `0x0040` = large solid-block profile, `0x0080` = live content-defined deduplication. **A reader must reject any bit it does not understand** |
 | `reserved` | `u32` | Must be `0` |
 
 ## Solid blocks
@@ -297,8 +297,9 @@ Archive-wide service data. Unknown types are skipped by their length.
 | 4 | signature | Signer public key (32 bytes) + Monocypher EdDSA signature (64 bytes) |
 | 5 | capture_report | `vint warning_count`, then `vint path_len`, UTF-8 path, `vint message_len`, UTF-8 message for each incomplete source capture |
 | 6 | encryption_v2 | Key identifier plus one or more password slots (see [Encryption](#encryption)) |
-| 7 | chunk_table | Snapshot chunk-table version, keyed-ID flag, and chunk records: logical size, CRC-32, BLAKE3 identity, block index, and block offset |
+| 7 | chunk_table | Chunk-table version, keyed-ID flag, and chunk records: logical size, CRC-32, BLAKE3 identity, block index, and block offset |
 | 8 | snapshot_manifest | Snapshot manifest version and bounded named snapshot records. Each record contains generation, creation time, and length-prefixed snapshot entry bodies |
+| 9 | dedup_profile | Profile version, chunker ID/version, minimum/average/maximum chunk sizes, table ID, and packing mode |
 
 Recovery data is deliberately kept **outside** this TLV, so repair can locate it
 even when the protected directory itself is the damaged part.
@@ -385,7 +386,7 @@ u8[]     payload
 | 9 | security_descriptor | Bounded self-relative Windows security descriptor; maximum 64 KiB |
 | 10 | xattr | `vint name_len`, UTF-8 attribute name, then the raw value; maximum 1 MiB per value and 128 values per entry |
 | 11 | reparse | `vint tag`, `vint data_len`, and the bounded opaque Windows reparse buffer; restored only after content writes |
-| 12 | chunk_refs | Snapshot-only: `vint profile_version 1`, `vint reference_count`, then chunk-table indices |
+| 12 | chunk_refs | Chunk-addressed file content: `vint profile_version 1`, `vint reference_count`, then chunk-table indices |
 
 Readers consume the records they understand and **skip the rest by
 `payload_len`**.
@@ -398,37 +399,50 @@ Multiple file entries may intentionally share the same (`first_block`,
 `offset`) pair. **Readers must treat data ranges as shareable** rather than
 assuming every entry owns a unique range — deduplication depends on it.
 
-### Snapshot repositories and chunk deduplication
+### Content-defined chunk deduplication
 
-The snapshot profile sets required header flag `0x0020` and writes AXAR v5.
+AXAR has two mutually exclusive chunk-addressed profiles. Snapshot repositories
+set required header flag `0x0020` and retain named history. Live deduplicated
+archives set required flag `0x0080`, keep only the current entry catalogue, and
+support ordinary add/update/fresh/sync/delete/move workflows. Both write AXAR
+v5 and use archive extra type 7 plus entry extra type 12.
 
-Instead of giving each snapshot file a single solid-block address, the archive
-stores a content-defined sequence of independently addressable chunks. The
-default boundaries target 256 KiB minimum, 1 MiB average, and 4 MiB maximum;
-the exact geometry is writer policy and is recorded only through the resulting
-chunk references. Each distinct chunk is compressed once, and the current entry
-stores an ordered list of chunk-table indices. A changed file therefore reuses
-unchanged chunks from earlier snapshots, and only genuinely new chunks are
-appended.
+Instead of giving each file a single solid-block address, these profiles store
+a content-defined sequence of independently addressable chunks. The default
+boundaries target 256 KiB minimum, 1 MiB average, and 4 MiB maximum. Each
+distinct chunk is compressed once, and the current entry stores an ordered list
+of chunk-table indices. A changed file therefore reuses unchanged chunks, and
+only genuinely new chunks are appended.
 
 **Archive extra type 7** is the chunk table. Each record contains the logical
 chunk size, CRC-32, a 32-byte BLAKE3 identity, and the block and offset holding
 the chunk bytes. With keyed identifiers enabled, the BLAKE3 identity is keyed
 by the archive data key — the key itself is never stored in the identifier.
-Keyed IDs are the default for encrypted snapshot repositories; `--plain-chunks`
+Keyed IDs are the default for encrypted chunk-addressed archives; `--plain-chunks`
 exists for when equality across separate encrypted repositories is an
 intentional requirement. Every extracted chunk is checked against both its CRC
 and its identity before it is returned to the file stream.
 
-**Archive extra type 8** is the snapshot manifest. It stores a bounded unique
+**Archive extra type 9** is the deduplication profile. Version 1 records the
+FastCDC-style chunker (`chunker = 1`, `chunker_version = 1`), minimum/average/
+maximum sizes, chunk-table identity (`table_id = 1`), and independent-block
+packing (`packing = 0`). Unsupported identifiers or invalid geometry are a
+format error. New snapshot repositories also write this record; older snapshot
+repositories without it remain readable.
+
+**Archive extra type 8** is snapshot-only. It stores a bounded unique
 name, generation number, creation time, and a complete entry catalogue for each
 snapshot. Manifest entry bodies use the same path, content, sparse, link, and
 metadata semantics as the live directory, plus entry extra type 12. The live
 directory *is* the newest snapshot, so ordinary listing, testing, and
 extraction remain correct without selecting a historical snapshot at all.
 
-Snapshot creation and addition are append-compatible. `prune` removes selected
-historical manifests but never the current one. `repack` marks chunks reachable
+Live-dedup updates append only new chunks and a new generation directory.
+Replaced or deleted chunks remain unreachable until `repack`, which marks the
+current entry references, copies each reachable chunk once, and remaps the
+table. Snapshot creation and addition are likewise append-compatible. `prune`
+removes selected historical manifests but never the current one. `repack` marks
+chunks reachable
 from the current and retained manifests, copies only their blocks, and remaps
 every reference — that is snapshot garbage collection.
 
@@ -778,7 +792,7 @@ Older readers reject AXC `9` and `10`, so an archive written with an external
 method requires Axiom 0.7.0.0 or newer.
 
 Existing AXAR v4 archives remain readable. An archive with encryption-v2,
-sparse maps, a capture report, or a snapshot chunk table is AXAR v5 and requires
+sparse maps, a capture report, or either chunk-addressed profile is AXAR v5 and requires
 a reader that understands the corresponding required flags — a v4 reader must
 reject it, rather than silently restoring a dense file or hiding a capture loss.
 An archive with extended ACL, xattr, or reparse metadata also uses AXAR v5 and
@@ -787,6 +801,10 @@ requires the `0x0008` flag.
 Snapshot repositories additionally require `0x0020`. Readers that don't
 implement the snapshot profile must reject the archive rather than treating
 chunk references as ordinary contiguous block addresses.
+
+Live-deduplicated archives additionally require `0x0080`. It is mutually
+exclusive with `0x0020`; readers must reject an archive carrying both profiles
+or a live-dedup flag without its chunk table and deduplication profile.
 
 Large-solid-block archives additionally require `0x0040`. Readers that don't
 implement bounded external LZMA2 subframes must reject them rather than applying

@@ -100,6 +100,7 @@ Some common variations:
 axiomc a --level 9 archive.axar mydir                                   # smallest result
 axiomc a --method lzma2 --codec-level 7 archive.axar mydir               # use LZMA2 instead
 axiomc a -p "correct horse battery staple" --encrypt-names private.axar secrets
+axiomc a --dedup backup.axar "D:\Projects"                               # store repeated chunks once
 axiomc a --recovery 10 backup.axar "D:\Work"                             # add repair data
 axiomc sfx archive.axar installer.exe                                    # make a self-extractor
 ```
