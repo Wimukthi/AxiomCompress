@@ -1156,6 +1156,7 @@ bool TooltipManager::create(HWND owner, UINT layout_dpi, bool dark) {
     SetWindowSubclass(owner_, &TooltipManager::owner_subclass_proc,
                       reinterpret_cast<UINT_PTR>(this),
                       reinterpret_cast<DWORD_PTR>(this));
+    relay_windows_.push_back(owner_);
     SetWindowPos(hwnd_, HWND_TOPMOST, 0, 0, 0, 0,
                  SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
     SendMessageW(hwnd_, TTM_SETDELAYTIME, TTDT_INITIAL, 500);
@@ -1208,11 +1209,33 @@ bool TooltipManager::add(HWND control, const wchar_t* text) {
         SendMessageW(hwnd_, TTM_ADDTOOLW, 0,
                      reinterpret_cast<LPARAM>(&overlay)) != FALSE;
     if (overlay_added) tools_.push_back(entry);
-    return child_tool_added || overlay_added;
+    attach_relay_chain(control);
+    bool nested_edit_added = false;
+    if (lstrcmpiW(class_name, L"COMBOBOX") == 0) {
+        COMBOBOXINFO info{sizeof(info)};
+        if (GetComboBoxInfo(control, &info) && info.hwndItem != nullptr &&
+            info.hwndItem != control) {
+            // Editable combo boxes route pointer input to their inner EDIT.
+            // Register it with the same explanation so the tooltip does not
+            // disappear over the part where the user actually types.
+            nested_edit_added = add(info.hwndItem, text);
+        }
+    }
+    return child_tool_added || overlay_added || nested_edit_added;
 }
 
 void TooltipManager::remove(HWND control) {
     if (hwnd_ == nullptr || control == nullptr) return;
+    wchar_t class_name[32]{};
+    if (GetClassNameW(control, class_name,
+                      static_cast<int>(std::size(class_name))) > 0 &&
+        lstrcmpiW(class_name, L"COMBOBOX") == 0) {
+        COMBOBOXINFO info{sizeof(info)};
+        if (GetComboBoxInfo(control, &info) && info.hwndItem != nullptr &&
+            info.hwndItem != control) {
+            remove(info.hwndItem);
+        }
+    }
     TOOLINFOW tool{};
     tool.cbSize = TTTOOLINFOW_V1_SIZE;
     tool.uFlags = TTF_IDISHWND;
@@ -1260,20 +1283,41 @@ void TooltipManager::apply_theme(bool dark) {
 }
 
 void TooltipManager::destroy() {
-    if (owner_ != nullptr && IsWindow(owner_)) {
-        RemoveWindowSubclass(owner_, &TooltipManager::owner_subclass_proc,
-                             reinterpret_cast<UINT_PTR>(this));
+    for (HWND relay_window : relay_windows_) {
+        if (relay_window != nullptr && IsWindow(relay_window)) {
+            RemoveWindowSubclass(relay_window,
+                                 &TooltipManager::owner_subclass_proc,
+                                 reinterpret_cast<UINT_PTR>(this));
+        }
     }
     if (hwnd_ != nullptr && IsWindow(hwnd_)) DestroyWindow(hwnd_);
     hwnd_ = nullptr;
     owner_ = nullptr;
     tools_.clear();
+    relay_windows_.clear();
 }
 
 UINT_PTR TooltipManager::overlay_id(HWND control) {
     constexpr UINT_PTR high_bit =
         static_cast<UINT_PTR>(1) << (sizeof(UINT_PTR) * 8 - 1);
     return reinterpret_cast<UINT_PTR>(control) ^ high_bit;
+}
+
+void TooltipManager::attach_relay_chain(HWND control) {
+    if (control == nullptr || owner_ == nullptr) return;
+    for (HWND parent = GetParent(control);
+         parent != nullptr && parent != owner_;
+         parent = GetParent(parent)) {
+        if (std::find(relay_windows_.begin(), relay_windows_.end(), parent) !=
+            relay_windows_.end()) {
+            continue;
+        }
+        if (SetWindowSubclass(parent, &TooltipManager::owner_subclass_proc,
+                              reinterpret_cast<UINT_PTR>(this),
+                              reinterpret_cast<DWORD_PTR>(this))) {
+            relay_windows_.push_back(parent);
+        }
+    }
 }
 
 void TooltipManager::update_rect(TOOLINFOW& tool, HWND control) const {
@@ -1293,7 +1337,13 @@ LRESULT CALLBACK TooltipManager::owner_subclass_proc(
     if (message == WM_NCDESTROY) {
         RemoveWindowSubclass(hwnd, &TooltipManager::owner_subclass_proc,
                              subclass_id);
-        if (self != nullptr) self->owner_ = nullptr;
+        if (self != nullptr) {
+            self->relay_windows_.erase(
+                std::remove(self->relay_windows_.begin(),
+                            self->relay_windows_.end(), hwnd),
+                self->relay_windows_.end());
+            if (self->owner_ == hwnd) self->owner_ = nullptr;
+        }
         return DefSubclassProc(hwnd, message, wparam, lparam);
     }
     if (message == WM_SIZE) {
@@ -1310,11 +1360,17 @@ LRESULT CALLBACK TooltipManager::owner_subclass_proc(
             case WM_RBUTTONUP:
             case WM_MBUTTONDOWN:
             case WM_MBUTTONUP: {
+                POINT client_point{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
+                if (self->owner_ != nullptr && hwnd != self->owner_) {
+                    MapWindowPoints(hwnd, self->owner_, &client_point, 1);
+                }
                 MSG relay{};
-                relay.hwnd = hwnd;
+                relay.hwnd = self->owner_;
                 relay.message = message;
                 relay.wParam = wparam;
-                relay.lParam = lparam;
+                relay.lParam = MAKELPARAM(
+                    static_cast<short>(client_point.x),
+                    static_cast<short>(client_point.y));
                 relay.time = static_cast<DWORD>(GetMessageTime());
                 const DWORD cursor = GetMessagePos();
                 relay.pt.x = static_cast<short>(LOWORD(cursor));
@@ -1798,43 +1854,71 @@ int restore_named_window_placement(HWND window, HWND owner, std::wstring_view na
     if (window == nullptr) return SW_SHOW;
     WINDOWPLACEMENT placement{sizeof(placement)};
     UINT saved_dpi = 0;
-    if (!g_dialog_appearance.center_child_windows &&
-        read_window_placement(name, placement, saved_dpi) &&
-        window_placement_is_visible(placement)) {
-        const int show_command =
-            placement.showCmd == SW_SHOWMAXIMIZED ? SW_SHOWMAXIMIZED : SW_SHOW;
+    if (read_window_placement(name, placement, saved_dpi)) {
+        const long long saved_width =
+            static_cast<long long>(placement.rcNormalPosition.right) -
+            placement.rcNormalPosition.left;
+        const long long saved_height =
+            static_cast<long long>(placement.rcNormalPosition.bottom) -
+            placement.rcNormalPosition.top;
+        if (saved_width >= 64 && saved_height >= 64 &&
+            saved_width <= INT_MAX && saved_height <= INT_MAX) {
+            const int show_command = placement.showCmd == SW_SHOWMAXIMIZED
+                ? SW_SHOWMAXIMIZED : SW_SHOW;
+            const bool restore_saved_position =
+                !g_dialog_appearance.center_child_windows &&
+                window_placement_is_visible(placement);
 
-        // WINDOWPLACEMENT stores physical pixels for a per-monitor-aware window.
-        // Move first so Windows establishes the destination monitor DPI, then
-        // convert the persisted normal size from its saved DPI exactly once.
-        SetWindowPos(window, nullptr,
-                     placement.rcNormalPosition.left,
-                     placement.rcNormalPosition.top,
-                     0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
-        const UINT target_dpi = GetDpiForWindow(window);
-        if (saved_dpi >= 48 && saved_dpi <= 768 && target_dpi != 0 &&
-            target_dpi != saved_dpi) {
-            const int width = MulDiv(
-                placement.rcNormalPosition.right - placement.rcNormalPosition.left,
-                static_cast<int>(target_dpi), static_cast<int>(saved_dpi));
-            const int height = MulDiv(
-                placement.rcNormalPosition.bottom - placement.rcNormalPosition.top,
-                static_cast<int>(target_dpi), static_cast<int>(saved_dpi));
-            placement.rcNormalPosition.right = placement.rcNormalPosition.left + width;
-            placement.rcNormalPosition.bottom = placement.rcNormalPosition.top + height;
+            // WINDOWPLACEMENT stores physical pixels for a per-monitor-aware
+            // window. Move first so Windows establishes the destination monitor
+            // DPI, then convert the persisted normal size exactly once.
+            if (restore_saved_position) {
+                SetWindowPos(window, nullptr,
+                             placement.rcNormalPosition.left,
+                             placement.rcNormalPosition.top,
+                             0, 0,
+                             SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+            }
+            const UINT target_dpi = GetDpiForWindow(window);
+            int width = static_cast<int>(saved_width);
+            int height = static_cast<int>(saved_height);
+            if (saved_dpi >= 48 && saved_dpi <= 768 && target_dpi != 0 &&
+                target_dpi != saved_dpi) {
+                width = MulDiv(width, static_cast<int>(target_dpi),
+                               static_cast<int>(saved_dpi));
+                height = MulDiv(height, static_cast<int>(target_dpi),
+                                static_cast<int>(saved_dpi));
+            }
+
+            const RECT work = owner_or_primary_work_area(
+                restore_saved_position ? window : owner);
+            const int work_width = (std::max)(64L, work.right - work.left);
+            const int work_height = (std::max)(64L, work.bottom - work.top);
+            width = std::clamp(width, 64, work_width);
+            height = std::clamp(height, 64, work_height);
+
+            int x = placement.rcNormalPosition.left;
+            int y = placement.rcNormalPosition.top;
+            if (!restore_saved_position) {
+                const POINT position = centered_window_position(owner, width, height);
+                x = position.x;
+                y = position.y;
+            } else {
+                x = std::clamp(x, static_cast<int>(work.left),
+                               (std::max)(static_cast<int>(work.left),
+                                          static_cast<int>(work.right) - width));
+                y = std::clamp(y, static_cast<int>(work.top),
+                               (std::max)(static_cast<int>(work.top),
+                                          static_cast<int>(work.bottom) - height));
+            }
+            // SetWindowPlacement also applies showCmd and can expose a hidden
+            // window before its dark non-client frame and first client frame
+            // are ready. Restore the normal geometry directly and let the
+            // caller show the fully initialized window once.
+            SetWindowPos(window, nullptr, x, y, width, height,
+                         SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+            return show_command;
         }
-        // SetWindowPlacement also applies showCmd and can expose a hidden
-        // window before its dark non-client frame and first client frame are
-        // ready. Restore the normal geometry directly and let the caller show
-        // the fully initialized window once.
-        SetWindowPos(
-            window, nullptr,
-            placement.rcNormalPosition.left,
-            placement.rcNormalPosition.top,
-            placement.rcNormalPosition.right - placement.rcNormalPosition.left,
-            placement.rcNormalPosition.bottom - placement.rcNormalPosition.top,
-            SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
-        return show_command;
     }
 
     RECT rect{};
@@ -1847,8 +1931,7 @@ int restore_named_window_placement(HWND window, HWND owner, std::wstring_view na
 }
 
 void save_named_window_placement(std::wstring_view name, HWND window) {
-    if (g_dialog_appearance.center_child_windows ||
-        window == nullptr || !IsWindow(window)) return;
+    if (window == nullptr || !IsWindow(window)) return;
     WINDOWPLACEMENT placement{sizeof(placement)};
     if (!GetWindowPlacement(window, &placement)) return;
     if (placement.showCmd == SW_SHOWMINIMIZED) placement.showCmd = SW_SHOWNORMAL;

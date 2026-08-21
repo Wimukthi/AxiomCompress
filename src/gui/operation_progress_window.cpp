@@ -294,6 +294,7 @@ void OperationProgressWindow::rebuild_font() {
 }
 
 void OperationProgressWindow::create_controls() {
+    tooltip_.create(hwnd_, dpi_, theme_.dark);
     constexpr DWORD telemetry_style =
         WS_CHILD | WS_VISIBLE | SS_LEFT | SS_CENTERIMAGE | SS_NOPREFIX | SS_ENDELLIPSIS;
     for (HWND& control : telemetry_fields_) {
@@ -315,6 +316,15 @@ void OperationProgressWindow::create_controls() {
     SendMessageW(pause_button_, WM_SETFONT, reinterpret_cast<WPARAM>(font_), TRUE);
     SendMessageW(cancel_button_, WM_SETFONT, reinterpret_cast<WPARAM>(font_), TRUE);
     SendMessageW(details_button_, WM_SETFONT, reinterpret_cast<WPARAM>(font_), TRUE);
+    add_dialog_tooltip(
+        tooltip_, pause_button_,
+        L"Pause the operation at its next safe checkpoint. Select Resume to continue.");
+    add_dialog_tooltip(
+        tooltip_, cancel_button_,
+        L"Request cancellation. The active codec or file operation stops at its next safe checkpoint.");
+    add_dialog_tooltip(
+        tooltip_, details_button_,
+        L"Show or hide elapsed-time, update-age, and archive-read diagnostics.");
     if (!pause_available_) ShowWindow(pause_button_, SW_HIDE);
     update_telemetry_fields();
 }
@@ -326,6 +336,7 @@ void OperationProgressWindow::apply_theme() {
     apply_dialog_control_theme(pause_button_, theme_.dark);
     apply_dialog_control_theme(cancel_button_, theme_.dark);
     apply_dialog_control_theme(details_button_, theme_.dark);
+    tooltip_.apply_theme(theme_.dark);
     InvalidateRect(hwnd_, nullptr, TRUE);
     for (HWND control : telemetry_fields_) {
         if (control != nullptr) InvalidateRect(control, nullptr, TRUE);
@@ -866,6 +877,7 @@ LRESULT OperationProgressWindow::handle_message(UINT message, WPARAM wparam, LPA
             SendMessageW(pause_button_, WM_SETFONT, reinterpret_cast<WPARAM>(font_), TRUE);
             SendMessageW(cancel_button_, WM_SETFONT, reinterpret_cast<WPARAM>(font_), TRUE);
             SendMessageW(details_button_, WM_SETFONT, reinterpret_cast<WPARAM>(font_), TRUE);
+            tooltip_.update_dpi(dpi_);
             layout();
             return 0;
         }

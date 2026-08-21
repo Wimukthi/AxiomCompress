@@ -5,8 +5,8 @@
 IDI_AXIOM_SFX ICON "..\\..\\Icons\\axiom.ico"
 
 VS_VERSION_INFO VERSIONINFO
- FILEVERSION 0,10,0,0
- PRODUCTVERSION 0,10,0,0
+ FILEVERSION 0,10,1,0
+ PRODUCTVERSION 0,10,1,0
  FILEFLAGSMASK 0x3fL
 #ifdef _DEBUG
  FILEFLAGS 0x1L
@@ -23,11 +23,11 @@ BEGIN
         BEGIN
             VALUE "CompanyName", "Wimukthi Bandara"
             VALUE "FileDescription", "Axiom console self-extractor"
-            VALUE "FileVersion", "0.10.0.0"
+            VALUE "FileVersion", "0.10.1.0"
             VALUE "InternalName", "AxiomSfxMini"
             VALUE "OriginalFilename", "AxiomSfxMini.bin"
             VALUE "ProductName", "Axiom"
-            VALUE "ProductVersion", "0.10.0.0"
+            VALUE "ProductVersion", "0.10.1.0"
         END
     END
     BLOCK "VarFileInfo"

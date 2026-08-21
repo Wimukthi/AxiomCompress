@@ -1494,6 +1494,7 @@ private:
         create_font();
         window_brush_ = CreateSolidBrush(palette_.window);
         edit_brush_ = CreateSolidBrush(palette_.edit);
+        tooltip_.create(window_, dpi_, palette_.dark);
         hex_edit_ = create_control(
             L"EDIT", L"", WS_TABSTOP | WS_BORDER | ES_CENTER |
                            ES_UPPERCASE | ES_AUTOHSCROLL,
@@ -1508,6 +1509,9 @@ private:
             WS_TABSTOP | BS_DEFPUSHBUTTON | BS_OWNERDRAW, kAcceptColor);
         cancel_ = create_control(
             L"BUTTON", L"Cancel", WS_TABSTOP | BS_OWNERDRAW, kCancelColor);
+        add_dialog_tooltip(
+            tooltip_, hex_edit_,
+            L"Enter a hexadecimal RGB color as #RRGGBB, for example #FFB93C. The preview updates after a valid value is entered.");
         sync_hex_edit();
         layout();
     }
@@ -1758,6 +1762,7 @@ private:
                                      reinterpret_cast<WPARAM>(font_), TRUE);
                     }
                 }
+                tooltip_.update_dpi(dpi_);
                 layout();
                 InvalidateRect(window_, nullptr, FALSE);
                 return 0;
@@ -1928,6 +1933,7 @@ private:
     HFONT font_ = nullptr;
     HBRUSH window_brush_ = nullptr;
     HBRUSH edit_brush_ = nullptr;
+    TooltipManager tooltip_;
     HWND hex_edit_ = nullptr;
     HWND accept_ = nullptr;
     HWND cancel_ = nullptr;
@@ -2062,6 +2068,7 @@ private:
         set_dark_title(window_, palette_.dark);
         apply_axiom_window_icons(window_, instance_);
         rebuild_font();
+        tooltip_.create(window_, dpi_, palette_.dark);
 
         description_ = CreateWindowExW(
             0, L"STATIC",
@@ -2091,6 +2098,21 @@ private:
         defaults_ = button(L"Defaults", kDefaults);
         accept_ = button(L"OK", kAccept);
         cancel_ = button(L"Cancel", kCancel);
+        add_dialog_tooltip(
+            tooltip_, table_.hwnd(),
+            L"Select a column to change. Double-click or press Space to show or hide it; the Name column is always visible and stays first.");
+        add_dialog_tooltip(
+            tooltip_, toggle_,
+            L"Show or hide the selected file-list column. The Name column cannot be hidden.");
+        add_dialog_tooltip(
+            tooltip_, move_up_,
+            L"Move the selected column one position to the left. The Name column stays first.");
+        add_dialog_tooltip(
+            tooltip_, move_down_,
+            L"Move the selected column one position to the right.");
+        add_dialog_tooltip(
+            tooltip_, defaults_,
+            L"Restore Axiom's default visible columns, widths, and order in this editor.");
         layout();
     }
 
@@ -2235,6 +2257,7 @@ private:
                              SWP_NOZORDER | SWP_NOACTIVATE);
                 rebuild_font();
                 apply_axiom_window_icons(window_, instance_);
+                tooltip_.update_dpi(dpi_);
                 layout();
                 return 0;
             }
@@ -2318,6 +2341,7 @@ private:
     HBRUSH window_brush_ = nullptr;
     HBRUSH edit_brush_ = nullptr;
     HFONT font_ = nullptr;
+    TooltipManager tooltip_;
     HWND description_ = nullptr;
     DarkTableView table_;
     HWND toggle_ = nullptr;
@@ -2936,6 +2960,9 @@ private:
         rebuild_toolbar_settings_image_list();
         refresh_toolbar_settings_list();
         settings_controls_.push_back({toolbar_list_.hwnd(), page, x, y, width, height, false});
+        add_dialog_tooltip(
+            tooltip_, toolbar_list_.hwnd(),
+            L"Select a command to show or hide it on the main toolbar. Double-click a row to toggle its status.");
 
         toolbar_status_combo_ = control(
             L"COMBOBOX", L"",
@@ -2953,6 +2980,9 @@ private:
         SendMessageW(toolbar_status_combo_, CB_SETMINVISIBLE,
                      static_cast<WPARAM>(kToolbarStatusNames.size()), 0);
         ShowWindow(toolbar_status_combo_, SW_HIDE);
+        add_dialog_tooltip(
+            tooltip_, toolbar_status_combo_,
+            L"Choose whether the selected command is shown on or hidden from the main toolbar.");
     }
 
     void ensure_toolbar_settings_list() {
@@ -3284,10 +3314,22 @@ private:
         SendMessageW(item(kUpdateUrl), EM_SETLIMITTEXT, 2048, 0);
         SendMessageW(item(kShortcutValue), EM_SETLIMITTEXT, 64, 0);
 
+        add_dialog_tooltip(
+            tooltip_, item(kThemeMode),
+            L"Choose whether Axiom follows the Windows app theme or always uses dark or light controls.");
+        add_dialog_tooltip(
+            tooltip_, item(kAccentColorMode),
+            L"Choose the color source used for selections, progress indicators, focus, and other accents.");
         add_dialog_tooltip(tooltip_, item(kCustomAccentColor),
                            L"Hexadecimal RGB color. Enter exactly #RRGGBB, for example #FFB93C.");
         add_dialog_tooltip(tooltip_, item(kPickAccentColor),
                            L"Open Axiom's accent color picker and select a custom RGB color.");
+        add_dialog_tooltip(
+            tooltip_, item(kToolbarIconStyle),
+            L"Choose whether command icons follow the current theme, keep their full colors, or use the selected accent color.");
+        add_dialog_tooltip(
+            tooltip_, item(kStartupMode),
+            L"Choose the location shown when Axiom starts. Custom uses the folder path below.");
         add_dialog_tooltip(tooltip_, item(kStartupCustomPath),
                            L"Windows folder path used when Startup location is Custom.");
         add_dialog_tooltip(tooltip_, item(kBrowseStartupCustomPath),
@@ -3296,30 +3338,96 @@ private:
                            L"Unsigned integer from 0 through 50. Zero disables recent locations.");
         add_dialog_tooltip(tooltip_, item(kCenterChildWindows),
                            L"When selected, dialogs open centered on the main Axiom window. Clear it to remember each dialog's last position.");
+        add_dialog_tooltip(
+            tooltip_, item(kRestoreWindowPlacement),
+            L"Restore the main window's saved size, position, and maximized state the next time Axiom starts.");
+        add_dialog_tooltip(
+            tooltip_, item(kConfirmDelete),
+            L"Ask for confirmation before deleting filesystem items or entries from an archive.");
+        add_dialog_tooltip(
+            tooltip_, item(kConfirmOverwrite),
+            L"Ask before an archive, extracted file, or other output replaces an existing file.");
         add_dialog_tooltip(tooltip_, item(kThreads),
                            L"Unsigned integer from 0 through the available logical processor count. Zero uses all processors.");
+        add_dialog_tooltip(
+            tooltip_, item(kCompressionMethod),
+            L"Choose the default codec for new AXAR archives. ZIP supports Deflate or Store.");
+        add_dialog_tooltip(
+            tooltip_, item(kLevel),
+            L"Choose the default method-specific compression level. Higher values generally trade time and memory for a smaller archive.");
+        add_dialog_tooltip(
+            tooltip_, item(kDictionarySize),
+            L"Choose the default history dictionary. Larger values can improve compression but require more memory.");
+        add_dialog_tooltip(
+            tooltip_, item(kWordSize),
+            L"Choose the default match-search word size. Useful values depend on the selected codec and level.");
+        add_dialog_tooltip(
+            tooltip_, item(kSolidBlockSize),
+            L"Choose how much input is compressed as one solid block. Larger blocks can improve ratio but make random extraction more expensive.");
+        add_dialog_tooltip(
+            tooltip_, item(kThreadModel),
+            L"Choose the codec-specific threading strategy used by default. Available choices depend on the compression method.");
+        add_dialog_tooltip(
+            tooltip_, item(kDefaultUpdateMode),
+            L"Choose how Add to archive treats existing entries: replace matches, update only newer inputs, freshen existing names, or synchronize the archive.");
         add_dialog_tooltip(tooltip_, item(kDefaultVolumeSize),
                            L"Maximum size of each output part. Select KiB, MiB, GiB, or TiB; leave empty for one archive file. Splitting only succeeds when the completed archive is larger than this value.");
         add_dialog_tooltip(tooltip_, item(kDefaultRecoveryPercent),
                            L"Unsigned integer percentage from 0 through 100.");
+        add_dialog_tooltip(
+            tooltip_, item(kDefaultVolumeUnit),
+            L"Binary unit applied to the default positive integer volume size.");
+        add_dialog_tooltip(
+            tooltip_, item(kDefaultRecoveryVolumes),
+            L"Create .rev files that can reconstruct missing or corrupt split-archive parts. Requires a volume size and a recovery percentage.");
+        add_dialog_tooltip(
+            tooltip_, item(kDefaultCreateSfx),
+            L"Enable creation of a self-extracting Windows executable by default when the selected archive format supports it.");
+        add_dialog_tooltip(
+            tooltip_, item(kDefaultSignArchive),
+            L"Sign completed AXAR archives with the default key below so recipients can verify authenticity.");
         add_dialog_tooltip(tooltip_, item(kDefaultSigningKey),
                            L"Windows file path to an Axiom signing-key file.");
         add_dialog_tooltip(tooltip_, item(kBrowseDefaultSigningKey),
                            L"Choose an existing Axiom signing-key file.");
+        add_dialog_tooltip(
+            tooltip_, item(kArchiveOutputMode),
+            L"Choose whether new archives are written beside the source, in the last-used folder, or in the custom folder below.");
         add_dialog_tooltip(tooltip_, item(kArchiveOutputFolder),
                            L"Windows folder path for newly created archives when the custom-folder policy is selected.");
         add_dialog_tooltip(tooltip_, item(kBrowseArchiveOutputFolder),
                            L"Choose an existing custom archive-output folder.");
+        add_dialog_tooltip(
+            tooltip_, item(kExtractDestinationMode),
+            L"Choose whether extraction starts beside the archive, in the last-used folder, or in the custom folder below.");
         add_dialog_tooltip(tooltip_, item(kExtractDestinationFolder),
                            L"Windows folder path for extracted files when the custom-folder policy is selected.");
         add_dialog_tooltip(tooltip_, item(kBrowseExtractDestinationFolder),
                            L"Choose an existing custom extraction folder.");
+        add_dialog_tooltip(
+            tooltip_, item(kTempFolderMode),
+            L"Choose whether Axiom stages temporary files in the Windows temporary folder or in the custom folder below.");
         add_dialog_tooltip(tooltip_, item(kTempFolder),
                            L"Windows folder path for Axiom temporary and staging files.");
         add_dialog_tooltip(tooltip_, item(kBrowseTempFolder),
                            L"Choose an existing custom temporary folder.");
         add_dialog_tooltip(tooltip_, item(kTempCleanupDays),
                            L"Unsigned integer from 0 through 365 days.");
+        add_dialog_tooltip(
+            tooltip_, item(kShowAddressShellLocations),
+            L"Include This PC, known folders, and drives in the address-bar dropdown.");
+        add_dialog_tooltip(
+            tooltip_, item(kShowAddressRecentLocations),
+            L"Include recently visited filesystem and archive locations in the address-bar dropdown.");
+        add_dialog_tooltip(
+            tooltip_, item(kShowAddressArchiveChildren),
+            L"Include child folders from the current filesystem or archive location in the address-bar dropdown.");
+        add_dialog_tooltip(
+            tooltip_, item(kCustomizeFileColumns),
+            L"Open the column editor to choose visible file-list fields and their left-to-right order.");
+        add_dialog_tooltip(
+            tooltip_, item(kFileOpenMode),
+            L"Choose what double-clicking a file inside an archive does: open with Windows, use Axiom's viewer setting, or prompt.");
         add_dialog_tooltip(tooltip_, item(kExternalViewer),
                            L"Windows file path to the executable used to view extracted files.");
         add_dialog_tooltip(tooltip_, item(kBrowseExternalViewer),
@@ -3328,24 +3436,75 @@ private:
                            L"Windows file path to the executable used to edit extracted files.");
         add_dialog_tooltip(tooltip_, item(kBrowseExternalEditor),
                            L"Choose an existing editor executable file.");
+        add_dialog_tooltip(
+            tooltip_, item(kWarnExecutableOpen),
+            L"Show a safety warning before launching executable or script content extracted from an archive.");
+        add_dialog_tooltip(
+            tooltip_, item(kKeepViewedFilesUntilExit),
+            L"Keep selectively extracted viewing files available until Axiom exits instead of cleaning them up immediately.");
+        add_dialog_tooltip(
+            tooltip_, item(kPasswordPromptMode),
+            L"Choose when Axiom asks for an archive password instead of waiting for an encrypted operation to require it.");
+        add_dialog_tooltip(
+            tooltip_, item(kCachePasswords),
+            L"Reuse passwords only in memory while their archive remains open. Passwords are never written to settings.");
+        add_dialog_tooltip(
+            tooltip_, item(kVerifySignatures),
+            L"Verify a signed AXAR archive against trusted public keys before extraction begins.");
+        add_dialog_tooltip(
+            tooltip_, item(kWipeEncryptedTempFiles),
+            L"Overwrite temporary plaintext files produced from encrypted archives before deleting them.");
         add_dialog_tooltip(tooltip_, item(kTrustedKeysFolder),
                            L"Windows folder path containing trusted Axiom public-key files.");
         add_dialog_tooltip(tooltip_, item(kBrowseTrustedKeysFolder),
                            L"Choose an existing trusted-keys folder.");
         add_dialog_tooltip(tooltip_, item(kUpdateUrl),
                            L"Absolute HTTPS URL for a custom update feed. Leave empty to use Axiom's official GitHub release feed.");
+        add_dialog_tooltip(
+            tooltip_, item(kUpdateChannel),
+            L"Choose which release channel automatic and manual update checks follow.");
+        add_dialog_tooltip(
+            tooltip_, item(kAutomaticUpdateChecks),
+            L"Check the selected release feed at startup, at most once every 24 hours. Updates are not installed automatically.");
+        add_dialog_tooltip(
+            tooltip_, item(kShortcutCommand),
+            L"Choose the Axiom command whose keyboard shortcut you want to inspect or change.");
         add_dialog_tooltip(tooltip_, item(kShortcutValue),
                            L"Key-chord text such as Ctrl+O, Alt+Left, F5, Delete, or None.");
+        add_dialog_tooltip(
+            tooltip_, item(kShortcutAssign),
+            L"Assign the typed key chord to the selected command. Duplicate non-contextual shortcuts are rejected.");
+        add_dialog_tooltip(
+            tooltip_, item(kShortcutClear),
+            L"Remove the custom shortcut from the selected command.");
+        add_dialog_tooltip(
+            tooltip_, item(kShortcutResetAll),
+            L"Restore every keyboard shortcut to Axiom's defaults.");
         add_dialog_tooltip(tooltip_, item(kToolbarDisplayMode),
                            L"Choose whether the main command toolbar shows labels beside icons or uses icons only. Full command names remain available as tooltips.");
+        add_dialog_tooltip(
+            tooltip_, item(kToolbarResetDefaults),
+            L"Restore the default set and order of commands on the main toolbar.");
+        add_dialog_tooltip(
+            tooltip_, item(kWorkerPriority),
+            L"Choose the Windows process priority used while archive operations run. Lower priority keeps other applications more responsive.");
+        add_dialog_tooltip(
+            tooltip_, item(kVerboseLogging),
+            L"Write detailed operation diagnostics to the selected log folder. Logs may contain file paths.");
         add_dialog_tooltip(tooltip_, item(kLogFolder),
                            L"Windows folder path for verbose operation logs.");
         add_dialog_tooltip(tooltip_, item(kBrowseLogFolder),
                            L"Choose an existing log folder.");
+        add_dialog_tooltip(
+            tooltip_, item(kIoBufferMode),
+            L"Use Axiom's 1 MiB I/O buffer or enable the custom byte-size field beside this list.");
         add_dialog_tooltip(tooltip_, item(kIoBufferSize),
                            L"Positive byte size from 64 KiB through 64 MiB. Accepted suffixes: B, KiB, MiB, GiB, or TiB.");
         add_dialog_tooltip(tooltip_, item(kMemoryLimit),
                            L"Positive byte size. Accepted suffixes: B, KiB, MiB, GiB, or TiB.");
+        add_dialog_tooltip(
+            tooltip_, item(kMemoryLimitMode),
+            L"Use Axiom's automatic operation memory budget or enable the custom byte-size field beside this list.");
 
         accept_ = control(L"BUTTON", L"OK", WS_TABSTOP | BS_DEFPUSHBUTTON | BS_OWNERDRAW, kAccept);
         cancel_ = control(L"BUTTON", L"Cancel", WS_TABSTOP | BS_OWNERDRAW, kCancel);
@@ -3553,22 +3712,58 @@ private:
         add_dialog_tooltip(tooltip_, level_combo_,
                            L"Method-specific compression level. Available values change with the selected codec.");
         add_dialog_tooltip(
+            tooltip_, dictionary_combo_,
+            L"Compression history dictionary. Larger values can improve ratio but require more memory; available values depend on the codec.");
+        add_dialog_tooltip(
+            tooltip_, word_size_combo_,
+            L"Match-search word size used by the selected codec. Available values depend on the method and compression level.");
+        add_dialog_tooltip(
+            tooltip_, solid_block_combo_,
+            L"Amount of input compressed as one solid block. Larger blocks can improve ratio but make random extraction more expensive.");
+        add_dialog_tooltip(
+            tooltip_, thread_model_combo_,
+            L"Codec-specific threading strategy. Available choices depend on the selected compression method.");
+        add_dialog_tooltip(
+            tooltip_, update_mode_combo_,
+            L"Choose whether to replace matching entries, update only newer inputs, freshen existing names, or synchronize removals with the source.");
+        add_dialog_tooltip(
             tooltip_, compression_preview_,
             L"Live compression prognosis. Select a point to choose that codec level; the shaded band shows estimate uncertainty.");
         add_dialog_tooltip(tooltip_, threads_combo_,
                            L"Unsigned integer from 0 through the available logical processor count. Zero uses all processors.");
         add_dialog_tooltip(tooltip_, comment_edit_,
                            L"Unicode text stored as the archive comment.");
+        add_dialog_tooltip(
+            tooltip_, lock_archive_,
+            L"Mark the completed AXAR archive as locked so later update operations refuse to modify it.");
+        add_dialog_tooltip(
+            tooltip_, repack_after_update_,
+            L"Rewrite the archive after updating to remove superseded data and recover unused space. This adds another full archive pass.");
+        add_dialog_tooltip(
+            tooltip_, encrypt_data_,
+            L"Encrypt stored file content with XChaCha20-Poly1305. A non-empty password is required.");
+        add_dialog_tooltip(
+            tooltip_, encrypt_names_,
+            L"Encrypt the AXAR directory so file names and paths are hidden until the password is supplied. This also encrypts file data.");
         add_dialog_tooltip(tooltip_, password_edit_,
                            L"Unicode password text. Passwords are never saved in GUI settings.");
         add_dialog_tooltip(tooltip_, confirm_password_edit_,
                            L"Repeat the password exactly; both text fields must match.");
+        add_dialog_tooltip(
+            tooltip_, show_password_,
+            L"Temporarily show or mask both password fields. This does not store the password.");
         add_dialog_tooltip(tooltip_, volume_size_edit_,
                            L"Maximum size of each output part. Select KiB, MiB, GiB, or TiB; leave empty to disable splitting. The completed archive must be larger than this value.");
         add_dialog_tooltip(tooltip_, volume_unit_combo_,
                            L"Binary unit applied to the positive integer volume size.");
         add_dialog_tooltip(tooltip_, recovery_percent_edit_,
                            L"Unsigned integer percentage from 0 through 100.");
+        add_dialog_tooltip(
+            tooltip_, recovery_volumes_,
+            L"Create .rev files that can reconstruct missing or corrupt split-archive parts. Requires splitting and a recovery percentage.");
+        add_dialog_tooltip(
+            tooltip_, sign_archive_,
+            L"Sign the completed AXAR archive so its authenticity can be verified with the matching public key.");
         add_dialog_tooltip(tooltip_, signing_key_edit_,
                            L"Windows file path to an Axiom signing-key file.");
         add_dialog_tooltip(tooltip_, browse_signing_key_,

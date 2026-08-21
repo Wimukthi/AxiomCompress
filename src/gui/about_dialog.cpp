@@ -37,6 +37,7 @@ struct AboutDialogState {
     HWND auto_update{};
     HWND check_updates{};
     HWND ok{};
+    TooltipManager tooltip;
     HINSTANCE instance{};
     HFONT font{};
     HFONT title_font{};
@@ -143,6 +144,7 @@ void apply_theme(AboutDialogState* state) {
     for (HWND control : controls(state)) {
         apply_dialog_control_theme(control, state->dark);
     }
+    state->tooltip.apply_theme(state->dark);
 }
 
 LRESULT control_color(AboutDialogState* state, WPARAM wparam, LPARAM lparam) {
@@ -262,6 +264,10 @@ LRESULT CALLBACK about_dialog_proc(HWND hwnd, UINT message, WPARAM wparam, LPARA
                 0, L"BUTTON", L"OK",
                 WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | WS_TABSTOP | BS_OWNERDRAW,
                 0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(IDOK), state->instance, nullptr);
+            state->tooltip.create(hwnd, state->dpi, state->dark);
+            add_dialog_tooltip(
+                state->tooltip, state->auto_update,
+                L"Check Axiom's release feed at startup, at most once every 24 hours. No update is installed automatically.");
             for (HWND control : controls(state)) set_dialog_control_font(control, state->font);
             set_dialog_control_font(state->title,
                                     state->title_font != nullptr ? state->title_font : state->font);
@@ -298,6 +304,7 @@ LRESULT CALLBACK about_dialog_proc(HWND hwnd, UINT message, WPARAM wparam, LPARA
                          EC_LEFTMARGIN | EC_RIGHTMARGIN,
                          MAKELPARAM(scale_for_dialog_dpi(6, state->dpi),
                                    scale_for_dialog_dpi(6, state->dpi)));
+            state->tooltip.update_dpi(state->dpi);
             layout(state);
             return 0;
         }

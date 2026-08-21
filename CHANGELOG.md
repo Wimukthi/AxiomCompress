@@ -14,6 +14,23 @@ Entries are condensed from the
 
 ## [Unreleased]
 
+## [0.10.1.0] - 2026-08-21
+
+Native UI clarity and window-persistence release.
+
+### Fixed
+
+- Main-window and dialog dimensions now survive display changes. Centered child
+  windows retain their saved size and maximized state, with dialog dimensions
+  DPI-scaled and kept inside the active monitor.
+
+### Changed
+
+- Expanded native, task-oriented tooltips across non-obvious archive, settings,
+  progress, color, column, and update controls. Editable combo boxes now retain
+  their tooltip over the embedded text field, including when controls are
+  disabled, resized for DPI, or restyled for a theme change.
+
 ## [0.10.0.0] - 2026-08-21
 
 AXAR deduplication GUI and tooltip consistency release.
@@ -521,7 +538,8 @@ First published release: the Inno Setup installer and portable zip, carrying
 update/repair/remove maintenance handling, and dynamic light/dark setup
 styling.
 
-[Unreleased]: https://github.com/Wimukthi/AxiomCompress/compare/0.10.0.0...HEAD
+[Unreleased]: https://github.com/Wimukthi/AxiomCompress/compare/0.10.1.0...HEAD
+[0.10.1.0]: https://github.com/Wimukthi/AxiomCompress/releases/tag/0.10.1.0
 [0.10.0.0]: https://github.com/Wimukthi/AxiomCompress/releases/tag/0.10.0.0
 [0.9.2.3]: https://github.com/Wimukthi/AxiomCompress/releases/tag/0.9.2.3
 [0.9.2.2]: https://github.com/Wimukthi/AxiomCompress/releases/tag/0.9.2.2

@@ -2,6 +2,7 @@
 
 #include "axiom/axiom.hpp"
 #include "core/progress_rate.hpp"
+#include "gui/dialog_support.hpp"
 
 #include <windows.h>
 
@@ -127,6 +128,7 @@ private:
     HWND pause_button_{};
     HWND cancel_button_{};
     HWND details_button_{};
+    TooltipManager tooltip_;
     std::array<HWND, static_cast<std::size_t>(TelemetryField::count)> telemetry_fields_{};
     std::array<std::wstring, static_cast<std::size_t>(TelemetryField::count)> telemetry_text_{};
     HINSTANCE instance_{};

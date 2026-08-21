@@ -101,6 +101,7 @@ private:
     };
 
     static UINT_PTR overlay_id(HWND control);
+    void attach_relay_chain(HWND control);
     void update_rect(TOOLINFOW& tool, HWND control) const;
     static LRESULT CALLBACK owner_subclass_proc(
         HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam,
@@ -109,6 +110,7 @@ private:
     HWND hwnd_ = nullptr;
     HWND owner_ = nullptr;
     std::vector<ToolEntry> tools_;
+    std::vector<HWND> relay_windows_;
 };
 
 inline void add_dialog_tooltip(TooltipManager& tooltips, HWND control,
@@ -133,9 +135,10 @@ void restore_dialog_owner(HWND owner, bool was_enabled);
 bool message_targets_window(HWND window, const MSG& message);
 bool window_placement_is_visible(const WINDOWPLACEMENT& placement);
 POINT centered_window_position(HWND owner, int width, int height);
-// Restores geometry without making the window visible. The returned SW_*
-// command preserves a saved maximized state and must be passed to ShowWindow
-// after the caller has finished theming and constructing the first frame.
+// Restores geometry without making the window visible. Center-child mode only
+// replaces the saved position; the user's size and maximized state still
+// persist. The returned SW_* command must be passed to ShowWindow after the
+// caller has finished theming and constructing the first frame.
 int restore_named_window_placement(HWND window, HWND owner, std::wstring_view name);
 void save_named_window_placement(std::wstring_view name, HWND window);
 std::wstring last_error_text(DWORD error = GetLastError());

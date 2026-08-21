@@ -91,21 +91,39 @@ bool MainWindow::create(HINSTANCE instance,
 
     bool restored_window_placement = false;
     if (application_options_.restore_window_placement &&
-        persisted_settings_.has_placement &&
-        axiom::gui::window_placement_is_visible(persisted_settings_.placement)) {
+        persisted_settings_.has_placement) {
         if (persisted_settings_.placement.showCmd == SW_SHOWMINIMIZED) {
             persisted_settings_.placement.showCmd = SW_SHOWNORMAL;
         }
-        SetWindowPlacement(hwnd_, &persisted_settings_.placement);
-        restored_window_placement = true;
-    } else if (application_options_.restore_window_placement &&
-               persisted_settings_.has_placement) {
-        RECT rect{};
-        GetWindowRect(hwnd_, &rect);
-        const POINT position = axiom::gui::centered_window_position(
-            nullptr, rect.right - rect.left, rect.bottom - rect.top);
-        SetWindowPos(hwnd_, nullptr, position.x, position.y, 0, 0,
-                     SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        if (axiom::gui::window_placement_is_visible(
+                persisted_settings_.placement)) {
+            SetWindowPlacement(hwnd_, &persisted_settings_.placement);
+            restored_window_placement = true;
+        } else {
+            const RECT& saved = persisted_settings_.placement.rcNormalPosition;
+            const long long saved_width =
+                static_cast<long long>(saved.right) - saved.left;
+            const long long saved_height =
+                static_cast<long long>(saved.bottom) - saved.top;
+            if (saved_width >= 64 && saved_height >= 64 &&
+                saved_width <= INT_MAX && saved_height <= INT_MAX) {
+                RECT work{};
+                SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
+                const int work_width =
+                    (std::max)(64L, work.right - work.left);
+                const int work_height =
+                    (std::max)(64L, work.bottom - work.top);
+                const int width = std::clamp(
+                    static_cast<int>(saved_width), 64, work_width);
+                const int height = std::clamp(
+                    static_cast<int>(saved_height), 64, work_height);
+                const POINT position = axiom::gui::centered_window_position(
+                    nullptr, width, height);
+                SetWindowPos(hwnd_, nullptr, position.x, position.y, width, height,
+                             SWP_NOZORDER | SWP_NOACTIVATE);
+                restored_window_placement = true;
+            }
+        }
     }
 
     ShowWindow(hwnd_, restored_window_placement
@@ -422,11 +440,6 @@ void MainWindow::on_create() {
     add_tooltip(navigate_refresh_, L"Refresh");
     add_tooltip(address_edit_,
                 L"Folder/archive path text or a named shell location such as This PC. Press Enter or Go to navigate.");
-    COMBOBOXINFO address_info{sizeof(address_info)};
-    if (GetComboBoxInfo(address_edit_, &address_info)) {
-        add_tooltip(address_info.hwndItem,
-                    L"Folder/archive path text or a named shell location such as This PC. Press Enter or Go to navigate.");
-    }
     add_tooltip(address_go_, L"Navigate to the folder, archive, or shell location in the path field.");
 
     table_.create(hwnd_, instance_, kList);
