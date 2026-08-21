@@ -1604,19 +1604,22 @@ void MainWindow::on_table_begin_drag() {
             }
             set_busy(true);
             set_status(L"Transferring dropped archive entries...");
-            if (!operation_window_.create(
+            // The shell copies these staged files by calling back into our
+            // IStream on this thread, which therefore dispatches neither
+            // WM_TIMER nor input until the whole transfer finishes. A progress
+            // window owned by this thread would freeze, so host it on its own.
+            // Pause stays unavailable: blocking inside an OLE stream read would
+            // stall the shell's copy with no way to resume it.
+            if (!drag_transfer_window_.start(
                     hwnd_, instance_, L"Transferring dropped files...", {},
                     make_operation_window_theme(theme_),
-                    [transfer_control](bool paused) {
-                        transfer_control->set_paused(paused);
-                    },
+                    {},
                     [transfer_control] { transfer_control->request_cancel(); },
-                    false)) {
+                    false, transfer_control)) {
                 set_busy(false);
                 throw std::runtime_error(
                     "could not create the drag transfer progress window");
             }
-            operation_window_.set_progress_source(transfer_control);
             transfer_started = true;
             return paths;
         } catch (...) {
@@ -1637,7 +1640,7 @@ void MainWindow::on_table_begin_drag() {
             completed.total_items = transfer_total_files;
             transfer_control->report(completed);
         }
-        operation_window_.close();
+        drag_transfer_window_.stop();
         set_busy(false);
         operation_paused_ = false;
         set_status(effect == DROPEFFECT_NONE

@@ -3,6 +3,7 @@
 #include "axiom/archive.hpp"
 #include "axiom/version.hpp"
 #include "core/cpu.hpp"
+#include "core/progress_rate.hpp"
 #include "core/path_text.hpp"
 #include "core/windows_time.hpp"
 #include "archive/sfx_image.hpp"
@@ -267,7 +268,8 @@ public:
             return;
         }
         last_draw_ = now;
-        draw_line_locked(render(progress, now));
+        rate_.update(progress, now);
+        draw_line_locked(render(progress));
     }
 
     void finish(bool ok) {
@@ -289,8 +291,7 @@ public:
     }
 
 private:
-    std::string render(const axiom::OperationProgress& progress,
-                       std::chrono::steady_clock::time_point now) const {
+    std::string render(const axiom::OperationProgress& progress) const {
         const bool has_byte_total = progress.total_bytes > 0;
         const bool has_item_total = progress.total_items > 0;
         double fraction = 0.0;
@@ -323,10 +324,13 @@ private:
         if (has_byte_total) {
             line << format_bytes(progress.completed_bytes) << " / "
                  << format_bytes(progress.total_bytes);
-            const double seconds = std::chrono::duration<double>(now - started_).count();
-            if (seconds > 0.15 && progress.completed_bytes > 0) {
-                line << "  " << format_bytes_per_second(
-                    static_cast<double>(progress.completed_bytes) / seconds);
+            // Shared with the GUI through ProgressRateTracker: a trailing
+            // window over throughput_bytes, not completed_bytes divided by
+            // total elapsed time. The old cumulative average both lagged a
+            // speed change permanently and read 0 B/s while the first solid
+            // block was still being assembled.
+            if (const double rate = rate_.rate(); rate > 0.0) {
+                line << "  " << format_bytes_per_second(rate);
             }
         } else if (progress.completed_bytes > 0) {
             line << format_bytes(progress.completed_bytes);
@@ -393,6 +397,7 @@ private:
     std::string action_;
     std::chrono::steady_clock::time_point started_;
     std::chrono::steady_clock::time_point last_draw_;
+    axiom::ProgressRateTracker rate_;
     axiom::OperationProgress latest_;
     std::size_t line_width_ = 0;
     bool finished_ = false;

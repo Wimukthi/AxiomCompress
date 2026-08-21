@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <future>
 #include <sstream>
 #include <utility>
 
@@ -17,7 +18,28 @@ namespace {
 constexpr wchar_t kWindowClass[] = L"AxiomOperationProgressWindow";
 constexpr int kPauseButton = 1;
 constexpr int kCancelButton = 2;
+constexpr int kDetailsButton = 3;
 constexpr UINT_PTR kAnimationTimer = 1;
+// Growing the window is deferred through the queue rather than done inside the
+// timer handler, so a resize never interleaves with the paint that is already
+// in flight for the old geometry.
+constexpr UINT kResizeMessage = WM_APP + 1;
+
+// Layout grid, in 96-DPI logical units. The collapsed view stops after the
+// activity row; Details adds the two diagnostic rows below it.
+constexpr int kBarHeight = 22;
+constexpr int kOverallBarTop = 66;
+constexpr int kOverallBarBottom = kOverallBarTop + kBarHeight;
+constexpr int kFileBarTop = 162;
+constexpr int kFileBarBottom = kFileBarTop + kBarHeight;
+constexpr int kRowHeight = 22;
+// Compression figures and the sync plan only exist for some operations. Their
+// rows are reserved on demand so an extraction or a drag transfer does not
+// leave a band of empty dialog above the buttons.
+constexpr int kOptionalRowTop = kFileBarBottom + 26;
+constexpr int kDetailRowHeight = 20;
+
+std::wstring format_bytes_of(std::uint64_t completed, std::uint64_t total);
 
 std::wstring format_size(std::uint64_t bytes) {
     constexpr const wchar_t* units[] = {L"B", L"KB", L"MB", L"GB", L"TB"};
@@ -31,6 +53,31 @@ std::wstring format_size(std::uint64_t bytes) {
     stream.setf(std::ios::fixed);
     stream.precision(unit == 0 ? 0 : 1);
     stream << value << L' ' << units[unit];
+    return stream.str();
+}
+
+// "170 MB of 400 MB". One phrase instead of three labelled fields.
+std::wstring format_bytes_of(std::uint64_t completed, std::uint64_t total) {
+    return format_size(completed) + L" of " + format_size(total);
+}
+
+std::wstring format_count(std::uint64_t value) {
+    std::wstring digits = std::to_wstring(value);
+    for (std::size_t position = digits.size(); position > 3;) {
+        position -= 3;
+        digits.insert(position, 1, L',');
+    }
+    return digits;
+}
+
+std::wstring format_percent(std::uint64_t completed, std::uint64_t total) {
+    std::wstringstream stream;
+    stream.setf(std::ios::fixed);
+    stream.precision(1);
+    stream << (total == 0 ? 0.0
+                          : std::min(100.0, static_cast<double>(completed) *
+                                                100.0 / total))
+           << L'%';
     return stream.str();
 }
 
@@ -154,7 +201,8 @@ bool OperationProgressWindow::create(HWND owner,
                                      const OperationWindowTheme& theme,
                                      PauseHandler pause_handler,
                                      CancelHandler cancel_handler,
-                                     bool pause_available) {
+                                     bool pause_available,
+                                     const Placement* placement) {
     close();
     owner_ = owner;
     instance_ = instance;
@@ -164,13 +212,16 @@ bool OperationProgressWindow::create(HWND owner,
     pause_handler_ = std::move(pause_handler);
     cancel_handler_ = std::move(cancel_handler);
     pause_available_ = pause_available;
+    follow_system_theme_ = placement == nullptr || placement->follow_system_theme;
     started_ = std::chrono::steady_clock::now();
     last_progress_time_ = started_;
     last_heartbeat_paint_ = started_;
     progress_source_.reset();
-    rate_samples_.clear();
+    rate_.reset();
     last_progress_sequence_ = 0;
-    current_rate_ = 0.0;
+    details_expanded_ = false;
+    file_bar_active_ = false;
+    reserved_optional_rows_ = 0;
     paused_ = false;
     cancelling_ = false;
     has_progress_ = false;
@@ -178,17 +229,21 @@ bool OperationProgressWindow::create(HWND owner,
     telemetry_dirty_ = true;
     for (auto& text : telemetry_text_) text.clear();
     pulse_ = 0;
-    dpi_ = owner != nullptr ? GetDpiForWindow(owner) : GetDpiForSystem();
+    dpi_ = placement != nullptr && placement->dpi != 0
+               ? placement->dpi
+               : (owner != nullptr ? GetDpiForWindow(owner) : GetDpiForSystem());
     if (!register_class()) return false;
 
     constexpr DWORD kWindowStyle = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU |
                                    WS_MINIMIZEBOX | WS_CLIPCHILDREN;
-    RECT window_rect{0, 0, scale(660), scale(360)};
+    RECT window_rect{0, 0, scale(640), scale(collapsed_height())};
     AdjustWindowRectExForDpi(&window_rect, kWindowStyle, FALSE, 0, dpi_);
     const int width = window_rect.right - window_rect.left;
     const int height = window_rect.bottom - window_rect.top;
     RECT anchor_rect{};
-    if (owner == nullptr || !GetWindowRect(owner, &anchor_rect)) {
+    if (placement != nullptr && !IsRectEmpty(&placement->anchor)) {
+        anchor_rect = placement->anchor;
+    } else if (owner == nullptr || !GetWindowRect(owner, &anchor_rect)) {
         SystemParametersInfoW(SPI_GETWORKAREA, 0, &anchor_rect, 0);
     }
     const int x = anchor_rect.left + (anchor_rect.right - anchor_rect.left - width) / 2;
@@ -200,6 +255,13 @@ bool OperationProgressWindow::create(HWND owner,
     if (hwnd_ == nullptr) return false;
     apply_axiom_window_icons(hwnd_, instance_);
     ShowWindow(hwnd_, SW_SHOWNORMAL);
+    if (placement != nullptr && placement->topmost) {
+        // An ownerless window has nothing keeping it above the window the user
+        // just dropped onto. Raise it without taking focus, so the drop target
+        // keeps activation.
+        SetWindowPos(hwnd_, HWND_TOPMOST, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    }
     UpdateWindow(hwnd_);
     return true;
 }
@@ -245,8 +307,14 @@ void OperationProgressWindow::create_controls() {
     cancel_button_ = CreateWindowExW(0, L"BUTTON", L"Cancel", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
                                      0, 0, 0, 0, hwnd_,
                                      reinterpret_cast<HMENU>(static_cast<INT_PTR>(kCancelButton)), instance_, nullptr);
+    details_button_ = CreateWindowExW(0, L"BUTTON", L"Details",
+                                      WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+                                      0, 0, 0, 0, hwnd_,
+                                      reinterpret_cast<HMENU>(static_cast<INT_PTR>(kDetailsButton)),
+                                      instance_, nullptr);
     SendMessageW(pause_button_, WM_SETFONT, reinterpret_cast<WPARAM>(font_), TRUE);
     SendMessageW(cancel_button_, WM_SETFONT, reinterpret_cast<WPARAM>(font_), TRUE);
+    SendMessageW(details_button_, WM_SETFONT, reinterpret_cast<WPARAM>(font_), TRUE);
     if (!pause_available_) ShowWindow(pause_button_, SW_HIDE);
     update_telemetry_fields();
 }
@@ -257,17 +325,65 @@ void OperationProgressWindow::apply_theme() {
     background_brush_ = CreateSolidBrush(theme_.background);
     apply_dialog_control_theme(pause_button_, theme_.dark);
     apply_dialog_control_theme(cancel_button_, theme_.dark);
+    apply_dialog_control_theme(details_button_, theme_.dark);
     InvalidateRect(hwnd_, nullptr, TRUE);
     for (HWND control : telemetry_fields_) {
         if (control != nullptr) InvalidateRect(control, nullptr, TRUE);
     }
     InvalidateRect(pause_button_, nullptr, TRUE);
     InvalidateRect(cancel_button_, nullptr, TRUE);
+    InvalidateRect(details_button_, nullptr, TRUE);
 }
 
 void OperationProgressWindow::set_theme(const OperationWindowTheme& theme) {
     theme_ = theme;
     if (hwnd_ != nullptr) apply_theme();
+}
+
+int OperationProgressWindow::activity_row() const {
+    // The trailing gap keeps the status line from sitting flush against the
+    // last content row when no optional rows are reserved.
+    return kOptionalRowTop + reserved_optional_rows_ * kRowHeight + 12;
+}
+
+int OperationProgressWindow::collapsed_height() const {
+    return activity_row() + 18 + 14 + 32 + 20;
+}
+
+int OperationProgressWindow::expanded_height() const {
+    return collapsed_height() + kDetailRowHeight * 2 + 6;
+}
+
+void OperationProgressWindow::apply_window_size() {
+    if (hwnd_ == nullptr) return;
+    RECT window_rect{0, 0, scale(640),
+                     scale(details_expanded_ ? expanded_height()
+                                             : collapsed_height())};
+    AdjustWindowRectExForDpi(&window_rect,
+                             static_cast<DWORD>(GetWindowLongPtrW(hwnd_, GWL_STYLE)),
+                             FALSE, 0, dpi_);
+    SetWindowPos(hwnd_, nullptr, 0, 0,
+                 window_rect.right - window_rect.left,
+                 window_rect.bottom - window_rect.top,
+                 SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+    layout();
+    // Moving a child STATIC leaves its old pixels on the parent until the
+    // parent repaints that band, and the cached back buffer can otherwise blit
+    // the pre-move frame straight back over it. Drop the buffer and force the
+    // parent and every child to redraw now, rather than invalidating and
+    // hoping the next paint covers the vacated rows.
+    release_back_buffer();
+    RedrawWindow(hwnd_, nullptr, nullptr,
+                 RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW);
+}
+
+// Reserved rows only ever grow within one operation. Releasing a row again
+// when a counter briefly returns to zero would make the dialog change height
+// underneath the reader, which is worse than a little unused space.
+void OperationProgressWindow::reserve_optional_rows(int needed) {
+    if (needed <= reserved_optional_rows_ || hwnd_ == nullptr) return;
+    reserved_optional_rows_ = needed;
+    PostMessageW(hwnd_, kResizeMessage, 0, 0);
 }
 
 void OperationProgressWindow::layout() {
@@ -276,39 +392,36 @@ void OperationProgressWindow::layout() {
     const int margin = scale(20);
     const int gap = scale(8);
     const int button_width = scale(92);
+    const int details_width = scale(120);
     const int button_height = scale(32);
     const int bottom = client.bottom - margin;
-    const int column_gap = scale(12);
     const int content_width = client.right - margin * 2;
-    const int column_width = std::max(1, (content_width - column_gap * 2) / 3);
-    const int x0 = margin;
-    const int x1 = x0 + column_width + column_gap;
-    const int x2 = x1 + column_width + column_gap;
-    const auto place = [&](TelemetryField field_id, int x, int y, int width,
-                           int height = 22) {
-        MoveWindow(field(field_id), x, scale(y), width, scale(height), TRUE);
+    const auto place = [&](TelemetryField field_id, int y, int height = 20) {
+        MoveWindow(field(field_id), margin, scale(y), content_width,
+                   scale(height), TRUE);
     };
 
-    place(TelemetryField::stage, margin, 14, content_width, 26);
-    place(TelemetryField::current_path, margin, 40, content_width);
-    place(TelemetryField::output_path, margin, 62, content_width);
+    place(TelemetryField::stage, 14, 24);
+    place(TelemetryField::output_path, 38, 18);
+    place(TelemetryField::overall_summary, kOverallBarBottom + 4);
+    place(TelemetryField::overall_rate, kOverallBarBottom + 26);
+    place(TelemetryField::current_path, 140, 18);
+    place(TelemetryField::file_summary, kFileBarBottom + 4);
+    place(TelemetryField::result_summary, kOptionalRowTop);
+    place(TelemetryField::plan_summary, kOptionalRowTop + kRowHeight);
 
-    place(TelemetryField::overall_percent, x0, 117, column_width);
-    place(TelemetryField::overall_completed, x1, 117, column_width);
-    place(TelemetryField::overall_total, x2, 117, column_width);
-    place(TelemetryField::items_completed, x0, 140, column_width);
-    place(TelemetryField::items_total, x1, 140, column_width);
-    place(TelemetryField::speed, x2, 140, column_width);
+    const int activity_y = activity_row();
+    place(TelemetryField::activity, activity_y, 18);
+    place(TelemetryField::detail_timing, activity_y + 26, 18);
+    place(TelemetryField::detail_archive, activity_y + 26 + kDetailRowHeight, 18);
 
-    place(TelemetryField::file_percent, x0, 201, column_width);
-    place(TelemetryField::file_completed, x1, 201, column_width);
-    place(TelemetryField::file_total, x2, 201, column_width);
-    place(TelemetryField::eta, x0, 224, column_width);
-    place(TelemetryField::elapsed, x1, 224, column_width);
-    place(TelemetryField::checkpoint_age, x2, 224, column_width);
-    place(TelemetryField::compressed_size, x0, 250, column_width);
-    place(TelemetryField::compression_ratio, x1, 250, column_width);
-    place(TelemetryField::activity, x2, 250, column_width);
+    ShowWindow(field(TelemetryField::result_summary),
+               reserved_optional_rows_ >= 1 ? SW_SHOW : SW_HIDE);
+    ShowWindow(field(TelemetryField::plan_summary),
+               reserved_optional_rows_ >= 2 ? SW_SHOW : SW_HIDE);
+    const int show = details_expanded_ ? SW_SHOW : SW_HIDE;
+    ShowWindow(field(TelemetryField::detail_timing), show);
+    ShowWindow(field(TelemetryField::detail_archive), show);
 
     MoveWindow(cancel_button_, client.right - margin - button_width,
                bottom - button_height, button_width, button_height, TRUE);
@@ -316,6 +429,15 @@ void OperationProgressWindow::layout() {
         MoveWindow(pause_button_, client.right - margin - button_width * 2 - gap,
                    bottom - button_height, button_width, button_height, TRUE);
     }
+    MoveWindow(details_button_, margin, bottom - button_height, details_width,
+               button_height, TRUE);
+}
+
+void OperationProgressWindow::toggle_details() {
+    details_expanded_ = !details_expanded_;
+    SetWindowTextW(details_button_,
+                   details_expanded_ ? L"Hide details" : L"Details");
+    apply_window_size();
 }
 
 HWND OperationProgressWindow::field(TelemetryField field_id) const {
@@ -334,8 +456,9 @@ void OperationProgressWindow::set_field_text(TelemetryField field_id,
 bool OperationProgressWindow::muted_field(HWND control) const {
     return control == field(TelemetryField::current_path) ||
            control == field(TelemetryField::output_path) ||
-           control == field(TelemetryField::checkpoint_age) ||
-           control == field(TelemetryField::activity);
+           control == field(TelemetryField::activity) ||
+           control == field(TelemetryField::detail_timing) ||
+           control == field(TelemetryField::detail_archive);
 }
 
 std::pair<std::uint64_t, std::uint64_t>
@@ -361,128 +484,125 @@ void OperationProgressWindow::update_telemetry_fields() {
         std::chrono::duration<double>(now - started_).count());
     const auto checkpoint_seconds = static_cast<std::uint64_t>(
         std::chrono::duration<double>(now - last_progress_time_).count());
-    const auto percentage = [](std::uint64_t completed, std::uint64_t total) {
-        std::wstringstream stream;
-        stream.setf(std::ios::fixed);
-        stream.precision(1);
-        stream << (total == 0 ? 0.0
-                              : static_cast<double>(completed) * 100.0 / total)
-               << L'%';
-        return stream.str();
-    };
+    constexpr const wchar_t* kSeparator = L"  \x2022  ";
+
+    // A multi-phase operation reports two different scopes at once: the bar and
+    // its percentage span the whole operation, while the byte and item counters
+    // describe only the current phase. Say which is which rather than letting
+    // one row imply both are the same measurement.
+    const bool phased = has_progress_ && progress_.phase_count != 0;
 
     std::wstring stage = has_progress_ ? stage_text(progress_.stage)
                                        : std::wstring{L"Preparing"};
-    if (has_progress_ && progress_.phase_count != 0) {
+    if (phased) {
         stage = L"Stage " + std::to_wstring(progress_.phase_index + 1) +
                 L" of " + std::to_wstring(progress_.phase_count) + L": " + stage;
-    } else {
-        stage = L"Stage: " + stage;
     }
     set_field_text(TelemetryField::stage, stage);
-    set_field_text(TelemetryField::current_path,
-                   L"Current item: " +
-                       (has_progress_ && !progress_.current_path.empty()
-                            ? widen(progress_.current_path)
-                            : std::wstring{L"Waiting for backend"}));
+
     set_field_text(TelemetryField::output_path,
-                   L"Output: " + (output_path_.empty()
-                                       ? std::wstring{L"Not applicable"}
-                                       : output_path_.wstring()));
+                   output_path_.empty() ? std::wstring{}
+                                        : output_path_.wstring());
 
     const bool byte_total = has_progress_ && progress_.total_bytes > 0;
     const bool item_total = has_progress_ && progress_.total_items > 0;
     const auto [overall_completed, overall_total] =
         has_progress_ ? overall_progress(progress_)
                       : std::pair<std::uint64_t, std::uint64_t>{0, 0};
-    set_field_text(TelemetryField::overall_percent,
-                   L"Overall progress: " +
-                       percentage(overall_completed, overall_total));
-    set_field_text(TelemetryField::overall_completed,
-                   (progress_.phase_count != 0
-                        ? L"Phase completed: " : L"Completed bytes: ") +
-                       format_size(
-                       has_progress_ ? progress_.completed_bytes : 0));
-    set_field_text(TelemetryField::overall_total,
-                   (progress_.phase_count != 0
-                        ? L"Phase total: " : L"Total bytes: ") +
-                       format_size(
-                       byte_total ? progress_.total_bytes : 0));
-    set_field_text(TelemetryField::items_completed,
-                   L"Completed items: " + std::to_wstring(
-                       has_progress_ ? progress_.completed_items : 0));
-    set_field_text(TelemetryField::items_total,
-                   L"Total items: " + std::to_wstring(
-                       item_total ? progress_.total_items : 0));
-    set_field_text(TelemetryField::speed,
-                   L"Speed: " + format_size(static_cast<std::uint64_t>(
-                       std::max(0.0, current_rate_))) + L"/s");
-    const bool has_sync_plan = has_progress_ &&
-        (progress_.planned_added_items != 0 ||
-         progress_.planned_updated_items != 0 ||
-         progress_.planned_removed_items != 0 ||
-         progress_.planned_unchanged_items != 0);
-    const auto reused_summary = [&] {
-        if (!has_progress_ || progress_.reused_items == 0) return std::wstring{};
-        return L"   Reused: " + format_size(progress_.reused_bytes) +
-               L" (" + std::to_wstring(progress_.reused_items) + L")";
-    };
-    if (has_sync_plan) {
-        set_field_text(
-            TelemetryField::compressed_size,
-            L"Added: " + std::to_wstring(progress_.planned_added_items) +
-                L"   Updated: " +
-                std::to_wstring(progress_.planned_updated_items) +
-                reused_summary());
-        set_field_text(
-            TelemetryField::compression_ratio,
-            L"Removed: " + std::to_wstring(progress_.planned_removed_items) +
-                L"   Unchanged: " +
-                std::to_wstring(progress_.planned_unchanged_items));
-    } else {
-        set_field_text(TelemetryField::compressed_size,
-                       L"Compressed size: " + format_size(
-                           has_progress_ ? progress_.compressed_bytes : 0) +
-                           reused_summary());
+
+    std::wstring summary = format_percent(overall_completed, overall_total);
+    if (phased) summary += L" overall";
+    if (byte_total) {
+        summary += kSeparator +
+                   format_bytes_of(progress_.completed_bytes,
+                                   progress_.total_bytes);
+        if (phased) summary += L" in this stage";
+    } else if (has_progress_ && progress_.completed_bytes > 0) {
+        summary += kSeparator + format_size(progress_.completed_bytes);
+    }
+    if (item_total) {
+        summary += kSeparator + format_count(progress_.completed_items) +
+                   L" of " + format_count(progress_.total_items) + L" items";
+    } else if (has_progress_ && progress_.completed_items > 0) {
+        summary += kSeparator + format_count(progress_.completed_items) +
+                   L" items";
+    }
+    set_field_text(TelemetryField::overall_summary, summary);
+
+    // Time remaining is derived from the current phase's byte counters, so it
+    // is a stage estimate whenever phases are in play. Labelling it plainly
+    // "ETA" during a five-phase sync overstates what it knows.
+    const double rate = rate_.rate();
+    std::wstring rate_line =
+        format_size(static_cast<std::uint64_t>(std::max(0.0, rate))) + L"/s";
+    if (byte_total && progress_.completed_bytes >= progress_.total_bytes) {
+        rate_line += std::wstring{kSeparator} +
+                     (phased ? L"stage complete" : L"finishing");
+    } else if (byte_total && rate > 0.0) {
+        const double seconds =
+            static_cast<double>(progress_.total_bytes - progress_.completed_bytes) /
+            rate;
+        // Integer-truncating this rendered "0s left" for most of the last
+        // second, which reads as a stall rather than as nearly done.
+        if (seconds < 1.0) {
+            rate_line += std::wstring{kSeparator} + L"finishing";
+        } else {
+            rate_line += kSeparator +
+                         format_duration(static_cast<std::uint64_t>(seconds + 0.5)) +
+                         (phased ? L" left in this stage" : L" left");
+        }
+    } else if (has_progress_) {
+        rate_line += std::wstring{kSeparator} + L"estimating time remaining";
+    }
+    set_field_text(TelemetryField::overall_rate, rate_line);
+
+    set_field_text(TelemetryField::current_path,
+                   has_progress_ && !progress_.current_path.empty()
+                       ? widen(progress_.current_path)
+                       : std::wstring{L"Waiting for the first item"});
+
+    const auto [file_completed, file_total_bytes] = displayed_file_progress();
+    set_field_text(TelemetryField::file_summary,
+                   file_total_bytes > 0
+                       ? format_bytes_of(file_completed, file_total_bytes)
+                       : (file_completed > 0 ? format_size(file_completed)
+                                             : std::wstring{}));
+
+    std::wstring result;
+    if (has_progress_ && progress_.compressed_bytes != 0) {
         std::wstringstream ratio;
         ratio.setf(std::ios::fixed);
         ratio.precision(2);
-        ratio << (has_progress_ && progress_.compressed_bytes != 0
-                      ? static_cast<double>(progress_.compressed_source_bytes) /
-                            static_cast<double>(progress_.compressed_bytes)
-                      : 0.0)
-              << L'x';
-        set_field_text(TelemetryField::compression_ratio,
-                       L"Compression ratio: " + ratio.str());
+        ratio << static_cast<double>(progress_.compressed_source_bytes) /
+                     static_cast<double>(progress_.compressed_bytes);
+        result = L"Compressed " + format_size(progress_.compressed_bytes) +
+                 L" (" + ratio.str() + L"x)";
     }
-
-    const auto [file_completed, file_total_bytes] = displayed_file_progress();
-    const bool file_total = file_total_bytes > 0;
-    set_field_text(TelemetryField::file_percent,
-                   L"File progress: " +
-                       (file_total ? percentage(file_completed, file_total_bytes)
-                                   : percentage(0, 0)));
-    set_field_text(TelemetryField::file_completed,
-                   L"File completed: " + format_size(file_completed));
-    set_field_text(TelemetryField::file_total,
-                   L"File total: " + format_size(file_total_bytes));
-
-    std::wstring eta = L"Calculating";
-    if (byte_total && progress_.total_bytes > progress_.completed_bytes &&
-        current_rate_ > 0.0) {
-        const auto speed = static_cast<std::uint64_t>(current_rate_);
-        if (speed != 0) {
-            eta = format_duration((progress_.total_bytes - progress_.completed_bytes) /
-                                  speed);
-        }
-    } else if (byte_total && progress_.completed_bytes >= progress_.total_bytes) {
-        eta = L"0s";
+    if (has_progress_ && progress_.reused_items != 0) {
+        if (!result.empty()) result += kSeparator;
+        result += L"reused " + format_size(progress_.reused_bytes) + L" in " +
+                  format_count(progress_.reused_items) + L" items";
     }
-    set_field_text(TelemetryField::eta, L"ETA: " + eta);
-    set_field_text(TelemetryField::elapsed,
-                   L"Elapsed: " + format_duration(elapsed_seconds));
-    set_field_text(TelemetryField::checkpoint_age,
-                   L"Checkpoint age: " + format_duration(checkpoint_seconds));
+    set_field_text(TelemetryField::result_summary, result);
+
+    // The plan counters get their own row. They used to be written into the
+    // compressed-size and ratio fields, which meant two controls changed
+    // meaning depending on the operation.
+    std::wstring plan;
+    if (has_progress_ &&
+        (progress_.planned_added_items != 0 ||
+         progress_.planned_updated_items != 0 ||
+         progress_.planned_removed_items != 0 ||
+         progress_.planned_unchanged_items != 0)) {
+        plan = L"Planned: " + format_count(progress_.planned_added_items) +
+               L" added" + kSeparator +
+               format_count(progress_.planned_updated_items) + L" updated" +
+               kSeparator + format_count(progress_.planned_removed_items) +
+               L" removed" + kSeparator +
+               format_count(progress_.planned_unchanged_items) + L" unchanged";
+    }
+    set_field_text(TelemetryField::plan_summary, plan);
+    reserve_optional_rows((result.empty() ? 0 : 1) + (plan.empty() ? 0 : 1));
 
     std::wstring activity = L"Preparing";
     if (cancelling_) {
@@ -490,62 +610,33 @@ void OperationProgressWindow::update_telemetry_fields() {
     } else if (paused_) {
         activity = L"Paused";
     } else if (has_progress_ && checkpoint_seconds >= 2) {
-        activity = L"Waiting for checkpoint";
+        activity = L"Waiting for the next checkpoint";
     } else if (has_progress_) {
         activity = L"Active";
     }
-    if (has_progress_ && progress_.archive_bytes_read > 0 &&
-        (progress_.stage == OperationStage::testing ||
-         progress_.stage == OperationStage::extracting)) {
-        activity += L"   Archive read: " +
-                    format_size(progress_.archive_bytes_read);
-    }
-    set_field_text(TelemetryField::activity, L"Activity: " + activity);
+    set_field_text(TelemetryField::activity, activity);
+
+    set_field_text(TelemetryField::detail_timing,
+                   L"Elapsed " + format_duration(elapsed_seconds) + kSeparator +
+                       L"last update " + format_duration(checkpoint_seconds) +
+                       L" ago");
+    set_field_text(
+        TelemetryField::detail_archive,
+        has_progress_ && progress_.archive_bytes_read > 0
+            ? L"Archive bytes read " + format_size(progress_.archive_bytes_read)
+            : std::wstring{L"Archive bytes read not reported by this backend"});
 }
 
 void OperationProgressWindow::set_progress(const OperationProgress& progress) {
     const auto now = std::chrono::steady_clock::now();
-    const auto rate_counter = [](const OperationProgress& value) {
-        return value.throughput_bytes != 0
-            ? value.throughput_bytes : value.completed_bytes;
-    };
-    const auto sample = rate_counter(progress);
-    const auto previous_sample = rate_counter(progress_);
-    // Archive pipelines legitimately alternate between compressing and writing
-    // while the same byte counter advances. Resetting on every stage flip made
-    // the sampling window collapse to one point and displayed 0 B/s despite
-    // visible progress. Only a counter restart or a new total begins a new rate
-    // epoch.
-    const bool new_rate_epoch = !has_progress_ ||
-        sample < previous_sample ||
-        progress.total_bytes != progress_.total_bytes;
     progress_ = progress;
     has_progress_ = true;
     progress_dirty_ = true;
     telemetry_dirty_ = true;
     last_progress_time_ = now;
     last_progress_sequence_ = progress.sequence;
-    if (new_rate_epoch) {
-        rate_samples_.clear();
-        current_rate_ = 0.0;
-    }
-    if (rate_samples_.empty() ||
-        rate_samples_.back().second != sample) {
-        rate_samples_.emplace_back(now, sample);
-    }
-    while (rate_samples_.size() > 2 &&
-           now - rate_samples_.front().first > std::chrono::seconds(4)) {
-        rate_samples_.pop_front();
-    }
-    if (rate_samples_.size() >= 2) {
-        const double seconds = std::chrono::duration<double>(
-            rate_samples_.back().first - rate_samples_.front().first).count();
-        const auto first = rate_samples_.front().second;
-        const auto last = rate_samples_.back().second;
-        if (seconds > 0.1 && last >= first) {
-            current_rate_ = static_cast<double>(last - first) / seconds;
-        }
-    }
+    rate_.update(progress, now);
+    if (displayed_file_progress().second > 0) file_bar_active_ = true;
 }
 
 void OperationProgressWindow::set_progress_source(
@@ -561,7 +652,8 @@ void OperationProgressWindow::invalidate_progress_area() {
     RECT client{};
     GetClientRect(hwnd_, &client);
     RECT progress_area{0, 0, client.right,
-                       std::min(client.bottom, static_cast<LONG>(scale(210)))};
+                       std::min(client.bottom,
+                                static_cast<LONG>(scale(kFileBarBottom + 4)))};
     InvalidateRect(hwnd_, &progress_area, FALSE);
 }
 
@@ -610,6 +702,7 @@ void OperationProgressWindow::set_cancelling() {
     SetWindowTextW(pause_button_, L"Pause");
     EnableWindow(pause_button_, FALSE);
     EnableWindow(cancel_button_, FALSE);
+    // Details stays usable while cancelling; it only reveals text.
     telemetry_dirty_ = true;
     update_telemetry_fields();
     InvalidateRect(hwnd_, nullptr, FALSE);
@@ -656,14 +749,18 @@ void OperationProgressWindow::draw_button(const DRAWITEMSTRUCT& draw) const {
     SetTextColor(draw.hDC, content_color);
     SIZE text_size{};
     GetTextExtentPoint32W(draw.hDC, text.c_str(), static_cast<int>(text.size()), &text_size);
-    const int icon_size = scale(18);
-    const int gap = scale(5);
+    // Details is a plain disclosure toggle, so it carries no command icon.
+    const bool with_icon = draw.CtlID != kDetailsButton;
+    const int icon_size = with_icon ? scale(18) : 0;
+    const int gap = with_icon ? scale(5) : 0;
     const int content_width = icon_size + gap + static_cast<int>(text_size.cx);
     const int left = rect.left + (rect.right - rect.left - content_width) / 2;
     RECT icon_rect{left, rect.top, left + icon_size, rect.bottom};
-    const ToolbarIcon icon = draw.CtlID == kCancelButton ? ToolbarIcon::cancel
-        : paused_ ? ToolbarIcon::resume : ToolbarIcon::pause;
-    draw_toolbar_icon(draw.hDC, icon, icon_rect, content_color, dpi_);
+    if (with_icon) {
+        const ToolbarIcon icon = draw.CtlID == kCancelButton ? ToolbarIcon::cancel
+            : paused_ ? ToolbarIcon::resume : ToolbarIcon::pause;
+        draw_toolbar_icon(draw.hDC, icon, icon_rect, content_color, dpi_);
+    }
     RECT text_rect{icon_rect.right + gap, rect.top,
                    icon_rect.right + gap + static_cast<int>(text_size.cx), rect.bottom};
     DrawTextW(draw.hDC, text.c_str(), -1, &text_rect,
@@ -685,11 +782,13 @@ void OperationProgressWindow::paint() {
     const int margin = scale(20);
 
     const auto draw_progress_bar = [&](RECT track, std::uint64_t completed,
-                                       std::uint64_t total) {
+                                       std::uint64_t total,
+                                       bool pulse_when_unknown = true) {
         fill_rect(dc, track, theme_.progress_track);
         frame_rect(dc, track, theme_.border);
         RECT inner = track;
         InflateRect(&inner, -scale(2), -scale(2));
+        if (total == 0 && !pulse_when_unknown) return;
         if (total > 0) {
             const double fraction = std::clamp(
                 static_cast<double>(completed) / total, 0.0, 1.0);
@@ -711,11 +810,22 @@ void OperationProgressWindow::paint() {
     const auto [stage_completed, stage_total] =
         has_progress_ ? overall_progress(progress_)
                       : std::pair<std::uint64_t, std::uint64_t>{0, 0};
-    draw_progress_bar({margin, scale(89), client.right - margin, scale(111)},
+    draw_progress_bar({margin, scale(kOverallBarTop), client.right - margin,
+                       scale(kOverallBarBottom)},
                       stage_completed, stage_total);
+    // Plenty of backends report no per-item size at all, and pulsing an
+    // indeterminate second bar under a blank label is just motion that means
+    // nothing. But whether a *given* snapshot carries a per-file size is not
+    // stable: an empty file, or the first report of an operation, momentarily
+    // has none. Deciding per frame made the bar blink out mid-transfer, so the
+    // decision is made once per operation and then held.
     const auto [file_completed, file_total] = displayed_file_progress();
-    draw_progress_bar({margin, scale(177), client.right - margin, scale(199)},
-                      file_completed, file_total);
+    if (file_bar_active_) {
+        draw_progress_bar({margin, scale(kFileBarTop), client.right - margin,
+                           scale(kFileBarBottom)},
+                          file_completed, file_total,
+                          /*pulse_when_unknown=*/false);
+    }
     if (buffered) {
         const RECT& dirty = paint_info.rcPaint;
         BitBlt(paint_dc, dirty.left, dirty.top,
@@ -740,6 +850,7 @@ LRESULT OperationProgressWindow::handle_message(UINT message, WPARAM wparam, LPA
             SetTimer(hwnd_, kAnimationTimer, 33, nullptr);
             return 0;
         case WM_SIZE: layout(); return 0;
+        case kResizeMessage: apply_window_size(); return 0;
         case WM_DPICHANGED: {
             dpi_ = HIWORD(wparam);
             const auto* suggested = reinterpret_cast<const RECT*>(lparam);
@@ -754,6 +865,7 @@ LRESULT OperationProgressWindow::handle_message(UINT message, WPARAM wparam, LPA
             }
             SendMessageW(pause_button_, WM_SETFONT, reinterpret_cast<WPARAM>(font_), TRUE);
             SendMessageW(cancel_button_, WM_SETFONT, reinterpret_cast<WPARAM>(font_), TRUE);
+            SendMessageW(details_button_, WM_SETFONT, reinterpret_cast<WPARAM>(font_), TRUE);
             layout();
             return 0;
         }
@@ -804,14 +916,17 @@ LRESULT OperationProgressWindow::handle_message(UINT message, WPARAM wparam, LPA
         case WM_COMMAND:
             if (LOWORD(wparam) == kPauseButton) { toggle_pause(); return 0; }
             if (LOWORD(wparam) == kCancelButton) { request_cancel(); return 0; }
+            if (LOWORD(wparam) == kDetailsButton) { toggle_details(); return 0; }
             break;
         case WM_SETTINGCHANGE:
+            if (!follow_system_theme_) return 0;
             handle_dialog_theme_setting_change(lparam);
             refresh_operation_theme(theme_);
             apply_theme();
             return 0;
         case WM_THEMECHANGED:
         case WM_SYSCOLORCHANGE:
+            if (!follow_system_theme_) return 0;
             refresh_operation_theme(theme_);
             apply_theme();
             return 0;
@@ -843,6 +958,84 @@ LRESULT CALLBACK OperationProgressWindow::window_proc(HWND hwnd, UINT message,
     }
     return window != nullptr ? window->handle_message(message, wparam, lparam)
                              : DefWindowProcW(hwnd, message, wparam, lparam);
+}
+
+ThreadedOperationProgressWindow::~ThreadedOperationProgressWindow() { stop(); }
+
+bool ThreadedOperationProgressWindow::start(HWND anchor,
+                                            HINSTANCE instance,
+                                            std::wstring title,
+                                            std::filesystem::path output_path,
+                                            const OperationWindowTheme& theme,
+                                            PauseHandler pause_handler,
+                                            CancelHandler cancel_handler,
+                                            bool pause_available,
+                                            std::shared_ptr<OperationControl> source) {
+    stop();
+
+    // Resolve everything that must be read from the calling thread's window
+    // before handing off. The progress thread never touches `anchor`.
+    OperationProgressWindow::Placement placement;
+    placement.topmost = true;
+    placement.follow_system_theme = false;
+    if (anchor != nullptr) {
+        placement.dpi = GetDpiForWindow(anchor);
+        if (!GetWindowRect(anchor, &placement.anchor)) placement.anchor = {};
+    }
+
+    std::promise<bool> ready;
+    std::future<bool> ready_future = ready.get_future();
+
+    thread_ = std::thread([this, instance, title = std::move(title),
+                           output_path = std::move(output_path), theme,
+                           pause_handler = std::move(pause_handler),
+                           cancel_handler = std::move(cancel_handler),
+                           pause_available, source = std::move(source),
+                           placement, ready = std::move(ready)]() mutable {
+        thread_id_ = GetCurrentThreadId();
+        // Force a message queue to exist before start() returns, so a stop()
+        // that arrives immediately cannot post to a queue that is not there.
+        MSG bootstrap{};
+        PeekMessageW(&bootstrap, nullptr, WM_USER, WM_USER, PM_NOREMOVE);
+
+        OperationProgressWindow window;
+        const bool created = window.create(nullptr, instance, std::move(title),
+                                           std::move(output_path), theme,
+                                           std::move(pause_handler),
+                                           std::move(cancel_handler),
+                                           pause_available, &placement);
+        if (created) window.set_progress_source(std::move(source));
+        ready.set_value(created);
+        if (!created) return;
+
+        MSG message{};
+        while (GetMessageW(&message, nullptr, 0, 0) > 0) {
+            TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
+        // `window` is destroyed here, on the thread that created it, which is
+        // the only thread allowed to call DestroyWindow on it.
+    });
+
+    bool created = false;
+    try {
+        created = ready_future.get();
+    } catch (...) {
+        created = false;
+    }
+    if (!created) stop();
+    return created;
+}
+
+void ThreadedOperationProgressWindow::stop() {
+    if (!thread_.joinable()) return;
+    if (thread_id_ != 0) {
+        // WM_QUIT ends the loop; the window is then torn down on its own
+        // thread as the local OperationProgressWindow goes out of scope.
+        PostThreadMessageW(thread_id_, WM_QUIT, 0, 0);
+    }
+    thread_.join();
+    thread_id_ = 0;
 }
 
 } // namespace axiom::gui

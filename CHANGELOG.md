@@ -12,6 +12,46 @@ Entries are condensed from the
 > **The archive format is still pre-release** and can change between minor
 > versions. Where a release changes what Axiom writes, the entry says so.
 
+## [Unreleased]
+
+### Changed
+
+- Simplified the operation progress window. It now shows six lines and two
+  bars instead of eighteen labelled readouts, and keeps elapsed time, time
+  since the last update, and archive bytes read behind a **Details** button.
+  The add/update/remove/unchanged plan counters get their own row rather than
+  borrowing the compressed-size and ratio fields.
+
+### Fixed
+
+- Showed live progress while dragged archive entries are copied from Axiom's
+  staging directory to the drop target. The copy is driven by shell callbacks
+  on Axiom's own UI thread, so the progress window it owned could neither
+  repaint nor accept a Cancel click, and a large drag looked like it had hung.
+  That window now runs on its own UI thread, so progress advances throughout
+  and Cancel works during the copy.
+- Stopped reporting a percentage and byte counts that measured different things
+  during a multi-phase operation. The bar and percentage span the whole
+  operation; the counters and the time remaining are labelled as belonging to
+  the current stage.
+- Gave the command line the same throughput measurement the window uses. It was
+  dividing completed bytes by total elapsed time, which lagged any speed change
+  for the rest of the run and reported 0 B/s while the first solid block was
+  still being assembled.
+- Replaced a sub-second time remaining that displayed as "0s left" with
+  "finishing", and stopped animating an indeterminate per-file bar when the
+  backend reports no per-item size.
+- Stopped the per-file progress bar blinking out during an operation. Whether a
+  progress report carries a per-item size is not stable across snapshots, so
+  the bar is now shown or hidden once per operation instead of being decided
+  frame by frame.
+- Matched the two progress bars in height, and removed the band of empty dialog
+  above the buttons during operations that report no compression figures or
+  plan counts.
+- Fixed a duplicated status line left behind when the progress window grew to
+  make room for the compression figures. The rows below the new one moved
+  without the vacated band being repainted, so the status text appeared twice.
+
 ## [0.9.2.2] - 2026-08-06
 
 Large-window and large-solid-block release.

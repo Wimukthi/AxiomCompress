@@ -554,6 +554,31 @@ block used to arrive at once.
 Cancellation throws `OperationCancelled` and leaves no partial output, because
 writes are atomic. The unpaused checkpoint path is an atomic fast path.
 
+### Presenting progress
+
+The snapshot is deliberately wide — 21 fields — because producers should report
+what they know and let each frontend decide what is worth showing. Frontends
+are expected to curate, not to mirror. The Windows progress window renders six
+lines plus two bars, and keeps elapsed time, time since the last update, and
+physical archive bytes read behind a **Details** disclosure; the CLI renders one
+line. Both drop fields that would not change a reader's decision.
+
+Two rules exist because breaking them produced wrong numbers rather than merely
+noisy ones:
+
+- **Scope must be stated wherever two scopes coexist.** With phases active, the
+  bar and its percentage span the whole operation via `overall_progress()`,
+  while the byte and item counters describe only the current phase. Time
+  remaining is derived from the phase counters, so it is a phase estimate. The
+  window says "overall", "in this stage", and "left in this stage" rather than
+  letting one row imply a single measurement.
+- **Throughput has one definition, in `core/progress_rate.hpp`.** It samples
+  `throughput_bytes` — falling back to `completed_bytes` — over a trailing
+  four-second window. A cumulative average lags a speed change permanently, and
+  reading `completed_bytes` during the first solid block reports 0 B/s while
+  the reader is visibly busy. The CLI and the GUI share the tracker so they
+  cannot drift apart again.
+
 ## The GUI boundary
 
 The Win32 thread owns windows, menus, dialogs, input routing, and presentation.
@@ -589,19 +614,45 @@ semantic colors, custom menus, and owner-drawn archive controls.
 ### Drag and drop
 
 The file list implements `IDataObject`, `IDropSource`, and `IDropTarget`.
-Dragging entries out materializes them only when a shell target actually asks
-for `CF_HDROP` — so hovering over Explorer doesn't start extracting anything.
 
-Drag-out has two telemetry phases. The provider first extracts entries into
-Axiom's private staging directory. After the drop is accepted, the OLE
+Dragging a **filesystem** selection out is trivial: the data object offers
+`CF_HDROP` with the real paths and the shell does the rest.
+
+Dragging an **archive** selection out cannot work that way, because the files
+do not exist yet. That path offers virtual files instead —
+`CFSTR_FILEDESCRIPTORW` describes the entries, and `CFSTR_FILECONTENTS`
+supplies each one as an `IStream`. Extraction into Axiom's private staging
+directory is deferred until the shell asks for the first stream, so hovering
+over Explorer never starts any work.
+
+Drag-out therefore has two phases, and they behave very differently.
+
+**Extraction** runs on a worker thread while the GUI thread waits in a nested
+message loop, so its progress window repaints normally.
+
+**Transfer** does not. The shell reads the staged files by calling back into
+our `IStream`, and those calls are marshalled onto the source STA — the GUI
+thread. While they run, that thread dispatches no `WM_TIMER` and no input.
 `CFSTR_FILECONTENTS` streams are wrapped by a read-only counting `IStream` that
-reports the bytes the shell has actually consumed, the current relative path,
-and completed-file counts, publishing at 1 MiB or file boundaries without
-rescanning or recopying. Transfer cancellation is checked on every stream read.
+reports bytes actually consumed by the shell, the current relative path, and
+completed-file counts, publishing at 1 MiB or file boundaries without
+rescanning or recopying; cancellation is checked on every read. All of that
+telemetry reaches `OperationControl` correctly — but a progress window owned by
+the GUI thread would never paint it, and its Cancel button would never receive
+a click.
 
-Pause is deliberately unavailable here. An OLE stream call may be dispatched on
-the source STA, and blocking it would also block the Resume button — an
-unpausable operation is better than a deadlocked one.
+So the transfer progress window is hosted on its own UI thread
+(`ThreadedOperationProgressWindow`). It polls the same `OperationControl`
+snapshot every 33 ms, which is safe from any thread, and it takes no owner
+window: owning a window across threads attaches the two input queues and would
+reintroduce exactly the stall the separate thread exists to remove. For the
+same reason it declines `WM_SETTINGCHANGE` theme tracking, since that reads and
+writes process-wide theme state that only the GUI thread may touch.
+
+Pause remains deliberately unavailable. Blocking inside an OLE stream read
+would stall the shell's copy with nothing able to resume it — an unpausable
+operation is better than a deadlocked one. Cancel is available and now
+actually clickable.
 
 ## Benchmarking infrastructure
 

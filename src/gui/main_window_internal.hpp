@@ -1334,6 +1334,10 @@ private:
     std::vector<axiom::gui::FileListColumnId> visible_file_columns_;
 
     axiom::gui::OperationProgressWindow operation_window_;
+    // Drag-out transfers are driven by shell callbacks on this thread, so their
+    // progress window has to live on its own thread to stay alive. See
+    // ThreadedOperationProgressWindow and on_table_begin_drag().
+    axiom::gui::ThreadedOperationProgressWindow drag_transfer_window_;
 
     ThemePalette theme_;
 

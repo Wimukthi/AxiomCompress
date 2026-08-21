@@ -170,10 +170,26 @@ Select what you want and press **Extract**, or `Ctrl+E`. Selecting a folder
 takes everything inside it. You can also just drag entries out of the window
 into Explorer.
 
-Long operations run on background threads, so the window stays usable. Progress
-shows byte counts, throughput, an estimated time remaining, output size, and
-compression ratio where those make sense. Pause, resume, and cancel all work,
-and cancelling never leaves a half-written file behind.
+Dragging out happens in two steps, and both report progress. Axiom first
+unpacks what you dragged into a temporary folder, then Windows copies it to
+where you dropped it. You get a progress window for each, and Cancel works in
+both.
+
+Long operations run on background threads, so the window stays usable.
+
+The progress window shows the stage, an overall bar with byte and item counts,
+the current speed and time remaining, and the item being worked on. Where they
+apply, it also shows the compressed size and ratio so far, and how much data
+was reused rather than recompressed. **Details** reveals the diagnostics —
+elapsed time, how long since the last update, and how many bytes have been read
+from the archive.
+
+When an operation runs in several stages, the bar and its percentage cover the
+whole thing, while the byte counts and the time remaining describe the stage
+you're in. The window says which is which.
+
+Pause, resume, and cancel all work, and cancelling never leaves a half-written
+file behind.
 
 When you extract a few files from a large AXAR archive, Axiom reads only the
 compressed pieces those files actually need, provided the archive records where
