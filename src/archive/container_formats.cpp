@@ -38,39 +38,6 @@ bool file_starts_with_magic(const fs::path& path,
            std::equal(expected.begin(), expected.end(), bytes.begin());
 }
 
-bool file_has_magic_at(const fs::path& path,
-                       std::uint64_t offset,
-                       std::span<const std::uint8_t> expected) {
-    std::ifstream stream(path, std::ios::binary);
-    if (!stream) return false;
-    stream.seekg(0, std::ios::end);
-    const auto size = stream.tellg();
-    if (size < 0 ||
-        static_cast<std::uint64_t>(size) < offset + expected.size()) {
-        return false;
-    }
-    stream.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
-    ByteVector bytes(expected.size());
-    stream.read(reinterpret_cast<char*>(bytes.data()),
-                static_cast<std::streamsize>(bytes.size()));
-    return static_cast<std::size_t>(stream.gcount()) == bytes.size() &&
-           std::equal(expected.begin(), expected.end(), bytes.begin());
-}
-
-bool has_ascii_suffix(std::string_view text, std::string_view suffix) {
-    return text.size() >= suffix.size() &&
-           text.substr(text.size() - suffix.size()) == suffix;
-}
-
-bool has_ascii_suffix(std::wstring_view text, std::wstring_view suffix) {
-    return text.size() >= suffix.size() &&
-           text.substr(text.size() - suffix.size()) == suffix;
-}
-
-std::wstring lower_ascii_path_name(const fs::path& path) {
-    return lower_ascii(path.filename().wstring());
-}
-
 bool looks_like_native_archive_file(const fs::path& path) {
     return file_starts_with_magic(path, kArchiveMagic) ||
            sfx_embedded_archive_range(path).has_value();
@@ -111,68 +78,6 @@ bool looks_like_zip_file(const fs::path& path) {
     if (!stream) return false;
     constexpr std::array<std::uint8_t, 4> kEocd{{'P', 'K', 0x05, 0x06}};
     return std::search(tail.begin(), tail.end(), kEocd.begin(), kEocd.end()) != tail.end();
-}
-
-bool looks_like_7z_file(const fs::path& path) {
-    constexpr std::array<std::uint8_t, 6> kSevenZMagic{{0x37, 0x7a, 0xbc, 0xaf, 0x27, 0x1c}};
-    return file_starts_with_magic(path, kSevenZMagic);
-}
-
-bool looks_like_rar_file(const fs::path& path) {
-    constexpr std::array<std::uint8_t, 7> kRar4Magic{{'R', 'a', 'r', '!', 0x1a, 0x07, 0x00}};
-    constexpr std::array<std::uint8_t, 8> kRar5Magic{{'R', 'a', 'r', '!', 0x1a, 0x07, 0x01, 0x00}};
-    return file_starts_with_magic(path, kRar4Magic) ||
-           file_starts_with_magic(path, kRar5Magic);
-}
-
-bool looks_like_tar_file(const fs::path& path) {
-    constexpr std::array<std::uint8_t, 5> kUstarMagic{{'u', 's', 't', 'a', 'r'}};
-    return file_has_magic_at(path, 257, kUstarMagic);
-}
-
-bool looks_like_iso_file(const fs::path& path) {
-    constexpr std::array<std::uint8_t, 5> kIsoMagic{{'C', 'D', '0', '0', '1'}};
-    return file_has_magic_at(path, 0x8001, kIsoMagic);
-}
-
-bool looks_like_cab_file(const fs::path& path) {
-    constexpr std::array<std::uint8_t, 4> kCabMagic{{'M', 'S', 'C', 'F'}};
-    return file_starts_with_magic(path, kCabMagic);
-}
-
-bool has_7z_extension(const fs::path& path) {
-    return lower_ascii(path.extension().wstring()) == L".7z";
-}
-
-bool has_rar_extension(const fs::path& path) {
-    const std::wstring name = lower_ascii_path_name(path);
-    const std::wstring extension = lower_ascii(path.extension().wstring());
-    if (extension == L".rar") return true;
-    if (extension.size() == 4 && extension[0] == L'.' && extension[1] == L'r' &&
-        extension[2] >= L'0' && extension[2] <= L'9' &&
-        extension[3] >= L'0' && extension[3] <= L'9') {
-        return true;
-    }
-    return name.find(L".part") != std::wstring::npos && has_ascii_suffix(name, L".rar");
-}
-
-bool has_tar_extension(const fs::path& path) {
-    const std::wstring name = lower_ascii_path_name(path);
-    constexpr std::array<std::wstring_view, 9> kTarSuffixes{
-        L".tar", L".tar.gz", L".tgz", L".tar.xz", L".txz",
-        L".tar.bz2", L".tbz2", L".tar.zst", L".tzst"};
-    return std::any_of(kTarSuffixes.begin(), kTarSuffixes.end(),
-                       [&](std::wstring_view suffix) {
-                           return has_ascii_suffix(name, suffix);
-                       });
-}
-
-bool has_iso_extension(const fs::path& path) {
-    return lower_ascii(path.extension().wstring()) == L".iso";
-}
-
-bool has_cab_extension(const fs::path& path) {
-    return lower_ascii(path.extension().wstring()) == L".cab";
 }
 
 class AxarArchiveProvider final : public ArchiveProvider {

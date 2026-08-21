@@ -49,9 +49,10 @@ Entries are condensed from the
 - Applied the project's warning level to the GUI, CLI, and test targets in the
   CMake build, which had been left at the default while only the library was
   raised. The MSBuild projects were already at `/W4`. Added an
-  `AXIOM_WARNINGS_AS_ERRORS` option, off by default and enabled in CI, so a
-  compiler upgrade on a floating runner cannot block a local build or a
-  release package.
+  `AXIOM_WARNINGS_AS_ERRORS` option, off by default and enabled for the Windows
+  CI job, so a compiler upgrade on a floating runner cannot block a local build
+  or a release package. The GCC and Clang jobs still build with warnings only,
+  pending a cleanup of the warnings those compilers report.
 
 ## [0.10.2.0] - 2026-08-21
 
