@@ -277,7 +277,7 @@ std::uint32_t match_cost(std::size_t length, std::size_t distance) {
 
 // A repeat-offset match codes no distance, so it costs the match overhead and a
 // length only. This is what makes the parser prefer reusing a recent distance.
-std::uint32_t rep_cost(std::size_t length) {
+[[maybe_unused]] std::uint32_t rep_cost(std::size_t length) {
     return 12 + (varuint_cost(length) * 5);
 }
 

@@ -79,9 +79,11 @@ std::vector<std::uint8_t> bytes_from_string(const std::string& text) {
     return {text.begin(), text.end()};
 }
 
+#if defined(_WIN32)
 std::string utf8_bytes(std::u8string_view text) {
     return {reinterpret_cast<const char*>(text.data()), text.size()};
 }
+#endif
 
 void expect_roundtrip(const std::vector<std::uint8_t>& input) {
     const auto archive = axiom::compress(input);

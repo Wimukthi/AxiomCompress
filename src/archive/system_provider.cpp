@@ -34,6 +34,11 @@ namespace axiom {
 namespace fs = std::filesystem;
 namespace {
 
+// The system providers wrap Windows shell and 7-Zip facilities. The whole
+// implementation, helpers included, is Windows-only; the POSIX build keeps
+// just the two entry points below, which report that no provider matched.
+#ifdef _WIN32
+
 std::string lower_ascii(std::string text) {
     for (char& ch : text) {
         if (ch >= 'A' && ch <= 'Z') ch = static_cast<char>(ch - 'A' + 'a');
@@ -218,8 +223,6 @@ public:
 private:
     fs::path path_;
 };
-
-#ifdef _WIN32
 
 std::wstring utf8_to_wide(std::string_view text) {
     if (text.empty()) return {};

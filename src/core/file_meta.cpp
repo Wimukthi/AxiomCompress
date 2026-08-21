@@ -832,7 +832,7 @@ SparseCaptureResult capture_sparse_file(const std::filesystem::path& path,
     return result;
 }
 
-bool restore_sparse_file(const std::filesystem::path& path,
+bool restore_sparse_file([[maybe_unused]] const std::filesystem::path& path,
                          const SparseFileMap& map,
                          std::uint64_t logical_size,
                          std::string* error) {

@@ -2,7 +2,17 @@
 
 #include "third_party/lzma-sdk/Lzma2Dec.h"
 #include "third_party/lzma-sdk/Lzma2Enc.h"
+// miniz declares its full static helper set in the header, so every
+// translation unit that includes it leaves most of them unused. The
+// vendored file is dependency-locked and cannot carry the suppression.
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-function"
+#endif
 #include "third_party/miniz/miniz.h"
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
 #include "third_party/zstd/lib/zstd.h"
 
 #include <algorithm>
