@@ -34,11 +34,11 @@ jobs:
           path: Wimukthi.Win32Theme
       - name: Configure
         if: runner.os != 'Windows'
-        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DAXIOM_WARNINGS_AS_ERRORS=ON
       - name: Configure Windows
         if: runner.os == 'Windows'
         shell: pwsh
-        run: cmake -B build -DCMAKE_BUILD_TYPE=Release "-DWIMUKTHI_WIN32_THEME_ROOT=$env:GITHUB_WORKSPACE\Wimukthi.Win32Theme"
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DAXIOM_WARNINGS_AS_ERRORS=ON "-DWIMUKTHI_WIN32_THEME_ROOT=$env:GITHUB_WORKSPACE\Wimukthi.Win32Theme"
       - name: Build
         run: cmake --build build --config Release
       - name: Test
@@ -65,6 +65,17 @@ jobs:
       - name: Pick fuzz duration
         id: dur
         run: echo "seconds=${{ github.event_name == 'schedule' && 600 || 60 }}" >> "$GITHUB_OUTPUT"
+      # Carry the corpus between runs. Without it every run restarts from zero
+      # coverage and a 60-second budget never gets past the shallow paths.
+      # The key is unique per run so the cache is always written back; the
+      # restore-keys prefix picks up the most recent previous corpus.
+      - name: Restore fuzz corpus
+        uses: actions/cache@v4
+        with:
+          path: fuzz-corpus
+          key: fuzz-corpus-linux-${{ github.run_id }}
+          restore-keys: |
+            fuzz-corpus-linux-
       - name: Build fuzz targets (clang + libFuzzer + ASan)
         run: |
           set -euo pipefail
@@ -128,8 +139,26 @@ jobs:
         run: |
           set -euo pipefail
           secs="${{ steps.dur.outputs.seconds }}"
-          ASAN_OPTIONS=allocator_may_return_null=1 ./fuzz_decompress -max_total_time=$secs -rss_limit_mb=2048
-          ASAN_OPTIONS=allocator_may_return_null=1 ./fuzz_archive    -max_total_time=$secs -rss_limit_mb=2048
+          mkdir -p fuzz-corpus/decompress fuzz-corpus/archive
+          # Passing a corpus directory makes libFuzzer both seed from it and
+          # write newly discovered coverage-increasing inputs back into it.
+          ASAN_OPTIONS=allocator_may_return_null=1 ./fuzz_decompress fuzz-corpus/decompress \
+            -max_total_time=$secs -rss_limit_mb=2048 -print_final_stats=1
+          ASAN_OPTIONS=allocator_may_return_null=1 ./fuzz_archive    fuzz-corpus/archive \
+            -max_total_time=$secs -rss_limit_mb=2048 -print_final_stats=1
+      - name: Minimize corpus for the next run
+        if: always()
+        run: |
+          set -euo pipefail
+          # Merge into a fresh directory so the cached corpus stays at the
+          # smallest input set that holds the coverage reached so far.
+          for target in decompress archive; do
+            mkdir -p "fuzz-corpus/${target}-min"
+            ASAN_OPTIONS=allocator_may_return_null=1 "./fuzz_${target}" \
+              -merge=1 "fuzz-corpus/${target}-min" "fuzz-corpus/${target}" -rss_limit_mb=2048
+            rm -rf "fuzz-corpus/${target}"
+            mv "fuzz-corpus/${target}-min" "fuzz-corpus/${target}"
+          done
       - name: Upload crash artifacts
         if: failure()
         uses: actions/upload-artifact@v7
@@ -162,6 +191,15 @@ jobs:
       - name: Build fuzz targets
         run: ./tools/build_fuzz.ps1 -Target all
         shell: pwsh
+      # Same rolling-cache pattern as the Linux job: coverage has to accumulate
+      # across runs for a short per-push budget to reach anything deep.
+      - name: Restore fuzz corpus
+        uses: actions/cache@v4
+        with:
+          path: fuzz-corpus
+          key: fuzz-corpus-windows-${{ github.run_id }}
+          restore-keys: |
+            fuzz-corpus-windows-
       - name: Fuzz
-        run: ./tools/run_fuzz.ps1 -Seconds ${{ github.event_name == 'schedule' && 600 || 60 }} -Target all
+        run: ./tools/run_fuzz.ps1 -Seconds ${{ github.event_name == 'schedule' && 600 || 60 }} -Target all -CorpusRoot fuzz-corpus -Minimize
         shell: pwsh

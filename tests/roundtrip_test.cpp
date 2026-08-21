@@ -2091,8 +2091,34 @@ void test_skip_unreadable_archive_inputs() {
 #endif
 
 #if defined(_WIN32)
+// Resolve System32's bsdtar explicitly. A bare "tar" picks up whichever tar is
+// first on PATH, and the MSYS/Git build reads a "C:\..." argument as a remote
+// host spec ("Cannot connect to C") and fails. The library resolves tar the
+// same way, so this also matches what the provider under test actually runs.
+std::string windows_tar_command() {
+    wchar_t system_dir[MAX_PATH]{};
+    const UINT length = GetSystemDirectoryW(system_dir, MAX_PATH);
+    if (length == 0 || length >= MAX_PATH) {
+        return "tar";
+    }
+    const fs::path candidate = fs::path(system_dir) / L"tar.exe";
+    std::error_code ec;
+    if (!fs::exists(candidate, ec)) {
+        return "tar";
+    }
+    return "\"" + candidate.string() + "\"";
+}
+
+// std::system runs the string through `cmd /c`, which strips the outer quote
+// pair when the command begins with a quote -- splitting a quoted program path
+// mid-way. Wrapping the whole command in one more quote pair is the documented
+// way to keep it intact.
+int run_shell_command(const std::string& command) {
+    return std::system(("\"" + command + "\"").c_str());
+}
+
 bool windows_tar_available() {
-    return std::system("tar --version >nul 2>nul") == 0;
+    return run_shell_command(windows_tar_command() + " --version >nul 2>nul") == 0;
 }
 
 std::string quote_for_command(const fs::path& path) {
@@ -2339,9 +2365,9 @@ void test_system_archive_provider_layer() {
 
     const auto archive = root / "sample.not_tar";
     const std::string command =
-        "tar -cf \"" + archive.string() + "\" -C \"" + source.string() +
+        windows_tar_command() + " -cf \"" + archive.string() + "\" -C \"" + source.string() +
         "\" folder top.txt";
-    AXIOM_CHECK(std::system(command.c_str()) == 0);
+    AXIOM_CHECK(run_shell_command(command) == 0);
 
     const auto* provider = axiom::archive_provider_for_path(archive);
     AXIOM_CHECK(provider != nullptr);
@@ -5822,13 +5848,49 @@ void fuzz_archive(unsigned iterations) {
 
 }  // namespace
 
-int main() {
-    expect_roundtrip({});
+// ---- corpora shared by the codec suites ------------------------------------
 
+std::string make_repeated_corpus() {
     std::string repeated;
     for (int i = 0; i < 2000; ++i) {
         repeated += "function compressBlock(input, context) { return input + context; }\n";
     }
+    return repeated;
+}
+
+std::vector<std::uint8_t> make_binary_corpus() {
+    std::vector<std::uint8_t> binary;
+    for (int i = 0; i < 4096; ++i) {
+        binary.push_back(static_cast<std::uint8_t>((i * 31) & 0xFF));
+    }
+    return binary;
+}
+
+// Interleave several recurring substrings so the parser sees a handful of
+// distinct distances that cycle, exercising rep0..rep3 selection and MTF.
+std::string make_rep_heavy_corpus() {
+    std::string rep_heavy;
+    for (int i = 0; i < 1500; ++i) {
+        rep_heavy += "alpha_token_one ";
+        rep_heavy += "beta_token_two_is_longer ";
+        if (i % 2 == 0) rep_heavy += "gamma_three ";
+        if (i % 3 == 0) rep_heavy += "delta_four_variant ";
+    }
+    return rep_heavy;
+}
+
+std::vector<std::uint8_t> make_random_corpus() {
+    std::mt19937 rng(0xA710CAFEu);
+    std::vector<std::uint8_t> random(8192);
+    std::generate(random.begin(), random.end(), [&] {
+        return static_cast<std::uint8_t>(rng() & 0xFF);
+    });
+    return random;
+}
+
+void test_codec_text_corpus() {
+    const std::string repeated = make_repeated_corpus();
+    expect_roundtrip({});
     expect_roundtrip(bytes_from_string(repeated));
     expect_external_codec_roundtrip(bytes_from_string(repeated));
     expect_lzma_multichunk_settings_roundtrip();
@@ -5850,11 +5912,10 @@ int main() {
     expect_parallel_block_roundtrip(bytes_from_string(repeated));
     expect_nested_task_executor();
     expect_fast_lz_roundtrip(bytes_from_string(repeated));
+}
 
-    std::vector<std::uint8_t> binary;
-    for (int i = 0; i < 4096; ++i) {
-        binary.push_back(static_cast<std::uint8_t>((i * 31) & 0xFF));
-    }
+void test_codec_binary_corpus() {
+    const std::vector<std::uint8_t> binary = make_binary_corpus();
     expect_roundtrip(binary);
     expect_huffman_roundtrip(binary);
     expect_order1_roundtrip(binary);
@@ -5867,16 +5928,10 @@ int main() {
     test_full_previous_literal_mode();
     expect_sequence_stream_roundtrip(binary);
     expect_fast_lz_roundtrip(binary);
+}
 
-    // Interleave several recurring substrings so the parser sees a handful of
-    // distinct distances that cycle, exercising rep0..rep3 selection and MTF.
-    std::string rep_heavy;
-    for (int i = 0; i < 1500; ++i) {
-        rep_heavy += "alpha_token_one ";
-        rep_heavy += "beta_token_two_is_longer ";
-        if (i % 2 == 0) rep_heavy += "gamma_three ";
-        if (i % 3 == 0) rep_heavy += "delta_four_variant ";
-    }
+void test_codec_repetitive_corpus() {
+    const std::string rep_heavy = make_rep_heavy_corpus();
     expect_roundtrip(bytes_from_string(rep_heavy));
     expect_split_stream_roundtrip(bytes_from_string(rep_heavy));
     expect_slot_split_stream_roundtrip(bytes_from_string(rep_heavy));
@@ -5884,12 +5939,13 @@ int main() {
     expect_fast_lz_roundtrip(bytes_from_string(rep_heavy));
     expect_optimal_lz77_roundtrip(bytes_from_string(rep_heavy));
     expect_tree_lz77_roundtrip(bytes_from_string(rep_heavy));
+}
 
-    std::mt19937 rng(0xA710CAFEu);
-    std::vector<std::uint8_t> random(8192);
-    std::generate(random.begin(), random.end(), [&] {
-        return static_cast<std::uint8_t>(rng() & 0xFF);
-    });
+void test_codec_random_corpus() {
+    const std::string repeated = make_repeated_corpus();
+    const std::vector<std::uint8_t> binary = make_binary_corpus();
+    const std::string rep_heavy = make_rep_heavy_corpus();
+    const std::vector<std::uint8_t> random = make_random_corpus();
     expect_roundtrip(random);
     expect_order1_roundtrip(random);
     // A grossly truncated adaptive order-1 stream must be rejected: the bit
@@ -5929,7 +5985,9 @@ int main() {
     }
     long_distance.insert(long_distance.end(), long_distance.begin(), long_distance.end());
     expect_fast_lz_roundtrip(long_distance);
+}
 
+void test_stream_checksum_validation() {
     auto archive = axiom::compress(bytes_from_string("checksum validation"));
     archive.back() ^= 0x55u;
 
@@ -5940,72 +5998,133 @@ int main() {
         failed = true;
     }
     AXIOM_CHECK(failed);
+}
 
-    test_compression_level_presets();
-    test_swarm_extended_levels();
-    test_reversible_transforms_and_v7();
-    test_filtered_axar_roundtrip();
-    test_crc32();
-    test_benchmark_corpus_generator();
-    test_blake3();
-    test_reed_solomon();
-    test_rans_edges();
-    test_rans_contextual_edges();
-    test_archive_roundtrip();
-    test_axar_version_fixtures_and_validation();
-    test_external_codec_axar_roundtrip();
-    test_large_lzma2_solid_profile();
-    test_axar_seekable_extraction();
-    test_archive_provider_layer();
-    test_zip_provider_layer();
-    test_safe_file_replacement();
+// ---- registry --------------------------------------------------------------
+
+struct RegisteredTest {
+    const char* name;
+    void (*run)();
+};
+
+void run_fuzz_decompress() { fuzz_decompress(20000); }
+void run_fuzz_archive() { fuzz_archive(1500); }
+
+// Every test is listed here and every entry is registered with CTest as its own
+// case. AXIOM_CHECK aborts the process on failure -- which it must, because
+// checks run inside callbacks that the library invokes behind its own
+// catch(...) handlers, where a thrown failure would be swallowed. Giving each
+// test its own process is what keeps one abort from hiding the rest.
+constexpr RegisteredTest kTests[] = {
+    {"codec_text_corpus", test_codec_text_corpus},
+    {"codec_binary_corpus", test_codec_binary_corpus},
+    {"codec_repetitive_corpus", test_codec_repetitive_corpus},
+    {"codec_random_corpus", test_codec_random_corpus},
+    {"stream_checksum_validation", test_stream_checksum_validation},
+    {"compression_level_presets", test_compression_level_presets},
+    {"swarm_extended_levels", test_swarm_extended_levels},
+    {"reversible_transforms_and_v7", test_reversible_transforms_and_v7},
+    {"filtered_axar_roundtrip", test_filtered_axar_roundtrip},
+    {"crc32", test_crc32},
+    {"benchmark_corpus_generator", test_benchmark_corpus_generator},
+    {"blake3", test_blake3},
+    {"reed_solomon", test_reed_solomon},
+    {"rans_edges", test_rans_edges},
+    {"rans_contextual_edges", test_rans_contextual_edges},
+    {"archive_roundtrip", test_archive_roundtrip},
+    {"axar_version_fixtures_and_validation", test_axar_version_fixtures_and_validation},
+    {"external_codec_axar_roundtrip", test_external_codec_axar_roundtrip},
+    {"large_lzma2_solid_profile", test_large_lzma2_solid_profile},
+    {"axar_seekable_extraction", test_axar_seekable_extraction},
+    {"archive_provider_layer", test_archive_provider_layer},
+    {"zip_provider_layer", test_zip_provider_layer},
+    {"safe_file_replacement", test_safe_file_replacement},
 #if defined(_WIN32)
-    test_skip_unreadable_archive_inputs();
-    test_unicode_path_archive_probe();
-    test_unicode_archive_entry_names();
-    test_iso_native_listing_provider_layer();
-    test_system_archive_provider_layer();
-    test_bundled_7z_provider_layer();
+    {"skip_unreadable_archive_inputs", test_skip_unreadable_archive_inputs},
+    {"unicode_path_archive_probe", test_unicode_path_archive_probe},
+    {"unicode_archive_entry_names", test_unicode_archive_entry_names},
+    {"iso_native_listing_provider_layer", test_iso_native_listing_provider_layer},
+    {"system_archive_provider_layer", test_system_archive_provider_layer},
+    {"bundled_7z_provider_layer", test_bundled_7z_provider_layer},
 #endif
-    test_zip_aes256_encryption();
-    test_zip_aes_data_descriptor_compatibility();
-    test_archive_symlinks();
-    test_archive_hardlinks();
-    test_archive_add();
-    test_archive_content_reuse();
-    test_gui_live_dedup_option_mapping();
-    test_archive_live_dedup();
-    test_archive_snapshots();
-    test_archive_file_manager_apis();
-    test_archive_delete_repack();
-    test_archive_update_sync();
-    test_archive_single_pass_sync_transaction();
-    test_archive_comment_lock();
-    test_archive_recovery_and_volumes();
-    test_archive_authenticity_and_sfx();
-    test_sfx_options_and_config();
-    test_sfx_config_packaging();
-    test_archive_encryption();
-    test_archive_encryption_v2_password_slots();
-    test_archive_encrypted_directory();
-    test_archive_timestamp_conversion();
-    test_archive_operation_control();
-    test_compression_estimator();
+    {"zip_aes256_encryption", test_zip_aes256_encryption},
+    {"zip_aes_data_descriptor_compatibility", test_zip_aes_data_descriptor_compatibility},
+    {"archive_symlinks", test_archive_symlinks},
+    {"archive_hardlinks", test_archive_hardlinks},
+    {"archive_add", test_archive_add},
+    {"archive_content_reuse", test_archive_content_reuse},
+    {"gui_live_dedup_option_mapping", test_gui_live_dedup_option_mapping},
+    {"archive_live_dedup", test_archive_live_dedup},
+    {"archive_snapshots", test_archive_snapshots},
+    {"archive_file_manager_apis", test_archive_file_manager_apis},
+    {"archive_delete_repack", test_archive_delete_repack},
+    {"archive_update_sync", test_archive_update_sync},
+    {"archive_single_pass_sync_transaction", test_archive_single_pass_sync_transaction},
+    {"archive_comment_lock", test_archive_comment_lock},
+    {"archive_recovery_and_volumes", test_archive_recovery_and_volumes},
+    {"archive_authenticity_and_sfx", test_archive_authenticity_and_sfx},
+    {"sfx_options_and_config", test_sfx_options_and_config},
+    {"sfx_config_packaging", test_sfx_config_packaging},
+    {"archive_encryption", test_archive_encryption},
+    {"archive_encryption_v2_password_slots", test_archive_encryption_v2_password_slots},
+    {"archive_encrypted_directory", test_archive_encrypted_directory},
+    {"archive_timestamp_conversion", test_archive_timestamp_conversion},
+    {"archive_operation_control", test_archive_operation_control},
+    {"compression_estimator", test_compression_estimator},
 #if defined(_WIN32)
-    test_windows_metadata();
-    test_archive_ads();
-    test_archive_sparse_files();
+    {"windows_metadata", test_windows_metadata},
+    {"archive_ads", test_archive_ads},
+    {"archive_sparse_files", test_archive_sparse_files},
 #else
-    test_archive_xattrs();
+    {"archive_xattrs", test_archive_xattrs},
 #endif
-    test_archive_safety();
-    test_extract_link_safety();
-    test_decompress_bomb();
-    test_split_stream_size_bomb();
-    test_sequence_stream_truncation();
-    fuzz_decompress(20000);
-    fuzz_archive(1500);
+    {"archive_safety", test_archive_safety},
+    {"extract_link_safety", test_extract_link_safety},
+    {"decompress_bomb", test_decompress_bomb},
+    {"split_stream_size_bomb", test_split_stream_size_bomb},
+    {"sequence_stream_truncation", test_sequence_stream_truncation},
+    {"fuzz_decompress", run_fuzz_decompress},
+    {"fuzz_archive", run_fuzz_archive},
+};
 
+
+int run_named_test(std::string_view name) {
+    for (const auto& entry : kTests) {
+        if (name == entry.name) {
+            entry.run();
+            std::cout << "ok: " << entry.name << '\n';
+            return 0;
+        }
+    }
+    std::cerr << "unknown test: " << name << '\n';
+    return 2;
+}
+
+int main(int argc, char** argv) {
+    const std::vector<std::string_view> args(argv + 1, argv + argc);
+
+    // --list lets the build register one CTest case per test without the list
+    // being duplicated in CMake.
+    if (args.size() == 1 && args[0] == "--list") {
+        for (const auto& entry : kTests) {
+            std::cout << entry.name << '\n';
+        }
+        return 0;
+    }
+    if (args.size() == 2 && args[0] == "--test") {
+        return run_named_test(args[1]);
+    }
+    if (!args.empty()) {
+        std::cerr << "usage: axiom_roundtrip [--list | --test <name>]\n";
+        return 2;
+    }
+
+    // No arguments: run everything in this process, as before. A failing check
+    // still aborts here, so CTest -- which runs each case separately -- is the
+    // way to see the complete set of failures.
+    for (const auto& entry : kTests) {
+        entry.run();
+    }
     std::cout << "all tests passed (codec + archive + safety + fuzz)\n";
     return 0;
 }

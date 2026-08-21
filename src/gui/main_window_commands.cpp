@@ -1143,6 +1143,18 @@ void MainWindow::on_update_download_complete(LPARAM lparam) {
                          IDYES) != IDYES) {
         return;
     }
+    // The staged installer has been sitting in a user-writable directory for as
+    // long as the prompt above was open. Re-verify it against the published
+    // digest before handing it an elevation prompt.
+    std::wstring verify_error;
+    if (!axiom::gui::verify_installer_file(result->installer_path, result->update.digest,
+                                           verify_error)) {
+        show_app_message(L"The downloaded update could not be verified and was not run:\n\n" +
+                             verify_error,
+                         axiom::gui::MessageDialogIcon::error,
+                         L"Axiom Update");
+        return;
+    }
     SetLastError(ERROR_SUCCESS);
     const auto launch = reinterpret_cast<INT_PTR>(ShellExecuteW(
         hwnd_, L"runas", result->installer_path.c_str(), nullptr, nullptr, SW_SHOWNORMAL));

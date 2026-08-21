@@ -4,12 +4,20 @@
 param(
     [int]$Seconds = 60,
     [ValidateSet("fuzz_decompress", "fuzz_archive", "all")]
-    [string]$Target = "all"
+    [string]$Target = "all",
+    # Where the accumulated corpus lives. Point this at a cached directory in CI
+    # so coverage carries between runs instead of restarting from zero each time.
+    [string]$CorpusRoot,
+    # After fuzzing, reduce the corpus to the smallest input set that preserves
+    # the coverage reached, so a cached corpus does not grow without bound.
+    [switch]$Minimize
 )
 
 $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $PSScriptRoot
 $outDir = Join-Path $Root "build\fuzz"
+if (-not $CorpusRoot) { $CorpusRoot = $outDir }
+New-Item -ItemType Directory -Force -Path $CorpusRoot | Out-Null
 
 # The ASan/libFuzzer runtime DLL ships beside cl.exe; put it on PATH so the
 # instrumented executables can load it outside a developer shell.
@@ -36,8 +44,8 @@ New-Item -ItemType Directory -Force -Path $seedRoot | Out-Null
 if (Test-Path $axiomc) {
     $sample = Join-Path $seedRoot "sample.txt"
     ("axiom archival sample payload " * 64) | Set-Content -NoNewline $sample
-    $decSeeds = Join-Path $outDir "corpus_decompress"; New-Item -ItemType Directory -Force $decSeeds | Out-Null
-    $arcSeeds = Join-Path $outDir "corpus_archive"; New-Item -ItemType Directory -Force $arcSeeds | Out-Null
+    $decSeeds = Join-Path $CorpusRoot "corpus_decompress"; New-Item -ItemType Directory -Force $decSeeds | Out-Null
+    $arcSeeds = Join-Path $CorpusRoot "corpus_archive"; New-Item -ItemType Directory -Force $arcSeeds | Out-Null
     & $axiomc c $sample (Join-Path $decSeeds "seed.axc") 2>$null
     & $axiomc a (Join-Path $arcSeeds "seed.axar") $sample 2>$null
 }
@@ -47,7 +55,7 @@ $failed = $false
 foreach ($t in $targets) {
     $exe = Join-Path $outDir "$t.exe"
     if (-not (Test-Path $exe)) { throw "$exe not found; run tools\build_fuzz.ps1 first." }
-    $corpus = Join-Path $outDir "corpus_$($t -replace 'fuzz_','')"
+    $corpus = Join-Path $CorpusRoot "corpus_$($t -replace 'fuzz_','')"
     New-Item -ItemType Directory -Force -Path $corpus | Out-Null
     Write-Host "=== fuzzing $t for ${Seconds}s ==="
     # libFuzzer logs progress to stderr; don't let that abort the script.
@@ -58,6 +66,25 @@ foreach ($t in $targets) {
     $code = $LASTEXITCODE
     $ErrorActionPreference = $prevEAP
     if ($code -ne 0) { Write-Host "!! $t reported a finding (exit $code)"; $failed = $true }
+
+    if ($Minimize -and -not $failed) {
+        $minimized = "$corpus-min"
+        if (Test-Path $minimized) { Remove-Item -Recurse -Force $minimized }
+        New-Item -ItemType Directory -Force -Path $minimized | Out-Null
+        $prevEAP = $ErrorActionPreference
+        $ErrorActionPreference = "Continue"
+        & $exe "-merge=1" "-rss_limit_mb=2048" $minimized $corpus 2>&1 |
+            ForEach-Object { Write-Host $_ }
+        $mergeCode = $LASTEXITCODE
+        $ErrorActionPreference = $prevEAP
+        if ($mergeCode -eq 0) {
+            Remove-Item -Recurse -Force $corpus
+            Move-Item $minimized $corpus
+        } else {
+            Write-Host "!! $t corpus merge failed (exit $mergeCode); keeping the unminimized corpus"
+            Remove-Item -Recurse -Force $minimized -ErrorAction SilentlyContinue
+        }
+    }
 }
 if ($failed) { exit 1 }
 Write-Host "fuzzing completed with no findings"

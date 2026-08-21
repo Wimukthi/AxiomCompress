@@ -14,6 +14,45 @@ Entries are condensed from the
 
 ## [Unreleased]
 
+### Added
+
+- Added `axiomc --version` (also `-V` and `version`), printing one
+  machine-readable `axiomc <version>` line to standard output. Packaging and
+  scripts previously had no way to read the installed version, and the flag
+  fell through to "unknown command".
+- Registered every case in the round-trip suite as its own CTest test, and gave
+  the test binary `--list` and `--test <name>`. A failed check aborts the
+  process by design — checks run inside library callbacks that sit behind
+  `catch(...)` handlers, where a thrown failure would be swallowed — so a
+  single-process run stopped at the first failure and hid every later case. The
+  suite still runs end to end when invoked with no arguments.
+- Carried the libFuzzer corpus between CI runs, on Linux and Windows, and
+  minimized it afterwards. Each run previously started from zero coverage, so a
+  60-second budget never reached beyond the shallow decode paths.
+
+### Fixed
+
+- Refused an update download whose release asset publishes no SHA-256 digest,
+  instead of accepting it as verified. The installer is launched elevated, so
+  an unverifiable download is now reported and skipped.
+- Re-verified the downloaded installer against its published digest immediately
+  before launching it. The file is staged in a user-writable directory and the
+  confirmation prompt can stay open indefinitely, leaving a window between the
+  original check and the elevation.
+- Resolved `tar.exe` from the system directory in the system-provider test,
+  matching what the library itself does. A bare `tar` picked up whichever build
+  came first on `PATH`, and the MSYS/Git build reads a `C:\...` argument as a
+  remote host and fails.
+
+### Changed
+
+- Applied the project's warning level to the GUI, CLI, and test targets in the
+  CMake build, which had been left at the default while only the library was
+  raised. The MSBuild projects were already at `/W4`. Added an
+  `AXIOM_WARNINGS_AS_ERRORS` option, off by default and enabled in CI, so a
+  compiler upgrade on a floating runner cannot block a local build or a
+  release package.
+
 ## [0.10.2.0] - 2026-08-21
 
 Progress stability and file-selection reliability release.

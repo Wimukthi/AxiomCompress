@@ -508,7 +508,14 @@ std::optional<std::string> sha256_hex(const std::vector<BYTE>& bytes,
 
 bool verify_digest(const std::vector<BYTE>& bytes, std::wstring_view expected,
                    std::wstring& error) {
-    if (expected.empty()) return true;
+    // Fail closed. The downloaded installer is launched elevated, so an asset
+    // that arrives without a digest is refused rather than trusted.
+    if (expected.empty()) {
+        error = L"The release did not publish a SHA-256 digest for this asset, "
+                L"so the download cannot be verified. Install the update "
+                L"manually from the releases page instead.";
+        return false;
+    }
     std::string normalized = lower_ascii(wide_to_utf8(expected));
     constexpr std::string_view prefix = "sha256:";
     if (!normalized.starts_with(prefix)) {
@@ -706,6 +713,34 @@ void start_update_download(HWND notify_window, UpdateInfo update) {
         result->installer_path = installer.wstring();
         post_owned_result(notify_window, kUpdateDownloadCompleteMessage, std::move(result));
     }).detach();
+}
+
+bool verify_installer_file(const std::wstring& installer_path,
+                           const std::wstring& expected_digest, std::wstring& error) {
+    std::error_code ec;
+    const std::filesystem::path path(installer_path);
+    const auto size = std::filesystem::file_size(path, ec);
+    if (ec) {
+        error = L"The downloaded installer is no longer readable.";
+        return false;
+    }
+    if (size > kMaximumDownloadBytes) {
+        error = L"The downloaded installer changed size after it was verified.";
+        return false;
+    }
+    std::ifstream input(path, std::ios::binary);
+    if (!input) {
+        error = L"The downloaded installer could not be reopened for verification.";
+        return false;
+    }
+    std::vector<BYTE> bytes(static_cast<std::size_t>(size));
+    if (!bytes.empty() &&
+        !input.read(reinterpret_cast<char*>(bytes.data()),
+                    static_cast<std::streamsize>(bytes.size()))) {
+        error = L"The downloaded installer could not be read back for verification.";
+        return false;
+    }
+    return verify_digest(bytes, expected_digest, error);
 }
 
 }  // namespace axiom::gui

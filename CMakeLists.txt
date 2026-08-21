@@ -132,15 +132,39 @@ if(NOT AXIOM_X86)
         BLAKE3_USE_NEON=0)
 endif()
 
+# Off by default so a compiler upgrade on a floating CI runner cannot block a
+# local build or a release package. CI turns it on, which is where a newly
+# introduced warning should surface.
+option(AXIOM_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" OFF)
+
+# Applies the project's warning level to a target we own. Kept in one place so
+# the GUI, CLI, and test binary cannot drift from the library's settings --
+# which they had, leaving roughly a third of the codebase at default warnings.
+function(axiom_set_warning_level target)
+    if(MSVC)
+        target_compile_options(${target} PRIVATE /W4 /permissive-)
+        if(AXIOM_WARNINGS_AS_ERRORS)
+            target_compile_options(${target} PRIVATE /WX)
+        endif()
+    else()
+        # Designated initializers that rely on default member initializers for
+        # the trailing fields are deliberate; GCC reports each omitted member.
+        target_compile_options(${target} PRIVATE
+            -Wall -Wextra -Wpedantic -Wno-missing-field-initializers)
+        if(AXIOM_WARNINGS_AS_ERRORS)
+            target_compile_options(${target} PRIVATE -Werror)
+        endif()
+    endif()
+endfunction()
+
+axiom_set_warning_level(axiom)
 if(MSVC)
-    target_compile_options(axiom PRIVATE /W4 /permissive-)
     set_source_files_properties(${BLAKE3_SOURCES} ${MONOCYPHER_SOURCES} ${MINIZ_SOURCES} ${ZSTD_SOURCES} ${LZMA_SDK_SOURCES} ${MINIZIP_NG_SOURCES} PROPERTIES COMPILE_OPTIONS /w)
     if(AXIOM_X86)
         set_source_files_properties(src/third_party/blake3/blake3_avx2.c PROPERTIES COMPILE_OPTIONS "/w;/arch:AVX2")
         set_source_files_properties(src/third_party/blake3/blake3_avx512.c PROPERTIES COMPILE_OPTIONS "/w;/arch:AVX512")
     endif()
 else()
-    target_compile_options(axiom PRIVATE -Wall -Wextra -Wpedantic)
     set_source_files_properties(${BLAKE3_SOURCES} ${MONOCYPHER_SOURCES} ${MINIZ_SOURCES} ${ZSTD_SOURCES} ${LZMA_SDK_SOURCES} ${MINIZIP_NG_SOURCES} PROPERTIES COMPILE_OPTIONS -w)
     if(AXIOM_X86)
         set_source_files_properties(src/core/checksum_clmul.cpp PROPERTIES COMPILE_OPTIONS "-msse4.1;-mpclmul")
@@ -167,6 +191,7 @@ endif()
 add_executable(axiomc ${AXIOMC_SOURCES})
 target_link_libraries(axiomc PRIVATE axiom)
 target_include_directories(axiomc PRIVATE src)
+axiom_set_warning_level(axiomc)
 
 if(WIN32)
     set(WIMUKTHI_WIN32_THEME_ROOT
@@ -320,6 +345,7 @@ if(WIN32)
     target_link_libraries(axiom_gui PRIVATE axiom axiom_sfx_decode Wimukthi::Win32Theme Bcrypt Comctl32 Dwmapi Gdiplus Msimg32 Ole32 Shell32 Shlwapi Version Winhttp)
     target_include_directories(axiom_gui PRIVATE src)
     target_compile_definitions(axiom_gui PRIVATE UNICODE _UNICODE)
+    axiom_set_warning_level(axiom_gui)
     set_target_properties(axiom_gui PROPERTIES OUTPUT_NAME "Axiom")
     add_dependencies(axiom_gui axiom_sfx_module)
     add_dependencies(axiomc axiom_sfx_module)
@@ -330,4 +356,28 @@ enable_testing()
 add_executable(axiom_roundtrip tests/roundtrip_test.cpp)
 target_link_libraries(axiom_roundtrip PRIVATE axiom)
 target_include_directories(axiom_roundtrip PRIVATE src)
-add_test(NAME axiom_roundtrip COMMAND axiom_roundtrip)
+axiom_set_warning_level(axiom_roundtrip)
+
+# Register every case in the suite as its own CTest test. A failing check aborts
+# the process by design -- checks run inside library callbacks that sit behind
+# catch(...) handlers, so a thrown failure would be swallowed -- which means a
+# single-process run stops at the first failure and hides every later case.
+# Separate processes let one failure be reported without masking the rest, and
+# let CTest run the suite in parallel.
+set(AXIOM_TEST_LIST_FILE "${CMAKE_CURRENT_BINARY_DIR}/axiom_roundtrip_tests.cmake")
+add_custom_command(
+    TARGET axiom_roundtrip POST_BUILD
+    COMMAND ${CMAKE_COMMAND}
+        -D "TEST_EXECUTABLE=$<TARGET_FILE:axiom_roundtrip>"
+        -D "OUTPUT_FILE=${AXIOM_TEST_LIST_FILE}"
+        -D "WORKING_DIR=${CMAKE_CURRENT_BINARY_DIR}"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/DiscoverRoundtripTests.cmake"
+    COMMENT "Discovering axiom_roundtrip test cases"
+    VERBATIM)
+
+# Written by the POST_BUILD step above; created empty first so a configure that
+# precedes the first build still produces a valid include.
+if(NOT EXISTS "${AXIOM_TEST_LIST_FILE}")
+    file(WRITE "${AXIOM_TEST_LIST_FILE}" "")
+endif()
+set_property(DIRECTORY APPEND PROPERTY TEST_INCLUDE_FILES "${AXIOM_TEST_LIST_FILE}")

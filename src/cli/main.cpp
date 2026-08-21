@@ -95,6 +95,10 @@ void print_usage() {
         "  axiomc c [options] <input> <output.axc>         compress one stream\n"
         "  axiomc d [options] <input.axc> <output>         decompress one stream\n"
         "\n"
+        "General:\n"
+        "  axiomc --version | -V | version                 print the version and exit\n"
+        "  axiomc --help | -h | help                       show this help\n"
+        "\n"
         "Encryption:\n"
         "  -p, --password STR  encrypt blocks on 'a' (create); supply to read 'x'/'t'/'l'\n"
         "                      AXAR uses Argon2id + XChaCha20-Poly1305; ZIP uses WinZip AES-256\n"
@@ -556,6 +560,7 @@ void print_interactive_help() {
     std::cout <<
         "Interactive commands:\n"
         "  help                         show full command help\n"
+        "  version                      print the version and exit\n"
         "  clear                        clear the console\n"
         "  pwd                          print the current working directory\n"
         "  cd <dir>                     change the current working directory\n"
@@ -1761,6 +1766,12 @@ int run_decompress(std::vector<std::string> args) {
 int run_command(std::string_view command, std::vector<std::string> args) {
     if (command == "help" || command == "-h" || command == "--help" || command == "/?") {
         print_usage();
+        return 0;
+    }
+    if (command == "version" || command == "--version" || command == "-V") {
+        // One machine-parseable line on stdout, so packaging and scripts can
+        // read the installed version without parsing the help text.
+        std::cout << axiom::kCommandLineName << ' ' << axiom::kVersion << '\n';
         return 0;
     }
     if (command == "a" || command == "add") {
