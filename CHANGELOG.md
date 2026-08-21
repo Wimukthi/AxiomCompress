@@ -14,6 +14,10 @@ Entries are condensed from the
 
 ## [Unreleased]
 
+## [0.9.2.3] - 2026-08-21
+
+Live content deduplication and progress reporting release.
+
 ### Added
 
 - Added an opt-in AXAR v5 live-deduplication profile (`axiomc a --dedup`) with
@@ -60,6 +64,13 @@ Entries are condensed from the
 - Fixed a duplicated status line left behind when the progress window grew to
   make room for the compression figures. The rows below the new one moved
   without the vacated band being repainted, so the status text appeared twice.
+
+### Validation
+
+- Release MSVC solution build and the complete codec/archive/safety/fuzz suite
+  passed with no warnings or errors.
+- CLI create, integrity-test, repack, and post-repack integrity checks passed
+  for the new live-deduplication profile.
 
 ## [0.9.2.2] - 2026-08-06
 
@@ -494,6 +505,8 @@ First published release: the Inno Setup installer and portable zip, carrying
 update/repair/remove maintenance handling, and dynamic light/dark setup
 styling.
 
+[Unreleased]: https://github.com/Wimukthi/AxiomCompress/compare/0.9.2.3...HEAD
+[0.9.2.3]: https://github.com/Wimukthi/AxiomCompress/releases/tag/0.9.2.3
 [0.9.2.2]: https://github.com/Wimukthi/AxiomCompress/releases/tag/0.9.2.2
 [0.9.1.0]: https://github.com/Wimukthi/AxiomCompress/releases/tag/0.9.1.0
 [0.9.0.0]: https://github.com/Wimukthi/AxiomCompress/releases/tag/0.9.0.0
