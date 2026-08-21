@@ -18,28 +18,23 @@ namespace {
 constexpr wchar_t kWindowClass[] = L"AxiomOperationProgressWindow";
 constexpr int kPauseButton = 1;
 constexpr int kCancelButton = 2;
-constexpr int kDetailsButton = 3;
 constexpr UINT_PTR kAnimationTimer = 1;
 // Growing the window is deferred through the queue rather than done inside the
 // timer handler, so a resize never interleaves with the paint that is already
 // in flight for the old geometry.
 constexpr UINT kResizeMessage = WM_APP + 1;
 
-// Layout grid, in 96-DPI logical units. The collapsed view stops after the
-// activity row; Details adds the two diagnostic rows below it.
+// Layout grid, in 96-DPI logical units.
 constexpr int kBarHeight = 22;
 constexpr int kOverallBarTop = 66;
 constexpr int kOverallBarBottom = kOverallBarTop + kBarHeight;
-constexpr int kFileBarTop = 162;
+constexpr int kFileBarTop = 140;
 constexpr int kFileBarBottom = kFileBarTop + kBarHeight;
 constexpr int kRowHeight = 22;
 // Compression figures and the sync plan only exist for some operations. Their
 // rows are reserved on demand so an extraction or a drag transfer does not
 // leave a band of empty dialog above the buttons.
-constexpr int kOptionalRowTop = kFileBarBottom + 26;
-constexpr int kDetailRowHeight = 20;
-
-std::wstring format_bytes_of(std::uint64_t completed, std::uint64_t total);
+constexpr int kOptionalRowTop = kFileBarBottom + 10;
 
 std::wstring format_size(std::uint64_t bytes) {
     constexpr const wchar_t* units[] = {L"B", L"KB", L"MB", L"GB", L"TB"};
@@ -56,11 +51,6 @@ std::wstring format_size(std::uint64_t bytes) {
     return stream.str();
 }
 
-// "170 MB of 400 MB". One phrase instead of three labelled fields.
-std::wstring format_bytes_of(std::uint64_t completed, std::uint64_t total) {
-    return format_size(completed) + L" of " + format_size(total);
-}
-
 std::wstring format_count(std::uint64_t value) {
     std::wstring digits = std::to_wstring(value);
     for (std::size_t position = digits.size(); position > 3;) {
@@ -68,17 +58,6 @@ std::wstring format_count(std::uint64_t value) {
         digits.insert(position, 1, L',');
     }
     return digits;
-}
-
-std::wstring format_percent(std::uint64_t completed, std::uint64_t total) {
-    std::wstringstream stream;
-    stream.setf(std::ios::fixed);
-    stream.precision(1);
-    stream << (total == 0 ? 0.0
-                          : std::min(100.0, static_cast<double>(completed) *
-                                                100.0 / total))
-           << L'%';
-    return stream.str();
 }
 
 std::wstring format_duration(std::uint64_t seconds) {
@@ -213,14 +192,14 @@ bool OperationProgressWindow::create(HWND owner,
     cancel_handler_ = std::move(cancel_handler);
     pause_available_ = pause_available;
     follow_system_theme_ = placement == nullptr || placement->follow_system_theme;
-    started_ = std::chrono::steady_clock::now();
-    last_progress_time_ = started_;
-    last_heartbeat_paint_ = started_;
+    last_progress_time_ = std::chrono::steady_clock::now();
+    last_heartbeat_paint_ = last_progress_time_;
     progress_source_.reset();
     rate_.reset();
     last_progress_sequence_ = 0;
-    details_expanded_ = false;
     file_bar_active_ = false;
+    result_row_active_ = false;
+    plan_row_active_ = false;
     reserved_optional_rows_ = 0;
     paused_ = false;
     cancelling_ = false;
@@ -236,7 +215,7 @@ bool OperationProgressWindow::create(HWND owner,
 
     constexpr DWORD kWindowStyle = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU |
                                    WS_MINIMIZEBOX | WS_CLIPCHILDREN;
-    RECT window_rect{0, 0, scale(640), scale(collapsed_height())};
+    RECT window_rect{0, 0, scale(640), scale(window_height())};
     AdjustWindowRectExForDpi(&window_rect, kWindowStyle, FALSE, 0, dpi_);
     const int width = window_rect.right - window_rect.left;
     const int height = window_rect.bottom - window_rect.top;
@@ -308,23 +287,14 @@ void OperationProgressWindow::create_controls() {
     cancel_button_ = CreateWindowExW(0, L"BUTTON", L"Cancel", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
                                      0, 0, 0, 0, hwnd_,
                                      reinterpret_cast<HMENU>(static_cast<INT_PTR>(kCancelButton)), instance_, nullptr);
-    details_button_ = CreateWindowExW(0, L"BUTTON", L"Details",
-                                      WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
-                                      0, 0, 0, 0, hwnd_,
-                                      reinterpret_cast<HMENU>(static_cast<INT_PTR>(kDetailsButton)),
-                                      instance_, nullptr);
     SendMessageW(pause_button_, WM_SETFONT, reinterpret_cast<WPARAM>(font_), TRUE);
     SendMessageW(cancel_button_, WM_SETFONT, reinterpret_cast<WPARAM>(font_), TRUE);
-    SendMessageW(details_button_, WM_SETFONT, reinterpret_cast<WPARAM>(font_), TRUE);
     add_dialog_tooltip(
         tooltip_, pause_button_,
         L"Pause the operation at its next safe checkpoint. Select Resume to continue.");
     add_dialog_tooltip(
         tooltip_, cancel_button_,
         L"Request cancellation. The active codec or file operation stops at its next safe checkpoint.");
-    add_dialog_tooltip(
-        tooltip_, details_button_,
-        L"Show or hide elapsed-time, update-age, and archive-read diagnostics.");
     if (!pause_available_) ShowWindow(pause_button_, SW_HIDE);
     update_telemetry_fields();
 }
@@ -335,7 +305,6 @@ void OperationProgressWindow::apply_theme() {
     background_brush_ = CreateSolidBrush(theme_.background);
     apply_dialog_control_theme(pause_button_, theme_.dark);
     apply_dialog_control_theme(cancel_button_, theme_.dark);
-    apply_dialog_control_theme(details_button_, theme_.dark);
     tooltip_.apply_theme(theme_.dark);
     InvalidateRect(hwnd_, nullptr, TRUE);
     for (HWND control : telemetry_fields_) {
@@ -343,7 +312,6 @@ void OperationProgressWindow::apply_theme() {
     }
     InvalidateRect(pause_button_, nullptr, TRUE);
     InvalidateRect(cancel_button_, nullptr, TRUE);
-    InvalidateRect(details_button_, nullptr, TRUE);
 }
 
 void OperationProgressWindow::set_theme(const OperationWindowTheme& theme) {
@@ -357,19 +325,13 @@ int OperationProgressWindow::activity_row() const {
     return kOptionalRowTop + reserved_optional_rows_ * kRowHeight + 12;
 }
 
-int OperationProgressWindow::collapsed_height() const {
+int OperationProgressWindow::window_height() const {
     return activity_row() + 18 + 14 + 32 + 20;
-}
-
-int OperationProgressWindow::expanded_height() const {
-    return collapsed_height() + kDetailRowHeight * 2 + 6;
 }
 
 void OperationProgressWindow::apply_window_size() {
     if (hwnd_ == nullptr) return;
-    RECT window_rect{0, 0, scale(640),
-                     scale(details_expanded_ ? expanded_height()
-                                             : collapsed_height())};
+    RECT window_rect{0, 0, scale(640), scale(window_height())};
     AdjustWindowRectExForDpi(&window_rect,
                              static_cast<DWORD>(GetWindowLongPtrW(hwnd_, GWL_STYLE)),
                              FALSE, 0, dpi_);
@@ -403,7 +365,6 @@ void OperationProgressWindow::layout() {
     const int margin = scale(20);
     const int gap = scale(8);
     const int button_width = scale(92);
-    const int details_width = scale(120);
     const int button_height = scale(32);
     const int bottom = client.bottom - margin;
     const int content_width = client.right - margin * 2;
@@ -414,25 +375,25 @@ void OperationProgressWindow::layout() {
 
     place(TelemetryField::stage, 14, 24);
     place(TelemetryField::output_path, 38, 18);
-    place(TelemetryField::overall_summary, kOverallBarBottom + 4);
-    place(TelemetryField::overall_rate, kOverallBarBottom + 26);
-    place(TelemetryField::current_path, 140, 18);
-    place(TelemetryField::file_summary, kFileBarBottom + 4);
-    place(TelemetryField::result_summary, kOptionalRowTop);
-    place(TelemetryField::plan_summary, kOptionalRowTop + kRowHeight);
+    place(TelemetryField::overall_rate, kOverallBarBottom + 4);
+    place(TelemetryField::current_path, 116, 18);
+    int optional_y = kOptionalRowTop;
+    // Synchronization publishes its plan before compression statistics. Keep
+    // that first visible row in place when the result row arrives later.
+    if (plan_row_active_) {
+        place(TelemetryField::plan_summary, optional_y);
+        optional_y += kRowHeight;
+    }
+    if (result_row_active_) {
+        place(TelemetryField::result_summary, optional_y);
+    }
 
     const int activity_y = activity_row();
     place(TelemetryField::activity, activity_y, 18);
-    place(TelemetryField::detail_timing, activity_y + 26, 18);
-    place(TelemetryField::detail_archive, activity_y + 26 + kDetailRowHeight, 18);
-
     ShowWindow(field(TelemetryField::result_summary),
-               reserved_optional_rows_ >= 1 ? SW_SHOW : SW_HIDE);
+               result_row_active_ ? SW_SHOW : SW_HIDE);
     ShowWindow(field(TelemetryField::plan_summary),
-               reserved_optional_rows_ >= 2 ? SW_SHOW : SW_HIDE);
-    const int show = details_expanded_ ? SW_SHOW : SW_HIDE;
-    ShowWindow(field(TelemetryField::detail_timing), show);
-    ShowWindow(field(TelemetryField::detail_archive), show);
+               plan_row_active_ ? SW_SHOW : SW_HIDE);
 
     MoveWindow(cancel_button_, client.right - margin - button_width,
                bottom - button_height, button_width, button_height, TRUE);
@@ -440,15 +401,6 @@ void OperationProgressWindow::layout() {
         MoveWindow(pause_button_, client.right - margin - button_width * 2 - gap,
                    bottom - button_height, button_width, button_height, TRUE);
     }
-    MoveWindow(details_button_, margin, bottom - button_height, details_width,
-               button_height, TRUE);
-}
-
-void OperationProgressWindow::toggle_details() {
-    details_expanded_ = !details_expanded_;
-    SetWindowTextW(details_button_,
-                   details_expanded_ ? L"Hide details" : L"Details");
-    apply_window_size();
 }
 
 HWND OperationProgressWindow::field(TelemetryField field_id) const {
@@ -467,9 +419,7 @@ void OperationProgressWindow::set_field_text(TelemetryField field_id,
 bool OperationProgressWindow::muted_field(HWND control) const {
     return control == field(TelemetryField::current_path) ||
            control == field(TelemetryField::output_path) ||
-           control == field(TelemetryField::activity) ||
-           control == field(TelemetryField::detail_timing) ||
-           control == field(TelemetryField::detail_archive);
+           control == field(TelemetryField::activity);
 }
 
 std::pair<std::uint64_t, std::uint64_t>
@@ -491,16 +441,13 @@ OperationProgressWindow::displayed_file_progress() const {
 
 void OperationProgressWindow::update_telemetry_fields() {
     const auto now = std::chrono::steady_clock::now();
-    const auto elapsed_seconds = static_cast<std::uint64_t>(
-        std::chrono::duration<double>(now - started_).count());
     const auto checkpoint_seconds = static_cast<std::uint64_t>(
         std::chrono::duration<double>(now - last_progress_time_).count());
     constexpr const wchar_t* kSeparator = L"  \x2022  ";
 
-    // A multi-phase operation reports two different scopes at once: the bar and
-    // its percentage span the whole operation, while the byte and item counters
-    // describe only the current phase. Say which is which rather than letting
-    // one row imply both are the same measurement.
+    // A multi-phase operation reports two different scopes at once: the bar
+    // spans the whole operation, while speed and time remaining describe only
+    // the current phase. The stage and rate lines make that split explicit.
     const bool phased = has_progress_ && progress_.phase_count != 0;
 
     std::wstring stage = has_progress_ ? stage_text(progress_.stage)
@@ -516,30 +463,6 @@ void OperationProgressWindow::update_telemetry_fields() {
                                         : output_path_.wstring());
 
     const bool byte_total = has_progress_ && progress_.total_bytes > 0;
-    const bool item_total = has_progress_ && progress_.total_items > 0;
-    const auto [overall_completed, overall_total] =
-        has_progress_ ? overall_progress(progress_)
-                      : std::pair<std::uint64_t, std::uint64_t>{0, 0};
-
-    std::wstring summary = format_percent(overall_completed, overall_total);
-    if (phased) summary += L" overall";
-    if (byte_total) {
-        summary += kSeparator +
-                   format_bytes_of(progress_.completed_bytes,
-                                   progress_.total_bytes);
-        if (phased) summary += L" in this stage";
-    } else if (has_progress_ && progress_.completed_bytes > 0) {
-        summary += kSeparator + format_size(progress_.completed_bytes);
-    }
-    if (item_total) {
-        summary += kSeparator + format_count(progress_.completed_items) +
-                   L" of " + format_count(progress_.total_items) + L" items";
-    } else if (has_progress_ && progress_.completed_items > 0) {
-        summary += kSeparator + format_count(progress_.completed_items) +
-                   L" items";
-    }
-    set_field_text(TelemetryField::overall_summary, summary);
-
     // Time remaining is derived from the current phase's byte counters, so it
     // is a stage estimate whenever phases are in play. Labelling it plainly
     // "ETA" during a five-phase sync overstates what it knows.
@@ -572,13 +495,6 @@ void OperationProgressWindow::update_telemetry_fields() {
                        ? widen(progress_.current_path)
                        : std::wstring{L"Waiting for the first item"});
 
-    const auto [file_completed, file_total_bytes] = displayed_file_progress();
-    set_field_text(TelemetryField::file_summary,
-                   file_total_bytes > 0
-                       ? format_bytes_of(file_completed, file_total_bytes)
-                       : (file_completed > 0 ? format_size(file_completed)
-                                             : std::wstring{}));
-
     std::wstring result;
     if (has_progress_ && progress_.compressed_bytes != 0) {
         std::wstringstream ratio;
@@ -594,7 +510,10 @@ void OperationProgressWindow::update_telemetry_fields() {
         result += L"reused " + format_size(progress_.reused_bytes) + L" in " +
                   format_count(progress_.reused_items) + L" items";
     }
-    set_field_text(TelemetryField::result_summary, result);
+    if (!result.empty()) {
+        set_field_text(TelemetryField::result_summary, result);
+        result_row_active_ = true;
+    }
 
     // The plan counters get their own row. They used to be written into the
     // compressed-size and ratio fields, which meant two controls changed
@@ -612,8 +531,12 @@ void OperationProgressWindow::update_telemetry_fields() {
                L" removed" + kSeparator +
                format_count(progress_.planned_unchanged_items) + L" unchanged";
     }
-    set_field_text(TelemetryField::plan_summary, plan);
-    reserve_optional_rows((result.empty() ? 0 : 1) + (plan.empty() ? 0 : 1));
+    if (!plan.empty()) {
+        set_field_text(TelemetryField::plan_summary, plan);
+        plan_row_active_ = true;
+    }
+    reserve_optional_rows((result_row_active_ ? 1 : 0) +
+                          (plan_row_active_ ? 1 : 0));
 
     std::wstring activity = L"Preparing";
     if (cancelling_) {
@@ -627,15 +550,6 @@ void OperationProgressWindow::update_telemetry_fields() {
     }
     set_field_text(TelemetryField::activity, activity);
 
-    set_field_text(TelemetryField::detail_timing,
-                   L"Elapsed " + format_duration(elapsed_seconds) + kSeparator +
-                       L"last update " + format_duration(checkpoint_seconds) +
-                       L" ago");
-    set_field_text(
-        TelemetryField::detail_archive,
-        has_progress_ && progress_.archive_bytes_read > 0
-            ? L"Archive bytes read " + format_size(progress_.archive_bytes_read)
-            : std::wstring{L"Archive bytes read not reported by this backend"});
 }
 
 void OperationProgressWindow::set_progress(const OperationProgress& progress) {
@@ -713,7 +627,6 @@ void OperationProgressWindow::set_cancelling() {
     SetWindowTextW(pause_button_, L"Pause");
     EnableWindow(pause_button_, FALSE);
     EnableWindow(cancel_button_, FALSE);
-    // Details stays usable while cancelling; it only reveals text.
     telemetry_dirty_ = true;
     update_telemetry_fields();
     InvalidateRect(hwnd_, nullptr, FALSE);
@@ -760,18 +673,14 @@ void OperationProgressWindow::draw_button(const DRAWITEMSTRUCT& draw) const {
     SetTextColor(draw.hDC, content_color);
     SIZE text_size{};
     GetTextExtentPoint32W(draw.hDC, text.c_str(), static_cast<int>(text.size()), &text_size);
-    // Details is a plain disclosure toggle, so it carries no command icon.
-    const bool with_icon = draw.CtlID != kDetailsButton;
-    const int icon_size = with_icon ? scale(18) : 0;
-    const int gap = with_icon ? scale(5) : 0;
+    const int icon_size = scale(18);
+    const int gap = scale(5);
     const int content_width = icon_size + gap + static_cast<int>(text_size.cx);
     const int left = rect.left + (rect.right - rect.left - content_width) / 2;
     RECT icon_rect{left, rect.top, left + icon_size, rect.bottom};
-    if (with_icon) {
-        const ToolbarIcon icon = draw.CtlID == kCancelButton ? ToolbarIcon::cancel
-            : paused_ ? ToolbarIcon::resume : ToolbarIcon::pause;
-        draw_toolbar_icon(draw.hDC, icon, icon_rect, content_color, dpi_);
-    }
+    const ToolbarIcon icon = draw.CtlID == kCancelButton ? ToolbarIcon::cancel
+        : paused_ ? ToolbarIcon::resume : ToolbarIcon::pause;
+    draw_toolbar_icon(draw.hDC, icon, icon_rect, content_color, dpi_);
     RECT text_rect{icon_rect.right + gap, rect.top,
                    icon_rect.right + gap + static_cast<int>(text_size.cx), rect.bottom};
     DrawTextW(draw.hDC, text.c_str(), -1, &text_rect,
@@ -825,8 +734,8 @@ void OperationProgressWindow::paint() {
                        scale(kOverallBarBottom)},
                       stage_completed, stage_total);
     // Plenty of backends report no per-item size at all, and pulsing an
-    // indeterminate second bar under a blank label is just motion that means
-    // nothing. But whether a *given* snapshot carries a per-file size is not
+    // indeterminate second bar is just motion that means nothing. But whether
+    // a *given* snapshot carries a per-file size is not
     // stable: an empty file, or the first report of an operation, momentarily
     // has none. Deciding per frame made the bar blink out mid-transfer, so the
     // decision is made once per operation and then held.
@@ -876,7 +785,6 @@ LRESULT OperationProgressWindow::handle_message(UINT message, WPARAM wparam, LPA
             }
             SendMessageW(pause_button_, WM_SETFONT, reinterpret_cast<WPARAM>(font_), TRUE);
             SendMessageW(cancel_button_, WM_SETFONT, reinterpret_cast<WPARAM>(font_), TRUE);
-            SendMessageW(details_button_, WM_SETFONT, reinterpret_cast<WPARAM>(font_), TRUE);
             tooltip_.update_dpi(dpi_);
             layout();
             return 0;
@@ -928,7 +836,6 @@ LRESULT OperationProgressWindow::handle_message(UINT message, WPARAM wparam, LPA
         case WM_COMMAND:
             if (LOWORD(wparam) == kPauseButton) { toggle_pause(); return 0; }
             if (LOWORD(wparam) == kCancelButton) { request_cancel(); return 0; }
-            if (LOWORD(wparam) == kDetailsButton) { toggle_details(); return 0; }
             break;
         case WM_SETTINGCHANGE:
             if (!follow_system_theme_) return 0;

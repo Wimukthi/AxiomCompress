@@ -2143,15 +2143,40 @@ void MainWindow::remember_sfx_defaults(
 }
 
 void MainWindow::on_add_to_archive() {
+    const auto pick_sources = [this]() -> std::vector<fs::path> {
+        const int selection = show_app_message(
+            L"Choose what to add.\n\nFolders are added recursively. You can also "
+            L"select one or more individual files.",
+            axiom::gui::MessageDialogIcon::question, L"Add to archive",
+            axiom::gui::MessageDialogButtons::folder_files_cancel, IDYES);
+        if (selection == IDYES) {
+            if (auto folder = pick_folder(hwnd_, L"Choose a folder to add")) {
+                return {*folder};
+            }
+        } else if (selection == IDNO) {
+            return pick_files(hwnd_, L"Choose files to add");
+        }
+        return {};
+    };
+
     if (history_.current().kind == axiom::gui::BrowserLocationKind::archive) {
         const auto archive = active_archive_path();
-        if (!archive || !active_archive_is_editable()) return;
+        if (!archive) return;
+        if (GetFileAttributesW(archive->c_str()) == INVALID_FILE_ATTRIBUTES) {
+            show_app_message(
+                L"The open archive no longer exists. Axiom will return to its "
+                L"containing folder.",
+                axiom::gui::MessageDialogIcon::warning, L"Archive not found");
+            navigate_to(axiom::gui::BrowserLocation::filesystem(archive->parent_path()));
+            return;
+        }
+        if (!active_archive_is_editable()) return;
         if (!active_archive_capabilities().update) {
             show_app_message(L"This archive format does not support adding entries.",
                              axiom::gui::MessageDialogIcon::information);
             return;
         }
-        auto paths = pick_files(hwnd_);
+        auto paths = pick_sources();
         if (!paths.empty()) {
             create_archive_from_paths(std::move(paths), *archive,
                                       axiom::gui::ArchiveUpdateMode::add_or_replace);
@@ -2159,7 +2184,10 @@ void MainWindow::on_add_to_archive() {
         return;
     }
     auto paths = selected_filesystem_paths();
-    if (paths.empty()) paths = pick_files(hwnd_);
+    std::erase_if(paths, [](const fs::path& path) {
+        return GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES;
+    });
+    if (paths.empty()) paths = pick_sources();
     create_archive_from_paths(std::move(paths));
 }
 

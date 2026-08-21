@@ -302,8 +302,8 @@ parallel block or external-codec chunk. Encrypted, transformed, serial, and
 legacy blocks deliberately fall back to the existing bounded whole-block path.
 The directory is parsed once; the path lookup table is built lazily, only when
 selection or hard-link resolution needs it. Shared reader statistics count the
-physical archive bytes fetched, so the CLI and the progress window can show
-what a selected restore actually cost.
+physical archive bytes fetched, so frontends can report what a selected restore
+actually cost without estimating it from logical output size.
 
 ### Content-addressed deduplication
 
@@ -564,20 +564,20 @@ writes are atomic. The unpaused checkpoint path is an atomic fast path.
 
 The snapshot is deliberately wide — 21 fields — because producers should report
 what they know and let each frontend decide what is worth showing. Frontends
-are expected to curate, not to mirror. The Windows progress window renders six
-lines plus two bars, and keeps elapsed time, time since the last update, and
-physical archive bytes read behind a **Details** disclosure; the CLI renders one
-line. Both drop fields that would not change a reader's decision.
+are expected to curate, not to mirror. The Windows progress window renders the
+active stage, useful summaries, and two bars; the CLI renders one line. Both
+drop diagnostic fields that would not change a reader's decision. Once a
+per-file bar or optional summary row becomes useful, its presentation stays
+stable across stage snapshots that omit that field.
 
 Two rules exist because breaking them produced wrong numbers rather than merely
 noisy ones:
 
 - **Scope must be stated wherever two scopes coexist.** With phases active, the
-  bar and its percentage span the whole operation via `overall_progress()`,
-  while the byte and item counters describe only the current phase. Time
-  remaining is derived from the phase counters, so it is a phase estimate. The
-  window says "overall", "in this stage", and "left in this stage" rather than
-  letting one row imply a single measurement.
+  bar spans the whole operation via `overall_progress()`, while throughput and
+  time remaining describe only the current phase. The stage line identifies the
+  phase, and the rate line says "left in this stage" rather than implying that
+  the estimate covers the whole operation.
 - **Throughput has one definition, in `core/progress_rate.hpp`.** It samples
   `throughput_bytes` — falling back to `completed_bytes` — over a trailing
   four-second window. A cumulative average lags a speed change permanently, and

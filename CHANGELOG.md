@@ -14,6 +14,38 @@ Entries are condensed from the
 
 ## [Unreleased]
 
+## [0.10.2.0] - 2026-08-21
+
+Progress stability and file-selection reliability release.
+
+### Fixed
+
+- Made **Add to archive** accept folders as well as files from every entry
+  point. When no live filesystem selection is available, it now offers native
+  **Folder...** and **Files...** choices; folders are added recursively and the
+  file picker retains multi-selection. Vanished selections and a deleted open
+  archive are rejected before an operation starts.
+- Stopped the per-file progress presentation changing at stage boundaries.
+  Operation stages do not all report per-file byte totals, so the old caption
+  disappeared from transient snapshots even though the corresponding bar
+  intentionally remained visible.
+- Made synchronization plan and compression-result rows independently sticky.
+  A plan can arrive before compression statistics; the old count-based layout
+  populated the plan's hidden second row and revealed it only after another row
+  appeared.
+- Made benchmark report text use the palette's guaranteed foreground color and
+  refresh its brushes when the application, Windows, or high-contrast theme
+  changes.
+
+### Changed
+
+- Removed the redundant numeric captions beneath the overall and per-file
+  progress bars, along with the **Details** button and its elapsed,
+  checkpoint-age, and archive-read diagnostic labels.
+- Added native horizontal scrolling to the benchmark report alongside its
+  vertical scrollbar, including mouse-wheel, keyboard, page, and thumb-track
+  navigation.
+
 ## [0.10.1.0] - 2026-08-21
 
 Native UI clarity and window-persistence release.
@@ -538,7 +570,8 @@ First published release: the Inno Setup installer and portable zip, carrying
 update/repair/remove maintenance handling, and dynamic light/dark setup
 styling.
 
-[Unreleased]: https://github.com/Wimukthi/AxiomCompress/compare/0.10.1.0...HEAD
+[Unreleased]: https://github.com/Wimukthi/AxiomCompress/compare/0.10.2.0...HEAD
+[0.10.2.0]: https://github.com/Wimukthi/AxiomCompress/releases/tag/0.10.2.0
 [0.10.1.0]: https://github.com/Wimukthi/AxiomCompress/releases/tag/0.10.1.0
 [0.10.0.0]: https://github.com/Wimukthi/AxiomCompress/releases/tag/0.10.0.0
 [0.9.2.3]: https://github.com/Wimukthi/AxiomCompress/releases/tag/0.9.2.3

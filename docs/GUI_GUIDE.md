@@ -81,6 +81,11 @@ The archive's overall size and ratio are always exact.
 Select the files and folders you want, then press **Add** on the toolbar, or
 `Ctrl+N`, or right-click them in Explorer and use the Axiom submenu.
 
+The current filesystem selection can contain files, folders, or both. Folders
+are included recursively. If there is no longer a live selection, or if you are
+adding entries to an open archive, Axiom asks whether you want to choose a
+folder or one or more files.
+
 ![The Add to archive dialog, showing compression settings and a live size preview](images/axiom-add-to-archive.png)
 
 Everything lives in one resizable dialog. What you selected, the format, and
@@ -195,26 +200,23 @@ both.
 
 Long operations run on background threads, so the window stays usable.
 
-The progress window shows the stage, an overall bar with byte and item counts,
-the current speed and time remaining, and the item being worked on. Where they
-apply, it also shows the compressed size and ratio so far, and how much data
-was reused rather than recompressed. **Details** reveals the diagnostics —
-elapsed time, how long since the last update, and how many bytes have been read
-from the archive.
+The progress window shows the stage, overall and per-file bars, the current
+speed and time remaining, and the item being worked on. Where they apply, it
+also shows the compressed size and ratio so far, and how much data was reused
+rather than recompressed. Optional summaries stay in place once reported,
+including while an operation changes stages.
 
-When an operation runs in several stages, the bar and its percentage cover the
-whole thing, while the byte counts and the time remaining describe the stage
-you're in. The window says which is which.
+When an operation runs in several stages, the overall bar covers the whole
+thing, while the speed and time remaining describe the stage you're in. The
+window says which is which.
 
 Pause, resume, and cancel all work, and cancelling never leaves a half-written
 file behind.
 
 When you extract a few files from a large AXAR archive, Axiom reads only the
 compressed pieces those files actually need, provided the archive records where
-its pieces begin. The progress window reports how many bytes it read from the
-archive, so you can see the saving. Older archives, and blocks that are
-encrypted or filtered, fall back to reading the whole block — nothing to
-configure, it just happens.
+its pieces begin. Older archives, and blocks that are encrypted or filtered,
+fall back to reading the whole block — nothing to configure, it just happens.
 
 If an archive was split into numbered volumes and you still have all the data
 parts, open any one of them and Axiom reads the set directly. You only need to
@@ -383,6 +385,10 @@ Everything happens in RAM. Generated data is created there directly, and a file
 or folder you pick is loaded once before timing starts, so compression,
 decompression, and the byte-for-byte verification after each pass all run in
 memory. Your disk speed never contaminates the result.
+
+The report pane has vertical and horizontal scrollbars for long runs and wide
+system details. Its text and background follow the active light, dark, or
+high-contrast palette.
 
 The generated corpus is not a trivially repeating string — it uses
 deterministic literal data with backward matches spread across the window, so

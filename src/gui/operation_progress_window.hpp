@@ -77,20 +77,15 @@ public:
     [[nodiscard]] HWND hwnd() const { return hwnd_; }
 
 private:
-    // One row per thing a reader needs, not one row per struct field. Anything
-    // that is diagnostic rather than actionable lives behind Details.
+    // One row per thing a reader needs, not one row per struct field.
     enum class TelemetryField : std::size_t {
         stage,            // "Stage 3 of 5: Compressing"
         output_path,      // Static destination, muted
-        overall_summary,  // Percent, bytes, items
         overall_rate,     // Speed and time remaining
         current_path,     // Item in flight, muted
-        file_summary,     // Bytes for the item in flight
         result_summary,   // Compressed size, ratio, reuse
         plan_summary,     // Add/update/remove/unchanged, only when planned
         activity,         // Active / Paused / Cancelling, muted
-        detail_timing,    // Details: elapsed and time since the last update
-        detail_archive,   // Details: physical archive bytes read
         count,
     };
 
@@ -114,20 +109,17 @@ private:
     void release_back_buffer();
     void draw_button(const DRAWITEMSTRUCT& draw) const;
     void toggle_pause();
-    void toggle_details();
     void request_cancel();
     int scale(int value) const;
     void apply_window_size();
     void reserve_optional_rows(int needed);
     [[nodiscard]] int activity_row() const;
-    [[nodiscard]] int collapsed_height() const;
-    [[nodiscard]] int expanded_height() const;
+    [[nodiscard]] int window_height() const;
 
     HWND owner_{};
     HWND hwnd_{};
     HWND pause_button_{};
     HWND cancel_button_{};
-    HWND details_button_{};
     TooltipManager tooltip_;
     std::array<HWND, static_cast<std::size_t>(TelemetryField::count)> telemetry_fields_{};
     std::array<std::wstring, static_cast<std::size_t>(TelemetryField::count)> telemetry_text_{};
@@ -155,12 +147,15 @@ private:
     bool cancelling_{false};
     bool pause_available_{true};
     bool follow_system_theme_{true};
-    bool details_expanded_{false};
     // Sticky for the life of one operation: see the file-bar comment in paint().
     bool file_bar_active_{false};
+    // Optional rows are also sticky. Producers report different fields at
+    // different pipeline stages; clearing a row at a boundary makes useful
+    // information blink out and shifts the rows below it.
+    bool result_row_active_{false};
+    bool plan_row_active_{false};
     int reserved_optional_rows_{0};
     int pulse_{};
-    std::chrono::steady_clock::time_point started_{};
     std::chrono::steady_clock::time_point last_progress_time_{};
     std::chrono::steady_clock::time_point last_heartbeat_paint_{};
 };

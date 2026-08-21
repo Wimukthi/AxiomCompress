@@ -227,7 +227,9 @@ struct BenchmarkDialogState {
     std::atomic_bool running = false;
     bool paused = false;
     bool custom_input_checked = false;
-    int report_scroll = 0;
+    int report_scroll_x = 0;
+    int report_scroll_y = 0;
+    int report_content_width = 0;
     int report_content_height = 0;
     std::wstring latest_results;
 };
@@ -325,35 +327,76 @@ int report_line_count(std::wstring_view text) {
     return lines;
 }
 
-void update_report_scrollbar(BenchmarkDialogState* state) {
+void update_report_scrollbars(BenchmarkDialogState* state) {
     if (state == nullptr || state->results == nullptr) return;
     HDC dc = GetDC(state->results);
     if (dc == nullptr) return;
+    HFONT old_font = static_cast<HFONT>(SelectObject(dc, state->fixed_font));
     const int line_height = report_line_height(state, dc);
-    ReleaseDC(state->results, dc);
-
-    RECT client{};
-    GetClientRect(state->results, &client);
     const int padding = scale_for_dialog_dpi(8, state->dpi);
     state->report_content_height =
         padding * 2 + report_line_count(state->latest_results) * line_height;
-    const int visible_height = client.bottom - client.top;
-    const int max_scroll = std::max(0, state->report_content_height - visible_height);
-    state->report_scroll = std::clamp(state->report_scroll, 0, max_scroll);
+    state->report_content_width = padding * 2;
+    std::wstring_view text = state->latest_results.empty()
+        ? std::wstring_view{L"Ready."}
+        : std::wstring_view{state->latest_results};
+    std::size_t cursor = 0;
+    while (cursor <= text.size()) {
+        const std::size_t end = text.find(L'\n', cursor);
+        std::wstring_view line = end == std::wstring_view::npos
+            ? text.substr(cursor)
+            : text.substr(cursor, end - cursor);
+        if (!line.empty() && line.back() == L'\r') line.remove_suffix(1);
+        SIZE extent{};
+        if (!line.empty() &&
+            GetTextExtentPoint32W(dc, line.data(), static_cast<int>(line.size()),
+                                  &extent)) {
+            state->report_content_width = std::max(
+                state->report_content_width,
+                padding * 2 + static_cast<int>(extent.cx));
+        }
+        if (end == std::wstring_view::npos) break;
+        cursor = end + 1;
+    }
+    if (old_font) SelectObject(dc, old_font);
+    ReleaseDC(state->results, dc);
 
-    SCROLLINFO info{sizeof(info)};
-    info.fMask = SIF_RANGE | SIF_PAGE | SIF_POS;
-    info.nMin = 0;
-    info.nMax = std::max(0, state->report_content_height - 1);
-    info.nPage = static_cast<UINT>(std::max(0, visible_height));
-    info.nPos = state->report_scroll;
-    SetScrollInfo(state->results, SB_VERT, &info, TRUE);
+    // Setting one scrollbar can reduce the other axis's client area enough to
+    // require the second scrollbar. Re-evaluate once after both ranges change.
+    for (int pass = 0; pass < 2; ++pass) {
+        RECT client{};
+        GetClientRect(state->results, &client);
+        const int visible_width = std::max(0, static_cast<int>(client.right - client.left));
+        const int visible_height = std::max(0, static_cast<int>(client.bottom - client.top));
+        state->report_scroll_x = std::clamp(
+            state->report_scroll_x, 0,
+            std::max(0, state->report_content_width - visible_width));
+        state->report_scroll_y = std::clamp(
+            state->report_scroll_y, 0,
+            std::max(0, state->report_content_height - visible_height));
+
+        SCROLLINFO horizontal{sizeof(horizontal)};
+        horizontal.fMask = SIF_RANGE | SIF_PAGE | SIF_POS;
+        horizontal.nMin = 0;
+        horizontal.nMax = std::max(0, state->report_content_width - 1);
+        horizontal.nPage = static_cast<UINT>(visible_width);
+        horizontal.nPos = state->report_scroll_x;
+        SetScrollInfo(state->results, SB_HORZ, &horizontal, TRUE);
+
+        SCROLLINFO vertical{sizeof(vertical)};
+        vertical.fMask = SIF_RANGE | SIF_PAGE | SIF_POS;
+        vertical.nMin = 0;
+        vertical.nMax = std::max(0, state->report_content_height - 1);
+        vertical.nPage = static_cast<UINT>(visible_height);
+        vertical.nPos = state->report_scroll_y;
+        SetScrollInfo(state->results, SB_VERT, &vertical, TRUE);
+    }
 }
 
 void set_results_text(BenchmarkDialogState* state, std::wstring text) {
     if (state == nullptr || state->results == nullptr) return;
     state->latest_results = std::move(text);
-    update_report_scrollbar(state);
+    update_report_scrollbars(state);
     RedrawWindow(state->results, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE);
 }
 
@@ -1312,12 +1355,19 @@ void set_running(BenchmarkDialogState* state, bool running) {
 }
 
 void apply_theme(BenchmarkDialogState* state) {
+    const DialogColors colors = dialog_colors(state->dark);
+    if (state->background_brush != nullptr) DeleteObject(state->background_brush);
+    if (state->edit_brush != nullptr) DeleteObject(state->edit_brush);
+    state->background_brush = CreateSolidBrush(colors.background);
+    state->edit_brush = CreateSolidBrush(colors.control_background);
     apply_dialog_dark_frame(state->hwnd, state->dark);
     for (HWND control : controls(state)) {
         apply_dialog_control_theme(control, state->dark);
     }
     apply_dialog_control_theme(state->close, state->dark);
     state->tooltip.apply_theme(state->dark);
+    RedrawWindow(state->hwnd, nullptr, nullptr,
+                 RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);
 }
 
 void layout(BenchmarkDialogState* state) {
@@ -1365,7 +1415,7 @@ void layout(BenchmarkDialogState* state) {
     MoveWindow(state->results, margin, results_top,
                client.right - margin * 2,
                button_top - results_top - scale_for_dialog_dpi(16, state->dpi), TRUE);
-    update_report_scrollbar(state);
+    update_report_scrollbars(state);
     int x = client.right - margin - button_width;
     MoveWindow(state->close, x, button_top, button_width, button_height, TRUE);
     x -= button_width + button_gap;
@@ -1429,11 +1479,6 @@ LRESULT control_color(BenchmarkDialogState* state, UINT message, WPARAM wparam, 
     return reinterpret_cast<LRESULT>(state->background_brush);
 }
 
-bool report_heading(std::wstring_view line) {
-    if (line.empty() || line.front() == L' ') return false;
-    return line.find(L":") == std::wstring_view::npos;
-}
-
 void paint_report_view(BenchmarkDialogState* state, HWND window) {
     PAINTSTRUCT paint{};
     HDC target = BeginPaint(window, &paint);
@@ -1461,7 +1506,8 @@ void paint_report_view(BenchmarkDialogState* state, HWND window) {
     HFONT old_font = static_cast<HFONT>(SelectObject(dc, state->fixed_font));
     const int line_height = report_line_height(state, dc);
 
-    int y = padding - state->report_scroll;
+    const int x = padding - state->report_scroll_x;
+    int y = padding - state->report_scroll_y;
     std::wstring_view text = state->latest_results.empty()
         ? std::wstring_view{L"Ready."}
         : std::wstring_view{state->latest_results};
@@ -1475,23 +1521,18 @@ void paint_report_view(BenchmarkDialogState* state, HWND window) {
 
         if (y + line_height >= 0 && y < height) {
             SetBkMode(dc, TRANSPARENT);
-            SetTextColor(dc, report_heading(line) ? colors.focus_border : colors.text);
-            TextOutW(dc, padding, y, line.data(), static_cast<int>(line.size()));
+            // focus_border is an accent/border color and is not guaranteed to
+            // contrast with the report background for every custom palette.
+            // DialogColors::text is paired with control_background and remains
+            // readable in light, dark, and high-contrast themes.
+            SetTextColor(dc, colors.text);
+            TextOutW(dc, x, y, line.data(), static_cast<int>(line.size()));
         }
 
         y += line_height;
         if (end == std::wstring_view::npos) break;
         cursor = end + 1;
     }
-
-    state->report_content_height = std::max(height, y + padding + state->report_scroll);
-    SCROLLINFO scroll{sizeof(scroll)};
-    scroll.fMask = SIF_RANGE | SIF_PAGE | SIF_POS;
-    scroll.nMin = 0;
-    scroll.nMax = std::max(0, state->report_content_height - 1);
-    scroll.nPage = static_cast<UINT>(height);
-    scroll.nPos = state->report_scroll;
-    SetScrollInfo(window, SB_VERT, &scroll, TRUE);
 
     if (old_font) SelectObject(dc, old_font);
     HPEN border = CreatePen(PS_SOLID, 1,
@@ -1510,20 +1551,25 @@ void paint_report_view(BenchmarkDialogState* state, HWND window) {
     EndPaint(window, &paint);
 }
 
-void scroll_report_view(BenchmarkDialogState* state, int delta) {
+void scroll_report_view(BenchmarkDialogState* state, int bar, int delta) {
     if (state == nullptr || state->results == nullptr || delta == 0) return;
-    update_report_scrollbar(state);
+    update_report_scrollbars(state);
     RECT client{};
     GetClientRect(state->results, &client);
-    const int visible_height = static_cast<int>(client.bottom - client.top);
-    const int max_scroll = std::max(0, state->report_content_height - visible_height);
-    const int next = std::clamp(state->report_scroll + delta, 0, max_scroll);
-    if (next == state->report_scroll) return;
-    state->report_scroll = next;
+    int& position = bar == SB_HORZ ? state->report_scroll_x : state->report_scroll_y;
+    const int visible = bar == SB_HORZ
+        ? static_cast<int>(client.right - client.left)
+        : static_cast<int>(client.bottom - client.top);
+    const int content = bar == SB_HORZ
+        ? state->report_content_width : state->report_content_height;
+    const int max_scroll = std::max(0, content - visible);
+    const int next = std::clamp(position + delta, 0, max_scroll);
+    if (next == position) return;
+    position = next;
     SCROLLINFO info{sizeof(info)};
     info.fMask = SIF_POS;
-    info.nPos = state->report_scroll;
-    SetScrollInfo(state->results, SB_VERT, &info, TRUE);
+    info.nPos = position;
+    SetScrollInfo(state->results, bar, &info, TRUE);
     InvalidateRect(state->results, nullptr, FALSE);
 }
 
@@ -1543,7 +1589,7 @@ LRESULT CALLBACK benchmark_report_proc(HWND hwnd, UINT message, WPARAM wparam, L
         case WM_ERASEBKGND:
             return 1;
         case WM_SIZE:
-            update_report_scrollbar(state);
+            update_report_scrollbars(state);
             InvalidateRect(hwnd, nullptr, FALSE);
             return 0;
         case WM_SETFOCUS:
@@ -1559,7 +1605,17 @@ LRESULT CALLBACK benchmark_report_proc(HWND hwnd, UINT message, WPARAM wparam, L
                 : scale_for_dialog_dpi(18, state->dpi);
             if (dc != nullptr) ReleaseDC(hwnd, dc);
             const int delta = GET_WHEEL_DELTA_WPARAM(wparam);
-            scroll_report_view(state, -(delta / WHEEL_DELTA) * line_height * 3);
+            const bool horizontal = (GET_KEYSTATE_WPARAM(wparam) & MK_SHIFT) != 0;
+            scroll_report_view(
+                state, horizontal ? SB_HORZ : SB_VERT,
+                -(delta / WHEEL_DELTA) * line_height * 3);
+            return 0;
+        }
+        case WM_MOUSEHWHEEL: {
+            const int delta = GET_WHEEL_DELTA_WPARAM(wparam);
+            scroll_report_view(
+                state, SB_HORZ,
+                (delta / WHEEL_DELTA) * scale_for_dialog_dpi(48, state->dpi));
             return 0;
         }
         case WM_KEYDOWN: {
@@ -1571,23 +1627,29 @@ LRESULT CALLBACK benchmark_report_proc(HWND hwnd, UINT message, WPARAM wparam, L
             RECT client{};
             GetClientRect(hwnd, &client);
             switch (wparam) {
-                case VK_UP: scroll_report_view(state, -line_height); return 0;
-                case VK_DOWN: scroll_report_view(state, line_height); return 0;
-                case VK_PRIOR: scroll_report_view(state, -(client.bottom - client.top)); return 0;
-                case VK_NEXT: scroll_report_view(state, client.bottom - client.top); return 0;
-                case VK_HOME: scroll_report_view(state, -state->report_scroll); return 0;
+                case VK_LEFT: scroll_report_view(state, SB_HORZ, -line_height); return 0;
+                case VK_RIGHT: scroll_report_view(state, SB_HORZ, line_height); return 0;
+                case VK_UP: scroll_report_view(state, SB_VERT, -line_height); return 0;
+                case VK_DOWN: scroll_report_view(state, SB_VERT, line_height); return 0;
+                case VK_PRIOR: scroll_report_view(state, SB_VERT, -(client.bottom - client.top)); return 0;
+                case VK_NEXT: scroll_report_view(state, SB_VERT, client.bottom - client.top); return 0;
+                case VK_HOME: scroll_report_view(state, SB_VERT, -state->report_scroll_y); return 0;
                 case VK_END:
-                    update_report_scrollbar(state);
-                    scroll_report_view(state, state->report_content_height);
+                    update_report_scrollbars(state);
+                    scroll_report_view(state, SB_VERT, state->report_content_height);
                     return 0;
             }
             break;
         }
+        case WM_HSCROLL:
         case WM_VSCROLL: {
+            const int bar = message == WM_HSCROLL ? SB_HORZ : SB_VERT;
             SCROLLINFO info{sizeof(info)};
             info.fMask = SIF_ALL;
-            GetScrollInfo(hwnd, SB_VERT, &info);
-            int target = state->report_scroll;
+            GetScrollInfo(hwnd, bar, &info);
+            const int position = bar == SB_HORZ
+                ? state->report_scroll_x : state->report_scroll_y;
+            int target = position;
             const int page = static_cast<int>(info.nPage);
             switch (LOWORD(wparam)) {
                 case SB_LINEUP: target -= scale_for_dialog_dpi(18, state->dpi); break;
@@ -1597,10 +1659,13 @@ LRESULT CALLBACK benchmark_report_proc(HWND hwnd, UINT message, WPARAM wparam, L
                 case SB_THUMBTRACK:
                 case SB_THUMBPOSITION: target = info.nTrackPos; break;
                 case SB_TOP: target = 0; break;
-                case SB_BOTTOM: target = state->report_content_height; break;
+                case SB_BOTTOM:
+                    target = bar == SB_HORZ
+                        ? state->report_content_width : state->report_content_height;
+                    break;
                 default: return 0;
             }
-            scroll_report_view(state, target - state->report_scroll);
+            scroll_report_view(state, bar, target - position);
             return 0;
         }
         case WM_NCDESTROY:
@@ -1819,7 +1884,8 @@ LRESULT CALLBACK benchmark_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM l
             // without EDIT-control flicker or scroll jumps.
             state->results = CreateWindowExW(
                 0, kBenchmarkReportClass, L"",
-                WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | WS_TABSTOP | WS_VSCROLL,
+                WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | WS_TABSTOP |
+                    WS_HSCROLL | WS_VSCROLL,
                 0, 0, 0, 0, hwnd,
                 reinterpret_cast<HMENU>(static_cast<INT_PTR>(kResultEdit)),
                 state->instance, state);
@@ -1909,6 +1975,16 @@ LRESULT CALLBACK benchmark_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM l
         case WM_CTLCOLORLISTBOX:
         case WM_CTLCOLORBTN:
             return control_color(state, message, wparam, lparam);
+        case WM_SETTINGCHANGE:
+            handle_dialog_theme_setting_change(lparam);
+            state->dark = dialog_should_use_dark();
+            apply_theme(state);
+            return 0;
+        case WM_THEMECHANGED:
+        case WM_SYSCOLORCHANGE:
+            state->dark = dialog_should_use_dark();
+            apply_theme(state);
+            return 0;
         case WM_DRAWITEM:
             if (lparam != 0) {
                 const auto& draw = *reinterpret_cast<DRAWITEMSTRUCT*>(lparam);
