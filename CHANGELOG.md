@@ -49,10 +49,16 @@ Entries are condensed from the
 - Applied the project's warning level to the GUI, CLI, and test targets in the
   CMake build, which had been left at the default while only the library was
   raised. The MSBuild projects were already at `/W4`. Added an
-  `AXIOM_WARNINGS_AS_ERRORS` option, off by default and enabled for the Windows
-  CI job, so a compiler upgrade on a floating runner cannot block a local build
-  or a release package. The GCC and Clang jobs still build with warnings only,
-  pending a cleanup of the warnings those compilers report.
+  `AXIOM_WARNINGS_AS_ERRORS` option, off by default and enabled in CI, so a
+  compiler upgrade on a floating runner cannot block a local build or a
+  release package.
+- Cleared the warnings GCC and Clang report once that level applies, so the
+  option can be enforced on every platform. Container detection helpers that
+  `container_formats.cpp` kept after the system providers moved into their own
+  file were removed; the system providers are now confined to the Windows build
+  they were always limited to; and the vendored miniz header's unused static
+  helpers are suppressed at each include, since the file itself is covered by
+  the dependency lock.
 
 ## [0.10.2.0] - 2026-08-21
 

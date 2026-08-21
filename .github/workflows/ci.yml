@@ -34,9 +34,7 @@ jobs:
           path: Wimukthi.Win32Theme
       - name: Configure
         if: runner.os != 'Windows'
-        # Not yet errors on GCC/Clang: the POSIX build has a pre-existing
-        # warning backlog to clear first. The Windows job below keeps them on.
-        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DAXIOM_WARNINGS_AS_ERRORS=OFF
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DAXIOM_WARNINGS_AS_ERRORS=ON
       - name: Configure Windows
         if: runner.os == 'Windows'
         shell: pwsh
