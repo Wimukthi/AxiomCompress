@@ -46,6 +46,16 @@ Entries are condensed from the
 
 ### Changed
 
+- Cleared build leftovers from the source tree after a successful MSVC build.
+  Incremental link and LTCG byproducts (`.ilk`, `.iobj`, `.ipdb`, `.exp`) are
+  removed from the output directory, and compiler scratch that lands outside
+  `IntDir` — `vc###.pdb`, stray `.obj`, `.idb`, `.tlog` — is removed from the
+  tree, where nothing previously collected it. Executables, the SFX runtime
+  modules, the bundled backend, the static libraries the projects link, and
+  every `.pdb` are kept, so the installer and a release crash report are
+  unaffected. `-SkipCleanup` leaves the tree untouched; `-DeepClean` also
+  discards the intermediate object tree, which forces a full rebuild next time
+  and so is not the default.
 - Opened an archive with one directory read instead of five. Browsing asked the
   provider for its capabilities and for its entries separately, and the
   capability probe read the directory twice more on its own, so the same parse
