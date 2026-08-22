@@ -252,6 +252,22 @@ void sfx_zip_extract_selected(const std::filesystem::path& archive_path,
 
 // ---- provider registry glue ------------------------------------------------------
 
+// Entries plus the archive-state bits a capability query needs, from a single
+// directory read. Reading the directory of a large deduplicated archive costs
+// far more than everything else opening it, so the AXAR provider answers
+// capabilities() and list() from one pass rather than four.
+struct AxarDirectoryState {
+    std::vector<ArchiveEntry> entries;
+    bool snapshot_repository = false;
+    bool deduplicated = false;
+    bool locked = false;
+    bool encrypted = false;
+    bool directory_encrypted = false;
+};
+
+AxarDirectoryState read_axar_directory_state(const std::filesystem::path& archive_path,
+                                             const std::string& password);
+
 // The built-in ZIP provider singleton, defined in container_zip.cpp.
 const ArchiveProvider& zip_archive_provider();
 

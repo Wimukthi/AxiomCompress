@@ -437,9 +437,11 @@ std::shared_ptr<const ArchiveCatalog> ArchiveCatalog::load(const fs::path& path,
     if (provider == nullptr) {
         throw std::runtime_error("unsupported archive format");
     }
-    auto capabilities = provider->capabilities(path, password);
+    // One directory read yields both. Reading it twice is the dominant cost of
+    // opening a large deduplicated archive.
+    auto contents = provider->open(path, password);
     return std::shared_ptr<const ArchiveCatalog>(new ArchiveCatalog(
-        path, *provider, provider->list(path, password), capabilities));
+        path, *provider, std::move(contents.entries), std::move(contents.capabilities)));
 }
 
 const fs::path& ArchiveCatalog::path() const { return path_; }
@@ -484,15 +486,29 @@ BrowserLoadResult load_browser_location(
             result.snapshot = load_filesystem(location, stop);
         } else {
             result.archive_password_supplied = !archive_password.empty();
-            if (const auto* provider = axiom::archive_provider_for_path(
-                    location.archive_path)) {
-                result.archive_capabilities = provider->capabilities(
-                    location.archive_path, archive_password);
-                result.archive_capabilities_available = true;
-            }
             if (!archive_catalog || archive_catalog->path() != location.archive_path) {
-                archive_catalog = ArchiveCatalog::load(location.archive_path, archive_password);
+                try {
+                    archive_catalog =
+                        ArchiveCatalog::load(location.archive_path, archive_password);
+                } catch (...) {
+                    // A load that fails still has to say whether the archive is
+                    // encrypted, because that is what tells the caller to prompt
+                    // for a password rather than report an error. Probing costs a
+                    // second directory read, so it happens only on this path.
+                    if (const auto* provider = axiom::archive_provider_for_path(
+                            location.archive_path)) {
+                        result.archive_capabilities = provider->capabilities(
+                            location.archive_path, archive_password);
+                        result.archive_capabilities_available = true;
+                    }
+                    throw;
+                }
             }
+            // The catalog already carries the capabilities its own directory read
+            // produced; asking the provider again would read the directory twice
+            // more, on every navigation within the archive as well as on open.
+            result.archive_capabilities = archive_catalog->capabilities();
+            result.archive_capabilities_available = true;
             result.snapshot = archive_catalog->list(location, stop);
             result.archive_catalog = std::move(archive_catalog);
         }

@@ -3164,6 +3164,66 @@ void test_format_freeze_golden_profiles() {
     }
 }
 
+// Opening an archive for browsing asks one provider call for the capabilities
+// and the entries, instead of a capability probe and a listing that each read
+// the directory again. The saving is only legitimate if the combined answer is
+// identical, so compare the two directly — including a deduplicated archive,
+// whose required flags are what the capability probe reports on.
+void test_archive_open_matches_separate_queries() {
+    const auto root = make_temp_dir();
+    const auto source = root / "source";
+    fs::create_directories(source);
+    write_all(source / "a.txt", bytes_from_string("open equivalence " + std::string(500, 'a')));
+    write_all(source / "b.bin", bytes_from_string("second entry " + std::string(500, 'b')));
+
+    struct Case {
+        const char* name;
+        bool dedup;
+    };
+    constexpr Case kCases[] = {{"plain.axar", false}, {"dedup.axar", true}};
+
+    for (const auto& test_case : kCases) {
+        const auto archive = root / test_case.name;
+        axiom::CompressionOptions options;
+        options.enable_content_dedup = test_case.dedup;
+        axiom::create_archive({source}, archive, options);
+
+        const auto* provider = axiom::archive_provider_for_path(archive);
+        AXIOM_CHECK(provider != nullptr);
+
+        const auto probed = provider->capabilities(archive);
+        const auto listed = provider->list(archive);
+        const auto combined = provider->open(archive);
+
+        AXIOM_CHECK(combined.capabilities.snapshot_repository == probed.snapshot_repository);
+        AXIOM_CHECK(combined.capabilities.deduplicated_archive == probed.deduplicated_archive);
+        AXIOM_CHECK(combined.capabilities.encrypted == probed.encrypted);
+        AXIOM_CHECK(combined.capabilities.directory_encrypted == probed.directory_encrypted);
+        AXIOM_CHECK(combined.capabilities.locked == probed.locked);
+        AXIOM_CHECK(combined.capabilities.update == probed.update);
+        AXIOM_CHECK(combined.capabilities.delete_entries == probed.delete_entries);
+        AXIOM_CHECK(combined.capabilities.move_entries == probed.move_entries);
+        AXIOM_CHECK(combined.capabilities.is_multi_volume == probed.is_multi_volume);
+        AXIOM_CHECK(combined.capabilities.create == probed.create);
+
+        AXIOM_CHECK(combined.entries.size() == listed.size());
+        for (std::size_t index = 0; index < listed.size(); ++index) {
+            AXIOM_CHECK(combined.entries[index].path == listed[index].path);
+            AXIOM_CHECK(combined.entries[index].size == listed[index].size);
+            AXIOM_CHECK(combined.entries[index].packed_size == listed[index].packed_size);
+            AXIOM_CHECK(combined.entries[index].crc32 == listed[index].crc32);
+            AXIOM_CHECK(combined.entries[index].is_directory == listed[index].is_directory);
+            AXIOM_CHECK(combined.entries[index].chunk_count == listed[index].chunk_count);
+        }
+    }
+
+    // The deduplicated archive must actually have exercised that profile, or the
+    // comparison above proved nothing about the flags it was written for.
+    const auto* dedup_provider = axiom::archive_provider_for_path(root / "dedup.axar");
+    AXIOM_CHECK(dedup_provider != nullptr);
+    AXIOM_CHECK(dedup_provider->open(root / "dedup.axar").capabilities.deduplicated_archive);
+}
+
 // add_to_archive appends new files (reusing existing compressed blocks) and an
 // added path replaces the existing entry of the same name.
 void test_archive_add() {
@@ -6099,6 +6159,7 @@ constexpr RegisteredTest kTests[] = {
     {"archive_roundtrip", test_archive_roundtrip},
     {"axar_version_fixtures_and_validation", test_axar_version_fixtures_and_validation},
     {"format_freeze_golden_profiles", test_format_freeze_golden_profiles},
+    {"archive_open_matches_separate_queries", test_archive_open_matches_separate_queries},
     {"external_codec_axar_roundtrip", test_external_codec_axar_roundtrip},
     {"large_lzma2_solid_profile", test_large_lzma2_solid_profile},
     {"axar_seekable_extraction", test_axar_seekable_extraction},

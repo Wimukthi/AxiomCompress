@@ -46,6 +46,14 @@ Entries are condensed from the
 
 ### Changed
 
+- Opened an archive with one directory read instead of five. Browsing asked the
+  provider for its capabilities and for its entries separately, and the
+  capability probe read the directory twice more on its own, so the same parse
+  was paid for five times. Providers now answer both from a single pass, and
+  moving between directories inside an open archive reuses the catalog's
+  capabilities instead of re-probing the file on every navigation. A 65 GiB
+  deduplicated archive holding 80,680 entries opened in 1.28 s rather than
+  2.09 s, using half the CPU; the directory read itself is 226 ms of that.
 - Froze the archive format. The magic prefix, the 16-byte header layout, the
   container versions, and the eight assigned required-flag bits are fixed, and
   are now asserted at compile time. A new required flag may only take an

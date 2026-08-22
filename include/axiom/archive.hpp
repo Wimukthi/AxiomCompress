@@ -282,6 +282,12 @@ struct ArchiveMove {
     std::string destination_path;
 };
 
+// What a browser needs to open an archive: its capabilities and its entries.
+struct ArchiveContents {
+    ArchiveCapabilities capabilities;
+    std::vector<ArchiveEntry> entries;
+};
+
 class ArchiveProvider {
 public:
     virtual ~ArchiveProvider() = default;
@@ -297,6 +303,16 @@ public:
                                              const std::string& password = {}) const = 0;
     virtual std::vector<ArchiveEntry> list(const std::filesystem::path& archive_path,
                                            const std::string& password = {}) const = 0;
+    // Capabilities and entries from one directory read. Both are needed to open
+    // an archive for browsing, and for a large deduplicated archive the
+    // directory pass dominates that cost, so answering them separately reads it
+    // twice. The default composes the two calls above; a provider whose read
+    // already yields both should override this. Throws whatever list() throws.
+    virtual ArchiveContents open(const std::filesystem::path& archive_path,
+                                 const std::string& password = {}) const {
+        auto probed = capabilities(archive_path, password);
+        return ArchiveContents{std::move(probed), list(archive_path, password)};
+    }
     virtual void test(const std::filesystem::path& archive_path,
                       const DecompressionOptions& options = {}) const = 0;
     virtual void extract_all(const std::filesystem::path& archive_path,

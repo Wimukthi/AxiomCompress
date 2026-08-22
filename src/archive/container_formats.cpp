@@ -93,32 +93,7 @@ public:
 
     ArchiveCapabilities capabilities(const std::filesystem::path& archive_path,
                                      const std::string& password) const override {
-        ArchiveCapabilities result;
-        const bool embedded_sfx = is_axiom_sfx_archive(archive_path);
-        const bool volume_set = is_axiom_archive_volume(archive_path);
-        const bool writable = !embedded_sfx && !volume_set;
-        result.list = true;
-        result.extract = true;
-        result.test = true;
-        result.create = writable;
-        result.packed_sizes = true;
-        result.selective_extract = true;
-        result.update = writable;
-        result.delete_entries = writable;
-        result.move_entries = writable;
-        result.encryption = writable;
-        result.recovery_records = writable;
-        result.can_create_volumes = writable;
-        result.is_multi_volume = volume_set;
-        result.comments = writable;
-        result.lock = writable;
-        result.metadata = true;
-        result.sparse_files = true;
-        result.capture_warnings = true;
-        result.links = true;
-        result.authenticity = true;
-        result.snapshots = true;
-        result.sfx = writable;
+        ArchiveCapabilities result = static_capabilities(archive_path);
         // The state flags below require opening the archive, which throws for a
         // path that does not exist yet (a new archive about to be created) or a
         // damaged file. A capability query must not throw — callers use it to
@@ -137,14 +112,26 @@ public:
             }
         } catch (...) {
         }
-        if (result.snapshot_repository) {
-            // Snapshot history must not be discarded by a legacy file-manager
-            // mutation. Snapshot add/prune/repack are separate APIs/CLI verbs.
-            result.update = false;
-            result.delete_entries = false;
-            result.move_entries = false;
-        }
+        apply_snapshot_restrictions(result);
         return result;
+    }
+
+    // Browsing needs the capabilities and the entries together. Answered
+    // separately they read the directory twice over, and for a large
+    // deduplicated archive that read is most of the cost of opening it, so both
+    // come from one pass here. Unlike capabilities(), this reports a damaged or
+    // missing archive by throwing, exactly as list() does.
+    ArchiveContents open(const std::filesystem::path& archive_path,
+                         const std::string& password) const override {
+        auto state = read_axar_directory_state(archive_path, password);
+        ArchiveCapabilities result = static_capabilities(archive_path);
+        result.snapshot_repository = state.snapshot_repository;
+        result.deduplicated_archive = state.deduplicated;
+        result.encrypted = state.encrypted;
+        result.directory_encrypted = state.directory_encrypted;
+        result.locked = state.locked;
+        apply_snapshot_restrictions(result);
+        return ArchiveContents{std::move(result), std::move(state.entries)};
     }
 
     std::vector<ArchiveEntry> list(const std::filesystem::path& archive_path,
@@ -224,6 +211,49 @@ public:
                       const std::vector<ArchiveMove>& moves,
                       const CompressionOptions& options) const override {
         move_archive_entries(archive_path, moves, options);
+    }
+
+private:
+    // Everything that follows from the path alone, with the archive-state flags
+    // left at their defaults for the caller to fill in.
+    static ArchiveCapabilities static_capabilities(
+        const std::filesystem::path& archive_path) {
+        ArchiveCapabilities result;
+        const bool embedded_sfx = is_axiom_sfx_archive(archive_path);
+        const bool volume_set = is_axiom_archive_volume(archive_path);
+        const bool writable = !embedded_sfx && !volume_set;
+        result.list = true;
+        result.extract = true;
+        result.test = true;
+        result.create = writable;
+        result.packed_sizes = true;
+        result.selective_extract = true;
+        result.update = writable;
+        result.delete_entries = writable;
+        result.move_entries = writable;
+        result.encryption = writable;
+        result.recovery_records = writable;
+        result.can_create_volumes = writable;
+        result.is_multi_volume = volume_set;
+        result.comments = writable;
+        result.lock = writable;
+        result.metadata = true;
+        result.sparse_files = true;
+        result.capture_warnings = true;
+        result.links = true;
+        result.authenticity = true;
+        result.snapshots = true;
+        result.sfx = writable;
+        return result;
+    }
+
+    static void apply_snapshot_restrictions(ArchiveCapabilities& result) {
+        if (!result.snapshot_repository) return;
+        // Snapshot history must not be discarded by a legacy file-manager
+        // mutation. Snapshot add/prune/repack are separate APIs/CLI verbs.
+        result.update = false;
+        result.delete_entries = false;
+        result.move_entries = false;
     }
 };
 

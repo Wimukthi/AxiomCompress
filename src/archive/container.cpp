@@ -10046,14 +10046,12 @@ void append_entry_subframe_ranges(const EntryRec& entry,
     }
 }
 
-std::vector<ArchiveEntry> list_archive(const std::filesystem::path& archive_path,
-                                       const std::string& password) {
-    std::uint64_t file_size = 0;
-    auto stream = open_archive(archive_path, file_size);
-    const ByteSource source(stream, file_size);
-    const auto loaded = load_index(source, password);
-    const auto& index = loaded.index;
+namespace {
 
+// Turn an already-read directory into the public entry shape. Shared by
+// list_archive() and read_axar_directory_state() so opening an archive for
+// browsing does not read the directory twice.
+std::vector<ArchiveEntry> entries_from_index(const ArchiveIndex& index) {
     std::vector<ArchiveEntry> result;
     result.reserve(index.entries.size());
     for (const auto& entry : index.entries) {
@@ -10110,6 +10108,37 @@ std::vector<ArchiveEntry> list_archive(const std::filesystem::path& archive_path
         result.push_back(std::move(out));
     }
     return result;
+}
+
+}  // namespace
+
+std::vector<ArchiveEntry> list_archive(const std::filesystem::path& archive_path,
+                                       const std::string& password) {
+    std::uint64_t file_size = 0;
+    auto stream = open_archive(archive_path, file_size);
+    const ByteSource source(stream, file_size);
+    return entries_from_index(load_index(source, password).index);
+}
+
+AxarDirectoryState read_axar_directory_state(const std::filesystem::path& archive_path,
+                                             const std::string& password) {
+    std::uint64_t file_size = 0;
+    auto stream = open_archive(archive_path, file_size);
+    const ByteSource source(stream, file_size);
+    // The header answers the profile questions; everything else comes from the
+    // one directory read, which is the expensive part.
+    const auto layout = read_layout(source);
+    const auto loaded = load_index(source, password);
+    const auto& index = loaded.index;
+
+    AxarDirectoryState state;
+    state.snapshot_repository = (layout.flags & kFlagChunkTable) != 0;
+    state.deduplicated = (layout.flags & kFlagLiveDedup) != 0;
+    state.directory_encrypted = (layout.flags & kFlagEncryptedDirectory) != 0;
+    state.encrypted = state.directory_encrypted || index.meta.encryption.enabled;
+    state.locked = index.meta.locked;
+    state.entries = entries_from_index(index);
+    return state;
 }
 
 std::optional<std::uint64_t> estimate_solid_entry_packed_size(
