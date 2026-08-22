@@ -14,6 +14,10 @@ Entries are condensed from the
 
 ## [Unreleased]
 
+## [0.11.0.0] - 2026-08-22
+
+Archive format freeze, faster archive opening, and update verification release.
+
 ### Added
 
 - Added `axiomc --version` (also `-V` and `version`), printing one
@@ -644,7 +648,8 @@ First published release: the Inno Setup installer and portable zip, carrying
 update/repair/remove maintenance handling, and dynamic light/dark setup
 styling.
 
-[Unreleased]: https://github.com/Wimukthi/AxiomCompress/compare/0.10.2.0...HEAD
+[Unreleased]: https://github.com/Wimukthi/AxiomCompress/compare/0.11.0.0...HEAD
+[0.11.0.0]: https://github.com/Wimukthi/AxiomCompress/releases/tag/0.11.0.0
 [0.10.2.0]: https://github.com/Wimukthi/AxiomCompress/releases/tag/0.10.2.0
 [0.10.1.0]: https://github.com/Wimukthi/AxiomCompress/releases/tag/0.10.1.0
 [0.10.0.0]: https://github.com/Wimukthi/AxiomCompress/releases/tag/0.10.0.0
