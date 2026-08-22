@@ -15,9 +15,10 @@ itself, and runs at roughly the same speed no matter how hard the packer
 worked. An archive made at the highest setting opens as fast as one made at
 the lowest.
 
-> **This is pre-release software.** The archive format can still change between
-> minor versions, so an archive written today may not open in a much later
-> build. Keep independent backups of anything you care about.
+> **The archive format is frozen.** An archive written today opens in every
+> later build: the container versions and the required-flag set are fixed,
+> checked at compile time, and pinned by golden fixtures. The application
+> itself is still pre-1.0, so its interfaces and defaults can still change.
 
 ![The Axiom archive browser showing an open archive in dark mode](docs/images/axiom-gui.png)
 

@@ -777,7 +777,9 @@ arbitrary declared size, so the decoder defends itself before allocating:
 
 ## Compatibility
 
-The format is **pre-release and free to change.**
+The format is **frozen.** Readers keep opening every archive that earlier
+versions wrote, and an archive written with default options by any 1.x release
+opens on every other 1.x release.
 
 | Layer | Written | Accepted |
 |---|---|---|
@@ -787,6 +789,22 @@ The format is **pre-release and free to change.**
 | Append-generation extension | `1` | `1` |
 | Recovery service | `1` | `1` |
 | Volume header | `1` | `1` |
+
+### What the freeze covers
+
+- The magic prefix, the 16-byte header layout, the container versions, and the
+  eight assigned required-flag bits `0x0001`–`0x0080` do not change. They are
+  asserted at compile time in the container and recorded as bytes in the golden
+  fixtures under `tests/fixtures/`.
+- A new required flag may only take an unassigned bit from `0x0100` upward, and
+  only for a profile that stays off unless a user asks for it. Default options
+  never gain a required flag they do not already set, so an archive written with
+  defaults by any 1.x release opens on 1.0.
+- Which assigned flags a default archive carries depends on what the source
+  needs: extended metadata, sparse maps, and a capture report are each set only
+  when the captured files call for them.
+- Changing the meaning or layout of anything a written archive already contains
+  requires AXAR v6 and a major release.
 
 Older readers reject AXC `9` and `10`, so an archive written with an external
 method requires Axiom 0.7.0.0 or newer.
@@ -820,10 +838,10 @@ history or the generation-aware crash fallback.
 Unknown AXAR versions, AXC versions, required flags, codecs, transforms, and
 transform parameters are all rejected with a clear error.
 
-The `version` field and the reserved `flags` bitfield exist so that, once the
-format stabilizes, an incompatible structural change can bump `version` while
-additive optional features ride on `flags`. At that point readers can accept
-older archives and reject only the flags they genuinely cannot interpret.
+The `version` field and the reserved `flags` bitfield carry that policy. An
+incompatible structural change bumps `version`; additive optional features ride
+on `flags`. Readers accept older archives and reject only the flags they
+genuinely cannot interpret.
 
 ## Capabilities and limits
 
@@ -949,3 +967,8 @@ ever written *through* one.
 ## Planned
 
 - POSIX special-file records for devices, FIFOs, and sockets.
+
+Under the freeze, anything here that needs a required flag takes an unassigned
+bit from `0x0100` upward and stays off unless a user asks for it. Special-file
+records qualify: a reader that cannot recreate a device node must reject the
+archive rather than restore something else in its place.

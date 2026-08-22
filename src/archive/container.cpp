@@ -136,6 +136,31 @@ constexpr std::uint16_t kKnownArchiveFlags = kFlagEncryptedDirectory |
                                                kFlagLargeSolidBlocks |
                                                kFlagLiveDedup;
 
+// ---- Frozen format constants ------------------------------------------------
+// These values are the published compatibility contract: see the Compatibility
+// section of FORMAT.md and docs/VERSIONING.md. Every archive already written
+// carries them, so changing one is a deliberate format revision, never a
+// refactor. The golden fixtures under tests/fixtures/ pin the same values as
+// recorded bytes, and format_freeze_golden_profiles checks them.
+static_assert(kArchiveMagic == std::array<std::uint8_t, 8>{'A', 'X', 'I', 'O',
+                                                          'M', 'A', 'R', 0},
+              "the AXAR magic prefix is frozen");
+static_assert(kHeaderSize == 16, "the AXAR header is frozen at 16 bytes");
+static_assert(kArchiveVersion4 == 4, "AXAR v4 is the frozen read baseline");
+static_assert(kArchiveVersion5 == 5, "AXAR v5 is the frozen default write version");
+static_assert(kFlagEncryptedDirectory == 0x0001, "frozen required-flag bit");
+static_assert(kFlagSparseEntries == 0x0002, "frozen required-flag bit");
+static_assert(kFlagCaptureReport == 0x0004, "frozen required-flag bit");
+static_assert(kFlagExtendedMetadata == 0x0008, "frozen required-flag bit");
+static_assert(kFlagEncryptionV2 == 0x0010, "frozen required-flag bit");
+static_assert(kFlagChunkTable == 0x0020, "frozen required-flag bit");
+static_assert(kFlagLargeSolidBlocks == 0x0040, "frozen required-flag bit");
+static_assert(kFlagLiveDedup == 0x0080, "frozen required-flag bit");
+// Bits 0x0100 and up are unassigned. A new required flag may only come from
+// that range, and only for a profile that stays off by default, so an archive
+// written with default options keeps opening on every 1.x reader.
+static_assert(kKnownArchiveFlags == 0x00FF, "the assigned required-flag set is frozen");
+
 // Optional block-extra profile. Older AXAR readers already skip the reserved
 // block-extra byte range, so this remains additive and does not require a new
 // AXAR header version or feature flag.

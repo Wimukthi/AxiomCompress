@@ -3111,6 +3111,59 @@ void test_axar_version_fixtures_and_validation() {
     fs::remove_all(root, ec);
 }
 
+// Golden archives for every profile the 1.0 format freeze covers. Each was
+// written by the release that froze the format, and every later reader must
+// keep opening it byte for byte. A failure here means a format change broke the
+// compatibility promise: regenerating the fixture would hide the exact
+// regression it exists to catch.
+void test_format_freeze_golden_profiles() {
+    struct GoldenProfile {
+        const char* fixture;
+        std::uint16_t version;
+        std::uint16_t flags;
+        const char* password;
+        bool snapshot_repository;
+    };
+    constexpr GoldenProfile kProfiles[] = {
+        {"axar_v4_empty.hex", 4, 0x0000, "", false},
+        {"axar_v5_capture_report.hex", 5, 0x0004, "", false},
+        {"axar_v5_extended_metadata.hex", 5, 0x0008, "", false},
+        {"axar_v5_encryption_v2.hex", 5, 0x0018, "hunter2", false},
+        {"axar_v5_live_dedup.hex", 5, 0x008E, "", false},
+        {"axar_v5_snapshot_chunk_table.hex", 5, 0x0028, "", true},
+    };
+
+    const auto root = make_temp_dir();
+    for (const auto& profile : kProfiles) {
+        const auto bytes = read_hex_fixture(profile.fixture);
+        const auto archive = root / profile.fixture;
+        write_all(archive, bytes);
+
+        // The header carries the frozen part of the contract: magic, container
+        // version, and the exact required-flag set, with the reserved word
+        // still zero.
+        AXIOM_CHECK(bytes.size() > 16);
+        AXIOM_CHECK(std::memcmp(bytes.data(), "AXIOMAR", 8) == 0);
+        const auto version = static_cast<std::uint16_t>(bytes[8] | (bytes[9] << 8));
+        const auto flags = static_cast<std::uint16_t>(bytes[10] | (bytes[11] << 8));
+        const auto reserved = static_cast<std::uint32_t>(
+            bytes[12] | (bytes[13] << 8) | (bytes[14] << 16) | (bytes[15] << 24));
+        AXIOM_CHECK(version == profile.version);
+        AXIOM_CHECK(flags == profile.flags);
+        AXIOM_CHECK(reserved == 0);
+
+        // And each one still opens and verifies.
+        (void)axiom::list_archive(archive, profile.password);
+        if (profile.snapshot_repository) {
+            AXIOM_CHECK(!axiom::list_archive_snapshots(archive, profile.password).empty());
+        } else {
+            axiom::DecompressionOptions decompression;
+            decompression.password = profile.password;
+            axiom::test_archive(archive, decompression);
+        }
+    }
+}
+
 // add_to_archive appends new files (reusing existing compressed blocks) and an
 // added path replaces the existing entry of the same name.
 void test_archive_add() {
@@ -6045,6 +6098,7 @@ constexpr RegisteredTest kTests[] = {
     {"rans_contextual_edges", test_rans_contextual_edges},
     {"archive_roundtrip", test_archive_roundtrip},
     {"axar_version_fixtures_and_validation", test_axar_version_fixtures_and_validation},
+    {"format_freeze_golden_profiles", test_format_freeze_golden_profiles},
     {"external_codec_axar_roundtrip", test_external_codec_axar_roundtrip},
     {"large_lzma2_solid_profile", test_large_lzma2_solid_profile},
     {"axar_seekable_extraction", test_axar_seekable_extraction},

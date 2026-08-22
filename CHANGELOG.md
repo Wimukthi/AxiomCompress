@@ -9,8 +9,8 @@ Version numbers are four parts, `major.minor.patch.build`, explained in
 Entries are condensed from the
 [GitHub releases](https://github.com/Wimukthi/AxiomCompress/releases).
 
-> **The archive format is still pre-release** and can change between minor
-> versions. Where a release changes what Axiom writes, the entry says so.
+> **The archive format is frozen.** An archive written today opens in every
+> later build. Where a release changes what Axiom writes, the entry says so.
 
 ## [Unreleased]
 
@@ -46,6 +46,16 @@ Entries are condensed from the
 
 ### Changed
 
+- Froze the archive format. The magic prefix, the 16-byte header layout, the
+  container versions, and the eight assigned required-flag bits are fixed, and
+  are now asserted at compile time. A new required flag may only take an
+  unassigned bit from `0x0100` upward, and only for a profile that stays off
+  unless a user asks for it, so an archive written with default options by any
+  later 1.x release opens on 1.0. Changing what a written archive already
+  contains needs AXAR v6 and a major release. Golden fixtures now cover every
+  frozen profile — the v4 baseline, and v5 with a capture report, extended
+  metadata, encryption-v2 password slots, live deduplication, and a snapshot
+  chunk table — and are checked byte for byte before being opened.
 - Applied the project's warning level to the GUI, CLI, and test targets in the
   CMake build, which had been left at the default while only the library was
   raised. The MSBuild projects were already at `/W4`. Added an

@@ -31,11 +31,20 @@ The executable version and the AXAR container version are separate contracts.
 A newer Axiom must keep reading older archives; that obligation does not expire
 when the product version goes up.
 
+The format is **frozen**. The magic prefix, the header layout, the container
+versions, and the eight assigned required-flag bits are fixed. A new required
+flag may only take an unassigned bit from `0x0100` upward, and only for a
+profile that stays off unless a user asks for it, so default options never begin
+setting a required flag they did not already set. An archive written with
+defaults by any 1.x release opens on 1.0. Anything that changes what a written
+archive already contains needs AXAR v6 and a major release.
+
 The baseline is **AXAR v4**, and readers must continue to open v4 archives
-indefinitely. **AXAR v5** is an additive revision, used when a required
-fidelity feature can't be represented safely in v4. It currently covers the
-encryption-v2 password slots, snapshot repositories, and the large solid-block
-profile. Legacy v4 encryption stays readable forever.
+indefinitely. **AXAR v5** is an additive revision, used when a required fidelity
+feature can't be represented safely in v4: sparse allocation maps, a
+source-capture report, extended metadata, encryption-v2 password slots, snapshot
+repositories, large solid blocks, and live deduplication. Legacy v4 encryption
+stays readable forever.
 
 ### Required flags are requirements, not hints
 
@@ -45,8 +54,14 @@ rather than trying its luck. A v4 header must never claim a v5-only flag.
 
 | Flag | Profile |
 |---:|---|
+| `0x0001` | Encrypted central directory |
+| `0x0002` | Sparse-file allocation maps |
+| `0x0004` | Source-capture report |
+| `0x0008` | Extended metadata (ACLs, xattrs, reparse points) |
+| `0x0010` | Encryption-v2 password slots |
 | `0x0020` | Snapshot chunk table and manifest |
 | `0x0040` | Large solid blocks (LZMA2, above 4 GiB through 64 GiB) |
+| `0x0080` | Live content deduplication (mutually exclusive with `0x0020`) |
 
 The large-solid profile permits LZMA2 solid blocks above 4 GiB and up to 64 GiB
 while keeping the pieces inside them bounded. It does not change the ordinary
@@ -107,9 +122,21 @@ digest.
 
 ### Testing the rules
 
-Every format revision is covered by a checked-in golden fixture under
-`tests/fixtures/`, plus negative tests for reserved fields, unknown required
-flags, malformed TLV lengths, and truncation.
+Every profile the freeze covers has a checked-in golden fixture under
+`tests/fixtures/`, exercised by `format_freeze_golden_profiles`: the v4
+baseline, and v5 carrying a capture report, extended metadata, encryption-v2
+password slots, live deduplication, and a snapshot chunk table. The test
+asserts each fixture's magic, version, required-flag set, and reserved word,
+then opens it. Regenerating a fixture to make the test pass would defeat it.
+
+The large-solid-block profile (`0x0040`) has no golden archive, because a
+representative one would exceed 4 GiB. It is covered by the header-level and
+geometry validation tests instead.
+
+Negative tests cover reserved fields, unknown required flags, a v4 header
+claiming a v5-only flag, malformed TLV lengths, varint overflow, and
+truncation. The frozen constants themselves are asserted at compile time in
+`src/archive/container.cpp`.
 
 Changing any of these rules requires a deliberate format review and a matching
 update to [FORMAT.md](../FORMAT.md).
