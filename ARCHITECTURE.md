@@ -40,11 +40,11 @@ see [FORMAT.md](FORMAT.md). For the terminology, see
 | `src/codec/external_codecs.cpp` | The chunk envelope and the Zstandard, LZMA2, and Deflate adapters |
 | `src/entropy/` | Huffman and rANS coders |
 | `src/archive/container.cpp` | The AXAR engine: directory, solid blocks, encryption, recovery, volumes, signing, SFX |
-| `src/archive/container_zip.cpp` | ZIP read and write: miniz wrappers, AES-256 entries, the ZIP provider |
+| `src/archive/container_zip.cpp` | ZIP policy, streaming Deflate/AES-256/ZipCrypto adapters, extraction, the ZIP provider |
 | `src/archive/container_formats.cpp` | Format detection and the provider registry |
 | `src/archive/system_provider.cpp` | Read-only provider policy, the native ISO reader, Windows `tar.exe` |
 | `src/archive/seven_zip_library.cpp` | The direct `7z.dll` adapter |
-| `src/archive/zip_split_backend.cpp` | minizip-ng split-set creation and reading |
+| `src/archive/zip_split_backend.cpp` | Unified minizip-ng container I/O for ordinary ZIPs, split sets, and bounded SFX payloads |
 | `src/core/` | Checksums, crypto, filesystem metadata, Reed-Solomon, the task executor |
 | `src/cli/` | `axiomc` parsing and workflows |
 | `src/gui/` | The native Win32 app, built on the public archive API |
@@ -351,7 +351,7 @@ Archive browsing goes through a built-in provider layer:
 | Provider | What it can do |
 |---|---|
 | `axar` | Full read and write. Adapts the archive API without changing format or behaviour |
-| `zip` | miniz-backed browse, test, extract, create, add, update, sync, delete, move. New encrypted ZIPs use WinZip AES-256; existing encrypted ZIPs are read-only. Unchanged plaintext entries are cloned into an atomically rewritten ZIP |
+| `zip` | minizip-ng-backed browse, test, extract, create, add, update, sync, delete, move. New encrypted ZIPs use WinZip AES-256; existing encrypted ZIPs are read-only. Unchanged entries are raw-cloned into an atomically rewritten ZIP |
 | `system-readonly` | Windows only. Loads `7z.dll` directly for 7z, RAR/RAR5, hybrid ISO/UDF, and CAB; uses `tar.exe` for the TAR family. Never advertises create, update, delete, or move |
 
 The GUI asks a provider for its format identity and file-type text, its
@@ -371,13 +371,16 @@ display; hybrid media use the authoritative UDF catalog from the DLL. The DLL
 adapter consumes structured properties and callbacks rather than launching a
 helper process or parsing console text.
 
-ZIP vendors miniz 3.1.2 for a small, build-system-friendly container
-reader/writer and Deflate implementation. zlib-ng would be a reasonable future
-Deflate backend if profiling ever shows miniz's codec path is the bottleneck,
-but it is not a ZIP container layer and shouldn't be mistaken for one. A
-privately namespaced minizip-ng 4.2.2 core creates and reads standard `.z01`,
-`.z02`, …, `.zip` sets, raw-copying completed entries so Deflate data,
-metadata, CRCs, and AES ciphertext survive intact.
+ZIP has one container backend: the privately namespaced minizip-ng 4.2.2 core
+parses and emits ordinary files, standard `.z01`, `.z02`, …, `.zip` sets, and
+bounded payload ranges inside SFX images. Axiom keeps policy above that layer:
+path safety, cancellation, progress, atomic transactions, raw Deflate through
+miniz 3.1.2, and streaming ZipCrypto/WinZip AES-256 adapters. Reads and writes
+use bounded chunks; encrypted or split entries are not materialized in memory.
+Unchanged entries are raw-copied so compressed data, metadata, CRCs, and
+ciphertext survive an atomic rewrite. Direct split creation writes the staged
+volume set once and transactionally installs it, rather than first creating a
+complete ordinary ZIP and repartitioning it.
 
 The per-format roadmap is in [docs/FORMAT_SUPPORT.md](docs/FORMAT_SUPPORT.md).
 

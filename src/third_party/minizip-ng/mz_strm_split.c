@@ -48,6 +48,8 @@ typedef struct mzng_stream_split_s {
     int32_t number_disk;
     int64_t current_disk_size;
     int32_t current_disk;
+    int32_t highest_disk_created;
+    int32_t central_disk_created;
     int32_t reached_end;
 } mzng_stream_split;
 
@@ -67,7 +69,9 @@ static int32_t mzng_stream_split_open_disk(void *stream, int32_t number_disk) {
     int64_t position = 0;
     int32_t i = 0;
     int32_t err = MZ_OK;
+    int32_t open_mode = 0;
     int16_t disk_part = 0;
+    uint8_t create_disk = 0;
 
     /* Check if we are reading or writing a disk part or the cd disk */
     if (number_disk >= 0) {
@@ -101,8 +105,23 @@ static int32_t mzng_stream_split_open_disk(void *stream, int32_t number_disk) {
         }
     }
 
+    open_mode = split->mode;
+    if ((split->mode & MZ_OPEN_MODE_WRITE) && (split->mode & MZ_OPEN_MODE_CREATE)) {
+        const uint8_t already_created = number_disk < 0
+            ? (uint8_t)split->central_disk_created
+            : (uint8_t)(number_disk <= split->highest_disk_created);
+        if (already_created) {
+            /* Raw entry close revisits its local-header disk. CREATE_ALWAYS
+               would truncate the volume before updating CRC and sizes. */
+            open_mode &= ~MZ_OPEN_MODE_CREATE;
+            open_mode |= MZ_OPEN_MODE_APPEND;
+        } else {
+            create_disk = 1;
+        }
+    }
+
     if (err == MZ_OK)
-        err = mzng_stream_open(split->stream.base, split->path_disk, split->mode);
+        err = mzng_stream_open(split->stream.base, split->path_disk, open_mode);
 
     if (err == MZ_OK) {
         split->total_in_disk = 0;
@@ -110,11 +129,17 @@ static int32_t mzng_stream_split_open_disk(void *stream, int32_t number_disk) {
         split->current_disk = number_disk;
 
         if (split->mode & MZ_OPEN_MODE_WRITE) {
-            if ((split->current_disk == 0) && (split->disk_size > 0)) {
+            if (create_disk && (split->current_disk == 0) && (split->disk_size > 0)) {
                 err = mzng_stream_write_uint32(split->stream.base, MZ_ZIP_MAGIC_DISKHEADER);
 
                 split->total_out_disk += 4;
                 split->total_out += split->total_out_disk;
+            }
+            if (create_disk) {
+                if (number_disk < 0)
+                    split->central_disk_created = 1;
+                else if (number_disk > split->highest_disk_created)
+                    split->highest_disk_created = number_disk;
             }
         } else if (split->mode & MZ_OPEN_MODE_READ) {
             if (split->current_disk == 0) {
@@ -131,6 +156,7 @@ static int32_t mzng_stream_split_open_disk(void *stream, int32_t number_disk) {
         mzng_stream_seek(split->stream.base, 0, MZ_SEEK_END);
         split->current_disk_size = mzng_stream_tell(split->stream.base);
         mzng_stream_seek(split->stream.base, position, MZ_SEEK_SET);
+        split->total_out_disk = position;
 
         split->is_open = 1;
     }
@@ -266,7 +292,7 @@ int32_t mzng_stream_split_write(void *stream, const void *buf, int32_t size) {
         bytes_to_write = bytes_left;
 
         if (split->disk_size > 0) {
-            if ((split->total_out_disk == split->disk_size && split->total_out > 0) ||
+            if (((split->number_disk != -1) && (position >= split->disk_size) && split->total_out > 0) ||
                 (split->number_disk == -1 && split->number_disk != split->current_disk)) {
                 if (split->number_disk != -1)
                     number_disk = split->current_disk + 1;
@@ -279,7 +305,7 @@ int32_t mzng_stream_split_write(void *stream, const void *buf, int32_t size) {
             }
 
             if (split->number_disk != -1) {
-                bytes_avail = split->disk_size - split->total_out_disk;
+                bytes_avail = split->disk_size - position;
                 if (bytes_to_write > bytes_avail)
                     bytes_to_write = (int32_t)bytes_avail;
             }
@@ -294,12 +320,12 @@ int32_t mzng_stream_split_write(void *stream, const void *buf, int32_t size) {
         bytes_left -= written;
         buf_ptr += written;
 
-        split->total_out += written;
-        split->total_out_disk += written;
-
         position += written;
-        if (position > split->current_disk_size)
+        if (position > split->current_disk_size) {
+            split->total_out += position - split->current_disk_size;
             split->current_disk_size = position;
+        }
+        split->total_out_disk = position;
     }
 
     return size - bytes_left;
@@ -393,8 +419,10 @@ int32_t mzng_stream_split_set_prop_int64(void *stream, int32_t prop, int64_t val
 
 void *mzng_stream_split_create(void) {
     mzng_stream_split *split = (mzng_stream_split *)calloc(1, sizeof(mzng_stream_split));
-    if (split)
+    if (split) {
         split->stream.vtbl = &mzng_stream_split_vtbl;
+        split->highest_disk_created = -1;
+    }
     return split;
 }
 

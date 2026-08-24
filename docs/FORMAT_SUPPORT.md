@@ -69,6 +69,11 @@ encrypted archives, SFX packaging, and standard split volumes.
 
 Edits are atomic rewrites. Entries you didn't touch are cloned across intact —
 their Deflate data, metadata, and CRCs are preserved rather than recompressed.
+Ordinary ZIPs, split sets, and ZIP payloads embedded in SFX files all use the
+same minizip-ng container path. Entry data, Deflate, and encryption are streamed
+in bounded chunks. Creating a split ZIP writes its volumes directly into a
+staged set and installs the set transactionally; it does not create a complete
+ordinary ZIP first.
 
 Current limits:
 

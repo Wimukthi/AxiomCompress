@@ -55,6 +55,8 @@ unpacks itself, so the recipient needs nothing installed.
 
 **It reads what you already have.** Full read and write for ZIP. Read-only
 support for 7z, RAR, ISO/UDF, CAB, and the TAR family on Windows.
+Ordinary, split, and self-extracting ZIPs share one streaming container path;
+split ZIPs are written directly as a transactionally installed volume set.
 
 ## Installation
 

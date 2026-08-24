@@ -227,9 +227,6 @@
     <ClCompile Include="src\third_party\miniz\miniz_tinfl.c">
       <Filter>Third Party</Filter>
     </ClCompile>
-    <ClCompile Include="src\third_party\miniz\miniz_zip.c">
-      <Filter>Third Party</Filter>
-    </ClCompile>
     <ClCompile Include="src\third_party\monocypher\monocypher.c">
       <Filter>Third Party</Filter>
     </ClCompile>

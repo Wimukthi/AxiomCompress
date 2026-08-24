@@ -63,6 +63,7 @@
 #include <future>
 #include <iostream>
 #include <iterator>
+#include <map>
 #include <memory>
 #include <optional>
 #include <random>
@@ -2007,6 +2008,111 @@ void test_zip_provider_layer() {
     fs::remove_all(root, ec);
 }
 
+void test_zip_direct_split_creation() {
+    const auto root = make_temp_dir();
+    const auto source = root / "direct-source.bin";
+    std::vector<std::uint8_t> payload(2u << 20);
+    std::uint32_t state = 0x51a7f00du;
+    std::generate(payload.begin(), payload.end(), [&] {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        return static_cast<std::uint8_t>(state);
+    });
+    write_all(source, payload);
+
+    const auto archive = root / "direct.zip";
+    const auto* provider = axiom::archive_provider_for_path(archive);
+    AXIOM_CHECK(provider != nullptr);
+    axiom::ArchiveCreateRequest request;
+    request.inputs = {source};
+    request.archive_path = archive;
+    request.output.volume_size = 64u << 10;
+    provider->create(request);
+
+    AXIOM_CHECK(fs::exists(root / "direct.z01"));
+    const auto opened = provider->open(archive);
+    AXIOM_CHECK(opened.capabilities.is_multi_volume);
+    AXIOM_CHECK(!opened.capabilities.update);
+    AXIOM_CHECK(opened.entries.size() == 1);
+    AXIOM_CHECK(opened.entries.front().path == "direct-source.bin");
+    provider->test(archive);
+    const auto output = root / "direct-output";
+    provider->extract_all(archive, output, {});
+    AXIOM_CHECK(read_all(output / "direct-source.bin") == payload);
+
+#if defined(_WIN32)
+    // Confirm that the direct writer emits a standard split set consumable by
+    // another implementation, rather than merely one our reader accepts.
+    if (const auto seven_zip = bundled_7z_for_tests()) {
+        const auto interoperability_out = root / "direct-7z-output";
+        fs::create_directories(interoperability_out);
+        const std::wstring command = L"call \"" + seven_zip->wstring() +
+            L"\" x -y -o\"" + interoperability_out.wstring() + L"\" \"" +
+            archive.wstring() + L"\" >nul 2>nul";
+        AXIOM_CHECK(_wsystem(command.c_str()) == 0);
+        AXIOM_CHECK(read_all(interoperability_out / "direct-source.bin") == payload);
+    }
+#endif
+
+    const auto snapshot_set = [&](const fs::path& final_path) {
+        std::map<std::wstring, std::vector<std::uint8_t>> files;
+        for (const auto& item : fs::directory_iterator(final_path.parent_path())) {
+            if (!item.is_regular_file()) continue;
+            const auto extension = item.path().extension().wstring();
+            const bool numbered = item.path().stem() == final_path.stem() &&
+                extension.size() >= 3 &&
+                (extension[1] == L'z' || extension[1] == L'Z') &&
+                std::all_of(extension.begin() + 2, extension.end(),
+                            [](wchar_t ch) { return ch >= L'0' && ch <= L'9'; });
+            if (item.path() == final_path || numbered) {
+                files.emplace(item.path().filename().wstring(), read_all(item.path()));
+            }
+        }
+        return files;
+    };
+
+    const auto before_cancel = snapshot_set(archive);
+    write_all(source, std::vector<std::uint8_t>(payload.size(), 0x5a));
+    request.options.operation = std::make_shared<axiom::OperationControl>();
+    request.options.operation->set_progress_callback(
+        [operation = request.options.operation](const axiom::OperationProgress& progress) {
+            if (progress.stage == axiom::OperationStage::compressing &&
+                progress.completed_bytes != 0) {
+                operation->request_cancel();
+            }
+        });
+    expect_throws([&] { provider->create(request); });
+    AXIOM_CHECK(snapshot_set(archive) == before_cancel);
+
+    write_all(source, payload);
+    const auto encrypted_archive = root / "direct-encrypted.zip";
+    axiom::ArchiveCreateRequest encrypted = request;
+    encrypted.archive_path = encrypted_archive;
+    encrypted.options.operation.reset();
+    encrypted.options.password = "direct split password";
+    provider->create(encrypted);
+    AXIOM_CHECK(fs::exists(root / "direct-encrypted.z01"));
+    axiom::DecompressionOptions test_options;
+    test_options.password = encrypted.options.password;
+    provider->test(encrypted_archive, test_options);
+    axiom::ExtractOptions extract_options;
+    extract_options.password = encrypted.options.password;
+    const auto encrypted_output = root / "encrypted-output";
+    provider->extract_all(encrypted_archive, encrypted_output, extract_options);
+    AXIOM_CHECK(read_all(encrypted_output / "direct-source.bin") == payload);
+
+    axiom::ArchiveCreateRequest too_large = request;
+    too_large.archive_path = root / "not-split.zip";
+    too_large.options.operation.reset();
+    too_large.output.volume_size = 8u << 20;
+    expect_throws([&] { provider->create(too_large); });
+    AXIOM_CHECK(!fs::exists(too_large.archive_path));
+
+    std::error_code error;
+    fs::remove_all(root, error);
+}
+
 void test_safe_file_replacement() {
     const auto root = make_temp_dir();
     const auto destination = root / "destination.bin";
@@ -2600,6 +2706,13 @@ void test_zip_aes256_encryption() {
                 bytes_from_string("zip aes beta payload"));
 
 #if defined(_WIN32)
+    if (const auto seven_zip = bundled_7z_for_tests()) {
+        const std::wstring command = L"call \"" + seven_zip->wstring() +
+            L"\" t -p\"correct horse battery staple\" \"" +
+            archive.wstring() + L"\" >nul 2>nul";
+        AXIOM_CHECK(_wsystem(command.c_str()) == 0);
+    }
+
     const auto split_archive = root / "encrypted-split.zip";
     fs::copy_file(archive, split_archive);
     axiom::create_zip_volumes(split_archive, 160);
@@ -2766,6 +2879,46 @@ void test_zip_aes_data_descriptor_compatibility() {
 
     std::error_code ec;
     fs::remove_all(root, ec);
+}
+
+void test_zip_zipcrypto_compatibility() {
+#if defined(_WIN32)
+    const auto seven_zip = bundled_7z_for_tests();
+    if (!seven_zip) return;
+
+    const auto root = make_temp_dir();
+    const auto source = root / "zipcrypto-source.bin";
+    const auto payload = bytes_from_string("traditional zip encryption payload");
+    write_all(source, payload);
+    const auto archive = root / "zipcrypto.zip";
+
+    // Create the fixture independently so this covers Axiom's streaming
+    // ZipCrypto reader, including the password-verifier header.
+    const std::wstring command = L"call \"" + seven_zip->wstring() +
+        L"\" a -tzip -p\"traditional password\" -mem=ZipCrypto \"" +
+        archive.wstring() + L"\" \"" + source.wstring() + L"\" >nul 2>nul";
+    AXIOM_CHECK(_wsystem(command.c_str()) == 0);
+
+    const auto* provider = axiom::archive_provider_for_path(archive);
+    AXIOM_CHECK(provider != nullptr);
+    const auto entries = provider->list(archive);
+    AXIOM_CHECK(entries.size() == 1);
+
+    axiom::DecompressionOptions test_options;
+    test_options.password = "traditional password";
+    provider->test(archive, test_options);
+    test_options.password = "wrong password";
+    expect_throws([&] { provider->test(archive, test_options); });
+
+    axiom::ExtractOptions extract_options;
+    extract_options.password = "traditional password";
+    const auto output = root / "zipcrypto-output";
+    provider->extract_all(archive, output, extract_options);
+    AXIOM_CHECK(read_all(output / fs::path(entries.front().path)) == payload);
+
+    std::error_code error;
+    fs::remove_all(root, error);
+#endif
 }
 
 // Symlinks are archived as links (target stored, not followed) and recreated on
@@ -6165,6 +6318,7 @@ constexpr RegisteredTest kTests[] = {
     {"axar_seekable_extraction", test_axar_seekable_extraction},
     {"archive_provider_layer", test_archive_provider_layer},
     {"zip_provider_layer", test_zip_provider_layer},
+    {"zip_direct_split_creation", test_zip_direct_split_creation},
     {"safe_file_replacement", test_safe_file_replacement},
 #if defined(_WIN32)
     {"skip_unreadable_archive_inputs", test_skip_unreadable_archive_inputs},
@@ -6176,6 +6330,7 @@ constexpr RegisteredTest kTests[] = {
 #endif
     {"zip_aes256_encryption", test_zip_aes256_encryption},
     {"zip_aes_data_descriptor_compatibility", test_zip_aes_data_descriptor_compatibility},
+    {"zip_zipcrypto_compatibility", test_zip_zipcrypto_compatibility},
     {"archive_symlinks", test_archive_symlinks},
     {"archive_hardlinks", test_archive_hardlinks},
     {"archive_add", test_archive_add},
@@ -6218,7 +6373,13 @@ constexpr RegisteredTest kTests[] = {
 int run_named_test(std::string_view name) {
     for (const auto& entry : kTests) {
         if (name == entry.name) {
-            entry.run();
+            try {
+                entry.run();
+            } catch (const std::exception& error) {
+                std::cerr << "failed: " << entry.name << ": "
+                          << error.what() << '\n';
+                return 1;
+            }
             std::cout << "ok: " << entry.name << '\n';
             return 0;
         }

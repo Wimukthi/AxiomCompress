@@ -619,7 +619,17 @@ private:
                             provider->sync(inputs, archive, run_options);
                             break;
                         default:
-                            provider->create(inputs, archive, run_options);
+                            if (provider->info().format == axiom::ArchiveFormat::zip &&
+                                split_after) {
+                                axiom::ArchiveCreateRequest request;
+                                request.inputs = inputs;
+                                request.archive_path = archive;
+                                request.options = run_options;
+                                request.output.volume_size = volume_size;
+                                provider->create(request);
+                            } else {
+                                provider->create(inputs, archive, run_options);
+                            }
                             break;
                     }
                     if (provider->info().native && set_comment) {
@@ -668,7 +678,8 @@ private:
                                 remove_error);
                         }
                     } else if (provider->info().format == axiom::ArchiveFormat::zip &&
-                               split_after) {
+                               split_after &&
+                               mode != axiom::gui::ArchiveUpdateMode::create_new) {
                         const std::uint64_t archive_bytes = fs::file_size(archive);
                         if (volume_size >= archive_bytes) {
                             throw std::invalid_argument(

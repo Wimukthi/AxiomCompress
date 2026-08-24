@@ -9,5 +9,8 @@
     <ClCompile Include="tests\roundtrip_test.cpp">
       <Filter>Tests</Filter>
     </ClCompile>
+    <ClCompile Include="src\third_party\miniz\miniz_zip.c">
+      <Filter>Tests</Filter>
+    </ClCompile>
   </ItemGroup>
 </Project>

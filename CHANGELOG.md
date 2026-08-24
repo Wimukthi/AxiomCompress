@@ -14,6 +14,26 @@ Entries are condensed from the
 
 ## [Unreleased]
 
+## [0.12.0.0] - 2026-08-25
+
+Unified ZIP backend and direct split-volume creation release.
+
+### Changed
+
+- Unified ordinary, split, and SFX ZIP container I/O on minizip-ng. miniz now
+  supplies only raw Deflate/Inflate to product targets. ZIP entry data,
+  ZipCrypto, and WinZip AES-256 are streamed in bounded chunks, while unchanged
+  entries are raw-copied during atomic rewrites.
+- Split ZIP creation now writes directly into a staged volume set and installs
+  the complete set transactionally, instead of creating and repartitioning a
+  complete ordinary ZIP.
+
+### Fixed
+
+- Reopening a previously written split disk to patch a raw entry header no
+  longer truncates that volume. The vendored split stream now distinguishes a
+  new disk from a revisit and accounts overwrites by physical file position.
+
 ## [0.11.0.0] - 2026-08-22
 
 Archive format freeze, faster archive opening, and update verification release.
@@ -648,7 +668,8 @@ First published release: the Inno Setup installer and portable zip, carrying
 update/repair/remove maintenance handling, and dynamic light/dark setup
 styling.
 
-[Unreleased]: https://github.com/Wimukthi/AxiomCompress/compare/0.11.0.0...HEAD
+[Unreleased]: https://github.com/Wimukthi/AxiomCompress/compare/0.12.0.0...HEAD
+[0.12.0.0]: https://github.com/Wimukthi/AxiomCompress/releases/tag/0.12.0.0
 [0.11.0.0]: https://github.com/Wimukthi/AxiomCompress/releases/tag/0.11.0.0
 [0.10.2.0]: https://github.com/Wimukthi/AxiomCompress/releases/tag/0.10.2.0
 [0.10.1.0]: https://github.com/Wimukthi/AxiomCompress/releases/tag/0.10.1.0

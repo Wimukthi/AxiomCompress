@@ -11,8 +11,8 @@ The components below are bundled with it and retain their own licenses.
 | [Darkmodelib](#darkmodelib) | 0.75.0 | MPL-2.0, with MIT parts | Dark mode, via the theme framework |
 | [Zstandard](#zstandard) | 1.5.7 | BSD-3-Clause | Optional AXAR Zstandard block codec |
 | [LZMA SDK](#lzma-sdk) | 26.02 | Public domain | Optional AXAR LZMA2 block codec |
-| [miniz](#miniz) | 3.1.2 | MIT | ZIP container read/write and Deflate |
-| [minizip-ng](#minizip-ng) | 4.2.2 | zlib | Standard split-ZIP container core |
+| [miniz](#miniz) | 3.1.2 | MIT | Raw Deflate/Inflate for ZIP and AXAR |
+| [minizip-ng](#minizip-ng) | 4.2.2 | zlib | Unified ordinary, split, and SFX ZIP container core |
 | [7-Zip engine](#7-zip-engine) | 26.02 | LGPL-2.1+, BSD parts, unRAR restriction | Read-only 7z/RAR/ISO/CAB support |
 | [Monocypher](#monocypher) | 4.0.3 | BSD-2-Clause / CC0-1.0 | Argon2id, XChaCha20-Poly1305, EdDSA |
 | [BLAKE3](#blake3) | 1.8.5 | CC0-1.0 or Apache-2.0 | Content hashing and integrity |
@@ -71,8 +71,9 @@ parallelism.
 
 ## miniz
 
-Provides the ZIP container reader/writer and the Deflate/Inflate
-implementation, which the AXAR Deflate method also uses.
+Provides raw Deflate/Inflate for ZIP entries and the AXAR Deflate method. Its
+ZIP container module is linked only into the interoperability test executable,
+where it creates and inspects fixtures independently of Axiom's provider.
 
 - Version: 3.1.2, pinned in `dependencies.lock.json`
 - License: `src/third_party/miniz/LICENSE` (MIT)
@@ -80,9 +81,10 @@ implementation, which the AXAR Deflate method also uses.
 ## minizip-ng
 
 A privately namespaced subset of minizip-ng's container and split-stream core,
-used to create and read standard `.z01`, `.z02`, …, `.zip` sets while
-raw-copying completed entries. The vendored split writer carries a documented
-local-header boundary fix, verified against bundled 7-Zip.
+used for every ordinary ZIP, standard `.z01`, `.z02`, …, `.zip` set, and
+bounded SFX ZIP payload. The vendored split writer carries documented
+local-header boundary and non-truncating disk-revisit fixes, verified against
+bundled 7-Zip.
 
 - License: `src/third_party/minizip-ng/LICENSE` (zlib)
 

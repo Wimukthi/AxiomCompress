@@ -59,7 +59,6 @@ $libSources = @(
     "src\third_party\miniz\miniz.c",
     "src\third_party\miniz\miniz_tdef.c",
     "src\third_party\miniz\miniz_tinfl.c",
-    "src\third_party\miniz\miniz_zip.c",
     "src\third_party\minizip-ng\mz_crypt.c",
     "src\third_party\minizip-ng\mz_os.c",
     "src\third_party\minizip-ng\mz_os_win32.c",

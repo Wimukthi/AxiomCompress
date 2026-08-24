@@ -230,8 +230,8 @@ LRESULT CALLBACK about_dialog_proc(HWND hwnd, UINT message, WPARAM wparam, LPARA
                 0, 0, 0, 0, hwnd, nullptr, state->instance, nullptr);
             state->third_party = CreateWindowExW(
                 0, L"EDIT",
-                L"miniz - ZIP and AXAR Deflate support - MIT license\r\n"
-                L"minizip-ng - standard split-ZIP support - zlib license\r\n"
+                L"miniz - ZIP and AXAR Deflate codec - MIT license\r\n"
+                L"minizip-ng - unified ZIP container support - zlib license\r\n"
                 L"Zstandard - AXAR codec - BSD license\r\n"
                 L"LZMA SDK - AXAR LZMA2 codec - public domain\r\n"
                 L"7-Zip - read-only archive backend - LGPL/BSD/unRAR restriction\r\n"

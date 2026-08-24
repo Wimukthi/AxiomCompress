@@ -178,10 +178,6 @@
       <CompileAs>CompileAsC</CompileAs>
       <WarningLevel>TurnOffAllWarnings</WarningLevel>
     </ClCompile>
-    <ClCompile Include="src\third_party\miniz\miniz_zip.c">
-      <CompileAs>CompileAsC</CompileAs>
-      <WarningLevel>TurnOffAllWarnings</WarningLevel>
-    </ClCompile>
     <ClCompile Include="src\third_party\zstd\lib\common\*.c">
       <CompileAs>CompileAsC</CompileAs>
       <WarningLevel>TurnOffAllWarnings</WarningLevel>

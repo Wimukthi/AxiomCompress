@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "generated": "2026-08-02",
+  "generated": "2026-08-24",
   "artifact_hash_mode": "canonical-text-lf",
   "dependencies": {
     "blake3": {
@@ -69,10 +69,12 @@
       "commit": "7b2387161c542fa9f427352dcdef76097d0d692b",
       "path": "src/third_party/minizip-ng",
       "artifacts": {
-        "mz.h": "4A6EDA89F5DC0533DC93B9C4F98278DC052C5F1E27C39DFEAF59672549F1C1A8"
+        "mz.h": "4A6EDA89F5DC0533DC93B9C4F98278DC052C5F1E27C39DFEAF59672549F1C1A8",
+        "mz_strm_split.c": "7F395184E22C5B58D927E65F35369A137C936DCDA9B08B1B71EF3C04ED4E5B1F"
       },
       "local_patches": [
-        "Prevent a local file header from straddling split ZIP disks."
+        "Prevent a local file header from straddling split ZIP disks.",
+        "Reopen previously written split disks without truncation and account header overwrites by file position."
       ]
     },
     "monocypher": {

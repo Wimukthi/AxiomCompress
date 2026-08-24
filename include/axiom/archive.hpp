@@ -277,6 +277,21 @@ struct ArchiveInput {
     std::string destination_path;
 };
 
+// Physical layout requested for a newly created archive. A zero volume size
+// means one ordinary file. Providers that support native volumes can consume a
+// non-zero size while writing instead of materializing and repartitioning a
+// complete temporary archive.
+struct ArchiveOutputLayout {
+    std::uint64_t volume_size = 0;
+};
+
+struct ArchiveCreateRequest {
+    std::vector<std::filesystem::path> inputs;
+    std::filesystem::path archive_path;
+    CompressionOptions options;
+    ArchiveOutputLayout output;
+};
+
 struct ArchiveMove {
     std::string source_path;
     std::string destination_path;
@@ -325,6 +340,13 @@ public:
     virtual void create(const std::vector<std::filesystem::path>& inputs,
                         const std::filesystem::path& archive_path,
                         const CompressionOptions& options = {}) const = 0;
+    virtual void create(const ArchiveCreateRequest& request) const {
+        if (request.output.volume_size != 0) {
+            throw std::runtime_error(
+                "archive format does not support direct multi-volume creation");
+        }
+        create(request.inputs, request.archive_path, request.options);
+    }
     virtual void add(const std::vector<std::filesystem::path>& inputs,
                      const std::filesystem::path& archive_path,
                      const CompressionOptions& options = {}) const = 0;

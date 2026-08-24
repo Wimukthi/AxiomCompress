@@ -32,13 +32,12 @@ endif()
 set(MONOCYPHER_SOURCES
     src/third_party/monocypher/monocypher.c)
 
-# Vendored miniz for ZIP container view/extract/test support. Small C library;
-# warnings off like the other third-party sources.
+# Vendored miniz supplies the raw Deflate codec used by ZIP and AXAR. ZIP
+# container parsing and emission are owned solely by minizip-ng.
 set(MINIZ_SOURCES
     src/third_party/miniz/miniz.c
     src/third_party/miniz/miniz_tdef.c
-    src/third_party/miniz/miniz_tinfl.c
-    src/third_party/miniz/miniz_zip.c)
+    src/third_party/miniz/miniz_tinfl.c)
 
 # Bundled AXC codec backends. Zstandard 1.5.7 is built from its official C
 # sources with assembly disabled for portable Release/CI builds. The public
@@ -57,9 +56,8 @@ set(LZMA_SDK_SOURCES
     src/third_party/lzma-sdk/Lzma2Enc.c
     src/third_party/lzma-sdk/Lzma2Dec.c)
 
-# minizip-ng's raw container/split-stream core. Axiom uses this narrow backend
-# to preserve completed ZIP entries while producing or joining standard split
-# sets; normal ZIP Deflate remains on the established miniz provider path.
+# minizip-ng is the single ZIP container backend for ordinary archives, split
+# sets, and bounded SFX payloads. Axiom owns policy, Deflate, and crypto streams.
 set(MINIZIP_NG_SOURCES
     src/third_party/minizip-ng/mz_crypt.c
     src/third_party/minizip-ng/mz_os.c
@@ -353,10 +351,21 @@ endif()
 
 enable_testing()
 
-add_executable(axiom_roundtrip tests/roundtrip_test.cpp)
+# miniz's container module is test-only: it creates and inspects independent
+# interoperability fixtures, but is not linked into any Axiom product target.
+add_executable(axiom_roundtrip
+    tests/roundtrip_test.cpp
+    src/third_party/miniz/miniz_zip.c)
 target_link_libraries(axiom_roundtrip PRIVATE axiom)
 target_include_directories(axiom_roundtrip PRIVATE src)
 axiom_set_warning_level(axiom_roundtrip)
+if(MSVC)
+    set_source_files_properties(src/third_party/miniz/miniz_zip.c
+        PROPERTIES COMPILE_OPTIONS /w)
+else()
+    set_source_files_properties(src/third_party/miniz/miniz_zip.c
+        PROPERTIES COMPILE_OPTIONS -w)
+endif()
 
 # Register every case in the suite as its own CTest test. A failing check aborts
 # the process by design -- checks run inside library callbacks that sit behind

@@ -195,10 +195,6 @@
       <CompileAs>CompileAsC</CompileAs>
       <WarningLevel>TurnOffAllWarnings</WarningLevel>
     </ClCompile>
-    <ClCompile Include="src\third_party\miniz\miniz_zip.c">
-      <CompileAs>CompileAsC</CompileAs>
-      <WarningLevel>TurnOffAllWarnings</WarningLevel>
-    </ClCompile>
     <ClCompile Include="src\third_party\zstd\lib\common\*.c">
       <CompileAs>CompileAsC</CompileAs>
       <WarningLevel>TurnOffAllWarnings</WarningLevel>
@@ -220,16 +216,16 @@
       <PreprocessorDefinitions>Z7_ST;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
     <ClCompile Include="src\archive\zip_split_backend.cpp" />
-    <ClCompile Include="src\third_party\minizip-ng\mz_crypt.c"><PreprocessorDefinitions>MZ_ZIP_NO_CRYPTO;_CRT_SECURE_NO_DEPRECATE;_CRT_NONSTDC_NO_DEPRECATE;%(PreprocessorDefinitions)</PreprocessorDefinitions><DisableSpecificWarnings>4100;4244;4267;4706;%(DisableSpecificWarnings)</DisableSpecificWarnings></ClCompile>
-    <ClCompile Include="src\third_party\minizip-ng\mz_os.c"><PreprocessorDefinitions>MZ_ZIP_NO_CRYPTO;_CRT_SECURE_NO_DEPRECATE;_CRT_NONSTDC_NO_DEPRECATE;%(PreprocessorDefinitions)</PreprocessorDefinitions></ClCompile>
-    <ClCompile Include="src\third_party\minizip-ng\mz_os_win32.c"><PreprocessorDefinitions>MZ_ZIP_NO_CRYPTO;_CRT_SECURE_NO_DEPRECATE;_CRT_NONSTDC_NO_DEPRECATE;%(PreprocessorDefinitions)</PreprocessorDefinitions></ClCompile>
-    <ClCompile Include="src\third_party\minizip-ng\mz_strm.c"><PreprocessorDefinitions>MZ_ZIP_NO_CRYPTO;_CRT_SECURE_NO_DEPRECATE;_CRT_NONSTDC_NO_DEPRECATE;%(PreprocessorDefinitions)</PreprocessorDefinitions></ClCompile>
-    <ClCompile Include="src\third_party\minizip-ng\mz_strm_buf.c"><PreprocessorDefinitions>MZ_ZIP_NO_CRYPTO;_CRT_SECURE_NO_DEPRECATE;_CRT_NONSTDC_NO_DEPRECATE;%(PreprocessorDefinitions)</PreprocessorDefinitions></ClCompile>
-    <ClCompile Include="src\third_party\minizip-ng\mz_strm_mem.c"><PreprocessorDefinitions>MZ_ZIP_NO_CRYPTO;_CRT_SECURE_NO_DEPRECATE;_CRT_NONSTDC_NO_DEPRECATE;%(PreprocessorDefinitions)</PreprocessorDefinitions></ClCompile>
-    <ClCompile Include="src\third_party\minizip-ng\mz_strm_os_win32.c"><PreprocessorDefinitions>MZ_ZIP_NO_CRYPTO;_CRT_SECURE_NO_DEPRECATE;_CRT_NONSTDC_NO_DEPRECATE;%(PreprocessorDefinitions)</PreprocessorDefinitions></ClCompile>
-    <ClCompile Include="src\third_party\minizip-ng\mz_strm_split.c"><PreprocessorDefinitions>MZ_ZIP_NO_CRYPTO;_CRT_SECURE_NO_DEPRECATE;_CRT_NONSTDC_NO_DEPRECATE;%(PreprocessorDefinitions)</PreprocessorDefinitions></ClCompile>
-    <ClCompile Include="src\third_party\minizip-ng\mz_zip.c"><PreprocessorDefinitions>MZ_ZIP_NO_CRYPTO;_CRT_SECURE_NO_DEPRECATE;_CRT_NONSTDC_NO_DEPRECATE;%(PreprocessorDefinitions)</PreprocessorDefinitions></ClCompile>
-    <ClCompile Include="src\third_party\minizip-ng\mz_zip_rw.c"><PreprocessorDefinitions>MZ_ZIP_NO_CRYPTO;_CRT_SECURE_NO_DEPRECATE;_CRT_NONSTDC_NO_DEPRECATE;%(PreprocessorDefinitions)</PreprocessorDefinitions></ClCompile>
+    <ClCompile Include="src\third_party\minizip-ng\mz_crypt.c"><WarningLevel>TurnOffAllWarnings</WarningLevel><PreprocessorDefinitions>MZ_ZIP_NO_CRYPTO;_CRT_SECURE_NO_DEPRECATE;_CRT_NONSTDC_NO_DEPRECATE;%(PreprocessorDefinitions)</PreprocessorDefinitions></ClCompile>
+    <ClCompile Include="src\third_party\minizip-ng\mz_os.c"><WarningLevel>TurnOffAllWarnings</WarningLevel><PreprocessorDefinitions>MZ_ZIP_NO_CRYPTO;_CRT_SECURE_NO_DEPRECATE;_CRT_NONSTDC_NO_DEPRECATE;%(PreprocessorDefinitions)</PreprocessorDefinitions></ClCompile>
+    <ClCompile Include="src\third_party\minizip-ng\mz_os_win32.c"><WarningLevel>TurnOffAllWarnings</WarningLevel><PreprocessorDefinitions>MZ_ZIP_NO_CRYPTO;_CRT_SECURE_NO_DEPRECATE;_CRT_NONSTDC_NO_DEPRECATE;%(PreprocessorDefinitions)</PreprocessorDefinitions></ClCompile>
+    <ClCompile Include="src\third_party\minizip-ng\mz_strm.c"><WarningLevel>TurnOffAllWarnings</WarningLevel><PreprocessorDefinitions>MZ_ZIP_NO_CRYPTO;_CRT_SECURE_NO_DEPRECATE;_CRT_NONSTDC_NO_DEPRECATE;%(PreprocessorDefinitions)</PreprocessorDefinitions></ClCompile>
+    <ClCompile Include="src\third_party\minizip-ng\mz_strm_buf.c"><WarningLevel>TurnOffAllWarnings</WarningLevel><PreprocessorDefinitions>MZ_ZIP_NO_CRYPTO;_CRT_SECURE_NO_DEPRECATE;_CRT_NONSTDC_NO_DEPRECATE;%(PreprocessorDefinitions)</PreprocessorDefinitions></ClCompile>
+    <ClCompile Include="src\third_party\minizip-ng\mz_strm_mem.c"><WarningLevel>TurnOffAllWarnings</WarningLevel><PreprocessorDefinitions>MZ_ZIP_NO_CRYPTO;_CRT_SECURE_NO_DEPRECATE;_CRT_NONSTDC_NO_DEPRECATE;%(PreprocessorDefinitions)</PreprocessorDefinitions></ClCompile>
+    <ClCompile Include="src\third_party\minizip-ng\mz_strm_os_win32.c"><WarningLevel>TurnOffAllWarnings</WarningLevel><PreprocessorDefinitions>MZ_ZIP_NO_CRYPTO;_CRT_SECURE_NO_DEPRECATE;_CRT_NONSTDC_NO_DEPRECATE;%(PreprocessorDefinitions)</PreprocessorDefinitions></ClCompile>
+    <ClCompile Include="src\third_party\minizip-ng\mz_strm_split.c"><WarningLevel>TurnOffAllWarnings</WarningLevel><PreprocessorDefinitions>MZ_ZIP_NO_CRYPTO;_CRT_SECURE_NO_DEPRECATE;_CRT_NONSTDC_NO_DEPRECATE;%(PreprocessorDefinitions)</PreprocessorDefinitions></ClCompile>
+    <ClCompile Include="src\third_party\minizip-ng\mz_zip.c"><WarningLevel>TurnOffAllWarnings</WarningLevel><PreprocessorDefinitions>MZ_ZIP_NO_CRYPTO;_CRT_SECURE_NO_DEPRECATE;_CRT_NONSTDC_NO_DEPRECATE;%(PreprocessorDefinitions)</PreprocessorDefinitions></ClCompile>
+    <ClCompile Include="src\third_party\minizip-ng\mz_zip_rw.c"><WarningLevel>TurnOffAllWarnings</WarningLevel><PreprocessorDefinitions>MZ_ZIP_NO_CRYPTO;_CRT_SECURE_NO_DEPRECATE;_CRT_NONSTDC_NO_DEPRECATE;%(PreprocessorDefinitions)</PreprocessorDefinitions></ClCompile>
     <ClCompile Include="src\third_party\monocypher\monocypher.c">
       <CompileAs>CompileAsC</CompileAs>
       <WarningLevel>TurnOffAllWarnings</WarningLevel>
