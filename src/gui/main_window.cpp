@@ -89,46 +89,17 @@ bool MainWindow::create(HINSTANCE instance,
     }
     axiom::gui::apply_axiom_window_icons(hwnd_, instance);
 
-    bool restored_window_placement = false;
+    int initial_show_command = show_command;
     if (application_options_.restore_window_placement &&
         persisted_settings_.has_placement) {
-        if (persisted_settings_.placement.showCmd == SW_SHOWMINIMIZED) {
-            persisted_settings_.placement.showCmd = SW_SHOWNORMAL;
-        }
-        if (axiom::gui::window_placement_is_visible(
-                persisted_settings_.placement)) {
-            SetWindowPlacement(hwnd_, &persisted_settings_.placement);
-            restored_window_placement = true;
-        } else {
-            const RECT& saved = persisted_settings_.placement.rcNormalPosition;
-            const long long saved_width =
-                static_cast<long long>(saved.right) - saved.left;
-            const long long saved_height =
-                static_cast<long long>(saved.bottom) - saved.top;
-            if (saved_width >= 64 && saved_height >= 64 &&
-                saved_width <= INT_MAX && saved_height <= INT_MAX) {
-                RECT work{};
-                SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
-                const int work_width =
-                    (std::max)(64L, work.right - work.left);
-                const int work_height =
-                    (std::max)(64L, work.bottom - work.top);
-                const int width = std::clamp(
-                    static_cast<int>(saved_width), 64, work_width);
-                const int height = std::clamp(
-                    static_cast<int>(saved_height), 64, work_height);
-                const POINT position = axiom::gui::centered_window_position(
-                    nullptr, width, height);
-                SetWindowPos(hwnd_, nullptr, position.x, position.y, width, height,
-                             SWP_NOZORDER | SWP_NOACTIVATE);
-                restored_window_placement = true;
-            }
-        }
+        initial_show_command = axiom::gui::restore_persisted_window_placement(
+            hwnd_, nullptr, persisted_settings_.placement,
+            persisted_settings_.placement_dpi,
+            axiom::gui::window_placement_is_visible(
+                persisted_settings_.placement));
     }
 
-    ShowWindow(hwnd_, restored_window_placement
-                          ? persisted_settings_.placement.showCmd
-                          : show_command);
+    ShowWindow(hwnd_, initial_show_command);
     UpdateWindow(hwnd_);
     on_initial_navigate();
     return true;
@@ -179,6 +150,48 @@ LRESULT CALLBACK MainWindow::toolbar_button_subclass_proc(
     return DefSubclassProc(window, message, wparam, lparam);
 }
 
+LRESULT CALLBACK MainWindow::filter_popup_subclass_proc(
+    HWND window, UINT message, WPARAM wparam, LPARAM lparam,
+    UINT_PTR subclass_id, DWORD_PTR ref_data) {
+    auto* self = reinterpret_cast<MainWindow*>(ref_data);
+    if (self == nullptr) return DefSubclassProc(window, message, wparam, lparam);
+
+    switch (message) {
+        case WM_ERASEBKGND:
+            return 1;
+        case WM_PAINT:
+            self->paint_filter_popup();
+            return 0;
+        case WM_CTLCOLOREDIT:
+            return self->paint_control_background(
+                reinterpret_cast<HWND>(lparam), reinterpret_cast<HDC>(wparam), message);
+        case WM_CTLCOLORSTATIC: {
+            HDC dc = reinterpret_cast<HDC>(wparam);
+            SetTextColor(dc, self->theme_.muted_text);
+            SetBkMode(dc, TRANSPARENT);
+            return reinterpret_cast<LRESULT>(self->panel_brush_);
+        }
+        case WM_DRAWITEM:
+            if (lparam != 0) {
+                self->draw_owner_button(*reinterpret_cast<DRAWITEMSTRUCT*>(lparam));
+                return TRUE;
+            }
+            break;
+        case WM_COMMAND:
+            return SendMessageW(self->hwnd_, message, wparam, lparam);
+        case WM_ACTIVATE:
+            if (LOWORD(wparam) == WA_INACTIVE && self->browser_filter_.empty()) {
+                ShowWindow(window, SW_HIDE);
+            }
+            break;
+        case WM_NCDESTROY:
+            RemoveWindowSubclass(window, &MainWindow::filter_popup_subclass_proc,
+                                 subclass_id);
+            break;
+    }
+    return DefSubclassProc(window, message, wparam, lparam);
+}
+
 void MainWindow::apply_edit_margins() const {
     const LPARAM margins = MAKELPARAM(scale(2), scale(2));
     if (address_edit_ != nullptr) {
@@ -190,6 +203,10 @@ void MainWindow::apply_edit_margins() const {
         SendMessageW(address_edit_, CB_SETITEMHEIGHT, 0, scale(24));
         SendMessageW(address_edit_, CB_SETITEMHEIGHT,
                      static_cast<WPARAM>(-1), scale(24));
+    }
+    if (filter_edit_ != nullptr) {
+        SendMessageW(filter_edit_, EM_SETMARGINS,
+                     EC_LEFTMARGIN | EC_RIGHTMARGIN, margins);
     }
 }
 
@@ -215,6 +232,7 @@ UINT MainWindow::toolbar_command_for_action(std::wstring_view action) {
     if (action == L"commands.delete") return kDelete;
     if (action == L"commands.select_all") return kSelectAll;
     if (action == L"tools.info") return kInfo;
+    if (action == L"tools.snapshots") return kSnapshots;
     if (action == L"tools.find") return kFind;
     if (action == L"tools.benchmark") return kBenchmark;
     if (action == L"tools.edit_comment") return kEditArchiveComment;
@@ -233,6 +251,16 @@ UINT MainWindow::toolbar_command_for_action(std::wstring_view action) {
     if (action == L"clipboard.copy_path") return kCopyPath;
     if (action == L"clipboard.copy_crc32") return kCopyCrc32;
     return 0;
+}
+
+const axiom::gui::ToolbarCommandInfo* MainWindow::toolbar_info_for_command(
+    UINT command) {
+    const auto found = std::find_if(
+        kToolbarCommandCatalog.begin(), kToolbarCommandCatalog.end(),
+        [command](const axiom::gui::ToolbarCommandInfo& info) {
+            return toolbar_command_for_action(info.id) == command;
+        });
+    return found == kToolbarCommandCatalog.end() ? nullptr : &*found;
 }
 
 int MainWindow::toolbar_button_width(UINT command) {
@@ -254,6 +282,7 @@ int MainWindow::toolbar_button_width(UINT command) {
         case kDelete: return 70;
         case kSelectAll: return 96;
         case kInfo: return 60;
+        case kSnapshots: return 98;
         case kFind: return 66;
         case kBenchmark: return 104;
         case kEditArchiveComment: return 94;
@@ -324,7 +353,13 @@ void MainWindow::create_toolbar_buttons() {
     toolbar_buttons_.clear();
     for (const axiom::gui::ToolbarCommandInfo& command : kToolbarCommandCatalog) {
         const UINT id = toolbar_command_for_action(command.id);
-        if (id == 0) continue;
+        // A malformed catalog entry must never turn into a clickable blank
+        // rectangle. Keep it out of the toolbar and report it in debug output.
+        if (id == 0 || command.icon == axiom::gui::ToolbarIcon::none ||
+            command.button_text == nullptr || command.button_text[0] == L'\0') {
+            OutputDebugStringW(L"Axiom: invalid toolbar command catalog entry\n");
+            continue;
+        }
         HWND button = make_control(
             L"BUTTON", command.button_text, WS_TABSTOP | BS_OWNERDRAW, static_cast<int>(id));
         toolbar_buttons_.push_back({id, button});
@@ -414,8 +449,39 @@ void MainWindow::on_create() {
     SendMessageW(address_edit_, CB_LIMITTEXT, 32767, 0);
     set_text(address_edit_, L"This PC");
     address_go_ = make_control(L"BUTTON", L"Go", WS_TABSTOP | BS_OWNERDRAW, kAddressGo);
+    filter_popup_ = CreateWindowExW(
+        WS_EX_TOOLWINDOW, L"STATIC", L"Filter current list",
+        WS_POPUP | WS_CLIPCHILDREN,
+        0, 0, 0, 0, hwnd_, nullptr, instance_, nullptr);
+    if (filter_popup_ != nullptr) {
+        SetWindowSubclass(filter_popup_, &MainWindow::filter_popup_subclass_proc,
+                          1, reinterpret_cast<DWORD_PTR>(this));
+        filter_edit_ = CreateWindowExW(
+            0, L"EDIT", L"",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
+            0, 0, 0, 0, filter_popup_,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kFilterEdit)),
+            instance_, nullptr);
+    }
+    SendMessageW(filter_edit_, EM_SETCUEBANNER, TRUE,
+                 reinterpret_cast<LPARAM>(
+                     L"Filter: name, *.cpp, type:archive, size:>10MB"));
+    if (filter_popup_ != nullptr) {
+        filter_clear_ = CreateWindowExW(
+            0, L"BUTTON", L"×",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+            0, 0, 0, 0, filter_popup_,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kFilterClear)),
+            instance_, nullptr);
+        filter_summary_ = CreateWindowExW(
+            0, L"STATIC", L"Type to filter the current list",
+            WS_CHILD | WS_VISIBLE | SS_LEFT | SS_NOPREFIX,
+            0, 0, 0, 0, filter_popup_,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kFilterSummary)),
+            instance_, nullptr);
+    }
     for (HWND button : {navigate_back_, navigate_forward_, navigate_up_,
-                        navigate_refresh_, address_go_}) {
+                        navigate_refresh_, address_go_, filter_clear_}) {
         track_toolbar_button(button);
     }
 
@@ -441,6 +507,9 @@ void MainWindow::on_create() {
     add_tooltip(address_edit_,
                 L"Folder/archive path text or a named shell location such as This PC. Press Enter or Go to navigate.");
     add_tooltip(address_go_, L"Navigate to the folder, archive, or shell location in the path field.");
+    add_tooltip(filter_edit_,
+                L"Filter this folder or archive instantly. Supports wildcards, quoted text, -exclude, and name:, type:, ext:, path:, size:, date: fields.");
+    add_tooltip(filter_clear_, L"Clear and close the instant filter (Escape).");
 
     table_.create(hwnd_, instance_, kList);
     list_ = table_.hwnd();
@@ -692,8 +761,48 @@ void MainWindow::layout() {
         }
     }
     layout_browser_panes(client, y, false);
+    position_filter_popup();
     tooltip_.update_layout();
     InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
+void MainWindow::position_filter_popup() const {
+    if (filter_popup_ == nullptr || list_ == nullptr) return;
+
+    RECT list_rect{};
+    GetWindowRect(list_, &list_rect);
+    const int inset = scale(10);
+    const int list_width = static_cast<int>(list_rect.right - list_rect.left);
+    const int available_width = (std::max)(scale(240), list_width - inset * 2);
+    const int width = (std::min)(scale(480), available_width);
+    const int height = scale(66);
+    int left = list_rect.right - width - inset;
+    int top = list_rect.top + scale(36);
+
+    HMONITOR monitor = MonitorFromRect(&list_rect, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO info{sizeof(info)};
+    if (GetMonitorInfoW(monitor, &info)) {
+        const int work_left = static_cast<int>(info.rcWork.left);
+        const int work_top = static_cast<int>(info.rcWork.top);
+        const int work_right = static_cast<int>(info.rcWork.right);
+        const int work_bottom = static_cast<int>(info.rcWork.bottom);
+        left = std::clamp(left, work_left,
+                          (std::max)(work_left, work_right - width));
+        top = std::clamp(top, work_top,
+                         (std::max)(work_top, work_bottom - height));
+    }
+    SetWindowPos(filter_popup_, HWND_TOP, left, top, width, height,
+                 SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+
+    const int padding = scale(6);
+    const int close_width = scale(34);
+    const int edit_height = scale(30);
+    MoveWindow(filter_edit_, padding, padding,
+               width - padding * 3 - close_width, edit_height, TRUE);
+    MoveWindow(filter_clear_, width - padding - close_width, padding,
+               close_width, edit_height, TRUE);
+    MoveWindow(filter_summary_, padding, padding + edit_height + scale(4),
+               width - padding * 2, scale(18), TRUE);
 }
 
 void MainWindow::set_status(const std::wstring& text) {
@@ -1016,15 +1125,24 @@ LRESULT MainWindow::handle_message(UINT message, WPARAM wparam, LPARAM lparam) {
                 case kView: on_view(); return 0;
                 case kDelete: on_delete_selected(); return 0;
                 case kInfo: on_info(); return 0;
+                case kCreateSnapshotRepository: on_create_snapshot_repository(); return 0;
+                case kAddSnapshot: on_add_snapshot(); return 0;
+                case kSnapshots: on_snapshots(); return 0;
                 case kFind: on_find_files(); return 0;
                 case kCopyPath: on_copy_paths(); return 0;
                 case kCopyCrc32: on_copy_crc32(); return 0;
+                case kCopyItems: on_copy_items(); return 0;
+                case kPasteItems: on_paste_items(); return 0;
+                case kRenameItem: on_rename_item(); return 0;
+                case kNewFolder: on_new_folder(); return 0;
                 case kCompressStream: on_compress_stream(); return 0;
                 case kDecompressStream: on_decompress_stream(); return 0;
                 case kAddFavorite: add_favorite_location(current_location_value()); return 0;
                 case kRemoveFavorite: remove_favorite_location(current_location_value()); return 0;
                 case kToggleTreePane: toggle_tree_pane(); return 0;
                 case kFocusAddress: focus_address_bar(); return 0;
+                case kFocusFilter: focus_filter(); return 0;
+                case kFilterClear: clear_filter(); return 0;
                 case kUpdateArchive:
                     on_update_archive(axiom::gui::ArchiveUpdateMode::update_newer);
                     return 0;
@@ -1062,6 +1180,12 @@ LRESULT MainWindow::handle_message(UINT message, WPARAM wparam, LPARAM lparam) {
                     }
                     if (HIWORD(wparam) == CBN_SELENDOK) {
                         select_address_entry();
+                        return 0;
+                    }
+                    break;
+                case kFilterEdit:
+                    if (HIWORD(wparam) == EN_CHANGE) {
+                        on_filter_changed();
                         return 0;
                     }
                     break;

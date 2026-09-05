@@ -29,10 +29,17 @@ the lowest.
 ## What you get
 
 **A Windows app that behaves like a file manager.** Browse folders and
-archives in the same window, drag files in and out, and run every archive
-command from the toolbar or menus. It is written directly against Win32 — no
-Qt, .NET, WinUI, or embedded browser — with dark mode and per-monitor DPI
-support.
+archives in the same window, filter the current list instantly, use normal
+copy/paste/rename/new-folder commands, batch-extract selected archives, drag
+files in and out, and review Update, Freshen, and Synchronize in a safe visual
+change plan before anything is written. Archive Information combines metadata,
+capabilities, compression totals, physical storage accounting, and the largest
+files in one view; snapshot repositories have a separate one-click timeline.
+Create a repository and append named snapshots directly from the Archive menu;
+unchanged chunks are retained only once across the timeline.
+Run every archive command from the toolbar or menus. It is written directly
+against Win32 — no Qt, .NET, WinUI, or embedded browser — with dark mode and
+per-monitor DPI support.
 
 **A command-line tool** that drives the identical engine, for scripts and
 scheduled backups.

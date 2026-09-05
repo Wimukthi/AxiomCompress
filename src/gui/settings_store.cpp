@@ -438,11 +438,38 @@ PersistedGuiSettings load_gui_settings() {
     settings.application.memory_limit = read_string(key, L"MemoryLimit");
     settings.application.compression_profiles = read_compression_profiles(key);
     if (registry_value_exists(key, L"ToolbarCommands")) {
+        auto stored_toolbar_commands = read_string_list(key, L"ToolbarCommands");
+        // Preserve the existing toolbar slot when the combined analyzer is
+        // replaced by the direct snapshot timeline command.
+        for (std::wstring& command : stored_toolbar_commands) {
+            if (command == L"tools.analyze") command = L"tools.snapshots";
+        }
         settings.application.toolbar_commands =
-            normalize_toolbar_commands(read_string_list(key, L"ToolbarCommands"));
+            normalize_toolbar_commands(stored_toolbar_commands);
+        // Version-zero customized toolbars predate this slot entirely. Add it
+        // once, but continue respecting users who removed it in later builds.
+        if (read_dword(key, L"ToolbarCatalogVersion", 0) < 1 &&
+            std::find(settings.application.toolbar_commands.begin(),
+                      settings.application.toolbar_commands.end(),
+                      L"tools.snapshots") == settings.application.toolbar_commands.end()) {
+            const auto info = std::find(settings.application.toolbar_commands.begin(),
+                                        settings.application.toolbar_commands.end(),
+                                        L"tools.info");
+            settings.application.toolbar_commands.insert(
+                info == settings.application.toolbar_commands.end()
+                    ? settings.application.toolbar_commands.end() : info + 1,
+                L"tools.snapshots");
+        }
+    }
+    auto stored_shortcuts = read_string_list(key, L"ShortcutOverrides");
+    for (std::wstring& shortcut : stored_shortcuts) {
+        constexpr std::wstring_view old_prefix = L"tools.analyze=";
+        if (shortcut.starts_with(old_prefix)) {
+            shortcut.replace(0, old_prefix.size(), L"tools.snapshots=");
+        }
     }
     settings.application.shortcut_overrides =
-        shortcut_overrides_from_strings(read_string_list(key, L"ShortcutOverrides"));
+        shortcut_overrides_from_strings(stored_shortcuts);
     settings.sort_column = static_cast<int>(std::clamp<DWORD>(
         read_dword(key, L"SortColumn", 0), 0,
         static_cast<DWORD>(kFileListColumnCatalog.size() - 1)));
@@ -469,6 +496,9 @@ PersistedGuiSettings load_gui_settings() {
                          &placement_size) == ERROR_SUCCESS &&
         type == REG_BINARY && placement_size == sizeof(settings.placement)) {
         settings.placement.length = sizeof(WINDOWPLACEMENT);
+        const DWORD stored_dpi = read_dword(key, L"WindowDpi", 0);
+        settings.placement_dpi = stored_dpi >= 48 && stored_dpi <= 768
+            ? stored_dpi : 0;
         settings.has_placement = true;
     }
     RegCloseKey(key);
@@ -630,6 +660,7 @@ void save_gui_settings(const PersistedGuiSettings& settings) {
     write_compression_profiles(key, settings.application.compression_profiles);
     write_string_list(key, L"ToolbarCommands",
                       normalize_toolbar_commands(settings.application.toolbar_commands));
+    write_dword(key, L"ToolbarCatalogVersion", 2);
     write_string_list(key, L"ShortcutOverrides",
                       shortcut_overrides_to_strings(settings.application.shortcut_overrides));
     write_dword(key, L"SortColumn", static_cast<DWORD>(settings.sort_column));
@@ -652,6 +683,9 @@ void save_gui_settings(const PersistedGuiSettings& settings) {
         RegSetValueExW(key, L"WindowPlacement", 0, REG_BINARY,
                        reinterpret_cast<const BYTE*>(&settings.placement),
                        sizeof(settings.placement));
+        write_dword(key, L"WindowDpi",
+                    settings.placement_dpi >= 48 && settings.placement_dpi <= 768
+                        ? settings.placement_dpi : USER_DEFAULT_SCREEN_DPI);
     }
     RegCloseKey(key);
 }

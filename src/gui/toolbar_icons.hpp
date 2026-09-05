@@ -12,6 +12,7 @@ enum class ToolbarIcon {
     view,
     delete_item,
     info,
+    snapshots,
     settings,
     open,
     back,
@@ -45,6 +46,7 @@ enum class ToolbarIcon {
     unfavorite,
     copy_path,
     copy_crc,
+    export_file,
 };
 
 enum class ToolbarIconStyle {
@@ -52,8 +54,9 @@ enum class ToolbarIconStyle {
     colorful,
 };
 
-// Draws a theme-tinted Fluent icon centered in bounds. Rasterized bitmaps are
-// cached by icon, DPI, and color so owner-draw hover/focus repaints stay cheap.
+// Draws a theme-tinted Fluent or supersampled procedural icon centered in
+// bounds. Rasterized bitmaps are cached by icon, DPI, and color so owner-draw
+// hover/focus repaints stay cheap.
 void draw_toolbar_icon(HDC dc,
                        ToolbarIcon icon,
                        const RECT& bounds,

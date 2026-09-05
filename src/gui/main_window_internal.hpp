@@ -17,6 +17,7 @@
 #include "gui/dialog_support.hpp"
 #include "gui/directory_watcher.hpp"
 #include "gui/drag_drop.hpp"
+#include "gui/file_manager_model.hpp"
 #include "gui/message_dialog.hpp"
 #include "gui/operation_runner.hpp"
 #include "gui/operation_progress_window.hpp"
@@ -107,6 +108,9 @@ enum ControlId : int {
     kDelete = 1029,
     kInfo = 1030,
     kSettings = 1031,
+    kFilterEdit = 1032,
+    kFilterClear = 1033,
+    kFilterSummary = 1034,
     kMenuFile = 1100,
     kMenuEdit = 1101,
     kMenuArchive = 1102,
@@ -154,6 +158,14 @@ enum ControlId : int {
     kCompressStream = 1155,
     kDecompressStream = 1156,
     kClearTempFiles = 1157,
+    kFocusFilter = 1158,
+    kCopyItems = 1159,
+    kPasteItems = 1160,
+    kRenameItem = 1161,
+    kNewFolder = 1162,
+    kSnapshots = 1163,
+    kCreateSnapshotRepository = 1164,
+    kAddSnapshot = 1165,
 };
 
 struct BackgroundUiTaskResult {
@@ -1030,6 +1042,8 @@ private:
     void apply_edit_margins() const;
     void add_tooltip(HWND control, const wchar_t* text);
     static UINT toolbar_command_for_action(std::wstring_view action);
+    static const axiom::gui::ToolbarCommandInfo* toolbar_info_for_command(
+        UINT command);
     static int toolbar_button_width(UINT command);
     static LRESULT CALLBACK toolbar_button_subclass_proc(
         HWND window, UINT message, WPARAM wparam, LPARAM lparam,
@@ -1056,6 +1070,17 @@ private:
                                                const axiom::gui::KeyboardShortcut& shortcut,
                                                HWND target) const;
     void focus_address_bar();
+    void focus_filter();
+    void show_filter_popup(bool select_all = false);
+    void position_filter_popup() const;
+    void update_filter_popup_summary();
+    void focus_first_filtered_item();
+    void on_filter_changed();
+    void clear_filter();
+    void paint_filter_popup() const;
+    static LRESULT CALLBACK filter_popup_subclass_proc(
+        HWND window, UINT message, WPARAM wparam, LPARAM lparam,
+        UINT_PTR subclass_id, DWORD_PTR ref_data);
     void show_browser_context_menu(POINT point);
     void show_tree_context_menu(POINT point);
     void paint_shell();
@@ -1144,12 +1169,17 @@ private:
     void remember_current_history_view_state();
     std::optional<BrowserViewState> saved_history_view_state() const;
     std::vector<fs::path> selected_filesystem_paths() const;
+    std::vector<fs::path> selected_filesystem_archives() const;
     std::vector<std::string> selected_archive_paths() const;
     bool copy_text_to_clipboard(const std::wstring& text) const;
     static std::wstring newline_join(const std::vector<std::wstring>& lines);
     std::wstring display_path_for_item(const axiom::gui::BrowserItem& item) const;
     void on_copy_paths();
     void on_copy_crc32();
+    void on_copy_items();
+    void on_paste_items();
+    void on_rename_item();
+    void on_new_folder();
     static std::string archive_name(std::string_view path);
     static std::string join_archive_directory(std::string_view directory,
                                               std::string_view name);
@@ -1178,7 +1208,8 @@ private:
     DWORD perform_file_drop(IDataObject* object, POINT point, DWORD, DWORD allowed);
     StagedArchiveEntries extract_archive_entries_to_staging(
         const fs::path& archive, const std::vector<std::string>& entries,
-        const std::string& password, bool for_drag, bool sensitive);
+        const std::string& password, bool for_drag, bool sensitive,
+        bool for_clipboard = false);
     void on_table_begin_drag();
     std::optional<fs::path> active_archive_path() const;
     axiom::gui::ArchiveCapabilities active_archive_capabilities() const;
@@ -1189,6 +1220,7 @@ private:
         const axiom::gui::ArchiveCapabilities& capabilities);
     void navigate_to(axiom::gui::BrowserLocation location, bool record_history = true);
     void sort_browser_items_for_table();
+    void rebuild_filtered_browser_items();
     std::vector<std::wstring> browser_row_for_item(
         const axiom::gui::BrowserItem& item) const;
     bool append_browser_table_batch();
@@ -1216,7 +1248,13 @@ private:
         std::optional<fs::path> target_archive = std::nullopt,
         axiom::gui::ArchiveUpdateMode update_mode =
             axiom::gui::ArchiveUpdateMode::create_new,
-        std::vector<axiom::ArchiveInput> mapped_inputs = {});
+        std::vector<axiom::ArchiveInput> mapped_inputs = {},
+        std::string snapshot_name = {});
+    void queue_archive_update_preview(
+        std::optional<axiom::gui::ArchiveUpdatePlan> approved_plan = std::nullopt);
+    void present_archive_update_preview(
+        axiom::gui::ArchiveUpdatePlan plan);
+    bool prompt_snapshot_name(std::wstring_view title, std::wstring& name);
     void on_add_to_archive();
     void on_update_archive(axiom::gui::ArchiveUpdateMode mode);
     bool active_archive_is_editable();
@@ -1227,6 +1265,9 @@ private:
     void on_lock_archive();
     void on_delete_selected();
     void on_info();
+    void on_create_snapshot_repository();
+    void on_add_snapshot();
+    void on_snapshots();
     void on_repair_archive();
     void on_edit_recovery_record();
     void on_split_archive();
@@ -1272,6 +1313,11 @@ private:
     void on_create_sfx();
     void on_verify_archive_signature();
     void on_extract();
+    void on_extract_multiple(std::vector<fs::path> archives);
+    void on_extract_multiple_ready(
+        std::vector<fs::path> archives,
+        std::vector<const axiom::ArchiveProvider*> providers,
+        std::vector<axiom::gui::ArchiveCapabilities> capabilities);
     void on_test();
     void on_operation_done(LPARAM lparam);
     LRESULT handle_message(UINT message, WPARAM wparam, LPARAM lparam);
@@ -1303,6 +1349,14 @@ private:
     HWND address_edit_ = nullptr;
 
     HWND address_go_ = nullptr;
+
+    HWND filter_popup_ = nullptr;
+
+    HWND filter_edit_ = nullptr;
+
+    HWND filter_clear_ = nullptr;
+
+    HWND filter_summary_ = nullptr;
 
     HWND view_ = nullptr;
 
@@ -1442,6 +1496,12 @@ private:
 
     std::vector<axiom::gui::BrowserItem> browser_items_;
 
+    // The table vector is a filtered projection. Keeping the complete snapshot
+    // separate avoids filesystem/archive reloads while the user types.
+    std::vector<axiom::gui::BrowserItem> browser_all_items_;
+
+    std::wstring browser_filter_;
+
     BrowserStatusTotals browser_status_totals_;
 
     std::unordered_map<std::wstring, ShellIconRef> shell_icon_cache_;
@@ -1509,6 +1569,8 @@ private:
     axiom::ArchiveFormat pending_archive_format_ = axiom::ArchiveFormat::axar;
 
     axiom::gui::ArchiveFeatureOptions pending_archive_features_;
+
+    std::string pending_snapshot_name_;
 
     fs::path archive_dialog_metadata_path_;
 

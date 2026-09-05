@@ -34,6 +34,7 @@ const std::uint8_t* mask_for_icon(ToolbarIcon icon) {
         case ToolbarIcon::resume: return kResumeMask.data();
         case ToolbarIcon::cancel: return kCancelMask.data();
         case ToolbarIcon::update_archive:
+        case ToolbarIcon::snapshots:
         case ToolbarIcon::freshen_archive:
         case ToolbarIcon::synchronize_archive:
         case ToolbarIcon::repack:
@@ -57,6 +58,7 @@ const std::uint8_t* mask_for_icon(ToolbarIcon icon) {
         case ToolbarIcon::unfavorite:
         case ToolbarIcon::copy_path:
         case ToolbarIcon::copy_crc:
+        case ToolbarIcon::export_file:
         case ToolbarIcon::none: return nullptr;
     }
     return nullptr;
@@ -65,6 +67,7 @@ const std::uint8_t* mask_for_icon(ToolbarIcon icon) {
 bool generated_icon(ToolbarIcon icon) {
     switch (icon) {
         case ToolbarIcon::update_archive:
+        case ToolbarIcon::snapshots:
         case ToolbarIcon::freshen_archive:
         case ToolbarIcon::synchronize_archive:
         case ToolbarIcon::repack:
@@ -88,6 +91,7 @@ bool generated_icon(ToolbarIcon icon) {
         case ToolbarIcon::unfavorite:
         case ToolbarIcon::copy_path:
         case ToolbarIcon::copy_crc:
+        case ToolbarIcon::export_file:
             return true;
         default:
             return false;
@@ -104,6 +108,7 @@ COLORREF color_for_icon(ToolbarIcon icon, COLORREF fallback, ToolbarIconStyle st
         case ToolbarIcon::view: return RGB(124, 185, 255);
         case ToolbarIcon::delete_item: return RGB(255, 99, 99);
         case ToolbarIcon::info: return RGB(92, 170, 255);
+        case ToolbarIcon::snapshots: return RGB(72, 214, 198);
         case ToolbarIcon::settings: return RGB(180, 143, 255);
         case ToolbarIcon::back:
         case ToolbarIcon::forward:
@@ -137,6 +142,7 @@ COLORREF color_for_icon(ToolbarIcon icon, COLORREF fallback, ToolbarIconStyle st
         case ToolbarIcon::unfavorite: return RGB(255, 142, 142);
         case ToolbarIcon::copy_path: return RGB(124, 185, 255);
         case ToolbarIcon::copy_crc: return RGB(180, 143, 255);
+        case ToolbarIcon::export_file: return RGB(96, 205, 112);
         case ToolbarIcon::none: return fallback;
     }
     return fallback;
@@ -161,6 +167,8 @@ std::uint8_t sample_mask(const std::uint8_t* mask, double source_x, double sourc
     const double bottom = at(x0, y1) * (1.0 - fx) + at(x1, y1) * fx;
     return static_cast<std::uint8_t>(std::lround(top * (1.0 - fy) + bottom * fy));
 }
+
+std::vector<std::uint8_t> rasterize_generated_mask(ToolbarIcon icon, int size);
 
 struct CachedBitmap {
     ToolbarIcon icon{ToolbarIcon::none};
@@ -191,7 +199,16 @@ public:
 private:
     static HBITMAP create(ToolbarIcon icon, COLORREF color, int size) {
         const std::uint8_t* mask = mask_for_icon(icon);
-        if (mask == nullptr || size <= 0) return nullptr;
+        if (size <= 0) return nullptr;
+        std::vector<std::uint8_t> generated_mask;
+        if (mask == nullptr) {
+            if (!generated_icon(icon)) return nullptr;
+            generated_mask = rasterize_generated_mask(icon, size);
+            if (generated_mask.size() !=
+                static_cast<std::size_t>(size) * static_cast<std::size_t>(size)) {
+                return nullptr;
+            }
+        }
 
         BITMAPINFO info{};
         info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
@@ -215,9 +232,18 @@ private:
         const std::uint8_t blue = GetBValue(color);
         for (int y = 0; y < size; ++y) {
             for (int x = 0; x < size; ++x) {
-                const double source_x = (static_cast<double>(x) + 0.5) * kSourceSize / size - 0.5;
-                const double source_y = (static_cast<double>(y) + 0.5) * kSourceSize / size - 0.5;
-                const std::uint8_t alpha = sample_mask(mask, source_x, source_y);
+                std::uint8_t alpha = 0;
+                if (mask != nullptr) {
+                    const double source_x =
+                        (static_cast<double>(x) + 0.5) * kSourceSize / size - 0.5;
+                    const double source_y =
+                        (static_cast<double>(y) + 0.5) * kSourceSize / size - 0.5;
+                    alpha = sample_mask(mask, source_x, source_y);
+                } else {
+                    alpha = generated_mask[static_cast<std::size_t>(y) *
+                                               static_cast<std::size_t>(size) +
+                                           static_cast<std::size_t>(x)];
+                }
                 const std::uint8_t premultiplied_red = static_cast<std::uint8_t>(red * alpha / 255);
                 const std::uint8_t premultiplied_green = static_cast<std::uint8_t>(green * alpha / 255);
                 const std::uint8_t premultiplied_blue = static_cast<std::uint8_t>(blue * alpha / 255);
@@ -241,13 +267,16 @@ IconBitmapCache& icon_cache() {
 
 class GeneratedIconPainter {
 public:
-    GeneratedIconPainter(HDC dc, const RECT& bounds, COLORREF color, UINT dpi,
-                         int logical_size)
-        : dc_(dc) {
-        size_ = scale_for_dpi(logical_size, dpi);
-        left_ = bounds.left + (bounds.right - bounds.left - size_) / 2;
-        top_ = bounds.top + (bounds.bottom - bounds.top - size_) / 2;
-        pen_ = CreatePen(PS_SOLID, std::max(1, scale_for_dpi(2, dpi)), color);
+    GeneratedIconPainter(HDC dc, int canvas_size)
+        : dc_(dc), size_(canvas_size) {
+        LOGBRUSH brush{BS_SOLID, RGB(255, 255, 255), 0};
+        const DWORD style = PS_GEOMETRIC | PS_SOLID |
+                            PS_ENDCAP_ROUND | PS_JOIN_ROUND;
+        const int stroke = std::max(1, MulDiv(canvas_size, 2, 18));
+        pen_ = ExtCreatePen(style, static_cast<DWORD>(stroke), &brush, 0, nullptr);
+        if (pen_ == nullptr) {
+            pen_ = CreatePen(PS_SOLID, stroke, RGB(255, 255, 255));
+        }
         old_pen_ = SelectObject(dc_, pen_);
         old_brush_ = SelectObject(dc_, GetStockObject(HOLLOW_BRUSH));
         SetBkMode(dc_, TRANSPARENT);
@@ -259,8 +288,8 @@ public:
         if (pen_ != nullptr) DeleteObject(pen_);
     }
 
-    int x(int value) const { return left_ + MulDiv(value, size_, kSourceSize); }
-    int y(int value) const { return top_ + MulDiv(value, size_, kSourceSize); }
+    int x(int value) const { return MulDiv(value, size_, kSourceSize); }
+    int y(int value) const { return MulDiv(value, size_, kSourceSize); }
     RECT r(int left, int top, int right, int bottom) const {
         return {x(left), y(top), x(right), y(bottom)};
     }
@@ -278,6 +307,11 @@ public:
         const RECT bounds = r(left, top, right, bottom);
         Ellipse(dc_, bounds.left, bounds.top, bounds.right, bounds.bottom);
     }
+    void arc(int left, int top, int right, int bottom,
+             int start_x, int start_y, int end_x, int end_y) const {
+        Arc(dc_, x(left), y(top), x(right), y(bottom),
+            x(start_x), y(start_y), x(end_x), y(end_y));
+    }
     void polyline(std::initializer_list<POINT> points) const {
         std::vector<POINT> copy(points.begin(), points.end());
         if (!copy.empty()) Polyline(dc_, copy.data(), static_cast<int>(copy.size()));
@@ -285,18 +319,22 @@ public:
 
 private:
     HDC dc_{};
-    int left_{};
-    int top_{};
     int size_{};
     HPEN pen_{};
     HGDIOBJ old_pen_{};
     HGDIOBJ old_brush_{};
 };
 
-void draw_generated_toolbar_icon(HDC dc, ToolbarIcon icon, const RECT& bounds,
-                                 COLORREF color, UINT dpi, int logical_size) {
-    GeneratedIconPainter icon_dc(dc, bounds, color, dpi, logical_size);
+void draw_generated_icon_shape(HDC dc, ToolbarIcon icon, int canvas_size) {
+    GeneratedIconPainter icon_dc(dc, canvas_size);
     switch (icon) {
+        case ToolbarIcon::snapshots:
+            icon_dc.ellipse(6, 5, 20, 19);
+            icon_dc.line(13, 8, 13, 13);
+            icon_dc.line(13, 13, 17, 15);
+            icon_dc.polyline({icon_dc.p(8, 4), icon_dc.p(4, 8), icon_dc.p(8, 12)});
+            icon_dc.line(4, 8, 10, 8);
+            break;
         case ToolbarIcon::update_archive:
             icon_dc.rect(4, 5, 20, 19);
             icon_dc.line(4, 8, 20, 8);
@@ -312,12 +350,10 @@ void draw_generated_toolbar_icon(HDC dc, ToolbarIcon icon, const RECT& bounds,
             icon_dc.line(16, 7, 20, 7);
             break;
         case ToolbarIcon::synchronize_archive:
-            Arc(dc, icon_dc.x(4), icon_dc.y(5), icon_dc.x(20), icon_dc.y(19),
-                icon_dc.x(18), icon_dc.y(7), icon_dc.x(7), icon_dc.y(7));
+            icon_dc.arc(4, 5, 20, 19, 18, 7, 7, 7);
             icon_dc.line(7, 7, 10, 5);
             icon_dc.line(7, 7, 10, 10);
-            Arc(dc, icon_dc.x(4), icon_dc.y(5), icon_dc.x(20), icon_dc.y(19),
-                icon_dc.x(6), icon_dc.y(17), icon_dc.x(17), icon_dc.y(17));
+            icon_dc.arc(4, 5, 20, 19, 6, 17, 17, 17);
             icon_dc.line(17, 17, 14, 14);
             icon_dc.line(17, 17, 14, 20);
             break;
@@ -459,9 +495,87 @@ void draw_generated_toolbar_icon(HDC dc, ToolbarIcon icon, const RECT& bounds,
             icon_dc.line(8, 13, 16, 13);
             icon_dc.line(8, 17, 13, 17);
             break;
+        case ToolbarIcon::export_file:
+            icon_dc.rect(5, 4, 19, 20);
+            icon_dc.line(8, 8, 16, 8);
+            icon_dc.line(12, 10, 12, 17);
+            icon_dc.line(9, 14, 12, 17);
+            icon_dc.line(15, 14, 12, 17);
+            break;
         default:
             break;
     }
+}
+
+std::vector<std::uint8_t> rasterize_generated_mask(ToolbarIcon icon, int size) {
+    if (size <= 0) return {};
+
+    // The generated command glyphs used to be drawn directly at 16-18 pixels,
+    // which left diagonal lines and curves visibly stair-stepped. Render them
+    // at 4x with rounded geometric strokes, then box-filter the coverage into
+    // the same alpha-mask pipeline used by the pinned Fluent icons.
+    constexpr int supersample = 4;
+    const int canvas_size = size * supersample;
+    BITMAPINFO info{};
+    info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    info.bmiHeader.biWidth = canvas_size;
+    info.bmiHeader.biHeight = -canvas_size;
+    info.bmiHeader.biPlanes = 1;
+    info.bmiHeader.biBitCount = 32;
+    info.bmiHeader.biCompression = BI_RGB;
+
+    void* raw_pixels = nullptr;
+    HBITMAP bitmap = CreateDIBSection(
+        nullptr, &info, DIB_RGB_COLORS, &raw_pixels, nullptr, 0);
+    if (bitmap == nullptr || raw_pixels == nullptr) {
+        if (bitmap != nullptr) DeleteObject(bitmap);
+        return {};
+    }
+    const std::size_t canvas_pixels =
+        static_cast<std::size_t>(canvas_size) *
+        static_cast<std::size_t>(canvas_size);
+    auto* pixels = static_cast<std::uint32_t*>(raw_pixels);
+    std::fill(pixels, pixels + canvas_pixels, 0u);
+
+    HDC memory_dc = CreateCompatibleDC(nullptr);
+    if (memory_dc == nullptr) {
+        DeleteObject(bitmap);
+        return {};
+    }
+    HGDIOBJ old_bitmap = SelectObject(memory_dc, bitmap);
+    draw_generated_icon_shape(memory_dc, icon, canvas_size);
+    GdiFlush();
+
+    std::vector<std::uint8_t> result(
+        static_cast<std::size_t>(size) * static_cast<std::size_t>(size));
+    constexpr std::uint32_t sample_count = supersample * supersample;
+    for (int y = 0; y < size; ++y) {
+        for (int x = 0; x < size; ++x) {
+            std::uint32_t coverage = 0;
+            for (int sample_y = 0; sample_y < supersample; ++sample_y) {
+                const int source_y = y * supersample + sample_y;
+                for (int sample_x = 0; sample_x < supersample; ++sample_x) {
+                    const int source_x = x * supersample + sample_x;
+                    const std::uint32_t pixel =
+                        pixels[static_cast<std::size_t>(source_y) *
+                                   static_cast<std::size_t>(canvas_size) +
+                               static_cast<std::size_t>(source_x)];
+                    coverage += std::max({pixel & 0xffu,
+                                         (pixel >> 8) & 0xffu,
+                                         (pixel >> 16) & 0xffu});
+                }
+            }
+            result[static_cast<std::size_t>(y) * static_cast<std::size_t>(size) +
+                   static_cast<std::size_t>(x)] =
+                static_cast<std::uint8_t>((coverage + sample_count / 2) /
+                                          sample_count);
+        }
+    }
+
+    SelectObject(memory_dc, old_bitmap);
+    DeleteDC(memory_dc);
+    DeleteObject(bitmap);
+    return result;
 }
 
 } // namespace
@@ -488,10 +602,6 @@ void draw_toolbar_icon(HDC dc,
                         GetGValue(color) * 72 / 100,
                         GetBValue(color) * 72 / 100);
         }
-    }
-    if (dc != nullptr && generated_icon(icon)) {
-        draw_generated_toolbar_icon(dc, icon, bounds, color, dpi, logical_size);
-        return;
     }
     HBITMAP bitmap = icon_cache().get(icon, color, size);
     if (dc == nullptr || bitmap == nullptr) return;

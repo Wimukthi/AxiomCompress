@@ -12,6 +12,7 @@
 #include "codec/transform.hpp"
 #include "core/checksum.hpp"
 #include "core/benchmark_corpus.hpp"
+#include "core/benchmark_statistics.hpp"
 #include "core/archive.hpp"
 #include "core/cpu.hpp"
 #include "core/hash.hpp"
@@ -22,6 +23,8 @@
 #include "entropy/huffman.hpp"
 #include "entropy/range.hpp"
 #include "gui/archive_feature_options.hpp"
+#include "gui/archive_update_plan.hpp"
+#include "gui/file_manager_model.hpp"
 // miniz declares its full static helper set in the header, so every
 // translation unit that includes it leaves most of them unused. The
 // vendored file is dependency-locked and cannot carry the suppression.
@@ -2008,6 +2011,40 @@ void test_zip_provider_layer() {
     fs::remove_all(root, ec);
 }
 
+void test_benchmark_statistics() {
+    using axiom::core::BenchmarkSample;
+    const std::array<BenchmarkSample, 5> stable{{
+        {1000, 1.00, 2.00},
+        {1000, 1.01, 2.02},
+        {1000, 0.99, 1.98},
+        {1000, 1.00, 2.00},
+        {1000, 4.00, 2.00},  // One interrupted/noisy pass must not own the result.
+    }};
+    const auto summary = axiom::core::summarize_benchmark_samples(stable);
+    AXIOM_CHECK(summary.sample_count == stable.size());
+    AXIOM_CHECK(std::abs(summary.median_bytes_per_second - 1000.0) < 0.001);
+    AXIOM_CHECK(std::abs(summary.median_active_cores - 2.0) < 0.001);
+    AXIOM_CHECK(summary.robust_spread_percent < 2.0);
+    AXIOM_CHECK(axiom::core::benchmark_samples_stable(stable));
+
+    const std::array<BenchmarkSample, 4> too_few{{
+        {1000, 1.0, 1.0}, {1000, 1.0, 1.0},
+        {1000, 1.0, 1.0}, {1000, 1.0, 1.0},
+    }};
+    AXIOM_CHECK(!axiom::core::benchmark_samples_stable(too_few));
+    const std::array<BenchmarkSample, 5> variable{{
+        {1000, 0.5, 1.0}, {1000, 0.7, 1.0}, {1000, 1.0, 1.0},
+        {1000, 1.3, 1.0}, {1000, 1.5, 1.0},
+    }};
+    AXIOM_CHECK(!axiom::core::benchmark_samples_stable(variable));
+
+    AXIOM_CHECK(axiom::core::calibrated_benchmark_iterations(0.25, 2.0, 64) == 8);
+    AXIOM_CHECK(axiom::core::calibrated_benchmark_iterations(3.0, 2.0, 64) == 1);
+    AXIOM_CHECK(axiom::core::calibrated_benchmark_iterations(0.001, 2.0, 64) == 64);
+    AXIOM_CHECK(axiom::core::calibrated_benchmark_iterations(0.0, 2.0, 64) == 1);
+    AXIOM_CHECK(axiom::core::calibrated_benchmark_iterations(1.0, 2.0, 0) == 0);
+}
+
 void test_zip_direct_split_creation() {
     const auto root = make_temp_dir();
     const auto source = root / "direct-source.bin";
@@ -3748,6 +3785,18 @@ void test_archive_snapshots() {
     options.snapshot_min_chunk_size = 4u << 10;
     options.snapshot_average_chunk_size = 8u << 10;
     options.snapshot_max_chunk_size = 16u << 10;
+    const auto ordinary_archive = root / "ordinary.axar";
+    axiom::create_archive({source}, ordinary_archive, options);
+    const auto ordinary_storage = axiom::analyze_archive_storage(ordinary_archive);
+    AXIOM_CHECK(ordinary_storage.physical_layout_exact);
+    AXIOM_CHECK(ordinary_storage.packed_sizes_complete);
+    AXIOM_CHECK(!ordinary_storage.snapshot_repository);
+    AXIOM_CHECK(!ordinary_storage.deduplicated);
+    AXIOM_CHECK(ordinary_storage.logical_bytes == base_a.size() + base_b.size());
+    AXIOM_CHECK(ordinary_storage.stored_payload_bytes +
+                    ordinary_storage.unreferenced_payload_bytes +
+                    ordinary_storage.metadata_and_service_bytes ==
+                ordinary_storage.physical_bytes);
     const auto archive = root / "snapshots.axar";
     axiom::create_snapshot_archive({source}, archive, "base", options);
     AXIOM_CHECK(axiom::archive_is_snapshot_repository(archive));
@@ -3758,6 +3807,25 @@ void test_archive_snapshots() {
     AXIOM_CHECK(first.front().name == "base");
     AXIOM_CHECK(first.front().current);
     AXIOM_CHECK(first.front().file_bytes == base_a.size() + base_b.size());
+    const auto initial_storage = axiom::analyze_archive_storage(archive);
+    AXIOM_CHECK(initial_storage.snapshot_repository);
+    AXIOM_CHECK(initial_storage.deduplicated);
+    AXIOM_CHECK(initial_storage.snapshots.size() == 1);
+    AXIOM_CHECK(initial_storage.logical_bytes == base_a.size() + base_b.size());
+    AXIOM_CHECK(initial_storage.referenced_logical_bytes == initial_storage.logical_bytes);
+    AXIOM_CHECK(initial_storage.unique_content_bytes > 0);
+    AXIOM_CHECK(initial_storage.stored_payload_bytes > 0);
+    AXIOM_CHECK(initial_storage.history_only_content_bytes == 0);
+    AXIOM_CHECK(initial_storage.snapshots.front().added_entries == 3);
+    AXIOM_CHECK(initial_storage.snapshots.front().modified_entries == 0);
+    AXIOM_CHECK(initial_storage.snapshots.front().removed_entries == 0);
+    AXIOM_CHECK(initial_storage.stored_payload_bytes +
+                    initial_storage.unreferenced_payload_bytes +
+                    initial_storage.metadata_and_service_bytes ==
+                initial_storage.physical_bytes);
+    AXIOM_CHECK(initial_storage.files.size() == 2);
+    AXIOM_CHECK(initial_storage.files.front().logical_bytes >=
+                initial_storage.files.back().logical_bytes);
     const auto live_entries = axiom::list_archive(archive);
     const auto live_file = std::find_if(
         live_entries.begin(), live_entries.end(),
@@ -3792,6 +3860,17 @@ void test_archive_snapshots() {
             return change.path == "source/a.bin" &&
                    change.kind == axiom::ArchiveSnapshotChangeKind::modified;
         }));
+    const auto changed_storage = axiom::analyze_archive_storage(archive);
+    AXIOM_CHECK(changed_storage.snapshots.size() == 2);
+    AXIOM_CHECK(changed_storage.referenced_logical_bytes ==
+                changed_storage.snapshots[0].snapshot.file_bytes +
+                    changed_storage.snapshots[1].snapshot.file_bytes);
+    AXIOM_CHECK(changed_storage.deduplication_saved_bytes > 0);
+    AXIOM_CHECK(changed_storage.history_only_content_bytes > 0);
+    AXIOM_CHECK(changed_storage.history_only_stored_bytes > 0);
+    AXIOM_CHECK(changed_storage.snapshots[1].modified_entries >= 1);
+    AXIOM_CHECK(changed_storage.snapshots[1].new_content_bytes <
+                changed_storage.snapshots[1].unique_content_bytes);
 
     std::error_code metadata_stamp_error;
     const auto metadata_stamp = fs::last_write_time(
@@ -3809,6 +3888,11 @@ void test_archive_snapshots() {
             return change.path == "source/b.bin" &&
                    change.kind == axiom::ArchiveSnapshotChangeKind::modified;
         }));
+    const auto metadata_storage = axiom::analyze_archive_storage(archive);
+    AXIOM_CHECK(metadata_storage.snapshots.size() == 3);
+    AXIOM_CHECK(metadata_storage.snapshots.back().modified_entries >= 1);
+    AXIOM_CHECK(metadata_storage.snapshots.back().new_content_bytes == 0);
+    AXIOM_CHECK(metadata_storage.snapshots.back().new_stored_bytes == 0);
 
     const auto changed_restore = root / "changed-restore";
     axiom::restore_archive_snapshot(archive, "changed", changed_restore, restore_options);
@@ -3822,6 +3906,11 @@ void test_archive_snapshots() {
     AXIOM_CHECK(axiom::list_archive_snapshots(archive).size() == 2);
     axiom::repack_archive(archive, options);
     axiom::test_archive(archive);
+    const auto repacked_storage = axiom::analyze_archive_storage(archive);
+    AXIOM_CHECK(repacked_storage.unreferenced_payload_bytes == 0);
+    AXIOM_CHECK(repacked_storage.stored_payload_bytes +
+                    repacked_storage.metadata_and_service_bytes ==
+                repacked_storage.physical_bytes);
     const auto post_repack_restore = root / "post-repack";
     axiom::restore_archive_snapshot(archive, "changed", post_repack_restore,
                                      restore_options);
@@ -3837,6 +3926,11 @@ void test_archive_snapshots() {
         .password = encrypted.password});
     AXIOM_CHECK(axiom::list_archive_snapshots(encrypted_archive, encrypted.password).size() == 1);
     expect_throws([&] { (void)axiom::list_archive_snapshots(encrypted_archive, "wrong"); });
+    AXIOM_CHECK(axiom::analyze_archive_storage(
+                    encrypted_archive, encrypted.password).snapshots.size() == 1);
+    expect_throws([&] {
+        (void)axiom::analyze_archive_storage(encrypted_archive, "wrong");
+    });
     axiom::repack_archive(encrypted_archive, encrypted);
     axiom::test_archive(encrypted_archive, axiom::DecompressionOptions{
         .password = encrypted.password});
@@ -6278,6 +6372,156 @@ void test_stream_checksum_validation() {
     AXIOM_CHECK(failed);
 }
 
+void test_file_manager_model() {
+    axiom::gui::BrowserItem item;
+    item.kind = axiom::gui::BrowserItemKind::file;
+    item.name = L"Quarterly Report.cpp";
+    item.type = L"C++ Source File";
+    item.filesystem_path = L"C:\\Work\\Quarterly Report.cpp";
+    item.size = 12ull << 20;
+    item.modified = L"2026-08-29 14:15";
+
+    AXIOM_CHECK(axiom::gui::browser_item_matches_filter(item, L"quarterly"));
+    AXIOM_CHECK(axiom::gui::browser_item_matches_filter(item, L"\"quarterly report\""));
+    AXIOM_CHECK(axiom::gui::browser_item_matches_filter(item, L"*.cpp"));
+    AXIOM_CHECK(axiom::gui::browser_item_matches_filter(item, L"name:report"));
+    AXIOM_CHECK(axiom::gui::browser_item_matches_filter(item, L"type:file"));
+    AXIOM_CHECK(axiom::gui::browser_item_matches_filter(item, L"ext:cpp"));
+    AXIOM_CHECK(axiom::gui::browser_item_matches_filter(item, L"path:work"));
+    AXIOM_CHECK(axiom::gui::browser_item_matches_filter(item, L"C:\\Work"));
+    AXIOM_CHECK(axiom::gui::browser_item_matches_filter(item, L"size:>=10MB"));
+    AXIOM_CHECK(!axiom::gui::browser_item_matches_filter(item, L"size:<10MB"));
+    AXIOM_CHECK(axiom::gui::browser_item_matches_filter(item, L"date:>=2026-01-01"));
+    AXIOM_CHECK(!axiom::gui::browser_item_matches_filter(item, L"date:>2026-08-29"));
+    AXIOM_CHECK(axiom::gui::browser_item_matches_filter(
+        item, L"*.cpp size:>1MB -name:draft"));
+    AXIOM_CHECK(!axiom::gui::browser_item_matches_filter(item, L"-*.cpp"));
+    AXIOM_CHECK(!axiom::gui::browser_item_matches_filter(item, L"size:not-a-size"));
+
+    axiom::gui::BrowserItem unicode_archive_item;
+    unicode_archive_item.kind = axiom::gui::BrowserItemKind::file;
+    unicode_archive_item.name = L"report.txt";
+    unicode_archive_item.archive_path =
+        "\xE8\xB5\x84\xE6\x96\x99/report.txt";  // U+8D44 U+6599
+    AXIOM_CHECK(axiom::gui::browser_item_matches_filter(
+        unicode_archive_item, L"path:\u8d44\u6599"));
+
+    axiom::gui::BrowserItem parent;
+    parent.kind = axiom::gui::BrowserItemKind::parent;
+    AXIOM_CHECK(axiom::gui::browser_item_matches_filter(parent, L"no-match"));
+
+    AXIOM_CHECK(axiom::gui::file_manager_leaf_name_error(L"Results 2026").empty());
+    AXIOM_CHECK(!axiom::gui::file_manager_leaf_name_error(L"").empty());
+    AXIOM_CHECK(!axiom::gui::file_manager_leaf_name_error(L"CON.txt").empty());
+    AXIOM_CHECK(!axiom::gui::file_manager_leaf_name_error(L"bad/name").empty());
+    AXIOM_CHECK(!axiom::gui::file_manager_leaf_name_error(L"trailing.").empty());
+
+    AXIOM_CHECK(axiom::gui::extraction_folder_name(L"backup.tar.gz") == L"backup");
+    AXIOM_CHECK(axiom::gui::extraction_folder_name(L"photos.part003.axar") == L"photos");
+    AXIOM_CHECK(axiom::gui::extraction_folder_name(L"set.part01.rar") == L"set");
+    AXIOM_CHECK(axiom::gui::extraction_folder_name(L"backup.7z.001") == L"backup");
+    const auto destinations = axiom::gui::batch_extraction_destinations(
+        L"/Output", {L"/A/Report.zip", L"/B/report.7z",
+                      L"/B/Data.tar.xz"});
+    AXIOM_CHECK(destinations.size() == 3);
+    AXIOM_CHECK(destinations[0].filename() == L"Report");
+    AXIOM_CHECK(destinations[1].filename() == L"report (2)");
+    AXIOM_CHECK(destinations[2].filename() == L"Data");
+}
+
+void test_archive_update_plan_model() {
+    const auto root = make_temp_dir();
+    const auto source = root / "source";
+    fs::create_directories(source);
+    write_all(source / "newer.txt", bytes_from_string("newer source bytes"));
+    write_all(source / "same.txt", bytes_from_string("same"));
+    write_all(source / "new.txt", bytes_from_string("new entry"));
+
+    const auto source_mtime = [](const fs::path& path) {
+        std::error_code error;
+        const auto stamp = fs::last_write_time(path, error);
+        AXIOM_CHECK(!error);
+        return axiom::to_unix_seconds(stamp);
+    };
+    const auto newer_mtime = source_mtime(source / "newer.txt");
+    const auto same_mtime = source_mtime(source / "same.txt");
+    std::vector<axiom::ArchiveEntry> existing = {
+        {.path = "source", .is_directory = true},
+        {.path = "source/newer.txt", .size = 5, .mtime = newer_mtime - 10},
+        {.path = "source/same.txt", .size = 4, .mtime = same_mtime},
+        {.path = "source/archive-only.txt", .size = 12, .mtime = same_mtime},
+    };
+    const std::vector<axiom::ArchiveInput> mapped = {{source, "source"}};
+
+    const auto update = axiom::gui::build_archive_update_plan(
+        mapped, existing, axiom::gui::ArchiveUpdateMode::update_newer,
+        axiom::ArchiveFormat::axar, root / "test.axar");
+    AXIOM_CHECK(update.added == 1);
+    AXIOM_CHECK(update.replaced == 1);
+    AXIOM_CHECK(update.removed == 0);
+    AXIOM_CHECK(update.conflicts == 0);
+    AXIOM_CHECK(update.has_changes());
+
+    const auto action_for = [](const axiom::gui::ArchiveUpdatePlan& plan,
+                               std::string_view path) {
+        const auto found = std::find_if(
+            plan.items.begin(), plan.items.end(), [path](const auto& item) {
+                return item.archive_path == path;
+            });
+        AXIOM_CHECK(found != plan.items.end());
+        return found->action;
+    };
+    AXIOM_CHECK(action_for(update, "source/newer.txt") ==
+                axiom::gui::ArchiveUpdatePlanAction::replace);
+    AXIOM_CHECK(action_for(update, "source/same.txt") ==
+                axiom::gui::ArchiveUpdatePlanAction::unchanged);
+    AXIOM_CHECK(action_for(update, "source/new.txt") ==
+                axiom::gui::ArchiveUpdatePlanAction::add);
+
+    const auto freshen = axiom::gui::build_archive_update_plan(
+        mapped, existing, axiom::gui::ArchiveUpdateMode::fresh_existing,
+        axiom::ArchiveFormat::axar);
+    AXIOM_CHECK(freshen.added == 0);
+    AXIOM_CHECK(freshen.replaced == 1);
+    AXIOM_CHECK(freshen.ignored == 1);
+    AXIOM_CHECK(action_for(freshen, "source/new.txt") ==
+                axiom::gui::ArchiveUpdatePlanAction::ignored);
+
+    const auto sync = axiom::gui::build_archive_update_plan(
+        mapped, existing, axiom::gui::ArchiveUpdateMode::synchronize,
+        axiom::ArchiveFormat::axar);
+    AXIOM_CHECK(sync.added == 1);
+    AXIOM_CHECK(sync.replaced == 1);
+    AXIOM_CHECK(sync.removed == 1);
+    AXIOM_CHECK(sync.removed_bytes == 12);
+    AXIOM_CHECK(action_for(sync, "source/archive-only.txt") ==
+                axiom::gui::ArchiveUpdatePlanAction::remove);
+
+    const auto duplicate = axiom::gui::build_archive_update_plan(
+        {{source / "same.txt", "duplicate.txt"},
+         {source / "new.txt", "duplicate.txt"}},
+        {}, axiom::gui::ArchiveUpdateMode::update_newer,
+        axiom::ArchiveFormat::axar);
+    AXIOM_CHECK(duplicate.conflicts == 2);
+    AXIOM_CHECK(!duplicate.can_apply());
+
+    const auto type_conflict = axiom::gui::build_archive_update_plan(
+        mapped, {{.path = "source", .size = 1}},
+        axiom::gui::ArchiveUpdateMode::synchronize,
+        axiom::ArchiveFormat::axar);
+    AXIOM_CHECK(type_conflict.conflicts != 0);
+    AXIOM_CHECK(!type_conflict.can_apply());
+
+    write_all(source / "new.txt", bytes_from_string("changed after approval"));
+    const auto changed = axiom::gui::build_archive_update_plan(
+        mapped, existing, axiom::gui::ArchiveUpdateMode::update_newer,
+        axiom::ArchiveFormat::axar, root / "test.axar");
+    AXIOM_CHECK(!axiom::gui::equivalent_archive_update_plans(update, changed));
+
+    std::error_code error;
+    fs::remove_all(root, error);
+}
+
 // ---- registry --------------------------------------------------------------
 
 struct RegisteredTest {
@@ -6299,12 +6543,15 @@ constexpr RegisteredTest kTests[] = {
     {"codec_repetitive_corpus", test_codec_repetitive_corpus},
     {"codec_random_corpus", test_codec_random_corpus},
     {"stream_checksum_validation", test_stream_checksum_validation},
+    {"file_manager_model", test_file_manager_model},
+    {"archive_update_plan_model", test_archive_update_plan_model},
     {"compression_level_presets", test_compression_level_presets},
     {"swarm_extended_levels", test_swarm_extended_levels},
     {"reversible_transforms_and_v7", test_reversible_transforms_and_v7},
     {"filtered_axar_roundtrip", test_filtered_axar_roundtrip},
     {"crc32", test_crc32},
     {"benchmark_corpus_generator", test_benchmark_corpus_generator},
+    {"benchmark_statistics", test_benchmark_statistics},
     {"blake3", test_blake3},
     {"reed_solomon", test_reed_solomon},
     {"rans_edges", test_rans_edges},

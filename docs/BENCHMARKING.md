@@ -279,11 +279,18 @@ ratio gap is in [GAP_ANALYSIS_LZMA2.md](GAP_ANALYSIS_LZMA2.md).
 ## The in-app benchmark
 
 **Tools > Benchmark…** measures Axiom's own method at a selected level,
-entirely in memory. It is the right tool for a quick throughput check on a
-specific machine.
+entirely in memory. It warms up first, calibrates fixed-duration batches outside
+the recorded passes, verifies every restore, and reports pass medians with a
+robust spread. The Stable mode collects 5-10 passes; Pause-crossed samples are
+discarded rather than polluted by the paused interval.
 
-It is not a substitute for the harnesses above, which store raw data and support
-baseline builds. See
+The dialog stores a summary history at
+`%LOCALAPPDATA%\AxiomCompress\benchmark-history.csv`, automatically compares a
+generated corpus with the previous matching run, and exports retained raw
+passes plus protocol and system metadata as CSV. This is ideal for a quick
+same-machine regression check. It is still not a substitute for the harnesses
+above when comparing two binaries, sweeping profiles and external codecs, or
+publishing controlled results. See
 [GUI_GUIDE.md](GUI_GUIDE.md#measuring-speed-on-your-machine).
 
 ## Publishing a new snapshot

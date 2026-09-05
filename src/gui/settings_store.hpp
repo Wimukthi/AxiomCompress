@@ -12,6 +12,7 @@ namespace axiom::gui {
 struct PersistedGuiSettings {
     ApplicationDialogOptions application;
     WINDOWPLACEMENT placement{sizeof(WINDOWPLACEMENT)};
+    UINT placement_dpi = 0;
     bool has_placement = false;
     std::wstring last_location;
     std::wstring last_archive_output_folder;

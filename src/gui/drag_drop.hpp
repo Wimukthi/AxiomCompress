@@ -42,6 +42,10 @@ bool read_archive_entries(IDataObject* data_object, ArchiveDragPayload& payload)
 
 HRESULT do_file_drag(FileDragSource source, DWORD allowed_effects, DWORD& performed_effect);
 
+// Publishes a shell-compatible file list and renders it immediately so staged
+// archive entries remain pasteable after the IDataObject is released.
+HRESULT set_file_clipboard(FileDragSource source);
+
 class OleDropTarget final {
 public:
     using Query = std::function<DWORD(IDataObject*, POINT, DWORD, DWORD)>;

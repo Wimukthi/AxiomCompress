@@ -427,6 +427,9 @@ ToolbarIcon button_icon_for_label(HWND button) {
     if (contains_text(text, L"copy") || contains_text(text, L"info")) {
         return ToolbarIcon::info;
     }
+    if (contains_text(text, L"export") || contains_text(text, L"save")) {
+        return ToolbarIcon::export_file;
+    }
     if (contains_text(text, L"pause")) {
         return ToolbarIcon::pause;
     }
@@ -1100,7 +1103,11 @@ void apply_dialog_control_theme(HWND control, bool dark) {
         GetClassNameW(control, class_name,
                       static_cast<int>(sizeof(class_name) / sizeof(class_name[0])));
         const bool combo_box = lstrcmpiW(class_name, L"ComboBox") == 0;
-        if (combo_box) {
+        const bool progress_bar =
+            lstrcmpiW(class_name, PROGRESS_CLASSW) == 0;
+        if (progress_bar) {
+            wimukthi::win32_theme::apply_progress_bar(control);
+        } else if (combo_box) {
             if (dark) {
                 wimukthi::win32_theme::apply_theme_class(control, L"", nullptr);
                 SetWindowSubclass(control, dark_combo_subclass_proc,
@@ -1850,75 +1857,88 @@ POINT centered_window_position(HWND owner, int width, int height) {
     return POINT{x, y};
 }
 
+int restore_persisted_window_placement(
+    HWND window, HWND owner, const WINDOWPLACEMENT& placement, UINT saved_dpi,
+    bool restore_saved_position) {
+    if (window == nullptr) return SW_SHOW;
+    const long long saved_width =
+        static_cast<long long>(placement.rcNormalPosition.right) -
+        placement.rcNormalPosition.left;
+    const long long saved_height =
+        static_cast<long long>(placement.rcNormalPosition.bottom) -
+        placement.rcNormalPosition.top;
+    if (saved_width >= 64 && saved_height >= 64 &&
+        saved_width <= INT_MAX && saved_height <= INT_MAX) {
+        const int show_command = placement.showCmd == SW_SHOWMAXIMIZED
+            ? SW_SHOWMAXIMIZED : SW_SHOW;
+        const bool use_saved_position =
+            restore_saved_position && window_placement_is_visible(placement);
+
+        // Moving without resizing establishes the destination monitor DPI.
+        // Applying WINDOWPLACEMENT here would let USER32 scale the already
+        // physical saved rectangle and then WM_DPICHANGED scale it again.
+        if (use_saved_position) {
+            SetWindowPos(window, nullptr,
+                         placement.rcNormalPosition.left,
+                         placement.rcNormalPosition.top,
+                         0, 0,
+                         SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+        const UINT target_dpi = GetDpiForWindow(window);
+        long long width = saved_width;
+        long long height = saved_height;
+        if (saved_dpi >= 48 && saved_dpi <= 768 && target_dpi != 0 &&
+            target_dpi != saved_dpi) {
+            width = (width * target_dpi + saved_dpi / 2) / saved_dpi;
+            height = (height * target_dpi + saved_dpi / 2) / saved_dpi;
+        }
+
+        const RECT work = owner_or_primary_work_area(
+            use_saved_position ? window : owner);
+        const int work_width = (std::max)(64L, work.right - work.left);
+        const int work_height = (std::max)(64L, work.bottom - work.top);
+        const int restored_width = static_cast<int>(
+            std::clamp<long long>(width, 64, work_width));
+        const int restored_height = static_cast<int>(
+            std::clamp<long long>(height, 64, work_height));
+
+        int x = placement.rcNormalPosition.left;
+        int y = placement.rcNormalPosition.top;
+        if (!use_saved_position) {
+            const POINT position = centered_window_position(
+                owner, restored_width, restored_height);
+            x = position.x;
+            y = position.y;
+        } else {
+            x = std::clamp(x, static_cast<int>(work.left),
+                           (std::max)(static_cast<int>(work.left),
+                                      static_cast<int>(work.right) - restored_width));
+            y = std::clamp(y, static_cast<int>(work.top),
+                           (std::max)(static_cast<int>(work.top),
+                                      static_cast<int>(work.bottom) - restored_height));
+        }
+        SetWindowPos(window, nullptr, x, y, restored_width, restored_height,
+                     SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+        return show_command;
+    }
+
+    RECT rect{};
+    if (!GetWindowRect(window, &rect)) return SW_SHOW;
+    const POINT position = centered_window_position(owner, rect.right - rect.left,
+                                                    rect.bottom - rect.top);
+    SetWindowPos(window, nullptr, position.x, position.y, 0, 0,
+                 SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+    return SW_SHOW;
+}
+
 int restore_named_window_placement(HWND window, HWND owner, std::wstring_view name) {
     if (window == nullptr) return SW_SHOW;
     WINDOWPLACEMENT placement{sizeof(placement)};
     UINT saved_dpi = 0;
     if (read_window_placement(name, placement, saved_dpi)) {
-        const long long saved_width =
-            static_cast<long long>(placement.rcNormalPosition.right) -
-            placement.rcNormalPosition.left;
-        const long long saved_height =
-            static_cast<long long>(placement.rcNormalPosition.bottom) -
-            placement.rcNormalPosition.top;
-        if (saved_width >= 64 && saved_height >= 64 &&
-            saved_width <= INT_MAX && saved_height <= INT_MAX) {
-            const int show_command = placement.showCmd == SW_SHOWMAXIMIZED
-                ? SW_SHOWMAXIMIZED : SW_SHOW;
-            const bool restore_saved_position =
-                !g_dialog_appearance.center_child_windows &&
-                window_placement_is_visible(placement);
-
-            // WINDOWPLACEMENT stores physical pixels for a per-monitor-aware
-            // window. Move first so Windows establishes the destination monitor
-            // DPI, then convert the persisted normal size exactly once.
-            if (restore_saved_position) {
-                SetWindowPos(window, nullptr,
-                             placement.rcNormalPosition.left,
-                             placement.rcNormalPosition.top,
-                             0, 0,
-                             SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
-            }
-            const UINT target_dpi = GetDpiForWindow(window);
-            int width = static_cast<int>(saved_width);
-            int height = static_cast<int>(saved_height);
-            if (saved_dpi >= 48 && saved_dpi <= 768 && target_dpi != 0 &&
-                target_dpi != saved_dpi) {
-                width = MulDiv(width, static_cast<int>(target_dpi),
-                               static_cast<int>(saved_dpi));
-                height = MulDiv(height, static_cast<int>(target_dpi),
-                                static_cast<int>(saved_dpi));
-            }
-
-            const RECT work = owner_or_primary_work_area(
-                restore_saved_position ? window : owner);
-            const int work_width = (std::max)(64L, work.right - work.left);
-            const int work_height = (std::max)(64L, work.bottom - work.top);
-            width = std::clamp(width, 64, work_width);
-            height = std::clamp(height, 64, work_height);
-
-            int x = placement.rcNormalPosition.left;
-            int y = placement.rcNormalPosition.top;
-            if (!restore_saved_position) {
-                const POINT position = centered_window_position(owner, width, height);
-                x = position.x;
-                y = position.y;
-            } else {
-                x = std::clamp(x, static_cast<int>(work.left),
-                               (std::max)(static_cast<int>(work.left),
-                                          static_cast<int>(work.right) - width));
-                y = std::clamp(y, static_cast<int>(work.top),
-                               (std::max)(static_cast<int>(work.top),
-                                          static_cast<int>(work.bottom) - height));
-            }
-            // SetWindowPlacement also applies showCmd and can expose a hidden
-            // window before its dark non-client frame and first client frame
-            // are ready. Restore the normal geometry directly and let the
-            // caller show the fully initialized window once.
-            SetWindowPos(window, nullptr, x, y, width, height,
-                         SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
-            return show_command;
-        }
+        return restore_persisted_window_placement(
+            window, owner, placement, saved_dpi,
+            !g_dialog_appearance.center_child_windows);
     }
 
     RECT rect{};

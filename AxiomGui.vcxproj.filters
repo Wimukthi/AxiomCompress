@@ -42,6 +42,12 @@
     <ClCompile Include="src\gui\archive_dialogs.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="src\gui\archive_update_dialog.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\gui\archive_storage_dialog.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="src\gui\archive_feature_dialogs.cpp"><Filter>Source Files</Filter></ClCompile>
     <ClCompile Include="src\gui\directory_watcher.cpp">
       <Filter>Source Files</Filter>
@@ -51,6 +57,12 @@
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="src\gui\browser_model.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\gui\file_manager_model.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\gui\archive_update_plan.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="src\gui\benchmark_dialog.cpp">
@@ -73,6 +85,12 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="src\gui\browser_model.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\gui\file_manager_model.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\gui\archive_update_plan.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="src\gui\main_window_internal.hpp"><Filter>Header Files</Filter></ClInclude>

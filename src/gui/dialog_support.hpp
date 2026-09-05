@@ -135,6 +135,12 @@ void restore_dialog_owner(HWND owner, bool was_enabled);
 bool message_targets_window(HWND window, const MSG& message);
 bool window_placement_is_visible(const WINDOWPLACEMENT& placement);
 POINT centered_window_position(HWND owner, int width, int height);
+// Restores persisted normal geometry without SetWindowPlacement's implicit DPI
+// transition. The saved size is converted once from saved_dpi to the monitor
+// that will contain the window, preventing cumulative scaling across launches.
+int restore_persisted_window_placement(
+    HWND window, HWND owner, const WINDOWPLACEMENT& placement, UINT saved_dpi,
+    bool restore_saved_position);
 // Restores geometry without making the window visible. Center-child mode only
 // replaces the saved position; the user's size and maximized state still
 // persist. The returned SW_* command must be passed to ShowWindow after the

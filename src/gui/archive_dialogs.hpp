@@ -1,6 +1,7 @@
 #pragma once
 
 #include "axiom/archive.hpp"
+#include "gui/archive_update_plan.hpp"
 #include "gui/archive_feature_options.hpp"
 #include "sfx/sfx_config.hpp"
 #include "gui/keyboard_shortcuts.hpp"
@@ -13,11 +14,14 @@
 #include <cstddef>
 #include <filesystem>
 #include <functional>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
 
 namespace axiom::gui {
+
+struct ThemePalette;
 
 enum class FileListColumnId : int {
     name = 0,
@@ -122,13 +126,14 @@ struct ToolbarCommandInfo {
     bool default_visible;
 };
 
-inline constexpr std::array<ToolbarCommandInfo, 33> kToolbarCommandCatalog{{
+inline constexpr std::array<ToolbarCommandInfo, 34> kToolbarCommandCatalog{{
     {L"commands.add", L"Add to archive", L"Add", ToolbarIcon::archive, true},
     {L"commands.extract", L"Extract", L"Extract", ToolbarIcon::extract, true},
     {L"commands.test", L"Test archive", L"Test", ToolbarIcon::test, true},
     {L"commands.view", L"View/open selection", L"View", ToolbarIcon::view, true},
     {L"commands.delete", L"Delete selection", L"Delete", ToolbarIcon::delete_item, true},
     {L"tools.info", L"Information", L"Info", ToolbarIcon::info, true},
+    {L"tools.snapshots", L"Browse and extract retained snapshots", L"Snapshots", ToolbarIcon::snapshots, true},
     {L"file.open_archive", L"Open archive", L"Open archive", ToolbarIcon::open, true},
     {L"options.settings", L"Settings", L"Settings", ToolbarIcon::settings, true},
     {L"commands.update", L"Update archive: add missing and replace newer files",
@@ -214,6 +219,10 @@ struct CreateArchiveDialogOptions {
     axiom::ArchiveFormat archive_format = axiom::ArchiveFormat::axar;
     bool fixed_archive_format = false;
     bool existing_archive = false;
+    // Snapshot repositories use the normal archive-options surface, but are
+    // constrained to the appendable AXAR snapshot profile.
+    bool snapshot_repository = false;
+    std::wstring snapshot_name;
     int level = 5;
     axiom::CompressionMethod method = axiom::CompressionMethod::axiom;
     int codec_level = axiom::kAutomaticCodecLevel;
@@ -351,6 +360,18 @@ bool show_application_settings_dialog(
     HWND owner,
     ApplicationDialogOptions& options,
     const std::function<void(const ApplicationDialogOptions&)>& apply_callback);
+bool show_archive_update_plan_dialog(HWND owner,
+                                     const ArchiveUpdatePlan& plan,
+                                     const ThemePalette& theme);
+ArchiveStorageAnalysis summarize_provider_archive_storage(
+    const std::filesystem::path& archive_path,
+    const std::vector<ArchiveEntry>& entries);
+std::optional<std::string> show_archive_snapshot_timeline_dialog(
+    HWND owner,
+    const std::filesystem::path& archive_path,
+    const std::wstring& format_name,
+    const ArchiveStorageAnalysis& analysis,
+    const ThemePalette& theme);
 
 // Converts the SFX settings authored on the dialog's SFX options page into the
 // configuration embedded in the generated executable. Shared with the operation

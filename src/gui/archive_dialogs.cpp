@@ -2406,7 +2406,9 @@ public:
         }
         const int x = owner_rect.left + ((owner_rect.right - owner_rect.left) - width) / 2;
         const int y = owner_rect.top + ((owner_rect.bottom - owner_rect.top) - height) / 2;
-        const wchar_t* title = mode_ == DialogMode::create_archive ? L"Add to archive"
+        const wchar_t* title = mode_ == DialogMode::create_archive
+            ? (create_options.snapshot_repository
+                   ? L"Create snapshot repository" : L"Add to archive")
             : (mode_ == DialogMode::extract_archive ? L"Extract archive" : L"Axiom settings");
         window_ = CreateWindowExW(extended_style, class_name(), title,
                                   window_style,
@@ -5911,8 +5913,12 @@ private:
         set_window_text(sfx_run_arguments_edit_,
                         create_options.features.sfx_run_arguments);
         set_window_text(sfx_license_edit_, create_options.features.sfx_license_text);
-        set_window_text(summary_, std::to_wstring(input_count) +
-                        (input_count == 1 ? L" item selected" : L" items selected"));
+        std::wstring summary = std::to_wstring(input_count) +
+            (input_count == 1 ? L" item selected" : L" items selected");
+        if (create_options.snapshot_repository) {
+            summary += L"  -  Initial snapshot: " + create_options.snapshot_name;
+        }
+        set_window_text(summary_, summary);
 
         fs::path output = create_options.archive_path;
         if (create_options.features.create_sfx) {
@@ -6180,6 +6186,21 @@ private:
     }
 
     void update_create_dependencies() {
+        if (create_options.snapshot_repository) {
+            create_options.archive_format = axiom::ArchiveFormat::axar;
+            create_options.features.update_mode = ArchiveUpdateMode::create_new;
+            create_options.features.enable_content_dedup = true;
+            create_options.features.lock_archive = false;
+            create_options.features.sign_archive = false;
+            create_options.features.create_sfx = false;
+            create_options.features.volume_size.clear();
+            create_options.features.create_recovery_volumes = false;
+            SendMessageW(format_combo_, CB_SETCURSEL,
+                         static_cast<WPARAM>(creatable_archive_format_index(
+                             axiom::ArchiveFormat::axar)), 0);
+            SendMessageW(update_mode_combo_, CB_SETCURSEL,
+                         static_cast<WPARAM>(ArchiveUpdateMode::create_new), 0);
+        }
         const auto available = selected_format_availability();
         const bool updating = create_options.features.update_mode != ArchiveUpdateMode::create_new;
         const bool native = selected_format_is_native();
@@ -6254,16 +6275,19 @@ private:
                   L"share each large block, preserving its full-window ratio."
                 : L"Level 7 uses a path-dependent lazy tree parse, so swarm is unavailable. "
                   L"Choose Split blocks or another compression level.");
-        EnableWindow(update_mode_combo_, available.update);
+        EnableWindow(update_mode_combo_,
+                     available.update && !create_options.snapshot_repository);
         EnableWindow(comment_edit_, available.comments);
-        EnableWindow(lock_archive_, available.lock);
+        EnableWindow(lock_archive_,
+                     available.lock && !create_options.snapshot_repository);
         EnableWindow(repack_after_update_, available.update && updating);
 
-        const bool can_select_dedup =
-            native && !updating && !create_options.existing_archive;
+        const bool can_select_dedup = native && !updating &&
+            !create_options.existing_archive && !create_options.snapshot_repository;
         EnableWindow(content_dedup_, can_select_dedup);
         const bool can_tune_dedup =
-            can_select_dedup && create_options.features.enable_content_dedup;
+            native && !updating && !create_options.existing_archive &&
+            create_options.features.enable_content_dedup;
         for (HWND control : {dedup_min_chunk_label_, dedup_min_chunk_edit_,
                              dedup_average_chunk_label_,
                              dedup_average_chunk_edit_,
@@ -6272,7 +6296,9 @@ private:
         }
         set_window_text(
             dedup_info_,
-            create_options.existing_archive
+            create_options.snapshot_repository
+                ? L"Snapshot repositories use content-defined chunks so unchanged data is stored once across retained points in time. These chunk sizes become the repository's permanent deduplication profile."
+            : create_options.existing_archive
                 ? create_options.features.enable_content_dedup
                     ? L"This archive already uses live content deduplication. Its persisted chunk geometry is preserved automatically for add, update, synchronize, delete, move, and repack operations."
                     : L"This archive uses ordinary AXAR storage. Its content profile cannot be converted from this update dialog; create a new archive to opt into live deduplication."
@@ -6300,7 +6326,9 @@ private:
                 : L"ZIP encryption uses WinZip AES-256 for file data. File names remain "
                   L"visible; use AXAR if archive directory encryption is required.");
 
-        const bool split_enabled = available.volumes && !create_options.features.create_sfx;
+        const bool split_enabled = available.volumes &&
+            !create_options.features.create_sfx &&
+            !create_options.snapshot_repository;
         EnableWindow(volume_size_edit_, split_enabled);
         EnableWindow(volume_unit_combo_, split_enabled);
         EnableWindow(recovery_percent_edit_, available.recovery);
@@ -6319,14 +6347,17 @@ private:
         EnableWindow(recovery_volumes_,
                      available.recovery && valid_split_size);
 
-        EnableWindow(sign_archive_, available.authenticity);
-        const bool key_enabled = available.authenticity && create_options.features.sign_archive;
+        EnableWindow(sign_archive_,
+                     available.authenticity && !create_options.snapshot_repository);
+        const bool key_enabled = available.authenticity &&
+            create_options.features.sign_archive && !create_options.snapshot_repository;
         EnableWindow(signing_key_edit_, key_enabled);
         EnableWindow(browse_signing_key_, key_enabled);
-        EnableWindow(create_sfx_, available.sfx);
+        EnableWindow(create_sfx_, available.sfx && !create_options.snapshot_repository);
         // The whole SFX options page only means anything for an SFX build.
         const bool sfx_options_enabled =
-            available.sfx && create_options.features.create_sfx;
+            available.sfx && create_options.features.create_sfx &&
+            !create_options.snapshot_repository;
         const bool mini_stub =
             sfx_options_enabled && combo_selection(sfx_stub_tier_combo_, 0, 1) == 1;
         // Mini has no dialog stack. Keep extraction and command-line behavior
@@ -7282,6 +7313,11 @@ private:
             selection != CB_ERR) {
             create_options.features.update_mode = static_cast<ArchiveUpdateMode>(selection);
         }
+        if (create_options.snapshot_repository) {
+            create_options.archive_format = axiom::ArchiveFormat::axar;
+            create_options.features.update_mode = ArchiveUpdateMode::create_new;
+            create_options.features.enable_content_dedup = true;
+        }
         const bool create_with_dedup =
             create_options.archive_format == axiom::ArchiveFormat::axar &&
             create_options.features.update_mode == ArchiveUpdateMode::create_new &&
@@ -7322,6 +7358,10 @@ private:
         create_options.features.comment = window_text(comment_edit_);
         create_options.features.volume_size =
             trim_dialog_input(window_text(volume_size_edit_));
+        if (create_options.snapshot_repository) {
+            create_options.features.volume_size.clear();
+            create_options.features.create_recovery_volumes = false;
+        }
         if (const LRESULT selection =
                 SendMessageW(volume_unit_combo_, CB_GETCURSEL, 0, 0);
             selection != CB_ERR) {
@@ -7448,6 +7488,17 @@ private:
 
         create_options.features.signing_key =
             trim_dialog_input(window_text(signing_key_edit_));
+        if (create_options.snapshot_repository) {
+            // Split/SFX/locking/signing turn a repository into a terminal
+            // artifact. Keep the new archive appendable for future captures.
+            create_options.features.lock_archive = false;
+            create_options.features.sign_archive = false;
+            create_options.features.signing_key.clear();
+            create_options.features.create_sfx = false;
+            create_options.features.sfx_destination.clear();
+            create_options.features.volume_size.clear();
+            create_options.features.create_recovery_volumes = false;
+        }
         if (create_options.features.sign_archive &&
             create_options.features.signing_key.empty()) {
             select_create_page(2);

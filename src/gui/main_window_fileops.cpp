@@ -21,13 +21,41 @@ constexpr DWORD kCommandInputDialogExStyle =
 struct UpdateSourceMapping {
     std::vector<fs::path> paths;
     std::vector<axiom::ArchiveInput> mapped_inputs;
-    std::wstring filesystem_source;
-    std::wstring archive_destination;
     std::wstring error;
-    std::size_t unmatched_files = 0;
-    std::size_t entries_outside_source_roots = 0;
-    bool matched_archive = false;
 };
+
+struct ArchiveUpdatePlanBuildResult {
+    std::optional<axiom::gui::ArchiveUpdatePlan> plan;
+    std::wstring error;
+};
+
+void add_selected_archive_effects(
+    axiom::gui::ArchiveUpdatePlan& plan,
+    const axiom::gui::ArchiveFeatureOptions& features) {
+    if (plan.format == axiom::ArchiveFormat::axar) {
+        plan.additional_effects.push_back(L"Apply the archive comment setting");
+        if (features.repack_after_update) {
+            plan.additional_effects.push_back(L"Repack the archive after updating");
+        }
+        if (features.recovery_percent != 0) {
+            plan.additional_effects.push_back(
+                L"Set the recovery record to " +
+                std::to_wstring(features.recovery_percent) + L"%");
+        }
+        if (features.sign_archive) {
+            plan.additional_effects.push_back(L"Replace the archive signature");
+        }
+        if (features.lock_archive) {
+            plan.additional_effects.push_back(L"Lock the archive after updating");
+        }
+    }
+    if (!features.volume_size.empty()) {
+        plan.additional_effects.push_back(L"Create split archive volumes");
+    }
+    if (features.create_sfx) {
+        plan.additional_effects.push_back(L"Create a self-extracting executable");
+    }
+}
 
 bool archive_text_equal(std::string_view left, std::string_view right) {
     const std::wstring wide_left = widen(left);
@@ -78,34 +106,10 @@ std::vector<fs::path> immediate_folder_children(const fs::path& folder,
     return children;
 }
 
-std::size_t count_entries_outside_mapped_roots(
-    const std::vector<axiom::ArchiveEntry>& entries,
-    const std::vector<axiom::ArchiveInput>& inputs) {
-    std::vector<std::string> roots;
-    roots.reserve(inputs.size());
-    for (const auto& input : inputs) {
-        const std::string root = archive_root(input.destination_path);
-        if (std::none_of(roots.begin(), roots.end(), [&root](const std::string& existing) {
-                return archive_text_equal(existing, root);
-            })) {
-            roots.push_back(root);
-        }
-    }
-    return static_cast<std::size_t>(std::count_if(
-        entries.begin(), entries.end(), [&roots](const auto& entry) {
-            const std::string root = archive_root(entry.path);
-            return std::none_of(roots.begin(), roots.end(),
-                                [&root](const std::string& selected) {
-                                    return archive_text_equal(selected, root);
-                                });
-        }));
-}
-
 UpdateSourceMapping map_update_folder(
     const fs::path& folder, const std::vector<axiom::ArchiveEntry>& entries,
     axiom::gui::ArchiveUpdateMode mode) {
     UpdateSourceMapping result;
-    result.filesystem_source = folder.wstring();
     std::error_code status_error;
     if (!fs::is_directory(folder, status_error) || status_error) {
         result.error = L"Choose an accessible source folder.";
@@ -153,16 +157,10 @@ UpdateSourceMapping map_update_folder(
             result.mapped_inputs.push_back(
                 {child, utf8(child.filename().wstring())});
         }
-        result.archive_destination = L"the archive root";
-        result.matched_archive = child_root_matches != 0;
     } else {
         result.paths.push_back(folder);
         result.mapped_inputs.push_back({folder, folder_name});
-        result.archive_destination = widen(folder_name) + L"\\...";
-        result.matched_archive = direct_match;
     }
-    result.entries_outside_source_roots =
-        count_entries_outside_mapped_roots(entries, result.mapped_inputs);
     return result;
 }
 
@@ -189,10 +187,8 @@ UpdateSourceMapping map_update_files(
         std::string destination;
         if (best != nullptr) {
             destination = best->path;
-            result.matched_archive = true;
         } else {
             destination = utf8(source.filename().wstring());
-            ++result.unmatched_files;
         }
         if (destination.empty()) {
             result.error = L"A selected file does not have a usable file name:\n\n" +
@@ -212,7 +208,6 @@ UpdateSourceMapping map_update_files(
         destinations.push_back(destination);
         result.mapped_inputs.push_back({source, std::move(destination)});
     }
-    result.archive_destination = L"their matching archive paths";
     return result;
 }
 
@@ -613,6 +608,25 @@ bool show_command_input_dialog(HWND owner,
     return state.accepted;
 }
 
+bool prompt_file_manager_name(HWND owner, HINSTANCE instance,
+                              std::wstring title, std::wstring heading,
+                              std::wstring& name) {
+    std::vector<CommandInputField> fields{{
+        L"Name", name, ES_AUTOHSCROLL, std::nullopt, 0,
+        L"Enter one Windows file or folder name, without path separators.", {}}};
+    const bool accepted = show_command_input_dialog(
+        owner, instance, std::move(title), std::move(heading), fields,
+        L"Dialog.FileManagerName",
+        [](const std::vector<CommandInputField>& values)
+            -> std::optional<CommandInputValidationError> {
+            const std::wstring error = file_manager_leaf_name_error(values[0].value);
+            if (error.empty()) return std::nullopt;
+            return CommandInputValidationError{0, error};
+        });
+    if (accepted) name = std::move(fields[0].value);
+    return accepted;
+}
+
 void set_dialog_initial_path(IFileDialog* dialog, const fs::path& path) {
     if (dialog == nullptr || path.empty()) return;
     const fs::path folder = path.has_filename() ? path.parent_path() : path;
@@ -797,6 +811,47 @@ void add_virtual_archive_item(
     materialized_archive_paths.push_back(std::move(archive_path));
 }
 
+std::optional<fs::path> named_split_primary(const fs::path& path) {
+    const auto digits_only = [](std::wstring_view text) {
+        return !text.empty() &&
+            std::all_of(text.begin(), text.end(),
+                        [](wchar_t ch) { return std::iswdigit(ch) != 0; });
+    };
+    const std::wstring filename = path.filename().wstring();
+    std::wstring folded = filename;
+    std::transform(folded.begin(), folded.end(), folded.begin(), [](wchar_t ch) {
+        return static_cast<wchar_t>(std::towlower(ch));
+    });
+    std::optional<fs::path> candidate;
+    const std::size_t part = folded.rfind(L".part");
+    if (part != std::wstring::npos && folded.ends_with(L".rar")) {
+        const std::wstring_view number(
+            folded.data() + part + 5, folded.size() - (part + 5) - 4);
+        if (digits_only(number)) {
+            const std::wstring first(number.size() - 1, L'0');
+            candidate = path.parent_path() /
+                (filename.substr(0, part + 5) + first + L"1.rar");
+        }
+    } else {
+        const std::wstring extension = path.extension().wstring();
+        if (extension.size() > 1 &&
+            (extension[1] == L'r' || extension[1] == L'R') &&
+            digits_only(std::wstring_view(extension).substr(2))) {
+            candidate = path.parent_path() /
+                (path.stem().wstring() + L".rar");
+        } else if (extension.size() > 1 &&
+                   digits_only(std::wstring_view(extension).substr(1))) {
+            const std::size_t width = extension.size() - 1;
+            candidate = path.parent_path() /
+                (path.stem().wstring() + L"." +
+                 std::wstring(width - 1, L'0') + L"1");
+        }
+    }
+    if (!candidate) return std::nullopt;
+    std::error_code exists_error;
+    return fs::exists(*candidate, exists_error) ? candidate : std::nullopt;
+}
+
 struct TempCleanupResult {
     std::uint64_t bytes_removed = 0;
     std::uintmax_t entries_removed = 0;
@@ -941,6 +996,47 @@ TempCleanupResult cleanup_axiom_temp_artifacts(
         }
     }
     return result;
+}
+
+std::wstring trim_snapshot_name(std::wstring name) {
+    const auto first = std::find_if_not(name.begin(), name.end(), [](wchar_t ch) {
+        return std::iswspace(ch) != 0;
+    });
+    const auto last = std::find_if_not(name.rbegin(), name.rend(), [](wchar_t ch) {
+        return std::iswspace(ch) != 0;
+    }).base();
+    if (first >= last) return {};
+    return std::wstring(first, last);
+}
+
+std::optional<std::wstring> snapshot_name_error(std::wstring_view name) {
+    if (name.empty()) return L"Enter a snapshot name.";
+    if (name == L"." || name == L"..") {
+        return L"Snapshot names cannot be '.' or '..'.";
+    }
+    if (std::any_of(name.begin(), name.end(), [](wchar_t ch) {
+            return ch == L'/' || ch == L'\\' || ch < 0x20 || ch == 0x7f;
+        })) {
+        return L"Snapshot names cannot contain slashes or control characters.";
+    }
+    try {
+        if (utf8(name).size() > 256) {
+            return L"Snapshot names can use at most 256 UTF-8 bytes.";
+        }
+    } catch (...) {
+        return L"The snapshot name contains invalid Unicode text.";
+    }
+    return std::nullopt;
+}
+
+std::wstring timestamp_snapshot_name() {
+    SYSTEMTIME now{};
+    GetLocalTime(&now);
+    wchar_t text[32]{};
+    swprintf_s(text, L"%04u-%02u-%02u %02u-%02u-%02u",
+               now.wYear, now.wMonth, now.wDay,
+               now.wHour, now.wMinute, now.wSecond);
+    return text;
 }
 
 }  // namespace
@@ -1421,7 +1517,8 @@ DWORD MainWindow::perform_file_drop(IDataObject* object, POINT point, DWORD, DWO
 
 StagedArchiveEntries MainWindow::extract_archive_entries_to_staging(
     const fs::path& archive, const std::vector<std::string>& entries,
-    const std::string& password, bool for_drag, bool sensitive) {
+    const std::string& password, bool for_drag, bool sensitive,
+    bool for_clipboard) {
     const auto active = active_archive_path();
     const auto* provider = active && same_filesystem_path(*active, archive)
         ? active_archive_provider() : nullptr;
@@ -1433,12 +1530,14 @@ StagedArchiveEntries MainWindow::extract_archive_entries_to_staging(
     std::exception_ptr failure;
 
     set_busy(true);
-    set_status(for_drag ? L"Preparing archive entries for drag and drop..."
-                        : L"Preparing archive file for viewing...");
+    set_status(for_clipboard ? L"Preparing archive entries for the clipboard..."
+               : for_drag ? L"Preparing archive entries for drag and drop..."
+                          : L"Preparing archive file for viewing...");
     if (!operation_window_.create(
             hwnd_, instance_,
-            for_drag ? L"Preparing dragged archive entries..."
-                     : L"Opening archive file...",
+            for_clipboard ? L"Copying archive entries..."
+              : for_drag ? L"Preparing dragged archive entries..."
+                         : L"Opening archive file...",
             staging,
             make_operation_window_theme(theme_),
             [control](bool paused) { control->set_paused(paused); },
@@ -1503,8 +1602,269 @@ StagedArchiveEntries MainWindow::extract_archive_entries_to_staging(
     for (const auto& entry : entries) {
         staged.paths.push_back(staging / fs::path(widen(entry)));
     }
-    set_status(for_drag ? L"Drag and drop ready." : L"Archive file is ready to open.");
+    set_status(for_clipboard ? L"Archive entries are ready to paste."
+               : for_drag ? L"Drag and drop ready."
+                          : L"Archive file is ready to open.");
     return staged;
+}
+
+void MainWindow::on_copy_items() {
+    if (busy_) return;
+    auto paths = selected_filesystem_paths();
+    if (!paths.empty()) {
+        FileDragSource source;
+        source.files = [paths = std::move(paths)] { return paths; };
+        source.preferred_effect = DROPEFFECT_COPY;
+        if (FAILED(set_file_clipboard(std::move(source)))) {
+            show_app_message(L"Windows could not place the selected items on the clipboard.",
+                             MessageDialogIcon::error, L"Copy failed");
+            return;
+        }
+        set_status(L"Selection copied. Choose a destination and paste it.");
+        return;
+    }
+
+    if (history_.current().kind != BrowserLocationKind::archive) return;
+    const auto entries = selected_archive_paths();
+    if (entries.empty()) return;
+    const fs::path archive = history_.current().archive_path;
+    auto password = password_for_archive_edit(archive);
+    if (!password) return;
+    try {
+        StagedArchiveEntries staged = extract_archive_entries_to_staging(
+            archive, entries, *password, false, !password->empty(), true);
+        secure_clear(*password);
+        FileDragSource source;
+        source.files = [paths = std::move(staged.paths)] { return paths; };
+        source.preferred_effect = DROPEFFECT_COPY;
+        if (FAILED(set_file_clipboard(std::move(source)))) {
+            throw std::runtime_error("Windows rejected the prepared clipboard data");
+        }
+        set_status(L"Archive selection copied. It can now be pasted as files.");
+    } catch (const std::exception& error) {
+        secure_clear(*password);
+        show_app_message(L"Axiom could not copy the selected archive entries.\n\n" +
+                             widen(error.what()),
+                         MessageDialogIcon::error, L"Copy failed");
+    }
+}
+
+void MainWindow::on_paste_items() {
+    if (busy_) return;
+    ComPtr<IDataObject> clipboard;
+    if (FAILED(OleGetClipboard(clipboard.put())) ||
+        !data_object_has_file_drop(clipboard.get())) {
+        show_app_message(L"The clipboard does not contain files or folders that Axiom can paste.",
+                         MessageDialogIcon::information, L"Paste");
+        return;
+    }
+
+    if (history_.current().kind == BrowserLocationKind::archive) {
+        perform_file_drop(clipboard.get(), POINT{-1, -1}, 0, DROPEFFECT_COPY);
+        return;
+    }
+    if (history_.current().kind != BrowserLocationKind::filesystem) return;
+    const auto paths = read_file_drop(clipboard.get());
+    if (paths.empty()) return;
+
+    ComPtr<IFileOperation> operation;
+    HRESULT result = CoCreateInstance(CLSID_FileOperation, nullptr, CLSCTX_INPROC_SERVER,
+                                      IID_PPV_ARGS(operation.put()));
+    ComPtr<IShellItem> destination;
+    if (SUCCEEDED(result)) {
+        result = SHCreateItemFromParsingName(
+            history_.current().filesystem_path.c_str(), nullptr,
+            IID_PPV_ARGS(destination.put()));
+    }
+    if (SUCCEEDED(result)) result = operation->SetOwnerWindow(hwnd_);
+    if (SUCCEEDED(result)) {
+        result = operation->SetOperationFlags(
+            FOF_NOCONFIRMMKDIR | FOFX_EARLYFAILURE | FOFX_SHOWELEVATIONPROMPT);
+    }
+    for (const fs::path& path : paths) {
+        if (FAILED(result)) break;
+        ComPtr<IShellItem> item;
+        result = SHCreateItemFromParsingName(path.c_str(), nullptr,
+                                             IID_PPV_ARGS(item.put()));
+        if (SUCCEEDED(result)) {
+            result = operation->CopyItem(item.get(), destination.get(), nullptr, nullptr);
+        }
+    }
+    if (SUCCEEDED(result)) result = operation->PerformOperations();
+    BOOL aborted = FALSE;
+    if (operation) operation->GetAnyOperationsAborted(&aborted);
+    if (FAILED(result)) {
+        show_app_message(L"Windows could not paste the clipboard items into this folder.",
+                         MessageDialogIcon::error, L"Paste failed");
+    } else if (!aborted) {
+        set_status(quote_count(paths.size(), L"item pasted.", L"items pasted."));
+    }
+    on_navigate_refresh();
+}
+
+void MainWindow::on_rename_item() {
+    if (busy_) return;
+    const std::vector<int> selected = selected_browser_indices();
+    if (selected.size() != 1 || selected.front() < 0 ||
+        selected.front() >= static_cast<int>(browser_items_.size())) {
+        show_app_message(L"Select exactly one file or folder to rename.",
+                         MessageDialogIcon::information, L"Rename");
+        return;
+    }
+    const BrowserItem item = browser_items_[static_cast<std::size_t>(selected.front())];
+    if (item.is_parent() || item.kind == BrowserItemKind::drive) {
+        show_app_message(L"This item cannot be renamed here.",
+                         MessageDialogIcon::information, L"Rename");
+        return;
+    }
+    std::wstring name = item.name;
+    if (!prompt_file_manager_name(
+            hwnd_, instance_, L"Rename",
+            L"Enter the new name. Only this item changes; its contents and metadata are preserved.",
+            name) || name == item.name) {
+        return;
+    }
+
+    if (history_.current().kind == BrowserLocationKind::filesystem) {
+        ComPtr<IFileOperation> operation;
+        HRESULT result = CoCreateInstance(CLSID_FileOperation, nullptr, CLSCTX_INPROC_SERVER,
+                                          IID_PPV_ARGS(operation.put()));
+        ComPtr<IShellItem> source;
+        if (SUCCEEDED(result)) {
+            result = SHCreateItemFromParsingName(item.filesystem_path.c_str(), nullptr,
+                                                 IID_PPV_ARGS(source.put()));
+        }
+        if (SUCCEEDED(result)) result = operation->SetOwnerWindow(hwnd_);
+        if (SUCCEEDED(result)) {
+            result = operation->SetOperationFlags(
+                FOF_NOCONFIRMMKDIR | FOFX_EARLYFAILURE | FOFX_SHOWELEVATIONPROMPT);
+        }
+        if (SUCCEEDED(result)) result = operation->RenameItem(source.get(), name.c_str(), nullptr);
+        if (SUCCEEDED(result)) result = operation->PerformOperations();
+        BOOL aborted = FALSE;
+        if (operation) operation->GetAnyOperationsAborted(&aborted);
+        if (FAILED(result)) {
+            show_app_message(L"Windows could not rename the selected item.",
+                             MessageDialogIcon::error, L"Rename failed");
+        } else if (!aborted) {
+            set_status(L"Renamed to " + name + L".");
+        }
+        on_navigate_refresh();
+        return;
+    }
+
+    if (history_.current().kind != BrowserLocationKind::archive ||
+        item.archive_path.empty() || !active_archive_is_editable()) {
+        return;
+    }
+    const ArchiveCapabilities capabilities = active_archive_capabilities();
+    if (!capabilities.move_entries) {
+        show_app_message(L"This archive format does not support renaming entries.",
+                         MessageDialogIcon::information, L"Rename");
+        return;
+    }
+    const fs::path archive = history_.current().archive_path;
+    auto password = password_for_archive_edit(archive);
+    if (!password) return;
+    const std::size_t slash = item.archive_path.find_last_of('/');
+    const std::string parent = slash == std::string::npos
+        ? std::string{} : item.archive_path.substr(0, slash);
+    const std::string destination = join_archive_directory(parent, utf8(name));
+    auto options = compression_options();
+    options.password = std::move(*password);
+    operation_archive_output_ = archive;
+    start_operation(
+        L"Renaming archive entry...", L"Archive entry renamed to " + name + L".",
+        [archive, move = axiom::ArchiveMove{item.archive_path, destination}, options](
+            std::shared_ptr<OperationControl> operation) mutable {
+            auto run_options = options;
+            run_options.operation = std::move(operation);
+            const auto* provider = axiom::archive_provider_for_path(archive);
+            if (provider == nullptr) throw std::runtime_error("unsupported archive format");
+            provider->move_entries(archive, {move}, run_options);
+        });
+}
+
+void MainWindow::on_new_folder() {
+    if (busy_) return;
+    std::wstring name = L"New folder";
+    if (!prompt_file_manager_name(
+            hwnd_, instance_, L"New folder",
+            L"Create a folder in the current location.", name)) {
+        return;
+    }
+    if (history_.current().kind == BrowserLocationKind::filesystem) {
+        ComPtr<IFileOperation> operation;
+        HRESULT result = CoCreateInstance(CLSID_FileOperation, nullptr, CLSCTX_INPROC_SERVER,
+                                          IID_PPV_ARGS(operation.put()));
+        ComPtr<IShellItem> destination;
+        if (SUCCEEDED(result)) {
+            result = SHCreateItemFromParsingName(
+                history_.current().filesystem_path.c_str(), nullptr,
+                IID_PPV_ARGS(destination.put()));
+        }
+        if (SUCCEEDED(result)) result = operation->SetOwnerWindow(hwnd_);
+        if (SUCCEEDED(result)) {
+            result = operation->SetOperationFlags(
+                FOF_NOCONFIRMMKDIR | FOFX_EARLYFAILURE | FOFX_SHOWELEVATIONPROMPT);
+        }
+        if (SUCCEEDED(result)) {
+            result = operation->NewItem(destination.get(), FILE_ATTRIBUTE_DIRECTORY,
+                                        name.c_str(), nullptr, nullptr);
+        }
+        if (SUCCEEDED(result)) result = operation->PerformOperations();
+        BOOL aborted = FALSE;
+        if (operation) operation->GetAnyOperationsAborted(&aborted);
+        if (FAILED(result)) {
+            show_app_message(L"Windows could not create the folder.",
+                             MessageDialogIcon::error, L"New folder failed");
+        } else if (!aborted) {
+            set_status(L"Created folder " + name + L".");
+        }
+        on_navigate_refresh();
+        return;
+    }
+
+    if (history_.current().kind != BrowserLocationKind::archive ||
+        !active_archive_is_editable()) {
+        return;
+    }
+    if (!active_archive_capabilities().update) {
+        show_app_message(L"This archive format does not support creating folders.",
+                         MessageDialogIcon::information, L"New folder");
+        return;
+    }
+    const fs::path archive = history_.current().archive_path;
+    auto password = password_for_archive_edit(archive);
+    if (!password) return;
+    fs::path source;
+    try {
+        const fs::path staging = create_drag_staging_directory(false);
+        source = staging / name;
+        if (!fs::create_directory(source)) {
+            throw std::runtime_error("could not create the temporary folder");
+        }
+    } catch (const std::exception& error) {
+        show_app_message(L"Axiom could not prepare the new archive folder.\n\n" +
+                             widen(error.what()),
+                         MessageDialogIcon::error, L"New folder failed");
+        return;
+    }
+    const std::string destination = join_archive_directory(
+        history_.current().archive_directory, utf8(name));
+    auto options = compression_options();
+    options.password = std::move(*password);
+    operation_archive_output_ = archive;
+    start_operation(
+        L"Creating archive folder...", L"Archive folder created: " + name + L".",
+        [archive, input = axiom::ArchiveInput{source, destination}, options](
+            std::shared_ptr<OperationControl> operation) mutable {
+            auto run_options = options;
+            run_options.operation = std::move(operation);
+            const auto* provider = axiom::archive_provider_for_path(archive);
+            if (provider == nullptr) throw std::runtime_error("unsupported archive format");
+            provider->add_mapped({input}, archive, run_options);
+        });
 }
 
 void MainWindow::on_table_begin_drag() {
@@ -1933,7 +2293,8 @@ void MainWindow::create_archive_from_paths(
     std::vector<fs::path> paths,
     std::optional<fs::path> target_archive,
     axiom::gui::ArchiveUpdateMode update_mode,
-    std::vector<axiom::ArchiveInput> mapped_inputs) {
+    std::vector<axiom::ArchiveInput> mapped_inputs,
+    std::string snapshot_name) {
     if (paths.empty()) return;
 
     if (target_archive) {
@@ -1951,11 +2312,13 @@ void MainWindow::create_archive_from_paths(
                 L"Reading archive settings...",
                 [this, path, paths = std::move(paths), update_mode,
                  mapped_inputs = std::move(mapped_inputs),
+                 snapshot_name = std::move(snapshot_name),
                  password = std::move(*password)]() mutable {
                     const auto mode = axiom::archive_encryption_mode(path);
                     std::wstring comment = widen(axiom::archive_comment(path, password));
                     return [this, path, paths = std::move(paths), update_mode, mode,
                             mapped_inputs = std::move(mapped_inputs),
+                            snapshot_name = std::move(snapshot_name),
                             comment = std::move(comment),
                             password = std::move(password)]() mutable {
                         archive_dialog_metadata_path_ = path;
@@ -1964,7 +2327,8 @@ void MainWindow::create_archive_from_paths(
                         archive_dialog_password_ = std::move(password);
                         archive_dialog_metadata_valid_ = true;
                         create_archive_from_paths(std::move(paths), path, update_mode,
-                                                  std::move(mapped_inputs));
+                                                  std::move(mapped_inputs),
+                                                  std::move(snapshot_name));
                     };
                 });
             return;
@@ -2022,12 +2386,26 @@ void MainWindow::create_archive_from_paths(
         application_options_.default_sfx_open_destination;
     dialog_options.features.sign_archive = application_options_.default_sign_archive;
     dialog_options.features.signing_key = application_options_.default_signing_key;
+    const bool creating_snapshot_repository = !snapshot_name.empty();
+    if (creating_snapshot_repository) {
+        dialog_options.snapshot_repository = true;
+        dialog_options.snapshot_name = widen(snapshot_name);
+        dialog_options.features.update_mode =
+            axiom::gui::ArchiveUpdateMode::create_new;
+        dialog_options.features.enable_content_dedup = true;
+        dialog_options.features.volume_size.clear();
+        dialog_options.features.create_recovery_volumes = false;
+        dialog_options.features.create_sfx = false;
+        dialog_options.features.sign_archive = false;
+        dialog_options.features.lock_archive = false;
+    }
     const fs::path source_folder =
         history_.current().kind == axiom::gui::BrowserLocationKind::filesystem
             ? history_.current().filesystem_path
             : paths.front().parent_path();
     const std::wstring archive_file_name =
-        suggested_archive_stem_for_inputs(paths, source_folder) + L".axar";
+        suggested_archive_stem_for_inputs(paths, source_folder) +
+        (creating_snapshot_repository ? L"-snapshots.axar" : L".axar");
     const fs::path base = history_.current().kind == axiom::gui::BrowserLocationKind::filesystem
         ? history_.current().filesystem_path
         : paths.front().parent_path();
@@ -2042,9 +2420,12 @@ void MainWindow::create_archive_from_paths(
     }
     default_archive = avoid_archive_input_collision(std::move(default_archive), paths);
     dialog_options.archive_path = target_archive.value_or(default_archive);
-    dialog_options.archive_format = dialog_options.archive_path.extension() == L".zip"
-        ? axiom::ArchiveFormat::zip : axiom::ArchiveFormat::axar;
-    dialog_options.fixed_archive_format = target_archive.has_value();
+    dialog_options.archive_format = creating_snapshot_repository
+        ? axiom::ArchiveFormat::axar
+        : dialog_options.archive_path.extension() == L".zip"
+            ? axiom::ArchiveFormat::zip : axiom::ArchiveFormat::axar;
+    dialog_options.fixed_archive_format =
+        target_archive.has_value() || creating_snapshot_repository;
     dialog_options.existing_archive = target_archive.has_value();
     if (target_archive) {
         const auto active = active_archive_path();
@@ -2122,8 +2503,92 @@ void MainWindow::create_archive_from_paths(
         save_current_settings();
     }
     pending_archive_features_ = std::move(dialog_options.features);
+    pending_snapshot_name_ = std::move(snapshot_name);
     remember_sfx_defaults(pending_archive_features_);
-    on_compress();
+    if (!mapped_inputs_.empty() &&
+        pending_archive_features_.update_mode !=
+            axiom::gui::ArchiveUpdateMode::create_new) {
+        queue_archive_update_preview();
+    } else {
+        on_compress();
+    }
+}
+
+void MainWindow::queue_archive_update_preview(
+    std::optional<axiom::gui::ArchiveUpdatePlan> approved_plan) {
+    const fs::path archive = pending_archive_path_;
+    const auto format = pending_archive_format_;
+    const auto mode = pending_archive_features_.update_mode;
+    const auto inputs = mapped_inputs_;
+    auto features = pending_archive_features_;
+    std::string password = features.encrypt_data
+        ? utf8(features.password) : std::string{};
+    // The worker needs the password only for the fresh directory read. Keep it
+    // out of the longer-lived feature snapshot used to describe post-actions.
+    secure_clear(features.password);
+
+    set_busy(true);
+    begin_background_ui_task(
+        approved_plan ? L"Revalidating archive update preview..."
+                      : L"Building archive update preview...",
+        [this, archive, format, mode, inputs, features,
+         approved_plan = std::move(approved_plan),
+         password = std::move(password)]() mutable {
+            ArchiveUpdatePlanBuildResult result;
+            try {
+                const auto* provider = axiom::archive_provider_for_path(archive);
+                if (provider == nullptr) {
+                    throw std::runtime_error("unsupported archive format");
+                }
+                auto entries = provider->list(archive, password);
+                secure_clear(password);
+                result.plan = axiom::gui::build_archive_update_plan(
+                    inputs, entries, mode, format, archive);
+                add_selected_archive_effects(*result.plan, features);
+            } catch (const std::exception& error) {
+                secure_clear(password);
+                result.error = widen(error.what());
+            } catch (...) {
+                secure_clear(password);
+                result.error = L"Axiom could not build the archive update preview.";
+            }
+            return [this, result = std::move(result),
+                    approved_plan = std::move(approved_plan)]() mutable {
+                set_busy(false);
+                if (!result.error.empty() || !result.plan) {
+                    secure_clear(pending_archive_features_.password);
+                    set_status(L"Archive update canceled. No changes were made.");
+                    show_app_message(
+                        result.error.empty()
+                            ? L"Axiom could not build the archive update preview."
+                            : result.error,
+                        axiom::gui::MessageDialogIcon::error,
+                        L"Archive update preview");
+                    return;
+                }
+                if (approved_plan) {
+                    if (axiom::gui::equivalent_archive_update_plans(
+                            *approved_plan, *result.plan)) {
+                        on_compress();
+                        return;
+                    }
+                    result.plan->notice =
+                        L"The source or archive changed while the preview was open. "
+                        L"This is a refreshed plan; review it again before continuing.";
+                }
+                present_archive_update_preview(std::move(*result.plan));
+            };
+        });
+}
+
+void MainWindow::present_archive_update_preview(
+    axiom::gui::ArchiveUpdatePlan plan) {
+    if (!axiom::gui::show_archive_update_plan_dialog(hwnd_, plan, theme_)) {
+        secure_clear(pending_archive_features_.password);
+        set_status(L"Archive update canceled. No changes were made.");
+        return;
+    }
+    queue_archive_update_preview(std::move(plan));
 }
 
 void MainWindow::remember_sfx_defaults(
@@ -2140,6 +2605,121 @@ void MainWindow::remember_sfx_defaults(
     application_options_.default_sfx_allow_path_change = features.sfx_allow_path_change;
     application_options_.default_sfx_open_destination = features.sfx_open_destination;
     save_current_settings();
+}
+
+bool MainWindow::prompt_snapshot_name(std::wstring_view title,
+                                      std::wstring& name) {
+    while (axiom::gui::show_archive_snapshot_name_dialog(hwnd_, title, name)) {
+        name = trim_snapshot_name(std::move(name));
+        if (const auto error = snapshot_name_error(name)) {
+            show_app_message(*error, axiom::gui::MessageDialogIcon::warning,
+                             std::wstring(title));
+            continue;
+        }
+        return true;
+    }
+    return false;
+}
+
+void MainWindow::on_create_snapshot_repository() {
+    if (busy_) return;
+
+    auto paths = history_.current().kind == axiom::gui::BrowserLocationKind::filesystem
+        ? selected_filesystem_paths() : std::vector<fs::path>{};
+    std::erase_if(paths, [](const fs::path& path) {
+        return GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES;
+    });
+    if (paths.empty()) {
+        const int selection = show_app_message(
+            L"Choose the complete initial source state.\n\nFolders are captured "
+            L"recursively. You can also select one or more individual files.",
+            axiom::gui::MessageDialogIcon::question,
+            L"Create snapshot repository",
+            axiom::gui::MessageDialogButtons::folder_files_cancel, IDYES);
+        if (selection == IDYES) {
+            if (auto folder = pick_folder(
+                    hwnd_, L"Choose the initial snapshot folder")) {
+                paths.push_back(std::move(*folder));
+            }
+        } else if (selection == IDNO) {
+            paths = pick_files(hwnd_, L"Choose the initial snapshot files");
+        }
+    }
+    if (paths.empty()) return;
+
+    std::wstring name = L"Initial";
+    if (!prompt_snapshot_name(L"Create snapshot repository", name)) return;
+    create_archive_from_paths(
+        std::move(paths), std::nullopt,
+        axiom::gui::ArchiveUpdateMode::create_new, {}, utf8(name));
+}
+
+void MainWindow::on_add_snapshot() {
+    if (busy_) return;
+    const auto archive = active_archive_path();
+    if (!archive) {
+        show_app_message(L"Open or select a snapshot repository first.",
+                         axiom::gui::MessageDialogIcon::information,
+                         L"Add snapshot");
+        return;
+    }
+    const auto capabilities = active_archive_capabilities();
+    if (!capabilities.snapshot_repository) {
+        show_app_message(L"This archive is not a snapshot repository.",
+                         axiom::gui::MessageDialogIcon::information,
+                         L"Add snapshot");
+        return;
+    }
+    if (capabilities.locked) {
+        show_app_message(L"This snapshot repository is locked and cannot be changed.",
+                         axiom::gui::MessageDialogIcon::information,
+                         L"Add snapshot");
+        return;
+    }
+
+    const int selection = show_app_message(
+        L"Choose the complete source state for the new snapshot.\n\nItems omitted "
+        L"from this capture appear removed in the timeline. Choose the same source "
+        L"root or file set used by the earlier snapshots.",
+        axiom::gui::MessageDialogIcon::question, L"Add snapshot",
+        axiom::gui::MessageDialogButtons::folder_files_cancel, IDYES);
+    std::vector<fs::path> paths;
+    if (selection == IDYES) {
+        if (auto folder = pick_folder(hwnd_, L"Choose the new snapshot folder")) {
+            paths.push_back(std::move(*folder));
+        }
+    } else if (selection == IDNO) {
+        paths = pick_files(hwnd_, L"Choose the new snapshot files");
+    }
+    if (paths.empty()) return;
+    if (output_collides_with_input(*archive, paths)) {
+        show_app_message(
+            L"The snapshot repository is inside the selected source. Move the "
+            L"repository outside that source folder, or select a narrower source, "
+            L"so the repository cannot capture itself.",
+            axiom::gui::MessageDialogIcon::warning, L"Add snapshot");
+        return;
+    }
+
+    std::wstring name = timestamp_snapshot_name();
+    if (!prompt_snapshot_name(L"Add snapshot", name)) return;
+    auto password = password_for_archive_edit(*archive);
+    if (!password) return;
+
+    auto options = compression_options();
+    options.password = std::move(*password);
+    options.skip_unreadable_files = false;
+    const std::string encoded_name = utf8(name);
+    operation_archive_output_ = *archive;
+    start_operation(
+        L"Adding snapshot...",
+        L"Snapshot '" + name + L"' added: " + archive->wstring(),
+        [paths = std::move(paths), archive = *archive,
+         name = encoded_name, options = std::move(options)](
+            std::shared_ptr<axiom::OperationControl> operation) mutable {
+            options.operation = std::move(operation);
+            axiom::add_archive_snapshot(paths, archive, name, options);
+        });
 }
 
 void MainWindow::on_add_to_archive() {
@@ -2267,82 +2847,6 @@ void MainWindow::on_update_archive(axiom::gui::ArchiveUpdateMode mode) {
         return;
     }
     if (source.paths.empty() || source.mapped_inputs.empty()) return;
-
-    if (mode == axiom::gui::ArchiveUpdateMode::update_newer &&
-        !source.filesystem_source.empty() && !source.matched_archive) {
-        const std::wstring prompt =
-            L"The selected folder does not match an existing archive root.\n\n"
-            L"Source:\n" + source.filesystem_source +
-            L"\n\nUpdate will add it as a new tree at " +
-            source.archive_destination + L". Continue?";
-        if (show_app_message(prompt, axiom::gui::MessageDialogIcon::question,
-                             L"Update archive",
-                             axiom::gui::MessageDialogButtons::yes_no,
-                             IDNO) != IDYES) {
-            return;
-        }
-    } else if (mode == axiom::gui::ArchiveUpdateMode::fresh_existing &&
-        source.unmatched_files != 0) {
-        if (!source.matched_archive) {
-            show_app_message(
-                L"None of the selected files match an existing archive path. "
-                L"Freshen only replaces existing entries, so no changes would be made.",
-                axiom::gui::MessageDialogIcon::information, L"Freshen archive");
-            return;
-        }
-        const std::wstring prompt =
-            std::to_wstring(source.unmatched_files) +
-            (source.unmatched_files == 1
-                 ? L" selected file does not match an existing archive path"
-                 : L" selected files do not match existing archive paths") +
-            L" and will be ignored by Freshen. Continue with the matched files?";
-        if (show_app_message(prompt, axiom::gui::MessageDialogIcon::warning,
-                             L"Freshen archive",
-                             axiom::gui::MessageDialogButtons::yes_no,
-                             IDNO) != IDYES) {
-            return;
-        }
-    } else if (mode == axiom::gui::ArchiveUpdateMode::update_newer &&
-               source.unmatched_files != 0) {
-        const std::wstring prompt =
-            std::to_wstring(source.unmatched_files) +
-            (source.unmatched_files == 1
-                 ? L" selected file does not match an existing archive path"
-                 : L" selected files do not match existing archive paths") +
-            L". Update will add " +
-            (source.unmatched_files == 1 ? std::wstring(L"it")
-                                         : std::wstring(L"them")) +
-            L" at the archive root. Continue?";
-        if (show_app_message(prompt, axiom::gui::MessageDialogIcon::question,
-                             L"Update archive",
-                             axiom::gui::MessageDialogButtons::yes_no,
-                             IDYES) != IDYES) {
-            return;
-        }
-    }
-
-    if (mode == axiom::gui::ArchiveUpdateMode::synchronize) {
-        std::wstring prompt =
-            L"Source:\n" + source.filesystem_source +
-            L"\n\nArchive:\n" + archive->wstring() +
-            L"\n\nArchive mapping: " + source.archive_destination +
-            L"\n\nSynchronize will add missing files, replace newer files, and "
-            L"permanently remove every archived entry missing from this complete source.";
-        if (source.entries_outside_source_roots != 0) {
-            prompt += L"\n\n" +
-                std::to_wstring(source.entries_outside_source_roots) +
-                (source.entries_outside_source_roots == 1
-                     ? L" archived entry is outside the selected source roots and will be removed."
-                     : L" archived entries are outside the selected source roots and will be removed.");
-        }
-        prompt += L"\n\nContinue?";
-        if (show_app_message(prompt, axiom::gui::MessageDialogIcon::warning,
-                             L"Synchronize archive",
-                             axiom::gui::MessageDialogButtons::yes_no,
-                             IDNO) != IDYES) {
-            return;
-        }
-    }
 
     create_archive_from_paths(std::move(source.paths), *archive, mode,
                               std::move(source.mapped_inputs));
@@ -3140,13 +3644,25 @@ void MainWindow::on_compress() {
     const auto mapped_inputs = mapped_inputs_;
     auto options = compression_options();
     const auto mode = pending_archive_features_.update_mode;
+    const std::string snapshot_name = pending_snapshot_name_;
+    if (!snapshot_name.empty() &&
+        (output_format != axiom::ArchiveFormat::axar ||
+         mode != axiom::gui::ArchiveUpdateMode::create_new ||
+         !mapped_inputs.empty())) {
+        show_app_message(
+            L"Snapshot repositories must be created as a new AXAR archive from "
+            L"ordinary file or folder inputs.",
+            axiom::gui::MessageDialogIcon::warning,
+            L"Create snapshot repository");
+        return;
+    }
     axiom::gui::apply_content_dedup_options(
         pending_archive_features_,
         output_format == axiom::ArchiveFormat::axar &&
             mode == axiom::gui::ArchiveUpdateMode::create_new,
         options);
     options.skip_unreadable_files =
-        mode == axiom::gui::ArchiveUpdateMode::create_new;
+        mode == axiom::gui::ArchiveUpdateMode::create_new && snapshot_name.empty();
     options.encrypt_header = pending_archive_features_.encrypt_names;
     options.recovery_percent = static_cast<unsigned>(
         std::clamp(pending_archive_features_.recovery_percent, 0, 100));
@@ -3177,6 +3693,16 @@ void MainWindow::on_compress() {
     const bool lock_after = pending_archive_features_.lock_archive;
     const bool sign_after = pending_archive_features_.sign_archive;
     const bool create_sfx_after = pending_archive_features_.create_sfx;
+    if (!snapshot_name.empty() &&
+        (split_after || recovery_volumes || lock_after || sign_after ||
+         create_sfx_after)) {
+        show_app_message(
+            L"Snapshot repositories must remain appendable. Split volumes, recovery "
+            L"volumes, locking, signing, and SFX output are unavailable during creation.",
+            axiom::gui::MessageDialogIcon::warning,
+            L"Create snapshot repository");
+        return;
+    }
     const bool native_archive = output_format == axiom::ArchiveFormat::axar;
     const bool zip_archive = output_format == axiom::ArchiveFormat::zip;
     if (!native_archive &&
@@ -3254,6 +3780,10 @@ void MainWindow::on_compress() {
 
     std::wstring running = L"Compressing...";
     std::wstring success = L"Archive created: " + archive.wstring();
+    if (!snapshot_name.empty()) {
+        running = L"Creating snapshot repository...";
+        success = L"Snapshot repository created: " + archive.wstring();
+    }
     switch (mode) {
         case axiom::gui::ArchiveUpdateMode::add_or_replace:
             running = L"Adding to archive...";
@@ -3290,11 +3820,12 @@ void MainWindow::on_compress() {
         axiom::gui::sfx_config_from_features(pending_archive_features_));
     const auto sfx_tier =
         axiom::gui::sfx_stub_tier_from_features(pending_archive_features_);
+    pending_snapshot_name_.clear();
     start_operation(std::move(running), std::move(success),
                     [inputs, mapped_inputs, archive, options, mode, comment, set_comment,
                      repack_after, lock_after, sign_after, signing_key,
                      create_sfx_after, sfx_output, split_after, sfx_config, sfx_tier,
-                     volume_size = *volume_size, recovery_volumes](
+                     snapshot_name, volume_size = *volume_size, recovery_volumes](
                         std::shared_ptr<axiom::OperationControl> operation) mutable {
                         auto run_options = options;
                         run_options.operation = operation;
@@ -3354,7 +3885,10 @@ void MainWindow::on_compress() {
                                     }
                                     break;
                                 default:
-                                    if (provider->info().format ==
+                                    if (!snapshot_name.empty()) {
+                                        axiom::create_snapshot_archive(
+                                            inputs, archive, snapshot_name, run_options);
+                                    } else if (provider->info().format ==
                                             axiom::ArchiveFormat::zip && split_after) {
                                         axiom::ArchiveCreateRequest request;
                                         request.inputs = inputs;
@@ -3532,6 +4066,11 @@ void MainWindow::on_verify_archive_signature() {
 }
 
 void MainWindow::on_extract() {
+    std::vector<fs::path> selected_archives = selected_filesystem_archives();
+    if (selected_archives.size() > 1) {
+        on_extract_multiple(std::move(selected_archives));
+        return;
+    }
     const auto archive = active_archive_path();
     if (!archive) {
         show_app_message(L"Open or select a supported archive first.",
@@ -3652,6 +4191,217 @@ void MainWindow::on_extract() {
                             provider->extract_all(archive, output, retry_options);
                         }
                     });
+}
+
+void MainWindow::on_extract_multiple(std::vector<fs::path> archives) {
+    if (busy_ || archives.size() < 2) return;
+    set_busy(true);
+    begin_background_ui_task(
+        L"Analyzing selected archives...",
+        [archives = std::move(archives), this]() mutable {
+            std::vector<fs::path> canonical_archives;
+            canonical_archives.reserve(archives.size());
+            for (fs::path archive : archives) {
+                if (axiom::is_axiom_archive_volume(archive)) {
+                    archive = axiom::archive_volume_primary_path(archive);
+                } else if (auto primary = named_split_primary(archive)) {
+                    archive = std::move(*primary);
+                } else {
+                    const std::wstring extension = archive.extension().wstring();
+                    if (extension.size() >= 3 &&
+                        (extension[1] == L'z' || extension[1] == L'Z') &&
+                        std::all_of(extension.begin() + 2, extension.end(),
+                                    [](wchar_t ch) { return std::iswdigit(ch) != 0; })) {
+                        fs::path final_volume = archive;
+                        final_volume.replace_extension(L".zip");
+                        std::error_code exists_error;
+                        if (fs::exists(final_volume, exists_error)) {
+                            archive = std::move(final_volume);
+                        }
+                    }
+                }
+                if (std::none_of(canonical_archives.begin(), canonical_archives.end(),
+                                 [&archive](const fs::path& existing) {
+                                     return same_filesystem_path(existing, archive);
+                                 })) {
+                    canonical_archives.push_back(std::move(archive));
+                }
+            }
+            archives = std::move(canonical_archives);
+            std::vector<const axiom::ArchiveProvider*> providers;
+            std::vector<ArchiveCapabilities> capabilities;
+            std::wstring error;
+            providers.reserve(archives.size());
+            capabilities.reserve(archives.size());
+            for (const fs::path& archive : archives) {
+                try {
+                    const auto* provider = axiom::archive_provider_for_path(archive);
+                    if (provider == nullptr) {
+                        error = L"Axiom does not recognize this selected archive:\n\n" +
+                                archive.wstring();
+                        break;
+                    }
+                    const ArchiveCapabilities probed = provider->capabilities(archive);
+                    if (!probed.extract && !probed.encrypted) {
+                        error = L"This selected archive cannot be extracted:\n\n" +
+                                archive.wstring();
+                        break;
+                    }
+                    providers.push_back(provider);
+                    capabilities.push_back(probed);
+                } catch (const std::exception& caught) {
+                    error = L"Axiom could not inspect this selected archive:\n\n" +
+                            archive.wstring() + L"\n\n" + widen(caught.what());
+                    break;
+                } catch (...) {
+                    error = L"Axiom could not inspect this selected archive:\n\n" +
+                            archive.wstring();
+                    break;
+                }
+            }
+            return [this, archives = std::move(archives),
+                    providers = std::move(providers),
+                    capabilities = std::move(capabilities),
+                    error = std::move(error)]() mutable {
+                set_busy(false);
+                if (!error.empty()) {
+                    show_app_message(error, MessageDialogIcon::warning,
+                                     L"Extract selected archives");
+                    return;
+                }
+                on_extract_multiple_ready(
+                    std::move(archives), std::move(providers),
+                    std::move(capabilities));
+            };
+        });
+}
+
+void MainWindow::on_extract_multiple_ready(
+    std::vector<fs::path> archives,
+    std::vector<const axiom::ArchiveProvider*> providers,
+    std::vector<ArchiveCapabilities> capabilities) {
+    if (busy_ || archives.empty() || providers.size() != archives.size() ||
+        capabilities.size() != archives.size()) {
+        return;
+    }
+    struct BatchItem {
+        fs::path archive;
+        const axiom::ArchiveProvider* provider = nullptr;
+        std::string password;
+    };
+    std::vector<BatchItem> items;
+    items.reserve(archives.size());
+    const auto clear_batch_passwords = [&items] {
+        for (auto& item : items) secure_clear(item.password);
+    };
+    for (std::size_t index = 0; index < archives.size(); ++index) {
+        const fs::path& archive = archives[index];
+        std::string password;
+        if (capabilities[index].encrypted) {
+            if (show_app_message(
+                    L"Enter the password for:\n\n" + archive.filename().wstring(),
+                    MessageDialogIcon::information,
+                    L"Encrypted archive",
+                    MessageDialogButtons::ok_cancel,
+                    IDOK) != IDOK) {
+                clear_batch_passwords();
+                return;
+            }
+            std::wstring entered;
+            if (!show_archive_password_dialog(hwnd_, entered)) {
+                clear_batch_passwords();
+                return;
+            }
+            password = utf8(entered);
+            secure_clear(entered);
+        }
+        try {
+            items.push_back({archive, providers[index], std::move(password)});
+        } catch (...) {
+            secure_clear(password);
+            clear_batch_passwords();
+            show_app_message(L"Axiom could not prepare the selected archive batch.",
+                             MessageDialogIcon::error, L"Extract selected archives");
+            return;
+        }
+    }
+
+    ExtractArchiveDialogOptions dialog_options;
+    dialog_options.thread_count = application_options_.default_thread_count;
+    if (application_options_.extract_destination_mode == 1 &&
+        !persisted_settings_.last_extract_destination_folder.empty()) {
+        dialog_options.destination = persisted_settings_.last_extract_destination_folder;
+    } else if (application_options_.extract_destination_mode == 2 &&
+               !application_options_.extract_destination_folder.empty()) {
+        dialog_options.destination = application_options_.extract_destination_folder;
+    } else {
+        dialog_options.destination = archives.front().parent_path();
+    }
+    const fs::path dialog_label(
+        std::to_wstring(archives.size()) + L" selected archives (one folder each)");
+    if (!show_extract_archive_dialog(hwnd_, dialog_label, dialog_options)) {
+        clear_batch_passwords();
+        return;
+    }
+    persisted_settings_.last_extract_destination_folder =
+        dialog_options.destination.wstring();
+    save_current_settings();
+
+    const std::vector<fs::path> destinations =
+        batch_extraction_destinations(dialog_options.destination, archives);
+    if (!dialog_options.overwrite) {
+        const auto collision = std::find_if(
+            destinations.begin(), destinations.end(), [](const fs::path& destination) {
+                std::error_code error;
+                return fs::exists(destination, error);
+            });
+        if (collision != destinations.end()) {
+            clear_batch_passwords();
+            show_app_message(
+                L"A destination folder already exists:\n\n" + collision->wstring() +
+                    L"\n\nChoose another root folder or enable overwrite.",
+                MessageDialogIcon::warning, L"Extract selected archives");
+            return;
+        }
+    }
+
+    ExtractOptions common_options;
+    common_options.thread_count = dialog_options.thread_count;
+    common_options.io_buffer_size = configured_io_buffer_size(application_options_);
+    common_options.restore_mtime = dialog_options.restore_mtime;
+    common_options.overwrite = dialog_options.overwrite
+        ? ExtractOptions::Overwrite::overwrite
+        : ExtractOptions::Overwrite::fail;
+    const std::size_t count = items.size();
+    operation_archive_output_.clear();
+    start_operation(
+        L"Extracting selected archives...",
+        quote_count(count, L"archive extracted.", L"archives extracted."),
+        [items = std::move(items), destinations, common_options](
+            std::shared_ptr<OperationControl> operation) mutable {
+            const auto phase_count = static_cast<std::uint32_t>(std::min<std::size_t>(
+                items.size(), std::numeric_limits<std::uint32_t>::max()));
+            for (std::size_t index = 0; index < items.size(); ++index) {
+                operation->checkpoint();
+                operation->set_progress_phase(
+                    static_cast<std::uint32_t>(std::min<std::size_t>(
+                        index, std::numeric_limits<std::uint32_t>::max() - 1)),
+                    phase_count);
+                auto options = common_options;
+                options.password = std::move(items[index].password);
+                options.operation = operation;
+                try {
+                    items[index].provider->extract_all(
+                        items[index].archive, destinations[index], options);
+                } catch (...) {
+                    secure_clear(options.password);
+                    for (auto& item : items) secure_clear(item.password);
+                    throw;
+                }
+                secure_clear(options.password);
+            }
+            operation->set_progress_phase(0, 0);
+        });
 }
 
 void MainWindow::on_test() {

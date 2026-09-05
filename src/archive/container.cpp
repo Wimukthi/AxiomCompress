@@ -35,6 +35,7 @@
 #include <mutex>
 #include <numeric>
 #include <optional>
+#include <set>
 #include <sstream>
 #include <span>
 #include <stdexcept>
@@ -7494,6 +7495,240 @@ void require_chunk_profile(const ArchiveIndex& index) {
     }
 }
 
+bool same_snapshot_entry(const EntryRec& left, const EntryRec& right) {
+    const auto same_blobs = [](const auto& first, const auto& second) {
+        if (first.size() != second.size()) return false;
+        return std::equal(first.begin(), first.end(), second.begin(),
+                          [](const auto& a, const auto& b) {
+                              return a.name == b.name && a.data == b.data;
+                          });
+    };
+    const auto same_metadata = [&](const core::FileMetadata& first,
+                                   const core::FileMetadata& second) {
+        return first.has_windows_attributes == second.has_windows_attributes &&
+               (!first.has_windows_attributes ||
+                first.windows_attributes == second.windows_attributes) &&
+               first.has_windows_times == second.has_windows_times &&
+               (!first.has_windows_times ||
+                (first.windows_creation_time == second.windows_creation_time &&
+                 first.windows_access_time == second.windows_access_time &&
+                 first.windows_write_time == second.windows_write_time)) &&
+               first.has_posix == second.has_posix &&
+               (!first.has_posix ||
+                (first.posix_mode == second.posix_mode &&
+                 first.posix_uid == second.posix_uid &&
+                 first.posix_gid == second.posix_gid)) &&
+               first.has_windows_security_descriptor ==
+                   second.has_windows_security_descriptor &&
+               (!first.has_windows_security_descriptor ||
+                first.windows_security_descriptor == second.windows_security_descriptor) &&
+               same_blobs(first.xattrs, second.xattrs) &&
+               first.has_reparse_data == second.has_reparse_data &&
+               (!first.has_reparse_data ||
+                (first.reparse_tag == second.reparse_tag &&
+                 first.reparse_data == second.reparse_data));
+    };
+    const auto same_sparse_map = [](const core::SparseFileMap& first,
+                                    const core::SparseFileMap& second) {
+        if (first.is_sparse != second.is_sparse ||
+            first.allocated.size() != second.allocated.size()) {
+            return false;
+        }
+        return std::equal(first.allocated.begin(), first.allocated.end(),
+                          second.allocated.begin(),
+                          [](const core::SparseExtent& a,
+                             const core::SparseExtent& b) {
+                              return a.offset == b.offset && a.length == b.length;
+                          });
+    };
+    return left.type == right.type && left.path == right.path &&
+           left.size == right.size && left.mtime == right.mtime &&
+           left.crc == right.crc && left.has_blake3 == right.has_blake3 &&
+           (!left.has_blake3 || left.blake3 == right.blake3) &&
+           left.chunk_refs == right.chunk_refs &&
+           left.link_target == right.link_target &&
+           same_blobs(left.ads, right.ads) &&
+           same_metadata(left.meta, right.meta) &&
+           same_sparse_map(left.sparse, right.sparse);
+}
+
+std::vector<ArchiveSnapshotChange> snapshot_changes(
+    const std::vector<EntryRec>& before_entries,
+    const std::vector<EntryRec>& after_entries) {
+    std::map<std::string, const EntryRec*> before;
+    std::map<std::string, const EntryRec*> after;
+    for (const auto& entry : before_entries) before.emplace(entry.path, &entry);
+    for (const auto& entry : after_entries) after.emplace(entry.path, &entry);
+
+    std::vector<ArchiveSnapshotChange> result;
+    auto before_it = before.begin();
+    auto after_it = after.begin();
+    while (before_it != before.end() || after_it != after.end()) {
+        if (after_it == after.end() ||
+            (before_it != before.end() && before_it->first < after_it->first)) {
+            result.push_back({before_it->first, ArchiveSnapshotChangeKind::removed,
+                              before_it->second->size, 0});
+            ++before_it;
+            continue;
+        }
+        if (before_it == before.end() || after_it->first < before_it->first) {
+            result.push_back({after_it->first, ArchiveSnapshotChangeKind::added,
+                              0, after_it->second->size});
+            ++after_it;
+            continue;
+        }
+        if (!same_snapshot_entry(*before_it->second, *after_it->second)) {
+            result.push_back({after_it->first, ArchiveSnapshotChangeKind::modified,
+                              before_it->second->size, after_it->second->size});
+        }
+        ++before_it;
+        ++after_it;
+    }
+    return result;
+}
+
+std::uint64_t checked_storage_sum(std::uint64_t total, std::uint64_t value,
+                                  const char* field) {
+    if (value > std::numeric_limits<std::uint64_t>::max() - total) {
+        throw FormatError(std::string("archive storage ") + field + " overflows");
+    }
+    return total + value;
+}
+
+struct ArchiveStorageUsage {
+    std::uint64_t logical_bytes = 0;
+    std::set<std::uint64_t> chunks;
+    std::set<std::uint64_t> blocks;
+};
+
+ArchiveStorageUsage storage_usage_for_entries(const std::vector<EntryRec>& entries,
+                                               const ArchiveIndex& index) {
+    ArchiveStorageUsage usage;
+    for (const auto& entry : entries) {
+        if (entry.type != kEntryFile) continue;
+        usage.logical_bytes = checked_storage_sum(
+            usage.logical_bytes, entry.size, "logical byte count");
+        if (!entry.chunk_refs.empty()) {
+            for (const auto ref : entry.chunk_refs) {
+                if (ref >= index.chunks.size()) {
+                    throw FormatError("snapshot entry points outside the chunk table");
+                }
+                usage.chunks.insert(ref);
+                const auto block = index.chunks[static_cast<std::size_t>(ref)].block_index;
+                if (block >= index.blocks.size()) {
+                    throw FormatError("archive chunk points outside the block table");
+                }
+                usage.blocks.insert(block);
+            }
+            continue;
+        }
+        std::uint64_t remaining = entry.size;
+        std::uint64_t block_index = entry.first_block;
+        std::uint64_t offset = entry.offset;
+        while (remaining != 0) {
+            if (block_index >= index.blocks.size()) {
+                throw FormatError("file extends past the last block");
+            }
+            const auto& block = index.blocks[static_cast<std::size_t>(block_index)];
+            if (offset >= block.uncompressed_size || block.uncompressed_size == 0) {
+                throw FormatError("file offset lies outside its block");
+            }
+            usage.blocks.insert(block_index);
+            const auto take = std::min(remaining, block.uncompressed_size - offset);
+            remaining -= take;
+            offset = 0;
+            ++block_index;
+        }
+    }
+    return usage;
+}
+
+std::uint64_t storage_chunk_bytes(const std::set<std::uint64_t>& chunks,
+                                  const ArchiveIndex& index) {
+    std::uint64_t total = 0;
+    for (const auto chunk : chunks) {
+        if (chunk >= index.chunks.size()) {
+            throw FormatError("archive storage chunk index is invalid");
+        }
+        total = checked_storage_sum(
+            total, index.chunks[static_cast<std::size_t>(chunk)].identity.size,
+            "content byte count");
+    }
+    return total;
+}
+
+std::uint64_t storage_block_bytes(const std::set<std::uint64_t>& blocks,
+                                  const ArchiveIndex& index, bool compressed) {
+    std::uint64_t total = 0;
+    for (const auto block : blocks) {
+        if (block >= index.blocks.size()) {
+            throw FormatError("archive storage block index is invalid");
+        }
+        const auto& record = index.blocks[static_cast<std::size_t>(block)];
+        total = checked_storage_sum(total,
+                                    compressed ? record.compressed_size
+                                               : record.uncompressed_size,
+                                    compressed ? "stored payload" : "content byte count");
+    }
+    return total;
+}
+
+std::uint64_t storage_content_bytes(const ArchiveStorageUsage& usage,
+                                    const ArchiveIndex& index) {
+    return index.meta.chunk_table
+        ? storage_chunk_bytes(usage.chunks, index)
+        : storage_block_bytes(usage.blocks, index, false);
+}
+
+std::optional<std::uint64_t> storage_entry_packed_bytes(
+    const EntryRec& entry, const ArchiveIndex& index, bool& estimated) {
+    estimated = false;
+    if (entry.type != kEntryFile) return std::nullopt;
+    if (entry.size == 0) return std::uint64_t{0};
+    if (!entry.chunk_refs.empty()) {
+        std::uint64_t packed = 0;
+        for (const auto ref : entry.chunk_refs) {
+            if (ref >= index.chunks.size()) {
+                throw FormatError("snapshot entry points outside the chunk table");
+            }
+            const auto block = index.chunks[static_cast<std::size_t>(ref)].block_index;
+            if (block >= index.blocks.size()) {
+                throw FormatError("archive chunk points outside the block table");
+            }
+            packed = checked_storage_sum(
+                packed, index.blocks[static_cast<std::size_t>(block)].compressed_size,
+                "file packed size");
+        }
+        return packed;
+    }
+
+    std::uint64_t remaining = entry.size;
+    std::uint64_t block_index = entry.first_block;
+    std::uint64_t offset = entry.offset;
+    long double packed = 0.0L;
+    while (remaining != 0) {
+        if (block_index >= index.blocks.size()) {
+            throw FormatError("file extends past the last block");
+        }
+        const auto& block = index.blocks[static_cast<std::size_t>(block_index)];
+        if (offset >= block.uncompressed_size || block.uncompressed_size == 0) {
+            throw FormatError("file offset lies outside its block");
+        }
+        const auto take = std::min(remaining, block.uncompressed_size - offset);
+        packed += static_cast<long double>(take) *
+                  static_cast<long double>(block.compressed_size) /
+                  static_cast<long double>(block.uncompressed_size);
+        remaining -= take;
+        offset = 0;
+        ++block_index;
+    }
+    estimated = true;
+    if (packed > static_cast<long double>(std::numeric_limits<std::uint64_t>::max())) {
+        return std::numeric_limits<std::uint64_t>::max();
+    }
+    return std::max<std::uint64_t>(1, static_cast<std::uint64_t>(packed + 0.5L));
+}
+
 enum class PasswordMutation {
     add,
     remove,
@@ -8074,92 +8309,145 @@ std::vector<ArchiveSnapshotChange> diff_archive_snapshots(
     const auto& from = find_snapshot(loaded.index.meta, from_snapshot);
     const auto& to = find_snapshot(loaded.index.meta, to_snapshot);
 
-    const auto same_entry = [](const EntryRec& left, const EntryRec& right) {
-        const auto same_blobs = [](const auto& first, const auto& second) {
-            if (first.size() != second.size()) return false;
-            return std::equal(first.begin(), first.end(), second.begin(),
-                              [](const auto& a, const auto& b) {
-                                  return a.name == b.name && a.data == b.data;
-                              });
-        };
-        const auto same_metadata = [&](const core::FileMetadata& first,
-                                       const core::FileMetadata& second) {
-            return first.has_windows_attributes == second.has_windows_attributes &&
-                   (!first.has_windows_attributes ||
-                    first.windows_attributes == second.windows_attributes) &&
-                   first.has_windows_times == second.has_windows_times &&
-                   (!first.has_windows_times ||
-                    (first.windows_creation_time == second.windows_creation_time &&
-                     first.windows_access_time == second.windows_access_time &&
-                     first.windows_write_time == second.windows_write_time)) &&
-                   first.has_posix == second.has_posix &&
-                   (!first.has_posix ||
-                    (first.posix_mode == second.posix_mode &&
-                     first.posix_uid == second.posix_uid &&
-                     first.posix_gid == second.posix_gid)) &&
-                   first.has_windows_security_descriptor ==
-                       second.has_windows_security_descriptor &&
-                   (!first.has_windows_security_descriptor ||
-                    first.windows_security_descriptor == second.windows_security_descriptor) &&
-                   same_blobs(first.xattrs, second.xattrs) &&
-                   first.has_reparse_data == second.has_reparse_data &&
-                   (!first.has_reparse_data ||
-                    (first.reparse_tag == second.reparse_tag &&
-                     first.reparse_data == second.reparse_data));
-        };
-        const auto same_sparse_map = [](const core::SparseFileMap& first,
-                                        const core::SparseFileMap& second) {
-            if (first.is_sparse != second.is_sparse ||
-                first.allocated.size() != second.allocated.size()) {
-                return false;
+    return snapshot_changes(from.entries, to.entries);
+}
+
+ArchiveStorageAnalysis analyze_archive_storage(
+    const std::filesystem::path& archive_path, const std::string& password) {
+    std::uint64_t physical_size = 0;
+    auto input = open_archive(archive_path, physical_size);
+    const ByteSource source(input, physical_size);
+    auto loaded = load_index(source, password);
+    OptionalKeyWipeGuard key_wipe{loaded.key};
+    const auto& index = loaded.index;
+
+    ArchiveStorageAnalysis result;
+    result.physical_bytes = physical_size;
+    result.physical_layout_exact = true;
+    result.packed_sizes_complete = true;
+    result.snapshot_repository =
+        index.meta.chunk_table && !index.meta.snapshots.empty();
+    result.deduplicated = index.meta.chunk_table || index.meta.live_dedup;
+
+    const auto current_usage = storage_usage_for_entries(index.entries, index);
+    result.logical_bytes = current_usage.logical_bytes;
+
+    ArchiveStorageUsage retained_usage;
+    if (result.snapshot_repository) {
+        std::set<std::uint64_t> cumulative_chunks;
+        std::set<std::uint64_t> cumulative_blocks;
+        const std::vector<EntryRec> empty_entries;
+        const std::vector<EntryRec>* previous_entries = &empty_entries;
+        result.snapshots.reserve(index.meta.snapshots.size());
+        for (std::size_t snapshot_index = 0;
+             snapshot_index < index.meta.snapshots.size(); ++snapshot_index) {
+            const auto& snapshot = index.meta.snapshots[snapshot_index];
+            const auto usage = storage_usage_for_entries(snapshot.entries, index);
+            result.referenced_logical_bytes = checked_storage_sum(
+                result.referenced_logical_bytes, usage.logical_bytes,
+                "referenced logical byte count");
+
+            ArchiveSnapshotStorageInfo info;
+            info.snapshot.name = snapshot.name;
+            info.snapshot.generation = snapshot.generation;
+            info.snapshot.created = snapshot.created;
+            info.snapshot.entry_count = snapshot.entries.size();
+            info.snapshot.file_bytes = usage.logical_bytes;
+            info.snapshot.current = snapshot_index + 1 == index.meta.snapshots.size();
+            info.unique_content_bytes = storage_content_bytes(usage, index);
+            info.stored_payload_bytes = storage_block_bytes(usage.blocks, index, true);
+
+            std::set<std::uint64_t> new_chunks;
+            std::set<std::uint64_t> new_blocks;
+            std::set_difference(usage.chunks.begin(), usage.chunks.end(),
+                                cumulative_chunks.begin(), cumulative_chunks.end(),
+                                std::inserter(new_chunks, new_chunks.end()));
+            std::set_difference(usage.blocks.begin(), usage.blocks.end(),
+                                cumulative_blocks.begin(), cumulative_blocks.end(),
+                                std::inserter(new_blocks, new_blocks.end()));
+            info.new_content_bytes = index.meta.chunk_table
+                ? storage_chunk_bytes(new_chunks, index)
+                : storage_block_bytes(new_blocks, index, false);
+            info.new_stored_bytes = storage_block_bytes(new_blocks, index, true);
+            info.changes = snapshot_changes(*previous_entries, snapshot.entries);
+            for (const auto& change : info.changes) {
+                switch (change.kind) {
+                    case ArchiveSnapshotChangeKind::added: ++info.added_entries; break;
+                    case ArchiveSnapshotChangeKind::modified: ++info.modified_entries; break;
+                    case ArchiveSnapshotChangeKind::removed: ++info.removed_entries; break;
+                }
             }
-            return std::equal(first.allocated.begin(), first.allocated.end(),
-                              second.allocated.begin(),
-                              [](const core::SparseExtent& a,
-                                 const core::SparseExtent& b) {
-                                  return a.offset == b.offset && a.length == b.length;
-                              });
-        };
-        return left.type == right.type && left.path == right.path &&
-               left.size == right.size && left.mtime == right.mtime &&
-               left.crc == right.crc && left.has_blake3 == right.has_blake3 &&
-               (!left.has_blake3 || left.blake3 == right.blake3) &&
-               left.chunk_refs == right.chunk_refs &&
-               left.link_target == right.link_target &&
-               same_blobs(left.ads, right.ads) &&
-               same_metadata(left.meta, right.meta) &&
-               same_sparse_map(left.sparse, right.sparse);
-    };
+            result.snapshots.push_back(std::move(info));
 
-    std::map<std::string, const EntryRec*> before;
-    std::map<std::string, const EntryRec*> after;
-    for (const auto& entry : from.entries) before.emplace(entry.path, &entry);
-    for (const auto& entry : to.entries) after.emplace(entry.path, &entry);
-
-    std::vector<ArchiveSnapshotChange> result;
-    auto before_it = before.begin();
-    auto after_it = after.begin();
-    while (before_it != before.end() || after_it != after.end()) {
-        if (after_it == after.end() ||
-            (before_it != before.end() && before_it->first < after_it->first)) {
-            result.push_back({before_it->first, ArchiveSnapshotChangeKind::removed,
-                              before_it->second->size, 0});
-            ++before_it;
-            continue;
+            cumulative_chunks.insert(usage.chunks.begin(), usage.chunks.end());
+            cumulative_blocks.insert(usage.blocks.begin(), usage.blocks.end());
+            retained_usage.chunks.insert(usage.chunks.begin(), usage.chunks.end());
+            retained_usage.blocks.insert(usage.blocks.begin(), usage.blocks.end());
+            previous_entries = &snapshot.entries;
         }
-        if (before_it == before.end() || after_it->first < before_it->first) {
-            result.push_back({after_it->first, ArchiveSnapshotChangeKind::added,
-                              0, after_it->second->size});
-            ++after_it;
-            continue;
-        }
-        if (!same_entry(*before_it->second, *after_it->second)) {
-            result.push_back({after_it->first, ArchiveSnapshotChangeKind::modified,
-                              before_it->second->size, after_it->second->size});
-        }
-        ++before_it;
-        ++after_it;
+    } else {
+        result.referenced_logical_bytes = current_usage.logical_bytes;
+        retained_usage = current_usage;
     }
+
+    result.unique_content_bytes = storage_content_bytes(retained_usage, index);
+    result.stored_payload_bytes = storage_block_bytes(retained_usage.blocks, index, true);
+    if (result.referenced_logical_bytes > result.unique_content_bytes) {
+        result.deduplication_saved_bytes =
+            result.referenced_logical_bytes - result.unique_content_bytes;
+    }
+    if (result.unique_content_bytes > result.stored_payload_bytes) {
+        result.compression_saved_bytes =
+            result.unique_content_bytes - result.stored_payload_bytes;
+    }
+
+    std::uint64_t all_payload_bytes = 0;
+    for (const auto& block : index.blocks) {
+        all_payload_bytes = checked_storage_sum(
+            all_payload_bytes, block.compressed_size, "total stored payload");
+    }
+    if (all_payload_bytes > result.physical_bytes ||
+        result.stored_payload_bytes > all_payload_bytes) {
+        throw FormatError("archive storage accounting exceeds the physical file size");
+    }
+    result.unreferenced_payload_bytes = all_payload_bytes - result.stored_payload_bytes;
+    result.metadata_and_service_bytes = result.physical_bytes - all_payload_bytes;
+
+    if (result.snapshot_repository) {
+        std::set<std::uint64_t> history_chunks;
+        std::set<std::uint64_t> history_blocks;
+        std::set_difference(retained_usage.chunks.begin(), retained_usage.chunks.end(),
+                            current_usage.chunks.begin(), current_usage.chunks.end(),
+                            std::inserter(history_chunks, history_chunks.end()));
+        std::set_difference(retained_usage.blocks.begin(), retained_usage.blocks.end(),
+                            current_usage.blocks.begin(), current_usage.blocks.end(),
+                            std::inserter(history_blocks, history_blocks.end()));
+        result.history_only_content_bytes = index.meta.chunk_table
+            ? storage_chunk_bytes(history_chunks, index)
+            : storage_block_bytes(history_blocks, index, false);
+        result.history_only_stored_bytes =
+            storage_block_bytes(history_blocks, index, true);
+    }
+
+    result.files.reserve(index.entries.size());
+    for (const auto& entry : index.entries) {
+        if (entry.type != kEntryFile) continue;
+        ArchiveStorageFileInfo file;
+        file.path = entry.path;
+        file.logical_bytes = entry.size;
+        file.chunk_count = entry.chunk_refs.size();
+        file.packed_bytes = storage_entry_packed_bytes(
+            entry, index, file.packed_bytes_estimated);
+        result.files.push_back(std::move(file));
+    }
+    std::sort(result.files.begin(), result.files.end(),
+              [](const ArchiveStorageFileInfo& left,
+                 const ArchiveStorageFileInfo& right) {
+                  if (left.logical_bytes != right.logical_bytes) {
+                      return left.logical_bytes > right.logical_bytes;
+                  }
+                  return left.path < right.path;
+              });
     return result;
 }
 

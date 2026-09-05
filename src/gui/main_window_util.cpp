@@ -575,43 +575,10 @@ apply_dialog_dark_frame(hwnd, dark);
 }
 
 bool is_button_id(UINT id) {
-switch (id) {
-    case kAddFiles:
-    case kOpenArchive:
-    case kExtract:
-    case kTest:
-    case kUpdateArchive:
-    case kSynchronizeArchive:
-    case kDeleteArchiveEntries:
-    case kRepackArchive:
-    case kEditArchiveComment:
-    case kLockArchive:
-    case kRepairArchive:
-    case kVerifyArchiveSignature:
-    case kCreateSfx:
-    case kFreshenArchive:
-    case kBenchmark:
-    case kFind:
-    case kCopyPath:
-    case kCopyCrc32:
-    case kAddFavorite:
-    case kRemoveFavorite:
-    case kToggleTreePane:
-    case kNavigateBack:
-    case kNavigateForward:
-    case kNavigateUp:
-    case kNavigateRefresh:
-    case kAddressGo:
-    case kView:
-    case kDelete:
-    case kSelectAll:
-    case kInfo:
-    case kSettings:
-    case kCheckUpdates:
-        return true;
-    default:
-        return false;
-}
+    // Icon-bearing buttons are already enumerated by the renderer. Avoid a
+    // second command list that can silently omit a newly customizable button.
+    return id == kFilterClear ||
+           toolbar_icon_for_button(id) != axiom::gui::ToolbarIcon::none;
 }
 
 bool is_icon_only_button(UINT id) {

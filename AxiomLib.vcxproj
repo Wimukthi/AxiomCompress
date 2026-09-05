@@ -91,6 +91,7 @@
     <ClInclude Include="src\core\checksum.hpp" />
     <ClInclude Include="src\core\cpu.hpp" />
     <ClInclude Include="src\core\benchmark_corpus.hpp" />
+    <ClInclude Include="src\core\benchmark_statistics.hpp" />
     <ClInclude Include="src\core\crypto.hpp" />
     <ClInclude Include="src\core\file_meta.hpp" />
     <ClInclude Include="src\core\path_text.hpp" />
@@ -144,6 +145,7 @@
     <ClCompile Include="src\codec\transform.cpp" />
     <ClCompile Include="src\core\archive.cpp" />
     <ClCompile Include="src\core\benchmark_corpus.cpp" />
+    <ClCompile Include="src\core\benchmark_statistics.cpp" />
     <ClCompile Include="src\core\checksum.cpp" />
     <ClCompile Include="src\core\checksum_clmul.cpp" />
     <ClCompile Include="src\core\compression_estimator.cpp" />

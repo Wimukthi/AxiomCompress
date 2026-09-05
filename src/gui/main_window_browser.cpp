@@ -762,6 +762,16 @@ void MainWindow::update_browser_status(const std::vector<int>* selected_indices)
         text += format_size(totals.packed);
         text += L" packed";
     }
+    if (!browser_filter_.empty()) {
+        const std::size_t complete_count = static_cast<std::size_t>(std::count_if(
+            browser_all_items_.begin(), browser_all_items_.end(),
+            [](const BrowserItem& item) { return !item.is_parent(); }));
+        text += L" | Filtered ";
+        text += std::to_wstring(browser_status_totals_.items);
+        text += L" of ";
+        text += std::to_wstring(complete_count);
+        text += L" items";
+    }
     const std::wstring suffix = status_location_suffix();
     if (!suffix.empty()) {
         text += L" | ";
@@ -966,6 +976,7 @@ void MainWindow::navigate_to(axiom::gui::BrowserLocation location, bool record_h
     remember_address(location.display_name());
     table_.clear();
     browser_items_.clear();
+    browser_all_items_.clear();
     set_status(L"Loading " + location.display_name() + L"...");
 
     const std::uint64_t generation = ++browser_generation_;
@@ -1027,7 +1038,7 @@ void MainWindow::sort_browser_items_for_table() {
             item.kind == axiom::gui::BrowserItemKind::directory) return 1;
         return 2;
     };
-    std::stable_sort(browser_items_.begin(), browser_items_.end(),
+    std::stable_sort(browser_all_items_.begin(), browser_all_items_.end(),
                      [&](const auto& left, const auto& right) {
         if (rank(left) != rank(right)) return rank(left) < rank(right);
         int comparison = 0;
@@ -1036,6 +1047,34 @@ void MainWindow::sort_browser_items_for_table() {
         if (comparison == 0) comparison = _wcsicmp(left.name.c_str(), right.name.c_str());
         return sort_ascending_ ? comparison < 0 : comparison > 0;
     });
+    rebuild_filtered_browser_items();
+}
+
+std::vector<fs::path> MainWindow::selected_filesystem_archives() const {
+    std::vector<fs::path> result;
+    for (int index : selected_browser_indices()) {
+        const auto& item = browser_items_[static_cast<std::size_t>(index)];
+        if (item.kind == BrowserItemKind::archive &&
+            !item.filesystem_path.empty()) {
+            result.push_back(item.filesystem_path);
+        }
+    }
+    return result;
+}
+
+void MainWindow::rebuild_filtered_browser_items() {
+    browser_items_.clear();
+    browser_items_.reserve(browser_all_items_.size());
+    for (const BrowserItem& item : browser_all_items_) {
+        if (browser_item_matches_filter(item, browser_filter_)) {
+            browser_items_.push_back(item);
+        }
+    }
+    browser_status_totals_ = {};
+    for (const BrowserItem& item : browser_items_) {
+        add_status_item(browser_status_totals_, item);
+    }
+    update_filter_popup_summary();
 }
 
 std::vector<std::wstring> MainWindow::browser_row_for_item(
@@ -1270,20 +1309,25 @@ void MainWindow::on_browser_loaded(LPARAM lparam) {
     }
 
     if (result->archive_catalog) archive_catalog_ = std::move(result->archive_catalog);
-    browser_items_ = std::move(result->snapshot.items);
+    browser_all_items_ = std::move(result->snapshot.items);
     if (!application_options_.show_parent_entry) {
-        std::erase_if(browser_items_, [](const auto& item) { return item.is_parent(); });
+        std::erase_if(browser_all_items_, [](const auto& item) { return item.is_parent(); });
     }
     if (!application_options_.show_hidden) {
-        std::erase_if(browser_items_, [](const auto& item) {
+        std::erase_if(browser_all_items_, [](const auto& item) {
             return item.attributes.find(L'H') != std::wstring::npos ||
                    item.attributes.find(L'S') != std::wstring::npos;
         });
     }
-    browser_status_totals_ = {};
-    for (const auto& item : browser_items_) {
-        add_status_item(browser_status_totals_, item);
+    if (pending_find_location_ && *pending_find_location_ == loaded_location &&
+        !browser_filter_.empty()) {
+        // A deep Find result is explicit navigation. Do not leave it invisible
+        // behind a filter that belonged to the previous folder.
+        browser_filter_.clear();
+        SetWindowTextW(filter_edit_, L"");
+        ShowWindow(filter_popup_, SW_HIDE);
     }
+    rebuild_filtered_browser_items();
     std::optional<BrowserViewState> restore_state;
     if (pending_browser_view_state_) {
         restore_state = std::move(pending_browser_view_state_);

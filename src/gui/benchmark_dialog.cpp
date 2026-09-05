@@ -3,6 +3,7 @@
 
 #include "axiom/archive.hpp"
 #include "core/benchmark_corpus.hpp"
+#include "core/benchmark_statistics.hpp"
 #include "core/cpu.hpp"
 #include "core/path_text.hpp"
 #include "gui/dialog_support.hpp"
@@ -23,6 +24,7 @@
 #include <deque>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iomanip>
 #include <limits>
 #include <memory>
@@ -59,12 +61,15 @@ constexpr int kCustomInput = 3111;
 constexpr int kCustomPath = 3112;
 constexpr int kBrowseCustom = 3113;
 constexpr int kBrowseCustomFolder = 3114;
+constexpr int kExportButton = 3115;
+constexpr int kProgressBar = 3116;
 constexpr int kCloseButton = IDCANCEL;
 constexpr int kBenchmarkInitialWidth = 960;
 constexpr int kBenchmarkMinimumWidth = 940;
-constexpr int kBenchmarkInitialHeight = 640;
-constexpr int kBenchmarkMinimumHeight = 600;
+constexpr int kBenchmarkInitialHeight = 720;
+constexpr int kBenchmarkMinimumHeight = 660;
 constexpr wchar_t kBenchmarkLayoutName[] = L"BenchmarkDialog";
+constexpr wchar_t kBenchmarkRegistryPath[] = L"Software\\AxiomCompress\\Benchmark";
 constexpr DWORD kBenchmarkDialogStyle =
     WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_CLIPCHILDREN;
 constexpr DWORD kBenchmarkDialogExStyle =
@@ -80,18 +85,16 @@ constexpr std::array<const wchar_t*, 9> kLevelNames{
     L"1 - Fastest", L"2 - Very fast", L"3 - Fast", L"4 - Normal",
     L"5 - Balanced", L"6 - Strong", L"7 - High", L"8 - Very high",
     L"9 - Maximum"};
-constexpr std::array<const wchar_t*, 8> kThreadNames{
-    L"0 (all processors)", L"1", L"2", L"4", L"8", L"16", L"32", L"64"};
-constexpr std::array<std::size_t, 8> kThreadValues{0, 1, 2, 4, 8, 16, 32, 64};
 constexpr std::array<const wchar_t*, 5> kPassNames{
-    L"1", L"3", L"5", L"10", L"Continuous"};
+    L"1", L"3", L"Stable (5-10)", L"10", L"Continuous"};
 constexpr std::array<int, 5> kPassValues{1, 3, 5, 10, 0};
 constexpr std::size_t kRecentPassLimit = 20;
+constexpr std::size_t kSampleHistoryLimit = 4096;
 constexpr std::size_t kRollingPassCount = 8;
 constexpr std::size_t kMinimumStablePasses = 5;
 constexpr double kStableVariationPercent = 2.0;
-constexpr double kTargetCompressionSeconds = 2.0;
-constexpr double kTargetDecompressionSeconds = 2.0;
+constexpr double kTargetCompressionSeconds = 1.5;
+constexpr double kTargetDecompressionSeconds = 1.5;
 constexpr std::size_t kMaximumCompressionIterations = 64;
 constexpr std::size_t kMaximumDecompressionIterations = 256;
 constexpr std::size_t kWarmupBytes = 8u << 20;
@@ -108,7 +111,8 @@ struct BenchmarkParams {
     bool automatic_size = true;
     int level = 5;
     std::size_t threads = 0;
-    int passes = 3;
+    int passes = 10;
+    bool adaptive_stability = true;
     bool continuous = false;
     std::optional<fs::path> custom_input;
     std::wstring app_version;
@@ -133,7 +137,15 @@ struct SystemDetails {
     std::wstring cpu_features;
     std::wstring architecture;
     std::uint64_t total_memory = 0;
+    std::uint64_t available_memory = 0;
     std::size_t hardware_threads = 1;
+    std::size_t physical_cores = 1;
+    bool on_ac_power = true;
+};
+
+struct ThreadChoice {
+    std::wstring label;
+    std::size_t value = 0;
 };
 
 struct PassMetrics {
@@ -150,16 +162,12 @@ struct PassMetrics {
     double extract_cpu_seconds = 0.0;
 };
 
-struct MetricTotals {
-    std::uint64_t bytes = 0;
-    double wall_seconds = 0.0;
-    double cpu_seconds = 0.0;
-
-    void add(std::uint64_t new_bytes, double wall, double cpu) {
-        bytes += new_bytes;
-        wall_seconds += wall;
-        cpu_seconds += cpu;
-    }
+struct BenchmarkBaseline {
+    std::wstring timestamp;
+    std::wstring app_version;
+    double compression_bytes_per_second = 0.0;
+    double decompression_bytes_per_second = 0.0;
+    std::uint64_t archive_bytes = 0;
 };
 
 struct BenchmarkLiveState {
@@ -175,14 +183,23 @@ struct BenchmarkLiveState {
     bool input_ready = false;
     bool verified = false;
     bool warmup_complete = false;
+    bool timing_active = false;
     std::wstring status;
     axiom::OperationProgress progress;
     CpuTimeSample phase_start;
     std::chrono::steady_clock::time_point started{};
     std::uint64_t total_passes = 0;
-    MetricTotals compression_totals;
-    MetricTotals decompression_totals;
     std::deque<PassMetrics> recent_passes;
+    std::deque<PassMetrics> pass_history;
+    std::deque<axiom::core::BenchmarkSample> compression_samples;
+    std::deque<axiom::core::BenchmarkSample> decompression_samples;
+    std::size_t calibrated_compression_iterations = 1;
+    std::size_t calibrated_decompression_iterations = 1;
+    std::uint64_t discarded_samples = 0;
+    std::optional<BenchmarkBaseline> baseline;
+    std::wstring history_path;
+    std::wstring persistence_warning;
+    std::atomic_uint64_t pause_generation = 0;
 };
 
 struct BenchmarkProgressText {
@@ -203,6 +220,7 @@ struct BenchmarkDialogState {
     bool owner_was_enabled = false;
     HFONT font{};
     HFONT fixed_font{};
+    HFONT summary_font{};
     HBRUSH background_brush{};
     HBRUSH edit_brush{};
     TooltipManager tooltip;
@@ -220,6 +238,8 @@ struct BenchmarkDialogState {
     HWND pause{};
     HWND cancel{};
     HWND copy{};
+    HWND export_results{};
+    HWND progress_bar{};
     HWND close{};
     std::shared_ptr<axiom::OperationControl> operation;
     std::shared_ptr<BenchmarkLiveState> live;
@@ -227,6 +247,8 @@ struct BenchmarkDialogState {
     std::atomic_bool running = false;
     bool paused = false;
     bool custom_input_checked = false;
+    SystemDetails preview_system;
+    std::vector<ThreadChoice> thread_choices;
     int report_scroll_x = 0;
     int report_scroll_y = 0;
     int report_content_width = 0;
@@ -252,13 +274,13 @@ private:
     T* value_ = nullptr;
 };
 
-std::array<HWND, 14> controls(BenchmarkDialogState* state) {
+std::array<HWND, 16> controls(BenchmarkDialogState* state) {
     if (state == nullptr) return {};
     return {
         state->corpus, state->size, state->level, state->threads, state->passes,
         state->custom_input, state->custom_path, state->browse_custom,
         state->browse_custom_folder, state->results, state->start, state->pause,
-        state->cancel, state->copy,
+        state->cancel, state->copy, state->export_results, state->progress_bar,
     };
 }
 
@@ -283,6 +305,17 @@ HFONT create_benchmark_results_font(UINT dpi) {
     font.lfCharSet = DEFAULT_CHARSET;
     font.lfQuality = CLEARTYPE_QUALITY;
     wcscpy_s(font.lfFaceName, L"Consolas");
+    return CreateFontIndirectW(&font);
+}
+
+HFONT create_benchmark_summary_font(UINT dpi) {
+    LOGFONTW font{};
+    font.lfHeight = -MulDiv(14, static_cast<int>(
+        dpi == 0 ? USER_DEFAULT_SCREEN_DPI : dpi), 72);
+    font.lfWeight = FW_SEMIBOLD;
+    font.lfCharSet = DEFAULT_CHARSET;
+    font.lfQuality = CLEARTYPE_QUALITY;
+    wcscpy_s(font.lfFaceName, L"Segoe UI");
     return CreateFontIndirectW(&font);
 }
 
@@ -393,18 +426,65 @@ void update_report_scrollbars(BenchmarkDialogState* state) {
     }
 }
 
+void update_benchmark_progress(BenchmarkDialogState* state) {
+    if (state == nullptr || state->progress_bar == nullptr) return;
+    int position = 0;
+    if (state->live) {
+        std::lock_guard lock(state->live->mutex);
+        const BenchmarkLiveState& live = *state->live;
+        if (live.phase == BenchmarkPhase::finished) {
+            position = live.total_passes != 0 ? 1000 : 0;
+        } else if (live.current_pass == 0) {
+            if (live.progress.total_bytes != 0) {
+                position = static_cast<int>(std::clamp(
+                    static_cast<double>(live.progress.completed_bytes) /
+                        static_cast<double>(live.progress.total_bytes) * 100.0,
+                    0.0, 100.0));
+            } else if (live.input_ready) {
+                position = live.warmup_complete ? 90 : 60;
+            }
+        } else {
+            double phase_fraction = 0.0;
+            if (live.phase == BenchmarkPhase::decompressing) phase_fraction = 0.5;
+            if (live.progress.total_bytes != 0) {
+                const double within = std::clamp(
+                    static_cast<double>(live.progress.completed_bytes) /
+                        static_cast<double>(live.progress.total_bytes),
+                    0.0, 1.0);
+                phase_fraction += within * 0.5;
+            }
+            if (live.params.continuous) {
+                position = 100 + static_cast<int>(phase_fraction * 900.0);
+            } else {
+                const double completed = static_cast<double>(live.total_passes);
+                const double passes = static_cast<double>(std::max(1, live.params.passes));
+                position = 100 + static_cast<int>(
+                    std::clamp((completed + phase_fraction) / passes, 0.0, 1.0) * 900.0);
+            }
+        }
+    }
+    SendMessageW(state->progress_bar, PBM_SETPOS,
+                 static_cast<WPARAM>(std::clamp(position, 0, 1000)), 0);
+    InvalidateRect(state->progress_bar, nullptr, FALSE);
+}
+
 void set_results_text(BenchmarkDialogState* state, std::wstring text) {
     if (state == nullptr || state->results == nullptr) return;
     state->latest_results = std::move(text);
     update_report_scrollbars(state);
+    update_benchmark_progress(state);
     RedrawWindow(state->results, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE);
+    InvalidateRect(state->hwnd, nullptr, FALSE);
 }
 
 void set_custom_input_checked(BenchmarkDialogState* state, bool checked) {
     if (state == nullptr || state->custom_input == nullptr) return;
     state->custom_input_checked = checked;
     SendMessageW(state->custom_input, BM_SETCHECK, checked ? BST_CHECKED : BST_UNCHECKED, 0);
+    EnableWindow(state->corpus, !state->running && !checked);
+    EnableWindow(state->size, !state->running && !checked);
     InvalidateRect(state->custom_input, nullptr, TRUE);
+    InvalidateRect(state->hwnd, nullptr, FALSE);
 }
 
 std::wstring format_bytes(std::uint64_t bytes) {
@@ -448,9 +528,24 @@ std::wstring format_decimal(double value, int precision = 1) {
     return text.str();
 }
 
-std::wstring format_cpu_usage(double cpu_seconds, double wall_seconds) {
-    if (wall_seconds <= 0.000001) return L"-";
-    return format_decimal((cpu_seconds / wall_seconds) * 100.0, 0) + L"%";
+std::wstring format_comparison_delta(double current, double baseline,
+                                     bool smaller_is_better = false) {
+    if (!std::isfinite(current) || !std::isfinite(baseline) || baseline <= 0.0) {
+        return L"-";
+    }
+    double percent = (current - baseline) / baseline * 100.0;
+    if (smaller_is_better) percent = -percent;
+    std::wostringstream text;
+    text << std::showpos << std::fixed << std::setprecision(1) << percent
+         << std::noshowpos << L'%';
+    return text.str();
+}
+
+std::uint64_t rounded_throughput(double value);
+
+std::wstring format_active_cores(double cpu_seconds, double wall_seconds) {
+    if (wall_seconds <= 0.000001 || cpu_seconds < 0.0) return L"-";
+    return format_decimal(cpu_seconds / wall_seconds, 1) + L" cores";
 }
 
 std::wstring format_per_core_speed(std::uint64_t bytes, double wall_seconds,
@@ -531,6 +626,58 @@ std::wstring read_registry_string(HKEY root, const wchar_t* path, const wchar_t*
     return value;
 }
 
+std::optional<DWORD> read_registry_dword(
+    HKEY root, const wchar_t* path, const wchar_t* name) {
+    DWORD value = 0;
+    DWORD bytes = sizeof(value);
+    if (RegGetValueW(root, path, name, RRF_RT_REG_DWORD, nullptr,
+                     &value, &bytes) != ERROR_SUCCESS || bytes != sizeof(value)) {
+        return std::nullopt;
+    }
+    return value;
+}
+
+std::optional<std::uint64_t> read_registry_qword(
+    HKEY root, const wchar_t* path, const wchar_t* name) {
+    ULONGLONG value = 0;
+    DWORD bytes = sizeof(value);
+    if (RegGetValueW(root, path, name, RRF_RT_REG_QWORD, nullptr,
+                     &value, &bytes) != ERROR_SUCCESS || bytes != sizeof(value)) {
+        return std::nullopt;
+    }
+    return static_cast<std::uint64_t>(value);
+}
+
+bool write_registry_dword(HKEY key, const wchar_t* name, DWORD value) {
+    return RegSetValueExW(
+        key, name, 0, REG_DWORD, reinterpret_cast<const BYTE*>(&value),
+        sizeof(value)) == ERROR_SUCCESS;
+}
+
+bool write_registry_qword(HKEY key, const wchar_t* name, std::uint64_t value) {
+    const ULONGLONG stored = value;
+    return RegSetValueExW(
+        key, name, 0, REG_QWORD, reinterpret_cast<const BYTE*>(&stored),
+        sizeof(stored)) == ERROR_SUCCESS;
+}
+
+bool write_registry_string(HKEY key, const wchar_t* name,
+                           const std::wstring& value) {
+    return RegSetValueExW(
+        key, name, 0, REG_SZ, reinterpret_cast<const BYTE*>(value.c_str()),
+        static_cast<DWORD>((value.size() + 1) * sizeof(wchar_t))) == ERROR_SUCCESS;
+}
+
+std::wstring utc_timestamp() {
+    SYSTEMTIME now{};
+    GetSystemTime(&now);
+    wchar_t value[32]{};
+    swprintf_s(value, L"%04u-%02u-%02uT%02u:%02u:%02uZ",
+               now.wYear, now.wMonth, now.wDay,
+               now.wHour, now.wMinute, now.wSecond);
+    return value;
+}
+
 std::wstring windows_version_text() {
     OSVERSIONINFOW version{};
     version.dwOSVersionInfoSize = sizeof(version);
@@ -569,16 +716,95 @@ SystemDetails collect_system_details() {
     details.cpu_features = widen_ascii(axiom::core::cpu_features_string());
     details.architecture = architecture_text();
     details.hardware_threads = axiom::core::logical_processor_count();
+    details.physical_cores = axiom::core::physical_core_count();
     MEMORYSTATUSEX memory{sizeof(memory)};
     if (GlobalMemoryStatusEx(&memory)) {
         details.total_memory = memory.ullTotalPhys;
+        details.available_memory = memory.ullAvailPhys;
+    }
+    SYSTEM_POWER_STATUS power{};
+    if (GetSystemPowerStatus(&power)) {
+        details.on_ac_power = power.ACLineStatus != 0;
     }
     return details;
+}
+
+std::vector<ThreadChoice> thread_choices(const SystemDetails& system) {
+    const std::size_t logical = std::max<std::size_t>(1, system.hardware_threads);
+    const std::size_t physical = std::clamp<std::size_t>(
+        system.physical_cores, 1, logical);
+    std::vector<std::size_t> fixed{1};
+    for (std::size_t value = 2; value < logical;) {
+        fixed.push_back(value);
+        if (value > std::numeric_limits<std::size_t>::max() / 2) break;
+        value *= 2;
+    }
+    fixed.push_back(physical);
+    fixed.push_back(logical);
+    std::sort(fixed.begin(), fixed.end());
+    fixed.erase(std::unique(fixed.begin(), fixed.end()), fixed.end());
+
+    std::vector<ThreadChoice> choices;
+    choices.push_back({
+        L"Automatic (" + std::to_wstring(physical) + L" cores / " +
+            std::to_wstring(logical) + L" threads)",
+        0});
+    for (const std::size_t value : fixed) {
+        std::wstring label = std::to_wstring(value);
+        if (value == physical && physical != logical) label += L" (physical cores)";
+        if (value == logical) label += L" (logical processors)";
+        choices.push_back({std::move(label), value});
+    }
+    return choices;
 }
 
 std::size_t selected_thread_count(std::size_t requested, std::size_t hardware_threads) {
     if (requested == 0) return std::max<std::size_t>(1, hardware_threads);
     return std::max<std::size_t>(1, requested);
+}
+
+std::wstring baseline_registry_path(const BenchmarkParams& params,
+                                    const SystemDetails& system,
+                                    std::uint64_t original_bytes) {
+    const std::size_t effective_threads = selected_thread_count(
+        params.threads, system.hardware_threads);
+    std::wostringstream path;
+    path << kBenchmarkRegistryPath << L"\\Baselines\\P"
+         << axiom::core::kBenchmarkProtocolVersion << L"-C"
+         << axiom::core::kBenchmarkCorpusVersion << L'-'
+         << static_cast<int>(params.corpus) << L"-S" << original_bytes
+         << L"-L" << params.level << L"-R" << params.threads
+         << L"-E" << effective_threads;
+    return path.str();
+}
+
+std::optional<BenchmarkBaseline> load_benchmark_baseline(
+    const BenchmarkParams& params, const SystemDetails& system,
+    std::uint64_t original_bytes) {
+    // A custom file or folder may change without changing its byte count. Do
+    // not present a potentially misleading historical comparison for it.
+    if (params.custom_input) return std::nullopt;
+    const std::wstring path = baseline_registry_path(
+        params, system, original_bytes);
+    const auto compression = read_registry_qword(
+        HKEY_CURRENT_USER, path.c_str(), L"CompressionBytesPerSecond");
+    const auto decompression = read_registry_qword(
+        HKEY_CURRENT_USER, path.c_str(), L"DecompressionBytesPerSecond");
+    const auto archive = read_registry_qword(
+        HKEY_CURRENT_USER, path.c_str(), L"ArchiveBytes");
+    if (!compression || !decompression || !archive || *compression == 0 ||
+        *decompression == 0 || *archive == 0) {
+        return std::nullopt;
+    }
+    BenchmarkBaseline baseline;
+    baseline.timestamp = read_registry_string(
+        HKEY_CURRENT_USER, path.c_str(), L"TimestampUtc");
+    baseline.app_version = read_registry_string(
+        HKEY_CURRENT_USER, path.c_str(), L"AxiomVersion");
+    baseline.compression_bytes_per_second = static_cast<double>(*compression);
+    baseline.decompression_bytes_per_second = static_cast<double>(*decompression);
+    baseline.archive_bytes = *archive;
+    return baseline;
 }
 
 std::uint64_t effective_solid_block_size(const axiom::CompressionOptions& options,
@@ -623,16 +849,16 @@ std::uint64_t estimate_memory_usage(const axiom::CompressionOptions& options,
 
 std::uint64_t automatic_corpus_size(const axiom::CompressionOptions& options,
                                     std::size_t threads,
-                                    std::uint64_t total_memory) {
+                                    std::uint64_t available_memory) {
     const std::uint64_t window_target = options.window_size > UINT64_MAX - (64u << 10)
         ? UINT64_MAX
         : static_cast<std::uint64_t>(options.window_size) + (64u << 10);
     const std::uint64_t desired = std::max<std::uint64_t>(
         64ull << 20,
         std::max(window_target, effective_solid_block_size(options, threads)));
-    const std::uint64_t memory_limit = total_memory == 0
+    const std::uint64_t memory_limit = available_memory == 0
         ? UINT64_MAX
-        : total_memory - total_memory / 4;
+        : available_memory - available_memory / 3;
 
     for (std::size_t index = 1; index < kSizeValues.size(); ++index) {
         const std::uint64_t candidate = kSizeValues[index];
@@ -688,10 +914,9 @@ std::wstring corpus_text(const BenchmarkParams& params) {
 void append_metric_header(std::wostringstream& out) {
     out << L"  " << std::left << std::setw(11) << L"Row"
         << L"  " << std::right << std::setw(12) << L"Size"
-        << L"  " << std::setw(15) << L"Speed"
-        << L"  " << std::setw(12) << L"CPU Usage"
-        << L"  " << std::setw(21) << L"Rating / Usage"
-        << L"  " << std::setw(15) << L"Rating" << L"\r\n";
+        << L"  " << std::setw(15) << L"Throughput"
+        << L"  " << std::setw(14) << L"Active CPU"
+        << L"  " << std::setw(21) << L"Per-core" << L"\r\n";
 }
 
 void append_metric_row(std::wostringstream& out,
@@ -704,85 +929,79 @@ void append_metric_row(std::wostringstream& out,
         << L"  " << std::right << std::setw(12)
         << (display_size == 0 ? std::wstring(L"-") : format_bytes(display_size))
         << L"  " << std::setw(15) << format_speed_kib(processed_bytes, wall_seconds)
-        << L"  " << std::setw(12) << format_cpu_usage(cpu_seconds, wall_seconds)
+        << L"  " << std::setw(14) << format_active_cores(cpu_seconds, wall_seconds)
         << L"  " << std::setw(21) << format_per_core_speed(processed_bytes, wall_seconds, cpu_seconds)
-        << L"  " << std::setw(15) << format_speed(processed_bytes, wall_seconds) << L"\r\n";
+        << L"\r\n";
 }
 
 void append_placeholder_row(std::wostringstream& out, const wchar_t* label) {
     out << L"  " << std::left << std::setw(11) << label
         << L"  " << std::right << std::setw(12) << L"..."
         << L"  " << std::setw(15) << L"..."
-        << L"  " << std::setw(12) << L"..."
-        << L"  " << std::setw(21) << L"..."
-        << L"  " << std::setw(15) << L"..." << L"\r\n";
+        << L"  " << std::setw(14) << L"..."
+        << L"  " << std::setw(21) << L"..." << L"\r\n";
 }
 
 void append_aggregate_row(std::wostringstream& out,
                           const wchar_t* label,
                           const BenchmarkLiveState& state,
                           bool compression) {
-    const MetricTotals& totals = compression
-        ? state.compression_totals
-        : state.decompression_totals;
-    if (totals.bytes == 0 || state.original_bytes == 0) {
+    const auto& samples = compression
+        ? state.compression_samples : state.decompression_samples;
+    std::vector<axiom::core::BenchmarkSample> contiguous(
+        samples.begin(), samples.end());
+    const auto summary = axiom::core::summarize_benchmark_samples(contiguous);
+    if (summary.sample_count == 0 || state.original_bytes == 0) {
         append_placeholder_row(out, label);
         return;
     }
-    append_metric_row(out, label, state.original_bytes, totals.bytes,
-                      totals.wall_seconds, totals.cpu_seconds);
-}
-
-MetricTotals rolling_totals(const BenchmarkLiveState& state, bool compression) {
-    MetricTotals totals;
-    const std::size_t count = std::min(kRollingPassCount, state.recent_passes.size());
-    const std::size_t first = state.recent_passes.size() - count;
-    for (std::size_t index = first; index < state.recent_passes.size(); ++index) {
-        const PassMetrics& pass = state.recent_passes[index];
-        totals.add(compression ? pass.compress_bytes : pass.extract_bytes,
-                   compression ? pass.compress_wall_seconds : pass.extract_wall_seconds,
-                   compression ? pass.compress_cpu_seconds : pass.extract_cpu_seconds);
-    }
-    return totals;
+    append_metric_row(
+        out, label, state.original_bytes,
+        static_cast<std::uint64_t>(summary.median_bytes_per_second), 1.0,
+        summary.median_active_cores);
 }
 
 void append_rolling_row(std::wostringstream& out, const BenchmarkLiveState& state,
                         bool compression) {
-    const MetricTotals totals = rolling_totals(state, compression);
-    if (totals.bytes == 0) {
+    std::vector<axiom::core::BenchmarkSample> samples;
+    const std::size_t count = std::min(kRollingPassCount, state.recent_passes.size());
+    const std::size_t first = state.recent_passes.size() - count;
+    samples.reserve(count);
+    for (std::size_t index = first; index < state.recent_passes.size(); ++index) {
+        const PassMetrics& pass = state.recent_passes[index];
+        samples.push_back({
+            compression ? pass.compress_bytes : pass.extract_bytes,
+            compression ? pass.compress_wall_seconds : pass.extract_wall_seconds,
+            compression ? pass.compress_cpu_seconds : pass.extract_cpu_seconds});
+    }
+    const auto summary = axiom::core::summarize_benchmark_samples(samples);
+    if (summary.sample_count == 0) {
         append_placeholder_row(out, L"Rolling");
         return;
     }
-    append_metric_row(out, L"Rolling", state.original_bytes, totals.bytes,
-                      totals.wall_seconds, totals.cpu_seconds);
+    append_metric_row(
+        out, L"Rolling", state.original_bytes,
+        static_cast<std::uint64_t>(summary.median_bytes_per_second), 1.0,
+        summary.median_active_cores);
 }
 
 double rolling_variation_percent(const BenchmarkLiveState& state, bool compression) {
     const std::size_t count = std::min(kRollingPassCount, state.recent_passes.size());
-    if (count < 2) return 0.0;
     const std::size_t first = state.recent_passes.size() - count;
-    double mean = 0.0;
-    double m2 = 0.0;
-    std::size_t samples = 0;
+    std::vector<axiom::core::BenchmarkSample> samples;
+    samples.reserve(count);
     for (std::size_t index = first; index < state.recent_passes.size(); ++index) {
         const PassMetrics& pass = state.recent_passes[index];
-        const std::uint64_t bytes = compression ? pass.compress_bytes : pass.extract_bytes;
-        const double seconds = compression
-            ? pass.compress_wall_seconds
-            : pass.extract_wall_seconds;
-        if (bytes == 0 || seconds <= 0.0) continue;
-        const double speed = static_cast<double>(bytes) / seconds;
-        ++samples;
-        const double delta = speed - mean;
-        mean += delta / static_cast<double>(samples);
-        m2 += delta * (speed - mean);
+        samples.push_back({
+            compression ? pass.compress_bytes : pass.extract_bytes,
+            compression ? pass.compress_wall_seconds : pass.extract_wall_seconds,
+            compression ? pass.compress_cpu_seconds : pass.extract_cpu_seconds});
     }
-    if (samples < 2 || mean <= 0.0) return 0.0;
-    return std::sqrt(m2 / static_cast<double>(samples - 1)) / mean * 100.0;
+    return axiom::core::summarize_benchmark_samples(samples).robust_spread_percent;
 }
 
 std::wstring stability_text(const BenchmarkLiveState& state) {
-    if (state.total_passes < kMinimumStablePasses) return L"Warming up";
+    if (state.total_passes < kMinimumStablePasses) return L"Collecting samples";
     const double variation = std::max(
         rolling_variation_percent(state, true),
         rolling_variation_percent(state, false));
@@ -792,7 +1011,8 @@ std::wstring stability_text(const BenchmarkLiveState& state) {
 void append_current_phase_row(std::wostringstream& out,
                               const BenchmarkLiveState& state,
                               BenchmarkPhase phase) {
-    if (state.phase != phase || state.current_pass <= 0 || state.original_bytes == 0) {
+    if (state.phase != phase || state.current_pass <= 0 ||
+        state.original_bytes == 0 || !state.timing_active) {
         append_placeholder_row(out, L"Current");
         return;
     }
@@ -821,6 +1041,14 @@ std::wstring render_benchmark_report(const BenchmarkLiveState& state) {
         state.started.time_since_epoch().count() == 0
             ? 0.0
             : std::chrono::duration<double>(now - state.started).count();
+    const std::vector<axiom::core::BenchmarkSample> compression_samples(
+        state.compression_samples.begin(), state.compression_samples.end());
+    const std::vector<axiom::core::BenchmarkSample> decompression_samples(
+        state.decompression_samples.begin(), state.decompression_samples.end());
+    const auto compression_summary =
+        axiom::core::summarize_benchmark_samples(compression_samples);
+    const auto decompression_summary =
+        axiom::core::summarize_benchmark_samples(decompression_samples);
 
     std::wostringstream out;
     out << L"Axiom Benchmark\r\n";
@@ -845,6 +1073,9 @@ std::wstring render_benchmark_report(const BenchmarkLiveState& state) {
             << axiom::core::kBenchmarkCorpusDefaultSeed << std::dec << std::nouppercase
             << L"\r\n";
     }
+    out << L"  Protocol: " << axiom::core::kBenchmarkProtocolVersion
+        << L" | Statistic: median with robust spread"
+        << L"\r\n";
 
     out << L"System\r\n";
     out << L"  CPU: " << state.system.cpu_name << L"\r\n";
@@ -852,18 +1083,26 @@ std::wstring render_benchmark_report(const BenchmarkLiveState& state) {
         << L"  Axiom " << (state.params.app_version.empty() ? L"unknown" : state.params.app_version)
         << L"\r\n";
     out << L"  Features: " << state.system.cpu_features << L"\r\n";
+    out << L"  Topology: " << state.system.physical_cores << L" physical cores / "
+        << state.system.hardware_threads << L" logical processors"
+        << L" | Power: " << (state.system.on_ac_power ? L"AC" : L"battery")
+        << L" | Available memory: " << format_bytes(state.system.available_memory)
+        << L"\r\n";
+#if defined(_DEBUG)
+    out << L"  WARNING: Debug build; throughput is not comparable to Release.\r\n";
+#endif
 
     out << L"Compressing\r\n";
     append_metric_header(out);
     append_current_phase_row(out, state, BenchmarkPhase::compressing);
     append_rolling_row(out, state, true);
-    append_aggregate_row(out, L"Resulting", state, true);
+    append_aggregate_row(out, L"Median", state, true);
 
     out << L"Decompressing\r\n";
     append_metric_header(out);
     append_current_phase_row(out, state, BenchmarkPhase::decompressing);
     append_rolling_row(out, state, false);
-    append_aggregate_row(out, L"Resulting", state, false);
+    append_aggregate_row(out, L"Median", state, false);
 
     out << L"Run\r\n";
     out << L"  Status: " << benchmark_status_line(state)
@@ -874,6 +1113,8 @@ std::wstring render_benchmark_report(const BenchmarkLiveState& state) {
     }
     if (state.params.continuous) {
         out << L" / continuous";
+    } else if (state.params.adaptive_stability) {
+        out << L" / stable target (maximum " << state.params.passes << L")";
     } else {
         out << L" / " << state.params.passes;
     }
@@ -881,9 +1122,20 @@ std::wstring render_benchmark_report(const BenchmarkLiveState& state) {
     if (state.total_passes >= 2) {
         out << L" (comp " << std::fixed << std::setprecision(1)
             << rolling_variation_percent(state, true) << L"%, dec "
-            << rolling_variation_percent(state, false) << L"% CV)";
+            << rolling_variation_percent(state, false) << L"% robust spread)";
     }
     out << L"\r\n";
+    if (state.calibrated_compression_iterations != 0 &&
+        state.calibrated_decompression_iterations != 0) {
+        out << L"  Batch: " << state.calibrated_compression_iterations
+            << L" compression iteration(s), "
+            << state.calibrated_decompression_iterations
+            << L" decompression iteration(s) per pass";
+        if (state.discarded_samples != 0) {
+            out << L" | Discarded after pause: " << state.discarded_samples;
+        }
+        out << L"\r\n";
+    }
     if (state.archive_bytes != 0) {
         out << L"  Archive: " << format_bytes(state.archive_bytes)
             << L" | Ratio: " << ratio_text(state.original_bytes, state.archive_bytes)
@@ -896,27 +1148,77 @@ std::wstring render_benchmark_report(const BenchmarkLiveState& state) {
             << L"\r\n";
     }
 
+    if (state.baseline && compression_summary.sample_count != 0 &&
+        decompression_summary.sample_count != 0 && state.archive_bytes != 0) {
+        const BenchmarkBaseline& baseline = *state.baseline;
+        out << L"Previous matching run";
+        if (!baseline.timestamp.empty()) out << L"  " << baseline.timestamp;
+        if (!baseline.app_version.empty()) out << L"  Axiom " << baseline.app_version;
+        out << L"\r\n";
+        out << L"  Compression: "
+            << format_speed(
+                   rounded_throughput(baseline.compression_bytes_per_second), 1.0)
+            << L" -> "
+            << format_speed(
+                   rounded_throughput(compression_summary.median_bytes_per_second), 1.0)
+            << L"  (" << format_comparison_delta(
+                   compression_summary.median_bytes_per_second,
+                   baseline.compression_bytes_per_second)
+            << L")\r\n";
+        out << L"  Decompression: "
+            << format_speed(
+                   rounded_throughput(baseline.decompression_bytes_per_second), 1.0)
+            << L" -> "
+            << format_speed(
+                   rounded_throughput(decompression_summary.median_bytes_per_second), 1.0)
+            << L"  (" << format_comparison_delta(
+                   decompression_summary.median_bytes_per_second,
+                   baseline.decompression_bytes_per_second)
+            << L")\r\n";
+        out << L"  Stored size: " << format_bytes(baseline.archive_bytes)
+            << L" -> " << format_bytes(state.archive_bytes)
+            << L"  (" << format_comparison_delta(
+                   static_cast<double>(state.archive_bytes),
+                   static_cast<double>(baseline.archive_bytes), true)
+            << L")  Positive means better.\r\n";
+    } else if (state.phase == BenchmarkPhase::finished &&
+               !state.params.custom_input && state.total_passes != 0) {
+        out << (state.total_passes >= 3
+            ? L"Previous matching run: none yet; this result is now the baseline.\r\n"
+            : L"Previous matching run: none; at least 3 passes are required to establish one.\r\n");
+    }
+    if (!state.history_path.empty()) {
+        out << L"History: " << state.history_path << L"\r\n";
+    }
+    if (!state.persistence_warning.empty()) {
+        out << L"History warning: " << state.persistence_warning << L"\r\n";
+    }
+
     if (!state.recent_passes.empty()) {
         out << L"Recent measured passes\r\n";
         out << L"  " << std::left << std::setw(5) << L"Pass"
             << L"  " << std::right << std::setw(14) << L"Comp Speed"
-            << L"  " << std::setw(8) << L"Comp CPU"
+            << L"  " << std::setw(12) << L"Comp CPU"
             << L"  " << std::setw(14) << L"Dec Speed"
-            << L"  " << std::setw(8) << L"Dec CPU"
+            << L"  " << std::setw(12) << L"Dec CPU"
             << L"  " << std::setw(18) << L"Ratio"
             << L"  " << std::setw(10) << L"Archive" << L"\r\n";
         for (const auto& pass : state.recent_passes) {
             out << L"  " << std::left << std::setw(5) << pass.pass
                 << L"  " << std::right << std::setw(14)
                 << format_speed_kib(pass.compress_bytes, pass.compress_wall_seconds)
-                << L"  " << std::setw(8)
-                << format_cpu_usage(pass.compress_cpu_seconds, pass.compress_wall_seconds)
+                << L"  " << std::setw(12)
+                << format_active_cores(pass.compress_cpu_seconds, pass.compress_wall_seconds)
                 << L"  " << std::setw(14)
                 << format_speed_kib(pass.extract_bytes, pass.extract_wall_seconds)
-                << L"  " << std::setw(8)
-                << format_cpu_usage(pass.extract_cpu_seconds, pass.extract_wall_seconds)
+                << L"  " << std::setw(12)
+                << format_active_cores(pass.extract_cpu_seconds, pass.extract_wall_seconds)
                 << L"  " << std::setw(18) << ratio_text(pass.original_bytes, pass.archive_bytes)
                 << L"  " << std::setw(10) << format_bytes(pass.archive_bytes) << L"\r\n";
+        }
+        if (state.total_passes > state.pass_history.size()) {
+            out << L"  Raw export retains the latest " << state.pass_history.size()
+                << L" measured passes.\r\n";
         }
     }
 
@@ -1003,11 +1305,13 @@ void append_file_bytes(axiom::ByteVector& output, const fs::path& path,
 
 axiom::ByteVector load_custom_corpus(
     const fs::path& input_path,
-    const std::shared_ptr<axiom::OperationControl>& operation) {
+    const std::shared_ptr<axiom::OperationControl>& operation,
+    const std::function<void(std::uint64_t)>& validate_size) {
     std::error_code ec;
     if (fs::is_regular_file(input_path, ec)) {
         const std::uint64_t size = fs::file_size(input_path, ec);
         if (ec) throw std::runtime_error("cannot measure custom benchmark input");
+        if (validate_size) validate_size(size);
         axiom::ByteVector corpus;
         corpus.reserve(checked_corpus_size(size));
         std::uint64_t completed = 0;
@@ -1063,6 +1367,7 @@ axiom::ByteVector load_custom_corpus(
         }
         stream_bytes += metadata + file.size;
     }
+    if (validate_size) validate_size(stream_bytes);
     axiom::ByteVector corpus;
     corpus.reserve(checked_corpus_size(stream_bytes));
     corpus.insert(corpus.end(), magic.begin(), magic.end());
@@ -1088,6 +1393,8 @@ void post_done(HWND hwnd, bool success, const std::wstring& text) {
                  reinterpret_cast<LPARAM>(new BenchmarkDone{success, text}));
 }
 
+void persist_completed_benchmark(BenchmarkLiveState& live) noexcept;
+
 void benchmark_worker(HWND hwnd, BenchmarkParams params,
                       std::shared_ptr<axiom::OperationControl> operation,
                       std::shared_ptr<BenchmarkLiveState> live) {
@@ -1106,7 +1413,7 @@ void benchmark_worker(HWND hwnd, BenchmarkParams params,
         params.threads, system.hardware_threads);
     if (params.automatic_size && !params.custom_input) {
         params.bytes = automatic_corpus_size(
-            benchmark_compression, selected_threads, system.total_memory);
+            benchmark_compression, selected_threads, system.available_memory);
     }
     {
         std::lock_guard lock(live->mutex);
@@ -1129,33 +1436,75 @@ void benchmark_worker(HWND hwnd, BenchmarkParams params,
         post_text(hwnd, text);
     };
 
-    auto begin_phase = [&](BenchmarkPhase phase, std::uint64_t pass, std::wstring status,
-                           CpuTimeSample sample = sample_cpu_time()) {
+    auto announce_phase = [&](BenchmarkPhase phase, std::uint64_t pass,
+                              std::wstring status, bool publish_now = true) {
         {
             std::lock_guard lock(live->mutex);
             live->phase = phase;
             live->current_pass = pass;
             live->progress = {};
-            live->phase_start = sample;
+            live->phase_start = {};
+            live->timing_active = false;
             live->status = std::move(status);
+        }
+        if (publish_now) publish();
+    };
+
+    auto start_timing = [&] {
+        {
+            std::lock_guard lock(live->mutex);
+            live->phase_start = {};
+            live->timing_active = true;
+        }
+        // Take the clock sample after releasing the UI-state mutex. A report
+        // paint that happened to own that mutex must never appear as codec
+        // time.
+        return sample_cpu_time();
+    };
+
+    auto finish_timing = [&] {
+        std::lock_guard lock(live->mutex);
+        live->timing_active = false;
+    };
+
+    auto discard_paused_sample = [&] {
+        {
+            std::lock_guard lock(live->mutex);
+            ++live->discarded_samples;
+            live->timing_active = false;
+            live->status = L"Paused sample discarded; repeating it...";
         }
         publish();
     };
 
     try {
-        begin_phase(BenchmarkPhase::preparing, 0,
-                    params.custom_input ? L"Loading input into memory..."
-                                        : L"Preparing memory corpus...");
+        announce_phase(BenchmarkPhase::preparing, 0,
+                       params.custom_input ? L"Loading input into memory..."
+                                           : L"Preparing memory corpus...");
+        const std::uint64_t memory_limit = system.available_memory == 0
+            ? UINT64_MAX
+            : system.available_memory - system.available_memory / 3;
+        const auto validate_corpus_size = [&](std::uint64_t bytes) {
+            if (estimate_memory_usage(
+                    benchmark_compression, selected_threads, bytes) > memory_limit) {
+                throw std::runtime_error(
+                    "benchmark input exceeds the safe available-memory budget");
+            }
+        };
+        if (!params.custom_input) validate_corpus_size(params.bytes);
         // Preparation is intentionally outside every timed pass. The source
         // remains immutable and resident until all passes have verified.
         const axiom::ByteVector corpus = params.custom_input
-            ? load_custom_corpus(*params.custom_input, operation)
+            ? load_custom_corpus(*params.custom_input, operation, validate_corpus_size)
             : generate_corpus(params, benchmark_compression, selected_threads, operation);
         const std::uint64_t original_bytes = corpus.size();
+        const auto baseline = load_benchmark_baseline(
+            params, system, original_bytes);
         {
             std::lock_guard lock(live->mutex);
             live->original_bytes = original_bytes;
             live->input_ready = true;
+            live->baseline = baseline;
             live->estimated_memory = estimate_memory_usage(
                 live->compression, selected_threads, original_bytes);
             live->status = L"Memory corpus ready.";
@@ -1167,7 +1516,7 @@ void benchmark_worker(HWND hwnd, BenchmarkParams params,
         // level-9 or custom-input benchmarks.
         const std::size_t warmup_size = std::min<std::size_t>(corpus.size(), kWarmupBytes);
         if (warmup_size != 0) {
-            begin_phase(BenchmarkPhase::preparing, 0, L"Warming up (not measured)...");
+            announce_phase(BenchmarkPhase::preparing, 0, L"Warming up (not measured)...");
             axiom::ByteVector warmup_input(corpus.begin(), corpus.begin() +
                 static_cast<std::ptrdiff_t>(warmup_size));
             axiom::CompressionOptions compression = benchmark_compression;
@@ -1191,6 +1540,90 @@ void benchmark_worker(HWND hwnd, BenchmarkParams params,
             publish();
         }
 
+        axiom::CompressionOptions compression = benchmark_compression;
+        compression.operation = operation;
+        compression.encoded_bytes_progress = [operation, original_bytes](std::uint64_t done) {
+            operation->report({axiom::OperationStage::compressing, done,
+                               original_bytes, 0, 0, "In-memory stream"});
+        };
+        axiom::DecompressionOptions decompression;
+        decompression.thread_count = params.threads;
+        decompression.operation = operation;
+        decompression.max_output_size = corpus.size();
+        decompression.decoded_bytes_progress =
+            [operation](std::uint64_t done, std::uint64_t total) {
+                operation->report({axiom::OperationStage::extracting, done, total,
+                                   0, 0, "In-memory stream"});
+            };
+
+        // Calibrate once, outside the measured passes, so every reported pass
+        // uses identical batch geometry. This removes duration-dependent
+        // weighting and makes pass medians meaningful.
+        axiom::ByteVector archive;
+        double calibration_compress_seconds = 0.0;
+        for (;;) {
+            operation->checkpoint();
+            announce_phase(BenchmarkPhase::compressing, 0,
+                           L"Calibrating compression (not measured)...");
+            const std::uint64_t pause_generation =
+                live->pause_generation.load(std::memory_order_acquire);
+            const CpuTimeSample timed = start_timing();
+            axiom::ByteVector candidate = axiom::compress(corpus, compression);
+            const double wall = elapsed_wall_seconds(timed);
+            const std::uint64_t pause_after =
+                live->pause_generation.load(std::memory_order_acquire);
+            finish_timing();
+            archive = std::move(candidate);
+            if (pause_generation != pause_after) {
+                discard_paused_sample();
+                continue;
+            }
+            calibration_compress_seconds = wall;
+            break;
+        }
+
+        double calibration_decompress_seconds = 0.0;
+        for (;;) {
+            operation->checkpoint();
+            announce_phase(BenchmarkPhase::decompressing, 0,
+                           L"Calibrating decompression (not measured)...");
+            const std::uint64_t pause_generation =
+                live->pause_generation.load(std::memory_order_acquire);
+            const CpuTimeSample timed = start_timing();
+            const axiom::ByteVector restored = axiom::decompress(archive, decompression);
+            const double wall = elapsed_wall_seconds(timed);
+            const std::uint64_t pause_after =
+                live->pause_generation.load(std::memory_order_acquire);
+            finish_timing();
+            if (restored != corpus) {
+                throw std::runtime_error("in-memory calibration verification failed");
+            }
+            if (pause_generation != pause_after) {
+                discard_paused_sample();
+                continue;
+            }
+            calibration_decompress_seconds = wall;
+            break;
+        }
+
+        const std::size_t compression_iterations =
+            axiom::core::calibrated_benchmark_iterations(
+                calibration_compress_seconds, kTargetCompressionSeconds,
+                kMaximumCompressionIterations);
+        const std::size_t decompression_iterations =
+            axiom::core::calibrated_benchmark_iterations(
+                calibration_decompress_seconds, kTargetDecompressionSeconds,
+                kMaximumDecompressionIterations);
+        {
+            std::lock_guard lock(live->mutex);
+            live->calibrated_compression_iterations = compression_iterations;
+            live->calibrated_decompression_iterations = decompression_iterations;
+            live->verified = true;
+            live->status = L"Calibration complete; starting measured passes.";
+        }
+        publish();
+
+        bool stable_result = false;
         for (std::uint64_t pass = 1;
              params.continuous || pass <= static_cast<std::uint64_t>(params.passes);
              ++pass) {
@@ -1198,28 +1631,32 @@ void benchmark_worker(HWND hwnd, BenchmarkParams params,
             PassMetrics metrics;
             metrics.pass = pass;
             metrics.original_bytes = original_bytes;
-            axiom::CompressionOptions compression = benchmark_compression;
-            compression.operation = operation;
-            compression.encoded_bytes_progress = [operation, original_bytes](std::uint64_t done) {
-                operation->report({axiom::OperationStage::compressing, done,
-                                   original_bytes, 0, 0, "In-memory stream"});
-            };
-            axiom::ByteVector archive;
-            do {
+            while (metrics.compress_iterations < compression_iterations) {
                 operation->checkpoint();
-                const CpuTimeSample compress_start = sample_cpu_time();
-                begin_phase(
+                announce_phase(
                     BenchmarkPhase::compressing, pass,
                     L"Compressing pass " + std::to_wstring(pass) + L", iteration " +
                         std::to_wstring(metrics.compress_iterations + 1) + L"...",
-                    compress_start);
-                archive = axiom::compress(corpus, compression);
-                metrics.compress_wall_seconds += elapsed_wall_seconds(compress_start);
-                metrics.compress_cpu_seconds += elapsed_cpu_seconds(compress_start);
+                    metrics.compress_iterations == 0);
+                const std::uint64_t pause_generation =
+                    live->pause_generation.load(std::memory_order_acquire);
+                const CpuTimeSample compress_start = start_timing();
+                axiom::ByteVector candidate = axiom::compress(corpus, compression);
+                const double wall = elapsed_wall_seconds(compress_start);
+                const double cpu = elapsed_cpu_seconds(compress_start);
+                const std::uint64_t pause_after =
+                    live->pause_generation.load(std::memory_order_acquire);
+                finish_timing();
+                archive = std::move(candidate);
+                if (pause_generation != pause_after) {
+                    discard_paused_sample();
+                    continue;
+                }
+                metrics.compress_wall_seconds += wall;
+                metrics.compress_cpu_seconds += cpu;
                 metrics.compress_bytes += original_bytes;
                 ++metrics.compress_iterations;
-            } while (metrics.compress_wall_seconds < kTargetCompressionSeconds &&
-                     metrics.compress_iterations < kMaximumCompressionIterations);
+            }
             const std::uint64_t archive_bytes = archive.size();
             metrics.archive_bytes = archive_bytes;
             {
@@ -1228,55 +1665,87 @@ void benchmark_worker(HWND hwnd, BenchmarkParams params,
                 live->status = L"Compressed stream ready in memory.";
             }
 
-            axiom::DecompressionOptions decompression;
-            decompression.thread_count = params.threads;
-            decompression.operation = operation;
-            decompression.max_output_size = corpus.size();
-            decompression.decoded_bytes_progress =
-                [operation](std::uint64_t done, std::uint64_t total) {
-                    operation->report({axiom::OperationStage::extracting, done, total,
-                                       0, 0, "In-memory stream"});
-                };
-            do {
+            while (metrics.extract_iterations < decompression_iterations) {
                 operation->checkpoint();
-                const CpuTimeSample extract_start = sample_cpu_time();
-                begin_phase(
+                announce_phase(
                     BenchmarkPhase::decompressing, pass,
                     L"Decompressing pass " + std::to_wstring(pass) + L", iteration " +
                         std::to_wstring(metrics.extract_iterations + 1) + L"...",
-                    extract_start);
+                    metrics.extract_iterations == 0);
+                const std::uint64_t pause_generation =
+                    live->pause_generation.load(std::memory_order_acquire);
+                const CpuTimeSample extract_start = start_timing();
                 const axiom::ByteVector restored = axiom::decompress(archive, decompression);
-                metrics.extract_wall_seconds += elapsed_wall_seconds(extract_start);
-                metrics.extract_cpu_seconds += elapsed_cpu_seconds(extract_start);
-                metrics.extract_bytes += original_bytes;
-                ++metrics.extract_iterations;
+                const double wall = elapsed_wall_seconds(extract_start);
+                const double cpu = elapsed_cpu_seconds(extract_start);
+                const std::uint64_t pause_after =
+                    live->pause_generation.load(std::memory_order_acquire);
+                finish_timing();
                 operation->checkpoint();
                 if (restored != corpus) {
                     throw std::runtime_error("in-memory round-trip verification failed");
                 }
-            } while (metrics.extract_wall_seconds < kTargetDecompressionSeconds &&
-                     metrics.extract_iterations < kMaximumDecompressionIterations);
+                if (pause_generation != pause_after) {
+                    discard_paused_sample();
+                    continue;
+                }
+                metrics.extract_wall_seconds += wall;
+                metrics.extract_cpu_seconds += cpu;
+                metrics.extract_bytes += original_bytes;
+                ++metrics.extract_iterations;
+            }
 
+            bool stable = false;
             {
                 std::lock_guard lock(live->mutex);
                 live->verified = true;
                 live->total_passes = pass;
-                live->compression_totals.add(
-                    metrics.compress_bytes, metrics.compress_wall_seconds,
-                    metrics.compress_cpu_seconds);
-                live->decompression_totals.add(
-                    metrics.extract_bytes, metrics.extract_wall_seconds,
-                    metrics.extract_cpu_seconds);
                 live->recent_passes.push_back(metrics);
                 if (live->recent_passes.size() > kRecentPassLimit) {
                     live->recent_passes.pop_front();
                 }
+                live->pass_history.push_back(metrics);
+                if (live->pass_history.size() > kSampleHistoryLimit) {
+                    live->pass_history.pop_front();
+                }
+                live->compression_samples.push_back({
+                    metrics.compress_bytes, metrics.compress_wall_seconds,
+                    metrics.compress_cpu_seconds});
+                live->decompression_samples.push_back({
+                    metrics.extract_bytes, metrics.extract_wall_seconds,
+                    metrics.extract_cpu_seconds});
+                if (live->compression_samples.size() > kSampleHistoryLimit) {
+                    live->compression_samples.pop_front();
+                }
+                if (live->decompression_samples.size() > kSampleHistoryLimit) {
+                    live->decompression_samples.pop_front();
+                }
+                if (params.adaptive_stability && pass >= kMinimumStablePasses) {
+                    const std::vector<axiom::core::BenchmarkSample> compression_samples(
+                        live->compression_samples.begin(), live->compression_samples.end());
+                    const std::vector<axiom::core::BenchmarkSample> decompression_samples(
+                        live->decompression_samples.begin(), live->decompression_samples.end());
+                    stable = axiom::core::benchmark_samples_stable(
+                                 compression_samples, kMinimumStablePasses,
+                                 kStableVariationPercent) &&
+                             axiom::core::benchmark_samples_stable(
+                                 decompression_samples, kMinimumStablePasses,
+                                 kStableVariationPercent);
+                }
                 live->phase = BenchmarkPhase::preparing;
                 live->current_pass = 0;
                 live->progress = {};
-                live->status = L"Pass " + std::to_wstring(pass) + L" complete.";
+                live->phase_start = {};
+                live->timing_active = false;
+                live->status = stable
+                    ? L"Stable result reached after " + std::to_wstring(pass) + L" passes."
+                    : L"Pass " + std::to_wstring(pass) + L" complete.";
             }
             publish();
+            if (stable) {
+                stable_result = true;
+                break;
+            }
         }
 
         {
@@ -1284,8 +1753,13 @@ void benchmark_worker(HWND hwnd, BenchmarkParams params,
             live->phase = BenchmarkPhase::finished;
             live->current_pass = 0;
             live->progress = {};
-            live->status = L"Finished.";
+            live->phase_start = {};
+            live->timing_active = false;
+            live->status = stable_result
+                ? L"Finished with a stable result."
+                : L"Finished " + std::to_wstring(live->total_passes) + L" passes.";
         }
+        persist_completed_benchmark(*live);
         std::wstring final_text;
         {
             std::lock_guard lock(live->mutex);
@@ -1299,6 +1773,8 @@ void benchmark_worker(HWND hwnd, BenchmarkParams params,
             live->phase = BenchmarkPhase::finished;
             live->current_pass = 0;
             live->progress = {};
+            live->phase_start = {};
+            live->timing_active = false;
             live->status = L"Benchmark stopped.";
             final_text = render_benchmark_report(*live);
         }
@@ -1310,6 +1786,8 @@ void benchmark_worker(HWND hwnd, BenchmarkParams params,
             live->phase = BenchmarkPhase::finished;
             live->current_pass = 0;
             live->progress = {};
+            live->phase_start = {};
+            live->timing_active = false;
             live->status = L"Benchmark failed: " +
                 std::wstring(ex.what(), ex.what() + std::strlen(ex.what()));
             final_text = render_benchmark_report(*live);
@@ -1321,8 +1799,10 @@ void benchmark_worker(HWND hwnd, BenchmarkParams params,
 void rebuild_fonts(BenchmarkDialogState* state) {
     delete_dialog_font(state->font);
     delete_dialog_font(state->fixed_font);
+    delete_dialog_font(state->summary_font);
     state->font = create_dialog_font(state->dpi);
     state->fixed_font = create_benchmark_results_font(state->dpi);
+    state->summary_font = create_benchmark_summary_font(state->dpi);
     for (HWND control : controls(state)) {
         set_dialog_control_font(control, state->font);
     }
@@ -1337,8 +1817,8 @@ void rebuild_fonts(BenchmarkDialogState* state) {
 
 void set_running(BenchmarkDialogState* state, bool running) {
     state->running = running;
-    EnableWindow(state->corpus, !running);
-    EnableWindow(state->size, !running);
+    EnableWindow(state->corpus, !running && !state->custom_input_checked);
+    EnableWindow(state->size, !running && !state->custom_input_checked);
     EnableWindow(state->level, !running);
     EnableWindow(state->threads, !running);
     EnableWindow(state->passes, !running);
@@ -1349,6 +1829,8 @@ void set_running(BenchmarkDialogState* state, bool running) {
     EnableWindow(state->start, !running);
     EnableWindow(state->pause, running);
     EnableWindow(state->cancel, running);
+    EnableWindow(state->copy, !running);
+    EnableWindow(state->export_results, !running);
     EnableWindow(state->close, !running);
     SetWindowTextW(state->pause, L"Pause");
     state->paused = false;
@@ -1407,7 +1889,15 @@ void layout(BenchmarkDialogState* state) {
                    scale_for_dialog_dpi(160, state->dpi),
                row_height, TRUE);
 
-    const int results_top = top + 3 * (row_height + gap) + scale_for_dialog_dpi(16, state->dpi);
+    const int summary_top =
+        top + 3 * (row_height + gap) + scale_for_dialog_dpi(8, state->dpi);
+    const int summary_height = scale_for_dialog_dpi(86, state->dpi);
+    const int progress_height = scale_for_dialog_dpi(8, state->dpi);
+    MoveWindow(state->progress_bar, margin,
+               summary_top + summary_height - progress_height,
+               client.right - margin * 2, progress_height, TRUE);
+    const int results_top = summary_top + summary_height +
+        scale_for_dialog_dpi(14, state->dpi);
     const int button_height = scale_for_dialog_dpi(30, state->dpi);
     const int button_width = scale_for_dialog_dpi(90, state->dpi);
     const int button_gap = scale_for_dialog_dpi(10, state->dpi);
@@ -1418,6 +1908,8 @@ void layout(BenchmarkDialogState* state) {
     update_report_scrollbars(state);
     int x = client.right - margin - button_width;
     MoveWindow(state->close, x, button_top, button_width, button_height, TRUE);
+    x -= button_width + button_gap;
+    MoveWindow(state->export_results, x, button_top, button_width, button_height, TRUE);
     x -= button_width + button_gap;
     MoveWindow(state->copy, x, button_top, button_width, button_height, TRUE);
     x -= button_width + button_gap;
@@ -1432,6 +1924,8 @@ void layout(BenchmarkDialogState* state) {
 
 void paint_labels(BenchmarkDialogState* state, HDC dc) {
     const DialogColors colors = dialog_colors(state->dark);
+    RECT client{};
+    GetClientRect(state->hwnd, &client);
     SetBkMode(dc, TRANSPARENT);
     SetTextColor(dc, colors.text);
     HFONT old_font = static_cast<HFONT>(SelectObject(dc, state->font));
@@ -1456,6 +1950,143 @@ void paint_labels(BenchmarkDialogState* state, HDC dc) {
     draw_label(L"Level", column3, 0);
     draw_label(L"Threads", margin, 1);
     draw_label(L"Passes", column2, 1);
+
+    std::wstring compression_value = L"—";
+    std::wstring compression_detail = L"Waiting for measured passes";
+    std::wstring decompression_value = L"—";
+    std::wstring decompression_detail = L"Waiting for measured passes";
+    std::wstring ratio_value = L"—";
+    std::wstring ratio_detail = L"Verified in memory";
+    std::wstring cpu_value = L"—";
+    std::wstring cpu_detail = L"Machine-aware thread selection";
+    if (!state->thread_choices.empty()) {
+        const int level_index = std::clamp(combo_selection(state->level, 4), 0, 8);
+        const int thread_index = std::clamp(
+            combo_selection(state->threads), 0,
+            static_cast<int>(state->thread_choices.size() - 1));
+        const std::size_t requested =
+            state->thread_choices[static_cast<std::size_t>(thread_index)].value;
+        const std::size_t selected = selected_thread_count(
+            requested, state->preview_system.hardware_threads);
+        axiom::CompressionOptions preview;
+        axiom::apply_compression_level(preview, level_index + 1);
+        preview.thread_count = requested;
+        const int size_index = std::clamp(
+            combo_selection(state->size), 0,
+            static_cast<int>(kSizeValues.size() - 1));
+        std::uint64_t bytes = kSizeValues[static_cast<std::size_t>(size_index)];
+        if (bytes == 0) {
+            bytes = automatic_corpus_size(
+                preview, selected, state->preview_system.available_memory);
+        }
+        cpu_value = std::to_wstring(selected) + L" selected";
+        cpu_detail = state->custom_input_checked
+            ? L"Memory checked after scanning input"
+            : L"Estimated peak " + format_bytes(
+                  estimate_memory_usage(preview, selected, bytes));
+        ratio_detail = state->custom_input_checked
+            ? L"Custom input loaded before timing"
+            : format_bytes(bytes) + L" generated in memory";
+    }
+    if (state->live) {
+        std::lock_guard lock(state->live->mutex);
+        const BenchmarkLiveState& live = *state->live;
+        const std::vector<axiom::core::BenchmarkSample> compression_samples(
+            live.compression_samples.begin(), live.compression_samples.end());
+        const std::vector<axiom::core::BenchmarkSample> decompression_samples(
+            live.decompression_samples.begin(), live.decompression_samples.end());
+        const auto compression =
+            axiom::core::summarize_benchmark_samples(compression_samples);
+        const auto decompression =
+            axiom::core::summarize_benchmark_samples(decompression_samples);
+        if (compression.sample_count != 0) {
+            compression_value = format_speed(
+                static_cast<std::uint64_t>(compression.median_bytes_per_second), 1.0);
+            compression_detail = live.baseline
+                ? format_comparison_delta(
+                      compression.median_bytes_per_second,
+                      live.baseline->compression_bytes_per_second) +
+                      L" vs prior · ±" +
+                      format_decimal(compression.robust_spread_percent, 1) + L"%"
+                : L"±" + format_decimal(
+                      compression.robust_spread_percent, 1) + L"% robust spread";
+        }
+        if (decompression.sample_count != 0) {
+            decompression_value = format_speed(
+                static_cast<std::uint64_t>(decompression.median_bytes_per_second), 1.0);
+            decompression_detail = live.baseline
+                ? format_comparison_delta(
+                      decompression.median_bytes_per_second,
+                      live.baseline->decompression_bytes_per_second) +
+                      L" vs prior · ±" +
+                      format_decimal(decompression.robust_spread_percent, 1) + L"%"
+                : L"±" + format_decimal(
+                      decompression.robust_spread_percent, 1) + L"% robust spread";
+        }
+        if (live.archive_bytes != 0 && live.original_bytes != 0) {
+            ratio_value = ratio_text(live.original_bytes, live.archive_bytes);
+            ratio_detail = live.baseline
+                ? format_comparison_delta(
+                      static_cast<double>(live.archive_bytes),
+                      static_cast<double>(live.baseline->archive_bytes), true) +
+                      L" stored size vs prior"
+                : format_bytes(live.archive_bytes) +
+                      (live.verified ? L" · Verified" : L" · Verifying...");
+        }
+        if (compression.sample_count != 0 || decompression.sample_count != 0) {
+            const double active = compression.sample_count != 0
+                ? compression.median_active_cores : decompression.median_active_cores;
+            const std::size_t selected = selected_thread_count(
+                live.params.threads, live.system.hardware_threads);
+            cpu_value = format_decimal(active, 1) + L" active / " +
+                std::to_wstring(selected);
+            cpu_detail = L"Estimated peak " + format_bytes(live.estimated_memory);
+        }
+    }
+
+    const int summary_top =
+        top + 3 * (row_height + gap) + scale_for_dialog_dpi(8, state->dpi);
+    const int summary_gap = scale_for_dialog_dpi(9, state->dpi);
+    const int summary_bottom = summary_top + scale_for_dialog_dpi(68, state->dpi);
+    const int available_width = client.right - margin * 2 - summary_gap * 3;
+    const int card_width = std::max(scale_for_dialog_dpi(120, state->dpi),
+                                    available_width / 4);
+    HBRUSH card_brush = CreateSolidBrush(colors.control_background);
+    HBRUSH border_brush = CreateSolidBrush(colors.border);
+    const std::array<const wchar_t*, 4> card_labels{
+        L"Compression", L"Decompression", L"Ratio", L"CPU / memory"};
+    const std::array<std::wstring, 4> card_values{
+        compression_value, decompression_value, ratio_value, cpu_value};
+    const std::array<std::wstring, 4> card_details{
+        compression_detail, decompression_detail, ratio_detail, cpu_detail};
+    for (std::size_t index = 0; index < card_labels.size(); ++index) {
+        const int left = margin + static_cast<int>(index) * (card_width + summary_gap);
+        RECT card{left, summary_top, left + card_width, summary_bottom};
+        FillRect(dc, &card, card_brush);
+        FrameRect(dc, &card, border_brush);
+        RECT label{card.left + scale_for_dialog_dpi(9, state->dpi),
+                   card.top + scale_for_dialog_dpi(5, state->dpi),
+                   card.right - scale_for_dialog_dpi(7, state->dpi),
+                   card.top + scale_for_dialog_dpi(23, state->dpi)};
+        SetTextColor(dc, colors.disabled_text);
+        SelectObject(dc, state->font);
+        DrawTextW(dc, card_labels[index], -1, &label,
+                  DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+        RECT value{label.left, card.top + scale_for_dialog_dpi(22, state->dpi),
+                   label.right, card.top + scale_for_dialog_dpi(46, state->dpi)};
+        SetTextColor(dc, colors.text);
+        SelectObject(dc, state->summary_font);
+        DrawTextW(dc, card_values[index].c_str(), -1, &value,
+                  DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+        RECT detail{label.left, card.top + scale_for_dialog_dpi(46, state->dpi),
+                    label.right, card.bottom - scale_for_dialog_dpi(3, state->dpi)};
+        SetTextColor(dc, colors.disabled_text);
+        SelectObject(dc, state->font);
+        DrawTextW(dc, card_details[index].c_str(), -1, &detail,
+                  DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+    }
+    DeleteObject(border_brush);
+    DeleteObject(card_brush);
     if (old_font) SelectObject(dc, old_font);
 }
 
@@ -1695,12 +2326,18 @@ BenchmarkParams collect_params(BenchmarkDialogState* state) {
     params.bytes = kSizeValues[size_index];
     params.automatic_size = params.bytes == 0;
     params.level = std::clamp(combo_selection(state->level, 4), 0, 8) + 1;
-    params.threads = kThreadValues[std::clamp(
-        combo_selection(state->threads), 0, static_cast<int>(kThreadValues.size() - 1))];
+    const int thread_index = std::clamp(
+        combo_selection(state->threads), 0,
+        static_cast<int>(state->thread_choices.empty()
+            ? 0 : state->thread_choices.size() - 1));
+    params.threads = state->thread_choices.empty()
+        ? 0 : state->thread_choices[static_cast<std::size_t>(thread_index)].value;
     const int pass_index = std::clamp(
         combo_selection(state->passes, 1), 0, static_cast<int>(kPassValues.size() - 1));
     params.passes = kPassValues[pass_index];
     params.continuous = params.passes == 0;
+    params.adaptive_stability = pass_index == 2;
+    if (params.adaptive_stability) params.passes = 10;
     if (state->custom_input_checked) {
         const std::wstring path = trim(window_text(state->custom_path));
         if (path.empty()) {
@@ -1721,6 +2358,66 @@ BenchmarkParams collect_params(BenchmarkDialogState* state) {
     return params;
 }
 
+void load_benchmark_preferences(BenchmarkDialogState* state) {
+    const int corpus = static_cast<int>(std::clamp<DWORD>(
+        read_registry_dword(
+            HKEY_CURRENT_USER, kBenchmarkRegistryPath, L"CorpusIndex").value_or(0),
+        0, static_cast<DWORD>(kCorpusNames.size() - 1)));
+    const int size = static_cast<int>(std::clamp<DWORD>(
+        read_registry_dword(
+            HKEY_CURRENT_USER, kBenchmarkRegistryPath, L"SizeIndex").value_or(0),
+        0, static_cast<DWORD>(kSizeNames.size() - 1)));
+    const int level = static_cast<int>(std::clamp<DWORD>(
+        read_registry_dword(
+            HKEY_CURRENT_USER, kBenchmarkRegistryPath, L"LevelIndex").value_or(4),
+        0, static_cast<DWORD>(kLevelNames.size() - 1)));
+    const int passes = static_cast<int>(std::clamp<DWORD>(
+        read_registry_dword(
+            HKEY_CURRENT_USER, kBenchmarkRegistryPath, L"PassIndex").value_or(2),
+        0, static_cast<DWORD>(kPassNames.size() - 1)));
+    const std::uint64_t requested_threads = read_registry_qword(
+        HKEY_CURRENT_USER, kBenchmarkRegistryPath, L"RequestedThreads").value_or(0);
+    int thread_index = 0;
+    for (std::size_t index = 0; index < state->thread_choices.size(); ++index) {
+        if (state->thread_choices[index].value == requested_threads) {
+            thread_index = static_cast<int>(index);
+            break;
+        }
+    }
+    SendMessageW(state->corpus, CB_SETCURSEL, corpus, 0);
+    SendMessageW(state->size, CB_SETCURSEL, size, 0);
+    SendMessageW(state->level, CB_SETCURSEL, level, 0);
+    SendMessageW(state->threads, CB_SETCURSEL, thread_index, 0);
+    SendMessageW(state->passes, CB_SETCURSEL, passes, 0);
+}
+
+void save_benchmark_preferences(BenchmarkDialogState* state) {
+    HKEY key = nullptr;
+    DWORD disposition = 0;
+    if (RegCreateKeyExW(
+            HKEY_CURRENT_USER, kBenchmarkRegistryPath, 0, nullptr, 0,
+            KEY_SET_VALUE, nullptr, &key, &disposition) != ERROR_SUCCESS) {
+        return;
+    }
+    const int thread_index = std::clamp(
+        combo_selection(state->threads), 0,
+        static_cast<int>(state->thread_choices.empty()
+            ? 0 : state->thread_choices.size() - 1));
+    const std::size_t requested_threads = state->thread_choices.empty()
+        ? 0 : state->thread_choices[static_cast<std::size_t>(thread_index)].value;
+    write_registry_dword(
+        key, L"CorpusIndex", static_cast<DWORD>(combo_selection(state->corpus)));
+    write_registry_dword(
+        key, L"SizeIndex", static_cast<DWORD>(combo_selection(state->size)));
+    write_registry_dword(
+        key, L"LevelIndex", static_cast<DWORD>(combo_selection(state->level, 4)));
+    write_registry_dword(
+        key, L"PassIndex", static_cast<DWORD>(combo_selection(state->passes, 2)));
+    write_registry_qword(
+        key, L"RequestedThreads", static_cast<std::uint64_t>(requested_threads));
+    RegCloseKey(key);
+}
+
 void copy_results(BenchmarkDialogState* state) {
     if (state->latest_results.empty() || !OpenClipboard(state->hwnd)) return;
     EmptyClipboard();
@@ -1737,6 +2434,282 @@ void copy_results(BenchmarkDialogState* state) {
     }
     if (memory != nullptr) GlobalFree(memory);
     CloseClipboard();
+}
+
+std::wstring csv_field(std::wstring value) {
+    std::wstring escaped;
+    escaped.reserve(value.size() + 2);
+    escaped.push_back(L'"');
+    for (const wchar_t ch : value) {
+        if (ch == L'"') escaped.push_back(L'"');
+        escaped.push_back(ch);
+    }
+    escaped.push_back(L'"');
+    return escaped;
+}
+
+std::string utf8_text(std::wstring_view value) {
+    if (value.empty()) return {};
+    const int bytes = WideCharToMultiByte(
+        CP_UTF8, WC_ERR_INVALID_CHARS, value.data(), static_cast<int>(value.size()),
+        nullptr, 0, nullptr, nullptr);
+    if (bytes <= 0) throw std::runtime_error("cannot encode benchmark report as UTF-8");
+    std::string result(static_cast<std::size_t>(bytes), '\0');
+    if (WideCharToMultiByte(
+            CP_UTF8, WC_ERR_INVALID_CHARS, value.data(), static_cast<int>(value.size()),
+            result.data(), bytes, nullptr, nullptr) != bytes) {
+        throw std::runtime_error("cannot encode benchmark report as UTF-8");
+    }
+    return result;
+}
+
+std::optional<fs::path> benchmark_history_file() {
+    PWSTR raw_path = nullptr;
+    if (FAILED(SHGetKnownFolderPath(
+            FOLDERID_LocalAppData, KF_FLAG_CREATE, nullptr, &raw_path)) ||
+        raw_path == nullptr) {
+        return std::nullopt;
+    }
+    fs::path path(raw_path);
+    CoTaskMemFree(raw_path);
+    return path / L"AxiomCompress" / L"benchmark-history.csv";
+}
+
+std::uint64_t rounded_throughput(double value) {
+    if (!std::isfinite(value) || value <= 0.0) return 0;
+    if (value >= static_cast<double>(UINT64_MAX)) return UINT64_MAX;
+    return static_cast<std::uint64_t>(value + 0.5);
+}
+
+void persist_completed_benchmark(BenchmarkLiveState& live) noexcept {
+    try {
+    BenchmarkParams params;
+    SystemDetails system;
+    std::vector<axiom::core::BenchmarkSample> compression_samples;
+    std::vector<axiom::core::BenchmarkSample> decompression_samples;
+    std::uint64_t original_bytes = 0;
+    std::uint64_t archive_bytes = 0;
+    std::uint64_t total_passes = 0;
+    bool verified = false;
+    {
+        std::lock_guard lock(live.mutex);
+        params = live.params;
+        system = live.system;
+        compression_samples.assign(
+            live.compression_samples.begin(), live.compression_samples.end());
+        decompression_samples.assign(
+            live.decompression_samples.begin(), live.decompression_samples.end());
+        original_bytes = live.original_bytes;
+        archive_bytes = live.archive_bytes;
+        total_passes = live.total_passes;
+        verified = live.verified;
+    }
+    const auto compression =
+        axiom::core::summarize_benchmark_samples(compression_samples);
+    const auto decompression =
+        axiom::core::summarize_benchmark_samples(decompression_samples);
+    if (!verified || compression.sample_count == 0 ||
+        decompression.sample_count == 0 || archive_bytes == 0) {
+        return;
+    }
+
+    const std::wstring timestamp = utc_timestamp();
+    std::wstring warning;
+    if (!params.custom_input && compression.sample_count >= 3 &&
+        decompression.sample_count >= 3) {
+        const std::wstring path = baseline_registry_path(
+            params, system, original_bytes);
+        HKEY key = nullptr;
+        DWORD disposition = 0;
+        bool saved = RegCreateKeyExW(
+            HKEY_CURRENT_USER, path.c_str(), 0, nullptr, 0, KEY_SET_VALUE,
+            nullptr, &key, &disposition) == ERROR_SUCCESS;
+        if (saved) {
+            saved = write_registry_string(key, L"TimestampUtc", timestamp) &&
+                write_registry_string(key, L"AxiomVersion", params.app_version) &&
+                write_registry_qword(
+                    key, L"CompressionBytesPerSecond",
+                    rounded_throughput(compression.median_bytes_per_second)) &&
+                write_registry_qword(
+                    key, L"DecompressionBytesPerSecond",
+                    rounded_throughput(decompression.median_bytes_per_second)) &&
+                write_registry_qword(key, L"ArchiveBytes", archive_bytes);
+            RegCloseKey(key);
+        }
+        if (!saved) warning = L"The matching-run baseline could not be saved.";
+    }
+
+    std::wstring history_display;
+    if (const auto history = benchmark_history_file()) {
+        std::error_code error;
+        fs::create_directories(history->parent_path(), error);
+        const bool new_file = !error &&
+            (!fs::exists(*history, error) || (!error && fs::file_size(*history, error) == 0));
+        if (!error) {
+            std::ofstream file(*history, std::ios::binary | std::ios::app);
+            if (file) {
+                if (new_file) {
+                    static constexpr unsigned char bom[]{0xEF, 0xBB, 0xBF};
+                    file.write(reinterpret_cast<const char*>(bom), sizeof(bom));
+                    const std::string header =
+                        "TimestampUtc,Protocol,CorpusVersion,AxiomVersion,Input,InputBytes,"
+                        "Level,RequestedThreads,EffectiveThreads,Passes,CompressionMedianBytesPerSecond,"
+                        "CompressionSpreadPercent,DecompressionMedianBytesPerSecond,"
+                        "DecompressionSpreadPercent,ArchiveBytes,StoredPercent,"
+                        "CompressionActiveCores,DecompressionActiveCores,Verified\r\n";
+                    file.write(header.data(), static_cast<std::streamsize>(header.size()));
+                }
+                const std::wstring input = params.custom_input
+                    ? L"Custom input"
+                    : std::wstring(kCorpusNames[static_cast<int>(params.corpus)]);
+                const std::size_t effective_threads = selected_thread_count(
+                    params.threads, system.hardware_threads);
+                const double stored_percent = original_bytes == 0
+                    ? 0.0
+                    : static_cast<double>(archive_bytes) * 100.0 /
+                        static_cast<double>(original_bytes);
+                std::wostringstream row;
+                row << std::fixed << std::setprecision(6)
+                    << csv_field(timestamp) << L','
+                    << axiom::core::kBenchmarkProtocolVersion << L','
+                    << axiom::core::kBenchmarkCorpusVersion << L','
+                    << csv_field(params.app_version) << L','
+                    << csv_field(input) << L',' << original_bytes << L','
+                    << params.level << L',' << params.threads << L','
+                    << effective_threads << L',' << total_passes << L','
+                    << compression.median_bytes_per_second << L','
+                    << compression.robust_spread_percent << L','
+                    << decompression.median_bytes_per_second << L','
+                    << decompression.robust_spread_percent << L','
+                    << archive_bytes << L',' << stored_percent << L','
+                    << compression.median_active_cores << L','
+                    << decompression.median_active_cores << L','
+                    << L"true\r\n";
+                const std::string encoded = utf8_text(row.str());
+                file.write(encoded.data(), static_cast<std::streamsize>(encoded.size()));
+                if (file) history_display = history->wstring();
+            }
+        }
+    }
+    if (history_display.empty()) {
+        if (!warning.empty()) warning += L' ';
+        warning += L"The benchmark history row could not be saved.";
+    }
+    {
+        std::lock_guard lock(live.mutex);
+        live.history_path = std::move(history_display);
+        live.persistence_warning = std::move(warning);
+    }
+    } catch (...) {
+        // Persistence is useful context, never part of the measured result.
+        // A locked-down profile or full disk must not turn a valid benchmark
+        // into a codec failure.
+        try {
+            std::lock_guard lock(live.mutex);
+            live.persistence_warning =
+                L"The benchmark completed, but its history could not be saved.";
+        } catch (...) {
+        }
+    }
+}
+
+std::wstring benchmark_csv(const BenchmarkLiveState& live) {
+    const std::size_t effective_threads = selected_thread_count(
+        live.params.threads, live.system.hardware_threads);
+    const std::wstring private_input = live.params.custom_input
+        ? live.params.custom_input->filename().wstring()
+        : std::wstring(kCorpusNames[static_cast<int>(live.params.corpus)]);
+    const std::wstring exported_at = utc_timestamp();
+    std::wostringstream out;
+    out << L"ExportedAtUtc,Protocol,CorpusVersion,Statistic,AxiomVersion,Input,InputBytes,"
+           L"Level,RequestedThreads,EffectiveThreads,PhysicalCores,LogicalProcessors,"
+           L"Cpu,Os,Architecture,CpuFeatures,Power,TotalMemoryBytes,AvailableMemoryBytes,"
+           L"TotalPasses,RetainedPasses,DiscardedPausedSamples,Pass,CompressionIterations,"
+           L"CompressionBytes,CompressionSeconds,CompressionCpuSeconds,"
+           L"DecompressionIterations,DecompressionBytes,DecompressionSeconds,"
+           L"DecompressionCpuSeconds,ArchiveBytes,Verified\r\n";
+    out << std::fixed << std::setprecision(9);
+    for (const PassMetrics& pass : live.pass_history) {
+        out << csv_field(exported_at) << L','
+            << axiom::core::kBenchmarkProtocolVersion << L','
+            << axiom::core::kBenchmarkCorpusVersion << L','
+            << csv_field(L"median with robust spread") << L','
+            << csv_field(live.params.app_version) << L','
+            << csv_field(private_input) << L','
+            << pass.original_bytes << L',' << live.params.level << L','
+            << live.params.threads << L',' << effective_threads << L','
+            << live.system.physical_cores << L',' << live.system.hardware_threads << L','
+            << csv_field(live.system.cpu_name) << L','
+            << csv_field(live.system.windows_version) << L','
+            << csv_field(live.system.architecture) << L','
+            << csv_field(live.system.cpu_features) << L','
+            << csv_field(live.system.on_ac_power ? L"AC" : L"battery") << L','
+            << live.system.total_memory << L',' << live.system.available_memory << L','
+            << live.total_passes << L',' << live.pass_history.size() << L','
+            << live.discarded_samples << L','
+            << pass.pass << L',' << pass.compress_iterations << L','
+            << pass.compress_bytes << L',' << pass.compress_wall_seconds << L','
+            << pass.compress_cpu_seconds << L',' << pass.extract_iterations << L','
+            << pass.extract_bytes << L',' << pass.extract_wall_seconds << L','
+            << pass.extract_cpu_seconds << L',' << pass.archive_bytes << L','
+            << (live.verified ? L"true" : L"false") << L"\r\n";
+    }
+    return out.str();
+}
+
+void export_results(BenchmarkDialogState* state) {
+    if (state == nullptr || !state->live) return;
+    std::wstring csv;
+    bool has_passes = false;
+    {
+        std::lock_guard lock(state->live->mutex);
+        has_passes = !state->live->pass_history.empty();
+        if (has_passes) {
+            csv = benchmark_csv(*state->live);
+        }
+    }
+    if (!has_passes) {
+        show_message_dialog(
+            state->hwnd, state->instance, state->dpi, state->dark,
+            L"Axiom Benchmark", L"Run at least one verified pass before exporting.",
+            MessageDialogIcon::information);
+        return;
+    }
+
+    ComPtr<IFileSaveDialog> dialog;
+    if (FAILED(CoCreateInstance(CLSID_FileSaveDialog, nullptr, CLSCTX_INPROC_SERVER,
+                                IID_PPV_ARGS(dialog.put())))) {
+        return;
+    }
+    constexpr COMDLG_FILTERSPEC filters[]{{L"CSV files", L"*.csv"}};
+    dialog->SetFileTypes(1, filters);
+    dialog->SetDefaultExtension(L"csv");
+    dialog->SetFileName(L"Axiom-benchmark.csv");
+    dialog->SetTitle(L"Export benchmark measurements");
+    if (FAILED(dialog->Show(state->hwnd))) return;
+    ComPtr<IShellItem> item;
+    if (FAILED(dialog->GetResult(item.put()))) return;
+    PWSTR selected = nullptr;
+    if (FAILED(item->GetDisplayName(SIGDN_FILESYSPATH, &selected)) || selected == nullptr) {
+        return;
+    }
+    const fs::path output(selected);
+    CoTaskMemFree(selected);
+    try {
+        const std::string encoded = utf8_text(csv);
+        std::ofstream file(output, std::ios::binary | std::ios::trunc);
+        if (!file) throw std::runtime_error("cannot create the benchmark CSV");
+        static constexpr unsigned char bom[]{0xEF, 0xBB, 0xBF};
+        file.write(reinterpret_cast<const char*>(bom), sizeof(bom));
+        file.write(encoded.data(), static_cast<std::streamsize>(encoded.size()));
+        if (!file) throw std::runtime_error("cannot write the benchmark CSV");
+    } catch (const std::exception& ex) {
+        show_message_dialog(
+            state->hwnd, state->instance, state->dpi, state->dark,
+            L"Axiom Benchmark",
+            std::wstring(ex.what(), ex.what() + std::strlen(ex.what())),
+            MessageDialogIcon::error);
+    }
 }
 
 void start_benchmark(BenchmarkDialogState* state) {
@@ -1757,6 +2730,7 @@ void start_benchmark(BenchmarkDialogState* state) {
         }
         return;
     }
+    save_benchmark_preferences(state);
     state->operation = std::make_shared<axiom::OperationControl>();
     state->live = std::make_shared<BenchmarkLiveState>();
     set_results_text(state, L"Starting benchmark...");
@@ -1812,6 +2786,7 @@ void browse_custom_folder(BenchmarkDialogState* state) {
 
 void close_benchmark_dialog(BenchmarkDialogState* state) {
     if (state == nullptr) return;
+    save_benchmark_preferences(state);
     save_named_window_placement(kBenchmarkLayoutName, state->hwnd);
     HWND owner = state->owner;
     const bool owner_was_enabled = state->owner_was_enabled;
@@ -1862,8 +2837,15 @@ LRESULT CALLBACK benchmark_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM l
             fill_combo(state->corpus, kCorpusNames, 0);
             fill_combo(state->size, kSizeNames, 0);
             fill_combo(state->level, kLevelNames, 4);
-            fill_combo(state->threads, kThreadNames, 0);
-            fill_combo(state->passes, kPassNames, 1);
+            state->preview_system = collect_system_details();
+            state->thread_choices = thread_choices(state->preview_system);
+            for (const ThreadChoice& choice : state->thread_choices) {
+                SendMessageW(state->threads, CB_ADDSTRING, 0,
+                             reinterpret_cast<LPARAM>(choice.label.c_str()));
+            }
+            SendMessageW(state->threads, CB_SETCURSEL, 0, 0);
+            fill_combo(state->passes, kPassNames, 2);
+            load_benchmark_preferences(state);
             state->custom_input = make(
                 L"BUTTON", L"File/folder path",
                 WS_TABSTOP | BS_AUTOCHECKBOX | BS_OWNERDRAW, kCustomInput);
@@ -1880,6 +2862,7 @@ LRESULT CALLBACK benchmark_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM l
             state->browse_custom_folder = make(
                 L"BUTTON", L"Folder...", WS_TABSTOP | BS_OWNERDRAW, kBrowseCustomFolder);
             state->fixed_font = create_benchmark_results_font(state->dpi);
+            state->summary_font = create_benchmark_summary_font(state->dpi);
             // The benchmark report is painted by Axiom so live metrics update
             // without EDIT-control flicker or scroll jumps.
             state->results = CreateWindowExW(
@@ -1894,17 +2877,26 @@ LRESULT CALLBACK benchmark_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM l
             state->pause = make(L"BUTTON", L"Pause", WS_TABSTOP | BS_OWNERDRAW, kPauseButton);
             state->cancel = make(L"BUTTON", L"Stop", WS_TABSTOP | BS_OWNERDRAW, kCancelButton);
             state->copy = make(L"BUTTON", L"Copy", WS_TABSTOP | BS_OWNERDRAW, kCopyButton);
+            state->export_results = make(
+                L"BUTTON", L"Export...", WS_TABSTOP | BS_OWNERDRAW, kExportButton);
+            state->progress_bar = CreateWindowExW(
+                0, PROGRESS_CLASSW, L"", WS_CHILD | WS_VISIBLE | PBS_SMOOTH,
+                0, 0, 0, 0, hwnd,
+                reinterpret_cast<HMENU>(static_cast<INT_PTR>(kProgressBar)),
+                state->instance, nullptr);
+            SendMessageW(state->progress_bar, PBM_SETRANGE32, 0, 1000);
+            SendMessageW(state->progress_bar, PBM_SETPOS, 0, 0);
             state->close = make(L"BUTTON", L"Close", WS_TABSTOP | BS_OWNERDRAW, kCloseButton);
             add_dialog_tooltip(state->tooltip, state->corpus,
                                L"Select the generated in-memory corpus data type.");
             add_dialog_tooltip(state->tooltip, state->size,
-                               L"Choose an explicit unsigned corpus size, or Automatic to fit the codec window and memory budget.");
+                               L"Choose a corpus size, or Automatic to fit the codec window and available-memory budget.");
             add_dialog_tooltip(state->tooltip, state->level,
                                L"Select compression level 1 through 9.");
             add_dialog_tooltip(state->tooltip, state->threads,
-                               L"Select an unsigned CPU thread count, or Automatic to use all available processors.");
+                               L"Select a CPU thread count, or Automatic to use the available processors.");
             add_dialog_tooltip(state->tooltip, state->passes,
-                               L"Select a measured pass count, or Continuous to run until Stop is pressed.");
+                               L"Stable stops after 5-10 consistent passes; Continuous runs until Stop is pressed.");
             add_dialog_tooltip(state->tooltip, state->custom_input,
                                L"Use the Windows file or folder path in the adjacent text field instead of generated data.");
             add_dialog_tooltip(state->tooltip, state->custom_path,
@@ -1921,6 +2913,8 @@ LRESULT CALLBACK benchmark_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM l
                                L"Stop when the active codec operation reaches a cancellation checkpoint.");
             add_dialog_tooltip(state->tooltip, state->copy,
                                L"Copy the current settings, system details, and results.");
+            add_dialog_tooltip(state->tooltip, state->export_results,
+                               L"Save raw measured passes and reproducibility metadata as CSV.");
             EnableWindow(state->pause, FALSE);
             EnableWindow(state->cancel, FALSE);
             set_custom_input_checked(state, false);
@@ -2009,6 +3003,15 @@ LRESULT CALLBACK benchmark_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM l
             break;
         case WM_COMMAND:
             switch (LOWORD(wparam)) {
+                case kCorpusCombo:
+                case kSizeCombo:
+                case kLevelCombo:
+                case kThreadsCombo:
+                case kPassesCombo:
+                    if (HIWORD(wparam) == CBN_SELCHANGE) {
+                        InvalidateRect(state->hwnd, nullptr, FALSE);
+                    }
+                    return 0;
                 case kStartButton:
                     start_benchmark(state);
                     return 0;
@@ -2026,6 +3029,10 @@ LRESULT CALLBACK benchmark_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM l
                 case kPauseButton:
                     if (state->running && state->operation) {
                         state->paused = !state->paused;
+                        if (state->live) {
+                            state->live->pause_generation.fetch_add(
+                                1, std::memory_order_acq_rel);
+                        }
                         state->operation->set_paused(state->paused);
                         SetWindowTextW(state->pause, state->paused ? L"Resume" : L"Pause");
                     }
@@ -2038,6 +3045,9 @@ LRESULT CALLBACK benchmark_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM l
                     return 0;
                 case kCopyButton:
                     copy_results(state);
+                    return 0;
+                case kExportButton:
+                    export_results(state);
                     return 0;
                 case kCloseButton:
                     if (state->running && state->operation) {
@@ -2052,7 +3062,19 @@ LRESULT CALLBACK benchmark_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM l
             std::unique_ptr<BenchmarkProgressText> progress(
                 reinterpret_cast<BenchmarkProgressText*>(lparam));
             if (progress) {
-                set_results_text(state, std::move(progress->text));
+                bool timing_active = false;
+                if (state->live) {
+                    std::lock_guard lock(state->live->mutex);
+                    timing_active = state->live->timing_active;
+                }
+                if (timing_active) {
+                    // Accept the already-rendered snapshot but defer the
+                    // expensive scroll measurement and repaint until the
+                    // measured codec call releases the clock.
+                    state->latest_results = std::move(progress->text);
+                } else {
+                    set_results_text(state, std::move(progress->text));
+                }
             }
             return 0;
         }
@@ -2071,6 +3093,7 @@ LRESULT CALLBACK benchmark_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM l
                 state->live) {
                 if (auto progress = state->operation->latest_progress()) {
                     std::wstring text;
+                    bool timing_active = false;
                     {
                         std::lock_guard lock(state->live->mutex);
                         state->live->progress = *progress;
@@ -2084,9 +3107,20 @@ LRESULT CALLBACK benchmark_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM l
                             status << L"  " << progress->current_path.c_str();
                         }
                         state->live->status = status.str();
-                        text = render_benchmark_report(*state->live);
+                        timing_active = state->live->timing_active;
+                        if (!timing_active) {
+                            text = render_benchmark_report(*state->live);
+                        }
                     }
-                    set_results_text(state, std::move(text));
+                    if (timing_active) {
+                        // Repainting the full report can consume a measurable
+                        // slice of CPU on fast corpora. Keep the lightweight
+                        // progress strip alive, but render text only between
+                        // timed codec calls.
+                        update_benchmark_progress(state);
+                    } else {
+                        set_results_text(state, std::move(text));
+                    }
                 }
                 return 0;
             }
@@ -2105,6 +3139,7 @@ LRESULT CALLBACK benchmark_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM l
                 if (state->worker.joinable()) state->worker.join();
                 delete_dialog_font(state->font);
                 delete_dialog_font(state->fixed_font);
+                delete_dialog_font(state->summary_font);
                 if (state->background_brush) DeleteObject(state->background_brush);
                 if (state->edit_brush) DeleteObject(state->edit_brush);
                 state->hwnd = nullptr;

@@ -103,6 +103,7 @@ switch (id) {
     case kDelete: return ToolbarIcon::delete_item;
     case kDeleteArchiveEntries: return ToolbarIcon::delete_item;
     case kInfo: return ToolbarIcon::info;
+    case kSnapshots: return ToolbarIcon::snapshots;
     case kSelectAll: return ToolbarIcon::select_all;
     case kFind: return ToolbarIcon::find;
     case kBenchmark: return ToolbarIcon::benchmark;
@@ -166,7 +167,7 @@ void MainWindow::apply_fonts() {
     HWND controls[] = {
         list_, status_,
         navigate_back_, navigate_forward_, navigate_up_, navigate_refresh_,
-        address_edit_, address_go_,
+        address_edit_, address_go_, filter_edit_, filter_clear_, filter_summary_,
         tooltip_.hwnd(),
     };
     for (HWND control : controls) {
@@ -238,11 +239,13 @@ void MainWindow::apply_theme() {
                         application_options_.custom_accent_color);
     rebuild_theme_brushes();
     set_dark_title_bar(hwnd_, theme_.dark);
+    if (filter_popup_ != nullptr) set_dark_title_bar(filter_popup_, theme_.dark);
 
     HWND controls[] = {
         list_, status_,
         navigate_back_, navigate_forward_, navigate_up_, navigate_refresh_,
-        address_edit_, address_go_,
+        address_edit_, address_go_, filter_popup_, filter_edit_, filter_clear_,
+        filter_summary_,
     };
     for (HWND control : controls) {
         apply_theme_to_control(control);
@@ -265,6 +268,7 @@ void MainWindow::apply_theme() {
     operation_window_.set_theme(make_operation_window_theme(theme_));
 
     InvalidateRect(hwnd_, nullptr, FALSE);
+    if (filter_popup_ != nullptr) InvalidateRect(filter_popup_, nullptr, FALSE);
 }
 
 LRESULT MainWindow::paint_control_background(HWND control, HDC dc, UINT message) {
@@ -302,7 +306,8 @@ void MainWindow::frame_rect(HDC dc, const RECT& rect, COLORREF color) const {
 }
 
 void MainWindow::draw_owner_button(const DRAWITEMSTRUCT& draw) const {
-    if (!is_button_id(draw.CtlID)) {
+    const auto* toolbar_info = toolbar_info_for_command(draw.CtlID);
+    if (toolbar_info == nullptr && !is_button_id(draw.CtlID)) {
         return;
     }
 
@@ -328,11 +333,15 @@ void MainWindow::draw_owner_button(const DRAWITEMSTRUCT& draw) const {
     frame_rect(draw.hDC, rect, border);
 
     std::wstring text = get_text(draw.hwndItem);
+    if (text.empty() && toolbar_info != nullptr) {
+        text = toolbar_info->button_text;
+    }
     if (pressed) {
         OffsetRect(&rect, scale(1), scale(1));
     }
 
-    const auto icon = toolbar_icon_for_button(draw.CtlID);
+    const auto icon = toolbar_info != nullptr
+        ? toolbar_info->icon : toolbar_icon_for_button(draw.CtlID);
     const int icon_mode = std::clamp(application_options_.toolbar_icon_style, 0, 2);
     const COLORREF content_color = disabled ? theme_.muted_text
         : icon_mode == 2 ? theme_.accent : theme_.text;
@@ -419,6 +428,18 @@ void MainWindow::draw_address_entry(const DRAWITEMSTRUCT& draw) const {
     DrawTextW(draw.hDC, entry.label.c_str(), -1, &text_rect,
               DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
     SelectObject(draw.hDC, old_font);
+}
+
+void MainWindow::paint_filter_popup() const {
+    if (filter_popup_ == nullptr) return;
+    PAINTSTRUCT paint{};
+    HDC dc = BeginPaint(filter_popup_, &paint);
+    RECT rect{};
+    GetClientRect(filter_popup_, &rect);
+    fill_rect(dc, rect, theme_.panel);
+    const bool active = GetFocus() == filter_edit_ || !browser_filter_.empty();
+    frame_rect(dc, rect, active ? theme_.focus : theme_.border);
+    EndPaint(filter_popup_, &paint);
 }
 
 }  // namespace axiom::gui

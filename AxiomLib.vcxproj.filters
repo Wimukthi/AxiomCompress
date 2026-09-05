@@ -84,6 +84,9 @@
     <ClInclude Include="src\core\cpu.hpp">
       <Filter>Core</Filter>
     </ClInclude>
+    <ClInclude Include="src\core\benchmark_statistics.hpp">
+      <Filter>Core</Filter>
+    </ClInclude>
     <ClInclude Include="src\core\crypto.hpp">
       <Filter>Core</Filter>
     </ClInclude>
@@ -183,6 +186,9 @@
       <Filter>Codec</Filter>
     </ClCompile>
     <ClCompile Include="src\core\archive.cpp">
+      <Filter>Core</Filter>
+    </ClCompile>
+    <ClCompile Include="src\core\benchmark_statistics.cpp">
       <Filter>Core</Filter>
     </ClCompile>
     <ClCompile Include="src\core\checksum.cpp">

@@ -80,6 +80,8 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="tests\roundtrip_test.cpp" />
+    <ClCompile Include="src\gui\file_manager_model.cpp" />
+    <ClCompile Include="src\gui\archive_update_plan.cpp" />
     <ClCompile Include="src\third_party\miniz\miniz_zip.c">
       <CompileAs>CompileAsC</CompileAs>
       <WarningLevel>TurnOffAllWarnings</WarningLevel>

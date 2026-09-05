@@ -322,7 +322,13 @@ struct SimpleCommentDialogState {
     UINT dpi{USER_DEFAULT_SCREEN_DPI};
     bool dark{};
     bool accepted{};
-    std::wstring comment;
+    bool multiline{true};
+    std::size_t text_limit{65535};
+    std::wstring title{L"Archive comment"};
+    std::wstring label_text{L"Archive comment (Unicode text)"};
+    std::wstring tooltip_text{L"Unicode text stored in the archive comment field."};
+    std::wstring placement_name{L"ArchiveCommentEditor"};
+    std::wstring text;
 };
 
 std::array<HWND, 4> simple_comment_controls(SimpleCommentDialogState* state) {
@@ -342,10 +348,12 @@ void layout_simple_comment_dialog(SimpleCommentDialogState* state) {
     const int button_top = client.bottom - margin - button_height;
     MoveWindow(state->label, margin, margin, client.right - margin * 2,
                label_height, TRUE);
-    MoveWindow(state->edit, margin, margin + label_height + scale_for_dialog_dpi(8, state->dpi),
-               client.right - margin * 2,
-               button_top - margin - label_height - scale_for_dialog_dpi(20, state->dpi),
-               TRUE);
+    const int edit_top = margin + label_height + scale_for_dialog_dpi(8, state->dpi);
+    const int edit_height = state->multiline
+        ? button_top - margin - label_height - scale_for_dialog_dpi(20, state->dpi)
+        : scale_for_dialog_dpi(30, state->dpi);
+    MoveWindow(state->edit, margin, edit_top, client.right - margin * 2,
+               edit_height, TRUE);
     MoveWindow(state->cancel, client.right - margin - button_width, button_top,
                button_width, button_height, TRUE);
     MoveWindow(state->ok, client.right - margin - button_width * 2 - gap, button_top,
@@ -394,17 +402,20 @@ LRESULT CALLBACK simple_comment_dialog_proc(HWND hwnd, UINT message,
             state->control_brush = CreateSolidBrush(colors.control_background);
             state->font = create_dialog_font(state->dpi);
             state->label = CreateWindowExW(
-                0, L"STATIC", L"Archive comment (Unicode text)",
+                0, L"STATIC", state->label_text.c_str(),
                 WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | SS_NOPREFIX,
                 0, 0, 0, 0, hwnd, nullptr, state->instance, nullptr);
+            const DWORD edit_style = state->multiline
+                ? ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN | WS_VSCROLL
+                : ES_AUTOHSCROLL;
             state->edit = CreateWindowExW(
-                0, L"EDIT", state->comment.c_str(),
+                0, L"EDIT", state->text.c_str(),
                 WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | WS_TABSTOP |
-                    ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN | WS_VSCROLL,
+                    edit_style,
                 0, 0, 0, 0, hwnd,
                 reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSimpleCommentEdit)),
                 state->instance, nullptr);
-            SendMessageW(state->edit, EM_SETLIMITTEXT, 65535, 0);
+            SendMessageW(state->edit, EM_SETLIMITTEXT, state->text_limit, 0);
             state->ok = CreateWindowExW(
                 0, L"BUTTON", L"OK",
                 WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | WS_TABSTOP | BS_OWNERDRAW,
@@ -420,7 +431,7 @@ LRESULT CALLBACK simple_comment_dialog_proc(HWND hwnd, UINT message,
             }
             state->tooltip.create(hwnd, state->dpi, state->dark);
             add_dialog_tooltip(state->tooltip, state->edit,
-                               L"Unicode text stored in the archive comment field.");
+                               state->tooltip_text.c_str());
             apply_simple_comment_theme(state);
             layout_simple_comment_dialog(state);
             SendMessageW(hwnd, DM_SETDEFID, IDOK, 0);
@@ -447,21 +458,22 @@ LRESULT CALLBACK simple_comment_dialog_proc(HWND hwnd, UINT message,
         case WM_GETMINMAXINFO: {
             auto* info = reinterpret_cast<MINMAXINFO*>(lparam);
             const SIZE minimum = dialog_window_size_for_client(
-                520, 300, kSimpleDialogStyle, kSimpleDialogExStyle, state->dpi);
+                520, state->multiline ? 300 : 168,
+                kSimpleDialogStyle, kSimpleDialogExStyle, state->dpi);
             info->ptMinTrackSize.x = minimum.cx;
             info->ptMinTrackSize.y = minimum.cy;
             return 0;
         }
         case WM_COMMAND:
             if (LOWORD(wparam) == IDOK) {
-                state->comment = control_text(state->edit);
+                state->text = control_text(state->edit);
                 state->accepted = true;
-                save_named_window_placement(L"ArchiveCommentEditor", hwnd);
+                save_named_window_placement(state->placement_name, hwnd);
                 destroy_modal_dialog(hwnd);
                 return 0;
             }
             if (LOWORD(wparam) == IDCANCEL) {
-                save_named_window_placement(L"ArchiveCommentEditor", hwnd);
+                save_named_window_placement(state->placement_name, hwnd);
                 destroy_modal_dialog(hwnd);
                 return 0;
             }
@@ -494,7 +506,7 @@ LRESULT CALLBACK simple_comment_dialog_proc(HWND hwnd, UINT message,
             return 0;
         }
         case WM_CLOSE:
-            save_named_window_placement(L"ArchiveCommentEditor", hwnd);
+            save_named_window_placement(state->placement_name, hwnd);
             destroy_modal_dialog(hwnd);
             return 0;
         case WM_NCDESTROY:
@@ -585,7 +597,13 @@ bool run_simple_password_dialog(HWND owner, std::wstring& password) {
     return true;
 }
 
-bool run_simple_comment_dialog(HWND owner, std::wstring& comment) {
+bool run_simple_text_dialog(HWND owner, std::wstring& text,
+                            std::wstring_view title,
+                            std::wstring_view label,
+                            std::wstring_view tooltip,
+                            std::wstring_view placement_name,
+                            bool multiline,
+                            std::size_t text_limit) {
     HINSTANCE instance = reinterpret_cast<HINSTANCE>(
         GetWindowLongPtrW(owner, GWLP_HINSTANCE));
     if (instance == nullptr) instance = GetModuleHandleW(nullptr);
@@ -595,7 +613,13 @@ bool run_simple_comment_dialog(HWND owner, std::wstring& comment) {
     state.instance = instance;
     state.dpi = dpi;
     state.dark = dialog_system_prefers_dark_mode();
-    state.comment = comment;
+    state.multiline = multiline;
+    state.text_limit = text_limit;
+    state.title = title;
+    state.label_text = label;
+    state.tooltip_text = tooltip;
+    state.placement_name = placement_name;
+    state.text = text;
 
     WNDCLASSEXW window_class{};
     window_class.cbSize = sizeof(window_class);
@@ -606,28 +630,29 @@ bool run_simple_comment_dialog(HWND owner, std::wstring& comment) {
     assign_axiom_window_class_icons(window_class, instance);
     if (RegisterClassExW(&window_class) == 0 &&
         GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
-        show_message_dialog(owner, instance, dpi, state.dark, L"Archive comment",
+        show_message_dialog(owner, instance, dpi, state.dark, state.title,
                             last_error_text(), MessageDialogIcon::error);
         return false;
     }
 
     const SIZE window_size = dialog_window_size_for_client(
-        580, 380, kSimpleDialogStyle, kSimpleDialogExStyle, dpi);
+        580, multiline ? 380 : 188,
+        kSimpleDialogStyle, kSimpleDialogExStyle, dpi);
     const int width = window_size.cx;
     const int height = window_size.cy;
     const POINT position = centered_window_position(owner, width, height);
     HWND dialog = CreateWindowExW(
-        kSimpleDialogExStyle, kCommentEditorClass, L"Archive comment",
+        kSimpleDialogExStyle, kCommentEditorClass, state.title.c_str(),
         kSimpleDialogStyle,
         position.x, position.y, width, height, owner, nullptr, instance, &state);
     if (dialog == nullptr) {
-        show_message_dialog(owner, instance, dpi, state.dark, L"Archive comment",
+        show_message_dialog(owner, instance, dpi, state.dark, state.title,
                             last_error_text(), MessageDialogIcon::error);
         return false;
     }
     apply_axiom_window_icons(dialog, instance);
     const int show_command =
-        restore_named_window_placement(dialog, owner, L"ArchiveCommentEditor");
+        restore_named_window_placement(dialog, owner, state.placement_name);
     const bool owner_was_enabled = disable_dialog_owner(owner, dialog);
     ShowWindow(dialog, show_command);
     UpdateWindow(dialog);
@@ -640,7 +665,7 @@ bool run_simple_comment_dialog(HWND owner, std::wstring& comment) {
         }
         if (message_targets_window(dialog, message) &&
             message.message == WM_KEYDOWN && message.wParam == VK_ESCAPE) {
-            save_named_window_placement(L"ArchiveCommentEditor", dialog);
+            save_named_window_placement(state.placement_name, dialog);
             destroy_modal_dialog(dialog);
             continue;
         }
@@ -651,7 +676,7 @@ bool run_simple_comment_dialog(HWND owner, std::wstring& comment) {
     }
     restore_dialog_owner(owner, owner_was_enabled);
     if (!state.accepted) return false;
-    comment = std::move(state.comment);
+    text = std::move(state.text);
     return true;
 }
 
@@ -1504,29 +1529,20 @@ bool show_archive_password_dialog(HWND owner, std::wstring& password) {
 }
 
 bool show_archive_comment_dialog(HWND owner, std::wstring& comment) {
-    return run_simple_comment_dialog(owner, comment);
+    return run_simple_text_dialog(
+        owner, comment, L"Archive comment", L"Archive comment (Unicode text)",
+        L"Unicode text stored in the archive comment field.",
+        L"ArchiveCommentEditor", true, 65535);
 }
 
-void show_archive_information_dialog(
+bool show_archive_snapshot_name_dialog(
     HWND owner,
-    const std::filesystem::path& archive_path,
-    const ArchiveSummaryRows& details,
-    const ArchiveCapabilities& capabilities,
-    std::wstring archive_comment,
-    std::function<void(HWND)> estimate_action) {
-    ArchiveSummaryDialogData data;
-    data.title = L"Information - Axiom";
-    data.heading = archive_path.filename().wstring();
-    data.subheading = provider_name_for_archive(archive_path) + L"  -  " +
-                      archive_path.wstring();
-    data.details = details;
-    data.archive_comment = std::move(archive_comment);
-    data.capabilities = summary_capabilities(capabilities);
-    if (estimate_action) {
-        data.action_label = L"Estimate...";
-        data.action = std::move(estimate_action);
-    }
-    show_archive_summary_dialog(owner, std::move(data));
+    std::wstring_view title,
+    std::wstring& name) {
+    return run_simple_text_dialog(
+        owner, name, title, L"Snapshot name",
+        L"A short unique name for this retained point in time.",
+        L"SnapshotNamePrompt", false, 256);
 }
 
 void show_information_summary_dialog(

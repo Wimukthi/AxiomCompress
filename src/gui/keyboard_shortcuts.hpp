@@ -35,7 +35,7 @@ struct KeyboardShortcut {
     bool operator==(const KeyboardShortcut&) const = default;
 };
 
-inline constexpr std::array<ShortcutCommandInfo, 42> kShortcutCommandCatalog{{
+inline constexpr std::array<ShortcutCommandInfo, 48> kShortcutCommandCatalog{{
     {L"file.open_archive", L"File: Open archive", L"Ctrl+O"},
     {L"file.compress_stream", L"File: Compress single stream", L"Ctrl+Alt+Z"},
     {L"file.decompress_stream", L"File: Decompress single stream", L"Ctrl+Alt+X"},
@@ -52,7 +52,12 @@ inline constexpr std::array<ShortcutCommandInfo, 42> kShortcutCommandCatalog{{
     {L"commands.view", L"View: Open selected item", L"Enter"},
     {L"commands.delete", L"Edit: Delete selection", L"Delete"},
     {L"commands.select_all", L"Edit: Select all", L"Ctrl+A"},
+    {L"commands.copy", L"Edit: Copy selection", L"Ctrl+C"},
+    {L"commands.paste", L"Edit: Paste", L"Ctrl+V"},
+    {L"commands.rename", L"Edit: Rename", L"F2"},
+    {L"commands.new_folder", L"Edit: New folder", L"Ctrl+Shift+N"},
     {L"tools.info", L"File: Information", L"Alt+Enter"},
+    {L"tools.snapshots", L"Archive: Snapshot timeline", L"Ctrl+Shift+T"},
     {L"tools.find", L"Edit: Find files", L"Ctrl+F"},
     {L"tools.benchmark", L"Tools: Benchmark", L"Ctrl+B"},
     {L"tools.clear_temp", L"Tools: Delete Axiom temporary files", L"Ctrl+Shift+Delete"},
@@ -69,6 +74,7 @@ inline constexpr std::array<ShortcutCommandInfo, 42> kShortcutCommandCatalog{{
     {L"navigation.up", L"View: Up one level", L"Alt+Up"},
     {L"navigation.refresh", L"View: Refresh", L"F5"},
     {L"navigation.focus_address", L"View: Focus address bar", L"Ctrl+L"},
+    {L"navigation.focus_filter", L"View: Focus instant filter", L"Ctrl+Shift+F"},
     {L"navigation.go_address", L"View: Go to address", L"Enter"},
     {L"options.toggle_tree", L"View: Show/hide tree pane", L"F9"},
     {L"options.add_favorite", L"View: Add favorite", L"Ctrl+D"},

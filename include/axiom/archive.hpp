@@ -277,6 +277,49 @@ struct ArchiveInput {
     std::string destination_path;
 };
 
+struct ArchiveStorageFileInfo {
+    std::string path;
+    std::uint64_t logical_bytes = 0;
+    std::optional<std::uint64_t> packed_bytes;
+    bool packed_bytes_estimated = false;
+    std::uint64_t chunk_count = 0;
+};
+
+struct ArchiveSnapshotStorageInfo {
+    ArchiveSnapshotInfo snapshot;
+    std::uint64_t unique_content_bytes = 0;
+    std::uint64_t stored_payload_bytes = 0;
+    std::uint64_t new_content_bytes = 0;
+    std::uint64_t new_stored_bytes = 0;
+    std::uint64_t added_entries = 0;
+    std::uint64_t modified_entries = 0;
+    std::uint64_t removed_entries = 0;
+    std::vector<ArchiveSnapshotChange> changes;
+};
+
+// Physical and logical storage accounting for an archive. AXAR analysis is
+// exact at its block/chunk boundaries; provider-backed formats may populate a
+// reduced form when their directory does not expose physical layout details.
+struct ArchiveStorageAnalysis {
+    bool deduplicated = false;
+    bool snapshot_repository = false;
+    bool physical_layout_exact = false;
+    bool packed_sizes_complete = false;
+    std::uint64_t physical_bytes = 0;
+    std::uint64_t logical_bytes = 0;
+    std::uint64_t referenced_logical_bytes = 0;
+    std::uint64_t unique_content_bytes = 0;
+    std::uint64_t stored_payload_bytes = 0;
+    std::uint64_t unreferenced_payload_bytes = 0;
+    std::uint64_t metadata_and_service_bytes = 0;
+    std::uint64_t deduplication_saved_bytes = 0;
+    std::uint64_t compression_saved_bytes = 0;
+    std::uint64_t history_only_content_bytes = 0;
+    std::uint64_t history_only_stored_bytes = 0;
+    std::vector<ArchiveSnapshotStorageInfo> snapshots;
+    std::vector<ArchiveStorageFileInfo> files;
+};
+
 // Physical layout requested for a newly created archive. A zero volume size
 // means one ordinary file. Providers that support native volumes can consume a
 // non-zero size while writing instead of materializing and repartitioning a
@@ -628,6 +671,9 @@ std::vector<ArchiveSnapshotChange> diff_archive_snapshots(
     const std::filesystem::path& archive_path,
     const std::string& from_snapshot,
     const std::string& to_snapshot,
+    const std::string& password = {});
+ArchiveStorageAnalysis analyze_archive_storage(
+    const std::filesystem::path& archive_path,
     const std::string& password = {});
 void prune_archive_snapshots(
     const std::filesystem::path& archive_path,

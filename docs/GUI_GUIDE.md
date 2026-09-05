@@ -42,6 +42,11 @@ You can:
   locations such as Documents, your favorites, recent folders, and history.
 - Sort by any column, and show, hide, resize, or reorder columns. Your layout
   is remembered.
+- Narrow the current list as you type in the instant filter. This works the
+  same way in a filesystem folder and inside an archive.
+- Copy and paste files, rename one item, or create a folder with the familiar
+  Windows shortcuts. In editable AXAR and ZIP archives these commands update
+  the archive transactionally.
 - Drag files in from Explorer to add them, drag entries out to extract them,
   and drag entries between folders inside an archive to move them.
 - Drop an archive file onto the window to open it.
@@ -54,8 +59,8 @@ packed totals, and which archive is open.
 | Menu | What's in it |
 |---|---|
 | File | Open, compress or decompress a single file, Information, Exit |
-| Edit | Select all, Find, Delete, copy path, copy CRC-32 |
-| Archive | Add, Extract, Test, Update, Freshen, Synchronize, Repack, Split, Join, comment, lock, recovery, repair, sign, verify, SFX |
+| Edit | Copy, Paste, Rename, New folder, Select all, Find, Delete, copy path, copy CRC-32 |
+| Archive | Add, Extract, Test, create/add snapshots, Snapshot timeline, Update, Freshen, Synchronize, Repack, Split, Join, comment, lock, recovery, repair, sign, verify, SFX |
 | View | Navigation, refresh, tree pane, favorites, column layout |
 | Tools | Benchmark, Generate signing key, Delete Axiom temporary files, Settings |
 | Help | Check for updates, About Axiom |
@@ -75,6 +80,44 @@ answer, because the files share their compressed bytes. Axiom shows a
 proportional estimate and marks it with `≈` so you know it is one.
 
 The archive's overall size and ratio are always exact.
+
+### Filtering the current list
+
+Start typing while the file list is active and a compact filter popup appears.
+It updates immediately without rereading the folder or archive and reports the
+live match count. The popup stays out of the normal window layout when it is
+not needed. Press `Ctrl+Shift+F` to open it directly, `Enter` or `Down` to
+select the first match, or `Escape` to clear and close it.
+
+Plain words search names, types, and paths. You can combine as many terms as
+you need; every positive term must match, and a term beginning with `-` is
+excluded. Quotes keep a phrase together. Useful examples:
+
+| Filter | Result |
+|---|---|
+| `invoice` | Names, types, or paths containing “invoice” |
+| `*.jpg -draft` | JPEG names that do not contain “draft” |
+| `type:archive` | Archives only |
+| `ext:cpp size:>1MB` | C++ files larger than 1 MiB |
+| `date:>=2026-01-01` | Items modified on or after that date |
+| `name:"quarterly report"` | Exact phrase within the name |
+
+The status bar reports how many visible items remain out of the complete
+location. Deep **Find files** is still available with `Ctrl+F`; it searches
+beyond the current list and clears the instant filter when you open a result.
+
+### Everyday file operations
+
+`Ctrl+C` and `Ctrl+V`, `F2`, and `Ctrl+Shift+N` provide Copy, Paste, Rename,
+and New folder. Filesystem operations go through the Windows shell, including
+its collision and elevation handling. Copying from an archive first extracts
+the selected roots to Axiom's managed temporary area, then publishes a normal
+Windows file list, so it can be pasted into Explorer or another application.
+
+Inside an editable AXAR or ZIP, Paste and New folder add entries, while Rename
+moves the selected archive path without recompressing more than the format
+requires. Locked archives, filename-encrypted archives, split archives that
+cannot be edited, and read-only formats keep these commands disabled.
 
 ## Creating an archive
 
@@ -193,6 +236,14 @@ Select what you want and press **Extract**, or `Ctrl+E`. Selecting a folder
 takes everything inside it. You can also just drag entries out of the window
 into Explorer.
 
+In a filesystem folder, select two or more archives and choose **Extract** to
+run a batch. Pick one destination root and Axiom creates one subfolder per
+archive (`Photos`, `Photos (2)`, and so on when names collide). The progress bar
+covers the complete batch. Without **Overwrite** enabled, an existing target
+folder stops the batch before any archive is extracted. Selecting several
+members of the same recognized split-volume set counts as one archive, so the
+set is never extracted repeatedly.
+
 Dragging out happens in two steps, and both report progress. Axiom first
 unpacks what you dragged into a temporary folder, then Windows copies it to
 where you dropped it. You get a progress window for each, and Cancel works in
@@ -260,14 +311,34 @@ An AXAR archive can also be a *snapshot repository*: several dated versions of
 the same folder, stored without duplicating the unchanged parts. Axiom
 identifies these in the archive information as **Snapshot repository**.
 
-The Windows app browses, tests, and extracts the current snapshot through the
-normal window. It deliberately blocks the commands that change content — Add,
-Update, Freshen, Synchronize, Delete, Move, and ordinary Repack — because those
-were designed for ordinary archives and would discard the history.
+To start one, select the source folder or files and choose **Archive > Create
+snapshot repository...**. Name the initial snapshot, choose the repository
+path, and review the normal compression, encryption, recovery-record, and
+deduplication settings. Snapshot repositories always use AXAR and keep their
+chunk profile for every later capture.
 
-Create, append to, list, compare, restore, and prune snapshots with the
-`axiomc snapshot` commands, documented in
-[CLI_GUIDE.md](../CLI_GUIDE.md#snapshot-repositories).
+Open the repository and choose **Archive > Add snapshot...** for each new point
+in time. Choose the same complete source root or file set used before: omitted
+items are intentionally recorded as removals. Axiom suggests a timestamp name,
+rejects duplicates in the repository, and stores only content that is not
+already present. Split volumes, recovery volumes, signing, locking, and SFX
+output are unavailable during repository creation because they would prevent
+later snapshots from being appended.
+
+Press **Snapshots** on the toolbar, choose **Archive > Snapshot timeline**, or
+press `Ctrl+Shift+T` to open the history directly. Select any retained snapshot
+to see additions, modifications, and removals from the preceding point in
+time. **Extract snapshot...** restores the selected version to a folder without
+changing the repository.
+
+The normal browser continues to show the current snapshot. Commands that would
+change ordinary archive content — Add, Update, Freshen, Synchronize, Delete,
+Move, and ordinary Repack — stay disabled because they would discard history.
+**Information** combines the archive's metadata and capabilities with exact
+storage, deduplication, history-only content, and largest-file accounting.
+
+The `axiomc snapshot` commands remain available for scripts, comparisons, and
+pruning; see [CLI_GUIDE.md](../CLI_GUIDE.md#snapshot-repositories).
 
 ## Making a self-extracting .exe
 
@@ -328,6 +399,19 @@ Three commands refresh an existing archive from its source folder:
 | Freshen | — | ✓ | — |
 | Synchronize | ✓ | ✓ | ✓ |
 
+After you choose the source and compression options, Axiom opens a read-only
+change plan before touching the archive. The plan lists each addition,
+replacement, removal, unchanged entry, ignored entry, and path or type
+conflict. Use its search box and action filter to inspect large plans; the
+footer shows counts and logical-size impact. Synchronization removals are
+highlighted, and conflicts disable the operation until the source mapping is
+safe.
+
+When you approve the plan, Axiom scans both the archive and source again. If
+anything changed while the preview was open, it displays a refreshed plan and
+requires another approval. Canceling either preview leaves the archive
+untouched.
+
 All three run as one planned pass. Files that haven't changed are copied across
 still compressed — they are never decompressed and recompressed. Changed and
 new files are compressed once. Deleted files are dropped in the same rewrite,
@@ -386,19 +470,44 @@ or folder you pick is loaded once before timing starts, so compression,
 decompression, and the byte-for-byte verification after each pass all run in
 memory. Your disk speed never contaminates the result.
 
+The top of the window is deliberately glanceable: four cards show median
+compression, median decompression, ratio/verification, and active CPU plus the
+estimated peak memory requirement. The thin progress indicator covers corpus
+preparation, calibration, and measured passes. Changing the level, size, or
+thread choice updates the pre-run memory estimate before you commit to a run.
+
 The report pane has vertical and horizontal scrollbars for long runs and wide
 system details. Its text and background follow the active light, dark, or
 high-contrast palette.
 
 The generated corpus is not a trivially repeating string — it uses
 deterministic literal data with backward matches spread across the window, so
-the match finder has real work to do. Sizing adjusts to the level you picked
-and the memory you have, and each phase repeats enough times to average out
-timer noise.
+the match finder has real work to do. Automatic sizing uses currently available
+memory, not merely installed RAM, and refuses a custom input that would exceed
+the safe memory budget. Thread choices are generated from the machine's actual
+physical-core and logical-processor topology rather than stopping at a fixed
+list.
+
+Before recording data, Axiom warms the codec and calibrates a fixed batch that
+targets about 1.5 seconds per direction. Every pass uses that same batch,
+verification and UI rendering are outside the timed region, and results are
+medians with an outlier-resistant spread. **Stable (5-10)** stops when both
+directions settle within the protocol threshold or after ten passes. If Pause
+crosses a timed sample, that sample is discarded and repeated; paused time is
+never reported as codec time.
 
 Continuous mode runs until you press **Stop**, keeping per-pass detail
-alongside lifetime throughput, how much the numbers are varying, and a
-stability indicator.
+alongside median throughput, how much the recent numbers are varying, and a
+stability indicator. The dialog remembers its generated-corpus, size, level,
+thread, and pass choices, but deliberately does not retain a custom input path.
+
+Each completed verified run adds a summary row to
+`%LOCALAPPDATA%\AxiomCompress\benchmark-history.csv`. A generated-corpus run is
+also compared automatically with the previous run having the same protocol,
+corpus version/type, size, level, and requested/effective thread counts. Custom
+inputs are not compared automatically because the bytes may change without the
+file name or size changing. **Export…** saves the retained raw passes and full
+reproducibility metadata as UTF-8 CSV; **Copy** keeps the readable report.
 
 This window measures Axiom's own method only. To compare against zstd, LZMA2,
 WinRAR, and others, see [BENCHMARKING.md](BENCHMARKING.md).
@@ -440,14 +549,18 @@ defaults:
 | Create self-extracting archive | `Ctrl+Shift+X` |
 | Compress / decompress a single file | `Ctrl+Alt+Z` / `Ctrl+Alt+X` |
 | Information | `Alt+Enter` |
+| Snapshot timeline | `Ctrl+Shift+T` |
 | Find files | `Ctrl+F` |
 | Benchmark | `Ctrl+B` |
 | Delete Axiom temporary files | `Ctrl+Shift+Delete` |
 | Settings | `Ctrl+,` |
 | Select all / Delete | `Ctrl+A` / `Delete` |
+| Copy / Paste | `Ctrl+C` / `Ctrl+V` |
+| Rename / New folder | `F2` / `Ctrl+Shift+N` |
 | Copy path / Copy CRC-32 | `Ctrl+Shift+C` / `Ctrl+Alt+C` |
 | Back / Forward / Up | `Alt+Left` / `Alt+Right` / `Alt+Up` |
 | Focus the address bar | `Ctrl+L` |
+| Focus the instant filter | `Ctrl+Shift+F` |
 | Refresh | `F5` |
 | Show or hide the tree pane | `F9` |
 | Add / remove favorite | `Ctrl+D` / `Ctrl+Shift+D` |

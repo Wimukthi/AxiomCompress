@@ -95,6 +95,7 @@ add_library(axiom STATIC
     src/codec/transform.cpp
     src/core/archive.cpp
     src/core/benchmark_corpus.cpp
+    src/core/benchmark_statistics.cpp
     src/core/checksum.cpp
     src/core/checksum_clmul.cpp
     src/core/compression_estimator.cpp
@@ -324,11 +325,15 @@ if(WIN32)
         src/gui/compression_estimate_dialog.cpp
         src/gui/toolbar_icons.cpp
         src/gui/archive_dialogs.cpp
+        src/gui/archive_update_dialog.cpp
+        src/gui/archive_storage_dialog.cpp
         src/gui/archive_feature_dialogs.cpp
         src/gui/directory_watcher.cpp
         src/gui/drag_drop.cpp
         src/gui/settings_store.cpp
         src/gui/browser_model.cpp
+        src/gui/file_manager_model.cpp
+        src/gui/archive_update_plan.cpp
         src/gui/benchmark_dialog.cpp
         src/gui/operation_runner.cpp
         src/gui/operation_progress_window.cpp
@@ -355,6 +360,8 @@ enable_testing()
 # interoperability fixtures, but is not linked into any Axiom product target.
 add_executable(axiom_roundtrip
     tests/roundtrip_test.cpp
+    src/gui/file_manager_model.cpp
+    src/gui/archive_update_plan.cpp
     src/third_party/miniz/miniz_zip.c)
 target_link_libraries(axiom_roundtrip PRIVATE axiom)
 target_include_directories(axiom_roundtrip PRIVATE src)

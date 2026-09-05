@@ -105,11 +105,15 @@
     <ClCompile Include="src\gui\compression_estimate_dialog.cpp" />
     <ClCompile Include="src\gui\toolbar_icons.cpp" />
     <ClCompile Include="src\gui\archive_dialogs.cpp" />
+    <ClCompile Include="src\gui\archive_update_dialog.cpp" />
+    <ClCompile Include="src\gui\archive_storage_dialog.cpp" />
     <ClCompile Include="src\gui\archive_feature_dialogs.cpp" />
     <ClCompile Include="src\gui\directory_watcher.cpp" />
     <ClCompile Include="src\gui\drag_drop.cpp" />
     <ClCompile Include="src\gui\settings_store.cpp" />
     <ClCompile Include="src\gui\browser_model.cpp" />
+    <ClCompile Include="src\gui\file_manager_model.cpp" />
+    <ClCompile Include="src\gui\archive_update_plan.cpp" />
     <ClCompile Include="src\gui\benchmark_dialog.cpp" />
     <ClCompile Include="src\gui\operation_runner.cpp" />
     <ClCompile Include="src\gui\operation_progress_window.cpp" />
@@ -126,6 +130,8 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="src\gui\browser_model.hpp" />
+    <ClInclude Include="src\gui\file_manager_model.hpp" />
+    <ClInclude Include="src\gui\archive_update_plan.hpp" />
     <ClInclude Include="src\gui\main_window_internal.hpp" />
     <ClInclude Include="src\gui\custom_menu.hpp" />
     <ClInclude Include="src\gui\compression_estimate_dialog.hpp" />

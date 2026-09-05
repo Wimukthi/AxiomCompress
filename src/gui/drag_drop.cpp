@@ -796,6 +796,15 @@ HRESULT do_file_drag(FileDragSource source, DWORD allowed_effects, DWORD& perfor
     return result;
 }
 
+HRESULT set_file_clipboard(FileDragSource source) {
+    auto* data = new (std::nothrow) FileDataObject(std::move(source));
+    if (data == nullptr) return E_OUTOFMEMORY;
+    HRESULT result = OleSetClipboard(data);
+    if (SUCCEEDED(result)) result = OleFlushClipboard();
+    data->Release();
+    return result;
+}
+
 class OleDropTarget::Implementation final : public IDropTarget {
 public:
     Implementation(Query query, DropHandler drop)

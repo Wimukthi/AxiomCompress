@@ -9,6 +9,12 @@
     <ClCompile Include="tests\roundtrip_test.cpp">
       <Filter>Tests</Filter>
     </ClCompile>
+    <ClCompile Include="src\gui\file_manager_model.cpp">
+      <Filter>Tests</Filter>
+    </ClCompile>
+    <ClCompile Include="src\gui\archive_update_plan.cpp">
+      <Filter>Tests</Filter>
+    </ClCompile>
     <ClCompile Include="src\third_party\miniz\miniz_zip.c">
       <Filter>Tests</Filter>
     </ClCompile>

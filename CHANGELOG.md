@@ -14,6 +14,54 @@ Entries are condensed from the
 
 ## [Unreleased]
 
+## [0.13.0.0] - 2026-09-05
+
+### Added
+
+- Rebuilt the in-app benchmark around a versioned, reproducible measurement
+  protocol. It now calibrates fixed-duration batches outside the recorded
+  passes, reports medians and robust spread, offers a 5-10 pass stable mode,
+  discards any sample crossed by Pause, and verifies every decompression.
+- Added benchmark summary cards, phase/pass progress, topology-aware thread
+  choices, pre-run memory estimates, saved benchmark choices, raw CSV export,
+  automatic local history, and automatic comparisons with the previous
+  matching generated-corpus run.
+- Added a type-to-filter popup for filesystem folders and open archives. It
+  stays out of the normal layout, reports live match counts, and supports plain
+  text, quoted phrases, `*` and `?` wildcards, exclusions, and `name:`, `type:`,
+  `ext:`, `path:`, `size:`, and `date:` fields without rereading the location.
+- Added normal file-manager clipboard and organization commands: Copy, Paste,
+  Rename, and New folder. Filesystem changes use the Windows shell; editable
+  AXAR and ZIP archives use the same transactional update engine as drag and
+  drop. Copying archive entries materializes them safely for pasting elsewhere.
+- Added multi-archive extraction. Selecting two or more archives extracts each
+  into its own collision-safe subfolder under one chosen destination, with one
+  cancellable phased progress operation.
+- Added a safe, visual plan for Update, Freshen, and Synchronize. Before any
+  archive write, Axiom shows every add, replacement, removal, unchanged item,
+  ignored item, and mapping conflict with filterable counts and logical-size
+  impact. Conflicts block the operation, synchronization removals are called
+  out explicitly, and the plan is rescanned after approval so a changed source
+  or archive must be reviewed again.
+- Unified archive Information with storage analysis: metadata, capabilities,
+  physical and logical totals, format overhead, compression and deduplication
+  savings, and largest files now share one dark native window and one archive
+  information workflow.
+- Added a dedicated one-click Snapshot timeline with change inspection and
+  selected-snapshot extraction. Existing Analyze toolbar and shortcut settings
+  migrate to Snapshots without restoring buttons that users removed.
+- Added first-class GUI creation and capture for snapshot repositories. The
+  Archive menu can create an initial named AXAR snapshot with the full archive
+  options dialog, then append timestamp-named captures through the normal
+  password, progress, cancellation, and refresh paths.
+- Smoothed every code-defined toolbar and dialog glyph using supersampled alpha
+  rendering and rounded strokes, matching the antialiasing of the Fluent icons
+  across standard and high-DPI displays.
+- Fixed customizable toolbar commands that could appear as empty owner-drawn
+  rectangles when their command was missing from a duplicated draw allowlist.
+- Fixed main and child window placement growing again on each restart after a
+  move between monitors with different DPI scaling.
+
 ## [0.12.0.0] - 2026-08-25
 
 Unified ZIP backend and direct split-volume creation release.
