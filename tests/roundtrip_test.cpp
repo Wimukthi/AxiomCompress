@@ -6397,6 +6397,8 @@ void test_file_manager_model() {
         item, L"*.cpp size:>1MB -name:draft"));
     AXIOM_CHECK(!axiom::gui::browser_item_matches_filter(item, L"-*.cpp"));
     AXIOM_CHECK(!axiom::gui::browser_item_matches_filter(item, L"size:not-a-size"));
+    AXIOM_CHECK(!axiom::gui::browser_item_matches_filter(
+        item, L"size:>=18446744073709551616B"));
 
     axiom::gui::BrowserItem unicode_archive_item;
     unicode_archive_item.kind = axiom::gui::BrowserItemKind::file;

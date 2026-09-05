@@ -177,8 +177,8 @@ std::optional<std::uint64_t> parse_size(std::wstring_view text) {
     const std::wstring owned = trim(text);
     if (owned.empty()) return std::nullopt;
     wchar_t* end = nullptr;
-    const double number = std::wcstod(owned.c_str(), &end);
-    if (end == owned.c_str() || !std::isfinite(number) || number < 0.0) {
+    const long double number = std::wcstold(owned.c_str(), &end);
+    if (end == owned.c_str() || !std::isfinite(number) || number < 0.0L) {
         return std::nullopt;
     }
     std::wstring suffix = fold(trim(std::wstring_view(
@@ -197,8 +197,12 @@ std::optional<std::uint64_t> parse_size(std::wstring_view text) {
     } else {
         return std::nullopt;
     }
-    const long double bytes = static_cast<long double>(number) * multiplier;
-    if (bytes > std::numeric_limits<std::uint64_t>::max()) return std::nullopt;
+    const long double bytes = number * static_cast<long double>(multiplier);
+    // Compare with the exact exclusive 2^64 bound. Converting UINT64_MAX to
+    // long double rounds it up on platforms where long double is IEEE binary64.
+    const long double exclusive_limit =
+        std::ldexp(1.0L, std::numeric_limits<std::uint64_t>::digits);
+    if (bytes >= exclusive_limit) return std::nullopt;
     return static_cast<std::uint64_t>(bytes);
 }
 
