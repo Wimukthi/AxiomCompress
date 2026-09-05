@@ -30,7 +30,7 @@ jobs:
         uses: actions/checkout@v6
         with:
           repository: Wimukthi/Wimukthi.Win32Theme
-          ref: f39163076210144c492f79c82979218a10553bfb
+          ref: 3972cba189f566984f0811adbe4aac8c7f4faf12
           path: Wimukthi.Win32Theme
       - name: Configure
         if: runner.os != 'Windows'
@@ -180,7 +180,7 @@ jobs:
         uses: actions/checkout@v6
         with:
           repository: Wimukthi/Wimukthi.Win32Theme
-          ref: f39163076210144c492f79c82979218a10553bfb
+          ref: 3972cba189f566984f0811adbe4aac8c7f4faf12
           path: Wimukthi.Win32Theme
       - name: Build axiomc (for seed corpus)
         run: |
