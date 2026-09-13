@@ -9,8 +9,8 @@ that on a license, and can run a program that came out of the archive. Nothing
 more.
 
 The shipped command and configuration contract is documented in
-[CLI_GUIDE.md](../CLI_GUIDE.md#self-extracting-archives). The archive wrapper
-bytes are in [FORMAT.md](../FORMAT.md). This document is about why the design
+[CLI_GUIDE.md](CLI_GUIDE.md#self-extracting-archives). The archive wrapper
+bytes are in [FORMAT.md](FORMAT.md). This document is about why the design
 looks the way it does.
 
 ## Scope
@@ -333,14 +333,14 @@ stack at all.
 Select with `axiomc sfx --stub full|mini`. The Mini stub suits a build artifact
 unpacked by a script; the full stub is for something a person double-clicks.
 
-**Measured on the current Release x64 build (0.9.2.2):**
+**Measured on the Release x64 build of 0.13.1.0, 2026-09-13:**
 
 | Binary | Size | What it contains |
 |---|---:|---|
-| `AxiomSfxMini.bin` | 794,112 bytes (776 KiB) | Decode-only AXAR/ZIP runtime plus console UI |
-| `AxiomSfx.bin` | 2,324,480 bytes (2.22 MiB) | Full SFX UI plus compatibility archive services |
+| `AxiomSfxMini.bin` | 804,864 bytes (786 KiB) | Decode-only AXAR/ZIP runtime plus console UI |
+| `AxiomSfx.bin` | 2,396,672 bytes (2.29 MiB) | Full SFX UI plus compatibility archive services |
 
-Mini is 65.8% smaller than the full stub. `tools/test_sfx_footprint.ps1` guards
+Mini is 66.4% smaller than the full stub. `tools/test_sfx_footprint.ps1` guards
 that with a 1 MiB maximum and a minimum 20% reduction from the full image.
 
 The original under-400 KB target turned out to be too aggressive for the

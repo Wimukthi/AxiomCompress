@@ -19,7 +19,7 @@ here.
 
 This document explains how the code is arranged and why. For the byte layout,
 see [FORMAT.md](FORMAT.md). For the terminology, see
-[docs/GLOSSARY.md](docs/GLOSSARY.md).
+[GLOSSARY.md](GLOSSARY.md).
 
 ## Contents
 
@@ -306,24 +306,28 @@ physical archive bytes fetched, so frontends can report what a selected restore
 actually cost without estimating it from logical output size.
 
 Extraction, testing, and ordinary rebuilds hand `BlockSource` a read plan: the
-exact sequence of whole blocks they are about to consume. The plan does three
-things within one 256 MiB whole-block cache budget. A block stays cached until
-its last planned read and is released right after it, so duplicate files and
-repeated chunks decode once. Read-ahead workers decode upcoming blocks while
-the reader writes and hashes, and they validate snapshot chunks as they decode.
-A consumer that skips planned reads (an existing file left in place, say) stays
-correct and only decodes more. Without a plan the source keeps just the most
-recent block, which is the original one-block cache. Reads return spans into
-the cached block instead of copying each slice. Testing plans every file first,
-then each chunk and block no file reached, so validation covers historical and
-unreferenced data at any archive size. A demand that skips beyond the read-ahead
-window goes through those same workers; it waits for in-flight reservations
-instead of starting an unbudgeted foreground decode. The limit covers whole-block
-decoded data; streamed frame buffers, compressed input, and codec workspace are
-additional allocations. A block exceeding the limit is admitted only on its own.
-Large mapped blocks are
-streamed in full during testing, including their AXC whole-block checksum, so
-historical data is validated without materializing a multi-gigabyte solid block.
+exact sequence of whole blocks they are about to consume. The plan lets the
+source keep each block only while a later read still needs it, so duplicate
+files and repeated chunks decode once, and lets read-ahead workers decode
+upcoming blocks while the reader writes and hashes. The workers also validate
+snapshot chunks as they decode. Reads return spans into the cached block
+instead of copying each slice. Without a plan, the source keeps just the most
+recent block, which is the original one-block cache.
+
+All of that shares one budget of 256 MiB of decoded whole blocks, counting
+blocks kept for later reads, blocks decoded ahead, and decodes still running. A
+block larger than the budget is admitted only when nothing else is held.
+Streamed frame buffers, compressed input, and codec workspace are separate
+allocations. A consumer that skips planned reads (an existing file left in
+place, say) stays correct: a read that jumps past the read-ahead window is
+handed to the same workers and waits for budget, rather than starting an extra
+decode on the reader's thread.
+
+Testing plans every file first, then each chunk and block that no file reached,
+so validation covers historical and unreferenced data at any archive size.
+Blocks read through a subframe map are also streamed frame by frame to check
+their AXC whole-block CRC-32, which validates a large solid block without
+materializing it.
 
 ### Content-addressed deduplication
 
@@ -353,9 +357,11 @@ against a byte budget of two maximum-size chunks per worker, and workers are
 reduced when custom chunks exceed 8 MiB so the parser's working set cannot
 scale with the core count. The experimental swarm parser stays on the serial
 writer, because its checkpoint candidate depends on the executor that runs it.
-Serial/parallel candidate comparisons use cooperative waits, even when the shared
-executor has no helper threads. Pending candidates are drained on exceptions
-before the input spans they borrow can go out of scope.
+
+When a chunk is large enough for `compress()` to evaluate both the serial and
+the parallel candidate, it waits for the parallel one cooperatively, which also
+works on an executor with no helper threads. It drains that candidate before an
+exception can unwind the input span the candidate borrows.
 
 Snapshot metadata carries both the live directory and bounded historical
 manifests. `add_archive_snapshot` appends new chunk blocks and one generation
@@ -418,7 +424,7 @@ ciphertext survive an atomic rewrite. Direct split creation writes the staged
 volume set once and transactionally installs it, rather than first creating a
 complete ordinary ZIP and repartitioning it.
 
-The per-format roadmap is in [docs/FORMAT_SUPPORT.md](docs/FORMAT_SUPPORT.md).
+The per-format roadmap is in [FORMAT_SUPPORT.md](FORMAT_SUPPORT.md).
 
 ### Services
 
@@ -436,7 +442,7 @@ The per-format roadmap is in [docs/FORMAT_SUPPORT.md](docs/FORMAT_SUPPORT.md).
   The runtime opens the payload where it lies rather than copying it out, and
   drives all interaction through the `SfxUi` interface, so one code path serves
   both the dialog stub and the console-only one. Design and roadmap:
-  [docs/SFX_ARCHITECTURE.md](docs/SFX_ARCHITECTURE.md).
+  [SFX_ARCHITECTURE.md](SFX_ARCHITECTURE.md).
 - **POSIX metadata** rides in a skippable entry TLV.
 - **Recovery records** use the portable Reed-Solomon core and protect the
   archive through the end of the current directory and, for an appended
@@ -716,8 +722,8 @@ preloaded once, and custom folders become a deterministic sorted stream of
 relative UTF-8 paths, lengths, and contents. Timed passes call the in-memory
 `compress()` and `decompress()` APIs and compare byte-for-byte after each pass.
 
-Usage is documented in [docs/BENCHMARKING.md](docs/BENCHMARKING.md); published
-results are in [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
+Usage is documented in [BENCHMARKING.md](BENCHMARKING.md); published
+results are in [PERFORMANCE.md](PERFORMANCE.md).
 
 ### Compression prognosis
 

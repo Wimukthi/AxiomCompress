@@ -63,12 +63,7 @@ Source: "{#SourceRoot}\out\{#Configuration}\AxiomSfx.bin"; DestDir: "{app}"; Fla
 Source: "{#SourceRoot}\out\{#Configuration}\AxiomSfxMini.bin"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceRoot}\out\{#Configuration}\backends\7zip\*"; DestDir: "{app}\backends\7zip"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "{#SourceRoot}\README.md"; DestDir: "{app}"; Flags: ignoreversion
-Source: "{#SourceRoot}\CHANGELOG.md"; DestDir: "{app}"; Flags: ignoreversion
-Source: "{#SourceRoot}\CLI_GUIDE.md"; DestDir: "{app}"; Flags: ignoreversion
-Source: "{#SourceRoot}\ARCHITECTURE.md"; DestDir: "{app}"; Flags: ignoreversion
-Source: "{#SourceRoot}\FORMAT.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceRoot}\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
-Source: "{#SourceRoot}\THIRD_PARTY_NOTICES.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceRoot}\src\third_party\zstd\LICENSE"; DestDir: "{app}\licenses"; DestName: "Zstandard-BSD.txt"; Flags: ignoreversion
 Source: "{#SourceRoot}\src\third_party\lzma-sdk\LICENSE.txt"; DestDir: "{app}\licenses"; DestName: "LZMA-SDK-Public-Domain.txt"; Flags: ignoreversion
 Source: "{#SourceRoot}\docs\*"; DestDir: "{app}\docs"; Flags: ignoreversion recursesubdirs createallsubdirs
@@ -77,6 +72,15 @@ Source: "{#ThemeRoot}\THIRD_PARTY_NOTICES.md"; DestDir: "{app}\licenses"; DestNa
 Source: "{#ThemeRoot}\third_party\darkmodelib\LICENSE.md"; DestDir: "{app}\licenses"; DestName: "Darkmodelib-MPL-2.0.txt"; Flags: ignoreversion
 Source: "{#ThemeRoot}\third_party\darkmodelib\LICENSE-MIT.md"; DestDir: "{app}\licenses"; DestName: "Darkmodelib-MIT.txt"; Flags: ignoreversion
 Source: "{#ThemeRoot}\third_party\darkmodelib\*"; DestDir: "{app}\licenses\source\darkmodelib"; Flags: ignoreversion recursesubdirs createallsubdirs
+
+[InstallDelete]
+; Up to 0.13.0.0 these documents were installed beside the executables. They now
+; ship under docs\ with the rest of the documentation set.
+Type: files; Name: "{app}\CHANGELOG.md"
+Type: files; Name: "{app}\CLI_GUIDE.md"
+Type: files; Name: "{app}\ARCHITECTURE.md"
+Type: files; Name: "{app}\FORMAT.md"
+Type: files; Name: "{app}\THIRD_PARTY_NOTICES.md"
 
 [Icons]
 Name: "{group}\Axiom"; Filename: "{app}\Axiom.exe"; WorkingDir: "{app}"

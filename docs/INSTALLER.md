@@ -49,11 +49,15 @@ Both downloads carry the same payload:
 | `AxiomSfx.bin` | Full-window self-extractor runtime; must stay beside the executables |
 | `AxiomSfxMini.bin` | Console-only self-extractor runtime; needed by `--stub mini` |
 | `backends\7zip\` | The bundled read-only 7z / RAR / ISO / CAB engine |
-| `README.md`, `CHANGELOG.md`, `CLI_GUIDE.md`, `ARCHITECTURE.md`, `FORMAT.md` | User and developer documentation |
-| `LICENSE`, `THIRD_PARTY_NOTICES.md` | Licensing |
+| `README.md` | Overview and quick start |
+| `LICENSE` | The GNU GPL v3 license text |
+| `docs\` | The complete documentation set, including `CHANGELOG.md`, `CLI_GUIDE.md`, `ARCHITECTURE.md`, `FORMAT.md`, `THIRD_PARTY_NOTICES.md`, and the screenshots |
 | `licenses\` | Zstandard BSD, the LZMA SDK public-domain notice, and the Wimukthi.Win32Theme and Darkmodelib licenses |
 | `licenses\source\darkmodelib\` | The complete corresponding Darkmodelib source, as MPL-2.0 requires |
-| `docs\` | The rest of the documentation set |
+
+Up to 0.13.0.0, the changelog, CLI guide, architecture, format, and notices
+files sat beside `Axiom.exe`. Setup deletes those old copies when it updates an
+existing installation, so only the `docs\` versions remain.
 
 `AxiomSfx.bin` and `AxiomSfxMini.bin` are not programs. They are read only when
 someone creates a self-extracting archive, and both must stay beside

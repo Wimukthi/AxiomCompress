@@ -22,12 +22,23 @@ Decide before you write. The type sets the shape.
 |---|---|---|---|
 | **Tutorial** | "Show me it working" | We walk, you follow | The Quick start in the README |
 | **How-to** | "I need to do X" | Imperative, task-first | [GUI_GUIDE.md](GUI_GUIDE.md), [BENCHMARKING.md](BENCHMARKING.md), [INSTALLER.md](INSTALLER.md) |
-| **Reference** | "What exactly does this do?" | Neutral, exhaustive, dry | [CLI_GUIDE.md](../CLI_GUIDE.md), [FORMAT.md](../FORMAT.md), [FORMAT_SUPPORT.md](FORMAT_SUPPORT.md) |
-| **Explanation** | "Why is it built this way?" | Discursive, argues a case | [ARCHITECTURE.md](../ARCHITECTURE.md), [SFX_ARCHITECTURE.md](SFX_ARCHITECTURE.md) |
+| **Reference** | "What exactly does this do?" | Neutral, exhaustive, dry | [CLI_GUIDE.md](CLI_GUIDE.md), [FORMAT.md](FORMAT.md), [FORMAT_SUPPORT.md](FORMAT_SUPPORT.md) |
+| **Explanation** | "Why is it built this way?" | Discursive, argues a case | [ARCHITECTURE.md](ARCHITECTURE.md), [SFX_ARCHITECTURE.md](SFX_ARCHITECTURE.md) |
 
 Mixing types is the most common failure. A reference page that starts
 explaining design rationale has stopped being scannable; an explanation that
 starts listing every flag has stopped being readable.
+
+## Where documents live
+
+Every document lives in `docs/`, and images live in `docs/images/`. Only two
+files stay at the repository root: `README.md`, because GitHub shows it on the
+project page, and `LICENSE`, because GitHub reads the license from there.
+
+Link between documents with plain file names, such as
+`[CLI_GUIDE.md](CLI_GUIDE.md)`. From `README.md`, prefix the `docs/` folder. The
+release packages copy `docs\` whole, so a new document needs no packaging
+change.
 
 ## Writing for someone who isn't a compression engineer
 
@@ -98,7 +109,7 @@ Update the documentation in the same change as the code. Specifically:
 
 1. Change the reference page that owns the fact.
 2. Change any how-to guide that walks through it.
-3. Add a [CHANGELOG.md](../CHANGELOG.md) entry.
+3. Add a [CHANGELOG.md](CHANGELOG.md) entry.
 4. If a screenshot shows the old behaviour, retake it.
 
 Screenshots are captured at 100% scale on a dark theme, cropped to the window,

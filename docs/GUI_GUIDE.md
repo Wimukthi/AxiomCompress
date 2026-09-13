@@ -1,7 +1,7 @@
 # Using Axiom for Windows
 
 `Axiom.exe` is the Windows app. It browses folders and archives in one window,
-and it runs the same engine as the [command-line tool](../CLI_GUIDE.md), so
+and it runs the same engine as the [command-line tool](CLI_GUIDE.md), so
 anything you do here you can also script later.
 
 It is written directly against Win32 — no Qt, .NET, WinUI, or embedded
@@ -276,8 +276,10 @@ rejoin it when a part is missing or damaged.
 ## Checking and repairing an archive
 
 **Test** (`Ctrl+T`) decompresses everything and verifies every checksum without
-writing any files. It is the right thing to run after making a backup and
-before deleting the previous one.
+writing any files. That includes data no current file uses, such as pieces
+kept only for older snapshots and blocks left behind by replaced files. It is
+the right thing to run after making a backup and before deleting the previous
+one.
 
 If a test reports damage and the archive has a recovery record, **Repair**
 (`Ctrl+Shift+P`) rebuilds the damaged parts. A recovery record can only absorb
@@ -338,7 +340,7 @@ Move, and ordinary Repack — stay disabled because they would discard history.
 storage, deduplication, history-only content, and largest-file accounting.
 
 The `axiomc snapshot` commands remain available for scripts, comparisons, and
-pruning; see [CLI_GUIDE.md](../CLI_GUIDE.md#snapshot-repositories).
+pruning; see [CLI_GUIDE.md](CLI_GUIDE.md#snapshot-repositories).
 
 ## Making a self-extracting .exe
 
@@ -387,7 +389,7 @@ something.
 
 Everything on this page is available from the command line too, through
 `axiomc sfx --config`, documented in
-[CLI_GUIDE.md](../CLI_GUIDE.md#configuring-an-extractor).
+[CLI_GUIDE.md](CLI_GUIDE.md#configuring-an-extractor).
 
 ## Keeping an archive up to date
 

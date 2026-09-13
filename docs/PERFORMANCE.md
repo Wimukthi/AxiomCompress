@@ -170,6 +170,51 @@ Every entry ran on the same Release x64 host as the snapshot above. Unless a
 row says otherwise, these are **directional, single-host measurements**. Repeat
 the profiling workflow before making any cross-machine throughput claim.
 
+## 2026-09-13 — Parallel chunk writer and planned archive reads
+
+Axiom 0.13.1.0 against 0.13.0.0, both MSVC Release x64 builds, at level 5 with
+automatic threads unless a row says otherwise. The inputs were the twelve
+Silesia files as separate files (not the tar) and a snapshot of three copies of
+`mozilla`. Archives and extracted files went to NVMe with a warm cache. Every
+operation ran in its own process, so each peak-memory figure belongs to that
+operation alone. Times are the fastest of two creations, or of three tests and
+extractions.
+
+| Operation | 0.13.0.0 | 0.13.1.0 | Peak committed memory |
+|---|---:|---:|---:|
+| Create snapshot | 16.66 s | 2.34 s | 114 → 644 MiB |
+| Create snapshot, 4 threads | 16.46 s | 6.54 s | 84 → 172 MiB |
+| Create snapshot of 3 × `mozilla` | 3.46 s | 0.53 s | 107 → 551 MiB |
+| Test snapshot | 0.357 s | 0.125 s | 219 → 178 MiB |
+| Extract snapshot | 0.904 s | 0.190 s | 13 → 199 MiB |
+| Extract 3 × `mozilla` snapshot | 0.794 s | 0.123 s | 14 → 89 MiB |
+| Test ordinary archive | 0.169 s | 0.142 s | 232 → 285 MiB |
+| Extract ordinary archive | 0.399 s | 0.205 s | 66 → 284 MiB |
+| Create ordinary archive (median of 5) | 2.635 s | 2.691 s | 583 → 614 MiB |
+
+Extracting the three-copy snapshot read 17,095,451 archive bytes instead of
+51,277,235. The old one-block cache fetched and decoded the shared chunks once
+per copy; the read plan keeps them until the last copy is written.
+
+Creating an ordinary archive measured 2% slower, and every one of five
+interleaved runs agreed. The cause was not isolated. The writer changes in this
+release only remove work — a redundant CRC pass, buffer regrowth, and a second
+read of same-size files — so code layout in the relinked binary is a more
+likely source than new work, but the difference is reported, not dismissed.
+
+For every archive in this run, the header and all compressed blocks were
+byte-identical between the two builds. The first differing byte lay inside the
+directory, which records file access times and, for snapshots, the creation
+time. Extracted files matched the source by SHA-256. Earlier the same day, the
+build before its final review fixes was compared the same way in 27 creation
+cases: snapshots at levels 1–9 with 1, 4, 8, and automatic threads; Zstandard,
+LZMA2, Deflate, and Store; small and large chunks; live deduplication; and
+ordinary archives. Those review fixes change how a queued codec candidate is
+awaited and how archives are read, not what is written.
+
+**Next target.** Ordinary archive creation, to explain the 2% difference above
+before any further writer change lands.
+
 ## 2026-08-03 — All-level regression checkpoint
 
 The current Release x64 build compared against the last pushed baseline

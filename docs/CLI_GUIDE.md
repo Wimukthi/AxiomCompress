@@ -2,7 +2,7 @@
 
 `axiomc` is Axiom's command-line archiver. It handles `.axar` multi-file
 archives and `.axc` single-stream files, and it drives the same engine as the
-[Windows app](docs/GUI_GUIDE.md).
+[Windows app](GUI_GUIDE.md).
 
 ```text
 axiomc <command> [options] <archive> [paths...]
@@ -15,7 +15,7 @@ Options can go before or after the paths.
 > `axiomc l <archive>` first to see exactly how a path is stored, before you
 > delete, move, or selectively extract it.
 
-Unfamiliar with a term used here? [docs/GLOSSARY.md](docs/GLOSSARY.md) explains
+Unfamiliar with a term used here? [GLOSSARY.md](GLOSSARY.md) explains
 them in plain language.
 
 ## Contents
@@ -77,6 +77,7 @@ Commands are typed without the leading `axiomc`. A few extras exist only here:
 | Command | What it does |
 |---|---|
 | `help` | Print the full command help |
+| `version` | Print the version |
 | `pwd` | Print the working directory |
 | `cd <dir>` | Change the working directory |
 | `clear`, `cls` | Clear the console |
@@ -116,6 +117,10 @@ prints no banner, and exits.
 | `c`, `compress` | Compress one file to `.axc` |
 | `d`, `decompress` | Decompress one `.axc` file |
 | `help`, `-h`, `--help`, `/?` | Print help |
+| `version`, `--version`, `-V` | Print the version and exit |
+
+`axiomc --version` prints one line, such as `axiomc 0.13.1.0`, so a script can
+read the installed version without parsing the help text.
 
 ## Creating and updating archives
 
@@ -194,6 +199,14 @@ New and changed files append only chunks that are not already in the archive.
 Deleted and replaced chunks become unreachable but remain on disk until
 `axiomc repack backup.axar` performs garbage collection.
 
+New chunks are compressed on several threads at once while the next ones are
+read and hashed: one chunk per physical core by default, and fewer when
+`--chunk-max` is above 8 MiB. Every chunk gets exactly the compression settings
+it would get if the chunks went through one at a time, and chunks are written
+in their original order, so compressing them in parallel doesn't change the
+archive. `--threads` sets the total CPU budget. With `--swarm`, chunks are
+compressed one after another instead.
+
 Tune the stable per-archive chunk geometry with `--chunk-min SIZE`,
 `--chunk-average SIZE`, and `--chunk-max SIZE`. The defaults are 256 KiB,
 1 MiB, and 4 MiB. For encrypted archives, chunk identities are keyed with the
@@ -248,6 +261,8 @@ silently throw away your history. Use `snapshot add` for content and
 
 Snapshot commands accept the same password, thread, compression, encryption,
 recovery, and progress options as the archive command they correspond to.
+`snapshot create` and `snapshot add` compress new pieces on several threads in
+the same way as [deduplicated archives](#deduplicated-archives).
 
 ## Writing to standard output
 
@@ -286,7 +301,18 @@ axiomc x [options] <archive.axar> [destination]
 encryption state, the entry count, and the total uncompressed size.
 
 `test` decompresses everything and verifies every checksum without writing a
-single file.
+single file. That includes data no current file uses: pieces kept only for
+older snapshots, and blocks left behind by replaced or deleted files. Blocks in
+the large solid-block LZMA2 profile are streamed in bounded pieces to check
+their whole-block checksum, which roughly doubles the time a test of that
+profile takes.
+
+Testing and extraction decode upcoming blocks on extra threads while the
+current file is checked or written, and keep a block in memory while later
+files still need it, so a chunk shared by several files is decoded once. They
+hold at most 256 MiB of decoded blocks at a time; a single block larger than
+that is held on its own. Codec working memory and the pieces read for
+`--include` come on top of that budget.
 
 Extraction goes to the current directory unless you name another. What happens
 to files that are already there is always explicit:
@@ -488,10 +514,10 @@ archive when it runs. `axiomc sfx` leaves your original archive in place.
 
 `--stub` picks the extractor runtime:
 
-| Stub | Size (Release 0.9.2.2) | Behaviour |
+| Stub | Size (Release 0.13.1.0) | Behaviour |
 |---|---:|---|
-| `full` (default) | 2.22 MiB | Shows dialogs. For something a person double-clicks |
-| `mini` | 776 KiB | Console only, never prompts. For an artifact a script unpacks |
+| `full` (default) | 2.29 MiB | Shows dialogs. For something a person double-clicks |
+| `mini` | 786 KiB | Console only, never prompts. For an artifact a script unpacks |
 
 Both understand the same options and the same configuration file. `mini` uses a
 decode-only runtime with no archive writers and no compression backends linked

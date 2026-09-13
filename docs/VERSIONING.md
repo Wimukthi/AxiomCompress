@@ -139,7 +139,7 @@ truncation. The frozen constants themselves are asserted at compile time in
 `src/archive/container.cpp`.
 
 Changing any of these rules requires a deliberate format review and a matching
-update to [FORMAT.md](../FORMAT.md).
+update to [FORMAT.md](FORMAT.md).
 
 ## The automatic build number
 
@@ -174,8 +174,12 @@ packaging doesn't quietly turn a planned `0.1.1.0` into `0.1.1.1`.
 
 1. Update `major`, `minor`, or `patch` in `src\gui\axiom_gui.rc` if the release
    warrants it, and set the full four-part version to the exact tag you intend
-   to ship.
-2. Add the release entry to [`CHANGELOG.md`](../CHANGELOG.md).
+   to ship. `Update-AxiomVersion.ps1` mirrors the version only when it
+   increments the build number, so set the same version by hand in
+   `src\cli\axiom_cli.rc`, `src\sfx\sfx_stub.rc`, `src\sfx\sfx_mini_stub.rc`,
+   and `kVersion` in `include\axiom\version.hpp`, which `axiomc --version`
+   prints.
+2. Add the release entry to [`CHANGELOG.md`](CHANGELOG.md).
 3. Build and test with auto-increment disabled:
 
    ```powershell
@@ -188,7 +192,11 @@ packaging doesn't quietly turn a planned `0.1.1.0` into `0.1.1.1`.
    .\installer\build-installer.ps1 -SkipBuild -SkipTests -Version <version>
    ```
 
-5. Build the matching portable zip.
+5. Build the matching portable zip, with the same layout the **Release
+   Package** workflow uses: the executables, `AxiomSfx.bin`,
+   `AxiomSfxMini.bin`, `backends\`, `README.md`, `LICENSE`, `docs\`, and
+   `licenses\`. Running that workflow on the pushed commit builds, tests, and
+   packages both downloads on a clean runner instead.
 6. Tag the release with the exact resource version.
 
 ### Before you push the tag

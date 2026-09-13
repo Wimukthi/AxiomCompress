@@ -50,7 +50,7 @@ known quantity or need to skip compression entirely.
 
 **Files that are checked, not just stored.** Every block carries a CRC-32, and
 every file carries both a CRC-32 and a BLAKE3-256 hash. The `test` command
-verifies all of them.
+verifies all of them, including data that only older snapshots still use.
 
 **Optional protection, when you want it.** Password encryption (Argon2id key
 derivation with XChaCha20-Poly1305), optionally hiding file names as well;
@@ -116,7 +116,7 @@ axiomc sfx archive.axar installer.exe                                    # make 
 ```
 
 Running `axiomc` with no arguments opens an interactive prompt. Full reference:
-[CLI_GUIDE.md](CLI_GUIDE.md).
+[docs/CLI_GUIDE.md](docs/CLI_GUIDE.md).
 
 ## Compression levels
 
@@ -152,8 +152,8 @@ single solid block. That mode writes the raw data to a temporary file and
 compresses it in bounded pieces, so a 64 GiB block does not need 64 GiB of
 memory. It cannot currently be combined with encryption or recovery records,
 and older versions of Axiom will refuse to open such an archive rather than
-misread it. Details: [FORMAT.md](FORMAT.md) and the
-[CLI guide](CLI_GUIDE.md#block-size).
+misread it. Details: [docs/FORMAT.md](docs/FORMAT.md) and the
+[CLI guide](docs/CLI_GUIDE.md#block-size).
 
 ## How fast, and how small
 
@@ -259,14 +259,17 @@ The scheduled run fuzzes for longer.
 
 ## Documentation
 
+Every document lives in the [`docs`](docs) folder. The release packages carry
+the same folder, which ends up as `docs\` beside `Axiom.exe`.
+
 | Document | What's in it |
 |---|---|
 | [docs/GUI_GUIDE.md](docs/GUI_GUIDE.md) | Using the Windows app |
-| [CLI_GUIDE.md](CLI_GUIDE.md) | Every `axiomc` command and option |
+| [docs/CLI_GUIDE.md](docs/CLI_GUIDE.md) | Every `axiomc` command and option |
 | [docs/GLOSSARY.md](docs/GLOSSARY.md) | What the terminology means, in plain language |
 | [docs/FORMAT_SUPPORT.md](docs/FORMAT_SUPPORT.md) | What Axiom can do with each archive format |
-| [ARCHITECTURE.md](ARCHITECTURE.md) | How the codec and container are built, and why |
-| [FORMAT.md](FORMAT.md) | The `.axar` and `.axc` byte-level specification |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | How the codec and container are built, and why |
+| [docs/FORMAT.md](docs/FORMAT.md) | The `.axar` and `.axc` byte-level specification |
 | [docs/SFX_ARCHITECTURE.md](docs/SFX_ARCHITECTURE.md) | How the self-extractor works |
 | [docs/PERFORMANCE.md](docs/PERFORMANCE.md) | Published benchmark results |
 | [docs/BENCHMARKING.md](docs/BENCHMARKING.md) | How to measure a change yourself |
@@ -274,10 +277,11 @@ The scheduled run fuzzes for longer.
 | [docs/VERSIONING.md](docs/VERSIONING.md) | Version numbering and release steps |
 | [docs/GAP_ANALYSIS_LZMA2.md](docs/GAP_ANALYSIS_LZMA2.md) | Research notes on the remaining LZMA2 ratio gap |
 | [docs/STYLE.md](docs/STYLE.md) | How this documentation is written |
-| [CHANGELOG.md](CHANGELOG.md) | Release history |
+| [docs/CHANGELOG.md](docs/CHANGELOG.md) | Release history |
+| [docs/THIRD_PARTY_NOTICES.md](docs/THIRD_PARTY_NOTICES.md) | Bundled components and their licenses |
 
 ## License
 
 AxiomCompress is licensed under the
 [GNU General Public License v3](LICENSE). Bundled components keep their own
-licenses; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+licenses; see [docs/THIRD_PARTY_NOTICES.md](docs/THIRD_PARTY_NOTICES.md).

@@ -5,8 +5,8 @@ of the single-stream `.axc` payload it embeds once per solid block.
 
 It is a reference document, written for someone implementing a reader or
 auditing the format. If you are looking for how to *use* Axiom, start with
-[CLI_GUIDE.md](CLI_GUIDE.md) or [docs/GUI_GUIDE.md](docs/GUI_GUIDE.md). If a
-term here is unfamiliar, [docs/GLOSSARY.md](docs/GLOSSARY.md) defines it in
+[CLI_GUIDE.md](CLI_GUIDE.md) or [GUI_GUIDE.md](GUI_GUIDE.md). If a
+term here is unfamiliar, [GLOSSARY.md](GLOSSARY.md) defines it in
 plain language.
 
 Two conventions apply throughout. All integers are little-endian. Offsets and
@@ -341,6 +341,15 @@ each range points at the complete frame or chunk header as well as its payload.
 AXAR readers may use these ranges to decode only the frames that intersect a
 selected file. The public `ArchiveEntry::subframes` view converts them to
 entry-relative ranges and absolute archive offsets for inspection.
+
+Decoding a frame on its own skips the block-level CRC-32 in the AXC header, so
+a reader that relies on the map must still check that header against the
+directory before it trusts any range: the AXC original size must equal
+`uncompressed_size`, the AXC payload must end exactly at `compressed_size`, and
+the transform flag must agree with the metadata length. A block that fails
+these checks is rejected. An integrity test that reads a mapped block through
+its frames must also stream every frame and compare the combined CRC-32 with
+the AXC header, because frames that no file covers are otherwise never checked.
 
 Unknown block-extra TLVs remain length-delimited and are skipped, which
 preserves the old directory parser contract.
@@ -753,7 +762,11 @@ arbitrary declared size, so the decoder defends itself before allocating:
 - Pre-reservations are capped, so a malformed count or size cannot force a huge
   allocation even transiently.
 - A subframe map is limited to `2^20` frames per solid block; every mapped range
-  is checked for monotonic, bounded geometry before it can drive a read.
+  is checked for monotonic, bounded geometry, and the block's AXC header sizes
+  are checked against the directory, before the map can drive a read.
+- Extraction and testing hold at most 256 MiB of decoded solid blocks at once.
+  A single block larger than that is admitted only when nothing else is held,
+  so peak decoded memory stays at the larger of 256 MiB and the biggest block.
 - A sparse map is limited to `2^20` extents per entry. Capture-report records
   are limited to `2^16` warnings, with each path and message limited to `2^20`
   bytes.

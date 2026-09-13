@@ -140,7 +140,7 @@ constexpr std::uint16_t kKnownArchiveFlags = kFlagEncryptedDirectory |
 
 // ---- Frozen format constants ------------------------------------------------
 // These values are the published compatibility contract: see the Compatibility
-// section of FORMAT.md and docs/VERSIONING.md. Every archive already written
+// section of docs/FORMAT.md and docs/VERSIONING.md. Every archive already written
 // carries them, so changing one is a deliberate format revision, never a
 // refactor. The golden fixtures under tests/fixtures/ pin the same values as
 // recorded bytes, and format_freeze_golden_profiles checks them.

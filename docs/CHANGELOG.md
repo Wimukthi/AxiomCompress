@@ -4,7 +4,7 @@ Everything worth knowing about each AxiomCompress release, newest first.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Version numbers are four parts, `major.minor.patch.build`, explained in
-[docs/VERSIONING.md](docs/VERSIONING.md).
+[VERSIONING.md](VERSIONING.md).
 
 Entries are condensed from the
 [GitHub releases](https://github.com/Wimukthi/AxiomCompress/releases).
@@ -14,15 +14,11 @@ Entries are condensed from the
 
 ## [Unreleased]
 
-### Fixed
+## [0.13.1.0] - 2026-09-13
 
-- Prevented snapshot compression from deadlocking on a shared executor with no
-  helper threads when both serial and parallel candidates are evaluated; pending
-  candidates are also drained safely on cancellation and errors.
-- Kept skipped-file cache misses within the decoder's worker and decoded-byte
-  budgets instead of launching an extra foreground decode.
-- Restored integrity checks for unreferenced blocks in large-solid archives and
-  verified their full AXC checksums through bounded subframe reads.
+This release changes how fast Axiom writes and reads archives, not what it
+writes: for the same input and settings it produces the same archive bytes as
+0.13.0.0.
 
 ### Changed
 
@@ -30,19 +26,36 @@ Entries are condensed from the
   several threads while the next chunks are read and hashed. Chunks keep their
   boundaries, compression settings, and order, so the archive bytes are
   identical to the previous serial writer. Creating a level-5 snapshot of the
-  Silesia corpus fell from 16.1 s to 2.2 s on a 16-core Ryzen 9 5950X
-  (automatic threads, measured 2026-09-13).
+  Silesia corpus fell from 16.7 s to 2.3 s on a 16-core Ryzen 9 5950X
+  (automatic threads, measured 2026-09-13). Peak committed memory during that
+  creation rose from 114 MiB to 644 MiB.
 - Extraction and archive testing now decode upcoming blocks ahead of the
-  reader and keep blocks that later files reuse, with a 256 MiB whole-block
-  cache budget. A snapshot holding three copies of a file reads its chunks once instead
-  of three times, and extracting the Silesia snapshot fell from 0.89 s to
-  0.18 s on the same machine.
+  reader and keep blocks that later files reuse, within a 256 MiB budget of
+  decoded blocks. Extracting a snapshot of three copies of one file now reads
+  16.3 MiB of the archive instead of 48.9 MiB, and extracting the Silesia
+  snapshot fell from 0.90 s to 0.19 s on the same machine. Peak committed
+  memory during that extraction rose from 13 MiB to 199 MiB.
 - Testing an archive now validates every stored block and every snapshot chunk
-  regardless of archive size. Previously archives above 512 MiB of file data
-  skipped solid blocks that no file referenced.
+  at any archive size, including data that only older snapshots still use.
+  Previously an archive with more than 512 MiB of file data skipped blocks that
+  no file referenced. Blocks in the large solid-block LZMA2 profile are also
+  streamed in bounded pieces to check their whole-block checksum, so testing
+  that profile takes about twice as long.
 - Adding files no longer reads a same-size file twice when its content turns
   out not to be a duplicate, and the writer reuses solid-block buffers instead
-  of regrowing them for every block. Archive bytes are unchanged.
+  of regrowing them for every block. Archive bytes are unchanged. Creating an
+  ordinary Silesia archive nevertheless measured 2% slower on the same machine;
+  see [PERFORMANCE.md](PERFORMANCE.md) for the numbers.
+- All documentation except `README.md` and `LICENSE` now lives in `docs/`, in
+  the repository and in both release packages. Setup removes the copies that
+  earlier versions installed beside `Axiom.exe`. The screenshots were retaken
+  for the current interface, and the CLI guide now covers `axiomc --version`.
+
+### Fixed
+
+- Cancelling archive creation at level 8 or 9 could crash. A queued
+  compression candidate could keep reading its input after the operation had
+  released that input; Axiom now waits for the candidate before unwinding.
 
 ## [0.13.0.0] - 2026-09-05
 
@@ -746,7 +759,9 @@ First published release: the Inno Setup installer and portable zip, carrying
 update/repair/remove maintenance handling, and dynamic light/dark setup
 styling.
 
-[Unreleased]: https://github.com/Wimukthi/AxiomCompress/compare/0.12.0.0...HEAD
+[Unreleased]: https://github.com/Wimukthi/AxiomCompress/compare/0.13.1.0...HEAD
+[0.13.1.0]: https://github.com/Wimukthi/AxiomCompress/releases/tag/0.13.1.0
+[0.13.0.0]: https://github.com/Wimukthi/AxiomCompress/releases/tag/0.13.0.0
 [0.12.0.0]: https://github.com/Wimukthi/AxiomCompress/releases/tag/0.12.0.0
 [0.11.0.0]: https://github.com/Wimukthi/AxiomCompress/releases/tag/0.11.0.0
 [0.10.2.0]: https://github.com/Wimukthi/AxiomCompress/releases/tag/0.10.2.0

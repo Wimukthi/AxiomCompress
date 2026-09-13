@@ -1,7 +1,8 @@
 # Third-party notices
 
-AxiomCompress is distributed under the [GNU General Public License v3](LICENSE).
-The components below are bundled with it and retain their own licenses.
+AxiomCompress is distributed under the
+[GNU General Public License v3](../LICENSE). The components below are bundled
+with it and retain their own licenses.
 
 ## Summary
 
@@ -28,7 +29,8 @@ Axiom's Windows theme integration uses `Wimukthi.Win32Theme`, an MIT-licensed
 C++20 facade maintained alongside this repository.
 
 - <https://github.com/Wimukthi/Wimukthi.Win32Theme>
-- Pinned commit: `f39163076210144c492f79c82979218a10553bfb`
+- Pinned commit: `3972cba189f566984f0811adbe4aac8c7f4faf12`, the same commit CI
+  and the release workflow check out
 
 Binary packages include its MIT license as
 `licenses/Wimukthi.Win32Theme-LICENSE.txt` and its own notices as

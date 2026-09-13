@@ -2,7 +2,7 @@
 
 Terms used across the Axiom documentation, in plain language. Where a term has
 a precise on-disk meaning, the exact definition is in
-[FORMAT.md](../FORMAT.md); this page is the everyday one.
+[FORMAT.md](FORMAT.md); this page is the everyday one.
 
 ## Archive terms
 
@@ -39,6 +39,25 @@ Axiom installed.
 
 **Snapshot repository** — an archive that keeps several dated versions of the
 same folder without storing unchanged data twice.
+
+**Chunk** — a piece of a file, cut at a boundary chosen by the file's own
+content rather than at a fixed offset. Because the cut points follow the
+content, inserting a few bytes near the start of a file changes only the chunks
+around the edit. Deduplicated archives and snapshot repositories store each
+distinct chunk once.
+
+**Deduplicated archive** — an ordinary AXAR archive, chosen at creation with
+`--dedup`, that stores each distinct chunk once. Unlike a snapshot repository
+it keeps no history: deleting a file makes its chunks unreachable, and
+`repack` reclaims them.
+
+**Generation** — one appended update to an archive. Axiom can add new data and
+a new directory after the existing bytes instead of rewriting the file, and a
+reader falls back to the previous generation if an append was interrupted.
+
+**Read-ahead** — decoding the blocks that are about to be needed on other
+threads while the current file is still being written or checked. Axiom does
+this during extraction and testing, within a fixed memory budget.
 
 ## Compression terms
 

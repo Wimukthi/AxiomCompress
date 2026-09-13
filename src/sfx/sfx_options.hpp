@@ -17,7 +17,7 @@
 
 namespace axiom::sfx {
 
-// Documented in docs/SFX_ARCHITECTURE.md and CLI_GUIDE.md. Scripts branch on
+// Documented in docs/SFX_ARCHITECTURE.md and docs/CLI_GUIDE.md. Scripts branch on
 // these, so the numbers are part of the interface: do not renumber them.
 enum class ExitCode : int {
     success = 0,
