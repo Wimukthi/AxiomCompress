@@ -1,6 +1,7 @@
 #include "axiom/archive.hpp"
 #include "axiom/axiom.hpp"
 #include "archive/container_internal.hpp"
+#include "archive/decoded_block_budget.hpp"
 #include "archive/sfx_image.hpp"
 #include "sfx/sfx_config.hpp"
 #include "sfx/sfx_options.hpp"
@@ -3603,6 +3604,272 @@ void test_archive_content_reuse() {
     fs::remove_all(root, ec);
 }
 
+void test_archive_chunk_pipeline_and_read_plan() {
+    const auto root = make_temp_dir();
+    const auto source = root / "source";
+    fs::create_directories(source);
+    const auto make_payload = [](std::size_t size, std::uint32_t seed) {
+        std::vector<std::uint8_t> bytes(size);
+        std::uint32_t state = seed;
+        for (std::size_t index = 0; index < bytes.size(); ++index) {
+            state = state * 1664525u + 1013904223u;
+            // Compressible but content-defined: short runs of a varying byte.
+            bytes[index] = static_cast<std::uint8_t>((state >> 29) + (index / 7));
+        }
+        return bytes;
+    };
+    const auto shared = make_payload(600u << 10, 0x5EED);
+    const auto other = make_payload(300u << 10, 0xBEEF);
+    for (int copy = 0; copy < 3; ++copy) {
+        write_all(source / ("copy-" + std::to_string(copy) + ".bin"), shared);
+    }
+    write_all(source / "other.bin", other);
+
+    axiom::CompressionOptions options;
+    options.snapshot_min_chunk_size = 4u << 10;
+    options.snapshot_average_chunk_size = 16u << 10;
+    options.snapshot_max_chunk_size = 64u << 10;
+
+    // Chunks compressed concurrently are written exactly where the serial
+    // writer puts them.
+    std::vector<std::uint8_t> reference_blocks;
+    for (const std::size_t threads : {std::size_t{1}, std::size_t{4}, std::size_t{0}}) {
+        options.thread_count = threads;
+        const auto archive = root / ("snapshot-" + std::to_string(threads) + ".axar");
+        axiom::create_snapshot_archive({source}, archive, "base", options);
+        const auto blocks = axar_block_region(archive);
+        if (reference_blocks.empty()) {
+            reference_blocks = blocks;
+        } else {
+            AXIOM_CHECK(blocks == reference_blocks);
+        }
+    }
+
+    // Three files share one set of chunks: extraction fetches each stored chunk
+    // once rather than once per file, with and without read-ahead workers.
+    const auto archive = root / "snapshot-4.axar";
+    for (const std::size_t threads : {std::size_t{1}, std::size_t{4}}) {
+        axiom::ExtractOptions extract;
+        extract.thread_count = threads;
+        extract.operation = std::make_shared<axiom::OperationControl>();
+        const auto output = root / ("extract-" + std::to_string(threads));
+        axiom::extract_archive(archive, output, extract);
+        for (int copy = 0; copy < 3; ++copy) {
+            AXIOM_CHECK(read_all(output / "source" / ("copy-" + std::to_string(copy) + ".bin")) ==
+                        shared);
+        }
+        AXIOM_CHECK(read_all(output / "source" / "other.bin") == other);
+        const auto progress = extract.operation->latest_progress();
+        AXIOM_CHECK(progress.has_value());
+        AXIOM_CHECK(progress->archive_bytes_read <= fs::file_size(archive));
+
+        axiom::DecompressionOptions test;
+        test.thread_count = threads;
+        axiom::test_archive(archive, test);
+    }
+
+    // Skipping existing files jumps past reads that may already be in flight.
+    // The remaining demand must use the same bounded worker queue.
+    const auto skip_output = root / "skip-existing";
+    fs::create_directories(skip_output / "source");
+    const auto marker = bytes_from_string("leave this file untouched");
+    for (int copy = 0; copy < 3; ++copy) {
+        write_all(skip_output / "source" / ("copy-" + std::to_string(copy) + ".bin"), marker);
+    }
+    axiom::ExtractOptions skip;
+    skip.thread_count = 4;
+    skip.overwrite = axiom::ExtractOptions::Overwrite::skip;
+    axiom::extract_archive(archive, skip_output, skip);
+    for (int copy = 0; copy < 3; ++copy) {
+        AXIOM_CHECK(read_all(skip_output / "source" / ("copy-" + std::to_string(copy) + ".bin")) == marker);
+    }
+    AXIOM_CHECK(read_all(skip_output / "source" / "other.bin") == other);
+
+    // A chunk that only history references is still validated by test, while
+    // restoring the current snapshot never reads it.
+    const auto old_source = root / "old";
+    const auto new_source = root / "new";
+    fs::create_directories(old_source);
+    fs::create_directories(new_source);
+    write_all(old_source / "data.bin", make_payload(200u << 10, 0x01D));
+    const auto current = make_payload(200u << 10, 0x0E3);
+    write_all(new_source / "data.bin", current);
+    options.thread_count = 4;
+    const auto history = root / "history.axar";
+    axiom::create_snapshot_archive({old_source}, history, "old", options);
+    axiom::add_archive_snapshot({new_source}, history, "new", options);
+    axiom::test_archive(history);
+    auto corrupted = read_all(history);
+    corrupted[64] ^= 0x5A;
+    write_all(history, corrupted);
+    expect_throws([&] { axiom::test_archive(history); });
+    const auto restored = root / "restored";
+    axiom::restore_archive_snapshot(history, "new", restored, {});
+    AXIOM_CHECK(read_all(restored / "new" / "data.bin") == current);
+
+    // Cancelling an appended snapshot while chunks are in flight rolls the
+    // repository back to its previous generation.
+    const auto before_size = fs::file_size(archive);
+    auto cancel = std::make_shared<axiom::OperationControl>();
+    cancel->set_progress_callback([&cancel](const axiom::OperationProgress& progress) {
+        if (progress.completed_items >= 1) cancel->request_cancel();
+    });
+    auto cancelled_options = options;
+    cancelled_options.operation = cancel;
+    write_all(source / "copy-0.bin", make_payload(600u << 10, 0xC0FFEE));
+    expect_throws([&] {
+        axiom::add_archive_snapshot({source}, archive, "cancelled", cancelled_options);
+    });
+    AXIOM_CHECK(fs::file_size(archive) == before_size);
+    AXIOM_CHECK(axiom::list_archive_snapshots(archive).size() == 1);
+    axiom::test_archive(archive);
+
+    // Same-size files are hashed before they are read. The ones that are not
+    // duplicates are compressed from those verified bytes.
+    const auto same_size = root / "same-size";
+    fs::create_directories(same_size);
+    write_all(same_size / "a.bin", make_payload(200u << 10, 11));
+    write_all(same_size / "b.bin", make_payload(200u << 10, 12));
+    write_all(same_size / "c.bin", make_payload(200u << 10, 11));
+    write_all(same_size / "d.bin", make_payload(200u << 10, 13));
+    axiom::CompressionOptions ordinary;
+    ordinary.operation = std::make_shared<axiom::OperationControl>();
+    const auto ordinary_archive = root / "same-size.axar";
+    axiom::create_archive({same_size}, ordinary_archive, ordinary);
+    const auto ordinary_progress = ordinary.operation->latest_progress();
+    AXIOM_CHECK(ordinary_progress.has_value());
+    AXIOM_CHECK(ordinary_progress->reused_bytes == (200u << 10));
+    axiom::test_archive(ordinary_archive);
+    const auto same_size_output = root / "same-size-output";
+    axiom::extract_archive(ordinary_archive, same_size_output, {});
+    for (const char* name : {"a.bin", "b.bin", "c.bin", "d.bin"}) {
+        AXIOM_CHECK(read_all(same_size_output / "same-size" / name) ==
+                    read_all(same_size / name));
+    }
+
+    // Selected extraction with an I/O buffer that does not align with the
+    // subframes still delivers every byte in order.
+    const auto seek_source = root / "seek";
+    fs::create_directories(seek_source);
+    const auto bulk = make_payload(3u << 20, 0x5EE4);
+    write_all(seek_source / "bulk.bin", bulk);
+    axiom::CompressionOptions seekable;
+    seekable.block_size = 1u << 20;
+    seekable.thread_count = 4;
+    seekable.force_parallel_blocks = true;
+    seekable.enable_file_filters = false;
+    const auto seek_archive = root / "seek.axar";
+    axiom::create_archive({seek_source}, seek_archive, seekable);
+    axiom::ExtractOptions odd_buffer;
+    odd_buffer.io_buffer_size = 100000;
+    axiom::extract_entries(seek_archive, {"seek/bulk.bin"}, root / "seek-output", odd_buffer);
+    AXIOM_CHECK(read_all(root / "seek-output" / "seek" / "bulk.bin") == bulk);
+
+    std::error_code ec;
+    fs::remove_all(root, ec);
+}
+
+void test_archive_decoded_block_budget() {
+    constexpr std::uint64_t limit = std::uint64_t{256} << 20;
+    constexpr std::uint64_t block = std::uint64_t{64} << 20;
+    std::uint64_t reserved = 0;
+    for (unsigned job = 0; job < 4; ++job) {
+        AXIOM_CHECK(axiom::detail::decoded_block_fits(limit, reserved, block));
+        reserved += block;
+    }
+    // A reader that skips past these four in-flight jobs must wait for a
+    // worker/reservation, not start a fifth decode on the calling thread.
+    AXIOM_CHECK(!axiom::detail::decoded_block_fits(limit, reserved, block));
+    reserved -= block;
+    AXIOM_CHECK(axiom::detail::decoded_block_fits(limit, reserved, block));
+    AXIOM_CHECK(axiom::detail::decoded_block_fits(limit, 0, limit * 2));
+    AXIOM_CHECK(!axiom::detail::decoded_block_fits(limit, limit * 2, 1));
+    AXIOM_CHECK(!axiom::detail::decoded_block_fits(
+        limit, 1, std::numeric_limits<std::uint64_t>::max()));
+}
+
+void test_archive_snapshot_shared_executor() {
+    const auto root = make_temp_dir();
+    const auto input = root / "repeat.bin";
+    const std::vector<std::uint8_t> data(5u << 20, 'A');
+    write_all(input, data);
+    axiom::CompressionOptions options;
+    axiom::apply_compression_level(options, 9);
+    options.thread_count = 2;
+    options.snapshot_min_chunk_size = data.size();
+    options.snapshot_average_chunk_size = data.size();
+    options.snapshot_max_chunk_size = data.size();
+    // This chunk produces both serial and parallel codec candidates. Its
+    // tiny token streams do not otherwise pump the shared executor queue.
+    const auto expected = axiom::compress(data, options);
+    const auto archive = root / "snapshot.axar";
+    auto create = std::async(std::launch::async, [&] {
+        axiom::create_snapshot_archive({input}, archive, "base", options);
+    });
+    AXIOM_CHECK(create.wait_for(std::chrono::seconds(60)) == std::future_status::ready);
+    create.get();
+    AXIOM_CHECK(axar_block_region(archive) == expected);
+    axiom::test_archive(archive);
+
+    // Cancellation after the serial parse must drain the queued parallel
+    // candidate before its borrowed input goes out of scope.
+    auto cancelled = std::async(std::launch::async, [&] {
+        auto cancel_options = options;
+        auto operation = std::make_shared<axiom::OperationControl>();
+        cancel_options.operation = operation;
+        cancel_options.task_executor = std::make_shared<axiom::core::TaskExecutor>(1);
+        cancel_options.compression_telemetry = [operation](const axiom::CompressionTelemetryEvent& event) {
+            if (event.phase == axiom::CompressionTelemetryPhase::lz77_greedy) {
+                operation->request_cancel();
+            }
+        };
+        expect_throws([&] { (void)axiom::compress(data, cancel_options); });
+    });
+    AXIOM_CHECK(cancelled.wait_for(std::chrono::seconds(60)) == std::future_status::ready);
+    cancelled.get();
+    std::error_code ec;
+    fs::remove_all(root, ec);
+}
+
+void test_archive_large_profile_history_integrity() {
+    const auto root = make_temp_dir();
+    const auto input = root / "data.bin";
+    const auto archive = root / "large.axar";
+    std::vector<std::uint8_t> data(200u << 10);
+    for (std::size_t i = 0; i < data.size(); ++i) {
+        data[i] = static_cast<std::uint8_t>((i / 7 + i * 19) % 251);
+    }
+    write_all(input, data);
+    axiom::CompressionOptions options;
+    options.method = axiom::CompressionMethod::lzma2;
+    options.block_size = std::size_t{8} << 30;
+    options.auto_block_size_for_threads = false;
+    options.thread_count = 2;
+    options.enable_file_filters = false;
+    axiom::create_archive({input}, archive, options);
+    const auto old_payload = axar_block_region(archive);
+    for (auto& byte : data) byte ^= 0x91;
+    write_all(input, data);
+    axiom::add_to_archive(std::vector<fs::path>{input}, archive, options);
+    axiom::test_archive(archive);
+    const auto intact = read_all(archive);
+    auto damaged = intact;
+    damaged[16 + old_payload.size() / 2] ^= 0x5a;
+    write_all(archive, damaged);
+    // The latest file remains readable, but Test must also check the retained
+    // old block even when the archive has the large-solid feature flag.
+    axiom::extract_archive(archive, root / "extracted", {});
+    AXIOM_CHECK(read_all(root / "extracted" / "data.bin") == data);
+    expect_throws([&] { axiom::test_archive(archive); });
+    // Verify the AXC whole-block checksum, not only the per-frame decoder.
+    damaged = intact;
+    damaged[16 + 28] ^= 1;
+    write_all(archive, damaged);
+    expect_throws([&] { axiom::test_archive(archive); });
+    std::error_code ec;
+    fs::remove_all(root, ec);
+}
+
 void test_gui_live_dedup_option_mapping() {
     axiom::gui::ArchiveFeatureOptions features;
     features.enable_content_dedup = true;
@@ -6586,6 +6853,10 @@ constexpr RegisteredTest kTests[] = {
     {"archive_content_reuse", test_archive_content_reuse},
     {"gui_live_dedup_option_mapping", test_gui_live_dedup_option_mapping},
     {"archive_live_dedup", test_archive_live_dedup},
+    {"archive_chunk_pipeline_and_read_plan", test_archive_chunk_pipeline_and_read_plan},
+    {"archive_decoded_block_budget", test_archive_decoded_block_budget},
+    {"archive_snapshot_shared_executor", test_archive_snapshot_shared_executor},
+    {"archive_large_profile_history_integrity", test_archive_large_profile_history_integrity},
     {"archive_snapshots", test_archive_snapshots},
     {"archive_file_manager_apis", test_archive_file_manager_apis},
     {"archive_delete_repack", test_archive_delete_repack},

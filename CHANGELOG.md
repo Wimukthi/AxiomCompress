@@ -14,6 +14,36 @@ Entries are condensed from the
 
 ## [Unreleased]
 
+### Fixed
+
+- Prevented snapshot compression from deadlocking on a shared executor with no
+  helper threads when both serial and parallel candidates are evaluated; pending
+  candidates are also drained safely on cancellation and errors.
+- Kept skipped-file cache misses within the decoder's worker and decoded-byte
+  budgets instead of launching an extra foreground decode.
+- Restored integrity checks for unreferenced blocks in large-solid archives and
+  verified their full AXC checksums through bounded subframe reads.
+
+### Changed
+
+- Snapshot repositories and deduplicated archives now compress new chunks on
+  several threads while the next chunks are read and hashed. Chunks keep their
+  boundaries, compression settings, and order, so the archive bytes are
+  identical to the previous serial writer. Creating a level-5 snapshot of the
+  Silesia corpus fell from 16.1 s to 2.2 s on a 16-core Ryzen 9 5950X
+  (automatic threads, measured 2026-09-13).
+- Extraction and archive testing now decode upcoming blocks ahead of the
+  reader and keep blocks that later files reuse, with a 256 MiB whole-block
+  cache budget. A snapshot holding three copies of a file reads its chunks once instead
+  of three times, and extracting the Silesia snapshot fell from 0.89 s to
+  0.18 s on the same machine.
+- Testing an archive now validates every stored block and every snapshot chunk
+  regardless of archive size. Previously archives above 512 MiB of file data
+  skipped solid blocks that no file referenced.
+- Adding files no longer reads a same-size file twice when its content turns
+  out not to be a duplicate, and the writer reuses solid-block buffers instead
+  of regrowing them for every block. Archive bytes are unchanged.
+
 ## [0.13.0.0] - 2026-09-05
 
 ### Added

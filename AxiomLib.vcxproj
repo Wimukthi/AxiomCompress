@@ -82,6 +82,7 @@
     <ClInclude Include="src\codec\varint.hpp" />
     <ClInclude Include="src\core\archive.hpp" />
     <ClInclude Include="src\archive\container_internal.hpp" />
+    <ClInclude Include="src\archive\decoded_block_budget.hpp" />
     <ClInclude Include="src\archive\sfx_image.hpp" />
     <ClInclude Include="src\sfx\sfx_config.hpp" />
     <ClInclude Include="src\sfx\sfx_options.hpp" />

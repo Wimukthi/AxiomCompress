@@ -305,6 +305,26 @@ selection or hard-link resolution needs it. Shared reader statistics count the
 physical archive bytes fetched, so frontends can report what a selected restore
 actually cost without estimating it from logical output size.
 
+Extraction, testing, and ordinary rebuilds hand `BlockSource` a read plan: the
+exact sequence of whole blocks they are about to consume. The plan does three
+things within one 256 MiB whole-block cache budget. A block stays cached until
+its last planned read and is released right after it, so duplicate files and
+repeated chunks decode once. Read-ahead workers decode upcoming blocks while
+the reader writes and hashes, and they validate snapshot chunks as they decode.
+A consumer that skips planned reads (an existing file left in place, say) stays
+correct and only decodes more. Without a plan the source keeps just the most
+recent block, which is the original one-block cache. Reads return spans into
+the cached block instead of copying each slice. Testing plans every file first,
+then each chunk and block no file reached, so validation covers historical and
+unreferenced data at any archive size. A demand that skips beyond the read-ahead
+window goes through those same workers; it waits for in-flight reservations
+instead of starting an unbudgeted foreground decode. The limit covers whole-block
+decoded data; streamed frame buffers, compressed input, and codec workspace are
+additional allocations. A block exceeding the limit is admitted only on its own.
+Large mapped blocks are
+streamed in full during testing, including their AXC whole-block checksum, so
+historical data is validated without materializing a multi-gigabyte solid block.
+
 ### Content-addressed deduplication
 
 The shared chunk engine has two isolated AXAR v5 profiles: snapshot history
@@ -320,6 +340,22 @@ default, so an observer can't learn chunk equality from the table.
 `EntryRec::chunk_refs` is the only content address a chunk-addressed entry uses,
 and `BlockSource::chunk` validates both the stored CRC and the identity before
 exposing bytes to extraction, testing, or restore.
+
+New chunks are compressed by an `OrderedBlockEncoder`. The reader assigns each
+new chunk its chunk and block index when the identity lookup misses, inserts
+the identity immediately so later duplicates can refer to work still in flight,
+and queues the bytes. One worker per physical core compresses queued chunks
+with the caller's thread count, so every chunk keeps the codec geometry the
+serial writer gave it; nested codec tasks share one executor. Payloads are
+written back in index order, which keeps offsets and AEAD associated data
+identical to serial output. Queued, running, and unwritten chunks are charged
+against a byte budget of two maximum-size chunks per worker, and workers are
+reduced when custom chunks exceed 8 MiB so the parser's working set cannot
+scale with the core count. The experimental swarm parser stays on the serial
+writer, because its checkpoint candidate depends on the executor that runs it.
+Serial/parallel candidate comparisons use cooperative waits, even when the shared
+executor has no helper threads. Pending candidates are drained on exceptions
+before the input spans they borrow can go out of scope.
 
 Snapshot metadata carries both the live directory and bounded historical
 manifests. `add_archive_snapshot` appends new chunk blocks and one generation

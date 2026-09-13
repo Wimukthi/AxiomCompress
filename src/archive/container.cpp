@@ -1,6 +1,7 @@
 #include "axiom/archive.hpp"
 
 #include "archive/container_internal.hpp"
+#include "archive/decoded_block_budget.hpp"
 #include "archive/sfx_image.hpp"
 #include "codec/block.hpp"
 #include "codec/external_codecs.hpp"
@@ -965,6 +966,9 @@ CompressionOptions options_for_dedup_profile(const CompressionOptions& options,
     return result;
 }
 
+// Calls `callback(chunk)` with each content-defined chunk of `path`. The
+// callback may move the bytes out; whatever capacity it leaves behind is
+// reused for the next chunk.
 template <typename Callback>
 void read_content_defined_chunks(const fs::path& path,
                                  const CompressionOptions& options,
@@ -983,35 +987,61 @@ void read_content_defined_chunks(const fs::path& path,
     }
     --mask;
 
+    const auto min_size = options.snapshot_min_chunk_size;
+    const auto max_size = options.snapshot_max_chunk_size;
+    // The fingerprint is a 64-bit shift register, so a byte stops influencing
+    // it 64 positions later. Cuts are only tested from min_size onward, which
+    // makes every byte before min_size - 64 irrelevant to the cut: copy those
+    // without hashing. (Validation guarantees min_size >= 4 KiB.)
+    const auto hash_start = min_size - 64;
     ByteVector chunk;
-    chunk.reserve(options.snapshot_max_chunk_size);
     std::uint64_t fingerprint = 0;
     std::vector<char> buffer(effective_io_buffer_size(options.io_buffer_size));
+    const auto emit = [&] {
+        callback(chunk);
+        chunk.clear();
+        fingerprint = 0;
+    };
     while (input) {
         operation_checkpoint(operation);
         input.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
         const auto count = input.gcount();
         if (count <= 0) break;
-        for (std::streamsize index = 0; index < count; ++index) {
-            const auto byte = static_cast<std::uint8_t>(buffer[static_cast<std::size_t>(index)]);
-            chunk.push_back(byte);
-            fingerprint = (fingerprint << 1) ^ gear[byte];
-            const bool at_min = chunk.size() >= options.snapshot_min_chunk_size;
-            const bool at_cut = at_min && ((fingerprint & mask) == 0);
-            const bool at_max = chunk.size() >= options.snapshot_max_chunk_size;
-            if (at_cut || at_max) {
-                callback(std::move(chunk));
-                chunk = {};
-                chunk.reserve(options.snapshot_max_chunk_size);
-                fingerprint = 0;
+        const auto* data = reinterpret_cast<const std::uint8_t*>(buffer.data());
+        const auto size = static_cast<std::size_t>(count);
+        std::size_t position = 0;
+        while (position < size) {
+            if (chunk.capacity() < max_size) {
+                chunk.reserve(max_size);
             }
+            if (chunk.size() < hash_start) {
+                const auto take = std::min(hash_start - chunk.size(), size - position);
+                chunk.insert(chunk.end(), data + position, data + position + take);
+                position += take;
+                continue;
+            }
+            auto length = chunk.size();
+            auto end = position;
+            bool cut = false;
+            while (end < size) {
+                fingerprint = (fingerprint << 1) ^ gear[data[end++]];
+                ++length;
+                if ((length >= min_size && (fingerprint & mask) == 0) ||
+                    length >= max_size) {
+                    cut = true;
+                    break;
+                }
+            }
+            chunk.insert(chunk.end(), data + position, data + end);
+            position = end;
+            if (cut) emit();
         }
     }
     if (input.bad()) {
         throw std::runtime_error("failed while reading input file: " +
                                  core::path_to_utf8(path));
     }
-    if (!chunk.empty()) callback(std::move(chunk));
+    if (!chunk.empty()) emit();
 }
 
 std::vector<SubframeRec> make_subframe_map(std::span<const std::uint8_t> compressed) {
@@ -1788,14 +1818,21 @@ struct HashedInput {
     std::int64_t source_stamp = 0;
 };
 
+// When `spool` is non-null it receives a copy of every byte hashed, so a
+// returned identity describes exactly the spooled content.
 std::optional<ContentIdentity> try_hash_input_stream(
     std::ifstream& input, std::uint64_t declared_size,
     const CompressionOptions& options,
-    const std::shared_ptr<OperationControl>& operation) {
+    const std::shared_ptr<OperationControl>& operation,
+    ByteVector* spool = nullptr) {
     core::Blake3 hasher;
     auto crc = core::crc32_init();
     std::vector<std::uint8_t> buffer(effective_io_buffer_size(options.io_buffer_size));
     std::uint64_t actual_size = 0;
+    if (spool != nullptr) {
+        spool->clear();
+        spool->reserve(static_cast<std::size_t>(declared_size));
+    }
     while (input) {
         operation_checkpoint(operation);
         input.read(reinterpret_cast<char*>(buffer.data()),
@@ -1807,6 +1844,9 @@ std::optional<ContentIdentity> try_hash_input_stream(
         hasher.update(bytes);
         crc = core::crc32_update(crc, bytes);
         actual_size += static_cast<std::uint64_t>(count);
+        if (spool != nullptr && actual_size <= declared_size) {
+            spool->insert(spool->end(), bytes.begin(), bytes.end());
+        }
     }
     if (input.bad() || actual_size != declared_size) return std::nullopt;
     return ContentIdentity{
@@ -3764,6 +3804,8 @@ struct AxCFrameContext {
     std::uint8_t codec = 0;
     bool transforms = false;
     std::uint64_t payload_offset = 0;
+    std::uint64_t original_size = 0;
+    std::uint32_t crc32 = 0;
 };
 
 AxCFrameContext read_axc_frame_context(const ByteSource& source,
@@ -3785,6 +3827,16 @@ AxCFrameContext read_axc_frame_context(const ByteSource& source,
     AxCFrameContext context;
     context.version = version;
     context.codec = prefix[10];
+    const auto read_le = [&](std::size_t offset, std::size_t count) {
+        std::uint64_t value = 0;
+        for (std::size_t i = 0; i < count; ++i) {
+            value |= static_cast<std::uint64_t>(prefix[offset + i]) << (i * 8);
+        }
+        return value;
+    };
+    context.original_size = read_le(12, 8);
+    const auto payload_size = read_le(20, 8);
+    context.crc32 = static_cast<std::uint32_t>(read_le(28, 4));
     if (legacy) {
         context.payload_offset = 32;
     } else {
@@ -3800,10 +3852,17 @@ AxCFrameContext read_axc_frame_context(const ByteSource& source,
             (static_cast<std::uint64_t>(prefix[34]) << 16) |
             (static_cast<std::uint64_t>(prefix[35]) << 24);
         context.transforms = (flags & 1u) != 0;
+        if (context.transforms != (metadata_size != 0)) {
+            throw FormatError("AXC transform flag does not match metadata");
+        }
         context.payload_offset = 36 + metadata_size;
     }
     if (context.payload_offset > record.compressed_size) {
         throw FormatError("AXC block metadata exceeds its compressed size");
+    }
+    if (context.original_size != record.uncompressed_size ||
+        payload_size != record.compressed_size - context.payload_offset) {
+        throw FormatError("AXC block sizes do not match the directory");
     }
     return context;
 }
@@ -3879,10 +3938,29 @@ void validate_large_solid_block_payload(const ByteSource& source,
     }
 }
 
+// A decoded solid block, with the validation outcome of every snapshot chunk
+// stored in it. Chunks are checked once per decode: cached bytes are
+// immutable, and a block that is released and decoded again is checked again.
+struct DecodedBlock {
+    ByteVector bytes;
+    // One entry per chunk in the block, in BlockSource chunk order. nullptr
+    // means the chunk's checksum and identity matched.
+    std::vector<const char*> chunk_errors;
+};
+
+// Reads decoded block bytes for extraction, testing, and rebuilds.
+//
+// Without a plan it keeps only the most recently read block, so the many small
+// files sharing a block decode it once. A plan (the exact sequence of whole
+// block reads the caller is about to make) lets it retain a block until its
+// last planned read, release it immediately afterwards, and decode upcoming
+// blocks on read-ahead workers, all within one byte budget. Reading in another
+// order is still correct; it only decodes more.
 class BlockSource {
 public:
     using DecodeProgressCallback =
         std::function<void(std::uint64_t, std::uint64_t, std::uint64_t)>;
+    using Sink = std::function<void(std::span<const std::uint8_t>)>;
 
     BlockSource(const ByteSource& source,
                 const ArchiveIndex& index,
@@ -3895,54 +3973,157 @@ public:
           thread_count_(thread_count),
           operation_(std::move(operation)),
           key_(std::move(key)),
-          use_subframes_(use_subframes) {}
+          use_subframes_(use_subframes) {
+        if (index_.chunks.empty()) return;
+        // Group chunk indices by block so one decode can validate every chunk
+        // that lives in the block.
+        block_chunk_begin_.assign(index_.blocks.size() + 1, 0);
+        for (const auto& chunk : index_.chunks) {
+            if (chunk.block_index < index_.blocks.size()) {
+                ++block_chunk_begin_[static_cast<std::size_t>(chunk.block_index) + 1];
+            }
+        }
+        std::partial_sum(block_chunk_begin_.begin(), block_chunk_begin_.end(),
+                         block_chunk_begin_.begin());
+        block_chunks_.resize(static_cast<std::size_t>(block_chunk_begin_.back()));
+        chunk_position_.assign(index_.chunks.size(), 0);
+        auto next = block_chunk_begin_;
+        for (std::size_t chunk = 0; chunk < index_.chunks.size(); ++chunk) {
+            const auto block = index_.chunks[chunk].block_index;
+            if (block >= index_.blocks.size()) continue;
+            const auto slot = next[static_cast<std::size_t>(block)]++;
+            block_chunks_[static_cast<std::size_t>(slot)] = chunk;
+            chunk_position_[chunk] = slot - block_chunk_begin_[static_cast<std::size_t>(block)];
+        }
+    }
+
+    BlockSource(const BlockSource&) = delete;
+    BlockSource& operator=(const BlockSource&) = delete;
+
+    ~BlockSource() {
+        {
+            std::lock_guard lock(mutex_);
+            stopping_ = true;
+        }
+        changed_.notify_all();
+        for (auto& worker : workers_) {
+            if (worker.joinable()) worker.join();
+        }
+        for (auto& [block, slot] : slots_) {
+            (void)block;
+            release_bytes(slot);
+        }
+    }
 
     void set_decode_progress(DecodeProgressCallback callback) {
         decode_progress_ = std::move(callback);
     }
 
-    const ByteVector& block(std::uint64_t block_index) {
-        if (block_index != cached_index_) {
-            const auto progress = decode_progress_;
-            cached_ = decode_solid_block(
-                source_, index_, block_index, thread_count_, operation_, key_,
-                [progress, block_index](std::uint64_t done, std::uint64_t total) {
-                    if (progress) {
-                        progress(block_index, done, total);
-                    }
-                });
-            cached_index_ = block_index;
-        }
-        return cached_;
+    // Whether read_range() decodes only the subframes a range needs rather
+    // than the whole block. Plans list only whole-block reads.
+    bool reads_whole_block(std::uint64_t block_index) const {
+        const auto& record = index_.blocks[static_cast<std::size_t>(block_index)];
+        return !use_subframes_ || key_ || record.subframes.empty();
     }
 
-    ByteVector chunk(std::uint64_t chunk_index) {
-        if (chunk_index >= index_.chunks.size()) {
-            throw FormatError("chunk index out of range");
+    // Appends the whole-block reads that read_file_bytes() makes for `entry`.
+    void append_entry_reads(const EntryRec& entry, std::vector<std::uint64_t>& reads) const {
+        if (entry.type != kEntryFile || entry.size == 0) return;
+        if (!entry.chunk_refs.empty()) {
+            for (const auto ref : entry.chunk_refs) {
+                if (ref < index_.chunks.size()) {
+                    reads.push_back(index_.chunks[static_cast<std::size_t>(ref)].block_index);
+                }
+            }
+            return;
         }
-        const auto& record = index_.chunks[static_cast<std::size_t>(chunk_index)];
-        const auto& bytes = block(record.block_index);
-        if (record.offset > bytes.size() ||
-            record.identity.size > bytes.size() - record.offset) {
-            throw FormatError("chunk points outside its decoded block");
+        std::uint64_t remaining = entry.size;
+        std::uint64_t block = entry.first_block;
+        std::uint64_t within = entry.offset;
+        while (remaining > 0 && block < index_.blocks.size()) {
+            const auto size = index_.blocks[static_cast<std::size_t>(block)].uncompressed_size;
+            if (within > size) return;
+            const auto take = std::min(remaining, size - within);
+            if (take != 0 && reads_whole_block(block)) reads.push_back(block);
+            remaining -= take;
+            within = 0;
+            ++block;
         }
-        const auto chunk_bytes = std::span<const std::uint8_t>(
-            bytes.data() + static_cast<std::ptrdiff_t>(record.offset),
-            static_cast<std::size_t>(record.identity.size));
-        auto crc = core::crc32_init();
-        crc = core::crc32_update(crc, chunk_bytes);
-        if (core::crc32_final(crc) != record.crc) {
-            throw FormatError("snapshot chunk checksum mismatch");
+    }
+
+    // Installs the read plan; call once, before the first read. Read-ahead
+    // workers start here when the caller allows more than one thread.
+    void plan(std::vector<std::uint64_t> reads) {
+        if (!workers_.empty() || !plan_.empty()) {
+            throw std::logic_error("block source already has a read plan");
         }
-        const auto digest = chunk_digest(
-            chunk_bytes, key_ ? &*key_ : nullptr, index_.meta.keyed_chunk_ids);
-        if (digest != record.identity.id) {
-            throw FormatError("snapshot chunk identity mismatch");
+        std::erase_if(reads, [&](std::uint64_t block) { return block >= index_.blocks.size(); });
+        if (reads.empty()) return;
+        read_position_begin_.assign(index_.blocks.size() + 1, 0);
+        for (const auto block : reads) {
+            ++read_position_begin_[static_cast<std::size_t>(block) + 1];
         }
-        return ByteVector(
-            bytes.begin() + static_cast<std::ptrdiff_t>(record.offset),
-            bytes.begin() + static_cast<std::ptrdiff_t>(record.offset +
-                                                         record.identity.size));
+        std::uint64_t largest = 0;
+        std::uint64_t distinct = 0;
+        for (std::size_t block = 0; block < index_.blocks.size(); ++block) {
+            if (read_position_begin_[block + 1] == 0) continue;
+            ++distinct;
+            largest = std::max(largest, index_.blocks[block].uncompressed_size);
+        }
+        std::partial_sum(read_position_begin_.begin(), read_position_begin_.end(),
+                         read_position_begin_.begin());
+        read_positions_.resize(reads.size());
+        read_cursor_.assign(read_position_begin_.begin(), read_position_begin_.end() - 1);
+        auto next = read_cursor_;
+        for (std::size_t position = 0; position < reads.size(); ++position) {
+            read_positions_[static_cast<std::size_t>(
+                next[static_cast<std::size_t>(reads[position])]++)] = position;
+        }
+        plan_ = std::move(reads);
+
+        // Decoded bytes held at once: blocks still needed later, blocks decoded
+        // ahead of the reader, and decodes in progress. A block larger than the
+        // budget is still admitted on its own, as the one-block cache always did.
+        constexpr std::uint64_t kDecodedByteBudget = std::uint64_t{256} << 20;
+        byte_budget_ = kDecodedByteBudget;
+        const auto threads = thread_count_ == 0
+            ? std::max<std::size_t>(1, core::logical_processor_count())
+            : thread_count_;
+        if (threads <= 1 || distinct <= 1) return;
+        // Small blocks decode serially inside the codec, so parallelism comes from
+        // decoding several at once; large blocks split their thread share.
+        const auto per_worker = std::max<std::uint64_t>(largest, std::uint64_t{1} << 20);
+        const auto worker_count = static_cast<std::size_t>(std::min<std::uint64_t>(
+            {static_cast<std::uint64_t>(threads), distinct,
+             std::max<std::uint64_t>(1, byte_budget_ / per_worker)}));
+        read_ahead_threads_ = std::max<std::size_t>(1, threads / worker_count);
+        workers_.reserve(worker_count);
+        try {
+            for (std::size_t i = 0; i < worker_count; ++i) {
+                workers_.emplace_back([this] {
+                    try {
+                        run_read_ahead();
+                    } catch (...) {
+                        // Queue/cache allocation can fail before decode()'s
+                        // own catch. Surface it to the reader, never terminate
+                        // the process or leave it waiting on an abandoned slot.
+                        std::lock_guard lock(mutex_);
+                        if (!read_ahead_failure_) read_ahead_failure_ = std::current_exception();
+                        stopping_ = true;
+                        changed_.notify_all();
+                    }
+                });
+            }
+        } catch (...) {
+            {
+                std::lock_guard lock(mutex_);
+                stopping_ = true;
+            }
+            changed_.notify_all();
+            for (auto& worker : workers_) worker.join();
+            workers_.clear();
+            throw;
+        }
     }
 
     std::uint64_t block_size(std::uint64_t block_index) const {
@@ -3952,9 +4133,56 @@ public:
         return index_.blocks[static_cast<std::size_t>(block_index)].uncompressed_size;
     }
 
-    ByteVector read_slice(std::uint64_t block_index,
-                          std::uint64_t offset,
-                          std::uint64_t length) {
+    // The whole decoded block. The span stays valid until the next read.
+    std::span<const std::uint8_t> block(std::uint64_t block_index) {
+        return acquire(block_index).bytes;
+    }
+
+    // One validated snapshot chunk. The span stays valid until the next read.
+    std::span<const std::uint8_t> chunk(std::uint64_t chunk_index) {
+        if (chunk_index >= index_.chunks.size()) {
+            throw FormatError("chunk index out of range");
+        }
+        const auto& record = index_.chunks[static_cast<std::size_t>(chunk_index)];
+        const auto& decoded = acquire(record.block_index);
+        const auto position = chunk_position_[static_cast<std::size_t>(chunk_index)];
+        if (position >= decoded.chunk_errors.size()) {
+            throw FormatError("chunk points outside its decoded block");
+        }
+        if (const auto* error = decoded.chunk_errors[static_cast<std::size_t>(position)]) {
+            throw FormatError(error);
+        }
+        return std::span<const std::uint8_t>(decoded.bytes)
+            .subspan(static_cast<std::size_t>(record.offset),
+                     static_cast<std::size_t>(record.identity.size));
+    }
+
+    // Test every byte even if no live file references it. Large solid blocks
+    // must remain streamed through bounded frames instead of allocating the
+    // whole (potentially 64 GiB) block merely to verify its AXC checksum.
+    void validate_block(std::uint64_t block_index, std::size_t io_chunk) {
+        const auto size = block_size(block_index);
+        const auto& record = index_.blocks[static_cast<std::size_t>(block_index)];
+        if (reads_whole_block(block_index) || seek_context(block_index, record).transforms) {
+            (void)block(block_index);
+            return;
+        }
+        const auto expected = seek_context_->crc32;
+        auto crc = core::crc32_init();
+        read_range(block_index, 0, size, io_chunk,
+                   [&](std::span<const std::uint8_t> part) { crc = core::crc32_update(crc, part); });
+        if (core::crc32_final(crc) != expected) {
+            throw FormatError("checksum mismatch for archived block");
+        }
+    }
+
+    // Delivers [offset, offset + length) of a block to `sink` in consecutive
+    // spans of at most `io_chunk` bytes.
+    void read_range(std::uint64_t block_index,
+                    std::uint64_t offset,
+                    std::uint64_t length,
+                    std::size_t io_chunk,
+                    const Sink& sink) {
         if (block_index >= index_.blocks.size()) {
             throw FormatError("block index out of range");
         }
@@ -3963,89 +4191,355 @@ public:
             length > record.uncompressed_size - offset) {
             throw FormatError("requested block range is outside the block");
         }
-        if (length == 0) return {};
+        if (length == 0) return;
+        const auto end = offset + length;
 
-        if (!use_subframes_ || key_ || record.subframes.empty()) {
-            const auto& bytes = block(block_index);
-            return ByteVector(
-                bytes.begin() + static_cast<std::ptrdiff_t>(offset),
-                bytes.begin() + static_cast<std::ptrdiff_t>(offset + length));
+        if (reads_whole_block(block_index) ||
+            seek_context(block_index, record).transforms) {
+            const auto bytes = block(block_index);
+            for (auto position = offset; position < end;) {
+                operation_checkpoint(operation_);
+                const auto take = std::min<std::uint64_t>(io_chunk, end - position);
+                sink(bytes.subspan(static_cast<std::size_t>(position),
+                                   static_cast<std::size_t>(take)));
+                position += take;
+            }
+            return;
         }
 
-        const auto context = seek_context(block_index, record);
-        if (context.transforms) {
-            const auto& bytes = block(block_index);
-            return ByteVector(
-                bytes.begin() + static_cast<std::ptrdiff_t>(offset),
-                bytes.begin() + static_cast<std::ptrdiff_t>(offset + length));
+        const auto& context = *seek_context_;
+        for (auto position = offset; position < end;) {
+            operation_checkpoint(operation_);
+            const auto take = std::min<std::uint64_t>(io_chunk, end - position);
+            auto frame_index = frame_at(record, position);
+            auto* frame = &record.subframes[frame_index];
+            if (take <= frame->uncompressed_offset + frame->uncompressed_size - position) {
+                const auto& decoded = subframe(block_index, frame_index, context);
+                sink(std::span<const std::uint8_t>(decoded).subspan(
+                    static_cast<std::size_t>(position - frame->uncompressed_offset),
+                    static_cast<std::size_t>(take)));
+            } else {
+                // A slice that crosses a frame boundary is assembled, so the sink
+                // sees the same slice sizes as a whole-block read.
+                slice_.resize(static_cast<std::size_t>(take));
+                std::uint64_t copied = 0;
+                while (copied < take) {
+                    frame_index = frame_at(record, position + copied);
+                    frame = &record.subframes[frame_index];
+                    const auto& decoded = subframe(block_index, frame_index, context);
+                    const auto from = position + copied - frame->uncompressed_offset;
+                    const auto count = std::min<std::uint64_t>(
+                        take - copied, frame->uncompressed_size - from);
+                    std::copy_n(decoded.begin() + static_cast<std::ptrdiff_t>(from),
+                                static_cast<std::size_t>(count),
+                                slice_.begin() + static_cast<std::ptrdiff_t>(copied));
+                    copied += count;
+                }
+                sink(slice_);
+            }
+            position += take;
         }
-        const auto request_end = offset + length;
-        ByteVector result(static_cast<std::size_t>(length));
-        std::uint64_t copied = 0;
-        for (std::size_t frame_index = 0; frame_index < record.subframes.size();
-             ++frame_index) {
-            const auto& frame = record.subframes[frame_index];
-            const auto frame_end = frame.uncompressed_offset + frame.uncompressed_size;
-            if (frame_end <= offset) continue;
-            if (frame.uncompressed_offset >= request_end) break;
-            const auto copy_begin = std::max(offset, frame.uncompressed_offset);
-            const auto copy_end = std::min(request_end, frame_end);
-            const auto& decoded = subframe(block_index, frame_index, context);
-            const auto source_offset = copy_begin - frame.uncompressed_offset;
-            const auto target_offset = copy_begin - offset;
-            const auto copy_size = copy_end - copy_begin;
-            std::copy(decoded.begin() + static_cast<std::ptrdiff_t>(source_offset),
-                      decoded.begin() + static_cast<std::ptrdiff_t>(source_offset + copy_size),
-                      result.begin() + static_cast<std::ptrdiff_t>(target_offset));
-            copied += copy_size;
-        }
-        if (copied != length) {
-            throw FormatError("subframe map does not cover the requested range");
-        }
-        return result;
     }
 
 private:
+    enum class SlotState : std::uint8_t { decoding, ready, failed };
+
+    struct Slot {
+        SlotState state = SlotState::decoding;
+        std::unique_ptr<DecodedBlock> decoded;
+        std::exception_ptr error;
+        std::uint64_t charge = 0;
+        // Bytes decoded so far by a read-ahead worker, for progress reports.
+        std::shared_ptr<std::atomic<std::uint64_t>> progress;
+    };
+
+    std::unique_ptr<DecodedBlock> decode(
+        std::uint64_t block_index, std::size_t threads,
+        const std::function<void(std::uint64_t, std::uint64_t)>& progress) const {
+        auto decoded = std::make_unique<DecodedBlock>();
+        decoded->bytes = decode_solid_block(source_, index_, block_index, threads,
+                                            operation_, key_, progress);
+        if (block_chunk_begin_.empty()) return decoded;
+        const auto begin = block_chunk_begin_[static_cast<std::size_t>(block_index)];
+        const auto end = block_chunk_begin_[static_cast<std::size_t>(block_index) + 1];
+        decoded->chunk_errors.assign(static_cast<std::size_t>(end - begin), nullptr);
+        const auto bytes = std::span<const std::uint8_t>(decoded->bytes);
+        for (auto position = begin; position < end; ++position) {
+            const auto& record = index_.chunks[static_cast<std::size_t>(
+                block_chunks_[static_cast<std::size_t>(position)])];
+            auto& error = decoded->chunk_errors[static_cast<std::size_t>(position - begin)];
+            if (record.offset > bytes.size() ||
+                record.identity.size > bytes.size() - record.offset) {
+                error = "chunk points outside its decoded block";
+                continue;
+            }
+            const auto chunk_bytes = bytes.subspan(static_cast<std::size_t>(record.offset),
+                                                   static_cast<std::size_t>(record.identity.size));
+            if (core::crc32(chunk_bytes) != record.crc) {
+                error = "snapshot chunk checksum mismatch";
+            } else if (chunk_digest(chunk_bytes, key_ ? &*key_ : nullptr,
+                                    index_.meta.keyed_chunk_ids) != record.identity.id) {
+                error = "snapshot chunk identity mismatch";
+            }
+        }
+        return decoded;
+    }
+
+    const DecodedBlock& acquire(std::uint64_t block_index) {
+        if (block_index >= index_.blocks.size()) {
+            throw FormatError("block index out of range");
+        }
+        std::unique_lock lock(mutex_);
+        if (const auto next = next_read_locked(block_index)) {
+            read_ordinal_ = *next + 1;
+            ++read_cursor_[static_cast<std::size_t>(block_index)];
+        }
+        const auto previous = pinned_;
+        pinned_ = block_index;
+        if (previous && *previous != block_index) {
+            release_if_unneeded_locked(*previous);
+        }
+        changed_.notify_all();
+
+        for (;;) {
+            if (read_ahead_failure_) std::rethrow_exception(read_ahead_failure_);
+            const auto found = slots_.find(block_index);
+            if (found == slots_.end()) {
+                if (workers_.empty()) break;
+                // Skipped files can jump beyond the read-ahead window. Route
+                // this miss through the same workers and admission budget;
+                // a foreground decode would exceed both limits.
+                demanded_ = block_index;
+                changed_.notify_all();
+            } else {
+                auto& slot = found->second;
+                if (slot.state == SlotState::ready) return *slot.decoded;
+                if (slot.state == SlotState::failed) std::rethrow_exception(slot.error);
+                // A read-ahead worker is decoding this block. Progress is still
+                // reported from this thread only.
+                if (decode_progress_ && slot.progress) {
+                    const auto done = slot.progress->load(std::memory_order_relaxed);
+                    lock.unlock();
+                    decode_progress_(block_index, done, block_size(block_index));
+                    lock.lock();
+                }
+            }
+            changed_.wait_for(lock, std::chrono::milliseconds(50), [&] {
+                const auto current = slots_.find(block_index);
+                return read_ahead_failure_ ||
+                    (current != slots_.end() && current->second.state != SlotState::decoding);
+            });
+            lock.unlock();
+            operation_checkpoint(operation_);
+            lock.lock();
+        }
+
+        const auto charge = std::max<std::uint64_t>(1, block_size(block_index));
+        if (!make_room_locked(charge)) {
+            throw std::logic_error("serial block reader has an in-flight decode");
+        }
+        slots_[block_index].charge = charge;
+        cached_bytes_ += charge;
+        lock.unlock();
+        std::unique_ptr<DecodedBlock> decoded;
+        std::exception_ptr error;
+        try {
+            const auto progress = decode_progress_;
+            decoded = decode(block_index, thread_count_,
+                             [progress, block_index](std::uint64_t done, std::uint64_t total) {
+                                 if (progress) progress(block_index, done, total);
+                             });
+        } catch (...) {
+            error = std::current_exception();
+        }
+        lock.lock();
+        const auto found = slots_.find(block_index);
+        if (error) {
+            cached_bytes_ -= found->second.charge;
+            slots_.erase(found);
+            changed_.notify_all();
+            std::rethrow_exception(error);
+        }
+        found->second.decoded = std::move(decoded);
+        found->second.state = SlotState::ready;
+        changed_.notify_all();
+        return *found->second.decoded;
+    }
+
+    // The next planned read of a block that the reader has not passed yet.
+    std::optional<std::uint64_t> next_read_locked(std::uint64_t block_index) {
+        if (read_position_begin_.empty()) return std::nullopt;
+        auto& cursor = read_cursor_[static_cast<std::size_t>(block_index)];
+        const auto end = read_position_begin_[static_cast<std::size_t>(block_index) + 1];
+        while (cursor < end && read_positions_[static_cast<std::size_t>(cursor)] < read_ordinal_) {
+            ++cursor;
+        }
+        if (cursor == end) return std::nullopt;
+        return read_positions_[static_cast<std::size_t>(cursor)];
+    }
+
+    void release_if_unneeded_locked(std::uint64_t block_index) {
+        const auto found = slots_.find(block_index);
+        if (found == slots_.end() || found->second.state == SlotState::decoding ||
+            (pinned_ && *pinned_ == block_index) || next_read_locked(block_index)) {
+            return;
+        }
+        cached_bytes_ -= found->second.charge;
+        release_bytes(found->second);
+        slots_.erase(found);
+    }
+
+    bool fits_locked(std::uint64_t charge) const {
+        return detail::decoded_block_fits(byte_budget_, cached_bytes_, charge);
+    }
+
+    // Evict ready blocks, never reservations for unfinished decodes. A demanded
+    // miss waits when jobs still occupy the budget instead of over-admitting.
+    bool make_room_locked(std::uint64_t charge) {
+        if (fits_locked(charge)) return true;
+        const auto target = byte_budget_ - byte_budget_ / 4;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> candidates;
+        for (const auto& [block, slot] : slots_) {
+            if (slot.state == SlotState::decoding || (pinned_ && *pinned_ == block)) continue;
+            const auto next = next_read_locked(block);
+            candidates.emplace_back(next ? *next : std::numeric_limits<std::uint64_t>::max(),
+                                    block);
+        }
+        std::sort(candidates.begin(), candidates.end(), std::greater<>());
+        for (const auto& [next_read, block] : candidates) {
+            (void)next_read;
+            if (cached_bytes_ + charge <= target) break;
+            const auto found = slots_.find(block);
+            cached_bytes_ -= found->second.charge;
+            release_bytes(found->second);
+            slots_.erase(found);
+        }
+        return fits_locked(charge);
+    }
+
+    void release_bytes(Slot& slot) {
+        if (slot.decoded && key_) core::secure_wipe(slot.decoded->bytes);
+        slot.decoded.reset();
+    }
+
+    void run_read_ahead() {
+        std::unique_lock lock(mutex_);
+        while (!stopping_) {
+            read_ahead_scan_ = std::max<std::uint64_t>(read_ahead_scan_, read_ordinal_);
+            while (read_ahead_scan_ < plan_.size() &&
+                   slots_.contains(plan_[static_cast<std::size_t>(read_ahead_scan_)])) {
+                ++read_ahead_scan_;
+            }
+            const bool demanded = demanded_ && !slots_.contains(*demanded_);
+            if (!demanded && read_ahead_scan_ >= plan_.size()) {
+                changed_.wait(lock);
+                continue;
+            }
+            const auto block_index = demanded ? *demanded_
+                : plan_[static_cast<std::size_t>(read_ahead_scan_)];
+            const auto charge = std::max<std::uint64_t>(1, block_size(block_index));
+            if (demanded ? !make_room_locked(charge) : !fits_locked(charge)) {
+                changed_.wait(lock);
+                continue;
+            }
+            if (demanded) demanded_.reset();
+            else ++read_ahead_scan_;
+            auto& slot = slots_[block_index];
+            slot.charge = charge;
+            slot.progress = std::make_shared<std::atomic<std::uint64_t>>(0);
+            const auto progress = slot.progress;
+            cached_bytes_ += charge;
+            lock.unlock();
+            std::unique_ptr<DecodedBlock> decoded;
+            std::exception_ptr error;
+            try {
+                decoded = decode(block_index, read_ahead_threads_,
+                                 [progress](std::uint64_t done, std::uint64_t) {
+                                     progress->store(done, std::memory_order_relaxed);
+                                 });
+            } catch (...) {
+                error = std::current_exception();
+            }
+            lock.lock();
+            auto& finished = slots_.at(block_index);
+            if (error) {
+                finished.error = error;
+                finished.state = SlotState::failed;
+            } else {
+                finished.decoded = std::move(decoded);
+                finished.state = SlotState::ready;
+                // The reader may already have passed its last planned read.
+                release_if_unneeded_locked(block_index);
+            }
+            changed_.notify_all();
+        }
+    }
+
     const AxCFrameContext& seek_context(std::uint64_t block_index,
                                         const BlockRec& record) {
-        if (seek_context_block_ != block_index || !seek_context_) {
-            seek_context_ = read_axc_frame_context(source_, record);
-            seek_context_block_ = block_index;
-            cached_subframe_block_ = std::numeric_limits<std::uint64_t>::max();
-            cached_subframe_index_ = std::numeric_limits<std::size_t>::max();
-            cached_subframe_.clear();
+        if (seek_context_block_ == block_index && seek_context_) {
+            return *seek_context_;
         }
-        const auto& context = *seek_context_;
+        seek_context_.reset();
+        cached_subframe_block_ = std::numeric_limits<std::uint64_t>::max();
+        cached_subframe_index_ = std::numeric_limits<std::size_t>::max();
+        cached_subframe_.clear();
+        const auto context = read_axc_frame_context(source_, record);
         const auto expected_parallel = static_cast<std::uint8_t>(
             core::CodecId::parallel_blocks);
-        if (context.transforms) return context;
-        for (const auto& frame : record.subframes) {
-            if (frame.compressed_offset < context.payload_offset) {
-                throw FormatError("subframe map points into the AXC header");
-            }
-            if (frame.kind == kSubframeStore &&
-                context.codec != static_cast<std::uint8_t>(core::CodecId::store)) {
-                throw FormatError("stored subframe map does not match its AXC codec");
-            }
-            if (frame.kind == kSubframeParallelBlock && context.codec != expected_parallel) {
-                throw FormatError("parallel subframe map does not match its AXC codec");
-            }
-            if (frame.kind == kSubframeParallelBlock &&
-                ((frame.codec == 6 && context.version < 6) ||
-                 (frame.codec == 7 && context.version < 7) ||
-                 ((frame.codec == 8 || frame.codec == 9) && context.version < 8) ||
-                 (frame.codec == 10 && context.version < 9))) {
-                throw FormatError("parallel subframe codec requires a newer AXC version");
-            }
-            if (frame.kind == kSubframeExternalChunk &&
-                frame.codec != context.codec) {
-                throw FormatError("external subframe map does not match its AXC codec");
-            }
-            if (frame.kind == kSubframeExternalChunk && context.version < 10) {
-                throw FormatError("external subframe codec requires AXC version 10");
+        // The map is immutable, so it is checked against its AXC header once
+        // per block instead of on every range read.
+        if (!context.transforms) {
+            for (const auto& frame : record.subframes) {
+                if (frame.compressed_offset < context.payload_offset) {
+                    throw FormatError("subframe map points into the AXC header");
+                }
+                if (frame.kind == kSubframeStore &&
+                    context.codec != static_cast<std::uint8_t>(core::CodecId::store)) {
+                    throw FormatError("stored subframe map does not match its AXC codec");
+                }
+                if (frame.kind == kSubframeParallelBlock && context.codec != expected_parallel) {
+                    throw FormatError("parallel subframe map does not match its AXC codec");
+                }
+                if (frame.kind == kSubframeParallelBlock &&
+                    ((frame.codec == 6 && context.version < 6) ||
+                     (frame.codec == 7 && context.version < 7) ||
+                     ((frame.codec == 8 || frame.codec == 9) && context.version < 8) ||
+                     (frame.codec == 10 && context.version < 9))) {
+                    throw FormatError("parallel subframe codec requires a newer AXC version");
+                }
+                if (frame.kind == kSubframeExternalChunk &&
+                    frame.codec != context.codec) {
+                    throw FormatError("external subframe map does not match its AXC codec");
+                }
+                if (frame.kind == kSubframeExternalChunk && context.version < 10) {
+                    throw FormatError("external subframe codec requires AXC version 10");
+                }
             }
         }
-        return context;
+        seek_context_ = context;
+        seek_context_block_ = block_index;
+        return *seek_context_;
+    }
+
+    // The subframe containing `position`. The map was validated as contiguous
+    // from offset zero when the directory was parsed.
+    static std::size_t frame_at(const BlockRec& record, std::uint64_t position) {
+        const auto found = std::upper_bound(
+            record.subframes.begin(), record.subframes.end(), position,
+            [](std::uint64_t value, const SubframeRec& frame) {
+                return value < frame.uncompressed_offset;
+            });
+        if (found == record.subframes.begin()) {
+            throw FormatError("subframe map does not cover the requested range");
+        }
+        const auto frame_index =
+            static_cast<std::size_t>(found - record.subframes.begin()) - 1;
+        const auto& frame = record.subframes[frame_index];
+        if (position - frame.uncompressed_offset >= frame.uncompressed_size) {
+            throw FormatError("subframe map does not cover the requested range");
+        }
+        return frame_index;
     }
 
     const ByteVector& subframe(std::uint64_t block_index,
@@ -4072,6 +4566,8 @@ private:
         const auto encoded = source_.read_compressed(
             record.compressed_offset + frame.compressed_offset,
             frame.compressed_size);
+        cached_subframe_block_ = std::numeric_limits<std::uint64_t>::max();
+        cached_subframe_index_ = std::numeric_limits<std::size_t>::max();
         cached_subframe_.resize(static_cast<std::size_t>(frame.uncompressed_size));
         if (frame.kind == kSubframeStore) {
             if (encoded.size() != cached_subframe_.size()) {
@@ -4114,38 +4610,62 @@ private:
     std::optional<core::CryptoKey> key_;
     bool use_subframes_ = false;
     DecodeProgressCallback decode_progress_;
-    std::uint64_t cached_index_ = std::numeric_limits<std::uint64_t>::max();
-    ByteVector cached_;
+
+    // Chunk layout: the chunks of block b are block_chunks_[begin[b], begin[b+1]).
+    std::vector<std::uint64_t> block_chunk_begin_;
+    std::vector<std::uint64_t> block_chunks_;
+    std::vector<std::uint64_t> chunk_position_;
+
+    // Read plan: plan_[k] is the k-th whole-block read. The planned positions
+    // of block b are read_positions_[begin[b], begin[b+1]), ascending.
+    std::vector<std::uint64_t> plan_;
+    std::vector<std::uint64_t> read_position_begin_;
+    std::vector<std::uint64_t> read_positions_;
+    std::vector<std::uint64_t> read_cursor_;
+
+    // Guarded by mutex_: decoded blocks shared with the read-ahead workers.
+    std::mutex mutex_;
+    std::condition_variable changed_;
+    std::unordered_map<std::uint64_t, Slot> slots_;
+    std::uint64_t cached_bytes_ = 0;
+    std::uint64_t byte_budget_ = 0;
+    std::uint64_t read_ordinal_ = 0;
+    std::uint64_t read_ahead_scan_ = 0;
+    std::optional<std::uint64_t> pinned_;
+    std::optional<std::uint64_t> demanded_;
+    std::exception_ptr read_ahead_failure_;
+    bool stopping_ = false;
+    std::size_t read_ahead_threads_ = 1;
+    std::vector<std::thread> workers_;
+
+    // Reader-thread state for the subframe path.
     std::uint64_t seek_context_block_ = std::numeric_limits<std::uint64_t>::max();
     std::optional<AxCFrameContext> seek_context_;
     std::uint64_t cached_subframe_block_ = std::numeric_limits<std::uint64_t>::max();
     std::size_t cached_subframe_index_ = std::numeric_limits<std::size_t>::max();
     ByteVector cached_subframe_;
+    ByteVector slice_;
 };
 
 void read_file_bytes(BlockSource& source,
                      std::size_t block_count,
                      const EntryRec& entry,
                      const std::shared_ptr<OperationControl>& operation,
-                     const std::function<void(std::span<const std::uint8_t>)>& sink,
+                     const BlockSource::Sink& sink,
                      std::size_t io_buffer_size = 0) {
-    std::uint64_t remaining = entry.size;
-    std::uint64_t block_index = entry.first_block;
-    std::uint64_t within = entry.offset;
     const std::size_t io_chunk = effective_io_buffer_size(io_buffer_size);
 
     if (!entry.chunk_refs.empty()) {
         std::uint64_t emitted = 0;
         for (const auto ref : entry.chunk_refs) {
             operation_checkpoint(operation);
-            auto chunk = source.chunk(ref);
-            std::size_t offset = 0;
-            while (offset < chunk.size()) {
+            const auto chunk = source.chunk(ref);
+            for (std::size_t offset = 0; offset < chunk.size();) {
                 const auto take = std::min<std::size_t>(io_chunk, chunk.size() - offset);
-                sink(std::span<const std::uint8_t>(chunk.data() + offset, take));
+                sink(chunk.subspan(offset, take));
                 offset += take;
-                emitted += take;
             }
+            emitted += chunk.size();
         }
         if (emitted != entry.size) {
             throw FormatError("snapshot chunks do not cover the file");
@@ -4153,6 +4673,9 @@ void read_file_bytes(BlockSource& source,
         return;
     }
 
+    std::uint64_t remaining = entry.size;
+    std::uint64_t block_index = entry.first_block;
+    std::uint64_t within = entry.offset;
     while (remaining > 0) {
         operation_checkpoint(operation);
         if (block_index >= block_count) {
@@ -4162,20 +4685,11 @@ void read_file_bytes(BlockSource& source,
         if (within > block_size) {
             throw FormatError("file offset lies past its block");
         }
-        const auto available = block_size - within;
-        const auto take = std::min<std::uint64_t>(
-            std::min<std::uint64_t>(available, remaining), io_chunk);
-        const auto bytes = source.read_slice(block_index, within, take);
-        sink(bytes);
+        const auto take = std::min<std::uint64_t>(block_size - within, remaining);
+        source.read_range(block_index, within, take, io_chunk, sink);
         remaining -= take;
-        within += take;
-        // `take` is capped by the extraction I/O buffer, so the returned
-        // slice can end well before the solid block does. Advance the archive
-        // block only after consuming the block's declared uncompressed range.
-        if (within >= block_size) {
-            within = 0;
-            ++block_index;
-        }
+        within = 0;
+        ++block_index;
     }
 }
 
@@ -4256,6 +4770,8 @@ void compress_items_into(Output& out, std::uint64_t& written,
     }
     ByteVector buffer;
     std::uint64_t buffer_size = 0;
+    // Only the staged large-LZMA2 writer consumes a whole-block CRC. The
+    // in-memory codec computes its own CRC while it encodes the block.
     std::uint32_t buffer_crc = core::crc32_init();
     fs::path buffer_spool_path;
     std::ofstream buffer_spool;
@@ -4264,6 +4780,12 @@ void compress_items_into(Output& out, std::uint64_t& written,
     std::vector<CompressionTransformRange> buffer_transform_ranges;
     std::uint64_t current_block = blocks.size();
     std::vector<char> io_buffer(effective_io_buffer_size(options.io_buffer_size));
+    // Same-size inputs are hashed before they are read for compression. When
+    // such a file turns out not to be a duplicate, its verified bytes are kept
+    // here (up to this bound) and compressed without reading the file again.
+    const auto same_size_spool_limit = std::min<std::uint64_t>(
+        block_size, std::uint64_t{64} << 20);
+    ByteVector same_size_spool;
     const auto track_raw_spool = [&](const fs::path& path) {
         raw_spool_guards.push_back(std::make_unique<TempFileGuard>(path));
     };
@@ -4356,13 +4878,19 @@ void compress_items_into(Output& out, std::uint64_t& written,
     const auto task_executor = helper_budget != 0
         ? std::make_shared<core::TaskExecutor>(helper_budget + 1)
         : std::shared_ptr<core::TaskExecutor>{};
+    // A compressed in-memory block hands its input buffer back to the reader.
+    // Later solid blocks refill that capacity instead of regrowing, copying,
+    // and page-faulting a fresh block-sized vector. At most one spare exists
+    // per in-flight slot, which the pipeline already holds at its peak.
+    std::mutex spare_buffers_mutex;
+    std::vector<ByteVector> spare_buffers;
 
     struct PendingBlock {
         std::uint64_t index = 0;
         ByteVector data;
         fs::path spool_path;
         std::uint64_t original_size = 0;
-        std::uint32_t crc = 0;
+        std::uint32_t crc = 0;  // staged large blocks only
         std::vector<CompressionTransformRange> transform_ranges;
         std::string path;
     };
@@ -4492,6 +5020,11 @@ void compress_items_into(Output& out, std::uint64_t& written,
                 compressed = core::aead_seal(*key, compressed, ad);
             }
             payload_size = compressed.size();
+            block.data.clear();
+            std::lock_guard lock(spare_buffers_mutex);
+            if (spare_buffers.size() < max_inflight_blocks) {
+                spare_buffers.push_back(std::move(block.data));
+            }
         }
         // Move this block from in-flight to completed; subtracting first keeps
         // the max-clamped display from overshooting the true total.
@@ -4685,14 +5218,20 @@ void compress_items_into(Output& out, std::uint64_t& written,
                         core::crc32_final(buffer_crc), {}, std::move(buffer_path)});
                 } else {
                     pending.push_back(PendingBlock{
-                        index, std::move(buffer), {}, buffer_size,
-                        core::crc32_final(buffer_crc),
+                        index, std::move(buffer), {}, buffer_size, 0,
                         std::move(buffer_transform_ranges), std::move(buffer_path)});
                 }
                 ++inflight_blocks;
                 lock.unlock();
                 pipeline_cv.notify_one();
                 buffer = ByteVector{};
+                {
+                    std::lock_guard spare_lock(spare_buffers_mutex);
+                    if (!spare_buffers.empty()) {
+                        buffer = std::move(spare_buffers.back());
+                        spare_buffers.pop_back();
+                    }
+                }
                 buffer_size = 0;
                 buffer_crc = core::crc32_init();
                 buffer_spool_path.clear();
@@ -4853,6 +5392,10 @@ void compress_items_into(Output& out, std::uint64_t& written,
         const ReuseCandidate* reuse_candidate = nullptr;
         ReuseCandidate batch_reuse_candidate;
         bool reuse_candidate_verified = false;
+        // Set when the same-size comparison below already read and hashed the
+        // complete file: its bytes are in same_size_spool and this identity
+        // describes exactly those bytes.
+        std::optional<ContentIdentity> spooled_identity;
         if (reuse_by_path != nullptr && !size_error && source_stamp_valid) {
             const auto found = reuse_by_path->find(item.archive_path);
             if (found != reuse_by_path->end() &&
@@ -4866,8 +5409,11 @@ void compress_items_into(Output& out, std::uint64_t& written,
             std::ifstream comparison;
             if (open_input_with_retry(comparison, item.absolute,
                                       options.input_open_retries, operation)) {
+                const bool spool = !spool_large_blocks &&
+                    file_total <= same_size_spool_limit;
                 const auto identity = try_hash_input_stream(
-                    comparison, file_total, options, operation);
+                    comparison, file_total, options, operation,
+                    spool ? &same_size_spool : nullptr);
                 std::error_code comparison_stamp_error;
                 const auto comparison_stamp =
                     fs::last_write_time(item.absolute, comparison_stamp_error);
@@ -4881,6 +5427,8 @@ void compress_items_into(Output& out, std::uint64_t& written,
                             *identity, found->second, source_stamp};
                         reuse_candidate = &batch_reuse_candidate;
                         reuse_candidate_verified = true;
+                    } else if (spool) {
+                        spooled_identity = identity;
                     }
                 }
             }
@@ -4991,24 +5539,42 @@ void compress_items_into(Output& out, std::uint64_t& written,
                          throughput_progress(), 0, 0,
                          reused_items.load(std::memory_order_relaxed),
                          reused_bytes.load(std::memory_order_relaxed));
-        while (in) {
+        // Spooled bytes are replayed in the same I/O-buffer slices a fresh read
+        // returns, so solid-block boundaries and transform ranges are unchanged.
+        std::size_t spool_offset = 0;
+        if (spooled_identity) {
+            in.close();
+        }
+        while (spooled_identity || in) {
             operation_checkpoint(operation);
-            in.read(io_buffer.data(), static_cast<std::streamsize>(io_buffer.size()));
-            const auto got = in.gcount();
-            if (got <= 0) {
+            std::span<const std::uint8_t> bytes;
+            if (spooled_identity) {
+                bytes = std::span<const std::uint8_t>(same_size_spool).subspan(
+                    spool_offset,
+                    std::min(io_buffer.size(), same_size_spool.size() - spool_offset));
+                spool_offset += bytes.size();
+            } else {
+                in.read(io_buffer.data(), static_cast<std::streamsize>(io_buffer.size()));
+                const auto got = in.gcount();
+                if (got > 0) {
+                    bytes = std::span<const std::uint8_t>(
+                        reinterpret_cast<const std::uint8_t*>(io_buffer.data()),
+                        static_cast<std::size_t>(got));
+                }
+            }
+            if (bytes.empty()) {
                 break;
             }
-            const std::span<const std::uint8_t> bytes(
-                reinterpret_cast<const std::uint8_t*>(io_buffer.data()),
-                static_cast<std::size_t>(got));
             if (!transform_classified) {
                 transform_classified = true;
                 if (!spool_large_blocks && options.enable_file_filters) {
                     transform_hint = codec::detect_transform_hint(bytes);
                 }
             }
-            crc = core::crc32_update(crc, bytes);
-            hasher.update(bytes);
+            if (!spooled_identity) {
+                crc = core::crc32_update(crc, bytes);
+                hasher.update(bytes);
+            }
             if (!spool_large_blocks &&
                 transform_hint.transform != CompressionTransform::none) {
                 CompressionTransformRange range{
@@ -5032,8 +5598,8 @@ void compress_items_into(Output& out, std::uint64_t& written,
                     buffer_transform_ranges.push_back(range);
                 }
             }
-            total += static_cast<std::uint64_t>(got);
-            read_bytes.fetch_add(static_cast<std::uint64_t>(got),
+            total += static_cast<std::uint64_t>(bytes.size());
+            read_bytes.fetch_add(static_cast<std::uint64_t>(bytes.size()),
                                  std::memory_order_relaxed);
             // completed_bytes intentionally does not advance here: bytes are
             // counted when their block finishes compressing (see flush_block),
@@ -5049,10 +5615,16 @@ void compress_items_into(Output& out, std::uint64_t& written,
                     if (!buffer_spool) {
                         throw std::runtime_error("cannot create staged raw solid block");
                     }
+                } else if (buffer.capacity() == 0) {
+                    // A solid block ends after the read that reaches block_size,
+                    // so it holds at most one I/O buffer more than that.
+                    buffer.reserve(static_cast<std::size_t>(std::min<std::uint64_t>(
+                        static_cast<std::uint64_t>(block_size) + io_buffer.size(),
+                        std::max<std::uint64_t>(total_bytes, bytes.size()))));
                 }
             }
-            buffer_crc = core::crc32_update(buffer_crc, bytes);
             if (spool_large_blocks) {
+                buffer_crc = core::crc32_update(buffer_crc, bytes);
                 buffer_spool.write(reinterpret_cast<const char*>(bytes.data()),
                                    static_cast<std::streamsize>(bytes.size()));
                 if (!buffer_spool) {
@@ -5091,8 +5663,8 @@ void compress_items_into(Output& out, std::uint64_t& written,
                 throw std::runtime_error(warning.message + ": " + item.archive_path);
             }
         }
-        entry.crc = core::crc32_final(crc);
-        entry.blake3 = hasher.finalize();
+        entry.crc = spooled_identity ? spooled_identity->crc : core::crc32_final(crc);
+        entry.blake3 = spooled_identity ? spooled_identity->blake3 : hasher.finalize();
         entry.has_blake3 = true;
         entry.ads = core::capture_ads(item.absolute);  // NTFS named streams (Win32 only)
         batch_reuse_candidates.emplace(
@@ -6197,6 +6769,18 @@ void rebuild_archive_keeping(const fs::path& archive_path,
             }
         }
     }
+    {
+        // Plan the reads the copy loop below makes: every kept file except a
+        // content-identical repeat, which reuses the first copy's new range.
+        std::vector<std::uint64_t> reads;
+        std::set<ContentIdentity> planned;
+        for (const auto& entry : index.entries) {
+            if (entry.type != kEntryFile || !keep(entry)) continue;
+            if (entry.has_blake3 && !planned.insert(content_identity(entry)).second) continue;
+            source.append_entry_reads(entry, reads);
+        }
+        source.plan(std::move(reads));
+    }
 
     const auto block_size = effective_solid_block_size(options);
     validate_large_solid_block_options(options, block_size);
@@ -6387,8 +6971,10 @@ void rebuild_archive_keeping(const fs::path& archive_path,
                                             "cannot create staged raw solid block");
                                     }
                                 }
-                                buffer_crc = core::crc32_update(buffer_crc, chunk);
                                 if (spool_large_blocks) {
+                                    // Only the staged large-LZMA2 writer
+                                    // consumes the whole-block CRC.
+                                    buffer_crc = core::crc32_update(buffer_crc, chunk);
                                     buffer_spool.write(
                                         reinterpret_cast<const char*>(chunk.data()),
                                         static_cast<std::streamsize>(chunk.size()));
@@ -7045,49 +7631,267 @@ SnapshotChunkLookup build_snapshot_chunk_lookup(const std::vector<ChunkRec>& chu
     return lookup;
 }
 
-template <typename Output>
-std::uint64_t append_snapshot_chunk(
-    Output& out, std::uint64_t& written, std::vector<BlockRec>& blocks,
-    std::vector<ChunkRec>& chunks, SnapshotChunkLookup& lookup,
-    const ByteVector& data, const CompressionOptions& options,
-    const std::shared_ptr<OperationControl>& operation,
-    const core::CryptoKey* key, bool keyed, ArchiveReuseStats& reuse_stats) {
-    const auto identity = make_chunk_identity(data, key, keyed);
-    const auto found = lookup.find(identity);
-    if (found != lookup.end()) {
-        reuse_stats.reused_items++;
-        reuse_stats.reused_bytes += data.size();
-        return found->second;
-    }
-    if (chunks.size() >= kMaxChunkCount) {
-        throw std::runtime_error("snapshot chunk table is full");
+// Encodes independent archive blocks on dedicated worker threads while the
+// calling thread keeps producing input. The caller gives every block its final
+// index before submitting it, and finished payloads are written back on the
+// calling thread strictly in index order. Offsets, AEAD associated data, and
+// the directory therefore come out exactly as a serial writer produces them.
+//
+// Memory is bounded by charging each submitted buffer's capacity until its
+// payload is written. With zero workers every block is encoded and written
+// inline by submit(), which is the serial writer itself.
+class OrderedBlockEncoder {
+public:
+    struct Encoded {
+        ByteVector payload;
+        std::vector<SubframeRec> subframes;
+        std::uint32_t crc = 0;
+    };
+    // Runs on a worker thread and must not touch writer state.
+    using EncodeFunction =
+        std::function<Encoded(std::uint64_t index, std::span<const std::uint8_t> data)>;
+    // Runs on the submitting thread, once per block, in index order.
+    using WriteFunction = std::function<void(std::uint64_t index, std::uint64_t tag,
+                                             std::uint64_t original_size, Encoded& encoded)>;
+
+    OrderedBlockEncoder(std::size_t worker_count, std::uint64_t byte_budget,
+                        std::uint64_t first_index, EncodeFunction encode,
+                        WriteFunction write)
+        : encode_(std::move(encode)),
+          write_(std::move(write)),
+          byte_budget_(std::max<std::uint64_t>(1, byte_budget)),
+          max_spares_(std::max<std::size_t>(1, worker_count * 2)),
+          next_submit_(first_index),
+          next_write_(first_index) {
+        try {
+            workers_.reserve(worker_count);
+            for (std::size_t i = 0; i < worker_count; ++i) {
+                workers_.emplace_back([this] { run_worker(); });
+            }
+        } catch (...) {
+            stop();
+            throw;
+        }
     }
 
-    operation_checkpoint(operation);
-    auto chunk_options = options;
-    chunk_options.enable_content_dedup = false;
-    chunk_options.enable_snapshot_dedup = false;
-    chunk_options.transform_ranges.clear();
-    chunk_options.task_executor.reset();
-    auto compressed = compress(data, chunk_options);
-    auto subframes = !key ? make_subframe_map(compressed)
-                           : std::vector<SubframeRec>{};
-    const auto block_index = static_cast<std::uint64_t>(blocks.size());
-    if (key != nullptr) {
-        compressed = core::aead_seal(*key, compressed, block_associated_data(block_index));
+    OrderedBlockEncoder(const OrderedBlockEncoder&) = delete;
+    OrderedBlockEncoder& operator=(const OrderedBlockEncoder&) = delete;
+
+    // Abandons queued blocks. Workers finish the block they are encoding (or
+    // observe cancellation inside the codec) and are joined before return.
+    ~OrderedBlockEncoder() { stop(); }
+
+    // Queues `data` as block `index`, which must be the next unused index.
+    // While the byte budget is exhausted this writes finished payloads and
+    // waits. Rethrows the first encoder or writer failure.
+    void submit(std::uint64_t index, std::uint64_t tag, ByteVector data) {
+        if (index != next_submit_) {
+            throw std::logic_error("ordered block encoder received an out-of-order block");
+        }
+        ++next_submit_;
+        if (workers_.empty()) {
+            auto encoded = encode_(index, data);
+            write_(index, tag, data.size(), encoded);
+            ++next_write_;
+            keep_spare(std::move(data));
+            return;
+        }
+        const auto charge = std::max<std::uint64_t>(1, data.capacity());
+        std::unique_lock lock(mutex_);
+        while (true) {
+            write_ready(lock);
+            if (inflight_count_ == 0 || inflight_bytes_ + charge <= byte_budget_) {
+                break;
+            }
+            result_ready_.wait(lock, [&] {
+                return failure_ || done_.contains(next_write_);
+            });
+        }
+        pending_.push_back({index, tag, std::move(data), charge});
+        inflight_bytes_ += charge;
+        ++inflight_count_;
+        lock.unlock();
+        work_ready_.notify_one();
     }
-    const auto archive_offset = written;
-    out.write(reinterpret_cast<const char*>(compressed.data()),
-              static_cast<std::streamsize>(compressed.size()));
-    if (!out) throw std::runtime_error("failed while writing snapshot chunk");
-    blocks.push_back({archive_offset, static_cast<std::uint64_t>(compressed.size()),
-                      static_cast<std::uint64_t>(data.size()), std::move(subframes)});
-    chunks.push_back({identity, core::crc32_final(core::crc32_update(
-                          core::crc32_init(), data)), block_index, 0});
-    written += compressed.size();
-    const auto chunk_index = static_cast<std::uint64_t>(chunks.size() - 1);
-    lookup.emplace(identity, chunk_index);
-    return chunk_index;
+
+    // Waits for every submitted block and writes the remainder in order.
+    void finish() {
+        if (workers_.empty()) return;
+        std::unique_lock lock(mutex_);
+        while (true) {
+            write_ready(lock);
+            if (inflight_count_ == 0) return;
+            result_ready_.wait(lock, [&] {
+                return failure_ || done_.contains(next_write_);
+            });
+        }
+    }
+
+    // A cleared buffer whose capacity came from an encoded block, or an empty
+    // buffer when none is spare.
+    ByteVector take_spare() {
+        std::lock_guard lock(mutex_);
+        if (spares_.empty()) return {};
+        auto spare = std::move(spares_.back());
+        spares_.pop_back();
+        return spare;
+    }
+
+private:
+    struct Job {
+        std::uint64_t index = 0;
+        std::uint64_t tag = 0;
+        ByteVector data;
+        std::uint64_t charge = 0;
+    };
+    struct Done {
+        std::uint64_t tag = 0;
+        std::uint64_t original_size = 0;
+        std::uint64_t charge = 0;
+        Encoded encoded;
+    };
+
+    void keep_spare(ByteVector data) {
+        data.clear();
+        std::lock_guard lock(mutex_);
+        if (spares_.size() < max_spares_) spares_.push_back(std::move(data));
+    }
+
+    void run_worker() {
+        while (true) {
+            Job job;
+            {
+                std::unique_lock lock(mutex_);
+                work_ready_.wait(lock, [&] {
+                    return stopping_ || failure_ || !pending_.empty();
+                });
+                if (stopping_ || failure_) return;
+                job = std::move(pending_.front());
+                pending_.pop_front();
+            }
+            try {
+                auto encoded = encode_(job.index, job.data);
+                const auto original_size = static_cast<std::uint64_t>(job.data.size());
+                job.data.clear();
+                {
+                    std::lock_guard lock(mutex_);
+                    done_.emplace(job.index, Done{job.tag, original_size, job.charge,
+                                                  std::move(encoded)});
+                    if (spares_.size() < max_spares_) spares_.push_back(std::move(job.data));
+                }
+                result_ready_.notify_all();
+            } catch (...) {
+                {
+                    std::lock_guard lock(mutex_);
+                    if (!failure_) failure_ = std::current_exception();
+                    pending_.clear();
+                }
+                result_ready_.notify_all();
+                work_ready_.notify_all();
+                return;
+            }
+        }
+    }
+
+    // Writes every consecutive finished block. The lock is released around
+    // each write so workers can keep publishing results.
+    void write_ready(std::unique_lock<std::mutex>& lock) {
+        while (true) {
+            if (failure_) {
+                const auto failure = failure_;
+                lock.unlock();
+                std::rethrow_exception(failure);
+            }
+            const auto found = done_.find(next_write_);
+            if (found == done_.end()) return;
+            auto done = std::move(found->second);
+            done_.erase(found);
+            lock.unlock();
+            try {
+                write_(next_write_, done.tag, done.original_size, done.encoded);
+            } catch (...) {
+                lock.lock();
+                if (!failure_) failure_ = std::current_exception();
+                pending_.clear();
+                lock.unlock();
+                work_ready_.notify_all();
+                throw;
+            }
+            lock.lock();
+            inflight_bytes_ -= done.charge;
+            --inflight_count_;
+            ++next_write_;
+        }
+    }
+
+    void stop() noexcept {
+        {
+            std::lock_guard lock(mutex_);
+            stopping_ = true;
+            pending_.clear();
+        }
+        work_ready_.notify_all();
+        for (auto& worker : workers_) {
+            if (worker.joinable()) worker.join();
+        }
+    }
+
+    EncodeFunction encode_;
+    WriteFunction write_;
+    std::uint64_t byte_budget_;
+    std::size_t max_spares_;
+    std::mutex mutex_;
+    std::condition_variable work_ready_;
+    std::condition_variable result_ready_;
+    std::deque<Job> pending_;
+    std::map<std::uint64_t, Done> done_;
+    std::vector<ByteVector> spares_;
+    std::uint64_t next_submit_;
+    std::uint64_t next_write_;
+    std::uint64_t inflight_bytes_ = 0;
+    std::size_t inflight_count_ = 0;
+    bool stopping_ = false;
+    std::exception_ptr failure_;
+    std::vector<std::thread> workers_;
+};
+
+struct ChunkEncoderPlan {
+    std::size_t workers = 0;
+    std::uint64_t byte_budget = 0;
+    std::shared_ptr<core::TaskExecutor> executor;
+};
+
+// Chunks are small independent blocks, so the parallelism that ordinary
+// archives get from splitting one solid block comes from compressing several
+// chunks at once instead. Each chunk keeps the geometry it always had: the
+// codec still sees the caller's thread count, and only scheduling changes.
+ChunkEncoderPlan plan_chunk_encoder(const CompressionOptions& options) {
+    ChunkEncoderPlan plan;
+    // The swarm parser's optional checkpoint candidate depends on the executor
+    // that runs it, so keep that experimental mode on the serial writer.
+    if (options.swarm_parse) return plan;
+    const auto execution_budget = selected_thread_count(options.thread_count);
+    const auto geometry_budget = selected_geometry_thread_count(options.thread_count);
+    const auto max_chunk = std::max<std::uint64_t>(1, options.snapshot_max_chunk_size);
+    // One chunk job per physical core, while keeping the raw bytes being
+    // parsed at once no larger than the 8 MiB per-core codec block ordinary
+    // level-9 archives already schedule. Large custom chunks therefore cannot
+    // multiply the parser's working set by the core count.
+    constexpr std::uint64_t kParseBytesPerWorker = std::uint64_t{8} << 20;
+    const auto parse_limit = std::max<std::uint64_t>(
+        1, static_cast<std::uint64_t>(geometry_budget) * kParseBytesPerWorker / max_chunk);
+    plan.workers = static_cast<std::size_t>(
+        std::min<std::uint64_t>(geometry_budget, parse_limit));
+    plan.byte_budget = static_cast<std::uint64_t>(plan.workers) * 2 * max_chunk;
+    if (execution_budget > 1) {
+        // Chunk workers count toward the operation's CPU budget; the rest serve
+        // nested codec tasks. Without spare helpers a one-queue executor still
+        // stops each compress() call from starting its own pool.
+        const auto helpers = execution_budget > plan.workers
+            ? execution_budget - plan.workers : std::size_t{0};
+        plan.executor = std::make_shared<core::TaskExecutor>(helpers + 1);
+    }
+    return plan;
 }
 
 template <typename Output>
@@ -7101,6 +7905,8 @@ std::vector<EntryRec> build_chunked_entries(
     validate_snapshot_chunk_sizes(options);
     const auto total_bytes = scanned_file_bytes(items);
     const auto total_items = static_cast<std::uint64_t>(items.size());
+    // Source bytes whose chunk is settled: a duplicate as soon as its identity
+    // matches, a new chunk once its compressed payload has been written.
     std::uint64_t completed_bytes = 0;
     std::uint64_t completed_items = 0;
     report_operation(operation, OperationStage::reading, 0, total_bytes, 0, total_items);
@@ -7118,6 +7924,47 @@ std::vector<EntryRec> build_chunked_entries(
     if (items.size() > kMaxSnapshotEntries) {
         throw std::invalid_argument("snapshot contains too many input entries");
     }
+
+    auto plan = plan_chunk_encoder(options);
+    auto chunk_options = options;
+    chunk_options.enable_content_dedup = false;
+    chunk_options.enable_snapshot_dedup = false;
+    chunk_options.transform_ranges.clear();
+    chunk_options.task_executor = plan.executor;
+    // Archive progress is published by this writer, not per compress() call.
+    chunk_options.encoded_bytes_progress = {};
+    chunk_options.encode_progress = {};
+    OrderedBlockEncoder encoder(
+        plan.workers, plan.byte_budget, blocks.size(),
+        [&chunk_options, key](std::uint64_t block_index,
+                              std::span<const std::uint8_t> data) {
+            OrderedBlockEncoder::Encoded encoded;
+            encoded.crc = core::crc32(data);
+            encoded.payload = compress(data, chunk_options);
+            if (key == nullptr) {
+                encoded.subframes = make_subframe_map(encoded.payload);
+            } else {
+                // The block index was assigned before dispatch, so the associated
+                // data matches a serial writer regardless of completion order.
+                encoded.payload = core::aead_seal(
+                    *key, encoded.payload, block_associated_data(block_index));
+            }
+            return encoded;
+        },
+        [&](std::uint64_t block_index, std::uint64_t chunk_index,
+            std::uint64_t original_size, OrderedBlockEncoder::Encoded& encoded) {
+            operation_checkpoint(operation);
+            out.write(reinterpret_cast<const char*>(encoded.payload.data()),
+                      static_cast<std::streamsize>(encoded.payload.size()));
+            if (!out) throw std::runtime_error("failed while writing snapshot chunk");
+            auto& block = blocks[static_cast<std::size_t>(block_index)];
+            block.compressed_offset = written;
+            block.compressed_size = static_cast<std::uint64_t>(encoded.payload.size());
+            block.subframes = std::move(encoded.subframes);
+            chunks[static_cast<std::size_t>(chunk_index)].crc = encoded.crc;
+            written += encoded.payload.size();
+            completed_bytes += original_size;
+        });
     std::map<std::tuple<std::uint64_t, std::uint64_t, std::uint64_t>, std::string> hardlinks;
     for (const auto& item : items) {
         operation_checkpoint(operation);
@@ -7214,24 +8061,43 @@ std::vector<EntryRec> build_chunked_entries(
         }
         read_content_defined_chunks(
             item.absolute, options, operation,
-            [&](ByteVector chunk) {
+            [&](ByteVector& chunk) {
                 const auto bytes = std::span<const std::uint8_t>(chunk);
+                const auto size = static_cast<std::uint64_t>(bytes.size());
                 crc = core::crc32_update(crc, bytes);
                 hasher.update(bytes);
                 if (entry.chunk_refs.size() >= kMaxChunkRefsPerEntry) {
                     throw std::runtime_error("snapshot file has too many chunk references");
                 }
-                const auto chunk_ref = append_snapshot_chunk(
-                    out, written, blocks, chunks, lookup, chunk, options,
-                    operation, key, keyed, reuse_stats);
+                const auto identity = make_chunk_identity(bytes, key, keyed);
+                std::uint64_t chunk_ref = 0;
+                if (const auto found = lookup.find(identity); found != lookup.end()) {
+                    // An identity already in the lookup may still be compressing;
+                    // its chunk and block indices are final either way.
+                    chunk_ref = found->second;
+                    reuse_stats.reused_items++;
+                    reuse_stats.reused_bytes += size;
+                    completed_bytes += size;
+                } else {
+                    if (chunks.size() >= kMaxChunkCount) {
+                        throw std::runtime_error("snapshot chunk table is full");
+                    }
+                    operation_checkpoint(operation);
+                    const auto block_index = static_cast<std::uint64_t>(blocks.size());
+                    chunk_ref = static_cast<std::uint64_t>(chunks.size());
+                    blocks.push_back({0, 0, size, {}});
+                    chunks.push_back({identity, 0, block_index, 0});
+                    lookup.emplace(identity, chunk_ref);
+                    encoder.submit(block_index, chunk_ref, std::move(chunk));
+                    chunk = encoder.take_spare();
+                }
                 if (entry.chunk_refs.empty()) {
                     const auto& first_chunk = chunks[static_cast<std::size_t>(chunk_ref)];
                     entry.first_block = first_chunk.block_index;
                     entry.offset = first_chunk.offset;
                 }
                 entry.chunk_refs.push_back(chunk_ref);
-                total += bytes.size();
-                completed_bytes += bytes.size();
+                total += size;
                 report_operation(operation, OperationStage::writing, completed_bytes,
                                  total_bytes, completed_items, total_items,
                                  item.archive_path, total, declared_size,
@@ -7254,6 +8120,10 @@ std::vector<EntryRec> build_chunked_entries(
                          completed_bytes, written, completed_bytes,
                          reuse_stats.reused_items, reuse_stats.reused_bytes);
     }
+    encoder.finish();
+    report_operation(operation, OperationStage::writing, completed_bytes, total_bytes,
+                     completed_items, total_items, {}, 0, 0, completed_bytes, written,
+                     completed_bytes, reuse_stats.reused_items, reuse_stats.reused_bytes);
     validate_snapshot_entry_paths_for_write(entries);
     return entries;
 }
@@ -10500,210 +11370,88 @@ void test_archive(const std::filesystem::path& archive_path,
     report_operation(operation, OperationStage::testing, completed_bytes, total_bytes,
                      completed_items, total_items);
 
-    // A test checks every file hash, so the old on-demand cache serialised all
-    // solid-block decodes before it could visit their file slices. For moderate
-    // archives, decode each independent solid block concurrently, then retain
-    // the validated bytes long enough to run the existing per-file CRC/BLAKE3
-    // checks. The cap preserves the archive reader's bounded-memory behavior
-    // for large backups, which continue to use the one-block cache below.
-    constexpr std::uint64_t kParallelTestDecodeLimit = std::uint64_t{512} << 20;
-    auto decode_budget = options.thread_count;
-    if (decode_budget == 0) {
-        decode_budget = core::logical_processor_count();
+    // Every file is read in directory order, then every chunk and block that no
+    // file reached, so the whole archive is validated, including historical
+    // snapshot chunks and unreferenced solid blocks. Mapped large blocks are
+    // additionally streamed in full to verify their AXC checksums. The read plan lets
+    // the block source decode ahead within its byte budget and keep blocks
+    // that later files reuse.
+    BlockSource source(bytes, index, options.thread_count, operation, loaded.key,
+                       index.meta.large_solid_blocks);
+    std::vector<std::uint64_t> reads;
+    std::vector<bool> chunk_read(index.chunks.size(), false);
+    std::vector<bool> block_read(index.blocks.size(), false);
+    for (const auto& entry : index.entries) {
+        const auto first = reads.size();
+        source.append_entry_reads(entry, reads);
+        for (auto position = first; position < reads.size(); ++position) {
+            block_read[static_cast<std::size_t>(reads[position])] = true;
+        }
+        for (const auto ref : entry.chunk_refs) {
+            if (ref < chunk_read.size()) chunk_read[static_cast<std::size_t>(ref)] = true;
+        }
     }
-    if (decode_budget == 0) {
-        decode_budget = 1;
+    std::vector<std::uint64_t> unread_chunks;
+    for (std::uint64_t chunk_index = 0; chunk_index < index.chunks.size(); ++chunk_index) {
+        const auto block = index.chunks[static_cast<std::size_t>(chunk_index)].block_index;
+        if (chunk_read[static_cast<std::size_t>(chunk_index)] || block >= index.blocks.size()) {
+            continue;
+        }
+        unread_chunks.push_back(chunk_index);
+        reads.push_back(block);
+        block_read[static_cast<std::size_t>(block)] = true;
     }
-    const auto outer_decode_workers = std::min<std::size_t>(
-        index.blocks.size(), std::min<std::size_t>(4, decode_budget));
-    const bool use_parallel_test_decode =
-        outer_decode_workers > 1 && total_bytes <= kParallelTestDecodeLimit;
+    std::vector<std::uint64_t> unread_blocks;
+    for (std::uint64_t block = 0; block < index.blocks.size(); ++block) {
+        if (block_read[static_cast<std::size_t>(block)]) continue;
+        unread_blocks.push_back(block);
+        if (source.reads_whole_block(block)) reads.push_back(block);
+    }
+    source.plan(std::move(reads));
 
-    auto verify_entries = [&](auto&& read_entry) {
-        for (const auto& entry : index.entries) {
-            operation_checkpoint(operation);
-            if (entry.type == kEntryDir || entry.type == kEntrySymlink ||
-                entry.type == kEntryHardlink) {
-                // No block content to verify (links carry only a target, not bytes).
-                ++completed_items;
-                report_operation(operation, OperationStage::testing, completed_bytes, total_bytes,
-                                 completed_items, total_items, entry.path);
-                continue;
-            }
-            auto crc = core::crc32_init();
-            core::Blake3 hasher;
-            std::uint64_t current_file_bytes = 0;
-            read_entry(entry, [&](std::span<const std::uint8_t> file_bytes) {
-                crc = core::crc32_update(crc, file_bytes);
-                hasher.update(file_bytes);
-                completed_bytes += file_bytes.size();
-                current_file_bytes += file_bytes.size();
-                report_operation(operation, OperationStage::testing,
-                                 completed_bytes, total_bytes,
-                                 completed_items, total_items, entry.path,
-                                 current_file_bytes, entry.size);
-            });
-            if (core::crc32_final(crc) != entry.crc) {
-                throw FormatError("checksum mismatch for archived file: " + entry.path);
-            }
-            if (entry.has_blake3 && hasher.finalize() != entry.blake3) {
-                throw FormatError("BLAKE3 mismatch for archived file: " + entry.path);
-            }
+    for (const auto& entry : index.entries) {
+        operation_checkpoint(operation);
+        if (entry.type == kEntryDir || entry.type == kEntrySymlink ||
+            entry.type == kEntryHardlink) {
+            // No block content to verify (links carry only a target, not bytes).
             ++completed_items;
             report_operation(operation, OperationStage::testing, completed_bytes, total_bytes,
                              completed_items, total_items, entry.path);
+            continue;
         }
-    };
-
-    const auto validate_snapshot_chunk = [&](const ChunkRec& chunk,
-                                             std::span<const std::uint8_t> bytes) {
         auto crc = core::crc32_init();
-        crc = core::crc32_update(crc, bytes);
-        if (core::crc32_final(crc) != chunk.crc) {
-            throw FormatError("snapshot chunk checksum mismatch");
+        core::Blake3 hasher;
+        std::uint64_t current_file_bytes = 0;
+        read_file_bytes(source, index.blocks.size(), entry, operation,
+                        [&](std::span<const std::uint8_t> file_bytes) {
+                            crc = core::crc32_update(crc, file_bytes);
+                            hasher.update(file_bytes);
+                            completed_bytes += file_bytes.size();
+                            current_file_bytes += file_bytes.size();
+                            report_operation(operation, OperationStage::testing,
+                                             completed_bytes, total_bytes,
+                                             completed_items, total_items, entry.path,
+                                             current_file_bytes, entry.size);
+                        },
+                        options.io_buffer_size);
+        if (core::crc32_final(crc) != entry.crc) {
+            throw FormatError("checksum mismatch for archived file: " + entry.path);
         }
-        const auto digest = chunk_digest(
-            bytes, loaded.key ? &*loaded.key : nullptr, index.meta.keyed_chunk_ids);
-        if (digest != chunk.identity.id) {
-            throw FormatError("snapshot chunk identity mismatch");
+        if (entry.has_blake3 && hasher.finalize() != entry.blake3) {
+            throw FormatError("BLAKE3 mismatch for archived file: " + entry.path);
         }
-    };
-
-    if (!use_parallel_test_decode) {
-        BlockSource source(bytes, index, options.thread_count, operation, loaded.key,
-                           index.meta.large_solid_blocks);
-        if (index.meta.chunk_table) {
-            for (std::uint64_t chunk_index = 0; chunk_index < index.chunks.size();
-                 ++chunk_index) {
-                operation_checkpoint(operation);
-                (void)source.chunk(chunk_index);
-            }
-        }
-        verify_entries([&](const EntryRec& entry, const auto& sink) {
-            read_file_bytes(source, index.blocks.size(), entry, operation, sink,
-                            options.io_buffer_size);
-        });
+        ++completed_items;
         report_operation(operation, OperationStage::testing, completed_bytes, total_bytes,
-                         completed_items, total_items, {}, 0, 0, 0, 0, 0, 0, 0,
-                         read_stats->archive_bytes_read.load(std::memory_order_relaxed));
-        return;
+                         completed_items, total_items, entry.path);
     }
-
-    std::vector<ByteVector> decoded(index.blocks.size());
-    std::atomic_size_t next_block = 0;
-    std::atomic_bool failed = false;
-    std::mutex exception_mutex;
-    std::exception_ptr first_exception;
-    const auto inner_decode_threads = std::max<std::size_t>(
-        1, decode_budget / outer_decode_workers);
-    auto decode_worker = [&] {
-        try {
-            while (!failed.load(std::memory_order_relaxed)) {
-                const auto block_index = next_block.fetch_add(1, std::memory_order_relaxed);
-                if (block_index >= index.blocks.size()) {
-                    return;
-                }
-                decoded[block_index] = decode_solid_block(bytes, index, block_index,
-                                                          inner_decode_threads, operation,
-                                                          loaded.key);
-            }
-        } catch (...) {
-            failed.store(true, std::memory_order_relaxed);
-            std::lock_guard lock(exception_mutex);
-            if (!first_exception) {
-                first_exception = std::current_exception();
-            }
-        }
-    };
-
-    std::vector<std::thread> decode_workers;
-    decode_workers.reserve(outer_decode_workers);
-    for (std::size_t i = 0; i < outer_decode_workers; ++i) {
-        decode_workers.emplace_back(decode_worker);
+    for (const auto chunk_index : unread_chunks) {
+        operation_checkpoint(operation);
+        (void)source.chunk(chunk_index);
     }
-    for (auto& worker : decode_workers) {
-        worker.join();
+    for (const auto block : unread_blocks) {
+        operation_checkpoint(operation);
+        source.validate_block(block, effective_io_buffer_size(options.io_buffer_size));
     }
-    if (first_exception) {
-        std::rethrow_exception(first_exception);
-    }
-
-    if (index.meta.chunk_table) {
-        for (const auto& chunk : index.chunks) {
-            operation_checkpoint(operation);
-            if (chunk.block_index >= decoded.size()) {
-                throw FormatError("snapshot chunk points outside the block table");
-            }
-            const auto& block = decoded[static_cast<std::size_t>(chunk.block_index)];
-            if (chunk.offset > block.size() ||
-                chunk.identity.size > block.size() - chunk.offset) {
-                throw FormatError("snapshot chunk points outside its block");
-            }
-            const auto chunk_bytes = std::span<const std::uint8_t>(
-                block.data() + static_cast<std::size_t>(chunk.offset),
-                static_cast<std::size_t>(chunk.identity.size));
-            validate_snapshot_chunk(chunk, chunk_bytes);
-        }
-    }
-
-    verify_entries([&](const EntryRec& entry, const auto& sink) {
-        if (!entry.chunk_refs.empty()) {
-            const auto io_chunk = effective_io_buffer_size(options.io_buffer_size);
-            for (const auto ref : entry.chunk_refs) {
-                if (ref >= index.chunks.size()) {
-                    throw FormatError("snapshot entry points outside the chunk table");
-                }
-                const auto& chunk = index.chunks[static_cast<std::size_t>(ref)];
-                if (chunk.block_index >= decoded.size()) {
-                    throw FormatError("snapshot chunk points outside the block table");
-                }
-                const auto& block = decoded[static_cast<std::size_t>(chunk.block_index)];
-                if (chunk.offset > block.size() ||
-                    chunk.identity.size > block.size() - chunk.offset) {
-                    throw FormatError("snapshot chunk points outside its block");
-                }
-                const auto chunk_bytes = std::span<const std::uint8_t>(
-                    block.data() + static_cast<std::size_t>(chunk.offset),
-                    static_cast<std::size_t>(chunk.identity.size));
-                validate_snapshot_chunk(chunk, chunk_bytes);
-                std::uint64_t offset = 0;
-                while (offset < chunk.identity.size) {
-                    const auto take = std::min<std::uint64_t>(
-                        io_chunk, chunk.identity.size - offset);
-                    sink(std::span<const std::uint8_t>(
-                        block.data() + chunk.offset + offset,
-                        static_cast<std::size_t>(take)));
-                    offset += take;
-                }
-            }
-            return;
-        }
-        std::uint64_t remaining = entry.size;
-        std::uint64_t block_index = entry.first_block;
-        std::uint64_t within = entry.offset;
-        const auto io_chunk = effective_io_buffer_size(options.io_buffer_size);
-        while (remaining > 0) {
-            operation_checkpoint(operation);
-            if (block_index >= decoded.size()) {
-                throw FormatError("file extends past the last block");
-            }
-            const auto& block = decoded[block_index];
-            if (within > block.size()) {
-                throw FormatError("file offset lies past its block");
-            }
-            const auto available = static_cast<std::uint64_t>(block.size()) - within;
-            const auto take = std::min<std::uint64_t>(
-                std::min<std::uint64_t>(available, remaining), io_chunk);
-            sink(std::span<const std::uint8_t>(block.data() + within,
-                                               static_cast<std::size_t>(take)));
-            remaining -= take;
-            within += take;
-            if (within >= block.size()) {
-                within = 0;
-                ++block_index;
-            }
-        }
-    });
     report_operation(operation, OperationStage::testing, completed_bytes, total_bytes,
                      completed_items, total_items, {}, 0, 0, 0, 0, 0, 0, 0,
                      read_stats->archive_bytes_read.load(std::memory_order_relaxed));
@@ -10800,6 +11548,9 @@ void extract_entries_impl(const std::filesystem::path& archive_path,
 
     std::uint64_t total_bytes = 0;
     std::uint64_t total_items = 0;
+    // The blocks the loop below reads, in order. Existing targets that are
+    // skipped only mean some planned reads never happen.
+    std::vector<std::uint64_t> reads;
     for (std::size_t i = 0; i < index.entries.size(); ++i) {
         operation_checkpoint(operation);
         if (!selected[i]) {
@@ -10809,6 +11560,7 @@ void extract_entries_impl(const std::filesystem::path& archive_path,
         const auto& entry = index.entries[i];
         if (entry.type == kEntryFile) {
             total_bytes += entry.size;
+            source.append_entry_reads(entry, reads);
         } else if (entry.type == kEntryHardlink) {
             const auto target = entry_by_path.find(entry.link_target);
             if (!target || index.entries[*target].type != kEntryFile) {
@@ -10816,9 +11568,11 @@ void extract_entries_impl(const std::filesystem::path& archive_path,
             }
             if (!selected[*target]) {
                 total_bytes += index.entries[*target].size;
+                source.append_entry_reads(index.entries[*target], reads);
             }
         }
     }
+    source.plan(std::move(reads));
     std::uint64_t completed_bytes = 0;
     std::uint64_t completed_items = 0;
     report_operation(operation, OperationStage::extracting, completed_bytes, total_bytes,

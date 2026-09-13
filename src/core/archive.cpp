@@ -488,6 +488,22 @@ ByteVector compress(std::span<const std::uint8_t> input,
                                (input.size() <= kSerialThoroughLimit &&
                                 input.size() <= options.optimal_parse_limit));
         std::future<ByteVector> block_future;
+        // A shared executor's future does not join its task on destruction.
+        // Drain it even on cancellation/error: the task borrows `input`, and
+        // cooperative waiting also works when the pool has no helper threads.
+        struct ParallelCandidateGuard {
+            std::future<ByteVector>& future;
+            core::TaskExecutor* executor;
+            ~ParallelCandidateGuard() noexcept {
+                if (!future.valid()) return;
+                try {
+                    if (executor) (void)executor->wait(future);
+                    else (void)future.get();
+                } catch (...) {
+                    // Preserve the original exception while unwinding.
+                }
+            }
+        } block_guard{block_future, options.task_executor.get()};
         if (evaluate_parallel_candidate && thorough) {
             auto encode_blocks = [&input, parallel_options] {
                 return codec::encode_parallel_blocks(input, parallel_options);
@@ -683,7 +699,8 @@ ByteVector compress(std::span<const std::uint8_t> input,
                                     /*try_sequence=*/true);
             }
             if (evaluate_parallel_candidate) {
-                auto block_payload = block_future.get();
+                auto block_payload = options.task_executor
+                    ? options.task_executor->wait(block_future) : block_future.get();
                 if (block_payload.size() < best_size) {
                     best_size = block_payload.size();
                     codec = core::CodecId::parallel_blocks;
