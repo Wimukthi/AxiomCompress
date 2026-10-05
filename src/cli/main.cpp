@@ -412,8 +412,14 @@ private:
 
 class ScopedInteractiveProgress {
 public:
-    explicit ScopedInteractiveProgress(std::string action) {
-        if (!interactive_command_active || !stream_is_terminal(stdout)) return;
+    // `collect_warnings` is for commands that report what they could not do: without
+    // a terminal there is nothing to draw, but the operation is still created so
+    // that its warnings can be printed by print_warnings().
+    explicit ScopedInteractiveProgress(std::string action, bool collect_warnings = false) {
+        if (!interactive_command_active || !stream_is_terminal(stdout)) {
+            if (collect_warnings) control_ = std::make_shared<axiom::OperationControl>();
+            return;
+        }
         display_ = std::make_shared<TerminalProgressDisplay>(std::move(action));
         control_ = std::make_shared<axiom::OperationControl>();
         telemetry_thread_ = std::jthread(
@@ -451,13 +457,40 @@ public:
         finish(true);
     }
 
+    // The warnings the operation collected (metadata that could not be restored,
+    // links that could not be created, ...), one line each on stderr. A long list
+    // is cut so a log of thousands of similar warnings stays readable. Paths come
+    // from the archive, so control characters are not passed to the terminal.
+    // Returns how many warnings there were.
+    std::size_t print_warnings() const {
+        if (!control_) return 0;
+        const auto warnings = control_->warnings();
+        constexpr std::size_t kShown = 25;
+        const auto printable = [](std::string text) {
+            for (auto& ch : text) {
+                if (static_cast<unsigned char>(ch) < 0x20 || ch == 0x7F) ch = '?';
+            }
+            return text;
+        };
+        for (std::size_t i = 0; i < warnings.size() && i < kShown; ++i) {
+            std::cerr << "axiomc: warning: ";
+            if (!warnings[i].path.empty()) std::cerr << printable(warnings[i].path) << ": ";
+            std::cerr << printable(warnings[i].message) << '\n';
+        }
+        if (warnings.size() > kShown) {
+            std::cerr << "axiomc: " << (warnings.size() - kShown)
+                      << " more warning(s) not shown\n";
+        }
+        return warnings.size();
+    }
+
 private:
     void finish(bool ok) {
         if (finished_) return;
         finished_ = true;
         telemetry_thread_.request_stop();
         if (telemetry_thread_.joinable()) telemetry_thread_.join();
-        if (control_) {
+        if (control_ && display_) {
             if (auto progress = control_->latest_progress()) display_->report(*progress);
         }
         if (display_) {
@@ -1197,7 +1230,7 @@ int run_extract(std::vector<std::string> args) {
         throw std::runtime_error("unsupported archive format: " +
                                  axiom::core::path_to_utf8(archive));
     }
-    ScopedInteractiveProgress progress("extracting archive");
+    ScopedInteractiveProgress progress("extracting archive", true);
     extract.operation = progress.operation();
     if (selected_entries.empty()) {
         provider->extract_all(archive, dest, extract);
@@ -1205,6 +1238,7 @@ int run_extract(std::vector<std::string> args) {
         provider->extract_selected(archive, selected_entries, dest, extract);
     }
     progress.complete();
+    progress.print_warnings();
     return 0;
 }
 
@@ -1390,11 +1424,12 @@ int run_snapshot(std::vector<std::string> args) {
             print_usage();
             return 2;
         }
-        ScopedInteractiveProgress progress("restoring snapshot");
+        ScopedInteractiveProgress progress("restoring snapshot", true);
         extract.operation = progress.operation();
         axiom::restore_archive_snapshot(
             positionals[0], positionals[1], positionals[2], extract);
         progress.complete();
+        progress.print_warnings();
         return 0;
     }
 
@@ -1434,11 +1469,14 @@ int run_test(std::vector<std::string> args) {
         throw std::runtime_error("unsupported archive format: " +
                                  axiom::core::path_to_utf8(archive));
     }
-    ScopedInteractiveProgress progress("testing archive");
+    ScopedInteractiveProgress progress("testing archive", true);
     options.operation = progress.operation();
     provider->test(archive, options);
     progress.complete();
-    std::cout << "archive is intact\n";
+    const auto warning_count = progress.print_warnings();
+    std::cout << "archive is intact";
+    if (warning_count != 0) std::cout << " (" << warning_count << " warning(s) above)";
+    std::cout << '\n';
     return 0;
 }
 

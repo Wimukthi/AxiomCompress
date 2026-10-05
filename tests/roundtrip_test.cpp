@@ -6455,6 +6455,10 @@ public:
                                                       directory.begin() + at + payload_size));
                 at += payload_size;
             }
+            if (entry.type == kHostileFile && !has_template_) {
+                template_ = entry;
+                has_template_ = true;
+            }
             entries_.push_back(std::move(entry));
         }
         tail_.assign(directory.begin() + at, directory.end());
@@ -6462,21 +6466,18 @@ public:
 
     std::vector<HostileEntry>& entries() { return entries_; }
 
-    // The first genuine file entry: its data range and checksums, to be reused
-    // under another name.
+    // The archive's first genuine file entry (kept even after entries() is
+    // replaced): its data range and checksums, to be reused under another name.
     HostileEntry file_like(const std::string& path) const {
-        for (const auto& entry : entries_) {
-            if (entry.type != kHostileFile) {
-                continue;
-            }
-            HostileEntry copy = entry;
-            copy.path = path;
-            // Keep mtime (1), CRC-32 (2) and BLAKE3 (3); drop recorded modes.
-            std::erase_if(copy.extras, [](const auto& extra) { return extra.first > 3; });
-            return copy;
-        }
-        AXIOM_CHECK(false);
-        return {};
+        AXIOM_CHECK(has_template_);
+        HostileEntry copy = template_;
+        copy.path = path;
+        // Keep mtime (1), CRC-32 (2), BLAKE3 (3) and chunk references (12); drop
+        // recorded modes and the like.
+        std::erase_if(copy.extras, [](const auto& extra) {
+            return extra.first > 3 && extra.first != 12;
+        });
+        return copy;
     }
 
     void write(const fs::path& path) const {
@@ -6522,6 +6523,8 @@ private:
     std::vector<std::uint8_t> blocks_;
     std::vector<HostileEntry> entries_;
     std::vector<std::uint8_t> tail_;
+    HostileEntry template_;
+    bool has_template_ = false;
 };
 
 HostileEntry hostile_symlink(const std::string& path, const std::string& target) {
@@ -6530,6 +6533,28 @@ HostileEntry hostile_symlink(const std::string& path, const std::string& target)
     entry.path = path;
     entry.target = target;
     return entry;
+}
+
+HostileEntry hostile_hardlink(const std::string& path, const std::string& target) {
+    HostileEntry entry;
+    entry.type = kHostileHardlink;
+    entry.path = path;
+    entry.target = target;
+    return entry;
+}
+
+HostileEntry hostile_directory_entry(const std::string& path) {
+    HostileEntry entry;
+    entry.type = 1;
+    entry.path = path;
+    return entry;
+}
+
+void hostile_add_ads(HostileEntry& entry, const std::string& name, const std::string& data) {
+    std::vector<std::uint8_t> payload;
+    hostile_put_string(payload, name);
+    payload.insert(payload.end(), data.begin(), data.end());
+    entry.extras.emplace_back(6, std::move(payload));
 }
 
 void hostile_set_posix(HostileEntry& entry, std::uint32_t mode, std::uint32_t uid,
@@ -6921,6 +6946,229 @@ void test_extract_withholds_privileged_xattrs() {
 #endif
 
 #endif  // !_WIN32
+
+// What `test` says about an entry list: unreadable structure fails, oddities that
+// older writers could produce are reported, and the order of entries is free.
+void test_archive_directory_findings() {
+    const auto root = make_temp_dir();
+    const auto base = make_hostile_base(root);
+    HostileDirectory hostile(base);
+    const auto evil = root / "evil.axar";
+
+    const auto warnings_of = [&](const fs::path& archive) {
+        axiom::DecompressionOptions options;
+        options.operation = std::make_shared<axiom::OperationControl>();
+        axiom::test_archive(archive, options);
+        return options.operation->warnings();
+    };
+
+    // A path used twice and an entry beneath a file are readable, and reported.
+    hostile.entries() = {hostile.file_like("same"), hostile.file_like("same"),
+                         hostile.file_like("plain"), hostile.file_like("plain/inner")};
+    hostile.write(evil);
+    AXIOM_CHECK(axiom::list_archive(evil).size() == 4);
+    const auto odd = warnings_of(evil);
+    AXIOM_CHECK(odd.size() == 2);
+    AXIOM_CHECK(odd[0].path == "same" &&
+                odd[0].message.find("more than one entry") != std::string::npos);
+    AXIOM_CHECK(odd[1].path == "plain/inner" &&
+                odd[1].message.find("not a directory") != std::string::npos);
+
+    // Directories may be missing from the list; entries may follow in any order.
+    hostile.entries() = {hostile_hardlink("link", "target"), hostile.file_like("target"),
+                         hostile.file_like("dir/deep/file")};
+    hostile.write(evil);
+    AXIOM_CHECK(warnings_of(evil).empty());
+
+    // These cannot be restored as stored: the test fails.
+    hostile.entries() = {hostile_hardlink("link", "missing")};
+    hostile.write(evil);
+    expect_throws([&] { (void)warnings_of(evil); });
+    hostile.entries() = {hostile_directory_entry("folder"), hostile_hardlink("link", "folder")};
+    hostile.write(evil);
+    expect_throws([&] { (void)warnings_of(evil); });
+    hostile.entries() = {hostile.file_like("../outside")};
+    hostile.write(evil);
+    expect_throws([&] { (void)warnings_of(evil); });
+
+    std::error_code ec;
+    fs::remove_all(root, ec);
+}
+
+// Alternate-data-stream names are appended to a file's path on Windows, so a name
+// that is not a plain stream name is refused when the directory is read.
+void test_archive_rejects_unsafe_ads_names() {
+    const auto root = make_temp_dir();
+    const auto base = make_hostile_base(root);
+    HostileDirectory hostile(base);
+    const auto evil = root / "evil.axar";
+
+    const std::vector<std::string> refused = {
+        "..\\..\\outside", "dir/outside", "other:stream", std::string("nul\0name", 8)};
+    for (const auto& name : refused) {
+        auto file = hostile.file_like("f");
+        hostile_add_ads(file, name, "payload");
+        hostile.entries() = {std::move(file)};
+        hostile.write(evil);
+        expect_throws([&] { (void)axiom::list_archive(evil); });
+    }
+    {
+        auto file = hostile.file_like("f");
+        hostile_add_ads(file, "", "payload");
+        hostile.entries() = {std::move(file)};
+        hostile.write(evil);
+        expect_throws([&] { (void)axiom::list_archive(evil); });
+    }
+    auto file = hostile.file_like("f");
+    hostile_add_ads(file, "Zone.Identifier", "[ZoneTransfer]\r\nZoneId=3\r\n");
+    hostile.entries() = {std::move(file)};
+    hostile.write(evil);
+    AXIOM_CHECK(axiom::list_archive(evil).size() == 1);
+
+    // A NUL would cut a path short wherever it reaches the operating system.
+    hostile.entries() = {hostile.file_like(std::string("cut\0short", 9))};
+    hostile.write(evil);
+    expect_throws([&] { (void)axiom::list_archive(evil); });
+
+    std::error_code ec;
+    fs::remove_all(root, ec);
+}
+
+// A chunk-addressed directory is checked when it is read. A name that sorts
+// between a path and the entries beneath it ("a", "a.txt", "a/b") must not hide
+// the file with children.
+void test_dedup_directory_rejects_non_directory_parent() {
+    const auto root = make_temp_dir();
+    const auto src = root / "src";
+    fs::create_directories(src);
+    write_all(src / "data.txt", bytes_from_string(kHostilePayload));
+    axiom::CompressionOptions options;
+    options.enable_content_dedup = true;
+    const auto archive = root / "dedup.axar";
+    axiom::create_archive({src}, archive, options);
+
+    HostileDirectory hostile(archive);
+    const auto evil = root / "evil.axar";
+    hostile.entries() = {hostile.file_like("a"), hostile.file_like("a.txt"),
+                         hostile.file_like("a/b")};
+    hostile.write(evil);
+    expect_throws([&] { (void)axiom::list_archive(evil); });
+
+    // The same names are fine when "a" is a directory.
+    hostile.entries() = {hostile_directory_entry("a"), hostile.file_like("a.txt"),
+                         hostile.file_like("a/b")};
+    hostile.write(evil);
+    AXIOM_CHECK(axiom::list_archive(evil).size() == 3);
+
+    std::error_code ec;
+    fs::remove_all(root, ec);
+}
+
+// Creating or changing an archive refuses destinations that no extraction could
+// restore: one path used twice, or items beneath a file.
+void test_creation_rejects_conflicting_destinations() {
+    const auto root = make_temp_dir();
+    fs::create_directories(root / "A");
+    fs::create_directories(root / "B");
+    write_all(root / "A" / "readme.txt", bytes_from_string("from A"));
+    write_all(root / "B" / "readme.txt", bytes_from_string("from B"));
+    const auto archive = root / "dup.axar";
+
+    bool named_the_path = false;
+    try {
+        axiom::create_archive({root / "A" / "readme.txt", root / "B" / "readme.txt"}, archive, {});
+    } catch (const std::invalid_argument& error) {
+        named_the_path = std::string(error.what()).find("readme.txt") != std::string::npos;
+    }
+    AXIOM_CHECK(named_the_path);
+    AXIOM_CHECK(!fs::exists(archive));
+
+    axiom::create_archive({root / "A" / "readme.txt"}, archive, {});
+    expect_throws([&] {
+        axiom::add_to_archive({root / "B" / "readme.txt", root / "B" / "readme.txt"}, archive, {});
+    });
+    expect_throws([&] {
+        axiom::update_archive({root / "B" / "readme.txt", root / "B" / "readme.txt"}, archive, {});
+    });
+    AXIOM_CHECK(axiom::list_archive(archive).size() == 1);
+
+    // Mapped destinations: the same checks, and the ones against what the archive
+    // already holds.
+    const auto mapped = [&](const std::vector<axiom::ArchiveInput>& inputs) {
+        axiom::add_to_archive(inputs, archive, {});
+    };
+    expect_throws([&] {
+        mapped({{root / "A" / "readme.txt", "x"}, {root / "B" / "readme.txt", "x"}});
+    });
+    expect_throws([&] {
+        mapped({{root / "A" / "readme.txt", "x"}, {root / "B" / "readme.txt", "x/inside"}});
+    });
+    mapped({{root / "A" / "readme.txt", "folder/child"}});  // no entry for "folder": fine
+    expect_throws([&] { mapped({{root / "B" / "readme.txt", "folder"}}); });  // would have children
+    mapped({{root / "A" / "readme.txt", "plain"}});
+    expect_throws([&] { mapped({{root / "B" / "readme.txt", "plain/inside"}}); });  // beneath a file
+    expect_throws([&] { mapped({{root / "B", "plain"}}); });  // a directory over a file
+    mapped({{root / "B" / "readme.txt", "folder/other"}});  // beside, not over
+    AXIOM_CHECK(axiom::list_archive(archive).size() == 4);
+    axiom::test_archive(archive);
+
+    std::error_code ec;
+    fs::remove_all(root, ec);
+}
+
+// A hard link may stand ahead of the file it shares bytes with, as it does after
+// an update that replaces that file; extraction must still produce both.
+void test_extract_hardlink_before_target() {
+    const auto root = make_temp_dir();
+    const auto base = make_hostile_base(root);
+    HostileDirectory hostile(base);
+    hostile.entries() = {hostile_hardlink("link", "target"), hostile.file_like("target")};
+    const auto evil = root / "evil.axar";
+    hostile.write(evil);
+
+    const auto dest = root / "dest";
+    axiom::extract_archive(evil, dest, {});
+    AXIOM_CHECK(read_all(dest / "target") == bytes_from_string(kHostilePayload));
+    AXIOM_CHECK(read_all(dest / "link") == bytes_from_string(kHostilePayload));
+
+    // The same result from a selection that names only the link.
+    const auto only_link = root / "only-link";
+    axiom::extract_entries(evil, {"link"}, only_link, {});
+    AXIOM_CHECK(read_all(only_link / "link") == bytes_from_string(kHostilePayload));
+    AXIOM_CHECK(!fs::exists(only_link / "target"));
+
+    std::error_code ec;
+    fs::remove_all(root, ec);
+}
+
+void test_extract_hardlink_after_updating_target() {
+    const auto root = make_temp_dir();
+    const auto src = root / "src";
+    fs::create_directories(src);
+    write_all(src / "a", bytes_from_string("first version"));
+    std::error_code link_error;
+    fs::create_hard_link(src / "a", src / "b", link_error);
+    if (link_error) {
+        std::error_code ec;
+        fs::remove_all(root, ec);
+        return;  // the test filesystem has no hard links
+    }
+    const auto archive = root / "links.axar";
+    axiom::create_archive({src / "a", src / "b"}, archive, {});
+
+    // Replace only the file the link points to.
+    write_all(src / "a", bytes_from_string("second version, which is longer"));
+    axiom::add_to_archive({src / "a"}, archive, {});
+    axiom::test_archive(archive);
+
+    const auto dest = root / "dest";
+    axiom::extract_archive(archive, dest, {});
+    AXIOM_CHECK(read_all(dest / "a") == bytes_from_string("second version, which is longer"));
+    AXIOM_CHECK(read_all(dest / "b") == bytes_from_string("second version, which is longer"));
+
+    std::error_code ec;
+    fs::remove_all(root, ec);
+}
 
 // ExclusiveFile creates a file only where nothing exists and never through a link.
 void test_exclusive_file_refuses_existing_names() {
@@ -7537,6 +7785,12 @@ constexpr RegisteredTest kTests[] = {
     {"extract_link_safety", test_extract_link_safety},
     {"exclusive_file_refuses_existing_names", test_exclusive_file_refuses_existing_names},
     {"staging_names", test_staging_names},
+    {"archive_directory_findings", test_archive_directory_findings},
+    {"archive_rejects_unsafe_ads_names", test_archive_rejects_unsafe_ads_names},
+    {"dedup_directory_rejects_non_directory_parent", test_dedup_directory_rejects_non_directory_parent},
+    {"creation_rejects_conflicting_destinations", test_creation_rejects_conflicting_destinations},
+    {"extract_hardlink_before_target", test_extract_hardlink_before_target},
+    {"extract_hardlink_after_updating_target", test_extract_hardlink_after_updating_target},
 #if !defined(_WIN32)
     {"extract_staging_name_plant", test_extract_staging_name_plant},
     {"extract_link_then_child_stays_inside", test_extract_link_then_child_stays_inside},

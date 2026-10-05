@@ -373,12 +373,37 @@ u8[]     path                  relative, UTF-8, '/'-separated, no '..'
     vint   target_len
     u8[]   target              symlink: the link target, verbatim
                                hardlink: the archive path of the file whose bytes
-                               are shared (always an earlier entry); no content
+                               are shared (usually an earlier entry; see
+                               "Entry list rules"); no content
 --- zero or more TLV extra records, until the body ends ---
 vint     record_type
 vint     payload_len
 u8[]     payload
 ```
+
+#### Entry list rules
+
+A **hard link normally follows the file it shares bytes with**, but an update
+that replaces that file appends the new entry after the link, so a reader must
+not rely on the order. Extraction links to the target only when it wrote that
+file itself, and otherwise writes the link's path from the target entry's bytes.
+
+Readers refuse a directory whose entries cannot be interpreted: an unknown
+entry type, a path containing a NUL, or an alternate-data-stream name that is
+empty or contains `\`, `/`, `:` or NUL (a stream name is appended to the file's
+path on Windows, where such a name would address something else). Chunk-addressed
+directories (snapshot history and live deduplication) are held to more: unique,
+normalized paths, hard-link targets that are normalized, and no entry beneath a
+path that is not a directory.
+
+Ordinary directories are not checked that strictly when they are opened, because
+older writers could produce a path used twice (two inputs with the same name) or
+an entry beneath a file. `test` examines the entry list too. It fails an archive
+that holds a path extraction refuses (rooted, or containing `..`) or a hard link
+whose target is not a file entry, and it reports a path used by more than one
+entry, or an entry beneath a non-directory, as warnings. Writers now refuse to
+create such a list: two items for one archive path, or an item beneath a file,
+make creation and update fail before anything is written.
 
 #### Entry extra records
 

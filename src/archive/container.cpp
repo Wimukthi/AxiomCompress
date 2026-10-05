@@ -809,15 +809,29 @@ void validate_snapshot_name(std::string_view name) {
     }
 }
 
+// The outermost proper ancestor of `path` that has an entry which is not a
+// directory, or nullopt. `by_path` maps entry paths (views into storage that
+// outlives the map) to entry types.
+std::optional<std::string_view> find_non_directory_ancestor(
+    const std::unordered_map<std::string_view, std::uint8_t>& by_path,
+    std::string_view path) {
+    for (auto slash = path.find('/'); slash != std::string_view::npos;
+         slash = path.find('/', slash + 1)) {
+        const auto found = by_path.find(path.substr(0, slash));
+        if (found != by_path.end() && found->second != kEntryDir) {
+            return found->first;
+        }
+    }
+    return std::nullopt;
+}
+
 void validate_snapshot_entry_paths_for_write(const std::vector<EntryRec>& entries) {
     if (entries.size() > kMaxSnapshotEntries) {
         throw std::invalid_argument("snapshot contains too many entries");
     }
 
-    std::vector<std::pair<std::string, std::uint8_t>> ordered;
-    ordered.reserve(entries.size());
-    std::unordered_set<std::string> seen;
-    seen.reserve(entries.size());
+    std::unordered_map<std::string_view, std::uint8_t> by_path;
+    by_path.reserve(entries.size());
     for (const auto& entry : entries) {
         if (entry.type > kEntryHardlink) {
             throw std::invalid_argument("snapshot contains an unknown entry type");
@@ -827,7 +841,7 @@ void validate_snapshot_entry_paths_for_write(const std::vector<EntryRec>& entrie
             throw std::invalid_argument("snapshot archive path is not normalized: " +
                                         entry.path);
         }
-        if (!seen.insert(entry.path).second) {
+        if (!by_path.emplace(entry.path, entry.type).second) {
             throw std::invalid_argument("snapshot contains a duplicate path: " + entry.path);
         }
         if (entry.type == kEntryHardlink) {
@@ -838,18 +852,12 @@ void validate_snapshot_entry_paths_for_write(const std::vector<EntryRec>& entrie
                     "snapshot hard-link target is not normalized: " + entry.link_target);
             }
         }
-        ordered.emplace_back(entry.path, entry.type);
     }
-    std::sort(ordered.begin(), ordered.end(),
-              [](const auto& first, const auto& second) {
-                  return first.first < second.first;
-              });
-    for (std::size_t index = 1; index < ordered.size(); ++index) {
-        if (is_same_or_child(ordered[index].first, ordered[index - 1].first) &&
-            ordered[index - 1].second != kEntryDir) {
+    for (const auto& entry : entries) {
+        if (const auto ancestor = find_non_directory_ancestor(by_path, entry.path)) {
             throw std::invalid_argument(
                 "snapshot has a non-directory entry with children: " +
-                ordered[index - 1].first);
+                std::string(*ancestor));
         }
     }
 }
@@ -859,10 +867,8 @@ void validate_snapshot_entry_paths_for_read(const std::vector<EntryRec>& entries
         throw FormatError("snapshot contains too many entries");
     }
 
-    std::vector<std::pair<std::string, std::uint8_t>> ordered;
-    ordered.reserve(entries.size());
-    std::unordered_set<std::string> seen;
-    seen.reserve(entries.size());
+    std::unordered_map<std::string_view, std::uint8_t> by_path;
+    by_path.reserve(entries.size());
     for (const auto& entry : entries) {
         if (entry.type > kEntryHardlink) {
             throw FormatError("snapshot contains an unknown entry type");
@@ -874,7 +880,7 @@ void validate_snapshot_entry_paths_for_read(const std::vector<EntryRec>& entries
         } catch (const std::invalid_argument&) {
             throw FormatError("snapshot manifest path is not safe");
         }
-        if (!seen.insert(entry.path).second) {
+        if (!by_path.emplace(entry.path, entry.type).second) {
             throw FormatError("snapshot manifest contains a duplicate path");
         }
         if (entry.type == kEntryHardlink) {
@@ -887,15 +893,9 @@ void validate_snapshot_entry_paths_for_read(const std::vector<EntryRec>& entries
                 throw FormatError("snapshot hard-link target is not safe");
             }
         }
-        ordered.emplace_back(entry.path, entry.type);
     }
-    std::sort(ordered.begin(), ordered.end(),
-              [](const auto& first, const auto& second) {
-                  return first.first < second.first;
-              });
-    for (std::size_t index = 1; index < ordered.size(); ++index) {
-        if (is_same_or_child(ordered[index].first, ordered[index - 1].first) &&
-            ordered[index - 1].second != kEntryDir) {
+    for (const auto& entry : entries) {
+        if (find_non_directory_ancestor(by_path, entry.path)) {
             throw FormatError("snapshot has a non-directory entry with children");
         }
     }
@@ -1651,58 +1651,64 @@ bool same_mapped_entry_class(std::uint8_t stored_type, std::uint8_t incoming_typ
     return is_file_like(stored_type) && is_file_like(incoming_type);
 }
 
-void validate_mapped_items(const std::vector<ScanItem>& items,
-                           const ArchiveIndex& existing,
-                           const std::shared_ptr<OperationControl>& operation) {
-    std::unordered_map<std::string, std::uint8_t> incoming;
+// Checks over what a creation or update is about to write, made before any byte is
+// written. Two items at one archive path, or an item beneath a non-directory one,
+// would produce a directory that no extraction can restore faithfully.
+void validate_incoming_items(const std::vector<ScanItem>& items,
+                             const std::shared_ptr<OperationControl>& operation) {
+    std::unordered_map<std::string_view, std::uint8_t> incoming;
     incoming.reserve(items.size());
     for (const auto& item : items) {
         operation_checkpoint(operation);
-        const auto [it, inserted] = incoming.emplace(item.archive_path, scan_item_type(item));
-        if (!inserted) {
+        if (!incoming.emplace(item.archive_path, scan_item_type(item)).second) {
             throw std::invalid_argument("duplicate archive destination: " + item.archive_path);
         }
     }
-
-    auto validate_tree = [](const auto& paths, const char* message) {
-        for (const auto& [path, type] : paths) {
-            if (type == kEntryDir) {
-                continue;
-            }
-            const std::string prefix = path + "/";
-            for (const auto& [other, ignored] : paths) {
-                (void)ignored;
-                if (other.size() > path.size() && other.compare(0, prefix.size(), prefix) == 0) {
-                    throw std::invalid_argument(std::string(message) + path);
-                }
-            }
-        }
-    };
-    validate_tree(incoming, "non-directory archive destination has children: ");
-
-    std::unordered_map<std::string, std::uint8_t> current;
-    current.reserve(existing.entries.size());
-    for (const auto& entry : existing.entries) {
-        current.emplace(entry.path, entry.type);
-    }
-    for (const auto& [path, type] : incoming) {
+    for (const auto& item : items) {
         operation_checkpoint(operation);
+        if (const auto ancestor = find_non_directory_ancestor(incoming, item.archive_path)) {
+            throw std::invalid_argument(
+                "non-directory archive destination has children: " + std::string(*ancestor));
+        }
+    }
+}
+
+void validate_mapped_items(const std::vector<ScanItem>& items,
+                           const ArchiveIndex& existing,
+                           const std::shared_ptr<OperationControl>& operation) {
+    validate_incoming_items(items, operation);
+
+    // The first entry at a path wins, as everywhere else the directory is indexed.
+    std::unordered_map<std::string_view, std::uint8_t> current;
+    current.reserve(existing.entries.size());
+    // Every proper ancestor of an existing entry: a path in here has something
+    // beneath it.
+    std::unordered_set<std::string_view> existing_parents;
+    for (const auto& entry : existing.entries) {
+        operation_checkpoint(operation);
+        current.emplace(entry.path, entry.type);
+        const std::string_view path = entry.path;
+        for (auto slash = path.find('/'); slash != std::string_view::npos;
+             slash = path.find('/', slash + 1)) {
+            existing_parents.insert(path.substr(0, slash));
+        }
+    }
+    for (const auto& item : items) {
+        operation_checkpoint(operation);
+        const std::string_view path = item.archive_path;
+        const auto type = scan_item_type(item);
         if (const auto found = current.find(path);
             found != current.end() && !same_mapped_entry_class(found->second, type)) {
-            throw std::invalid_argument("archive destination changes entry type: " + path);
+            throw std::invalid_argument("archive destination changes entry type: " +
+                                        item.archive_path);
         }
-        for (const auto& [old_path, old_type] : current) {
-            if (old_path == path) {
-                continue;
-            }
-            if (old_type != kEntryDir && is_same_or_child(path, old_path)) {
-                throw std::invalid_argument("archive destination is beneath a non-directory: " +
-                                            old_path);
-            }
-            if (type != kEntryDir && is_same_or_child(old_path, path)) {
-                throw std::invalid_argument("non-directory archive destination has children: " +
-                                            path);
-            }
+        if (const auto ancestor = find_non_directory_ancestor(current, path)) {
+            throw std::invalid_argument("archive destination is beneath a non-directory: " +
+                                        std::string(*ancestor));
+        }
+        if (type != kEntryDir && existing_parents.contains(path)) {
+            throw std::invalid_argument("non-directory archive destination has children: " +
+                                        item.archive_path);
         }
     }
 }
@@ -3087,6 +3093,9 @@ EntryRec parse_snapshot_entry_body(std::span<const std::uint8_t> bytes) {
             }
             core::AdsStream stream;
             stream.name = payload.str(static_cast<std::size_t>(name_length));
+            if (!core::is_valid_ads_name(stream.name)) {
+                throw FormatError("snapshot alternate data stream name is invalid");
+            }
             if (payload.remaining() > core::kMaxAdsBytes) {
                 throw FormatError("snapshot alternate data stream exceeds its metadata limit");
             }
@@ -3247,6 +3256,11 @@ ArchiveIndex parse_directory(const ByteVector& directory, std::uint64_t director
             throw FormatError("unknown archive entry type");
         }
         entry.path = body.str(static_cast<std::size_t>(body.vint()));
+        // No filesystem name contains a NUL, so no writer stores one. Left in, it
+        // would cut the path short wherever it is handed to the operating system.
+        if (entry.path.find('\0') != std::string::npos) {
+            throw FormatError("archive entry path contains a NUL character");
+        }
         if (entry.type == kEntryFile) {
             entry.size = body.vint();
             entry.first_block = body.vint();
@@ -3295,6 +3309,9 @@ ArchiveIndex parse_directory(const ByteVector& directory, std::uint64_t director
                     throw FormatError("alternate data stream name is invalid");
                 }
                 stream.name = payload.str(static_cast<std::size_t>(name_length));
+                if (!core::is_valid_ads_name(stream.name)) {
+                    throw FormatError("alternate data stream name is invalid");
+                }
                 if (payload.remaining() > core::kMaxAdsBytes) {
                     throw FormatError("alternate data stream exceeds its metadata limit");
                 }
@@ -8828,6 +8845,7 @@ void create_chunked_archive_impl(
         operation_checkpoint(operation);
         scan_input(input, items);
     }
+    validate_incoming_items(items, operation);
 
     CompressionOptions chunk_options = options;
     chunk_options.enable_content_dedup = !snapshot_name.has_value();
@@ -8933,6 +8951,7 @@ void create_archive(const std::vector<std::filesystem::path>& inputs,
         operation_checkpoint(operation);
         scan_input(input, items);
     }
+    validate_incoming_items(items, operation);
 
     const auto total_bytes = scanned_file_bytes(items);
     const auto total_items = static_cast<std::uint64_t>(items.size());
@@ -9044,6 +9063,7 @@ void add_archive_snapshot(
         operation_checkpoint(operation);
         scan_input(input, items);
     }
+    validate_incoming_items(items, operation);
 
     std::uint64_t physical_size = 0;
     auto input = open_archive(archive_path, physical_size);
@@ -9438,6 +9458,7 @@ void create_archive_to_stream(
         operation_checkpoint(operation);
         scan_input(input, items);
     }
+    validate_incoming_items(items, operation);
 
     const auto total_bytes = scanned_file_bytes(items);
     const auto total_items = static_cast<std::uint64_t>(items.size());
@@ -9524,6 +9545,7 @@ void add_to_archive(const std::vector<std::filesystem::path>& inputs,
         operation_checkpoint(operation);
         scan_input(input, items);
     }
+    validate_incoming_items(items, operation);
     append_items_to_archive(archive_path, items, options);
 }
 
@@ -9969,6 +9991,7 @@ void update_archive(const std::vector<std::filesystem::path>& inputs,
         operation_checkpoint(operation);
         scan_input(input, items);
     }
+    validate_incoming_items(items, operation);
 
     if (!fs::exists(archive_path)) {
         // Nothing to refresh against. `update` seeds a new archive; `fresh` is a no-op.
@@ -10012,6 +10035,7 @@ void sync_archive(const std::vector<std::filesystem::path>& inputs,
         operation_checkpoint(operation);
         scan_input(input, items);
     }
+    validate_incoming_items(items, operation);
     if (!fs::exists(archive_path)) {
         if (operation) operation->set_progress_phase(0, 0);
         create_archive(inputs, archive_path, options);
@@ -11343,6 +11367,63 @@ std::optional<std::uint64_t> estimate_solid_entry_packed_size(
     return rounded;
 }
 
+namespace {
+
+// What `test` checks about the entry list beyond block and file checksums. A path
+// that extraction would refuse, or a hard link with no file to share bytes with,
+// fails the test: the archive cannot be restored as stored. A path used twice, or
+// an entry beneath one that is not a directory, is still readable (older writers
+// could produce both) but cannot be extracted faithfully, so those are reported as
+// warnings. The order of entries does not matter: an update that replaces a file
+// can leave a hard link ahead of its target, and extraction handles that.
+void check_directory_structure(const std::vector<EntryRec>& entries,
+                               const std::shared_ptr<OperationControl>& operation) {
+    constexpr std::size_t kMaxReported = 20;
+    const auto report = [&](std::size_t& count, const std::string& path,
+                            const std::string& message) {
+        if (++count <= kMaxReported && operation) operation->add_warning({path, message});
+    };
+
+    std::unordered_map<std::string_view, std::uint8_t> types;  // first entry at each path
+    types.reserve(entries.size());
+    std::size_t duplicates = 0;
+    for (const auto& entry : entries) {
+        operation_checkpoint(operation);
+        if (!is_safe_relative(entry.path)) {
+            throw FormatError("archive contains an unsafe path: " + entry.path);
+        }
+        if (!types.emplace(entry.path, entry.type).second) {
+            report(duplicates, entry.path, "this path is used by more than one entry");
+        }
+    }
+    std::size_t orphans = 0;
+    for (const auto& entry : entries) {
+        operation_checkpoint(operation);
+        if (entry.type == kEntryHardlink) {
+            const auto target = types.find(entry.link_target);
+            if (target == types.end() || target->second != kEntryFile) {
+                throw FormatError("archive contains a dangling hard link: " + entry.path);
+            }
+        }
+        if (const auto ancestor = find_non_directory_ancestor(types, entry.path)) {
+            report(orphans, entry.path,
+                   "lies beneath an entry that is not a directory: " + std::string(*ancestor));
+        }
+    }
+    if (operation) {
+        if (duplicates > kMaxReported) {
+            operation->add_warning({{}, std::to_string(duplicates - kMaxReported) +
+                                            " more paths are used by more than one entry"});
+        }
+        if (orphans > kMaxReported) {
+            operation->add_warning({{}, std::to_string(orphans - kMaxReported) +
+                                            " more entries lie beneath a non-directory"});
+        }
+    }
+}
+
+}  // namespace
+
 void test_archive(const std::filesystem::path& archive_path,
                   const DecompressionOptions& options) {
     const auto operation = options.operation;
@@ -11364,6 +11445,7 @@ void test_archive(const std::filesystem::path& archive_path,
     if (index.meta.encryption.enabled && !loaded.key) {
         throw std::runtime_error("archive is encrypted; a password is required");
     }
+    check_directory_structure(index.entries, operation);
     const auto total_bytes = archive_file_bytes(index);
     const auto total_items = static_cast<std::uint64_t>(index.entries.size());
     std::uint64_t completed_bytes = 0;
@@ -11844,7 +11926,12 @@ void extract_entries_impl(const std::filesystem::path& archive_path,
 
         // NTFS named streams are written before timestamps so restoring the write
         // time isn't disturbed by the stream writes that follow it.
-        core::apply_ads(target, file_entry->ads);
+        for (const auto& warning : core::apply_ads(target, file_entry->ads)) {
+            if (operation) operation->add_warning({entry.path, warning});
+            if (options.strict_metadata) {
+                throw std::runtime_error(warning + ": " + entry.path);
+            }
+        }
         // High-precision Windows times (when present) supersede the seconds mtime.
         for (const auto& warning : core::apply_metadata(
                  target, file_entry->meta, options.restore_mtime,

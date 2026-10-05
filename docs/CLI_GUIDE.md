@@ -301,7 +301,10 @@ axiomc x [options] <archive.axar> [destination]
 encryption state, the entry count, and the total uncompressed size.
 
 `test` decompresses everything and verifies every checksum without writing a
-single file. That includes data no current file uses: pieces kept only for
+single file. It also examines the entry list: an archive that holds a path
+extraction would refuse, or a hard link with nothing to share bytes with, fails;
+a path used by more than one entry, or an entry beneath one that is not a
+directory, is printed as a warning on standard error. That includes data no current file uses: pieces kept only for
 older snapshots, and blocks left behind by replaced or deleted files. Blocks in
 the large solid-block LZMA2 profile are streamed in bounded pieces to check
 their whole-block checksum, which roughly doubles the time a test of that
