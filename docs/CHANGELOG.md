@@ -14,6 +14,8 @@ Entries are condensed from the
 
 ## [Unreleased]
 
+## [0.14.0.0] - 2026-10-05
+
 Extraction is stricter about links and privileged metadata, and several
 compression paths are faster. The archive format is unchanged: archives written
 by any earlier build extract with this one, and for the same input and settings
@@ -936,7 +938,8 @@ First published release: the Inno Setup installer and portable zip, carrying
 update/repair/remove maintenance handling, and dynamic light/dark setup
 styling.
 
-[Unreleased]: https://github.com/Wimukthi/AxiomCompress/compare/0.13.1.0...HEAD
+[Unreleased]: https://github.com/Wimukthi/AxiomCompress/compare/0.14.0.0...HEAD
+[0.14.0.0]: https://github.com/Wimukthi/AxiomCompress/releases/tag/0.14.0.0
 [0.13.1.0]: https://github.com/Wimukthi/AxiomCompress/releases/tag/0.13.1.0
 [0.13.0.0]: https://github.com/Wimukthi/AxiomCompress/releases/tag/0.13.0.0
 [0.12.0.0]: https://github.com/Wimukthi/AxiomCompress/releases/tag/0.12.0.0
