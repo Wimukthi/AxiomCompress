@@ -3,6 +3,7 @@
 #include "third_party/monocypher/monocypher.h"
 
 #include <cstring>
+#include <memory>
 #include <stdexcept>
 
 #if defined(_WIN32)
@@ -102,9 +103,16 @@ void random_bytes(std::span<std::uint8_t> out) {
 }
 
 CryptoKey derive_key(const std::string& password, const KdfParams& params) {
+    // The parameters may come from an untrusted archive. Argon2 itself checks
+    // nothing: too few blocks for the lanes would make it index outside its work area.
+    if (!kdf_parameters_valid(params)) {
+        throw std::invalid_argument("key-derivation parameters are outside the supported range");
+    }
     CryptoKey key{};
-    // Argon2 needs a scratch area of nb_blocks * 1 KiB.
-    std::vector<std::uint8_t> work_area(static_cast<std::size_t>(params.mem_blocks) * 1024);
+    // Argon2 needs a scratch area of nb_blocks * 1 KiB. It writes every block before
+    // reading it, so the area is left uninitialized rather than zero-filled first.
+    const std::size_t work_area_size = static_cast<std::size_t>(params.mem_blocks) * 1024;
+    const auto work_area = std::make_unique_for_overwrite<std::uint8_t[]>(work_area_size);
 
     const crypto_argon2_config config{params.algorithm, params.mem_blocks, params.passes,
                                       params.lanes};
@@ -113,9 +121,9 @@ CryptoKey derive_key(const std::string& password, const KdfParams& params) {
                                       static_cast<std::uint32_t>(password.size()),
                                       static_cast<std::uint32_t>(params.salt.size())};
 
-    crypto_argon2(key.data(), static_cast<std::uint32_t>(key.size()), work_area.data(), config,
+    crypto_argon2(key.data(), static_cast<std::uint32_t>(key.size()), work_area.get(), config,
                   inputs, crypto_argon2_no_extras);
-    crypto_wipe(work_area.data(), work_area.size());
+    crypto_wipe(work_area.get(), work_area_size);
     return key;
 }
 

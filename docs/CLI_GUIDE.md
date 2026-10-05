@@ -376,6 +376,31 @@ Interactive progress shows an `archive read` byte count during testing and
 extraction. That number includes reading the directory, and it is the way to
 confirm that a narrow selection really did skip the rest of the archive.
 
+### Archives you don't trust
+
+A compressed block can legitimately expand by factors in the millions: a 4 GiB
+block of zeros is a few kilobytes on disk. Axiom therefore cannot refuse an
+archive for expanding "too much" without refusing valid ones, and the size a
+block declares decides how much memory decoding it commits. When the archive
+comes from someone else, say how much you are willing to commit:
+
+```powershell
+axiomc t --max-output 256M download.axar
+axiomc x --max-output 256M download.axar fresh-empty-folder
+axiomc d --max-output 256M download.axc restored
+```
+
+`--max-output` takes a size such as `64M` or `4G` and refuses, before any
+allocation, a stream or solid block that declares more decoded bytes than that.
+The default is 4 GiB, the largest block a standard archive can hold. A refused
+archive can still be listed and extracted with a larger limit.
+
+Extract into a new, empty folder, run `test` first (it reports repeated paths
+and refuses unsafe ones), and leave `--restore-privileged` off. Key derivation
+for password-protected archives is bounded by the format regardless: a header
+that asks for more than about six seconds of work per derivation is refused
+before any of it is done.
+
 ## Metadata capture and sparse files
 
 A *sparse* file has large runs of zeros that the file system doesn't actually
@@ -708,7 +733,7 @@ implemented. Use repeatable `--include` patterns for selective extraction.
 
 ```text
 axiomc c [options] <input> <output.axc>
-axiomc d [--threads N] [-p <password>] <input.axc> <output>
+axiomc d [--threads N] [--max-output SIZE] [-p <password>] <input.axc> <output>
 ```
 
 ```powershell

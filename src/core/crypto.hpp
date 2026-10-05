@@ -26,11 +26,41 @@ struct KdfParams {
     std::array<std::uint8_t, 16> salt{};
 };
 
+// The cost parameters are read from the archive, so a reader must bound them
+// before it spends the time and memory they ask for. Axiom itself writes 64 MiB,
+// 3 passes, 1 lane (196,608 block passes, about a quarter of a second).
+inline constexpr std::uint32_t kMaxKdfMemBlocks = 1u << 21;  // 2 GiB of 1 KiB blocks
+inline constexpr std::uint32_t kMaxKdfPasses = 64;
+inline constexpr std::uint32_t kMaxKdfLanes = 16;
+// Memory blocks x passes: the work of one derivation, about 3 us per block pass at
+// worst. Together with the memory limit this allows 2 GiB for one pass, 64 MiB for
+// 32, and everything between.
+inline constexpr std::uint64_t kMaxKdfWorkBlocks = std::uint64_t{1} << 21;
+// The same measure summed over all the password slots of one archive, all of which
+// a wrong password has to work through.
+inline constexpr std::uint64_t kMaxKdfArchiveWorkBlocks = std::uint64_t{1} << 22;
+
+constexpr std::uint64_t kdf_work_blocks(const KdfParams& params) noexcept {
+    return std::uint64_t{params.mem_blocks} * params.passes;
+}
+
+// Whether `params` are inside the limits above and satisfy Argon2's own floor of 8
+// blocks per lane. Computed in 64 bits: a 32-bit `8 * lanes` wraps to zero.
+constexpr bool kdf_parameters_valid(const KdfParams& params) noexcept {
+    return params.algorithm <= 2 &&
+           params.lanes >= 1 && params.lanes <= kMaxKdfLanes &&
+           params.passes >= 1 && params.passes <= kMaxKdfPasses &&
+           params.mem_blocks <= kMaxKdfMemBlocks &&
+           std::uint64_t{params.mem_blocks} >= std::uint64_t{8} * params.lanes &&
+           kdf_work_blocks(params) <= kMaxKdfWorkBlocks;
+}
+
 // Fill `out` with cryptographically secure random bytes. Throws on RNG failure.
 void random_bytes(std::span<std::uint8_t> out);
 
 // Derive a 32-byte key from `password` using Argon2id with `params`. Expensive by
-// design (memory-hard); call once per archive, not per block.
+// design (memory-hard); call once per archive, not per block. Throws
+// std::invalid_argument when `params` fail kdf_parameters_valid().
 CryptoKey derive_key(const std::string& password, const KdfParams& params);
 
 // AEAD seal (XChaCha20-Poly1305): returns nonce(24) || mac(16) || ciphertext. `ad`

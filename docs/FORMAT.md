@@ -796,8 +796,22 @@ arbitrary declared size, so the decoder defends itself before allocating:
   are limited to `2^16` warnings, with each path and message limited to `2^20`
   bytes.
 - Encryption-v2 accepts at most `16` password slots. Passwords are limited to
-  `2^20` bytes; each slot's Argon2 memory cost is `8 * lanes` through `2^21`
-  1 KiB blocks, and its pass count is `1..64`.
+  `2^20` bytes. Each slot's Argon2 cost is bounded: `lanes` is `1..16`, the
+  memory cost is `8 * lanes` through `2^21` 1 KiB blocks, the pass count is
+  `1..64`, and memory blocks times passes is at most `2^21` (2 GiB for a single
+  pass, 64 MiB for 32). A wrong password works through every slot, so the slots'
+  products are limited together to `2^22`. Legacy v1 archives are held to the
+  per-derivation limits. Axiom writes 64 MiB, 3 passes, 1 lane, which is
+  `196,608` block passes. All of this is checked before any derivation, and the
+  lane floor is computed in 64 bits.
+- A block's declared uncompressed size decides how much memory decoding it
+  commits. The format allows enormous legitimate expansion (a long run of one
+  byte is a handful of match tokens, and the entropy stage can code a skewed
+  stream below a thousandth of a bit per symbol), so no ratio bound can be
+  applied without rejecting valid archives. Readers take a limit from the
+  caller instead (`ExtractOptions::max_block_size`,
+  `DecompressionOptions::max_output_size`, `--max-output`), applied to the
+  block's declared size and to each subframe before anything is allocated.
 
 ### Size ceilings
 
