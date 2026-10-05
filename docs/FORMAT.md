@@ -716,6 +716,15 @@ Repair validates each shard CRC, treats failures as erasures, reconstructs up to
 `parity_shards` unavailable shards, and atomically rewrites the protected data
 with fresh parity.
 
+The record stores its geometry, so a reader depends on none of the following; it
+is how current writers choose it. Repair survives the loss of any `parity_shards`
+shards wherever they are, so more and smaller shards tolerate more scattered
+damage for the same percentage. A writer takes as many data shards as the 255
+limit leaves after parity (`255 * 100 / (100 + percent)`), but gives no shard
+fewer than 4 KiB, and makes `parity_shards` the percentage of `data_shards`
+rounded up (at least 1). Earlier writers targeted 1 MiB shards, which gave an
+archive under 230 MiB very few of them.
+
 ## Split and recovery volumes
 
 Volume sets wrap the exact bytes of a completed `.axar`. Individual members are

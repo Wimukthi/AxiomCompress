@@ -151,6 +151,12 @@ axiomc s mirror.axar "D:\Current project"
 `sync` deletes things. List and test the result before you delete an older
 backup.
 
+These commands work on `.zip` archives as well: the format follows the archive's
+contents when it exists and its name when it does not, so `axiomc a project.zip
+src` writes a real ZIP, and `axiomc u`, `f`, `s` and `delete` change an existing
+one. Options that only AXAR has (`--recovery`, `--dedup`, `--encrypt-names`) are
+refused for ZIP, and formats Axiom can only read are refused by name.
+
 ### How updates avoid redoing work
 
 Update, freshen, and synchronize run as one planned transaction. Files that
@@ -489,6 +495,15 @@ axiomc recovery backup.axar 0    # remove it
 Valid percentages are `1..100`; `0` removes the record. Ordinary edits keep the
 existing percentage and regenerate the parity afterwards.
 
+The record divides the archive into up to 255 equal shards and stores enough
+parity to rebuild any `N` of them, where `N` is about the requested percentage
+of the shard count. What it survives is therefore counted in *shards*, not
+bytes: ten percent on a small archive is 231 data shards and 24 parity shards
+(`axiomc recovery` shows the split), so 24 isolated bad sectors in different
+parts of the file are repaired, and so is one contiguous 10% hole. Damage that
+touches more shards than there is parity cannot be repaired, however few bytes
+it changes. Shards are never smaller than 4 KiB, so a tiny archive gets fewer.
+
 If `test` reports damage and the recovery data can be found:
 
 ```powershell
@@ -536,7 +551,10 @@ axiomc verify release.axar release-public.key
 ```
 
 The secret key is 64 bytes and must be protected. The public key is 32 bytes
-and is meant to be distributed.
+and is meant to be distributed. `keygen` creates both files new: it refuses to
+overwrite a file that is already there (and never follows a link in its place),
+makes the secret key readable by its owner alone (mode `0600`; on Windows an ACL
+for your account and SYSTEM only), and wipes the key from memory when it is done.
 
 Verifying without naming a key checks that the signature is cryptographically
 valid, using the key embedded in the signature itself. Naming a key

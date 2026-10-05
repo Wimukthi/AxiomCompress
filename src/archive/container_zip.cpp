@@ -1149,8 +1149,7 @@ void rebuild_zip_archive(const fs::path& archive_path,
         staging_guard = std::make_unique<TempDirectoryGuard>(staging);
         temp_path = staging / archive_path.filename();
     } else {
-        temp_path = archive_path;
-        temp_path += ".tmp";
+        temp_path = core::unique_sibling_path(archive_path, L"write");
         temp_guard = std::make_unique<TempFileGuard>(temp_path);
     }
 
@@ -1411,8 +1410,7 @@ void move_zip_entries(const fs::path& archive_path,
     std::uint64_t total_bytes = 0;
     std::uint64_t total_items = 0;
 
-    fs::path temp_path = archive_path;
-    temp_path += ".tmp";
+    fs::path temp_path = core::unique_sibling_path(archive_path, L"write");
     TempFileGuard temp_guard(temp_path);
     {
         ZipReader reader(archive_path, options.operation);

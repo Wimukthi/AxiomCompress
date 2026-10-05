@@ -1,8 +1,17 @@
 #include "core/reed_solomon.hpp"
 
+#include "core/cpu.hpp"
+
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <cstring>
 #include <stdexcept>
+
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
+#include <immintrin.h>
+#define AXIOM_RS_X86 1
+#endif
 
 namespace axiom::core {
 namespace {
@@ -56,6 +65,129 @@ std::uint8_t gf_pow(std::uint8_t base, int exponent) {
         result = gf_mul(result, base);
     }
     return result;
+}
+
+// ---- multiply-accumulate over whole buffers --------------------------------------
+//
+// Encoding and reconstruction are sums of (coefficient x shard) terms, so nearly
+// all the time goes into dst[i] ^= c * src[i]. Multiplication distributes over XOR,
+// so c * b == c * (b & 15) ^ c * (b & 0xF0): two 16-entry tables per coefficient,
+// which a byte shuffle (PSHUFB) indexes 16 or 32 bytes at a time. Every path
+// computes exactly the same bytes as gf_mul() above, so the recovery data on disk
+// is unchanged.
+struct MulTables {
+    alignas(32) std::array<std::array<std::uint8_t, 16>, 256> low{};
+    alignas(32) std::array<std::array<std::uint8_t, 16>, 256> high{};
+    std::array<std::array<std::uint8_t, 256>, 256> full{};  // portable path
+
+    MulTables() {
+        for (int c = 0; c < 256; ++c) {
+            for (int x = 0; x < 256; ++x) {
+                full[static_cast<std::size_t>(c)][static_cast<std::size_t>(x)] =
+                    gf_mul(static_cast<std::uint8_t>(c), static_cast<std::uint8_t>(x));
+            }
+            for (int x = 0; x < 16; ++x) {
+                low[static_cast<std::size_t>(c)][static_cast<std::size_t>(x)] =
+                    full[static_cast<std::size_t>(c)][static_cast<std::size_t>(x)];
+                high[static_cast<std::size_t>(c)][static_cast<std::size_t>(x)] =
+                    full[static_cast<std::size_t>(c)][static_cast<std::size_t>(x) << 4];
+            }
+        }
+    }
+};
+
+const MulTables& mul_tables() {
+    static const MulTables tables;
+    return tables;
+}
+
+void mul_add_scalar(std::uint8_t* dst, const std::uint8_t* src, std::size_t count,
+                    std::uint8_t coefficient) {
+    const auto& row = mul_tables().full[coefficient];
+    for (std::size_t i = 0; i < count; ++i) {
+        dst[i] ^= row[src[i]];
+    }
+}
+
+#if defined(AXIOM_RS_X86)
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((target("ssse3")))
+#endif
+void mul_add_ssse3(std::uint8_t* dst, const std::uint8_t* src, std::size_t count,
+                   std::uint8_t coefficient) {
+    const auto& tables = mul_tables();
+    const __m128i low = _mm_load_si128(
+        reinterpret_cast<const __m128i*>(tables.low[coefficient].data()));
+    const __m128i high = _mm_load_si128(
+        reinterpret_cast<const __m128i*>(tables.high[coefficient].data()));
+    const __m128i mask = _mm_set1_epi8(0x0F);
+    std::size_t i = 0;
+    for (; i + 16 <= count; i += 16) {
+        const __m128i value = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src + i));
+        const __m128i product = _mm_xor_si128(
+            _mm_shuffle_epi8(low, _mm_and_si128(value, mask)),
+            _mm_shuffle_epi8(high, _mm_and_si128(_mm_srli_epi16(value, 4), mask)));
+        const __m128i sum = _mm_xor_si128(
+            _mm_loadu_si128(reinterpret_cast<const __m128i*>(dst + i)), product);
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + i), sum);
+    }
+    mul_add_scalar(dst + i, src + i, count - i, coefficient);
+}
+
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((target("avx2")))
+#endif
+void mul_add_avx2(std::uint8_t* dst, const std::uint8_t* src, std::size_t count,
+                  std::uint8_t coefficient) {
+    const auto& tables = mul_tables();
+    // _mm256_shuffle_epi8 shuffles within each 128-bit half, so both halves get the table.
+    const __m256i low = _mm256_broadcastsi128_si256(_mm_load_si128(
+        reinterpret_cast<const __m128i*>(tables.low[coefficient].data())));
+    const __m256i high = _mm256_broadcastsi128_si256(_mm_load_si128(
+        reinterpret_cast<const __m128i*>(tables.high[coefficient].data())));
+    const __m256i mask = _mm256_set1_epi8(0x0F);
+    std::size_t i = 0;
+    for (; i + 32 <= count; i += 32) {
+        const __m256i value = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + i));
+        const __m256i product = _mm256_xor_si256(
+            _mm256_shuffle_epi8(low, _mm256_and_si256(value, mask)),
+            _mm256_shuffle_epi8(high,
+                                _mm256_and_si256(_mm256_srli_epi16(value, 4), mask)));
+        const __m256i sum = _mm256_xor_si256(
+            _mm256_loadu_si256(reinterpret_cast<const __m256i*>(dst + i)), product);
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst + i), sum);
+    }
+    mul_add_scalar(dst + i, src + i, count - i, coefficient);
+}
+#endif
+
+using MulAddFunction = void (*)(std::uint8_t*, const std::uint8_t*, std::size_t, std::uint8_t);
+
+MulAddFunction select_mul_add() {
+#if defined(AXIOM_RS_X86)
+    const auto& cpu = cpu_features();
+    if (cpu.avx2) return mul_add_avx2;
+    if (cpu.sse41) return mul_add_ssse3;  // SSE4.1 hardware always has SSSE3
+#endif
+    return mul_add_scalar;
+}
+
+std::atomic<MulAddFunction> g_mul_add{nullptr};
+
+// dst[i] ^= coefficient * src[i]
+void mul_add(std::uint8_t* dst, const std::uint8_t* src, std::size_t count,
+             std::uint8_t coefficient) {
+    if (coefficient == 0 || count == 0) return;
+    if (coefficient == 1) {
+        for (std::size_t i = 0; i < count; ++i) dst[i] ^= src[i];  // vectorizes
+        return;
+    }
+    auto implementation = g_mul_add.load(std::memory_order_relaxed);
+    if (implementation == nullptr) {
+        implementation = select_mul_add();
+        g_mul_add.store(implementation, std::memory_order_relaxed);
+    }
+    implementation(dst, src, count, coefficient);
 }
 
 // A dense matrix over GF(2^8), row-major.
@@ -154,6 +286,28 @@ Matrix build_encoding_matrix(int data, int parity) {
 
 }  // namespace
 
+bool reed_solomon_select_kernel(std::string_view name) {
+    if (name == "auto") {
+        g_mul_add.store(select_mul_add(), std::memory_order_relaxed);
+        return true;
+    }
+    if (name == "scalar") {
+        g_mul_add.store(mul_add_scalar, std::memory_order_relaxed);
+        return true;
+    }
+#if defined(AXIOM_RS_X86)
+    if (name == "ssse3" && cpu_features().sse41) {
+        g_mul_add.store(mul_add_ssse3, std::memory_order_relaxed);
+        return true;
+    }
+    if (name == "avx2" && cpu_features().avx2) {
+        g_mul_add.store(mul_add_avx2, std::memory_order_relaxed);
+        return true;
+    }
+#endif
+    return false;
+}
+
 ReedSolomon::ReedSolomon(int data_shards, int parity_shards)
     : data_shards_(data_shards), parity_shards_(parity_shards) {
     if (data_shards < 1 || parity_shards < 1 || data_shards + parity_shards > 255) {
@@ -193,19 +347,22 @@ void ReedSolomon::encode_parity_shard(
     }
     const int row = data_shards_ + parity_index;
     constexpr std::size_t progress_interval = 1u << 20;
+    // Work in blocks that stay in cache while every data shard is folded in, then
+    // report progress at the same granularity as before.
+    constexpr std::size_t block_size = 32u << 10;
     std::size_t next_progress = progress_interval;
-    for (std::size_t byte = 0; byte < len; ++byte) {
-        std::uint8_t acc = 0;
+    for (std::size_t offset = 0; offset < len; offset += block_size) {
+        const std::size_t count = std::min(block_size, len - offset);
+        std::uint8_t* const out = parity.data() + offset;
+        std::memset(out, 0, count);
         for (int data_index = 0; data_index < data_shards_; ++data_index) {
             const std::uint8_t coefficient =
                 matrix_[static_cast<std::size_t>(row) * data_shards_ +
                         static_cast<std::size_t>(data_index)];
-            acc ^= gf_mul(
-                coefficient,
-                data[static_cast<std::size_t>(data_index)][byte]);
+            mul_add(out, data[static_cast<std::size_t>(data_index)].data() + offset, count,
+                    coefficient);
         }
-        parity[byte] = acc;
-        const std::size_t completed = byte + 1;
+        const std::size_t completed = offset + count;
         if (progress && (completed >= next_progress || completed == len)) {
             progress(parity_index, completed, len);
             next_progress = completed + progress_interval;
@@ -267,9 +424,7 @@ bool ReedSolomon::reconstruct(std::vector<std::vector<std::uint8_t>>& shards,
                 continue;
             }
             const auto& src = shards[static_cast<std::size_t>(source_rows[static_cast<std::size_t>(j)])];
-            for (std::size_t byte = 0; byte < len; ++byte) {
-                recovered[byte] ^= gf_mul(coeff, src[byte]);
-            }
+            mul_add(recovered.data(), src.data(), len, coeff);
         }
         shards[static_cast<std::size_t>(d)] = std::move(recovered);
     }
@@ -288,9 +443,7 @@ bool ReedSolomon::reconstruct(std::vector<std::vector<std::uint8_t>>& shards,
                 continue;
             }
             const auto& src = shards[static_cast<std::size_t>(dpos)];
-            for (std::size_t byte = 0; byte < len; ++byte) {
-                recovered[byte] ^= gf_mul(coeff, src[byte]);
-            }
+            mul_add(recovered.data(), src.data(), len, coeff);
         }
         shards[static_cast<std::size_t>(idx)] = std::move(recovered);
     }

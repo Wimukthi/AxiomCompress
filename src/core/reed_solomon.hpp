@@ -3,16 +3,24 @@
 #include <cstdint>
 #include <functional>
 #include <span>
+#include <string_view>
 #include <vector>
 
 namespace axiom::core {
+
+// Chooses the multiply-accumulate kernel: "auto" (the default, by CPU features),
+// "scalar", "ssse3" or "avx2". Returns false, and changes nothing, when this CPU or
+// build cannot run the one asked for. Every kernel produces identical bytes; this
+// exists so tests can check that on one machine.
+bool reed_solomon_select_kernel(std::string_view name);
 
 // Systematic Reed-Solomon erasure coding over GF(2^8). `data_shards` original shards
 // are protected by `parity_shards` computed shards; any up to `parity_shards` lost or
 // corrupted shards can be reconstructed, provided the caller knows which are missing.
 //
-// This is a portable scalar implementation (correctness first); a SIMD backend can be
-// slotted in later without changing the on-disk recovery format.
+// The multiply-accumulate that dominates the cost runs on AVX2 or SSSE3 byte shuffles
+// when the CPU has them and on 256-entry product tables otherwise; every path produces
+// the same bytes, so the on-disk recovery format does not depend on the CPU.
 class ReedSolomon {
 public:
     using EncodeProgressCallback =

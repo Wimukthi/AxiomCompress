@@ -82,6 +82,7 @@
 #include <source_location>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -5709,7 +5710,11 @@ void test_archive_operation_control() {
     options.operation = cancelled;
     expect_throws([&] { axiom::create_archive({src}, cancelled_archive, options); });
     AXIOM_CHECK(!fs::exists(cancelled_archive));
-    AXIOM_CHECK(!fs::exists(fs::path(cancelled_archive).concat(".tmp")));
+    // Temporaries have unpredictable names now: none may be left beside the archive.
+    for (const auto& item : fs::directory_iterator(root)) {
+        AXIOM_CHECK(item.path().filename().string().find("cancelled.axar.") != 0 ||
+                    item.path().extension() != ".tmp");
+    }
 
     std::error_code ec;
     fs::remove_all(root, ec);
@@ -7381,6 +7386,241 @@ void test_extract_block_size_limit() {
     fs::remove_all(root, ec);
 }
 
+#if !defined(_WIN32)
+// The archive writers build the new archive in a temporary beside the destination
+// and rename it into place. A link planted at the name an earlier version used
+// (the destination plus ".tmp") must not capture the archive's bytes.
+void test_archive_writers_ignore_planted_temporary() {
+    const auto root = make_temp_dir();
+    const auto src = root / "src";
+    fs::create_directories(src);
+    write_all(src / "data.txt", bytes_from_string(kHostilePayload));
+    const auto outside = root / "outside";
+    fs::create_directories(outside);
+    const std::string original = "content that must survive";
+    write_all(outside / "victim", bytes_from_string(original));
+
+    const auto archive = root / "work" / "planted.axar";
+    fs::create_directories(archive.parent_path());
+    const auto planted = fs::path(archive).concat(".tmp");
+    fs::create_symlink("../outside/victim", planted);
+
+    axiom::create_archive({src}, archive, {});
+    axiom::test_archive(archive);
+    AXIOM_CHECK(read_all(outside / "victim") == bytes_from_string(original));
+
+    write_all(src / "more.txt", bytes_from_string("added later"));
+    axiom::add_to_archive({src / "more.txt"}, archive, {});
+    axiom::set_archive_comment(archive, "rewritten");
+    axiom::test_archive(archive);
+    AXIOM_CHECK(read_all(outside / "victim") == bytes_from_string(original));
+    AXIOM_CHECK(fs::is_symlink(planted));  // left exactly as it was
+
+    // Nothing but the archive and the planted link remains beside it.
+    std::size_t entries = 0;
+    for (const auto& item : fs::directory_iterator(archive.parent_path())) {
+        (void)item;
+        ++entries;
+    }
+    AXIOM_CHECK(entries == 2);
+
+    std::error_code ec;
+    fs::remove_all(root, ec);
+}
+#endif
+
+// Sibling temporaries carry random names, and replacing an existing file, which
+// forces the new contents to disk first, works as before.
+void test_replace_file_and_temp_names() {
+    const auto root = make_temp_dir();
+    std::set<std::string> names;
+    for (int i = 0; i < 64; ++i) {
+        const auto name = axiom::core::unique_sibling_path(root / "target.bin", L"write")
+                              .filename().string();
+        AXIOM_CHECK(name.starts_with("target.bin.write."));
+        AXIOM_CHECK(name.ends_with(".tmp"));
+        AXIOM_CHECK(name.size() == std::string("target.bin.write.").size() + 16 + 4);
+        AXIOM_CHECK(names.insert(name).second);
+    }
+
+    const auto destination = root / "destination.bin";
+    const auto first = axiom::core::unique_sibling_path(destination, L"write");
+    write_all(first, bytes_from_string("new file"));
+    axiom::core::replace_file(first, destination, "test file");  // nothing to replace
+    AXIOM_CHECK(read_all(destination) == bytes_from_string("new file"));
+    AXIOM_CHECK(!fs::exists(first));
+
+    const auto second = axiom::core::unique_sibling_path(destination, L"write");
+    write_all(second, bytes_from_string("replacement contents"));
+    AXIOM_CHECK(!axiom::core::sync_file(second));
+    axiom::core::replace_file(second, destination, "test file");  // flushed, then installed
+    AXIOM_CHECK(read_all(destination) == bytes_from_string("replacement contents"));
+    AXIOM_CHECK(!fs::exists(second));
+
+    AXIOM_CHECK(axiom::core::sync_file(root / "does-not-exist"));  // a real error is reported
+
+    std::error_code ec;
+    fs::remove_all(root, ec);
+}
+
+// Repair survives the loss of any `parity_shards` shards, so smaller shards mean
+// more scattered damage survives: a 10% record on a small archive must not be
+// defeated by a handful of single-byte errors.
+void test_recovery_survives_scattered_damage() {
+    const auto root = make_temp_dir();
+    const auto source = root / "payload.bin";
+    std::vector<std::uint8_t> payload(3u << 20);
+    std::mt19937 random(0x5CA77E4u);
+    std::generate(payload.begin(), payload.end(), [&] {
+        return static_cast<std::uint8_t>(random() & 0xFFu);
+    });
+    write_all(source, payload);
+
+    axiom::CompressionOptions options;
+    options.recovery_percent = 10;
+    options.method = axiom::CompressionMethod::store;  // keep the size predictable
+    const auto archive = root / "scattered.axar";
+    axiom::create_archive({source}, archive, options);
+    const auto info = axiom::archive_recovery_info(archive);
+    AXIOM_CHECK(info.present);
+    AXIOM_CHECK(info.data_shards + info.parity_shards <= 255);
+    AXIOM_CHECK(info.data_shards >= 100);     // many small shards, not three big ones
+    AXIOM_CHECK(info.parity_shards >= 10);
+    const std::uint64_t shard_size =
+        (info.protected_size + info.data_shards - 1) / info.data_shards;
+    AXIOM_CHECK(shard_size >= 4096);
+
+    const auto good = read_all(archive);
+    const auto damage = [&](std::size_t count) {
+        auto bytes = good;
+        // One flipped byte in each of `count` different data shards, past the header.
+        for (std::size_t i = 0; i < count; ++i) {
+            const std::uint64_t shard = 8 + i * 3;
+            const std::uint64_t at = shard * shard_size + 17;
+            AXIOM_CHECK(at < info.protected_size);
+            bytes[static_cast<std::size_t>(at)] ^= 0x5Au;
+        }
+        write_all(archive, bytes);
+    };
+
+    damage(info.parity_shards);  // as many bad shards as there is parity: repairable
+    expect_throws([&] { axiom::test_archive(archive); });
+    AXIOM_CHECK(axiom::repair_archive(archive));
+    axiom::test_archive(archive);
+    axiom::extract_archive(archive, root / "repaired");
+    AXIOM_CHECK(read_all(root / "repaired" / "payload.bin") == payload);
+
+    write_all(archive, good);
+    damage(info.parity_shards + 1);  // one more than the parity covers
+    bool repaired = true;
+    try {
+        repaired = axiom::repair_archive(archive);
+    } catch (const std::exception&) {
+        repaired = false;
+    }
+    AXIOM_CHECK(!repaired);
+
+    std::error_code ec;
+    fs::remove_all(root, ec);
+}
+
+// Every Reed-Solomon multiply kernel (scalar tables, SSSE3, AVX2) must produce the
+// parity the first implementation did, byte for byte: the recovery data on disk
+// depends on it. The expected checksums were computed with that implementation.
+void test_reed_solomon_kernels_match_golden() {
+    struct Config {
+        int data;
+        int parity;
+        std::size_t length;
+        std::uint32_t seed;
+        std::uint32_t parity_crc;
+    };
+    const std::vector<Config> configs = {
+        {3, 2, 1000, 1u, 0x32830e1e},   {17, 5, 4097, 2u, 0x89ddaf21},
+        {1, 1, 33, 3u, 0xf0fbbf27},     {64, 8, 70001, 4u, 0x5e5b8f9d},
+        {231, 24, 6000, 5u, 0xdb50c42b},
+    };
+    std::size_t kernels_run = 0;
+    for (const char* kernel : {"scalar", "ssse3", "avx2", "auto"}) {
+        if (!axiom::core::reed_solomon_select_kernel(kernel)) continue;  // not on this CPU
+        ++kernels_run;
+        for (const auto& config : configs) {
+            std::mt19937 random(config.seed);
+            std::vector<std::vector<std::uint8_t>> data(
+                static_cast<std::size_t>(config.data), std::vector<std::uint8_t>(config.length));
+            for (auto& shard : data) {
+                for (auto& byte : shard) byte = static_cast<std::uint8_t>(random());
+            }
+            std::vector<std::vector<std::uint8_t>> parity(
+                static_cast<std::size_t>(config.parity), std::vector<std::uint8_t>(config.length));
+            std::vector<std::span<const std::uint8_t>> data_spans(data.begin(), data.end());
+            std::vector<std::span<std::uint8_t>> parity_spans(parity.begin(), parity.end());
+            const axiom::core::ReedSolomon codec(config.data, config.parity);
+            std::size_t last_progress = 0;
+            codec.encode(data_spans, parity_spans,
+                         [&](int, std::size_t done, std::size_t total) {
+                             AXIOM_CHECK(done <= total && done >= last_progress);
+                             last_progress = done;
+                         });
+            AXIOM_CHECK(last_progress == config.length);
+            auto crc = axiom::core::crc32_init();
+            for (const auto& shard : parity) crc = axiom::core::crc32_update(crc, shard);
+            AXIOM_CHECK(axiom::core::crc32_final(crc) == config.parity_crc);
+
+            // Lose as many shards as there is parity (spread across data and parity)
+            // and rebuild them.
+            std::vector<std::vector<std::uint8_t>> shards = data;
+            shards.insert(shards.end(), parity.begin(), parity.end());
+            const auto original = shards;
+            std::vector<bool> present(shards.size(), true);
+            for (int lost = 0; lost < config.parity; ++lost) {
+                const auto index = static_cast<std::size_t>(
+                    (static_cast<std::size_t>(lost) * 7 + 1) % shards.size());
+                present[index] = false;
+                std::fill(shards[index].begin(), shards[index].end(), std::uint8_t{0xEE});
+            }
+            AXIOM_CHECK(codec.reconstruct(shards, present));
+            AXIOM_CHECK(shards == original);
+        }
+    }
+    AXIOM_CHECK(kernels_run >= 2);  // at least "scalar" and "auto"
+    AXIOM_CHECK(axiom::core::reed_solomon_select_kernel("auto"));
+    AXIOM_CHECK(!axiom::core::reed_solomon_select_kernel("no-such-kernel"));
+}
+
+#if !defined(_WIN32)
+// Secrets are created readable by their owner alone, with no moment at which the
+// file exists with wider access; whatever the process umask.
+void test_exclusive_file_owner_only() {
+    const auto root = make_temp_dir();
+    const auto previous_umask = ::umask(0);  // let only the requested mode show
+    using Create = axiom::core::ExclusiveFile::Create;
+    std::error_code error;
+    {
+        axiom::core::ExclusiveFile secret;
+        AXIOM_CHECK(secret.create_new(root / "secret", error, true) == Create::created);
+        AXIOM_CHECK(secret.write(bytes_from_string("key bytes")));
+        AXIOM_CHECK(secret.sync());
+        AXIOM_CHECK(secret.close());
+        axiom::core::ExclusiveFile ordinary;
+        AXIOM_CHECK(ordinary.create_new(root / "ordinary", error) == Create::created);
+        AXIOM_CHECK(ordinary.close());
+        axiom::core::ExclusiveFile again;
+        AXIOM_CHECK(again.create_new(root / "secret", error, true) == Create::exists);
+    }
+    ::umask(previous_umask);
+    struct ::stat status {};
+    AXIOM_CHECK(::stat((root / "secret").c_str(), &status) == 0);
+    AXIOM_CHECK((status.st_mode & 0777) == 0600);
+    AXIOM_CHECK(::stat((root / "ordinary").c_str(), &status) == 0);
+    AXIOM_CHECK((status.st_mode & 0777) == 0666);
+    AXIOM_CHECK(read_all(root / "secret") == bytes_from_string("key bytes"));
+
+    std::error_code ec;
+    fs::remove_all(root, ec);
+}
+#endif
+
 // ExclusiveFile creates a file only where nothing exists and never through a link.
 void test_exclusive_file_refuses_existing_names() {
     const auto root = make_temp_dir();
@@ -7998,6 +8238,13 @@ constexpr RegisteredTest kTests[] = {
     {"staging_names", test_staging_names},
     {"encryption_kdf_limits", test_encryption_kdf_limits},
     {"extract_block_size_limit", test_extract_block_size_limit},
+    {"replace_file_and_temp_names", test_replace_file_and_temp_names},
+    {"reed_solomon_kernels_match_golden", test_reed_solomon_kernels_match_golden},
+    {"recovery_survives_scattered_damage", test_recovery_survives_scattered_damage},
+#if !defined(_WIN32)
+    {"archive_writers_ignore_planted_temporary", test_archive_writers_ignore_planted_temporary},
+    {"exclusive_file_owner_only", test_exclusive_file_owner_only},
+#endif
     {"archive_directory_findings", test_archive_directory_findings},
     {"archive_rejects_unsafe_ads_names", test_archive_rejects_unsafe_ads_names},
     {"dedup_directory_rejects_non_directory_parent", test_dedup_directory_rejects_non_directory_parent},
