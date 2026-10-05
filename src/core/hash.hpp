@@ -12,8 +12,10 @@ namespace axiom::core {
 // the cheap per-block check). BLAKE3 is collision-resistant, unlike CRC.
 using Blake3Digest = std::array<std::uint8_t, BLAKE3_OUT_LEN>;
 
-// Thin incremental wrapper over the vendored BLAKE3 (portable build). Feed file
-// chunks through update(); finalize() yields the digest. Cheap to construct.
+// Thin incremental wrapper over the vendored BLAKE3, which picks the fastest x86
+// backend (SSE2, SSE4.1, AVX2 or AVX-512) at run time and falls back to the
+// portable code elsewhere. Feed file chunks through update(); finalize() yields
+// the digest. Cheap to construct.
 class Blake3 {
 public:
     Blake3() { blake3_hasher_init(&hasher_); }

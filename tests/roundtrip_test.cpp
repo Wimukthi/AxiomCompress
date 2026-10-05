@@ -54,6 +54,7 @@
 #endif
 
 #if !defined(_WIN32)
+#include <fcntl.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -2123,11 +2124,14 @@ void test_zip_direct_split_creation() {
     const auto before_cancel = snapshot_set(archive);
     write_all(source, std::vector<std::uint8_t>(payload.size(), 0x5a));
     request.options.operation = std::make_shared<axiom::OperationControl>();
+    // The control owns this callback, so the callback may not own the control: a
+    // shared_ptr here is a cycle that nothing ever frees (LeakSanitizer reports it).
     request.options.operation->set_progress_callback(
-        [operation = request.options.operation](const axiom::OperationProgress& progress) {
+        [weak = std::weak_ptr<axiom::OperationControl>(request.options.operation)](
+            const axiom::OperationProgress& progress) {
             if (progress.stage == axiom::OperationStage::compressing &&
                 progress.completed_bytes != 0) {
-                operation->request_cancel();
+                if (const auto operation = weak.lock()) operation->request_cancel();
             }
         });
     expect_throws([&] { provider->create(request); });
@@ -3813,17 +3817,17 @@ void test_archive_snapshot_shared_executor() {
     // tiny token streams do not otherwise pump the shared executor queue.
     const auto expected = axiom::compress(data, options);
     const auto archive = root / "snapshot.axar";
-    auto create = std::async(std::launch::async, [&] {
-        axiom::create_snapshot_archive({input}, archive, "base", options);
-    });
-    AXIOM_CHECK(create.wait_for(std::chrono::seconds(60)) == std::future_status::ready);
-    create.get();
+    // No wall-clock limit here: how long this takes depends on the build (a
+    // sanitizer multiplies it by tens), and a deadlock is caught by the test
+    // runner's own timeout, which is what a time bound in the test would only
+    // imitate.
+    axiom::create_snapshot_archive({input}, archive, "base", options);
     AXIOM_CHECK(axar_block_region(archive) == expected);
     axiom::test_archive(archive);
 
     // Cancellation after the serial parse must drain the queued parallel
     // candidate before its borrowed input goes out of scope.
-    auto cancelled = std::async(std::launch::async, [&] {
+    {
         auto cancel_options = options;
         auto operation = std::make_shared<axiom::OperationControl>();
         cancel_options.operation = operation;
@@ -3834,9 +3838,7 @@ void test_archive_snapshot_shared_executor() {
             }
         };
         expect_throws([&] { (void)axiom::compress(data, cancel_options); });
-    });
-    AXIOM_CHECK(cancelled.wait_for(std::chrono::seconds(60)) == std::future_status::ready);
-    cancelled.get();
+    }
     std::error_code ec;
     fs::remove_all(root, ec);
 }
@@ -6873,6 +6875,47 @@ void test_extract_hardlink_to_skipped_canonical() {
     fs::remove_all(root, ec);
 }
 
+// A directory entry's recorded time is applied once everything inside it has
+// been written. If a link entry for the same path has replaced the directory by
+// then, the time must not follow the link to whatever it points at.
+void test_extract_directory_replaced_by_link_keeps_target_times() {
+    const auto root = make_temp_dir();
+    const auto base = make_hostile_base(root);
+    constexpr std::time_t kRecorded = 1000000000;  // what the archive says
+    constexpr std::time_t kOriginal = 1500000000;  // what the victim has
+
+    auto directory = hostile_directory_entry("d");
+    std::vector<std::uint8_t> recorded_mtime;
+    for (unsigned index = 0; index < 8; ++index) {
+        recorded_mtime.push_back(
+            static_cast<std::uint8_t>(static_cast<std::uint64_t>(kRecorded) >> (index * 8)));
+    }
+    directory.extras.emplace_back(1, std::move(recorded_mtime));
+    HostileDirectory hostile(base);
+    hostile.entries() = {directory, hostile_symlink("d", "../victim")};
+    const auto evil = root / "evil.axar";
+    hostile.write(evil);
+
+    const auto victim = root / "victim";
+    fs::create_directories(victim);
+    const struct timespec original[2] = {{kOriginal, 0}, {kOriginal, 0}};
+    AXIOM_CHECK(::utimensat(AT_FDCWD, victim.c_str(), original, 0) == 0);
+
+    const auto dest = root / "dest";
+    fs::create_directories(dest);
+    axiom::ExtractOptions options;
+    options.overwrite = axiom::ExtractOptions::Overwrite::overwrite;
+    axiom::extract_archive(evil, dest, options);
+
+    AXIOM_CHECK(fs::is_symlink(dest / "d"));
+    struct ::stat after {};
+    AXIOM_CHECK(::stat(victim.c_str(), &after) == 0);
+    AXIOM_CHECK(after.st_mtime == kOriginal);
+
+    std::error_code ec;
+    fs::remove_all(root, ec);
+}
+
 // Set-user-ID / set-group-ID bits are not restored unless asked for, whoever
 // extracts. Directories keep set-group-ID.
 void test_extract_withholds_set_id_bits() {
@@ -8465,6 +8508,8 @@ constexpr RegisteredTest kTests[] = {
     {"zip_extract_ignores_planted_link", test_zip_extract_ignores_planted_link},
     {"extract_hardlink_to_skipped_canonical", test_extract_hardlink_to_skipped_canonical},
     {"extract_withholds_set_id_bits", test_extract_withholds_set_id_bits},
+    {"extract_directory_replaced_by_link_keeps_target_times",
+     test_extract_directory_replaced_by_link_keeps_target_times},
 #if defined(__linux__)
     {"extract_withholds_privileged_xattrs", test_extract_withholds_privileged_xattrs},
 #endif

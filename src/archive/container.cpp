@@ -12052,6 +12052,9 @@ void extract_entries_impl(const std::filesystem::path& archive_path,
     // Restore directory timestamps last (deepest-first) so nothing written into a
     // directory afterward disturbs its restored time.
     for (auto it = deferred_dirs.rbegin(); it != deferred_dirs.rend(); ++it) {
+        // A link entry for the same path may have replaced the directory above;
+        // its recorded times and permissions must not reach what the link points at.
+        if (!fs::is_directory(fs::symlink_status(it->target, ec))) continue;
         for (const auto& warning : core::apply_metadata(
                  it->target, it->meta, options.restore_mtime,
                  options.restore_privileged_metadata)) {

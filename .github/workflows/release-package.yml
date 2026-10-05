@@ -7,6 +7,10 @@ on:
         description: Committed four-part app version from src/gui/axiom_gui.rc
         required: true
 
+# The package job only reads the repository and uploads artifacts.
+permissions:
+  contents: read
+
 jobs:
   package:
     name: Package win-x64

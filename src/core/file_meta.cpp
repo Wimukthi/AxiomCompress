@@ -161,10 +161,14 @@ std::vector<std::string> apply_metadata(const std::filesystem::path& path,
     if (restore_times && meta.has_windows_times) {
         // FILE_FLAG_BACKUP_SEMANTICS lets us open a directory handle; the write
         // happens before attributes so a restored read-only flag cannot block it.
+        // FILE_FLAG_OPEN_REPARSE_POINT opens a symbolic link or junction itself
+        // instead of whatever it points to, so the times of a link entry land on
+        // the link and never on a file outside the extraction folder.
         const HANDLE handle = CreateFileW(
             path.c_str(), FILE_WRITE_ATTRIBUTES,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
-            OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+            OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            nullptr);
         if (handle != INVALID_HANDLE_VALUE) {
             const FILETIME creation = u64_to_filetime(meta.windows_creation_time);
             const FILETIME access = u64_to_filetime(meta.windows_access_time);
@@ -193,7 +197,11 @@ std::vector<std::string> apply_metadata(const std::filesystem::path& path,
         }
     }
 
-    if (meta.has_windows_security_descriptor) {
+    // SetFileSecurityW opens `path` following links, so on a link it would change
+    // the owner and access list of the link's target. What an archive stores for a
+    // link is the target's descriptor anyway (capture follows the link), so a link
+    // is left with the default security of the folder it was created in.
+    if (meta.has_windows_security_descriptor && !is_reparse_point(path)) {
         auto* descriptor = reinterpret_cast<PSECURITY_DESCRIPTOR>(
             const_cast<std::uint8_t*>(meta.windows_security_descriptor.data()));
         if (!SetFileSecurityW(path.c_str(),
