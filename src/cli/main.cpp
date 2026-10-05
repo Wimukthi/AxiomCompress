@@ -135,7 +135,9 @@ void print_usage() {
         "  --include PATH     extract only: select an archive path (repeatable)\n"
         "  --strict-metadata  extract only: fail if sparse fidelity or capture report is incomplete\n"
         "  --restore-privileged  extract/restore only: also restore set-user-ID/set-group-ID bits\n"
-        "                     and security.*/trusted.*/system.* xattrs (trusted archives only)\n";
+        "                     and security.*/trusted.*/system.* xattrs (trusted archives only)\n"
+        "  --max-output SIZE  refuse a stream or solid block that declares more decoded bytes\n"
+        "                     (default 4G); lower it for archives you do not trust\n";
 }
 
 bool stream_is_terminal(FILE* stream) {
@@ -889,6 +891,8 @@ bool take_decompression_flags(std::vector<std::string>& args,
 
         if (arg == "--threads") {
             options.thread_count = parse_size(next("--threads"));
+        } else if (arg == "--max-output") {
+            options.max_output_size = parse_size(next("--max-output"));
         } else if (arg == "-p" || arg == "--password") {
             options.password = next(arg.c_str());
         } else if (arg.rfind("--", 0) == 0) {
@@ -1204,6 +1208,12 @@ int run_extract(std::vector<std::string> args) {
                 return 2;
             }
             decompression.thread_count = parse_size(args[++i]);
+        } else if (args[i] == "--max-output") {
+            if (i + 1 >= args.size()) {
+                print_usage();
+                return 2;
+            }
+            extract.max_block_size = parse_size(args[++i]);
         } else if (args[i] == "-p" || args[i] == "--password") {
             if (i + 1 >= args.size()) {
                 print_usage();
@@ -1407,6 +1417,12 @@ int run_snapshot(std::vector<std::string> args) {
                     return 2;
                 }
                 extract.thread_count = parse_size(args[++i]);
+            } else if (args[i] == "--max-output") {
+                if (i + 1 >= args.size()) {
+                    print_usage();
+                    return 2;
+                }
+                extract.max_block_size = parse_size(args[++i]);
             } else if (args[i] == "-p" || args[i] == "--password") {
                 if (i + 1 >= args.size()) {
                     print_usage();

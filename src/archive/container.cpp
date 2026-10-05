@@ -2983,6 +2983,17 @@ EncryptionInfo parse_encryption_v2_payload(std::span<const std::uint8_t> bytes,
     if (reader.has_more()) {
         throw FormatError("AXAR encryption-v2 payload has trailing data");
     }
+    // A wrong password works through every slot, so the slots' costs are bounded
+    // together as well as one by one (each is checked just before it is used).
+    std::uint64_t total_kdf_work = 0;
+    for (const auto& slot : enc.slots) {
+        const auto work = core::kdf_work_blocks(slot.kdf);  // fits: two 32-bit factors
+        if (work > core::kMaxKdfArchiveWorkBlocks - total_kdf_work) {
+            throw FormatError(
+                "AXAR encryption-v2 asks for more key-derivation work than allowed");
+        }
+        total_kdf_work += work;
+    }
     return enc;
 }
 
@@ -3785,13 +3796,20 @@ ByteVector decode_solid_block(const ByteSource& source,
                               const std::shared_ptr<OperationControl>& operation,
                               const std::optional<core::CryptoKey>& key,
                               const std::function<void(std::uint64_t, std::uint64_t)>&
-                                  decoded_bytes_progress = {}) {
+                                  decoded_bytes_progress = {},
+                              std::uint64_t max_block_bytes = 0) {
     operation_checkpoint(operation);
     if (block_index >= index.blocks.size()) {
         throw FormatError("block index out of range");
     }
 
     const auto& record = index.blocks[block_index];
+    // The declared size decides how much memory the decode commits.
+    if (max_block_bytes != 0 && record.uncompressed_size > max_block_bytes) {
+        throw FormatError("block declares " + std::to_string(record.uncompressed_size) +
+                          " decoded bytes, more than the allowed " +
+                          std::to_string(max_block_bytes));
+    }
     auto compressed = source.read_compressed(record.compressed_offset,
                                              record.compressed_size);
     if (key) {
@@ -4037,6 +4055,12 @@ public:
         decode_progress_ = std::move(callback);
     }
 
+    // Refuse to decode a block whose directory entry declares more than this many
+    // bytes (0: no limit beyond the format's).
+    void set_max_block_bytes(std::uint64_t bytes) {
+        max_block_bytes_ = bytes;
+    }
+
     // Whether read_range() decodes only the subframes a range needs rather
     // than the whole block. Plans list only whole-block reads.
     bool reads_whole_block(std::uint64_t block_index) const {
@@ -4276,7 +4300,7 @@ private:
         const std::function<void(std::uint64_t, std::uint64_t)>& progress) const {
         auto decoded = std::make_unique<DecodedBlock>();
         decoded->bytes = decode_solid_block(source_, index_, block_index, threads,
-                                            operation_, key_, progress);
+                                            operation_, key_, progress, max_block_bytes_);
         if (block_chunk_begin_.empty()) return decoded;
         const auto begin = block_chunk_begin_[static_cast<std::size_t>(block_index)];
         const auto end = block_chunk_begin_[static_cast<std::size_t>(block_index) + 1];
@@ -4569,6 +4593,11 @@ private:
         }
         const auto& record = index_.blocks[static_cast<std::size_t>(block_index)];
         const auto& frame = record.subframes[frame_index];
+        if (max_block_bytes_ != 0 && frame.uncompressed_size > max_block_bytes_) {
+            throw FormatError("subframe declares " + std::to_string(frame.uncompressed_size) +
+                              " decoded bytes, more than the allowed " +
+                              std::to_string(max_block_bytes_));
+        }
         if (frame.compressed_offset > record.compressed_size ||
             frame.compressed_size > record.compressed_size - frame.compressed_offset ||
             frame.compressed_size >
@@ -4627,6 +4656,7 @@ private:
     std::shared_ptr<OperationControl> operation_;
     std::optional<core::CryptoKey> key_;
     bool use_subframes_ = false;
+    std::uint64_t max_block_bytes_ = 0;
     DecodeProgressCallback decode_progress_;
 
     // Chunk layout: the chunks of block b are block_chunks_[begin[b], begin[b+1]).
@@ -5748,8 +5778,6 @@ void compress_items_into(Output& out, std::uint64_t& written,
     }
 }
 
-constexpr std::uint32_t kMaxKdfMemBlocks = 1u << 21;  // 2 GiB of 1 KiB blocks
-constexpr std::uint32_t kMaxKdfPasses = 64;
 constexpr std::size_t kMaxEncryptionPasswordBytes = 1u << 20;
 
 void validate_password_input(const std::string& password, const char* field) {
@@ -5762,9 +5790,7 @@ void validate_password_input(const std::string& password, const char* field) {
 }
 
 void validate_kdf_parameters(const core::KdfParams& kdf, const char* context) {
-    if (kdf.algorithm > 2 || kdf.lanes < 1 ||
-        kdf.passes < 1 || kdf.passes > kMaxKdfPasses ||
-        kdf.mem_blocks < 8 * kdf.lanes || kdf.mem_blocks > kMaxKdfMemBlocks) {
+    if (!core::kdf_parameters_valid(kdf)) {
         throw FormatError(std::string(context) + " has implausible KDF parameters");
     }
 }
@@ -11461,6 +11487,8 @@ void test_archive(const std::filesystem::path& archive_path,
     // that later files reuse.
     BlockSource source(bytes, index, options.thread_count, operation, loaded.key,
                        index.meta.large_solid_blocks);
+    // The default is the format's own ceiling for a block that is decoded whole.
+    source.set_max_block_bytes(options.max_output_size);
     std::vector<std::uint64_t> reads;
     std::vector<bool> chunk_read(index.chunks.size(), false);
     std::vector<bool> block_read(index.blocks.size(), false);
@@ -11597,6 +11625,7 @@ void extract_entries_impl(const std::filesystem::path& archive_path,
     }
     BlockSource source(bytes, index, options.thread_count, operation, loaded.key,
                        requested_entries != nullptr || index.meta.large_solid_blocks);
+    source.set_max_block_bytes(options.max_block_size);
 
     LazyPathIndex entry_by_path(index.entries);
     std::vector<bool> selected(index.entries.size(), requested_entries == nullptr);

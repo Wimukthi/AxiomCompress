@@ -12,6 +12,7 @@
 #include "codec/lz77_split.hpp"
 #include "codec/transform.hpp"
 #include "core/checksum.hpp"
+#include "core/crypto.hpp"
 #include "core/exclusive_file.hpp"
 #include "core/benchmark_corpus.hpp"
 #include "core/benchmark_statistics.hpp"
@@ -69,6 +70,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <future>
 #include <iostream>
 #include <iterator>
@@ -6466,6 +6468,10 @@ public:
 
     std::vector<HostileEntry>& entries() { return entries_; }
 
+    // The archive-level extra records that follow the entries: a vint count, then
+    // vint type, vint length and payload for each.
+    std::vector<std::uint8_t>& tail() { return tail_; }
+
     // The archive's first genuine file entry (kept even after entries() is
     // replaced): its data range and checksums, to be reused under another name.
     HostileEntry file_like(const std::string& path) const {
@@ -7170,6 +7176,211 @@ void test_extract_hardlink_after_updating_target() {
     fs::remove_all(root, ec);
 }
 
+// Rewrites the Argon2 cost fields of every password slot in an encryption-v2
+// archive (archive-extra type 6): the layout is "AXIOME2\0", u16 version, u16
+// options, 16-byte key id, vint slot count, then per slot u32 id, vint algorithm,
+// memory, passes, lanes, vint salt length and salt, vint wrapped-key length and key.
+void hostile_set_kdf(HostileDirectory& hostile, std::uint64_t mem_blocks, std::uint64_t passes,
+                     std::uint64_t lanes) {
+    const auto& tail = hostile.tail();
+    std::size_t at = 0;
+    const auto count = hostile_get_vint(tail, at);
+    std::vector<std::uint8_t> rebuilt;
+    hostile_put_vint(rebuilt, count);
+    bool patched = false;
+    for (std::uint64_t record = 0; record < count; ++record) {
+        const auto type = hostile_get_vint(tail, at);
+        const auto size = static_cast<std::size_t>(hostile_get_vint(tail, at));
+        AXIOM_CHECK(at + size <= tail.size());
+        std::vector<std::uint8_t> payload(tail.begin() + at, tail.begin() + at + size);
+        at += size;
+        if (type == 6) {
+            std::size_t cursor = 8 + 2 + 2 + 16;
+            std::vector<std::uint8_t> body(payload.begin(), payload.begin() + cursor);
+            const auto slots = hostile_get_vint(payload, cursor);
+            hostile_put_vint(body, slots);
+            for (std::uint64_t slot = 0; slot < slots; ++slot) {
+                body.insert(body.end(), payload.begin() + cursor, payload.begin() + cursor + 4);
+                cursor += 4;
+                (void)hostile_get_vint(payload, cursor);  // algorithm kept below
+                for (int field = 0; field < 3; ++field) (void)hostile_get_vint(payload, cursor);
+                hostile_put_vint(body, 2);  // Argon2id
+                hostile_put_vint(body, mem_blocks);
+                hostile_put_vint(body, passes);
+                hostile_put_vint(body, lanes);
+                const auto rest_start = cursor;
+                const auto salt_length = static_cast<std::size_t>(hostile_get_vint(payload, cursor));
+                cursor += salt_length;
+                const auto wrapped_length = static_cast<std::size_t>(hostile_get_vint(payload, cursor));
+                cursor += wrapped_length;
+                body.insert(body.end(), payload.begin() + rest_start, payload.begin() + cursor);
+            }
+            AXIOM_CHECK(cursor == payload.size());
+            payload = std::move(body);
+            patched = true;
+        }
+        hostile_put_vint(rebuilt, type);
+        hostile_put_vint(rebuilt, payload.size());
+        rebuilt.insert(rebuilt.end(), payload.begin(), payload.end());
+    }
+    AXIOM_CHECK(patched);
+    hostile.tail() = std::move(rebuilt);
+}
+
+// Argon2 cost parameters come from the archive. Values outside the limits are
+// refused before any memory is allocated or work is done, including a lane count
+// whose "8 blocks per lane" floor wraps around in 32-bit arithmetic.
+void test_encryption_kdf_limits() {
+    using axiom::core::KdfParams;
+    // The limits themselves.
+    KdfParams standard;
+    AXIOM_CHECK(axiom::core::kdf_parameters_valid(standard));
+    const auto with = [](std::uint32_t mem, std::uint32_t passes, std::uint32_t lanes) {
+        KdfParams params;
+        params.mem_blocks = mem;
+        params.passes = passes;
+        params.lanes = lanes;
+        return params;
+    };
+    AXIOM_CHECK(axiom::core::kdf_parameters_valid(with(8, 1, 1)));
+    AXIOM_CHECK(axiom::core::kdf_parameters_valid(with(128, 64, 16)));
+    AXIOM_CHECK(axiom::core::kdf_parameters_valid(with(1u << 21, 1, 1)));
+    AXIOM_CHECK(axiom::core::kdf_parameters_valid(with(1u << 16, 32, 1)));
+    AXIOM_CHECK(!axiom::core::kdf_parameters_valid(with(7, 1, 1)));                // under 8 blocks
+    AXIOM_CHECK(!axiom::core::kdf_parameters_valid(with(15, 1, 2)));               // under 8 per lane
+    AXIOM_CHECK(!axiom::core::kdf_parameters_valid(with(64, 1, 0)));
+    AXIOM_CHECK(!axiom::core::kdf_parameters_valid(with(64, 0, 1)));
+    AXIOM_CHECK(!axiom::core::kdf_parameters_valid(with(64, 1, 17)));              // lane limit
+    AXIOM_CHECK(!axiom::core::kdf_parameters_valid(with(64, 1, 1u << 29)));        // 8 * lanes wraps to 0
+    AXIOM_CHECK(!axiom::core::kdf_parameters_valid(with(64, 1, 0x20000001u)));     // ... and to 8
+    AXIOM_CHECK(!axiom::core::kdf_parameters_valid(with((1u << 21) + 1, 1, 1)));   // memory limit
+    AXIOM_CHECK(!axiom::core::kdf_parameters_valid(with(1024, 65, 1)));            // pass limit
+    AXIOM_CHECK(!axiom::core::kdf_parameters_valid(with(1u << 21, 2, 1)));         // work per slot
+    {
+        auto bad = standard;
+        bad.algorithm = 3;
+        AXIOM_CHECK(!axiom::core::kdf_parameters_valid(bad));
+    }
+    expect_throws([&] { (void)axiom::core::derive_key("x", with(64, 1, 1u << 29)); });
+    expect_throws([&] { (void)axiom::core::derive_key("x", with(1u << 21, 64, 1)); });
+
+    // Derivation is unchanged: fixed parameters give fixed keys.
+    const auto hex = [](const axiom::core::CryptoKey& key) {
+        static constexpr char digits[] = "0123456789abcdef";
+        std::string text;
+        for (const auto byte : key) {
+            text.push_back(digits[byte >> 4]);
+            text.push_back(digits[byte & 15]);
+        }
+        return text;
+    };
+    KdfParams first;
+    KdfParams second = with(8192, 2, 4);
+    for (std::uint8_t i = 0; i < 16; ++i) {
+        first.salt[i] = i;
+        second.salt[i] = static_cast<std::uint8_t>(0xA0 + i);
+    }
+    AXIOM_CHECK(hex(axiom::core::derive_key("correct horse battery staple", first)) ==
+                "0d1a3c6523c8f06e4e0af9c515aa5b5448cfebd6838f2d52c3d8b6ef8ddc3c2e");
+    AXIOM_CHECK(hex(axiom::core::derive_key("p", second)) ==
+                "855d8f3540d1fbaed381a961344e276b40412483fb8cf23d636679e6869ba0a5");
+
+    // The same limits applied to what an archive claims.
+    const auto root = make_temp_dir();
+    const auto src = root / "src";
+    fs::create_directories(src);
+    write_all(src / "data.txt", bytes_from_string(kHostilePayload));
+    axiom::CompressionOptions create;
+    create.password = "open sesame";
+    const auto archive = root / "locked.axar";
+    axiom::create_archive({src}, archive, create);
+    axiom::add_archive_password(archive, "open sesame", "second password", {});
+    axiom::add_archive_password(archive, "open sesame", "third password", {});
+
+    axiom::ExtractOptions open;
+    open.password = "open sesame";
+    axiom::extract_archive(archive, root / "control", open);  // unchanged archives open
+    AXIOM_CHECK(read_all(root / "control" / "src" / "data.txt") == bytes_from_string(kHostilePayload));
+
+    HostileDirectory hostile(archive);
+    const auto evil = root / "evil.axar";
+    const auto is_format_error = [&](const fs::path& target) {
+        try {
+            axiom::extract_archive(target, root / "never", open);
+        } catch (const axiom::FormatError&) {
+            return true;
+        } catch (const std::exception&) {
+            return false;
+        }
+        return false;
+    };
+    struct Case {
+        std::uint64_t mem;
+        std::uint64_t passes;
+        std::uint64_t lanes;
+    };
+    for (const Case& bad : {Case{64, 1, 1ull << 29}, Case{1024, 1, 17}, Case{(1ull << 21) + 1, 1, 1},
+                            Case{1024, 65, 1}, Case{1ull << 21, 2, 1}, Case{15, 1, 2},
+                            Case{64, 1, 0x20000001ull}}) {
+        hostile_set_kdf(hostile, bad.mem, bad.passes, bad.lanes);
+        hostile.write(evil);
+        AXIOM_CHECK(is_format_error(evil));
+        AXIOM_CHECK(!fs::exists(root / "never"));
+    }
+
+    // Three slots that each ask for the most one slot may are refused together: a
+    // wrong password would otherwise have to work through all of them.
+    hostile_set_kdf(hostile, 1ull << 21, 1, 1);
+    hostile.write(evil);
+    AXIOM_CHECK(is_format_error(evil));
+
+    // Parameters that are in range are used, and a key derived under different
+    // parameters than the slot was wrapped with is simply the wrong key.
+    hostile_set_kdf(hostile, 8192, 2, 2);
+    hostile.write(evil);
+    AXIOM_CHECK(!is_format_error(evil));
+    expect_throws([&] { axiom::extract_archive(evil, root / "never", open); });
+
+    std::error_code ec;
+    fs::remove_all(root, ec);
+}
+
+// A block's declared size decides how much memory decoding it commits. The caller
+// can bound that, for extraction and for testing alike.
+void test_extract_block_size_limit() {
+    const auto root = make_temp_dir();
+    const auto base = make_hostile_base(root);
+
+    const auto refused = [&](const std::function<void()>& run) {
+        try {
+            run();
+        } catch (const axiom::FormatError&) {
+            return true;
+        } catch (const std::exception&) {
+            return false;
+        }
+        return false;
+    };
+
+    axiom::ExtractOptions limited;
+    limited.max_block_size = 16;  // the block holds more than this
+    AXIOM_CHECK(refused([&] { axiom::extract_archive(base, root / "limited", limited); }));
+    AXIOM_CHECK(!fs::exists(root / "limited" / "base" / "data.txt"));
+    AXIOM_CHECK(refused([&] { axiom::extract_entries(base, {"base/data.txt"}, root / "partial", limited); }));
+
+    axiom::DecompressionOptions small;
+    small.max_output_size = 16;
+    AXIOM_CHECK(refused([&] { axiom::test_archive(base, small); }));
+
+    limited.max_block_size = std::uint64_t{1} << 20;
+    axiom::extract_archive(base, root / "roomy", limited);
+    AXIOM_CHECK(read_all(root / "roomy" / "base" / "data.txt") == bytes_from_string(kHostilePayload));
+    axiom::test_archive(base);  // the default limit is the format's own
+
+    std::error_code ec;
+    fs::remove_all(root, ec);
+}
+
 // ExclusiveFile creates a file only where nothing exists and never through a link.
 void test_exclusive_file_refuses_existing_names() {
     const auto root = make_temp_dir();
@@ -7785,6 +7996,8 @@ constexpr RegisteredTest kTests[] = {
     {"extract_link_safety", test_extract_link_safety},
     {"exclusive_file_refuses_existing_names", test_exclusive_file_refuses_existing_names},
     {"staging_names", test_staging_names},
+    {"encryption_kdf_limits", test_encryption_kdf_limits},
+    {"extract_block_size_limit", test_extract_block_size_limit},
     {"archive_directory_findings", test_archive_directory_findings},
     {"archive_rejects_unsafe_ads_names", test_archive_rejects_unsafe_ads_names},
     {"dedup_directory_rejects_non_directory_parent", test_dedup_directory_rejects_non_directory_parent},

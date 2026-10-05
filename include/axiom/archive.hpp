@@ -264,6 +264,11 @@ struct ExtractOptions {
     std::shared_ptr<OperationControl> operation;
     // Password for an encrypted archive; required to read one, ignored otherwise.
     std::string password;
+    // The largest decoded size one solid block may declare, in bytes; 0 means only
+    // the format's own limits apply. A block's declared size decides how much memory
+    // decoding it commits, and a compressed block can legitimately expand by
+    // factors in the millions, so set this when extracting archives you do not trust.
+    std::uint64_t max_block_size = 0;
     // Refuse extraction when the archive cannot recreate a captured sparse
     // allocation map or carries a non-empty capture warning report.
     bool strict_metadata = false;

@@ -37,8 +37,26 @@ the same archive bytes are produced.
 - A directory entry applies its recorded mode and times only to a real
   directory, not to a file that happens to be at the same path.
 
+### Added
+
+- `--max-output SIZE` for `axiomc d`, `x`, `t` and `snapshot restore`, and
+  `ExtractOptions::max_block_size`, bound the decoded size a stream, solid block
+  or subframe may declare. `DecompressionOptions::max_output_size` now bounds
+  blocks during `test_archive` as well. The default is unchanged (4 GiB). See
+  "Archives you don't trust" in the CLI guide.
+
 ### Fixed
 
+- Password-protected archives no longer let their header choose how long a wrong
+  password takes. The Argon2 lane count was checked with a 32-bit multiplication
+  that wraps for lane counts of 2^29 and above, so a header with a huge lane
+  count and almost no memory passed validation and kept one core busy for
+  minutes. Key-derivation parameters are now checked in 64 bits and bounded as
+  a whole: at most 16 lanes, and memory blocks times passes at most 2^21 per
+  derivation and 2^22 across all password slots (Axiom writes 196,608), so the
+  most a header can ask for is about six seconds per slot. `derive_key` refuses
+  out-of-range parameters itself, and its work area is no longer zero-filled
+  before Argon2 overwrites it.
 - Extracting an archive no longer silently drops a hard link whose target comes
   later in the entry list. Replacing only the file a hard link points to (for
   example `axiomc a archive file` after editing it) leaves the link ahead of
