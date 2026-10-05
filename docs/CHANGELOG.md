@@ -39,6 +39,11 @@ the same archive bytes are produced.
 
 ### Added
 
+- `axiomc a`, `u`, `f`, `s` and `delete` work on `.zip` archives. They used to
+  call only the AXAR writer, so `axiomc a project.zip src` produced an AXAR file
+  with a `.zip` name and the others failed on a real ZIP. The format now follows
+  the archive's contents, or its name when it does not exist yet; AXAR-only
+  options are refused for ZIP.
 - `--max-output SIZE` for `axiomc d`, `x`, `t` and `snapshot restore`, and
   `ExtractOptions::max_block_size`, bound the decoded size a stream, solid block
   or subframe may declare. `DecompressionOptions::max_output_size` now bounds
@@ -47,6 +52,36 @@ the same archive bytes are produced.
 
 ### Fixed
 
+- Recovery records protect small and medium archives against scattered damage.
+  Shards were 1 MiB, so a 10% record on a 62 MiB archive was 62 data shards and
+  7 parity shards and eight single-byte errors in eight different shards defeated
+  it. Writers now use as many shards as the 255 limit allows, never smaller than
+  4 KiB: the same archive gets 231 and 24, and 100 MiB is 231 and 24 instead of
+  96 and 10. The record stores its geometry, so older builds still read and
+  repair the new records and the new build reads the old ones.
+- Reed-Solomon encoding and repair are much faster. The inner multiply-accumulate
+  uses AVX2 or SSSE3 byte shuffles (or 256-entry product tables) in place of a
+  per-byte logarithm lookup; the parity bytes are identical. A 10% recovery
+  record on a 100 MiB archive took 2.0 s (6.1 s of CPU) with 96 + 10 shards and
+  takes 0.4 s (0.6 s of CPU) with 231 + 24; repairing scattered damage in the
+  same archive took 7.8 s and takes 1.2 s.
+- Archive writers build their output in a temporary beside the destination whose
+  name used to be predictable (the destination plus `.tmp`), opened following
+  links. Anyone able to write to that directory could plant a link there and have
+  the archive written through it. Temporaries now carry 64 random bits in their
+  name, so there is nothing to plant; the other sibling temporaries (single-file
+  output, spools, SFX) were named from a clock or process id and a counter, which
+  can be guessed too, and use the same random names. A temporary left behind by
+  a killed process is no longer overwritten by the next run.
+- Replacing an existing archive or output file now forces the new contents to
+  disk before the rename that retires the old ones (and the directory afterwards),
+  so a crash or power loss cannot leave a truncated file where the good one was.
+  Creating a new file is unchanged.
+- `axiomc keygen` made the secret key readable by everyone allowed by the umask
+  and overwrote existing files. The secret key is now created readable by its
+  owner only, nothing existing is overwritten or followed, and the key is wiped
+  from memory afterwards (the old wipe could be optimized away).
+- `random_bytes` no longer opens `/dev/urandom` through a stream on every call.
 - Password-protected archives no longer let their header choose how long a wrong
   password takes. The Argon2 lane count was checked with a 32-bit multiplication
   that wraps for lane counts of 2^29 and above, so a header with a huge lane

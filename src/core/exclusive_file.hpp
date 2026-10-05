@@ -31,6 +31,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <sddl.h>
 #else
 #include <cerrno>
 #include <fcntl.h>
@@ -65,18 +66,37 @@ public:
     }
 
     // Creates `path` as a new regular file opened for writing. Never follows a
-    // link at `path` and never opens a file that already exists.
-    Create create_new(const std::filesystem::path& path, std::error_code& error) {
+    // link at `path` and never opens a file that already exists. `owner_only`
+    // is for secrets: the file is created readable and writable by its owner
+    // alone (mode 0600; on Windows a protected ACL granting only the owner and
+    // SYSTEM, and creation fails if that cannot be set), with no moment at which
+    // it exists with broader access.
+    Create create_new(const std::filesystem::path& path, std::error_code& error,
+                      bool owner_only = false) {
         release();
         error.clear();
 #if defined(_WIN32)
+        SECURITY_ATTRIBUTES attributes{};
+        PSECURITY_DESCRIPTOR descriptor = nullptr;
+        if (owner_only) {
+            if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    L"D:P(A;;FA;;;OW)(A;;FA;;;SY)", SDDL_REVISION_1, &descriptor, nullptr)) {
+                error = std::error_code(static_cast<int>(GetLastError()),
+                                        std::system_category());
+                return Create::failed;
+            }
+            attributes.nLength = sizeof(attributes);
+            attributes.lpSecurityDescriptor = descriptor;
+            attributes.bInheritHandle = FALSE;
+        }
         // CREATE_NEW fails when the name exists. FILE_FLAG_OPEN_REPARSE_POINT
         // stops a symlink or junction at the final component from being
         // resolved first, so a dangling link also reads as "exists".
-        handle_ = CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr,
-                              CREATE_NEW,
+        handle_ = CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ,
+                              owner_only ? &attributes : nullptr, CREATE_NEW,
                               FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
                               nullptr);
+        if (descriptor != nullptr) LocalFree(descriptor);
         if (handle_ == INVALID_HANDLE_VALUE) {
             const DWORD native = GetLastError();
             if (native == ERROR_FILE_EXISTS || native == ERROR_ALREADY_EXISTS) {
@@ -93,7 +113,7 @@ public:
 #ifdef O_CLOEXEC
         flags |= O_CLOEXEC;
 #endif
-        handle_ = ::open(path.c_str(), flags, 0666);
+        handle_ = ::open(path.c_str(), flags, owner_only ? 0600 : 0666);
         if (handle_ < 0) {
             const int native = errno;
             handle_ = invalid_handle();

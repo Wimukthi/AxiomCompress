@@ -3,6 +3,8 @@
 #include "axiom/archive.hpp"
 #include "axiom/version.hpp"
 #include "core/cpu.hpp"
+#include "core/crypto.hpp"
+#include "core/exclusive_file.hpp"
 #include "core/progress_rate.hpp"
 #include "core/path_text.hpp"
 #include "core/windows_time.hpp"
@@ -683,24 +685,43 @@ std::size_t parse_size(const std::string& value) {
     return static_cast<std::size_t>(parsed_value * multiplier);
 }
 
+// Reads exactly Size bytes into `key`. The stream is unbuffered so that a secret
+// is not also copied into a heap buffer that nothing wipes; `key` is wiped again
+// when the file is not a key.
 template <std::size_t Size>
-std::array<std::uint8_t, Size> read_key(const fs::path& path) {
-    std::array<std::uint8_t, Size> key{};
-    std::ifstream input(path, std::ios::binary);
+void read_key(const fs::path& path, std::array<std::uint8_t, Size>& key) {
+    std::ifstream input;
+    input.rdbuf()->pubsetbuf(nullptr, 0);
+    input.open(path, std::ios::binary);
     if (!input || !input.read(reinterpret_cast<char*>(key.data()),
                               static_cast<std::streamsize>(key.size())) ||
         input.peek() != std::char_traits<char>::eof()) {
+        axiom::core::secure_wipe(key);
         throw std::runtime_error("invalid signing key file: " +
                                  axiom::core::path_to_utf8(path));
     }
-    return key;
 }
 
+// Creates a new key file; an existing one (or a link in its place) is never
+// overwritten or followed. A secret key is readable by its owner alone.
 template <std::size_t Size>
-void write_key(const fs::path& path, const std::array<std::uint8_t, Size>& key) {
-    std::ofstream output(path, std::ios::binary | std::ios::trunc);
-    if (!output || !output.write(reinterpret_cast<const char*>(key.data()),
-                                 static_cast<std::streamsize>(key.size()))) {
+void write_key(const fs::path& path, const std::array<std::uint8_t, Size>& key,
+               bool secret) {
+    axiom::core::ExclusiveFile file;
+    std::error_code error;
+    switch (file.create_new(path, error, secret)) {
+        case axiom::core::ExclusiveFile::Create::created:
+            break;
+        case axiom::core::ExclusiveFile::Create::exists:
+            throw std::runtime_error("refusing to overwrite an existing file: " +
+                                     axiom::core::path_to_utf8(path));
+        case axiom::core::ExclusiveFile::Create::failed:
+            throw std::runtime_error("cannot write signing key file: " +
+                                     axiom::core::path_to_utf8(path) + ": " + error.message());
+    }
+    if (!file.write(key) || !file.sync() || !file.close()) {
+        std::error_code ignored;
+        fs::remove(path, ignored);
         throw std::runtime_error("cannot write signing key file: " +
                                  axiom::core::path_to_utf8(path));
     }
@@ -928,6 +949,37 @@ std::string format_time(std::int64_t seconds) {
 #endif
 }
 
+// Formats other than AXAR are changed through their provider, the way `l`, `t` and
+// `x` already read them; without this a ".zip" name silently produced an AXAR file
+// and an existing ZIP could not be changed at all. Returns that provider, or nullptr
+// for AXAR, which keeps the library's own entry points. Throws when the format
+// cannot do what was asked.
+const axiom::ArchiveProvider* provider_for_change(const fs::path& archive,
+                                                  const axiom::CompressionOptions& options,
+                                                  bool changing_existing,
+                                                  bool deleting = false) {
+    const auto* provider = axiom::archive_provider_for_path(archive);
+    if (provider == nullptr || provider->info().native) return nullptr;
+    const auto capabilities = provider->capabilities(archive, options.password);
+    const std::string format(provider->info().display_name);
+    const bool supported = deleting ? capabilities.delete_entries
+                                    : (changing_existing ? capabilities.update
+                                                         : capabilities.create);
+    if (!supported) {
+        throw std::runtime_error(format + " archives cannot be " +
+                                 (changing_existing || deleting ? "changed" : "created") +
+                                 " by axiomc");
+    }
+    if (options.enable_content_dedup || options.encrypt_header) {
+        throw std::invalid_argument("--dedup and --encrypt-names apply only to AXAR archives, "
+                                    "not " + format);
+    }
+    if (options.recovery_percent != 0 && !capabilities.recovery_records) {
+        throw std::invalid_argument("--recovery applies only to AXAR archives, not " + format);
+    }
+    return provider;
+}
+
 int run_add(std::vector<std::string> args) {
     axiom::CompressionOptions options;
     if (!take_compression_flags(args, options, nullptr, true)) {
@@ -962,6 +1014,15 @@ int run_add(std::vector<std::string> args) {
                                                            : "creating archive");
     options.operation = progress.operation();
     // `a` creates a new archive, or adds to (and updates entries in) an existing one.
+    if (const auto* provider = provider_for_change(archive, options, fs::exists(archive))) {
+        if (fs::exists(archive)) {
+            provider->add(inputs, archive, options);
+        } else {
+            provider->create(inputs, archive, options);
+        }
+        progress.complete();
+        return 0;
+    }
     if (fs::exists(archive)) {
         if (options.enable_content_dedup) {
             throw std::invalid_argument(
@@ -993,7 +1054,11 @@ int run_update(std::vector<std::string> args, bool fresh_only) {
     ScopedInteractiveProgress progress(fresh_only ? "freshening archive"
                                                   : "updating archive");
     options.operation = progress.operation();
-    axiom::update_archive(inputs, archive, options, fresh_only);
+    if (const auto* provider = provider_for_change(archive, options, fs::exists(archive))) {
+        provider->update(inputs, archive, options, fresh_only);
+    } else {
+        axiom::update_archive(inputs, archive, options, fresh_only);
+    }
     progress.complete();
     return 0;
 }
@@ -1015,7 +1080,11 @@ int run_sync(std::vector<std::string> args) {
     std::vector<fs::path> inputs(args.begin() + 1, args.end());
     ScopedInteractiveProgress progress("synchronizing archive");
     options.operation = progress.operation();
-    axiom::sync_archive(inputs, archive, options);
+    if (const auto* provider = provider_for_change(archive, options, fs::exists(archive))) {
+        provider->sync(inputs, archive, options);
+    } else {
+        axiom::sync_archive(inputs, archive, options);
+    }
     progress.complete();
     return 0;
 }
@@ -1149,7 +1218,11 @@ int run_delete(std::vector<std::string> args) {
     const std::vector<std::string> paths(args.begin() + 1, args.end());
     ScopedInteractiveProgress progress("deleting archive entries");
     options.operation = progress.operation();
-    axiom::delete_from_archive(archive, paths, options);
+    if (const auto* provider = provider_for_change(archive, options, true, true)) {
+        provider->delete_entries(archive, paths, options);
+    } else {
+        axiom::delete_from_archive(archive, paths, options);
+    }
     progress.complete();
     return 0;
 }
@@ -1607,9 +1680,20 @@ int run_keygen(const std::vector<std::string>& args) {
         return 2;
     }
     auto key = axiom::generate_archive_signing_key();
-    write_key(args[0], key.secret_key);
-    write_key(args[1], key.public_key);
-    std::fill(key.secret_key.begin(), key.secret_key.end(), std::uint8_t{0});
+    try {
+        write_key(args[0], key.secret_key, true);
+        try {
+            write_key(args[1], key.public_key, false);
+        } catch (...) {
+            std::error_code ignored;
+            fs::remove(args[0], ignored);  // no half a key pair
+            throw;
+        }
+    } catch (...) {
+        axiom::core::secure_wipe(key.secret_key);
+        throw;
+    }
+    axiom::core::secure_wipe(key.secret_key);
     std::cout << "signing key generated\n";
     return 0;
 }
@@ -1621,13 +1705,18 @@ int run_sign(std::vector<std::string> args) {
         return 2;
     }
     axiom::ArchiveSigningKey key;
-    key.secret_key = read_key<64>(args[1]);
+    read_key<64>(args[1], key.secret_key);
     std::copy_n(key.secret_key.begin() + 32, key.public_key.size(), key.public_key.begin());
     ScopedInteractiveProgress progress("signing archive");
     options.operation = progress.operation();
-    axiom::sign_archive(args[0], key, options);
+    try {
+        axiom::sign_archive(args[0], key, options);
+    } catch (...) {
+        axiom::core::secure_wipe(key.secret_key);
+        throw;
+    }
     progress.complete();
-    std::fill(key.secret_key.begin(), key.secret_key.end(), std::uint8_t{0});
+    axiom::core::secure_wipe(key.secret_key);
     std::cout << "archive signed\n";
     return 0;
 }
@@ -1639,7 +1728,10 @@ int run_verify(std::vector<std::string> args) {
         return 2;
     }
     std::optional<std::array<std::uint8_t, 32>> trusted;
-    if (args.size() == 2) trusted = read_key<32>(args[1]);
+    if (args.size() == 2) {
+        trusted.emplace();
+        read_key<32>(args[1], *trusted);
+    }
     const auto info = axiom::verify_archive_signature(args[0], options.password, trusted);
     if (!info.present) {
         std::cout << "archive is not signed\n";

@@ -2469,6 +2469,35 @@ std::uint64_t recovery_progress_add(std::uint64_t left, std::uint64_t right) {
     return right > max - left ? max : left + right;
 }
 
+// How a recovery record divides the protected bytes into shards. Repair rebuilds
+// any `parity_count` shards, wherever in the archive they are, so the damage it
+// survives is counted in shards: more and smaller shards tolerate more scattered
+// damage for the same percentage. Reed-Solomon over GF(256) allows 255 in all, so
+// the data shards take as many of those as the percentage leaves them, but never
+// get smaller than a disk sector (a bad sector takes a whole shard with it). The
+// record stores the geometry it was written with, so readers do not depend on this.
+struct RecoveryGeometry {
+    int data_count = 0;
+    int parity_count = 0;
+    std::uint64_t shard_size = 0;
+};
+
+RecoveryGeometry recovery_geometry(std::uint64_t protected_size, unsigned percent) {
+    constexpr std::uint64_t kMinShardSize = 4096;
+    const std::uint64_t by_size = std::max<std::uint64_t>(1, protected_size / kMinShardSize);
+    const std::uint64_t max_data = std::max<std::uint64_t>(
+        1, (255u * 100u) / (100u + percent));
+    RecoveryGeometry geometry;
+    geometry.data_count = static_cast<int>(std::min(by_size, max_data));
+    geometry.parity_count = static_cast<int>(std::max<std::uint64_t>(
+        1, std::min<std::uint64_t>(
+               255 - geometry.data_count,
+               (static_cast<std::uint64_t>(geometry.data_count) * percent + 99) / 100)));
+    geometry.shard_size = std::max<std::uint64_t>(
+        1, (protected_size + geometry.data_count - 1) / geometry.data_count);
+    return geometry;
+}
+
 EncodedRecoveryService encode_recovery_service(
     const ByteSource& source, std::uint64_t protected_size,
     std::uint64_t directory_offset, std::uint64_t directory_size,
@@ -2476,17 +2505,10 @@ EncodedRecoveryService encode_recovery_service(
     if (percent < 1 || percent > 100) {
         throw std::invalid_argument("recovery percentage must be between 1 and 100");
     }
-    constexpr std::uint64_t target_shard_size = 1u << 20;
-    const std::uint64_t desired_data = std::max<std::uint64_t>(
-        1, (protected_size + target_shard_size - 1) / target_shard_size);
-    const std::uint64_t max_data = std::max<std::uint64_t>(
-        1, (255u * 100u) / (100u + percent));
-    const auto data_count = static_cast<int>(std::min(desired_data, max_data));
-    const auto parity_count = static_cast<int>(std::max<std::uint64_t>(
-        1, std::min<std::uint64_t>(255 - data_count,
-            (static_cast<std::uint64_t>(data_count) * percent + 99) / 100)));
-    const std::uint64_t shard_size =
-        std::max<std::uint64_t>(1, (protected_size + data_count - 1) / data_count);
+    const auto geometry = recovery_geometry(protected_size, percent);
+    const int data_count = geometry.data_count;
+    const int parity_count = geometry.parity_count;
+    const std::uint64_t shard_size = geometry.shard_size;
     if (shard_size > std::numeric_limits<std::size_t>::max()) {
         throw std::runtime_error("archive is too large for recovery processing");
     }
@@ -2597,8 +2619,7 @@ void rewrite_recovery_service(const fs::path& archive_path, unsigned percent,
     }
     const auto footer = archive_footer_bytes(layout.directory_offset, layout.directory_size);
 
-    fs::path temporary = archive_path;
-    temporary += L".recovery.tmp";
+    fs::path temporary = core::unique_sibling_path(archive_path, L"recovery");
     TempFileGuard guard(temporary);
     std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
     if (!output) throw std::runtime_error("cannot create recovery output");
@@ -2647,18 +2668,10 @@ void append_recovery_to_staged_archive(
     const ArchiveLayout layout = read_layout(source);
     const std::uint64_t protected_size = layout.directory_offset + layout.directory_size +
                                           layout.generation_size;
-    constexpr std::uint64_t target_shard_size = 1u << 20;
-    const std::uint64_t desired_data = std::max<std::uint64_t>(
-        1, (protected_size + target_shard_size - 1) / target_shard_size);
-    const std::uint64_t max_data = std::max<std::uint64_t>(
-        1, (255u * 100u) / (100u + percent));
-    const int data_count = static_cast<int>(std::min(desired_data, max_data));
-    const int parity_count = static_cast<int>(std::max<std::uint64_t>(
-        1, std::min<std::uint64_t>(
-               255 - data_count,
-               (static_cast<std::uint64_t>(data_count) * percent + 99) / 100)));
-    const std::uint64_t shard_size =
-        std::max<std::uint64_t>(1, (protected_size + data_count - 1) / data_count);
+    const auto geometry = recovery_geometry(protected_size, percent);
+    const int data_count = geometry.data_count;
+    const int parity_count = geometry.parity_count;
+    const std::uint64_t shard_size = geometry.shard_size;
     const std::uint64_t parity_bytes = recovery_progress_multiply(
         static_cast<std::uint64_t>(parity_count), shard_size);
     const std::uint64_t total_work = recovery_progress_add(
@@ -2675,8 +2688,7 @@ void append_recovery_to_staged_archive(
     std::vector<std::uint32_t> parity_crc(
         static_cast<std::size_t>(parity_count), core::crc32_init());
 
-    fs::path parity_path = staged_path;
-    parity_path += L".parity.tmp";
+    fs::path parity_path = core::unique_sibling_path(staged_path, L"parity");
     TempFileGuard parity_guard(parity_path);
     std::fstream parity_file(
         parity_path, std::ios::binary | std::ios::in |
@@ -6831,8 +6843,7 @@ void rebuild_archive_keeping(const fs::path& archive_path,
     const bool spool_large_blocks = requests_large_solid_blocks(block_size);
     index.meta.large_solid_blocks = spool_large_blocks;
 
-    fs::path temp_path = archive_path;
-    temp_path += ".tmp";
+    fs::path temp_path = core::unique_sibling_path(archive_path, L"write");
     TempFileGuard temp_guard(temp_path);
     std::ofstream out(temp_path, std::ios::binary | std::ios::trunc);
     if (!out) {
@@ -7416,8 +7427,7 @@ void append_items_to_archive_indexed(
         }
     }
 
-    fs::path temp_path = archive_path;
-    temp_path += ".tmp";
+    fs::path temp_path = core::unique_sibling_path(archive_path, L"write");
     TempFileGuard temp_guard(temp_path);
     std::ofstream out(temp_path, std::ios::binary | std::ios::trunc);
     if (!out) {
@@ -7588,8 +7598,7 @@ void rewrite_archive_directory(const fs::path& archive_path, ArchiveIndex index,
 
     const std::uint64_t block_region_end = archive_block_region_end(layout, index);
 
-    fs::path temp_path = archive_path;
-    temp_path += ".tmp";
+    fs::path temp_path = core::unique_sibling_path(archive_path, L"write");
     TempFileGuard temp_guard(temp_path);
     std::ofstream out(temp_path, std::ios::binary | std::ios::trunc);
     if (!out) {
@@ -8774,8 +8783,7 @@ void rewrite_archive_password(const fs::path& archive_path,
         }
     }
 
-    fs::path temp_path = archive_path;
-    temp_path += ".tmp";
+    fs::path temp_path = core::unique_sibling_path(archive_path, L"write");
     TempFileGuard temp_guard(temp_path);
     std::ofstream output(temp_path, std::ios::binary | std::ios::trunc);
     if (!output) {
@@ -8878,8 +8886,7 @@ void create_chunked_archive_impl(
     chunk_options.enable_snapshot_dedup = snapshot_name.has_value();
     const bool keyed = !options.password.empty() && options.keyed_chunk_ids;
 
-    fs::path temp_path = archive_path;
-    temp_path += ".tmp";
+    fs::path temp_path = core::unique_sibling_path(archive_path, L"write");
     TempFileGuard temp_guard(temp_path);
     std::ofstream out(temp_path, std::ios::binary | std::ios::trunc);
     if (!out) {
@@ -8989,8 +8996,7 @@ void create_archive(const std::vector<std::filesystem::path>& inputs,
     const auto block_size = effective_solid_block_size(options);
     validate_large_solid_block_options(options, block_size);
 
-    fs::path temp_path = archive_path;
-    temp_path += ".tmp";
+    fs::path temp_path = core::unique_sibling_path(archive_path, L"write");
     TempFileGuard temp_guard(temp_path);
     std::ofstream out(temp_path, std::ios::binary | std::ios::trunc);
     if (!out) {
@@ -9701,8 +9707,7 @@ void repack_snapshot_archive(const std::filesystem::path& archive_path,
         new_blocks.reserve(loaded.index.blocks.size());
         new_chunks.reserve(loaded.index.chunks.size());
 
-        fs::path temp_path = archive_path;
-        temp_path += ".tmp";
+        fs::path temp_path = core::unique_sibling_path(archive_path, L"write");
         TempFileGuard temp_guard(temp_path);
         std::ofstream out(temp_path, std::ios::binary | std::ios::trunc);
         if (!out) {
@@ -10560,8 +10565,7 @@ core::Blake3Digest hash_file(const fs::path& path,
 void write_volume(const fs::path& path, const VolumeHeader& header,
                   std::span<const std::uint8_t> payload) {
     const auto bytes = serialize_volume_header(header);
-    fs::path temporary = path;
-    temporary += L".tmp";
+    fs::path temporary = core::unique_sibling_path(path, L"volume");
     TempFileGuard guard(temporary);
     std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
     output.write(reinterpret_cast<const char*>(bytes.data()),
@@ -10666,8 +10670,7 @@ bool repair_archive(const std::filesystem::path& archive_path,
         service.directory_size, service.percent, operation);
     const auto footer = archive_footer_bytes(service.directory_offset, service.directory_size);
 
-    fs::path temporary = archive_path;
-    temporary += L".repair.tmp";
+    fs::path temporary = core::unique_sibling_path(archive_path, L"repair");
     TempFileGuard guard(temporary);
     std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
     output.write(reinterpret_cast<const char*>(protected_bytes.data()),
@@ -10888,8 +10891,7 @@ void join_archive_volumes(const std::filesystem::path& any_volume,
         throw FormatError("not enough archive/recovery volumes to reconstruct the archive");
     }
 
-    fs::path temporary = output_archive;
-    temporary += L".join.tmp";
+    fs::path temporary = core::unique_sibling_path(output_archive, L"join");
     TempFileGuard guard(temporary);
     std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
     core::Blake3 hash;
