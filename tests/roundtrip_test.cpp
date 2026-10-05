@@ -6416,8 +6416,12 @@ void hostile_put_string(std::vector<std::uint8_t>& out, const std::string& text)
 constexpr std::uint8_t kHostileFile = 0;
 constexpr std::uint8_t kHostileSymlink = 2;
 constexpr std::uint8_t kHostileHardlink = 3;
+#if !defined(_WIN32)
 constexpr std::uint64_t kHostileExtraPosix = 7;
+#endif
+#if defined(__linux__)
 constexpr std::uint64_t kHostileExtraXattr = 10;
+#endif
 
 class HostileDirectory {
 public:
@@ -6541,6 +6545,7 @@ private:
     bool has_template_ = false;
 };
 
+#if !defined(_WIN32)
 HostileEntry hostile_symlink(const std::string& path, const std::string& target) {
     HostileEntry entry;
     entry.type = kHostileSymlink;
@@ -6548,6 +6553,7 @@ HostileEntry hostile_symlink(const std::string& path, const std::string& target)
     entry.target = target;
     return entry;
 }
+#endif
 
 HostileEntry hostile_hardlink(const std::string& path, const std::string& target) {
     HostileEntry entry;
@@ -6571,6 +6577,7 @@ void hostile_add_ads(HostileEntry& entry, const std::string& name, const std::st
     entry.extras.emplace_back(6, std::move(payload));
 }
 
+#if !defined(_WIN32)
 void hostile_set_posix(HostileEntry& entry, std::uint32_t mode, std::uint32_t uid,
                        std::uint32_t gid) {
     std::vector<std::uint8_t> payload;
@@ -6581,13 +6588,16 @@ void hostile_set_posix(HostileEntry& entry, std::uint32_t mode, std::uint32_t ui
     }
     entry.extras.emplace_back(kHostileExtraPosix, std::move(payload));
 }
+#endif
 
+#if defined(__linux__)
 void hostile_add_xattr(HostileEntry& entry, const std::string& name, const std::string& value) {
     std::vector<std::uint8_t> payload;
     hostile_put_string(payload, name);
     payload.insert(payload.end(), value.begin(), value.end());
     entry.extras.emplace_back(kHostileExtraXattr, std::move(payload));
 }
+#endif
 
 const std::string kHostilePayload =
     "bytes the archive wants written inside the destination, and only there";
@@ -6602,6 +6612,8 @@ fs::path make_hostile_base(const fs::path& root) {
     return archive;
 }
 
+#if !defined(_WIN32)
+
 std::size_t count_regular_files_named(const fs::path& directory, std::string_view suffix) {
     std::size_t count = 0;
     for (const auto& item : fs::recursive_directory_iterator(directory)) {
@@ -6614,8 +6626,6 @@ std::size_t count_regular_files_named(const fs::path& directory, std::string_vie
     }
     return count;
 }
-
-#if !defined(_WIN32)
 
 // A symlink entry planted at the name an extractor would stage the next file
 // under must not capture that file's bytes: the file belongs to the destination,

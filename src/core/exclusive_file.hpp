@@ -102,6 +102,14 @@ public:
             if (native == ERROR_FILE_EXISTS || native == ERROR_ALREADY_EXISTS) {
                 return Create::exists;
             }
+            // A name that is already a directory is refused with "access denied"
+            // rather than "exists" (a directory cannot be opened as a file). If
+            // anything is there, the name is taken; a genuine permission problem
+            // leaves nothing at the name and stays a failure.
+            if (native == ERROR_ACCESS_DENIED &&
+                GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES) {
+                return Create::exists;
+            }
             error = std::error_code(static_cast<int>(native), std::system_category());
             return Create::failed;
         }
