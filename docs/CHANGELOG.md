@@ -14,6 +14,48 @@ Entries are condensed from the
 
 ## [Unreleased]
 
+Extraction is stricter about links and privileged metadata. The archive format
+is unchanged: archives written by any earlier build extract with this one, and
+the same archive bytes are produced.
+
+### Security
+
+- Extraction no longer writes through a link that sits at a file's temporary
+  name. Files are now staged under a random name that is created new and never
+  through a link, in both the AXAR and ZIP extractors. A link already present
+  at a file's final name is treated as an existing entry by `--overwrite`
+  (previously a dangling link was not) and is replaced rather than followed.
+- Symbolic links stored in an archive are created after every file and
+  directory instead of in directory order, so an archive cannot combine a link
+  entry with later entries to redirect a write. If creating a link fails, that
+  is now reported as a warning, and no metadata is applied to whatever is at
+  that path.
+- Restoring metadata no longer decides whether a path is a link from the mode
+  stored in the archive. A link entry carrying a regular file's mode could
+  previously have the permissions of its target changed; the path's type on disk
+  now decides, and permission bits are never applied through a link.
+- A directory entry applies its recorded mode and times only to a real
+  directory, not to a file that happens to be at the same path.
+
+### Changed
+
+- Extraction withholds privileged metadata unless asked. Extended attributes
+  outside the `user.` namespace on Linux (`security.*`, `trusted.*`,
+  `system.*`, which include file capabilities) used to be restored whenever the
+  kernel allowed it; they are now left out by default, and each file with
+  withheld attributes gets one warning. The set-user-ID and set-group-ID bits of
+  files used to survive or not depending on whether the ownership step that
+  followed happened to succeed; they are now never restored by default. Pass
+  `--restore-privileged` to `axiomc x` or `axiomc snapshot restore`, or set
+  `ExtractOptions::restore_privileged_metadata`, to restore them from an archive
+  you trust. Ownership is restored as before.
+- A hard link is made only to a file the same extraction wrote. When that file
+  was skipped (`--overwrite skip` over an existing file), excluded from the
+  selection, or not yet written, the link receives the archive's own bytes
+  instead of becoming another name for whatever was already there.
+- Ownership is now applied before permissions, and only when it differs from
+  what is on disk.
+
 ## [0.13.1.0] - 2026-09-13
 
 This release changes how fast Axiom writes and reads archives, not what it

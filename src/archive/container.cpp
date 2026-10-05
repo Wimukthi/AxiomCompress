@@ -11,6 +11,7 @@
 #include "core/archive.hpp"
 #include "core/cpu.hpp"
 #include "core/crypto.hpp"
+#include "core/exclusive_file.hpp"
 #include "core/file_meta.hpp"
 #include "core/file_replace.hpp"
 #include "core/path_text.hpp"
@@ -11592,6 +11593,18 @@ void extract_entries_impl(const std::filesystem::path& archive_path,
     };
     std::vector<DeferredDir> deferred_dirs;
 
+    // Symbolic links are created only after every file and directory of this run
+    // has been written, so nothing the archive stores can be written through a
+    // link that the same archive planted.
+    struct DeferredSymlink {
+        const EntryRec* entry = nullptr;
+        fs::path target;
+    };
+    std::vector<DeferredSymlink> deferred_symlinks;
+    // Regular files this run created, by entry index: the only things a hard link
+    // may be made to. Anything else is rebuilt from the archive's own bytes.
+    std::vector<bool> written(index.entries.size(), false);
+
     for (std::size_t entry_index = 0; entry_index < index.entries.size(); ++entry_index) {
         if (!selected[entry_index]) {
             continue;
@@ -11611,42 +11624,7 @@ void extract_entries_impl(const std::filesystem::path& archive_path,
         reject_symlinked_ancestor(dest_norm, target);
 
         if (entry.type == kEntrySymlink) {
-            fs::create_directories(target.parent_path(), ec);
-            if (fs::exists(fs::symlink_status(target, ec))) {
-                if (options.overwrite == ExtractOptions::Overwrite::skip) {
-                    ++completed_items;
-                    report_operation(operation, OperationStage::extracting, completed_bytes,
-                                     total_bytes, completed_items, total_items, entry.path);
-                    continue;
-                }
-                if (options.overwrite == ExtractOptions::Overwrite::fail) {
-                    throw std::runtime_error("target already exists: " +
-                                             core::path_to_utf8(target));
-                }
-                fs::remove(target, ec);
-            }
-            const fs::path link_to(entry.link_target);
-            const fs::path resolved =
-                link_to.is_absolute() ? link_to : (target.parent_path() / link_to);
-            std::error_code link_ec;
-            if (fs::is_directory(resolved, ec)) {
-                fs::create_directory_symlink(link_to, target, link_ec);
-            } else {
-                fs::create_symlink(link_to, target, link_ec);
-            }
-            // Best effort: creating a symlink can require privilege (Windows
-            // without Developer Mode); on failure the rest of the archive still
-            // extracts rather than aborting.
-            for (const auto& warning : core::apply_metadata(target, entry.meta,
-                                                            options.restore_mtime)) {
-                if (operation) operation->add_warning({entry.path, warning});
-                if (options.strict_metadata) {
-                    throw std::runtime_error(warning + ": " + entry.path);
-                }
-            }
-            ++completed_items;
-            report_operation(operation, OperationStage::extracting, completed_bytes, total_bytes,
-                             completed_items, total_items, entry.path);
+            deferred_symlinks.push_back({&entry, target});
             continue;
         }
 
@@ -11656,11 +11634,16 @@ void extract_entries_impl(const std::filesystem::path& archive_path,
             if (!canonical || index.entries[*canonical].type != kEntryFile) {
                 throw FormatError("archive contains a dangling hard link: " + entry.path);
             }
-            if (!selected[*canonical]) {
-                // A selected hardlink whose canonical file is outside the selection
-                // is materialized directly from the canonical entry. This keeps the
-                // requested output self-contained without exposing unrelated paths.
+            if (!selected[*canonical] || !written[*canonical]) {
+                // The canonical file is outside the selection, was skipped because
+                // its target already existed, or has not been written yet. In each
+                // case whatever sits at its path is not known to be this archive's
+                // file, so the hard link is materialized from the canonical entry's
+                // own bytes instead of being linked to it.
                 file_entry = &index.entries[*canonical];
+                if (selected[*canonical]) {
+                    total_bytes += file_entry->size;
+                }
             } else {
             // The canonical file precedes its hard links in the directory, so its
             // target already exists on disk by the time we reach this entry.
@@ -11670,6 +11653,7 @@ void extract_entries_impl(const std::filesystem::path& archive_path,
                 throw FormatError("hardlink target escapes the destination: " +
                                   entry.link_target);
             }
+            reject_symlinked_ancestor(dest_norm, link_to);
             fs::create_directories(target.parent_path(), ec);
             if (fs::exists(fs::symlink_status(target, ec))) {
                 if (options.overwrite == ExtractOptions::Overwrite::skip) {
@@ -11705,8 +11689,12 @@ void extract_entries_impl(const std::filesystem::path& archive_path,
             fs::create_directories(target, ec);
             // All directory metadata is deferred until descendants are written;
             // restoring a restrictive ACL/read-only attribute first could make a
-            // later child write fail.
-            deferred_dirs.push_back({target, entry.path, entry.meta, entry.mtime});
+            // later child write fail. Only a real directory gets it: if a file is
+            // in the way, its children fail on their own and the file is not
+            // re-permissioned with the directory's mode.
+            if (fs::is_directory(fs::symlink_status(target, ec))) {
+                deferred_dirs.push_back({target, entry.path, entry.meta, entry.mtime});
+            }
             ++completed_items;
             report_operation(operation, OperationStage::extracting, completed_bytes, total_bytes,
                              completed_items, total_items, entry.path);
@@ -11714,7 +11702,9 @@ void extract_entries_impl(const std::filesystem::path& archive_path,
         }
 
         fs::create_directories(target.parent_path(), ec);
-        if (fs::exists(target, ec)) {
+        // symlink_status: a link at the target is an existing entry (even a dangling
+        // one) and is judged by the overwrite policy like any other.
+        if (fs::exists(fs::symlink_status(target, ec))) {
             if (options.overwrite == ExtractOptions::Overwrite::skip) {
                 completed_bytes += file_entry->size;
                 ++completed_items;
@@ -11728,15 +11718,11 @@ void extract_entries_impl(const std::filesystem::path& archive_path,
             }
         }
 
-        fs::path temp_target = target;
-        temp_target += ".axtmp";
-        TempFileGuard temp_guard(temp_target);
+        // The file is staged under a name nobody can have prepared: created new and
+        // never through a link, so the bytes can only land in the file made here.
+        core::StagedFile staged(target);
+        const fs::path& temp_target = staged.path();
         {
-            std::ofstream file_out(temp_target, std::ios::binary | std::ios::trunc);
-            if (!file_out) {
-                throw std::runtime_error("cannot write file: " +
-                                         core::path_to_utf8(temp_target));
-            }
             std::uint64_t current_file_bytes = 0;
             auto file_crc = core::crc32_init();
             core::Blake3 file_hasher;
@@ -11799,9 +11785,7 @@ void extract_entries_impl(const std::filesystem::path& archive_path,
             read_file_bytes(source, index.blocks.size(), *file_entry, operation,
                             [&](std::span<const std::uint8_t> bytes) {
                                 operation_checkpoint(operation);
-                                file_out.write(reinterpret_cast<const char*>(bytes.data()),
-                                               static_cast<std::streamsize>(bytes.size()));
-                                if (!file_out) {
+                                if (!staged.write(bytes)) {
                                     throw std::runtime_error(
                                         "failed writing file: " +
                                         core::path_to_utf8(temp_target));
@@ -11825,6 +11809,10 @@ void extract_entries_impl(const std::filesystem::path& archive_path,
                 throw FormatError("BLAKE3 mismatch for extracted file: " + entry.path);
             }
         }
+        // A close error means buffered data never reached the disk.
+        if (!staged.close()) {
+            throw std::runtime_error("failed writing file: " + core::path_to_utf8(temp_target));
+        }
 
         fs::rename(temp_target, target, ec);
         if (ec) {
@@ -11834,7 +11822,10 @@ void extract_entries_impl(const std::filesystem::path& archive_path,
                 throw std::runtime_error("failed to move extracted file into place: " + ec.message());
             }
         }
-        temp_guard.dismiss();
+        staged.dismiss();
+        if (entry.type == kEntryFile) {
+            written[entry_index] = true;
+        }
 
         if (file_entry->sparse.is_sparse) {
             std::string sparse_error;
@@ -11855,8 +11846,9 @@ void extract_entries_impl(const std::filesystem::path& archive_path,
         // time isn't disturbed by the stream writes that follow it.
         core::apply_ads(target, file_entry->ads);
         // High-precision Windows times (when present) supersede the seconds mtime.
-        for (const auto& warning : core::apply_metadata(target, file_entry->meta,
-                                                        options.restore_mtime)) {
+        for (const auto& warning : core::apply_metadata(
+                 target, file_entry->meta, options.restore_mtime,
+                 options.restore_privileged_metadata)) {
             if (operation) operation->add_warning({entry.path, warning});
             if (options.strict_metadata) {
                 throw std::runtime_error(warning + ": " + entry.path);
@@ -11886,11 +11878,65 @@ void extract_entries_impl(const std::filesystem::path& archive_path,
                          completed_items, total_items, entry.path);
     }
 
+    // Symbolic links go in last, ahead of the directory timestamps because
+    // creating one changes its directory's mtime.
+    for (const auto& deferred : deferred_symlinks) {
+        const auto& entry = *deferred.entry;
+        const fs::path& target = deferred.target;
+        operation_checkpoint(operation);
+        // A link created earlier in this pass may now be an ancestor of this path.
+        reject_symlinked_ancestor(dest_norm, target);
+        fs::create_directories(target.parent_path(), ec);
+        if (fs::exists(fs::symlink_status(target, ec))) {
+            if (options.overwrite == ExtractOptions::Overwrite::skip) {
+                ++completed_items;
+                report_operation(operation, OperationStage::extracting, completed_bytes,
+                                 total_bytes, completed_items, total_items, entry.path);
+                continue;
+            }
+            if (options.overwrite == ExtractOptions::Overwrite::fail) {
+                throw std::runtime_error("target already exists: " +
+                                         core::path_to_utf8(target));
+            }
+            fs::remove(target, ec);
+        }
+        const fs::path link_to(entry.link_target);
+        const fs::path resolved =
+            link_to.is_absolute() ? link_to : (target.parent_path() / link_to);
+        std::error_code link_ec;
+        if (fs::is_directory(resolved, ec)) {
+            fs::create_directory_symlink(link_to, target, link_ec);
+        } else {
+            fs::create_symlink(link_to, target, link_ec);
+        }
+        // Best effort: creating a symlink can require privilege (Windows without
+        // Developer Mode), so a failure is reported and the rest of the archive
+        // still extracts. Metadata is applied only to a link that was really
+        // created; otherwise `target` is whatever was already there.
+        if (link_ec) {
+            const std::string warning = "symbolic link could not be created: " + link_ec.message();
+            if (operation) operation->add_warning({entry.path, warning});
+        } else {
+            for (const auto& warning : core::apply_metadata(
+                     target, entry.meta, options.restore_mtime,
+                     options.restore_privileged_metadata)) {
+                if (operation) operation->add_warning({entry.path, warning});
+                if (options.strict_metadata) {
+                    throw std::runtime_error(warning + ": " + entry.path);
+                }
+            }
+        }
+        ++completed_items;
+        report_operation(operation, OperationStage::extracting, completed_bytes, total_bytes,
+                         completed_items, total_items, entry.path);
+    }
+
     // Restore directory timestamps last (deepest-first) so nothing written into a
     // directory afterward disturbs its restored time.
     for (auto it = deferred_dirs.rbegin(); it != deferred_dirs.rend(); ++it) {
-        for (const auto& warning : core::apply_metadata(it->target, it->meta,
-                                                        options.restore_mtime)) {
+        for (const auto& warning : core::apply_metadata(
+                 it->target, it->meta, options.restore_mtime,
+                 options.restore_privileged_metadata)) {
             if (operation) operation->add_warning({it->archive_path, warning});
             if (options.strict_metadata) {
                 throw std::runtime_error(warning + ": " + core::path_to_utf8(it->target));

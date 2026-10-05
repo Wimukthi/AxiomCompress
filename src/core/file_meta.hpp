@@ -138,13 +138,25 @@ FileMetadata capture_metadata(const std::filesystem::path& path);
 
 // Reapply metadata to an extracted path, best-effort. Attributes are always
 // restored when present; timestamps are restored only when `restore_times` is set.
-// A no-op on non-Windows builds.
 // Reapply metadata after content is safely materialized. The returned messages
 // identify best-effort failures so callers can surface them or fail in strict
 // mode. Empty means every requested operation succeeded or was not applicable.
+//
+// What the path is on disk decides how it is treated, never what the archive says
+// it was: a symbolic link is never followed to change a mode, whatever mode the
+// archive stored for it.
+//
+// Privileged metadata is withheld unless `restore_privileged` is set, so that an
+// archive cannot plant a set-user-ID program or a file with capabilities by
+// itself. On POSIX that is the set-user-ID/set-group-ID bits of files and the
+// extended attributes outside the plain `user.` namespace (`security.*`,
+// `trusted.*`, `system.*`: file capabilities, SELinux labels, POSIX ACLs); each
+// file with withheld extended attributes yields one message naming them. Windows
+// restores its attributes, security descriptor and times as before.
 std::vector<std::string> apply_metadata(const std::filesystem::path& path,
                                         const FileMetadata& meta,
-                                        bool restore_times);
+                                        bool restore_times,
+                                        bool restore_privileged = false);
 
 // Apply an opaque Windows reparse point after the target has been created. On
 // platforms without Windows reparse controls this reports a single failure.

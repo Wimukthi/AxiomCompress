@@ -18,10 +18,46 @@
 #pragma comment(lib, "bcrypt")  // auto-link; the g++ build passes -lbcrypt instead
 #endif
 #else
-#include <fstream>
+#include <algorithm>
+#include <cerrno>
+#include <fcntl.h>
+#include <unistd.h>
+#if defined(__linux__) || defined(__APPLE__)
+#include <sys/random.h>
+#endif
 #endif
 
 namespace axiom::core {
+
+#if !defined(_WIN32)
+namespace {
+
+// Reads from /dev/urandom with plain descriptors: a stream would buffer a few
+// KiB of the kernel's output for every handful of bytes asked for.
+bool fill_from_urandom(std::uint8_t* cursor, std::size_t remaining) {
+    int flags = O_RDONLY;
+#ifdef O_CLOEXEC
+    flags |= O_CLOEXEC;
+#endif
+    const int fd = ::open("/dev/urandom", flags);
+    if (fd < 0) return false;
+    bool ok = true;
+    while (remaining != 0) {
+        const ssize_t got = ::read(fd, cursor, remaining);
+        if (got < 0 && errno == EINTR) continue;
+        if (got <= 0) {
+            ok = false;
+            break;
+        }
+        cursor += got;
+        remaining -= static_cast<std::size_t>(got);
+    }
+    ::close(fd);
+    return ok;
+}
+
+}  // namespace
+#endif
 
 void random_bytes(std::span<std::uint8_t> out) {
     if (out.empty()) {
@@ -34,9 +70,32 @@ void random_bytes(std::span<std::uint8_t> out) {
         throw std::runtime_error("secure random generation failed");
     }
 #else
-    std::ifstream urandom("/dev/urandom", std::ios::binary);
-    if (!urandom ||
-        !urandom.read(reinterpret_cast<char*>(out.data()), static_cast<std::streamsize>(out.size()))) {
+    std::uint8_t* cursor = out.data();
+    std::size_t remaining = out.size();
+#if defined(__linux__) || defined(__APPLE__)
+    // One system call and no file descriptor. getentropy() takes at most 256
+    // bytes per call, so ask in pieces of that size on every platform.
+    while (remaining != 0) {
+        const std::size_t want = std::min<std::size_t>(remaining, 256);
+#if defined(__linux__)
+        const ssize_t got = ::getrandom(cursor, want, 0);
+        if (got <= 0) {
+            if (got < 0 && errno == EINTR) continue;
+            break;  // ENOSYS on an old kernel, or no entropy source: try the device
+        }
+        const auto produced = static_cast<std::size_t>(got);
+#else
+        if (::getentropy(cursor, want) != 0) break;
+        const std::size_t produced = want;
+#endif
+        cursor += produced;
+        remaining -= produced;
+    }
+    if (remaining == 0) {
+        return;
+    }
+#endif
+    if (!fill_from_urandom(cursor, remaining)) {
         throw std::runtime_error("secure random generation failed");
     }
 #endif

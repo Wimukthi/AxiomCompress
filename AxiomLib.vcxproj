@@ -94,6 +94,7 @@
     <ClInclude Include="src\core\benchmark_corpus.hpp" />
     <ClInclude Include="src\core\benchmark_statistics.hpp" />
     <ClInclude Include="src\core\crypto.hpp" />
+    <ClInclude Include="src\core\exclusive_file.hpp" />
     <ClInclude Include="src\core\file_meta.hpp" />
     <ClInclude Include="src\core\path_text.hpp" />
     <ClInclude Include="src\core\file_replace.hpp" />

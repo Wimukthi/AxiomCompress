@@ -90,6 +90,9 @@
     <ClInclude Include="src\core\crypto.hpp">
       <Filter>Core</Filter>
     </ClInclude>
+    <ClInclude Include="src\core\exclusive_file.hpp">
+      <Filter>Core</Filter>
+    </ClInclude>
     <ClInclude Include="src\core\file_meta.hpp">
       <Filter>Core</Filter>
     </ClInclude>
