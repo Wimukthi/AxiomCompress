@@ -351,8 +351,24 @@ std::vector<AdsStream> capture_ads(const std::filesystem::path& path) {
     return streams;
 }
 
-void apply_ads(const std::filesystem::path& path, const std::vector<AdsStream>& streams) {
+std::vector<std::string> apply_ads(const std::filesystem::path& path,
+                                   const std::vector<AdsStream>& streams) {
+    std::vector<std::string> warnings;
     for (const auto& stream : streams) {
+        // The name is appended to the file's path, so anything that could change
+        // which file or stream that path means is refused: separators and ':'
+        // (checked when the archive is read, repeated for callers that build
+        // streams themselves), a leading '$' (NTFS attribute names such as $DATA
+        // address the file's own contents) and control characters.
+        const bool unsafe =
+            !is_valid_ads_name(stream.name) || stream.name.front() == '$' ||
+            std::any_of(stream.name.begin(), stream.name.end(),
+                        [](unsigned char ch) { return ch < 0x20; });
+        if (unsafe) {
+            warnings.push_back(
+                "an alternate data stream with an unsafe name was not restored");
+            continue;
+        }
         const std::wstring stream_path = path.wstring() + L":" + widen_utf8(stream.name);
         const HANDLE handle = CreateFileW(stream_path.c_str(), GENERIC_WRITE,
                                           FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
@@ -373,6 +389,7 @@ void apply_ads(const std::filesystem::path& path, const std::vector<AdsStream>& 
         }
         CloseHandle(handle);
     }
+    return warnings;
 }
 
 SparseCaptureResult capture_sparse_file(const std::filesystem::path& path,
@@ -828,7 +845,9 @@ std::vector<AdsStream> capture_ads(const std::filesystem::path&) {
     return {};
 }
 
-void apply_ads(const std::filesystem::path&, const std::vector<AdsStream>&) {}
+std::vector<std::string> apply_ads(const std::filesystem::path&, const std::vector<AdsStream>&) {
+    return {};
+}
 
 SparseCaptureResult capture_sparse_file(const std::filesystem::path& path,
                                         std::uint64_t logical_size) {

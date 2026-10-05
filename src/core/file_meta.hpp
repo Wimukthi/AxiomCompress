@@ -4,6 +4,7 @@
 #include <filesystem>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace axiom::core {
@@ -14,6 +15,15 @@ struct AdsStream {
     std::string name;                  // stream name, UTF-8 (no ':' or ':$DATA')
     std::vector<std::uint8_t> data;    // stream bytes
 };
+
+// Whether `name` can be an alternate-data-stream name as Windows reports it:
+// non-empty, with no path separator, no ':' (which separates a stream from its
+// type) and no NUL. A name that fails this can only come from a hand-built
+// archive, and appended to a file's path it would address something else.
+inline bool is_valid_ads_name(std::string_view name) noexcept {
+    return !name.empty() &&
+           name.find_first_of(std::string_view("\\/:\0", 4)) == std::string_view::npos;
+}
 
 // A bounded named metadata value. On POSIX this carries an extended attribute;
 // other platforms may use the same shape for future filesystem metadata.
@@ -76,8 +86,10 @@ bool is_reparse_point(const std::filesystem::path& path);
 std::vector<AdsStream> capture_ads(const std::filesystem::path& path);
 
 // Recreate named alternate data streams beside an extracted file, best-effort.
-// A no-op on non-Windows builds.
-void apply_ads(const std::filesystem::path& path, const std::vector<AdsStream>& streams);
+// A stream whose name could address anything but a plain named stream is not
+// restored and is reported in the returned messages. A no-op on non-Windows builds.
+std::vector<std::string> apply_ads(const std::filesystem::path& path,
+                                   const std::vector<AdsStream>& streams);
 
 // Capture the allocated ranges of a sparse file. Dense files return no map and
 // no warning. A warning is returned only when the file appears sparse but the

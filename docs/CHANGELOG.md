@@ -37,8 +37,39 @@ the same archive bytes are produced.
 - A directory entry applies its recorded mode and times only to a real
   directory, not to a file that happens to be at the same path.
 
+### Fixed
+
+- Extracting an archive no longer silently drops a hard link whose target comes
+  later in the entry list. Replacing only the file a hard link points to (for
+  example `axiomc a archive file` after editing it) leaves the link ahead of
+  the new entry, and extraction used to skip the link without a message. It now
+  writes the link's path from the target's bytes.
+- Adding or updating files with explicit archive destinations no longer takes
+  quadratic time in the number of entries. Adding 100,000 files to an archive
+  of 100,000 entries took 463 s and now takes 9.6 s (4-vCPU virtual machine,
+  measured 2026-10-05).
+- Snapshot and deduplicated-archive directories now catch a file that has
+  entries beneath it when another path sorts between them (`a`, `a.txt`,
+  `a/b`); the earlier check compared only neighbours in sorted order.
+
 ### Changed
 
+- Creating, adding, updating and syncing now refuse destinations that no
+  extraction could restore: two items for one archive path (for example two
+  inputs that share a file name) or an item beneath a file. Creation used to
+  write such an archive, which could not be extracted faithfully.
+- `axiomc t` checks the entry list as well as the data. It fails an archive that
+  holds a path extraction refuses or a hard link with no file to share bytes
+  with, and prints a warning for a path used by more than one entry or an entry
+  beneath a non-directory. Existing archives still open, list and extract.
+- `axiomc x`, `axiomc snapshot restore` and `axiomc t` now print the warnings an
+  operation collects (metadata that could not be restored, links that could
+  not be created, withheld privileged attributes) on standard error, up to 25
+  of them. They were collected and never shown.
+- An alternate-data-stream name that is empty or contains `\`, `/`, `:` or NUL,
+  and a stored path that contains NUL, are rejected when the archive is read.
+  Names such as `$DATA` and names with control characters are not restored on
+  Windows, with a warning.
 - Extraction withholds privileged metadata unless asked. Extended attributes
   outside the `user.` namespace on Linux (`security.*`, `trusted.*`,
   `system.*`, which include file capabilities) used to be restored whenever the
