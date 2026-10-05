@@ -14,9 +14,10 @@ Entries are condensed from the
 
 ## [Unreleased]
 
-Extraction is stricter about links and privileged metadata. The archive format
-is unchanged: archives written by any earlier build extract with this one, and
-the same archive bytes are produced.
+Extraction is stricter about links and privileged metadata, and several
+compression paths are faster. The archive format is unchanged: archives written
+by any earlier build extract with this one, and for the same input and settings
+the same archive bytes are produced (recovery records excepted; see Fixed).
 
 ### Security
 
@@ -49,6 +50,32 @@ the same archive bytes are produced.
   or subframe may declare. `DecompressionOptions::max_output_size` now bounds
   blocks during `test_archive` as well. The default is unchanged (4 GiB). See
   "Archives you don't trust" in the CLI guide.
+
+### Performance
+
+All timings are from a 4-vCPU virtual machine, measured 2026-10-05; read them as
+relative.
+
+- The zstd, LZMA2 and Deflate backends compress and decompress their
+  independently decodable chunks on several threads. They ran the chunks one
+  after another, so `--threads 4` was no faster than `--threads 1`. Chunk
+  boundaries and the codec settings are unchanged, so the encoded bytes are
+  identical to the serial writer's. A 104 MB input on four threads: LZMA2 36.8 s
+  to 10.7 s, zstd 2.34 s to 1.30 s, Deflate 3.4 s to 1.5 s. Memory in flight is
+  bounded: LZMA2 encoders hold a dictionary each, so the number of chunks
+  compressed at once is limited to what fits in about 3 GiB.
+- Levels 8 and 9 no longer slow down sharply on long repeated runs. The optimal
+  parser re-measured how far each of its eight recent offsets matches from
+  scratch at every position, which is quadratic inside a run of one byte. It now
+  carries the previous position's measurement forward when that measurement is
+  still exact, so the result is the same match for the same position and the
+  archive bytes do not change. 64 MiB of zeros at level 9 took 87.7 CPU-s and now
+  takes 36.4; 5 MiB of one byte at level 9 went from 7.7 s to 3.5 s.
+- An idle task executor no longer polls. Workers waited with a 100 microsecond
+  timeout, so an executor that stayed alive between operations spent CPU doing
+  nothing: 4 idle workers used 1.43 CPU-s per 3 s and 16 used 2.54. Workers, and
+  threads waiting for a result, now sleep until work arrives or the result is
+  ready (0.001 and 0.003 CPU-s over the same 3 s).
 
 ### Fixed
 

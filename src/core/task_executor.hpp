@@ -7,6 +7,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
+#include <cstdint>
 #include <deque>
 #include <functional>
 #include <future>
@@ -48,7 +49,7 @@ public:
 
     ~TaskExecutor() {
         stopping_.store(true, std::memory_order_release);
-        ready_.notify_all();
+        signal(/*all=*/true);
         for (auto& helper : helpers_) {
             helper.join();
         }
@@ -78,7 +79,15 @@ public:
             throw std::runtime_error("task submitted after executor shutdown");
         }
 
-        auto wrapper = [task] { (*task)(); };
+        auto wrapper = [this, task] {
+            (*task)();
+            // Threads blocked in wait() are woken when a task finishes, and only
+            // then: the fence pairs with the one in wait_until_ready().
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+            if (future_waiters_.load(std::memory_order_relaxed) != 0) {
+                signal(/*all=*/true);
+            }
+        };
         if (current_executor_ == this) {
             auto& queue = *queues_[current_worker_];
             std::lock_guard lock(queue.mutex);
@@ -92,26 +101,18 @@ public:
             injected_.emplace_back(std::move(wrapper));
             pending_.fetch_add(1, std::memory_order_release);
         }
-        ready_.notify_one();
+        signal(/*all=*/false);  // one sleeper is enough to take the task
         return future;
     }
 
     template <typename Result>
     Result wait(std::future<Result>& future) {
-        while (future.wait_for(std::chrono::seconds(0)) != std::future_status::ready) {
-            if (!run_one(active_worker())) {
-                wait_for_work();
-            }
-        }
+        wait_until_ready(future);
         return future.get();
     }
 
     void wait(std::future<void>& future) {
-        while (future.wait_for(std::chrono::seconds(0)) != std::future_status::ready) {
-            if (!run_one(active_worker())) {
-                wait_for_work();
-            }
-        }
+        wait_until_ready(future);
         future.get();
     }
 
@@ -178,12 +179,70 @@ private:
         return true;
     }
 
-    void wait_for_work() {
+    // Sleeping is event-driven. Every event a sleeper could be waiting for (a task
+    // submitted, a task finished while someone waits on it, shutdown) bumps
+    // `epoch_` under `wait_mutex_`; a sleeper reads the epoch BEFORE it looks for
+    // work and sleeps only while the epoch is still the one it read, so an event
+    // that lands in between cannot be missed. Idle threads therefore use no CPU,
+    // where a timed poll kept every helper waking thousands of times a second.
+    std::uint64_t observe() const noexcept {
+        return epoch_.load(std::memory_order_acquire);
+    }
+
+    void signal(bool all) {
+        {
+            std::lock_guard lock(wait_mutex_);
+            epoch_.fetch_add(1, std::memory_order_release);
+        }
+        if (all) {
+            ready_.notify_all();
+        } else {
+            ready_.notify_one();
+        }
+    }
+
+    // Sleeps until the epoch moves past `seen` (or shutdown). A finite `timeout`
+    // is only a safety net for futures this executor did not hand out.
+    void sleep_until_signalled(std::uint64_t seen,
+                               std::chrono::milliseconds timeout = std::chrono::milliseconds::zero()) {
         std::unique_lock lock(wait_mutex_);
-        ready_.wait_for(lock, std::chrono::microseconds(100), [this] {
-            return stopping_.load(std::memory_order_acquire) ||
-                   pending_.load(std::memory_order_acquire) != 0;
-        });
+        const auto moved = [this, seen] {
+            return epoch_.load(std::memory_order_acquire) != seen ||
+                   stopping_.load(std::memory_order_acquire);
+        };
+        if (timeout.count() == 0) {
+            ready_.wait(lock, moved);
+        } else {
+            ready_.wait_for(lock, timeout, moved);
+        }
+    }
+
+    template <typename Future>
+    void wait_until_ready(Future& future) {
+        // Registered before the future is checked: a task that finishes after
+        // the check then sees a waiter and signals (the fences make it so that
+        // one side or the other must see the other's write).
+        future_waiters_.fetch_add(1, std::memory_order_relaxed);
+        struct Unregister {
+            std::atomic_size_t& count;
+            ~Unregister() { count.fetch_sub(1, std::memory_order_relaxed); }
+        } unregister{future_waiters_};
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        while (true) {
+            const auto seen = observe();
+            if (future.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+                // A submit wakes one sleeper. If that was this thread, and it is
+                // leaving without taking the task, pass the wake-up on.
+                if (pending_.load(std::memory_order_acquire) != 0) {
+                    signal(/*all=*/false);
+                }
+                return;
+            }
+            if (run_one(active_worker())) {
+                continue;
+            }
+            sleep_until_signalled(seen, std::chrono::milliseconds(10));
+        }
     }
 
     void worker_loop(std::size_t worker) {
@@ -194,6 +253,7 @@ private:
         current_executor_ = this;
         current_worker_ = worker;
         while (true) {
+            const auto seen = observe();
             if (run_one(worker)) {
                 continue;
             }
@@ -201,7 +261,7 @@ private:
                 pending_.load(std::memory_order_acquire) == 0) {
                 break;
             }
-            wait_for_work();
+            sleep_until_signalled(seen);
         }
         current_executor_ = nullptr;
         current_worker_ = 0;
@@ -213,6 +273,8 @@ private:
     std::deque<std::function<void()>> injected_;
     std::mutex wait_mutex_;
     std::condition_variable ready_;
+    std::atomic<std::uint64_t> epoch_{0};
+    std::atomic_size_t future_waiters_{0};
     std::atomic_size_t pending_{0};
     std::atomic_size_t steal_cursor_{0};
     std::atomic_bool stopping_{false};

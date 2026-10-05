@@ -243,6 +243,55 @@ std::size_t match_length_at(std::span<const std::uint8_t> input,
     return common_prefix(input.data() + source, input.data() + position, limit);
 }
 
+// match_length_at() for a parser that asks about consecutive positions. Inside a
+// long run the repeat distances stay the same from one position to the next, and
+// then the answer follows from the previous one without comparing the run again:
+//
+//   * a match that ended before its limit at position-1 is exactly one byte
+//     shorter at position;
+//   * one that stopped at the limit has at least limit-1 bytes left, so only the
+//     bytes past that need comparing.
+//
+// Without it every position of a long run re-scans up to max_match bytes for each
+// of the four repeat distances, which is most of the optimal parser's time on
+// zero-filled or periodic data. The results are identical to match_length_at(),
+// including its rule that a match shorter than four bytes counts as none (so the
+// shortcut is used only where the previous answer was long enough to rule that
+// out).
+class RepLengthCache {
+public:
+    std::size_t length(std::span<const std::uint8_t> input, std::size_t position,
+                       std::size_t distance, std::size_t limit) {
+        Entry& entry = entries_[(static_cast<std::uint32_t>(distance) * 2654435761u) >> 29];
+        std::size_t result;
+        if (entry.distance == distance && entry.position + 1 == position &&
+            entry.length >= 5 && distance <= position) {
+            result = entry.length - 1;
+            if (entry.length == entry.limit) {
+                // The previous probe hit its limit: the match may run on.
+                const auto* here = input.data() + position;
+                const auto* source = here - distance;
+                while (result < limit && here[result] == source[result]) {
+                    ++result;
+                }
+            }
+        } else {
+            result = match_length_at(input, position, distance, limit);
+        }
+        entry = {distance, position, result, limit};
+        return result;
+    }
+
+private:
+    struct Entry {
+        std::size_t distance = 0;
+        std::size_t position = 0;
+        std::size_t length = 0;
+        std::size_t limit = 0;
+    };
+    std::array<Entry, 8> entries_{};
+};
+
 void write_literal_run(ByteVector& output,
                        std::span<const std::uint8_t> input,
                        std::size_t start,
@@ -2025,6 +2074,7 @@ ByteVector optimal_parse_with_costs(std::span<const std::uint8_t> input,
     CompressionTelemetryScope dp_telemetry(
         options, CompressionTelemetryPhase::lz77_optimal_dp, input.size());
     std::size_t position_slot = 0;
+    RepLengthCache rep_cache;
     for (std::size_t position = 0; position < input.size(); ++position) {
         if (position_slot == cost_ring_size) {
             position_slot = 0;
@@ -2133,7 +2183,7 @@ ByteVector optimal_parse_with_costs(std::span<const std::uint8_t> input,
         const auto& reps = reps_at[position];
         const auto rep_limit = std::min(max_match, input.size() - position);
         for (std::size_t i = 0; i < kRepCount; ++i) {
-            const auto rep_length = match_length_at(input, position, reps[i], rep_limit);
+            const auto rep_length = rep_cache.length(input, position, reps[i], rep_limit);
             if (rep_length < kMinMatch) {
                 continue;
             }
@@ -2393,6 +2443,7 @@ ByteVector parse_checkpoint_tile(std::span<const std::uint8_t> input,
     std::size_t match_cursor = 0;
     const auto cost_ring_size = costs.size();
     std::size_t local_slot = 0;
+    RepLengthCache rep_cache;
     for (std::size_t local = 0; local < length; ++local) {
         if (local_slot == cost_ring_size) {
             local_slot = 0;
@@ -2478,7 +2529,7 @@ ByteVector parse_checkpoint_tile(std::span<const std::uint8_t> input,
         const auto rep_limit = std::min(max_match, length - local);
         for (std::size_t index = 0; index < kRepCount; ++index) {
             const auto rep_length =
-                match_length_at(input, position, reps[index], rep_limit);
+                rep_cache.length(input, position, reps[index], rep_limit);
             if (rep_length < kMinMatch) {
                 continue;
             }
