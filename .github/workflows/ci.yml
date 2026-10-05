@@ -56,6 +56,25 @@ jobs:
         shell: pwsh
         run: .\tools\test_sfx_footprint.ps1 -BuildRoot .\build -Configuration Release
 
+  # The whole test suite under AddressSanitizer, UndefinedBehaviorSanitizer and
+  # LeakSanitizer. The fuzz jobs below cover the decode surfaces only; this one
+  # also covers extraction, the writers, encryption, recovery and the thread
+  # pool. Any report fails the run (see AXIOM_SANITIZE in CMakeLists.txt).
+  sanitizers-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Configure
+        run: >
+          cmake -B build-san -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          -DAXIOM_WARNINGS_AS_ERRORS=ON -DAXIOM_SANITIZE=address,undefined
+      - name: Build
+        run: cmake --build build-san --parallel
+      - name: Test
+        env:
+          UBSAN_OPTIONS: print_stacktrace=1
+        run: ctest --test-dir build-san --output-on-failure --parallel 4
+
   # Coverage-guided libFuzzer under AddressSanitizer over the untrusted decode
   # surfaces: the single-stream decoder and the archive container parser.
   fuzz-linux:

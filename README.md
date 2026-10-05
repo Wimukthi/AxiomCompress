@@ -162,7 +162,10 @@ compressor sees byte-identical input. AMD Ryzen 9 5950X (16 cores / 32
 threads), warm cache, Release build. Every row was decompressed and compared
 against the original before it was recorded.
 
-> These are the **0.8.0.0** figures, measured 2026-07-31.
+> These are the **0.8.0.0** figures, measured 2026-07-31, and they have not been
+> re-measured since. Later releases changed speed in places (see the
+> [changelog](docs/CHANGELOG.md)); treat the timings as a baseline, not as
+> what the current build does on the same machine.
 
 | Compressor and setting | Compressed | Ratio | Pack | Unpack |
 |---|---:|---:|---:|---:|
@@ -254,8 +257,9 @@ elsewhere. Non-Windows builds produce the library, the CLI, and the tests only.
 
 The round-trip suite covers the codec, the container, the safety rules, and an
 in-process mutation fuzzer. CI builds and tests on Windows, Linux, and macOS,
-and runs both decode-surface fuzz targets on Linux and Windows for every push.
-The scheduled run fuzzes for longer.
+runs the whole suite under AddressSanitizer and UndefinedBehaviorSanitizer on
+Linux, and runs both decode-surface fuzz targets on Linux and Windows for every
+push. The scheduled run fuzzes for longer.
 
 ## Documentation
 
@@ -266,6 +270,7 @@ the same folder, which ends up as `docs\` beside `Axiom.exe`.
 |---|---|
 | [docs/GUI_GUIDE.md](docs/GUI_GUIDE.md) | Using the Windows app |
 | [docs/CLI_GUIDE.md](docs/CLI_GUIDE.md) | Every `axiomc` command and option |
+| [docs/SECURITY.md](docs/SECURITY.md) | What extraction promises for archives you didn't make, and where it stops |
 | [docs/GLOSSARY.md](docs/GLOSSARY.md) | What the terminology means, in plain language |
 | [docs/FORMAT_SUPPORT.md](docs/FORMAT_SUPPORT.md) | What Axiom can do with each archive format |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | How the codec and container are built, and why |

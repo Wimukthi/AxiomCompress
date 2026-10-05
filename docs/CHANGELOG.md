@@ -36,10 +36,31 @@ the same archive bytes are produced (recovery records excepted; see Fixed).
   previously have the permissions of its target changed; the path's type on disk
   now decides, and permission bits are never applied through a link.
 - A directory entry applies its recorded mode and times only to a real
-  directory, not to a file that happens to be at the same path.
+  directory, not to a file that happens to be at the same path, and not to a
+  link that an entry for the same path has replaced it with (the time used to
+  follow the link and change its target's).
+- On Windows, restoring metadata no longer follows a link: timestamps are set on
+  the link itself, and the stored security descriptor, which in archives Axiom
+  writes describes the link's target, is not applied to a link.
+- The update check refuses to follow a redirect from HTTPS to plain HTTP (the
+  release data and the installer's digest travel that way) and ignores a
+  release asset whose name is not a plain file name.
+- On Windows, a Release build of the 7-Zip provider loads `7z.dll` only from
+  beside the program (`backends\7zip`). Earlier builds, when that copy was
+  missing, went on to look for `third_party\7zip\win-x64\7z.dll` relative to
+  the folder the program was started in, so a library placed there would have
+  been loaded. Source-tree builds (CMake and debug) keep that search, because
+  they do not copy the library beside the program.
 
 ### Added
 
+- [SECURITY.md](SECURITY.md) states what extraction promises for archives you
+  didn't make and where it stops, including the Windows gaps that have no fix
+  yet (the Mark of the Web, code-page arguments, the updater's trust model).
+- `-DAXIOM_SANITIZE=address,undefined` builds the library and tools with those
+  sanitizers, and CI now runs the whole test suite that way on Linux. The fuzz
+  jobs cover only the decode surfaces; this one also covers extraction, the
+  writers, encryption, recovery and the thread pool.
 - `axiomc a`, `u`, `f`, `s` and `delete` work on `.zip` archives. They used to
   call only the AXAR writer, so `axiomc a project.zip src` produced an AXAR file
   with a `.zip` name and the others failed on a real ZIP. The format now follows
@@ -109,6 +130,9 @@ relative.
   owner only, nothing existing is overwritten or followed, and the key is wiped
   from memory afterwards (the old wipe could be optimized away).
 - `random_bytes` no longer opens `/dev/urandom` through a stream on every call.
+- `OperationControl::latest_progress` could, on CPUs that reorder loads (ARM),
+  return a progress sample that mixes two updates. The reader now orders its
+  loads before it re-checks the version.
 - Password-protected archives no longer let their header choose how long a wrong
   password takes. The Argon2 lane count was checked with a 32-bit multiplication
   that wraps for lane counts of 2^29 and above, so a header with a huge lane

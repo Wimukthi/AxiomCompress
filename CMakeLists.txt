@@ -9,6 +9,23 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+# Instrumented builds, for GCC and Clang. CI runs the whole test suite this way:
+#   cmake -B build-san -DCMAKE_BUILD_TYPE=RelWithDebInfo -DAXIOM_SANITIZE=address,undefined
+# An undefined-behaviour report stops the process (-fno-sanitize-recover), so a
+# finding in our code fails the run rather than scrolling past in the log.
+set(AXIOM_SANITIZE "" CACHE STRING
+    "Comma-separated sanitizers to build with, for example address,undefined")
+if(AXIOM_SANITIZE)
+    if(MSVC)
+        message(FATAL_ERROR "AXIOM_SANITIZE is for GCC and Clang builds")
+    endif()
+    add_compile_options(-fsanitize=${AXIOM_SANITIZE} -fno-omit-frame-pointer)
+    add_link_options(-fsanitize=${AXIOM_SANITIZE})
+    if(AXIOM_SANITIZE MATCHES "undefined")
+        add_compile_options(-fno-sanitize-recover=undefined)
+    endif()
+endif()
+
 # Vendored BLAKE3. x86 SIMD backends are runtime-dispatched by CPUID; other
 # architectures use the portable implementation because this source snapshot
 # does not include BLAKE3's optional NEON translation unit.
@@ -165,6 +182,12 @@ if(MSVC)
     endif()
 else()
     set_source_files_properties(${BLAKE3_SOURCES} ${MONOCYPHER_SOURCES} ${MINIZ_SOURCES} ${ZSTD_SOURCES} ${LZMA_SDK_SOURCES} ${MINIZIP_NG_SOURCES} PROPERTIES COMPILE_OPTIONS -w)
+    if(AXIOM_SANITIZE MATCHES "undefined")
+        # The vendored LZMA SDK encoder stores 32-bit values through misaligned
+        # pointers. That is harmless on the CPUs we target and not ours to change.
+        set_property(SOURCE ${LZMA_SDK_SOURCES} APPEND PROPERTY
+            COMPILE_OPTIONS -fno-sanitize=alignment)
+    endif()
     if(AXIOM_X86)
         set_source_files_properties(src/core/checksum_clmul.cpp PROPERTIES COMPILE_OPTIONS "-msse4.1;-mpclmul")
         set_source_files_properties(src/third_party/blake3/blake3_sse2.c PROPERTIES COMPILE_OPTIONS "-w;-msse2")
@@ -177,6 +200,11 @@ endif()
 # Windows CSPRNG (BCryptGenRandom) used by core/crypto.
 if(WIN32)
     target_link_libraries(axiom PUBLIC advapi32 bcrypt ole32 oleaut32)
+    # A CMake build does not copy 7z.dll beside its programs, so the 7z provider
+    # also looks for the copy in the source tree, starting from the working
+    # directory. The shipped Release programs are built by tools/build_msvc.ps1,
+    # which does copy it, and do not search the working directory.
+    target_compile_definitions(axiom PRIVATE AXIOM_7Z_SOURCE_TREE_SEARCH)
 endif()
 
 set(AXIOMC_SOURCES

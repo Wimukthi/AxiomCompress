@@ -812,6 +812,11 @@ std::optional<fs::path> seven_zip_library_path() {
     }
 
     std::error_code error;
+#if defined(AXIOM_7Z_SOURCE_TREE_SEARCH) || !defined(NDEBUG)
+    // Running from a source checkout (a CMake build, or a debug build started from
+    // the repository): the repository's own copy, found from the working
+    // directory. Release builds leave this out so that a shipped program never
+    // loads native code from whatever folder it happened to be started in.
     const fs::path current = fs::current_path(error);
     if (!error) {
         candidates.push_back(
@@ -820,6 +825,7 @@ std::optional<fs::path> seven_zip_library_path() {
             current.parent_path() / L"third_party" / L"7zip" /
             L"win-x64" / L"7z.dll");
     }
+#endif
 
     for (const auto& candidate : candidates) {
         if (fs::is_regular_file(candidate, error) && !error) return candidate;

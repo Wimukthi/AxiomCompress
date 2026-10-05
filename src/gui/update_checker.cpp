@@ -342,7 +342,28 @@ std::string lower_ascii(std::string value) {
     return value;
 }
 
+// The asset name becomes a file name in the update folder, so it must be a plain
+// name: no path separators, no drive or stream colon, no wildcard, control or
+// reserved characters, and no ".." anywhere.
+bool plain_file_name(std::string_view name) {
+    constexpr std::size_t kMaxNameBytes = 128;
+    if (name.empty() || name.size() > kMaxNameBytes) return false;
+    for (const unsigned char ch : name) {
+        if (ch < 0x20 || ch == 0x7F) return false;
+        switch (ch) {
+            case '\\': case '/': case ':': case '*': case '?':
+            case '"': case '<': case '>': case '|':
+                return false;
+            default:
+                break;
+        }
+    }
+    return name.find("..") == std::string_view::npos && name.back() != ' ' &&
+           name.back() != '.';
+}
+
 bool installer_asset_name(std::string_view name) {
+    if (!plain_file_name(name)) return false;
     const std::string lower = lower_ascii(std::string(name));
     return (lower.starts_with("axiomcompresssetup-") || lower.starts_with("axiomsetup-")) &&
            lower.ends_with("-win-x64.exe");
@@ -408,7 +429,11 @@ std::optional<std::vector<BYTE>> http_get(std::wstring_view url, std::wstring& e
         error = L"Could not create update request: " + last_error_text();
         return std::nullopt;
     }
-    DWORD redirect = WINHTTP_OPTION_REDIRECT_POLICY_ALWAYS;
+    // Follow redirects (release assets are served from another host) but never
+    // from HTTPS down to HTTP: the release metadata and the installer's digest
+    // travel this way, and a downgrade would let anyone on the path substitute
+    // both.
+    DWORD redirect = WINHTTP_OPTION_REDIRECT_POLICY_DISALLOW_HTTPS_TO_HTTP;
     WinHttpSetOption(request.get(), WINHTTP_OPTION_REDIRECT_POLICY, &redirect, sizeof(redirect));
     const wchar_t headers[] =
         L"Accept: application/vnd.github+json\r\n"
@@ -704,6 +729,14 @@ void start_update_download(HWND notify_window, UpdateInfo update) {
             return;
         }
         const std::filesystem::path installer = *directory / result->update.asset_name;
+        // Belt and braces after installer_asset_name(): the file must land
+        // directly inside the update folder.
+        if (installer.parent_path() != *directory ||
+            installer.filename() != std::filesystem::path(result->update.asset_name)) {
+            result->message = L"The release asset name is not a plain file name.";
+            post_owned_result(notify_window, kUpdateDownloadCompleteMessage, std::move(result));
+            return;
+        }
         if (!write_download(installer, *bytes, error)) {
             result->message = std::move(error);
             post_owned_result(notify_window, kUpdateDownloadCompleteMessage, std::move(result));

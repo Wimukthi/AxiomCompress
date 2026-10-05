@@ -405,7 +405,8 @@ Extract into a new, empty folder, run `test` first (it reports repeated paths
 and refuses unsafe ones), and leave `--restore-privileged` off. Key derivation
 for password-protected archives is bounded by the format regardless: a header
 that asks for more than about six seconds of work per derivation is refused
-before any of it is done.
+before any of it is done. [SECURITY.md](SECURITY.md) lists what extraction
+promises and where it stops.
 
 ## Metadata capture and sparse files
 
@@ -814,7 +815,6 @@ on top of AXAR working on several blocks at once; a payload that is a single
 chunk has nothing to spread. At most about 3 GiB of LZMA2 encoder memory is in
 flight at a time, so a huge dictionary lowers the number of chunks compressed
 together.
-
 
 ZIP archives can only use `deflate` and `store`. Leaving `--method` off keeps
 the established ZIP Deflate behaviour.

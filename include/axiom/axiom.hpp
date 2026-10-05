@@ -104,6 +104,9 @@ class OperationControl final {
 public:
     using ProgressCallback = std::function<void(const OperationProgress&)>;
 
+    // The control owns its callback. A callback that holds a shared_ptr to this
+    // same control therefore keeps it alive forever; capture a weak_ptr instead
+    // (or a plain pointer, since the callback never outlives its owner).
     void set_progress_callback(ProgressCallback callback) {
         const bool present = static_cast<bool>(callback);
         auto value = callback
@@ -381,7 +384,11 @@ public:
                 path = progress_path_;
             }
             if (path) result.current_path = *path;
-            const std::uint64_t after = progress_version_.load(std::memory_order_acquire);
+            // The loads above are relaxed, so an acquire load of the version is not
+            // enough to keep them from being performed after this re-read on a
+            // weakly ordered CPU (ARM). A fence is what orders them first.
+            std::atomic_thread_fence(std::memory_order_acquire);
+            const std::uint64_t after = progress_version_.load(std::memory_order_relaxed);
             if (before == after && (after & 1u) == 0) {
                 result.sequence = after / 2;
                 return result;
