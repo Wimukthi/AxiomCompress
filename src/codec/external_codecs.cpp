@@ -1,5 +1,7 @@
 #include "codec/external_codecs.hpp"
 
+#include "core/cpu.hpp"
+#include "core/task_executor.hpp"
 #include "third_party/lzma-sdk/Lzma2Dec.h"
 #include "third_party/lzma-sdk/Lzma2Enc.h"
 // miniz declares its full static helper set in the header, so every
@@ -19,8 +21,12 @@
 #include <array>
 #include <cstdlib>
 #include <cstring>
+#include <future>
 #include <limits>
+#include <memory>
 #include <new>
+#include <optional>
+#include <semaphore>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -155,14 +161,16 @@ ByteVector encode_zstandard(std::span<const std::uint8_t> input, int level) {
     return output;
 }
 
-ByteVector decode_zstandard(std::span<const std::uint8_t> input,
-                           std::size_t expected_size) {
+// The decoders write into memory the caller owns, so independent chunks can be
+// decoded straight into their place in the output.
+void decode_zstandard_into(std::span<const std::uint8_t> input,
+                           std::span<std::uint8_t> output) {
+    const std::size_t expected_size = output.size();
     const std::size_t frame_size =
         ZSTD_findFrameCompressedSize(input.data(), input.size());
     if (ZSTD_isError(frame_size) || frame_size != input.size()) {
         throw FormatError("Zstandard chunk is truncated or has trailing data");
     }
-    ByteVector output(expected_size);
     ZSTD_DCtx* context = ZSTD_createDCtx();
     if (context == nullptr) {
         throw std::bad_alloc();
@@ -186,6 +194,12 @@ ByteVector decode_zstandard(std::span<const std::uint8_t> input,
     if (ZSTD_isError(size) || size != expected_size) {
         throw FormatError("Zstandard chunk does not match its declared size");
     }
+}
+
+ByteVector decode_zstandard(std::span<const std::uint8_t> input,
+                           std::size_t expected_size) {
+    ByteVector output(expected_size);
+    decode_zstandard_into(input, output);
     return output;
 }
 
@@ -205,19 +219,25 @@ ByteVector encode_deflate(std::span<const std::uint8_t> input, int level) {
     return output;
 }
 
-ByteVector decode_deflate(std::span<const std::uint8_t> input,
-                         std::size_t expected_size) {
+void decode_deflate_into(std::span<const std::uint8_t> input,
+                         std::span<std::uint8_t> output) {
+    const std::size_t expected_size = output.size();
     if (input.size() > std::numeric_limits<mz_ulong>::max() ||
         expected_size > std::numeric_limits<mz_ulong>::max()) {
         throw FormatError("Deflate chunk exceeds the codec size limit");
     }
-    ByteVector output(expected_size);
     mz_ulong output_size = static_cast<mz_ulong>(expected_size);
     mz_ulong input_size = static_cast<mz_ulong>(input.size());
     const int result = mz_uncompress2(output.data(), &output_size, input.data(), &input_size);
     if (result != MZ_OK || output_size != expected_size || input_size != input.size()) {
         throw FormatError("Deflate chunk does not match its declared size");
     }
+}
+
+ByteVector decode_deflate(std::span<const std::uint8_t> input,
+                         std::size_t expected_size) {
+    ByteVector output(expected_size);
+    decode_deflate_into(input, output);
     return output;
 }
 
@@ -264,6 +284,24 @@ SRes lzma_progress(ICompressProgressPtr progress, UInt64, UInt64) {
     }
 }
 
+// The dictionary an LZMA2 chunk is encoded with: the requested (or level
+// default) size, held to the chunk size and to the payload bound.
+std::size_t lzma_dictionary_for(const CompressionOptions& options,
+                                std::size_t dictionary_limit,
+                                std::size_t dictionary_input_bound) {
+    const int level = effective_level(CompressionMethod::lzma2, options);
+    const std::size_t dictionary = options.lzma_dictionary_size == 0
+        ? default_lzma_dictionary_size(level)
+        : options.lzma_dictionary_size;
+    const auto maximum_dictionary = std::min(
+        std::max(dictionary_limit, kMinLzmaDictionarySize),
+        kMaxLzmaDictionarySize);
+    const auto bounded_dictionary = std::clamp(
+        dictionary, kMinLzmaDictionarySize, maximum_dictionary);
+    return std::min(bounded_dictionary,
+                    std::max(dictionary_input_bound, kMinLzmaDictionarySize));
+}
+
 std::pair<ByteVector, std::uint8_t> encode_lzma2(
     std::span<const std::uint8_t> input,
     const CompressionOptions& options,
@@ -285,21 +323,12 @@ std::pair<ByteVector, std::uint8_t> encode_lzma2(
             throw std::invalid_argument(
                 "LZMA2 dictionary exceeds the 4 GiB limit");
         }
-        const std::size_t dictionary = options.lzma_dictionary_size == 0
-            ? default_lzma_dictionary_size(level)
-            : options.lzma_dictionary_size;
-        const auto maximum_dictionary = std::min(
-            std::max(dictionary_limit, kMinLzmaDictionarySize),
-            kMaxLzmaDictionarySize);
-        const auto bounded_dictionary = std::clamp(
-            dictionary, kMinLzmaDictionarySize, maximum_dictionary);
         // AXEC stores one LZMA2 property for the whole payload, so every frame
         // must use the same dictionary even when the final frame is short. The
         // caller supplies a stable payload/working-chunk bound to avoid a
         // multi-gigabyte SDK allocation for a genuinely small input.
-        const auto effective_dictionary = std::min(
-            bounded_dictionary,
-            std::max(dictionary_input_bound, kMinLzmaDictionarySize));
+        const auto effective_dictionary =
+            lzma_dictionary_for(options, dictionary_limit, dictionary_input_bound);
         properties.lzmaProps.dictSize = static_cast<UInt32>(effective_dictionary);
         const std::size_t fast_bytes = options.lzma_fast_bytes == 0
             ? default_lzma_fast_bytes(level)
@@ -342,10 +371,10 @@ std::pair<ByteVector, std::uint8_t> encode_lzma2(
     }
 }
 
-ByteVector decode_lzma2(std::span<const std::uint8_t> input,
-                       std::size_t expected_size,
+void decode_lzma2_into(std::span<const std::uint8_t> input,
+                       std::span<std::uint8_t> output,
                        std::uint8_t property) {
-    ByteVector output(expected_size);
+    const std::size_t expected_size = output.size();
     SizeT output_size = expected_size;
     SizeT input_size = input.size();
     ELzmaStatus status = LZMA_STATUS_NOT_SPECIFIED;
@@ -356,19 +385,33 @@ ByteVector decode_lzma2(std::span<const std::uint8_t> input,
         status != LZMA_STATUS_FINISHED_WITH_MARK) {
         throw FormatError("LZMA2 chunk does not match its declared size");
     }
+}
+
+ByteVector decode_lzma2(std::span<const std::uint8_t> input,
+                       std::size_t expected_size,
+                       std::uint8_t property) {
+    ByteVector output(expected_size);
+    decode_lzma2_into(input, output, property);
     return output;
 }
 
-EncodedChunk make_chunk(std::span<const std::uint8_t> input,
-                        CompressionMethod method,
-                        const CompressionOptions& options,
-                        std::size_t dictionary_limit,
-                        std::size_t dictionary_input_bound,
-                        std::vector<std::uint8_t>& properties) {
+struct MadeChunk {
+    EncodedChunk chunk;
+    // The LZMA2 stream property this chunk was encoded with. Chunks are encoded
+    // independently (and possibly at once), so the caller checks they agree.
+    std::optional<std::uint8_t> property;
+};
+
+MadeChunk make_chunk(std::span<const std::uint8_t> input,
+                     CompressionMethod method,
+                     const CompressionOptions& options,
+                     std::size_t dictionary_limit,
+                     std::size_t dictionary_input_bound) {
     if (input.size() > kMaxLzmaChunkSize) {
         throw std::runtime_error("external codec chunk exceeds the 4 GiB format limit");
     }
-    EncodedChunk chunk;
+    MadeChunk made;
+    EncodedChunk& chunk = made.chunk;
     chunk.raw_size = static_cast<std::uint32_t>(input.size());
     if (method == CompressionMethod::zstandard) {
         chunk.bytes = encode_zstandard(
@@ -377,11 +420,7 @@ EncodedChunk make_chunk(std::span<const std::uint8_t> input,
         auto [bytes, property] =
             encode_lzma2(
                 input, options, dictionary_limit, dictionary_input_bound);
-        if (properties.empty()) {
-            properties.push_back(property);
-        } else if (properties.front() != property) {
-            throw std::runtime_error("LZMA2 produced inconsistent stream properties");
-        }
+        made.property = property;
         chunk.bytes = std::move(bytes);
     } else if (method == CompressionMethod::deflate) {
         chunk.bytes = encode_deflate(
@@ -393,7 +432,34 @@ EncodedChunk make_chunk(std::span<const std::uint8_t> input,
         chunk.stored = true;
         chunk.bytes.assign(input.begin(), input.end());
     }
-    return chunk;
+    return made;
+}
+
+// How many chunks may be encoded at once. Chunks are independent, so this is a
+// question of workers and of memory: an LZMA2 encoder holds about twelve times
+// its dictionary, which for large chunks adds up quickly.
+std::size_t chunk_encode_concurrency(CompressionMethod method,
+                                     const CompressionOptions& options,
+                                     std::size_t chunk_count,
+                                     std::size_t chunk_size,
+                                     std::size_t dictionary_input_bound) {
+    if (chunk_count < 2) return 1;
+    std::size_t workers = options.task_executor
+        ? options.task_executor->worker_count()
+        : (options.thread_count == 0 ? core::logical_processor_count() : options.thread_count);
+    workers = std::min(std::max<std::size_t>(workers, 1), chunk_count);
+    if (workers < 2) return 1;
+
+    constexpr std::uint64_t kMemoryBudget = std::uint64_t{3} << 30;
+    std::uint64_t per_chunk = 64ull << 20;  // Zstandard: window-dependent, bounded by the level
+    if (method == CompressionMethod::lzma2) {
+        per_chunk = std::uint64_t{lzma_dictionary_for(options, chunk_size, dictionary_input_bound)} * 12 +
+                    2ull * chunk_size;
+    } else if (method == CompressionMethod::deflate) {
+        per_chunk = 1ull << 20;
+    }
+    const auto by_memory = std::max<std::uint64_t>(1, kMemoryBudget / std::max<std::uint64_t>(per_chunk, 1));
+    return static_cast<std::size_t>(std::min<std::uint64_t>(workers, by_memory));
 }
 
 }  // namespace
@@ -430,14 +496,74 @@ ByteVector encode_external_codec_impl(
     std::vector<EncodedChunk> chunks;
     chunks.reserve(chunk_count);
     std::vector<std::uint8_t> properties;
-    for (std::size_t index = 0; index < chunk_count; ++index) {
+    const auto chunk_end = [&](std::size_t index) {
+        return std::min(input.size(), (index + 1) * chunk_size);
+    };
+    const auto encode_chunk = [&](std::size_t index) {
         checkpoint(options.operation);
         const std::size_t offset = index * chunk_size;
-        const std::size_t size = std::min(chunk_size, input.size() - offset);
-        chunks.push_back(make_chunk(
-            input.subspan(offset, size), method, options, chunk_size,
-            dictionary_input_bound, properties));
-        report_encoded(options, static_cast<std::uint64_t>(offset + size));
+        return make_chunk(input.subspan(offset, chunk_end(index) - offset), method, options,
+                          chunk_size, dictionary_input_bound);
+    };
+    // Chunks are accepted in order, so progress and the payload do not depend on
+    // how they were scheduled.
+    const auto accept = [&](MadeChunk made, std::size_t index) {
+        if (made.property) {
+            if (properties.empty()) {
+                properties.push_back(*made.property);
+            } else if (properties.front() != *made.property) {
+                throw std::runtime_error("LZMA2 produced inconsistent stream properties");
+            }
+        }
+        chunks.push_back(std::move(made.chunk));
+        report_encoded(options, static_cast<std::uint64_t>(chunk_end(index)));
+    };
+
+    const std::size_t concurrency = chunk_encode_concurrency(
+        method, options, chunk_count, chunk_size, dictionary_input_bound);
+    if (concurrency <= 1) {
+        for (std::size_t index = 0; index < chunk_count; ++index) {
+            accept(encode_chunk(index), index);
+        }
+    } else {
+        // The operation's executor when it has one, otherwise one for this
+        // payload. Every chunk is queued and they are taken in order; the
+        // semaphore keeps no more than `concurrency` encoders alive at once, which
+        // is what bounds the memory (a finished chunk holds only its output).
+        core::TaskExecutor* executor = options.task_executor.get();
+        std::optional<core::TaskExecutor> local_executor;
+        if (executor == nullptr) {
+            local_executor.emplace(concurrency);
+            executor = &*local_executor;
+        }
+        std::counting_semaphore<> permits(static_cast<std::ptrdiff_t>(concurrency));
+        std::vector<std::future<MadeChunk>> pending;
+        pending.reserve(chunk_count);
+        try {
+            for (std::size_t index = 0; index < chunk_count; ++index) {
+                pending.push_back(executor->submit([&, index] {
+                    permits.acquire();
+                    struct Release {
+                        std::counting_semaphore<>& permits;
+                        ~Release() { permits.release(); }
+                    } release{permits};
+                    return encode_chunk(index);
+                }));
+            }
+            for (std::size_t index = 0; index < chunk_count; ++index) {
+                accept(executor->wait(pending[index]), index);
+            }
+        } catch (...) {
+            // The tasks borrow `input`, `options` and `permits`: let each finish
+            // before unwinding.
+            for (auto& future : pending) {
+                try {
+                    if (future.valid()) executor->wait(future);
+                } catch (...) {
+                }
+            }
+            throw;
+        }
     }
 
     if (properties.size() > kMaxPropertySize) {
@@ -527,8 +653,16 @@ ByteVector decode_external_codec(std::span<const std::uint8_t> payload,
         validate_lzma2_property(properties.front(), chunk_size);
     }
 
-    ByteVector output;
-    output.reserve(expected_size);
+    // Read every chunk record first: the geometry is validated before any chunk is
+    // decoded, and the records say where each chunk's bytes go.
+    struct ChunkJob {
+        std::span<const std::uint8_t> encoded;
+        std::size_t raw_size = 0;
+        bool stored = false;
+    };
+    std::vector<ChunkJob> jobs;
+    jobs.reserve(chunk_count);
+    std::size_t planned = 0;
     for (std::size_t index = 0; index < chunk_count; ++index) {
         checkpoint(options.operation);
         const std::uint32_t raw_size = read_u32(payload, cursor);
@@ -541,37 +675,101 @@ ByteVector decode_external_codec(std::span<const std::uint8_t> payload,
             payload[cursor++] != 0 || payload[cursor++] != 0 || payload[cursor++] != 0) {
             throw FormatError("external codec chunk flags are invalid");
         }
-        const std::size_t remaining = expected_size - output.size();
+        const std::size_t remaining = expected_size - planned;
         const std::size_t required =
             std::min(chunk_size, remaining);
         if (raw_size != required || encoded_size > payload.size() - cursor) {
             throw FormatError("external codec chunk size is invalid");
         }
-        const auto encoded = payload.subspan(cursor, encoded_size);
+        const bool stored = (flags & kStoredChunk) != 0;
+        if (stored && encoded_size != raw_size) {
+            throw FormatError("stored external codec chunk has the wrong size");
+        }
+        jobs.push_back({payload.subspan(cursor, encoded_size), raw_size, stored});
         cursor += encoded_size;
+        planned += raw_size;
+    }
+    if (cursor != payload.size() || planned != expected_size) {
+        throw FormatError("external codec payload has trailing or missing data");
+    }
 
-        ByteVector decoded;
-        if ((flags & kStoredChunk) != 0) {
-            if (encoded_size != raw_size) {
-                throw FormatError("stored external codec chunk has the wrong size");
-            }
-            decoded.assign(encoded.begin(), encoded.end());
+    const auto decode_chunk = [&](const ChunkJob& job, std::uint8_t* destination) {
+        checkpoint(options.operation);
+        const std::span<std::uint8_t> output(destination, job.raw_size);
+        if (job.stored) {
+            std::copy(job.encoded.begin(), job.encoded.end(), output.begin());
         } else if (method == CompressionMethod::zstandard) {
-            decoded = decode_zstandard(encoded, raw_size);
+            decode_zstandard_into(job.encoded, output);
         } else if (method == CompressionMethod::lzma2) {
-            decoded = decode_lzma2(encoded, raw_size, properties.front());
+            decode_lzma2_into(job.encoded, output, properties.front());
         } else if (method == CompressionMethod::deflate) {
-            decoded = decode_deflate(encoded, raw_size);
+            decode_deflate_into(job.encoded, output);
         } else {
             throw FormatError("unsupported external codec");
         }
-        output.insert(output.end(), decoded.begin(), decoded.end());
-        if (options.decoded_bytes_progress) {
-            options.decoded_bytes_progress(output.size(), expected_size);
-        }
+    };
+
+    // The output grows a few chunks at a time, never past the reserved capacity
+    // (so the chunks being decoded do not move), and a payload that fails early
+    // has only touched the memory it got to.
+    ByteVector output;
+    output.reserve(expected_size);
+    std::size_t workers = options.thread_count == 0 ? core::logical_processor_count()
+                                                    : options.thread_count;
+    workers = std::min(std::max<std::size_t>(workers, 1), jobs.size());
+    // Chunks of an LZMA2 payload each need a dictionary-sized working set.
+    if (method == CompressionMethod::lzma2 && chunk_size != 0) {
+        workers = std::min<std::size_t>(
+            workers, std::max<std::size_t>(1, (std::size_t{3} << 30) / std::max<std::size_t>(chunk_size, 1)));
     }
-    if (cursor != payload.size() || output.size() != expected_size) {
-        throw FormatError("external codec payload has trailing or missing data");
+    core::TaskExecutor* executor = core::TaskExecutor::current();
+    std::optional<core::TaskExecutor> local_executor;
+    if (workers > 1 && executor == nullptr) {
+        local_executor.emplace(workers);
+        executor = &*local_executor;
+    }
+    if (workers <= 1 || executor == nullptr) {
+        for (const auto& job : jobs) {
+            const std::size_t begin = output.size();
+            output.resize(begin + job.raw_size);
+            decode_chunk(job, output.data() + begin);
+            if (options.decoded_bytes_progress) {
+                options.decoded_bytes_progress(output.size(), expected_size);
+            }
+        }
+    } else {
+        for (std::size_t first = 0; first < jobs.size(); first += workers) {
+            const std::size_t last = std::min(first + workers, jobs.size());
+            const std::size_t base = output.size();
+            std::size_t wave_bytes = 0;
+            for (std::size_t i = first; i < last; ++i) wave_bytes += jobs[i].raw_size;
+            output.resize(base + wave_bytes);
+            std::vector<std::future<void>> tasks;
+            tasks.reserve(last - first);
+            try {
+                std::size_t position = base + jobs[first].raw_size;
+                for (std::size_t i = first + 1; i < last; ++i) {
+                    const std::size_t at = position;
+                    position += jobs[i].raw_size;
+                    tasks.push_back(executor->submit(
+                        [&, i, at] { decode_chunk(jobs[i], output.data() + at); }));
+                }
+                decode_chunk(jobs[first], output.data() + base);
+                for (auto& task : tasks) executor->wait(task);
+            } catch (...) {
+                // The tasks write into `output`: let each finish before unwinding.
+                for (auto& task : tasks) {
+                    try {
+                        if (task.valid()) executor->wait(task);
+                    } catch (...) {
+                    }
+                }
+                throw;
+            }
+            if (options.decoded_bytes_progress) {
+                options.decoded_bytes_progress(output.size(), expected_size);
+            }
+        }
     }
     return output;
 }

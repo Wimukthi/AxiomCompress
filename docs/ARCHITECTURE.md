@@ -233,6 +233,16 @@ setting maps to 4 GiB−1 on the wire. The encoder keeps one stable LZMA2
 property across a whole payload, including a short final chunk, so the decoder
 never has to infer changing dictionary geometry.
 
+Because the chunks are independent, both directions run them on several threads.
+The encoder queues every chunk and takes the results in order, so the payload
+and the progress it reports don't depend on scheduling, and a semaphore limits
+how many encoders exist at once: an LZMA2 encoder holds about twelve times its
+dictionary, so the limit is the number of workers or what fits in roughly 3 GiB,
+whichever is smaller. The decoder validates every chunk record first, then
+decodes a wave of chunks straight into their places in the output, which it
+grows one wave at a time so that a payload that fails early has touched only the
+memory it reached.
+
 Level-9 automatic block planning recognises validated POSIX ustar members and
 uses their boundaries as static match-window and entropy-table reset points.
 Large members are split below the normal thread-derived budget, and small
@@ -484,6 +494,14 @@ touching the archive at all.
 `thread_count == 0` means "use the machine": both compression and decode expose
 every logical processor to the shared work-stealing executor.
 
+The executor sleeps when it has nothing to do. A worker waits on a condition
+variable until a task is submitted or the executor shuts down, and a thread
+waiting for a result keeps running queued tasks until that result is ready, then
+sleeps until a finishing task wakes it. Each wake-up event advances a counter
+under the same mutex the sleepers wait on, and a sleeper reads the counter
+before it looks for work, so an event that arrives in between cannot be missed.
+Waiting on a timed poll instead cost an idle executor about half a core.
+
 Compression block *geometry* is a separate decision, and it targets the
 **physical** core count. This matters more than it sounds. If block planning
 followed logical processors, adding SMT would silently halve the block size and
@@ -574,6 +592,16 @@ dependency without hiding it — each fixed tile receives encoder-chosen static
 rep state and forbids tokens from crossing its end, which makes tile DPs
 independent and scalable. Because the ordinary global DP is still encoded and
 compared, checkpoint framing can never make a written block worse.
+
+**Repeat-distance probes.** At every position the DP asks how far each of the
+four repeat distances matches. Inside a long run those distances don't change
+from one position to the next, so a match that ended before its limit is
+exactly one byte shorter at the next position, and one that stopped at the limit
+only needs the bytes past it compared. A small cache keyed by distance makes
+that shortcut, and only where it is exact, so every probe returns what a fresh
+comparison would and the parse is unchanged. Without it, zero-filled input made
+levels 8 and 9 many times slower than level 5. A test pins the archive bytes of
+a mixed input at both levels.
 
 ### Progress and cancellation
 

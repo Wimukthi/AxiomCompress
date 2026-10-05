@@ -54,6 +54,7 @@
 #endif
 
 #if !defined(_WIN32)
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #endif
@@ -7621,6 +7622,207 @@ void test_exclusive_file_owner_only() {
 }
 #endif
 
+double process_cpu_seconds() {
+#if defined(_WIN32)
+    FILETIME created{};
+    FILETIME exited{};
+    FILETIME kernel{};
+    FILETIME user{};
+    GetProcessTimes(GetCurrentProcess(), &created, &exited, &kernel, &user);
+    const auto ticks = [](const FILETIME& time) {
+        return (static_cast<std::uint64_t>(time.dwHighDateTime) << 32) | time.dwLowDateTime;
+    };
+    return static_cast<double>(ticks(kernel) + ticks(user)) / 1e7;
+#else
+    struct ::rusage usage {};
+    ::getrusage(RUSAGE_SELF, &usage);
+    return static_cast<double>(usage.ru_utime.tv_sec + usage.ru_stime.tv_sec) +
+           static_cast<double>(usage.ru_utime.tv_usec + usage.ru_stime.tv_usec) / 1e6;
+#endif
+}
+
+// Helper threads sleep until there is something to do. They used to wake every
+// 100 microseconds to look, which kept an idle pool busy; and a task submitted to
+// a sleeping pool must still be picked up, with or without anyone waiting on it.
+void test_task_executor_sleeps_and_wakes() {
+    {
+        axiom::core::TaskExecutor executor(8);
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));  // let the pool settle
+        const auto before = process_cpu_seconds();
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        const auto burned = process_cpu_seconds() - before;
+        AXIOM_CHECK(burned < 0.1);  // an idle pool of seven helpers used to burn about 0.3 s
+    }
+
+    axiom::core::TaskExecutor executor(6);
+    // Fire and forget, with gaps long enough for every helper to fall asleep:
+    // nobody waits on these futures, so only the submit's wake-up can start them.
+    constexpr std::size_t kTasks = 300;
+    std::atomic_size_t done = 0;
+    std::vector<std::future<void>> futures;
+    for (std::size_t i = 0; i < kTasks; ++i) {
+        futures.push_back(executor.submit([&done] { done.fetch_add(1, std::memory_order_relaxed); }));
+        std::this_thread::sleep_for(std::chrono::microseconds(700));
+    }
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+    while (done.load(std::memory_order_relaxed) != kTasks &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    AXIOM_CHECK(done.load() == kTasks);
+    for (auto& future : futures) executor.wait(future);
+
+    // Waiting on a task that a sleeping helper has to run, repeatedly.
+    for (int round = 0; round < 200; ++round) {
+        std::this_thread::sleep_for(std::chrono::microseconds(300));
+        auto future = executor.submit([round] { return round * 2; });
+        AXIOM_CHECK(executor.wait(future) == round * 2);
+    }
+
+    // Parents that fan out and wait while others do the same, from several
+    // external threads at once.
+    std::atomic_size_t total = 0;
+    std::vector<std::thread> producers;
+    for (int producer = 0; producer < 4; ++producer) {
+        producers.emplace_back([&] {
+            for (int i = 0; i < 100; ++i) {
+                auto parent = executor.submit([&] {
+                    std::vector<std::future<std::size_t>> children;
+                    for (std::size_t child = 0; child < 8; ++child) {
+                        children.push_back(executor.submit([child] { return child; }));
+                    }
+                    std::size_t sum = 0;
+                    for (auto& child : children) sum += executor.wait(child);
+                    return sum;
+                });
+                total.fetch_add(executor.wait(parent), std::memory_order_relaxed);
+            }
+        });
+    }
+    for (auto& producer : producers) producer.join();
+    AXIOM_CHECK(total.load() == 4u * 100u * 28u);
+}
+
+// External-codec payloads are made of independent chunks, which are encoded and
+// decoded on several threads. The result must not depend on how many, and a bad
+// chunk must fail the whole payload rather than hang or be skipped.
+void test_external_codec_parallel_chunks() {
+    std::vector<std::uint8_t> input(5u << 20);
+    std::mt19937 random(0xC40C4u);
+    for (std::size_t index = 0; index < input.size(); ++index) {
+        // Runs and structure, so chunks differ yet compress.
+        input[index] = static_cast<std::uint8_t>(
+            (index / 977) % 61 + ((random() & 15u) == 0 ? random() & 0xFFu : 0u));
+    }
+    for (const auto method : {axiom::CompressionMethod::zstandard, axiom::CompressionMethod::lzma2,
+                              axiom::CompressionMethod::deflate}) {
+        axiom::CompressionOptions options;
+        options.method = method;
+        options.block_size = 512u << 10;
+        options.enable_file_filters = false;
+        axiom::apply_compression_level(options, 5);
+
+        options.thread_count = 1;
+        const auto serial = axiom::compress(input, options);
+        for (const std::size_t threads : {std::size_t{2}, std::size_t{4}, std::size_t{0}}) {
+            options.thread_count = threads;
+            AXIOM_CHECK(axiom::compress(input, options) == serial);
+        }
+        AXIOM_CHECK(serial.size() < input.size());
+
+        for (const std::size_t threads : {std::size_t{1}, std::size_t{2}, std::size_t{4}, std::size_t{0}}) {
+            axiom::DecompressionOptions decode;
+            decode.thread_count = threads;
+            std::uint64_t last_progress = 0;
+            decode.decoded_bytes_progress = [&](std::uint64_t done, std::uint64_t total) {
+                AXIOM_CHECK(done <= total && done >= last_progress);
+                last_progress = done;
+            };
+            AXIOM_CHECK(axiom::decompress(serial, decode) == input);
+            AXIOM_CHECK(last_progress == input.size());
+        }
+
+        // Damage inside different chunks of the payload: every one is refused.
+        for (const double position : {0.2, 0.5, 0.8}) {
+            auto damaged = serial;
+            const auto at = static_cast<std::size_t>(static_cast<double>(damaged.size()) * position);
+            damaged[at] ^= 0xFFu;
+            damaged[at + 1] ^= 0xA5u;
+            axiom::DecompressionOptions decode;
+            decode.thread_count = 4;
+            expect_throws([&] { (void)axiom::decompress(damaged, decode); });
+        }
+
+        // Cancelled work is abandoned cleanly, with every task finished first.
+        auto cancelled = std::make_shared<axiom::OperationControl>();
+        cancelled->request_cancel();
+        options.thread_count = 4;
+        options.operation = cancelled;
+        expect_throws([&] { (void)axiom::compress(input, options); });
+    }
+}
+
+// The optimal parser answers "how far does this repeat distance match here?" for
+// every position, and derives the answer from the previous position's when it can.
+// That is only a shortcut if the parse is unchanged: the expected checksums were
+// computed with the parser that rescanned every time, on input made of long runs,
+// short periods, noisy periods and blocks repeated at varying distances.
+void test_optimal_parser_matches_reference() {
+    std::mt19937 rng(0x5EED5u);
+    std::vector<std::uint8_t> input;
+    const auto append_run = [&](std::uint8_t value, std::size_t count) {
+        input.insert(input.end(), count, value);
+    };
+    const auto append_period = [&](std::size_t period, std::size_t count, unsigned noise) {
+        std::vector<std::uint8_t> unit(period);
+        for (auto& byte : unit) byte = static_cast<std::uint8_t>(rng());
+        for (std::size_t i = 0; i < count; ++i) {
+            std::uint8_t byte = unit[i % period];
+            if (noise != 0 && (rng() % noise) == 0) {
+                byte ^= static_cast<std::uint8_t>(1 + rng() % 255);
+            }
+            input.push_back(byte);
+        }
+    };
+    append_run(0, 70000);
+    append_period(2, 40000, 0);
+    append_period(7, 60000, 400);
+    append_run(0xAB, 3000);
+    append_period(33, 50000, 90);
+    for (int block = 0; block < 40; ++block) {
+        std::vector<std::uint8_t> chunk(static_cast<std::size_t>(120 + block));
+        for (auto& byte : chunk) byte = static_cast<std::uint8_t>(rng() & 0x3F);
+        for (int copy = 0; copy < 6; ++copy) {
+            input.insert(input.end(), chunk.begin(), chunk.end());
+            const std::size_t gap = rng() % 300;
+            for (std::size_t i = 0; i < gap; ++i) input.push_back(static_cast<std::uint8_t>(rng()));
+        }
+    }
+    append_run(0, 20000);
+    const std::string text =
+        "the quick brown fox jumps over the lazy dog while the five boxing wizards jump quickly. ";
+    for (int i = 0; i < 2000; ++i) input.insert(input.end(), text.begin(), text.end());
+    AXIOM_CHECK(input.size() == 488761);
+
+    struct Expected {
+        int level;
+        std::size_t size;
+        std::uint32_t crc;
+    };
+    for (const Expected expected : {Expected{7, 51614, 0x49039978u}, Expected{9, 48076, 0x83d8e9d5u}}) {
+        axiom::CompressionOptions options;
+        axiom::apply_compression_level(options, expected.level);
+        options.window_size = input.size();
+        const auto greedy = axiom::codec::encode_lz77(input, options);
+        const auto optimal = axiom::codec::encode_lz77_optimal(input, options, &greedy);
+        AXIOM_CHECK(optimal.size() == expected.size);
+        auto crc = axiom::core::crc32_init();
+        crc = axiom::core::crc32_update(crc, optimal);
+        AXIOM_CHECK(axiom::core::crc32_final(crc) == expected.crc);
+        AXIOM_CHECK(axiom::codec::decode_lz77(optimal, input.size()) == input);
+    }
+}
+
 // ExclusiveFile creates a file only where nothing exists and never through a link.
 void test_exclusive_file_refuses_existing_names() {
     const auto root = make_temp_dir();
@@ -8239,6 +8441,9 @@ constexpr RegisteredTest kTests[] = {
     {"encryption_kdf_limits", test_encryption_kdf_limits},
     {"extract_block_size_limit", test_extract_block_size_limit},
     {"replace_file_and_temp_names", test_replace_file_and_temp_names},
+    {"task_executor_sleeps_and_wakes", test_task_executor_sleeps_and_wakes},
+    {"external_codec_parallel_chunks", test_external_codec_parallel_chunks},
+    {"optimal_parser_matches_reference", test_optimal_parser_matches_reference},
     {"reed_solomon_kernels_match_golden", test_reed_solomon_kernels_match_golden},
     {"recovery_survives_scattered_damage", test_recovery_survives_scattered_damage},
 #if !defined(_WIN32)

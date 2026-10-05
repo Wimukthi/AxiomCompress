@@ -799,6 +799,23 @@ so a small payload is automatically capped to its own size, and a multi-chunk
 payload keeps one dictionary setting across all its chunks — including the
 short final one. `--lzma-mf hc4` favours speed; `bt4` favours ratio.
 
+Because the dictionary cannot exceed the chunk, `--window` alone changes nothing
+once it passes the block size: `--method lzma2 --codec-level 9 --window 64M`
+still uses a dictionary no larger than the default block, while
+`--window 64M --block-size 64M` uses all of it. The bigger window finds more
+long-range matches (about 9% smaller output on one 104 MB test input) at the
+cost of encoder memory, and a bigger block leaves fewer chunks to work on at
+once.
+
+The chunks of a Zstandard, LZMA2 or Deflate payload are independent, so they are
+compressed and decompressed on `--threads` threads at once, and the bytes are
+the same ones a single thread produces. This is parallelism inside one payload,
+on top of AXAR working on several blocks at once; a payload that is a single
+chunk has nothing to spread. At most about 3 GiB of LZMA2 encoder memory is in
+flight at a time, so a huge dictionary lowers the number of chunks compressed
+together.
+
+
 ZIP archives can only use `deflate` and `store`. Leaving `--method` off keeps
 the established ZIP Deflate behaviour.
 
