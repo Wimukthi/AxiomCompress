@@ -267,6 +267,12 @@ struct ExtractOptions {
     // Refuse extraction when the archive cannot recreate a captured sparse
     // allocation map or carries a non-empty capture warning report.
     bool strict_metadata = false;
+    // Also restore what an archive could use to gain privilege on this machine:
+    // set-user-ID/set-group-ID bits on files and, on POSIX, the extended
+    // attributes in the security.*, trusted.* and system.* namespaces (file
+    // capabilities, SELinux labels, POSIX ACLs). Off by default; enable it only
+    // for archives you trust, typically your own backups.
+    bool restore_privileged_metadata = false;
 };
 
 // A filesystem object mapped to an explicit path in an archive. For a directory,

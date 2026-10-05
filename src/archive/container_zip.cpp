@@ -8,6 +8,7 @@
 #include "archive/zip_split_backend.hpp"
 #include "core/checksum.hpp"
 #include "core/crypto.hpp"
+#include "core/exclusive_file.hpp"
 #include "core/file_replace.hpp"
 #include "core/file_meta.hpp"
 #include "core/path_text.hpp"
@@ -1482,7 +1483,7 @@ void move_zip_entries(const fs::path& archive_path,
 }
 
 struct ZipExtractCallbackContext {
-    std::ofstream* output = nullptr;
+    core::ExclusiveFile* output = nullptr;
     std::shared_ptr<OperationControl> operation;
     OperationStage stage = OperationStage::extracting;
     std::uint64_t* completed_bytes = nullptr;
@@ -1498,12 +1499,8 @@ void zip_emit_plain(ZipExtractCallbackContext& context,
                     std::span<const std::uint8_t> bytes) {
     if (bytes.empty()) return;
     operation_checkpoint(context.operation);
-    if (context.output != nullptr) {
-        context.output->write(reinterpret_cast<const char*>(bytes.data()),
-                              static_cast<std::streamsize>(bytes.size()));
-        if (!*context.output) {
-            throw std::runtime_error("failed writing file: " + context.current_path);
-        }
+    if (context.output != nullptr && !context.output->write(bytes)) {
+        throw std::runtime_error("failed writing file: " + context.current_path);
     }
     if (context.completed_bytes != nullptr) {
         *context.completed_bytes += bytes.size();
@@ -2175,7 +2172,8 @@ public:
             }
 
             fs::create_directories(target.parent_path(), ec);
-            if (fs::exists(target, ec)) {
+            // A link at the target counts as an existing entry, even a dangling one.
+            if (fs::exists(fs::symlink_status(target, ec))) {
                 if (options.overwrite == ExtractOptions::Overwrite::skip) {
                     completed_bytes += entry.size;
                     ++completed_items;
@@ -2195,17 +2193,13 @@ public:
                 fs::remove(target, ec);
             }
 
-            fs::path temp_target = target;
-            temp_target += ".axtmp";
-            TempFileGuard temp_guard(temp_target);
+            // Staged under a name nobody can have prepared, created new and never
+            // through a link, so the bytes can only land in the file made here.
+            core::StagedFile staged(target);
+            const fs::path& temp_target = staged.path();
             {
-                std::ofstream output(temp_target, std::ios::binary | std::ios::trunc);
-                if (!output) {
-                    throw std::runtime_error("cannot write file: " +
-                                             core::path_to_utf8(temp_target));
-                }
                 ZipExtractCallbackContext context;
-                context.output = &output;
+                context.output = &staged.file();
                 context.operation = options.operation;
                 context.completed_bytes = &completed_bytes;
                 context.total_bytes = total_bytes;
@@ -2215,6 +2209,11 @@ public:
                 context.current_file_total = entry.size;
                 extract_zip_entry(reader, plan, options.password, context,
                                   "ZIP extraction failed");
+            }
+            // A close error means buffered data never reached the disk.
+            if (!staged.close()) {
+                throw std::runtime_error("failed writing file: " +
+                                         core::path_to_utf8(temp_target));
             }
 
             fs::rename(temp_target, target, ec);
@@ -2226,7 +2225,7 @@ public:
                                              ec.message());
                 }
             }
-            temp_guard.dismiss();
+            staged.dismiss();
             if (options.restore_mtime && entry.mtime != 0) {
                 try {
                     fs::last_write_time(target, from_unix_seconds(entry.mtime), ec);

@@ -863,13 +863,17 @@ genuinely cannot interpret.
 - **Many regular files and directories**, recursive, with relative
   `/`-separated UTF-8 paths. Empty files and empty directories are preserved.
 - **Symbolic links** — stored as links, with the target recorded verbatim and
-  *not* followed, and recreated on extract. Creating a symlink on extract can
-  require privilege (Windows without Developer Mode); when the OS refuses, that
-  link is skipped and the rest of the archive still extracts.
+  *not* followed, and recreated on extract after every file and directory.
+  Creating a symlink on extract can require privilege (Windows without
+  Developer Mode); when the OS refuses, that link is skipped with a warning and
+  the rest of the archive still extracts.
 - **Hard links** — files sharing one identity (Windows volume + file index, or
   POSIX dev + inode) are stored **once**. The first occurrence holds the bytes,
   later ones are hardlink entries referencing it, and extract re-links them with
-  `create_hard_link`, falling back to an independent copy across volumes.
+  `create_hard_link`, falling back to an independent copy across volumes. A
+  link is made only to a file that the same extraction wrote; if that file was
+  skipped, excluded from the selection, or not yet written, the link's path
+  receives the archive's own bytes instead.
   Detection costs nothing for the common single-link file, because only files
   with a link count above 1 are probed.
 - **Solid compression** with per-block and per-file CRC-32, random-access
@@ -969,9 +973,25 @@ covers symlinks on every platform and, on Windows, **NTFS junctions and mount
 points**: directory reparse points that need no privilege to create and that
 `std::filesystem::is_symlink` does not report.
 
-It rejects both a pre-existing link in the destination and one the archive
-plants and then tries to write through. Because extraction happens in order, the
-later entry's parent chain already contains the planted link and is refused.
+It rejects a pre-existing link in the destination. Links stored in the archive
+are created only after every file and directory has been written, and each such
+link's own parent chain is checked again when it is created, so an archive
+cannot combine a link entry with later entries to redirect a write.
+
+Every file is staged beside its final name before being renamed into place. The
+staging file is created new, under a random name ending in `.axtmp`, and never
+through a link: if anything at all exists at a candidate name, including a
+dangling link, another name is used. A link already present at a file's final
+name counts as an existing entry for the overwrite policy and is replaced, not
+followed. Hard links are made only to files this extraction wrote, and a
+directory entry applies its metadata only to a real directory.
+
+Whether a path is treated as a link when its metadata is restored is decided
+from the filesystem, never from the mode the archive stored for it. Permission
+bits are never applied through a link. Privileged metadata — the set-user-ID and
+set-group-ID bits of files and, on Linux, extended attributes outside the
+`user.` namespace — is withheld unless the caller opts in with
+`ExtractOptions::restore_privileged_metadata` (`--restore-privileged`).
 
 A restored symlink's **target** is still stored verbatim and may point anywhere.
 The guarantee is not that links are harmless — it is that no archive entry is

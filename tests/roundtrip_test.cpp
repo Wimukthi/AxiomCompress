@@ -12,6 +12,7 @@
 #include "codec/lz77_split.hpp"
 #include "codec/transform.hpp"
 #include "core/checksum.hpp"
+#include "core/exclusive_file.hpp"
 #include "core/benchmark_corpus.hpp"
 #include "core/benchmark_statistics.hpp"
 #include "core/archive.hpp"
@@ -51,6 +52,10 @@
 #include <winioctl.h>
 #endif
 
+#if !defined(_WIN32)
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 #if !defined(_WIN32) && (defined(__linux__) || defined(__APPLE__))
 #include <sys/xattr.h>
 #endif
@@ -71,6 +76,7 @@
 #include <memory>
 #include <optional>
 #include <random>
+#include <set>
 #include <source_location>
 #include <string>
 #include <string_view>
@@ -6342,6 +6348,653 @@ void test_extract_link_safety() {
     fs::remove_all(root, ec);
 }
 
+// ---- hostile AXAR directories ----------------------------------------------
+//
+// An unencrypted AXAR directory is a block table, an entry count, the
+// length-prefixed entry records and a trailing extras area, followed by a 24-byte
+// footer {directory offset, directory size, magic}. HostileDirectory takes a
+// genuine archive, keeps its blocks (so every checksum still verifies) and lets a
+// test replace the entry list with records of its own choosing, which is what an
+// archive author with bad intentions would do. The extraction tests below use it
+// to build layouts the ordinary writer never produces.
+
+struct HostileEntry {
+    std::uint8_t type = 0;  // 0 file, 1 directory, 2 symlink, 3 hard link
+    std::string path;
+    std::string target;  // symlink / hard link target, stored verbatim
+    std::uint64_t size = 0;  // file: its byte range inside the blocks
+    std::uint64_t first_block = 0;
+    std::uint64_t offset = 0;
+    std::vector<std::pair<std::uint64_t, std::vector<std::uint8_t>>> extras;  // TLV records
+};
+
+void hostile_put_vint(std::vector<std::uint8_t>& out, std::uint64_t value) {
+    while (value >= 0x80u) {
+        out.push_back(static_cast<std::uint8_t>(value | 0x80u));
+        value >>= 7;
+    }
+    out.push_back(static_cast<std::uint8_t>(value));
+}
+
+std::uint64_t hostile_get_vint(const std::vector<std::uint8_t>& in, std::size_t& at) {
+    std::uint64_t value = 0;
+    for (unsigned shift = 0; shift < 64; shift += 7) {
+        AXIOM_CHECK(at < in.size());
+        const auto byte = in[at++];
+        value |= static_cast<std::uint64_t>(byte & 0x7Fu) << shift;
+        if ((byte & 0x80u) == 0) {
+            return value;
+        }
+    }
+    AXIOM_CHECK(false);
+    return 0;
+}
+
+std::string hostile_get_string(const std::vector<std::uint8_t>& in, std::size_t& at) {
+    const auto length = static_cast<std::size_t>(hostile_get_vint(in, at));
+    AXIOM_CHECK(at + length <= in.size());
+    std::string text(reinterpret_cast<const char*>(in.data() + at), length);
+    at += length;
+    return text;
+}
+
+void hostile_put_string(std::vector<std::uint8_t>& out, const std::string& text) {
+    hostile_put_vint(out, text.size());
+    out.insert(out.end(), text.begin(), text.end());
+}
+
+constexpr std::uint8_t kHostileFile = 0;
+constexpr std::uint8_t kHostileSymlink = 2;
+constexpr std::uint8_t kHostileHardlink = 3;
+constexpr std::uint64_t kHostileExtraPosix = 7;
+constexpr std::uint64_t kHostileExtraXattr = 10;
+
+class HostileDirectory {
+public:
+    explicit HostileDirectory(const fs::path& archive) : image_(read_all(archive)) {
+        constexpr std::size_t kFooterSize = 24;
+        AXIOM_CHECK(image_.size() > kFooterSize);
+        const auto footer = image_.size() - kFooterSize;
+        directory_offset_ = static_cast<std::size_t>(test_read_le64(image_, footer));
+        const auto directory_size = static_cast<std::size_t>(test_read_le64(image_, footer + 8));
+        magic_.assign(image_.end() - 8, image_.end());
+        AXIOM_CHECK(directory_offset_ + directory_size == footer);
+        const std::vector<std::uint8_t> directory(image_.begin() + directory_offset_,
+                                                  image_.begin() + footer);
+        std::size_t at = 0;
+        const auto block_count = hostile_get_vint(directory, at);
+        for (std::uint64_t block = 0; block < block_count; ++block) {
+            for (int field = 0; field < 3; ++field) {
+                (void)hostile_get_vint(directory, at);
+            }
+            at += static_cast<std::size_t>(hostile_get_vint(directory, at));
+            AXIOM_CHECK(at <= directory.size());
+        }
+        blocks_.assign(directory.begin(), directory.begin() + at);
+        const auto entry_count = hostile_get_vint(directory, at);
+        for (std::uint64_t i = 0; i < entry_count; ++i) {
+            const auto length = static_cast<std::size_t>(hostile_get_vint(directory, at));
+            const auto end = at + length;
+            AXIOM_CHECK(end <= directory.size());
+            HostileEntry entry;
+            entry.type = static_cast<std::uint8_t>(hostile_get_vint(directory, at));
+            entry.path = hostile_get_string(directory, at);
+            if (entry.type == kHostileFile) {
+                entry.size = hostile_get_vint(directory, at);
+                entry.first_block = hostile_get_vint(directory, at);
+                entry.offset = hostile_get_vint(directory, at);
+            } else if (entry.type == kHostileSymlink || entry.type == kHostileHardlink) {
+                entry.target = hostile_get_string(directory, at);
+            }
+            while (at < end) {
+                const auto record = hostile_get_vint(directory, at);
+                const auto payload_size = static_cast<std::size_t>(hostile_get_vint(directory, at));
+                AXIOM_CHECK(at + payload_size <= end);
+                entry.extras.emplace_back(
+                    record, std::vector<std::uint8_t>(directory.begin() + at,
+                                                      directory.begin() + at + payload_size));
+                at += payload_size;
+            }
+            entries_.push_back(std::move(entry));
+        }
+        tail_.assign(directory.begin() + at, directory.end());
+    }
+
+    std::vector<HostileEntry>& entries() { return entries_; }
+
+    // The first genuine file entry: its data range and checksums, to be reused
+    // under another name.
+    HostileEntry file_like(const std::string& path) const {
+        for (const auto& entry : entries_) {
+            if (entry.type != kHostileFile) {
+                continue;
+            }
+            HostileEntry copy = entry;
+            copy.path = path;
+            // Keep mtime (1), CRC-32 (2) and BLAKE3 (3); drop recorded modes.
+            std::erase_if(copy.extras, [](const auto& extra) { return extra.first > 3; });
+            return copy;
+        }
+        AXIOM_CHECK(false);
+        return {};
+    }
+
+    void write(const fs::path& path) const {
+        std::vector<std::uint8_t> directory = blocks_;
+        hostile_put_vint(directory, entries_.size());
+        for (const auto& entry : entries_) {
+            std::vector<std::uint8_t> body;
+            hostile_put_vint(body, entry.type);
+            hostile_put_string(body, entry.path);
+            if (entry.type == kHostileFile) {
+                hostile_put_vint(body, entry.size);
+                hostile_put_vint(body, entry.first_block);
+                hostile_put_vint(body, entry.offset);
+            } else if (entry.type == kHostileSymlink || entry.type == kHostileHardlink) {
+                hostile_put_string(body, entry.target);
+            }
+            for (const auto& [record, payload] : entry.extras) {
+                hostile_put_vint(body, record);
+                hostile_put_vint(body, payload.size());
+                body.insert(body.end(), payload.begin(), payload.end());
+            }
+            hostile_put_vint(directory, body.size());
+            directory.insert(directory.end(), body.begin(), body.end());
+        }
+        directory.insert(directory.end(), tail_.begin(), tail_.end());
+
+        std::vector<std::uint8_t> image(image_.begin(), image_.begin() + directory_offset_);
+        image.insert(image.end(), directory.begin(), directory.end());
+        for (const std::uint64_t value : {static_cast<std::uint64_t>(directory_offset_),
+                                          static_cast<std::uint64_t>(directory.size())}) {
+            for (unsigned index = 0; index < 8; ++index) {
+                image.push_back(static_cast<std::uint8_t>(value >> (index * 8)));
+            }
+        }
+        image.insert(image.end(), magic_.begin(), magic_.end());
+        write_all(path, image);
+    }
+
+private:
+    std::vector<std::uint8_t> image_;
+    std::size_t directory_offset_ = 0;
+    std::vector<std::uint8_t> magic_;
+    std::vector<std::uint8_t> blocks_;
+    std::vector<HostileEntry> entries_;
+    std::vector<std::uint8_t> tail_;
+};
+
+HostileEntry hostile_symlink(const std::string& path, const std::string& target) {
+    HostileEntry entry;
+    entry.type = kHostileSymlink;
+    entry.path = path;
+    entry.target = target;
+    return entry;
+}
+
+void hostile_set_posix(HostileEntry& entry, std::uint32_t mode, std::uint32_t uid,
+                       std::uint32_t gid) {
+    std::vector<std::uint8_t> payload;
+    for (const std::uint32_t value : {mode, uid, gid}) {
+        for (unsigned index = 0; index < 4; ++index) {
+            payload.push_back(static_cast<std::uint8_t>(value >> (index * 8)));
+        }
+    }
+    entry.extras.emplace_back(kHostileExtraPosix, std::move(payload));
+}
+
+void hostile_add_xattr(HostileEntry& entry, const std::string& name, const std::string& value) {
+    std::vector<std::uint8_t> payload;
+    hostile_put_string(payload, name);
+    payload.insert(payload.end(), value.begin(), value.end());
+    entry.extras.emplace_back(kHostileExtraXattr, std::move(payload));
+}
+
+const std::string kHostilePayload =
+    "bytes the archive wants written inside the destination, and only there";
+
+// A genuine one-file archive whose blocks the hostile archives below reuse.
+fs::path make_hostile_base(const fs::path& root) {
+    const auto src = root / "base";
+    fs::create_directories(src);
+    write_all(src / "data.txt", bytes_from_string(kHostilePayload));
+    const auto archive = root / "base.axar";
+    axiom::create_archive({src}, archive, {});
+    return archive;
+}
+
+std::size_t count_regular_files_named(const fs::path& directory, std::string_view suffix) {
+    std::size_t count = 0;
+    for (const auto& item : fs::recursive_directory_iterator(directory)) {
+        const auto name = item.path().filename().string();
+        if (item.symlink_status().type() == fs::file_type::regular &&
+            name.size() >= suffix.size() &&
+            name.compare(name.size() - suffix.size(), suffix.size(), suffix) == 0) {
+            ++count;
+        }
+    }
+    return count;
+}
+
+#if !defined(_WIN32)
+
+// A symlink entry planted at the name an extractor would stage the next file
+// under must not capture that file's bytes: the file belongs to the destination,
+// the link's target is outside it.
+void test_extract_staging_name_plant() {
+    const auto root = make_temp_dir();
+    const auto base = make_hostile_base(root);
+    const auto outside = root / "outside";
+    fs::create_directories(outside);
+    const std::string original = "content that must survive extraction";
+    write_all(outside / "victim", bytes_from_string(original));
+
+    HostileDirectory hostile(base);
+    hostile.entries() = {
+        hostile_symlink("foo.axtmp", "../outside/victim"),
+        hostile.file_like("foo"),
+        hostile_symlink("bar.axtmp", "../outside/created"),
+        hostile.file_like("bar"),
+    };
+    const auto evil = root / "evil.axar";
+    hostile.write(evil);
+
+    const auto dest = root / "dest";
+    axiom::extract_archive(evil, dest, {});
+
+    AXIOM_CHECK(read_all(outside / "victim") == bytes_from_string(original));
+    AXIOM_CHECK(!fs::exists(outside / "created"));
+    AXIOM_CHECK(read_all(dest / "foo") == bytes_from_string(kHostilePayload));
+    AXIOM_CHECK(read_all(dest / "bar") == bytes_from_string(kHostilePayload));
+    // The archive's own links are still created, as links.
+    AXIOM_CHECK(fs::is_symlink(dest / "foo.axtmp"));
+    AXIOM_CHECK(fs::is_symlink(dest / "bar.axtmp"));
+    AXIOM_CHECK(count_regular_files_named(dest, ".axtmp") == 0);  // no staging leftovers
+
+    std::error_code ec;
+    fs::remove_all(root, ec);
+}
+
+// A symlink entry and later entries beneath the same path must not combine into a
+// write through the link.
+void test_extract_link_then_child_stays_inside() {
+    const auto root = make_temp_dir();
+    const auto base = make_hostile_base(root);
+    const auto outside = root / "outside";
+    fs::create_directories(outside);
+
+    HostileDirectory hostile(base);
+    hostile.entries() = {
+        hostile_symlink("d", "../outside"),
+        hostile.file_like("d/x"),
+    };
+    const auto evil = root / "evil.axar";
+    hostile.write(evil);
+
+    const auto fail_dest = root / "dest-fail";
+    expect_throws([&] { axiom::extract_archive(evil, fail_dest, {}); });
+    AXIOM_CHECK(fs::is_empty(outside));
+
+    axiom::ExtractOptions skip;
+    skip.overwrite = axiom::ExtractOptions::Overwrite::skip;
+    const auto skip_dest = root / "dest-skip";
+    axiom::extract_archive(evil, skip_dest, skip);
+    AXIOM_CHECK(fs::is_empty(outside));
+    AXIOM_CHECK(read_all(skip_dest / "d" / "x") == bytes_from_string(kHostilePayload));
+
+    axiom::ExtractOptions overwrite;
+    overwrite.overwrite = axiom::ExtractOptions::Overwrite::overwrite;
+    const auto overwrite_dest = root / "dest-overwrite";
+    axiom::extract_archive(evil, overwrite_dest, overwrite);
+    AXIOM_CHECK(fs::is_empty(outside));
+    AXIOM_CHECK(read_all(overwrite_dest / "d" / "x") == bytes_from_string(kHostilePayload));
+
+    std::error_code ec;
+    fs::remove_all(root, ec);
+}
+
+// Whether a restore step may chmod an entry must depend on what is on disk, not
+// on the mode the archive claims for it.
+void test_extract_symlink_with_forged_mode() {
+    const auto root = make_temp_dir();
+    const auto base = make_hostile_base(root);
+    const auto outside = root / "outside";
+    fs::create_directories(outside);
+    const auto victim = outside / "victim";
+    write_all(victim, bytes_from_string("victim"));
+    fs::permissions(victim, fs::perms::owner_read | fs::perms::owner_write,
+                    fs::perm_options::replace);
+
+    HostileDirectory hostile(base);
+    auto link = hostile_symlink("lnk", "../outside/victim");
+    // A regular file's mode (S_IFREG | 0777) on an entry that is a symlink.
+    hostile_set_posix(link, 0100777u, static_cast<std::uint32_t>(::geteuid()),
+                      static_cast<std::uint32_t>(::getegid()));
+    hostile.entries() = {std::move(link)};
+    const auto evil = root / "evil.axar";
+    hostile.write(evil);
+
+    const auto dest = root / "dest";
+    axiom::extract_archive(evil, dest, {});
+
+    AXIOM_CHECK(fs::is_symlink(dest / "lnk"));
+    AXIOM_CHECK(fs::status(victim).permissions() ==
+                (fs::perms::owner_read | fs::perms::owner_write));
+
+    std::error_code ec;
+    fs::remove_all(root, ec);
+}
+
+// A directory entry whose path is already taken by a file must not leave that file
+// re-permissioned with the directory's recorded mode.
+void test_extract_directory_over_file_keeps_file_mode() {
+    const auto root = make_temp_dir();
+    const auto base = make_hostile_base(root);
+    HostileDirectory hostile(base);
+    HostileEntry dir;
+    dir.type = 1;
+    dir.path = "thing";
+    hostile_set_posix(dir, 040777u, static_cast<std::uint32_t>(::geteuid()),
+                      static_cast<std::uint32_t>(::getegid()));
+    hostile.entries() = {dir};
+    const auto evil = root / "evil.axar";
+    hostile.write(evil);
+
+    const auto dest = root / "dest";
+    fs::create_directories(dest);
+    write_all(dest / "thing", bytes_from_string("a file in the way"));
+    fs::permissions(dest / "thing", fs::perms::owner_read | fs::perms::owner_write,
+                    fs::perm_options::replace);
+    axiom::extract_archive(evil, dest, {});
+    AXIOM_CHECK(fs::is_regular_file(dest / "thing"));
+    AXIOM_CHECK(fs::status(dest / "thing").permissions() ==
+                (fs::perms::owner_read | fs::perms::owner_write));
+
+    std::error_code ec;
+    fs::remove_all(root, ec);
+}
+
+// A link already sitting at a file's target counts as an existing entry for the
+// overwrite policy, even when it dangles, and is never written through.
+void test_extract_existing_link_target() {
+    const auto root = make_temp_dir();
+    const auto base = make_hostile_base(root);
+    HostileDirectory hostile(base);
+    hostile.entries() = {hostile.file_like("foo")};
+    const auto archive = root / "one.axar";
+    hostile.write(archive);
+
+    const auto outside = root / "outside";
+    fs::create_directories(outside);
+
+    const auto dest = root / "dest";
+    fs::create_directories(dest);
+    fs::create_symlink("../outside/not-there", dest / "foo");
+
+    expect_throws([&] { axiom::extract_archive(archive, dest, {}); });
+    AXIOM_CHECK(fs::is_symlink(dest / "foo"));
+
+    axiom::ExtractOptions skip;
+    skip.overwrite = axiom::ExtractOptions::Overwrite::skip;
+    axiom::extract_archive(archive, dest, skip);
+    AXIOM_CHECK(fs::is_symlink(dest / "foo"));
+    AXIOM_CHECK(!fs::exists(outside / "not-there"));
+
+    axiom::ExtractOptions overwrite;
+    overwrite.overwrite = axiom::ExtractOptions::Overwrite::overwrite;
+    axiom::extract_archive(archive, dest, overwrite);
+    AXIOM_CHECK(fs::is_regular_file(fs::symlink_status(dest / "foo")));
+    AXIOM_CHECK(read_all(dest / "foo") == bytes_from_string(kHostilePayload));
+    AXIOM_CHECK(!fs::exists(outside / "not-there"));
+
+    std::error_code ec;
+    fs::remove_all(root, ec);
+}
+
+// The ZIP extractor stages files the same way and must not follow a link that is
+// already sitting at the staging name.
+void test_zip_extract_ignores_planted_link() {
+    const auto root = make_temp_dir();
+    const auto zip_path = root / "plain.zip";
+    {
+        mz_zip_archive zip{};
+        mz_zip_zero_struct(&zip);
+        AXIOM_CHECK(mz_zip_writer_init_file(&zip, zip_path.string().c_str(), 0));
+        AXIOM_CHECK(mz_zip_writer_add_mem(&zip, "foo", kHostilePayload.data(),
+                                          kHostilePayload.size(), MZ_BEST_COMPRESSION));
+        AXIOM_CHECK(mz_zip_writer_finalize_archive(&zip));
+        AXIOM_CHECK(mz_zip_writer_end(&zip));
+    }
+    const auto outside = root / "outside";
+    fs::create_directories(outside);
+    const std::string original = "content that must survive extraction";
+    write_all(outside / "victim", bytes_from_string(original));
+    const auto dest = root / "dest";
+    fs::create_directories(dest);
+    fs::create_symlink("../outside/victim", dest / "foo.axtmp");
+
+    const auto* provider = axiom::archive_provider_for_path(zip_path);
+    AXIOM_CHECK(provider != nullptr);
+    provider->extract_all(zip_path, dest, {});
+
+    AXIOM_CHECK(read_all(outside / "victim") == bytes_from_string(original));
+    AXIOM_CHECK(fs::is_regular_file(fs::symlink_status(dest / "foo")));
+    AXIOM_CHECK(read_all(dest / "foo") == bytes_from_string(kHostilePayload));
+    AXIOM_CHECK(fs::is_symlink(dest / "foo.axtmp"));  // left exactly as it was
+
+    std::error_code ec;
+    fs::remove_all(root, ec);
+}
+
+// A hard link is made only to a file this run wrote. When the canonical file was
+// skipped because something already sat at its path, the link gets the archive's
+// own bytes rather than becoming another name for whatever was there.
+void test_extract_hardlink_to_skipped_canonical() {
+    const auto root = make_temp_dir();
+    const auto src = root / "src";
+    fs::create_directories(src);
+    write_all(src / "a", bytes_from_string(kHostilePayload));
+    std::error_code link_error;
+    fs::create_hard_link(src / "a", src / "b", link_error);
+    if (link_error) {
+        std::error_code ec;
+        fs::remove_all(root, ec);
+        return;  // the test filesystem has no hard links
+    }
+    const auto archive = root / "links.axar";
+    axiom::create_archive({src}, archive, {});
+    // Which of the two names holds the bytes is the writer's choice: find it.
+    std::string link_path;
+    std::string canonical_path;
+    for (const auto& entry : axiom::list_archive(archive)) {
+        if (entry.is_hardlink) {
+            link_path = entry.path;
+            canonical_path = entry.link_target;
+        }
+    }
+    AXIOM_CHECK(!link_path.empty() && !canonical_path.empty());
+
+    const auto dest = root / "dest";
+    fs::create_directories(dest / "src");
+    write_all(dest / canonical_path, bytes_from_string("what was already here"));
+    axiom::ExtractOptions skip;
+    skip.overwrite = axiom::ExtractOptions::Overwrite::skip;
+    axiom::extract_archive(archive, dest, skip);
+
+    AXIOM_CHECK(read_all(dest / canonical_path) == bytes_from_string("what was already here"));
+    AXIOM_CHECK(read_all(dest / link_path) == bytes_from_string(kHostilePayload));
+    AXIOM_CHECK(fs::hard_link_count(dest / canonical_path) == 1);
+
+    // Without a pre-existing file the pair is still linked, as before.
+    const auto fresh = root / "fresh";
+    axiom::extract_archive(archive, fresh, {});
+    AXIOM_CHECK(read_all(fresh / "src" / "a") == bytes_from_string(kHostilePayload));
+    AXIOM_CHECK(read_all(fresh / "src" / "b") == bytes_from_string(kHostilePayload));
+    AXIOM_CHECK(fs::hard_link_count(fresh / "src" / "a") == 2);
+
+    std::error_code ec;
+    fs::remove_all(root, ec);
+}
+
+// Set-user-ID / set-group-ID bits are not restored unless asked for, whoever
+// extracts. Directories keep set-group-ID.
+void test_extract_withholds_set_id_bits() {
+    const auto root = make_temp_dir();
+    const auto src = root / "src";
+    fs::create_directories(src / "shared");
+    write_all(src / "prog", bytes_from_string("#!/bin/sh\nexit 0\n"));
+    ::chmod((src / "prog").c_str(), 06755);
+    ::chmod((src / "shared").c_str(), 02775);
+    struct ::stat prog_stat {};
+    struct ::stat dir_stat {};
+    AXIOM_CHECK(::stat((src / "prog").c_str(), &prog_stat) == 0);
+    AXIOM_CHECK(::stat((src / "shared").c_str(), &dir_stat) == 0);
+    if ((prog_stat.st_mode & S_ISUID) == 0) {
+        std::error_code ec;
+        fs::remove_all(root, ec);
+        return;  // this filesystem does not keep set-id bits
+    }
+    const auto archive = root / "setid.axar";
+    axiom::create_archive({src}, archive, {});
+
+    const auto plain = root / "plain";
+    axiom::extract_archive(archive, plain, {});
+    struct ::stat restored {};
+    AXIOM_CHECK(::stat((plain / "src" / "prog").c_str(), &restored) == 0);
+    AXIOM_CHECK((restored.st_mode & (S_ISUID | S_ISGID)) == 0);
+    AXIOM_CHECK((restored.st_mode & 0777) == 0755);
+    AXIOM_CHECK(::stat((plain / "src" / "shared").c_str(), &restored) == 0);
+    AXIOM_CHECK((restored.st_mode & S_ISUID) == 0);
+    AXIOM_CHECK((restored.st_mode & S_ISGID) == (dir_stat.st_mode & S_ISGID));
+
+    axiom::ExtractOptions trusted;
+    trusted.restore_privileged_metadata = true;
+    const auto full = root / "full";
+    axiom::extract_archive(archive, full, trusted);
+    AXIOM_CHECK(::stat((full / "src" / "prog").c_str(), &restored) == 0);
+    AXIOM_CHECK((restored.st_mode & S_ISUID) != 0);
+
+    std::error_code ec;
+    fs::remove_all(root, ec);
+}
+
+#if defined(__linux__)
+// Extended attributes outside the plain user namespace (file capabilities, MAC
+// labels, ACLs) are withheld by default, and the withholding is reported.
+void test_extract_withholds_privileged_xattrs() {
+    const auto root = make_temp_dir();
+    const auto base = make_hostile_base(root);
+    HostileDirectory hostile(base);
+    auto file = hostile.file_like("tool");
+    hostile_add_xattr(file, "security.capability", "not a real capability blob");
+    hostile_add_xattr(file, "user.axiom.note", "ordinary");
+    hostile.entries() = {std::move(file)};
+    const auto archive = root / "xattrs.axar";
+    hostile.write(archive);
+
+    const auto message_names = [](const std::shared_ptr<axiom::OperationControl>& operation,
+                                  std::string_view text) {
+        for (const auto& warning : operation->warnings()) {
+            if (warning.message.find(text) != std::string::npos) {
+                return warning.message;
+            }
+        }
+        return std::string{};
+    };
+
+    axiom::ExtractOptions plain;
+    plain.operation = std::make_shared<axiom::OperationControl>();
+    axiom::extract_archive(archive, root / "plain", plain);
+    const auto withheld = message_names(plain.operation, "privileged extended attributes");
+    AXIOM_CHECK(withheld.find("security.capability") != std::string::npos);
+    AXIOM_CHECK(withheld.find("user.axiom.note") == std::string::npos);
+
+    axiom::ExtractOptions trusted;
+    trusted.restore_privileged_metadata = true;
+    trusted.operation = std::make_shared<axiom::OperationControl>();
+    axiom::extract_archive(archive, root / "trusted", trusted);
+    AXIOM_CHECK(message_names(trusted.operation, "privileged extended attributes").empty());
+
+    std::error_code ec;
+    fs::remove_all(root, ec);
+}
+#endif
+
+#endif  // !_WIN32
+
+// ExclusiveFile creates a file only where nothing exists and never through a link.
+void test_exclusive_file_refuses_existing_names() {
+    const auto root = make_temp_dir();
+    const auto outside = root / "outside";
+    write_all(outside, bytes_from_string("untouched"));
+    write_all(root / "regular", bytes_from_string("untouched"));
+    fs::create_directories(root / "directory");
+
+    using Create = axiom::core::ExclusiveFile::Create;
+    std::error_code error;
+    {
+        axiom::core::ExclusiveFile file;
+        AXIOM_CHECK(file.create_new(root / "regular", error) == Create::exists);
+        AXIOM_CHECK(!file.is_open());
+        AXIOM_CHECK(file.create_new(root / "directory", error) == Create::exists);
+        AXIOM_CHECK(!file.is_open());
+    }
+#if !defined(_WIN32)
+    std::error_code link_error;
+    fs::create_symlink(outside, root / "to-existing", link_error);
+    fs::create_symlink(root / "missing", root / "dangling", link_error);
+    if (!link_error) {
+        axiom::core::ExclusiveFile file;
+        AXIOM_CHECK(file.create_new(root / "to-existing", error) == Create::exists);
+        AXIOM_CHECK(file.create_new(root / "dangling", error) == Create::exists);
+        AXIOM_CHECK(!fs::exists(root / "missing"));
+    }
+#endif
+    AXIOM_CHECK(read_all(outside) == bytes_from_string("untouched"));
+    AXIOM_CHECK(read_all(root / "regular") == bytes_from_string("untouched"));
+
+    // A fresh name is created, written, and closed cleanly.
+    axiom::core::ExclusiveFile created;
+    AXIOM_CHECK(created.create_new(root / "fresh", error) == Create::created);
+    const auto payload = bytes_from_string("hello");
+    AXIOM_CHECK(created.write(payload));
+    AXIOM_CHECK(created.close());
+    AXIOM_CHECK(read_all(root / "fresh") == payload);
+
+    std::error_code ec;
+    fs::remove_all(root, ec);
+}
+
+// Staging names are unique, recognisable, and fit whatever the target's name fits.
+void test_staging_names() {
+    const auto root = make_temp_dir();
+    std::set<std::string> seen;
+    for (int i = 0; i < 16; ++i) {
+        axiom::core::StagedFile staged(root / "name.txt");
+        const auto name = staged.path().filename().string();
+        AXIOM_CHECK(name.starts_with("name.txt."));
+        AXIOM_CHECK(name.ends_with(".axtmp"));
+        AXIOM_CHECK(seen.insert(name).second);
+        AXIOM_CHECK(fs::exists(staged.path()));
+    }
+    AXIOM_CHECK(fs::is_empty(root));  // every staged file removed itself
+
+    // A name that is legal on its own must still be stageable.
+    const std::string long_name(240, 'n');
+    {
+        axiom::core::StagedFile staged(root / long_name);
+        AXIOM_CHECK(staged.path().filename().string().size() <= 255);
+        AXIOM_CHECK(staged.path().filename().string().ends_with(".axtmp"));
+        AXIOM_CHECK(staged.write(bytes_from_string("x")));
+        staged.dismiss();
+        AXIOM_CHECK(staged.close());
+        const auto kept = staged.path();
+        AXIOM_CHECK(fs::exists(kept));
+    }
+    std::error_code ec;
+    fs::remove_all(root, ec);
+}
+
 // A tiny archive that declares an enormous original size must be rejected before
 // the decoder tries to expand it (decompression bomb).
 void test_decompress_bomb() {
@@ -6882,6 +7535,21 @@ constexpr RegisteredTest kTests[] = {
 #endif
     {"archive_safety", test_archive_safety},
     {"extract_link_safety", test_extract_link_safety},
+    {"exclusive_file_refuses_existing_names", test_exclusive_file_refuses_existing_names},
+    {"staging_names", test_staging_names},
+#if !defined(_WIN32)
+    {"extract_staging_name_plant", test_extract_staging_name_plant},
+    {"extract_link_then_child_stays_inside", test_extract_link_then_child_stays_inside},
+    {"extract_symlink_with_forged_mode", test_extract_symlink_with_forged_mode},
+    {"extract_directory_over_file_keeps_file_mode", test_extract_directory_over_file_keeps_file_mode},
+    {"extract_existing_link_target", test_extract_existing_link_target},
+    {"zip_extract_ignores_planted_link", test_zip_extract_ignores_planted_link},
+    {"extract_hardlink_to_skipped_canonical", test_extract_hardlink_to_skipped_canonical},
+    {"extract_withholds_set_id_bits", test_extract_withholds_set_id_bits},
+#if defined(__linux__)
+    {"extract_withholds_privileged_xattrs", test_extract_withholds_privileged_xattrs},
+#endif
+#endif
     {"decompress_bomb", test_decompress_bomb},
     {"split_stream_size_bomb", test_split_stream_size_bomb},
     {"sequence_stream_truncation", test_sequence_stream_truncation},

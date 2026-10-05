@@ -155,7 +155,8 @@ FileMetadata capture_metadata(const std::filesystem::path& path) {
 
 std::vector<std::string> apply_metadata(const std::filesystem::path& path,
                                         const FileMetadata& meta,
-                                        bool restore_times) {
+                                        bool restore_times,
+                                        bool /*restore_privileged*/) {
     std::vector<std::string> warnings;
     if (restore_times && meta.has_windows_times) {
         // FILE_FLAG_BACKUP_SEMANTICS lets us open a directory handle; the write
@@ -632,6 +633,19 @@ int set_xattr_no_follow(const std::filesystem::path& path, const char* name,
 #endif
 }
 
+// Extended attributes that can grant privilege or change access for other users:
+// file capabilities, MAC labels, integrity data, POSIX ACLs. Only Linux names its
+// attributes by namespace; on macOS every attribute is an ordinary one and the
+// kernel decides what a caller may set.
+bool is_privileged_xattr(const std::string& name) {
+#if defined(__linux__)
+    return !name.starts_with("user.");
+#else
+    (void)name;
+    return false;
+#endif
+}
+
 void capture_posix_xattrs(const std::filesystem::path& path, FileMetadata& meta) {
     const auto size = list_xattrs_no_follow(path, nullptr, 0);
     if (size <= 0) {
@@ -723,27 +737,62 @@ FileMetadata capture_metadata(const std::filesystem::path& path) {
 }
 
 std::vector<std::string> apply_metadata(const std::filesystem::path& path,
-                                        const FileMetadata& meta, bool) {
+                                        const FileMetadata& meta, bool,
+                                        bool restore_privileged) {
     std::vector<std::string> warnings;
+    // What is on disk decides how the path is treated. The stored mode describes
+    // the archive's source, so an entry that claims to be something other than a
+    // link must not get a link chmod'ed through to whatever it points at.
+    struct ::stat current {};
+    if (::lstat(path.c_str(), &current) != 0) {
+        warnings.push_back("POSIX metadata could not be restored: " +
+                           std::string(std::strerror(errno)));
+        return warnings;
+    }
+    const bool symlink = S_ISLNK(current.st_mode);
     if (meta.has_posix) {
-        const bool symlink = S_ISLNK(static_cast<mode_t>(meta.posix_mode));
-        if (!symlink && ::chmod(path.c_str(), static_cast<mode_t>(meta.posix_mode & 07777u)) != 0) {
-            warnings.push_back("POSIX mode could not be restored: " +
-                               std::string(std::strerror(errno)));
-        }
-        // Ownership restore is best-effort and normally requires privilege. lchown
-        // intentionally addresses the link itself rather than following it.
-        if (::lchown(path.c_str(), static_cast<uid_t>(meta.posix_uid),
-                     static_cast<gid_t>(meta.posix_gid)) != 0 && errno != EPERM) {
+        // Ownership first: changing a file's owner clears its set-id bits, so a
+        // mode applied before the chown could be partly undone. Best-effort and
+        // normally needs privilege; lchown addresses the link itself, not its
+        // target.
+        const auto uid = static_cast<uid_t>(meta.posix_uid);
+        const auto gid = static_cast<gid_t>(meta.posix_gid);
+        if ((current.st_uid != uid || current.st_gid != gid) &&
+            ::lchown(path.c_str(), uid, gid) != 0 && errno != EPERM) {
             warnings.push_back("POSIX ownership could not be restored: " +
                                std::string(std::strerror(errno)));
         }
+        if (!symlink) {
+            auto mode = static_cast<mode_t>(meta.posix_mode & 07777u);
+            if (!restore_privileged) {
+                // A set-user-ID/set-group-ID bit makes a program run with someone
+                // else's rights. Directories keep set-group-ID (it only decides
+                // which group new entries get).
+                mode &= static_cast<mode_t>(~S_ISUID);
+                if (!S_ISDIR(current.st_mode)) mode &= static_cast<mode_t>(~S_ISGID);
+            }
+            if (::chmod(path.c_str(), mode) != 0) {
+                warnings.push_back("POSIX mode could not be restored: " +
+                                   std::string(std::strerror(errno)));
+            }
+        }
     }
 #if defined(__linux__) || defined(__APPLE__)
+    std::string withheld;
     for (const auto& blob : meta.xattrs) {
+        if (!restore_privileged && is_privileged_xattr(blob.name)) {
+            if (!withheld.empty()) withheld += ", ";
+            withheld += blob.name;
+            continue;
+        }
         if (set_xattr_no_follow(path, blob.name.c_str(), blob.data.data(), blob.data.size()) != 0) {
             warnings.push_back("extended attribute could not be restored: " + blob.name);
         }
+    }
+    if (!withheld.empty()) {
+        warnings.push_back(
+            "privileged extended attributes were not restored (opt in to restore "
+            "privileged metadata): " + withheld);
     }
 #endif
     return warnings;

@@ -133,7 +133,9 @@ void print_usage() {
         "  --threads N        default 0 = all hardware threads\n"
         "  --overwrite MODE   extract only: fail (default), skip, all\n"
         "  --include PATH     extract only: select an archive path (repeatable)\n"
-        "  --strict-metadata  extract only: fail if sparse fidelity or capture report is incomplete\n";
+        "  --strict-metadata  extract only: fail if sparse fidelity or capture report is incomplete\n"
+        "  --restore-privileged  extract/restore only: also restore set-user-ID/set-group-ID bits\n"
+        "                     and security.*/trusted.*/system.* xattrs (trusted archives only)\n";
 }
 
 bool stream_is_terminal(FILE* stream) {
@@ -1155,6 +1157,8 @@ int run_extract(std::vector<std::string> args) {
             }
         } else if (args[i] == "--strict-metadata") {
             extract.strict_metadata = true;
+        } else if (args[i] == "--restore-privileged") {
+            extract.restore_privileged_metadata = true;
         } else if (args[i] == "--include") {
             if (i + 1 >= args.size() || args[i + 1].empty()) {
                 print_usage();
@@ -1361,6 +1365,8 @@ int run_snapshot(std::vector<std::string> args) {
                 }
             } else if (args[i] == "--strict-metadata") {
                 extract.strict_metadata = true;
+            } else if (args[i] == "--restore-privileged") {
+                extract.restore_privileged_metadata = true;
             } else if (args[i] == "--threads") {
                 if (i + 1 >= args.size()) {
                     print_usage();

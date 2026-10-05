@@ -327,6 +327,34 @@ Extracted paths are always kept inside the destination. Attempts to escape it �
 whether by `..`, by an absolute path, or through a symbolic link or junction —
 are rejected.
 
+Within that guarantee, symbolic links are created after every file and
+directory, so nothing an archive stores can be written through a link that the
+same archive created. Each file is written under a temporary name that is
+created new, never through an existing link, and then renamed into place. A link
+that an archive stores still points wherever its target says; Axiom promises not
+to write *through* it, not that the target is harmless. When the operating
+system refuses to create a link, extraction reports a warning and carries on.
+
+#### Privileged metadata
+
+Restoring permissions does not restore what could give a file extra privilege on
+this machine unless you ask. By default extraction leaves out:
+
+- the set-user-ID and set-group-ID bits of files (directories keep set-group-ID);
+- on Linux, extended attributes outside the plain `user.` namespace —
+  `security.*`, `trusted.*` and `system.*`, which carry file capabilities,
+  SELinux labels, and POSIX ACLs.
+
+Each file that had attributes withheld gets one warning that names them. For an
+archive you trust, such as your own backup, add `--restore-privileged` to `x` or
+`snapshot restore`:
+
+```powershell
+axiomc x --restore-privileged backup.axar restored
+```
+
+Ownership is restored as before, whenever the extracting user may change it.
+
 ### Extracting only part of an archive
 
 Repeat `--include` for each archive path you want. Naming a directory includes
