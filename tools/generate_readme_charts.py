@@ -14,10 +14,10 @@ ROOT = Path(__file__).resolve().parents[1]
 OUTPUT_DIR = ROOT / "docs" / "images"
 BENCHMARKS = (
     ("silesia", "Silesia",
-     ROOT / "bench" / "results" / "silesia-0.8.0.0.csv",
+     ROOT / "bench" / "results" / "silesia-0.14.0.0.csv",
      "211.9 MB mixed-data tar"),
     ("enwik8", "enwik8",
-     ROOT / "bench" / "results" / "enwik8-0.8.0.0.csv",
+     ROOT / "bench" / "results" / "enwik8-0.14.0.0.csv",
      "100 MB English Wikipedia text"),
 )
 
@@ -199,7 +199,7 @@ def write_tradeoff_chart(results: list[Result], slug: str, title: str,
     label_offsets = {
         "Axiom -9": (10, -12), "zstd -19": (10, 18),
         "zstd -22 --ultra": (-10, -12), "LZMA2 -mx9": (10, -18),
-        "LZMA2 -mx5": (10, 18), "WinRAR -m5 128M": (10, 18),
+        "LZMA2 -mx5": (-10, 18), "WinRAR -m5 128M": (-10, -12),
         "Axiom -1": (10, -10), "zstd -1": (-10, 18),
     }
     by_label = {result.label: result for result in results}

@@ -20,14 +20,23 @@ rather than scaling these.
 0.4.0.0 and 0.8.0.0 runs, reference binaries that had not changed at all moved
 by 3–18% on identical input. That is machine state, not code. Attribute a speed
 change to Axiom only from a controlled A/B run of two builds — which is exactly
-what `tools\bench_axiom_levels.ps1` exists for.
+what `tools\bench_axiom_levels.ps1` exists for. The 0.8.0.0 and 0.14.0.0 runs
+agree much more closely than that, which is what makes the comparison in
+[Since the 0.8.0.0 snapshot](#since-the-0800-snapshot) meaningful.
 
-> **Current snapshot: Axiom 0.8.0.0**, measured 2026-07-31.
+> **Current snapshot: Axiom 0.14.0.0**, measured 2026-10-06.
 >
-> On enwik8, every Axiom archive is byte-for-byte the same size as in the
-> 0.4.0.0 snapshot, at all nine levels. That is expected: 0.7.0.0 made the extra
-> block methods opt-in through `--method`, and 0.7.1.0 retuned the *automatic*
-> file-type profiles. Neither path changes what an explicit `--level N` emits.
+> Every Axiom archive is the same size as in the 0.8.0.0 snapshot: all nine
+> levels on enwik8, and levels 1–8 on Silesia. Level 9 on Silesia is 71 bytes
+> larger, the difference the 2026-08-03 regression checkpoint below recorded. On
+> enwik8 that makes 0.4.0.0, 0.8.0.0 and 0.14.0.0 identical, which is expected:
+> 0.7.0.0 made the extra block methods opt-in through `--method`, and 0.7.1.0
+> retuned the *automatic* file-type profiles. Neither path changes what an
+> explicit `--level N` emits.
+>
+> Speed is what moved. Silesia levels 8 and 9 and enwik8 levels 3–8 now take
+> 10–25% less compression time than in 0.8.0.0; see [Since the 0.8.0.0
+> snapshot](#since-the-0800-snapshot).
 >
 > The exact rows behind every table and chart are versioned in
 > [`../bench/results/`](../bench/results/).
@@ -36,12 +45,14 @@ what `tools\bench_axiom_levels.ps1` exists for.
 
 | | |
 |---|---|
+| Axiom | 0.14.0.0, commit `6a26fe8` |
 | CPU | AMD Ryzen 9 5950X, 16 cores / 32 threads |
+| OS | Windows 11 Pro, build 10.0.26300 |
 | Storage | NVMe, warm cache |
-| Build | MSVC Release x64 |
+| Build | MSVC 14.51 (Visual Studio 2026), Release x64 |
 | Protocol | Best-of-2 compression, best-of-3 decompression, every row round-trip verified |
 | Axiom settings | Default `--threads 0` |
-| References | zstd 1.5.7 (`-T0`), LZ4 1.10.0, 7-Zip 26.02 (`-mmt=on`) for LZMA2/bzip2/gzip, WinRAR 7.23 RAR5 (`-m3`, `-m5 -md128m`) |
+| References | zstd 1.5.7 (`-T0`) and LZ4 1.10.0, both official win64 builds, 7-Zip 26.03 (`-mmt=on`) for LZMA2/bzip2/gzip, WinRAR 7.23 RAR5 (`-m3`, `-m5 -md128m`) |
 
 ## Silesia
 
@@ -58,42 +69,42 @@ member transforms — exactly what a normal `axiomc c --level N` run would do.
 | LZ4 -1 | 100.9 MB | 2.10x | 0.09 s | 0.09 s |
 | LZ4 -9 (HC) | 78.0 MB | 2.72x | 0.37 s | 0.09 s |
 | zstd -1 | 73.3 MB | 2.89x | 0.07 s | 0.15 s |
-| zstd -3 | 66.2 MB | 3.20x | 0.12 s | 0.17 s |
-| **Axiom -1** | 64.9 MB | 3.27x | 0.74 s | 0.22 s |
-| gzip Deflate -9 | 64.7 MB | 3.28x | 87.90 s | 0.80 s |
-| zstd -9 | 59.2 MB | 3.58x | 0.51 s | 0.16 s |
+| zstd -3 | 66.2 MB | 3.20x | 0.12 s | 0.16 s |
+| **Axiom -1** | 64.9 MB | 3.27x | 0.72 s | 0.22 s |
+| gzip Deflate -9 | 64.7 MB | 3.28x | 89.87 s | 0.82 s |
+| zstd -9 | 59.2 MB | 3.58x | 0.52 s | 0.16 s |
 | **Axiom -2** | 59.1 MB | 3.59x | 1.57 s | 0.23 s |
-| **Axiom -3** | 58.4 MB | 3.63x | 1.74 s | 0.23 s |
-| **Axiom -4** | 56.8 MB | 3.73x | 2.31 s | 0.24 s |
-| **Axiom -5** (default) | 56.5 MB | 3.75x | 2.91 s | 0.24 s |
-| **Axiom -6** | 56.2 MB | 3.77x | 3.97 s | 0.24 s |
-| **Axiom -7** | 54.9 MB | 3.86x | 5.05 s | 0.24 s |
-| WinRAR -m3 | 54.2 MB | 3.91x | 1.94 s | 0.46 s |
-| bzip2 -9 | 54.2 MB | 3.91x | 7.23 s | 2.15 s |
-| WinRAR -m5 128M | 53.2 MB | 3.99x | 3.23 s | 0.45 s |
-| zstd -19 | 52.8 MB | 4.01x | 16.78 s | 0.17 s |
-| **Axiom -8** | 52.4 MB | 4.04x | 15.14 s | 0.25 s |
-| zstd -22 --ultra | 52.3 MB | 4.05x | 84.06 s | 0.19 s |
-| **Axiom -9** | 51.4 MB | 4.12x | 16.02 s | 0.24 s |
-| LZMA2 -mx5 | 49.6 MB | 4.27x | 17.93 s | 0.78 s |
-| LZMA2 -mx9 | 48.7 MB | 4.35x | 35.02 s | 1.21 s |
+| **Axiom -3** | 58.4 MB | 3.63x | 1.71 s | 0.23 s |
+| **Axiom -4** | 56.8 MB | 3.73x | 2.28 s | 0.23 s |
+| **Axiom -5** (default) | 56.5 MB | 3.75x | 2.93 s | 0.23 s |
+| **Axiom -6** | 56.2 MB | 3.77x | 3.86 s | 0.23 s |
+| **Axiom -7** | 54.9 MB | 3.86x | 4.90 s | 0.24 s |
+| WinRAR -m3 | 54.2 MB | 3.91x | 1.95 s | 0.46 s |
+| bzip2 -9 | 54.2 MB | 3.91x | 7.03 s | 2.12 s |
+| WinRAR -m5 128M | 53.2 MB | 3.99x | 3.25 s | 0.46 s |
+| zstd -19 | 52.8 MB | 4.01x | 17.20 s | 0.16 s |
+| **Axiom -8** | 52.4 MB | 4.04x | 12.68 s | 0.25 s |
+| zstd -22 --ultra | 52.3 MB | 4.05x | 84.47 s | 0.19 s |
+| **Axiom -9** | 51.4 MB | 4.12x | 12.08 s | 0.23 s |
+| LZMA2 -mx5 | 49.6 MB | 4.27x | 18.00 s | 0.79 s |
+| LZMA2 -mx9 | 48.7 MB | 4.35x | 35.14 s | 1.21 s |
 
-Raw data: [`silesia-0.8.0.0.csv`](../bench/results/silesia-0.8.0.0.csv).
+Raw data: [`silesia-0.14.0.0.csv`](../bench/results/silesia-0.14.0.0.csv).
 
 ### What the table says
 
 - Axiom's fast presets trade zstd's throughput for a smaller result. Levels 2–7
   cover the range between zstd -3 and WinRAR normal.
-- Axiom -9 is 2.8% smaller than zstd -19 at comparable encode time, and 1.7%
-  smaller than zstd -22 while encoding 5.2x faster.
-- WinRAR best is 3.4% larger and encodes 5.0x faster, but Axiom decodes 1.9x
+- Axiom -9 is 2.8% smaller than zstd -19 and encodes 1.4x faster, and 1.7%
+  smaller than zstd -22 while encoding 7.0x faster.
+- WinRAR best is 3.4% larger and encodes 3.7x faster, but Axiom decodes 2.0x
   faster.
-- Axiom -9 is 5.6% larger than LZMA2 -mx9, but encodes 2.2x faster and decodes
-  5.1x faster.
-- Levels 8 and 9 sit close together here: level 8 saves 5.5% of the encode time
-  for a 2.0% larger archive. On enwik8 they converge completely, so level 8
-  earns its place mainly through its smaller 32 MiB window rather than through
-  speed.
+- Axiom -9 is 5.5% larger than LZMA2 -mx9, but encodes 2.9x faster and decodes
+  5.3x faster.
+- Levels 8 and 9 sit close together here, and which one is cheaper depends on
+  the corpus. On Silesia level 8 took 5.0% longer than level 9 for a 2.0% larger
+  archive; on enwik8 it took 9.9% less for a 0.9% larger archive. Level 8 earns
+  its place mainly through its smaller 32 MiB window rather than through speed.
 
 Closing the remaining LZMA2 ratio gap is active work. The measured analysis is
 in [GAP_ANALYSIS_LZMA2.md](GAP_ANALYSIS_LZMA2.md).
@@ -105,8 +116,13 @@ reference codecs that have not changed at all. Both tars are exactly
 211,948,032 bytes, but they were written by different `tar` builds, whose
 headers differ. See [BENCHMARKING.md](BENCHMARKING.md#corpora).
 
+The 0.8.0.0 and 0.14.0.0 snapshots did see the same input: the 0.14.0.0 tar was
+written by bsdtar 3.8.8, and all 13 reference-codec archives are exactly the
+size they were in `silesia-0.8.0.0.csv`.
+
 Compare Axiom against the other codecs *within* a snapshot, not against a
-previous one.
+previous one. Comparing Axiom's own sizes across snapshots is safe only when the
+reference rows match exactly, as they do for 0.8.0.0 and 0.14.0.0.
 
 ## enwik8
 
@@ -119,32 +135,74 @@ de-facto LZMA-class ratio benchmark — with default `--threads 0`.
 
 | Axiom level | Compressed | Ratio | Compress | Decompress |
 |---:|---:|---:|---:|---:|
-| 1 | 37.3 MB | 2.68x | 0.26 s | 0.10 s |
-| 2 | 32.8 MB | 3.05x | 0.75 s | 0.09 s |
-| 3 | 32.4 MB | 3.09x | 1.08 s | 0.09 s |
-| 4 | 32.1 MB | 3.12x | 1.80 s | 0.10 s |
-| 5 (default) | 31.8 MB | 3.14x | 2.39 s | 0.10 s |
-| 6 | 31.7 MB | 3.15x | 3.38 s | 0.10 s |
-| 7 | 30.7 MB | 3.25x | 3.11 s | 0.11 s |
-| 8 | 28.7 MB | 3.48x | 7.08 s | 0.11 s |
-| 9 | 28.5 MB | 3.51x | 6.89 s | 0.10 s |
+| 1 | 37.3 MB | 2.68x | 0.27 s | 0.10 s |
+| 2 | 32.8 MB | 3.05x | 0.72 s | 0.10 s |
+| 3 | 32.4 MB | 3.09x | 0.97 s | 0.09 s |
+| 4 | 32.1 MB | 3.12x | 1.47 s | 0.10 s |
+| 5 (default) | 31.8 MB | 3.14x | 2.07 s | 0.10 s |
+| 6 | 31.7 MB | 3.15x | 2.89 s | 0.10 s |
+| 7 | 30.7 MB | 3.25x | 2.63 s | 0.10 s |
+| 8 | 28.7 MB | 3.48x | 5.88 s | 0.10 s |
+| 9 | 28.5 MB | 3.51x | 6.52 s | 0.10 s |
 
-On enwik8, Axiom -9 encodes 5.2x faster and decodes 5.9x faster than
-LZMA2 -mx9, while LZMA2 remains 12.9% smaller.
+On enwik8, Axiom -9 encodes 5.4x faster and decodes 6.0x faster than LZMA2 -mx9,
+while LZMA2 remains 12.9% smaller.
 
-Levels 8 and 9 are indistinguishable in cost on this corpus. They landed within
-3% of each other in both the 0.4.0.0 and the 0.8.0.0 run, in opposite
-directions, so level 9's 0.9% smaller archive is effectively free on text.
-Prefer level 8 here only when you need its smaller window for memory reasons.
+Levels 8 and 9 are no longer indistinguishable in cost on this corpus. They
+landed within 3% of each other in both the 0.4.0.0 and the 0.8.0.0 run, in
+opposite directions. Now level 8 takes 9.9% less encode time than level 9 for a
+0.9% larger archive, so level 9's extra 0.9% is no longer free on text.
 
-Raw data: [`enwik8-0.8.0.0.csv`](../bench/results/enwik8-0.8.0.0.csv).
+Raw data: [`enwik8-0.14.0.0.csv`](../bench/results/enwik8-0.14.0.0.csv).
 
 ### Full-window diagnostic
 
-A separate full-window sweep reaches 3.57x on enwik8, but only at 2.3 MB/s
-against the level-9 preset's 14.3 MB/s. It is kept as a diagnostic rather than
+A separate full-window sweep reaches 3.57x on enwik8, but only at 2.3 MiB/s
+against the level-9 preset's 14.4 MiB/s. It is kept as a diagnostic rather than
 promoted to a preset. The complete level/window sweep is in
-[`enwik8-level-window-0.8.0.0.csv`](../bench/results/enwik8-level-window-0.8.0.0.csv).
+[`enwik8-level-window-0.14.0.0.csv`](../bench/results/enwik8-level-window-0.14.0.0.csv).
+
+## Since the 0.8.0.0 snapshot
+
+This run used the same CPU model, corpora, harness and reference-tool versions
+as the 0.8.0.0 snapshot, except 7-Zip (26.03 now, 26.02 then). All 26 reference
+archives are exactly the size they were before, which shows both runs compressed
+the same input.
+
+**Archive bytes.** 43 of the 44 rows are the same size as before. The exception
+is Axiom -9 on Silesia, which is 71 bytes larger (51,386,664 instead of
+51,386,593). The 2026-08-03 regression checkpoint below recorded the same
+difference.
+
+**Control.** Reference-codec rows that take 0.1 s or longer moved by −3.8% to
++5.0% in compression time and −2.0% to +3.0% in decompression time, with every
+median within 1.3% of zero. Treat changes of 5% or less below as noise.
+
+**Axiom compression time**, 0.14.0.0 against 0.8.0.0. Negative means less time:
+
+| Axiom level | Silesia | enwik8 |
+|---:|---:|---:|
+| 1 | −3.3% | +2.7% |
+| 2 | −0.1% | −4.5% |
+| 3 | −1.7% | −10.5% |
+| 4 | −1.5% | −18.2% |
+| 5 | +0.6% | −13.1% |
+| 6 | −2.8% | −14.5% |
+| 7 | −3.1% | −15.5% |
+| 8 | −16.2% | −17.0% |
+| 9 | −24.6% | −5.3% |
+
+Silesia levels 8 and 9 and enwik8 levels 3–8 are the changes clearly beyond that
+noise: they take 10–25% less time. enwik8 level 9 (−5.3%) sits at its edge.
+Decompression changed little: −5.2% to +0.2% on Silesia and −9.3% to +2.2% on
+enwik8, where a run lasts only 0.1 s and a 10 ms difference is 10%.
+
+This compares two snapshots; it is not an A/B run of two builds, so it does not
+say which change produced the difference. The 2026-08-02 and 2026-08-03 entries
+in the log below record the parser and matcher changes made in the days after
+the 0.8.0.0 snapshot. To attribute a difference, run
+`tools\bench_axiom_levels.ps1` against a baseline build, as described in
+[BENCHMARKING.md](BENCHMARKING.md#comparing-two-builds).
 
 ## Charts
 

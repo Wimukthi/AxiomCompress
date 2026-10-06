@@ -162,23 +162,23 @@ compressor sees byte-identical input. AMD Ryzen 9 5950X (16 cores / 32
 threads), warm cache, Release build. Every row was decompressed and compared
 against the original before it was recorded.
 
-> These are the **0.8.0.0** figures, measured 2026-07-31, and they have not been
-> re-measured since. Later releases changed speed in places (see the
-> [changelog](docs/CHANGELOG.md)); treat the timings as a baseline, not as
-> what the current build does on the same machine.
+> These are the **0.14.0.0** figures, measured 2026-10-06. Compared with the
+> 0.8.0.0 snapshot they replace, archive sizes are unchanged (Axiom -9 is 71
+> bytes larger) and Axiom -9 packs in 25% less time. Details:
+> [docs/PERFORMANCE.md](docs/PERFORMANCE.md#since-the-0800-snapshot).
 
 | Compressor and setting | Compressed | Ratio | Pack | Unpack |
 |---|---:|---:|---:|---:|
-| zstd -3 | 66.2 MB | 3.20x | 0.12 s | 0.17 s |
-| **Axiom -5** (default) | 56.5 MB | 3.75x | 2.91 s | 0.24 s |
-| WinRAR -m5 128M | 53.2 MB | 3.99x | 3.23 s | 0.45 s |
-| zstd -19 | 52.8 MB | 4.01x | 16.78 s | 0.17 s |
-| **Axiom -9** | 51.4 MB | 4.12x | 16.02 s | 0.24 s |
-| LZMA2 -mx9 | 48.7 MB | 4.35x | 35.02 s | 1.21 s |
+| zstd -3 | 66.2 MB | 3.20x | 0.12 s | 0.16 s |
+| **Axiom -5** (default) | 56.5 MB | 3.75x | 2.93 s | 0.23 s |
+| WinRAR -m5 128M | 53.2 MB | 3.99x | 3.25 s | 0.46 s |
+| zstd -19 | 52.8 MB | 4.01x | 17.20 s | 0.16 s |
+| **Axiom -9** | 51.4 MB | 4.12x | 12.08 s | 0.23 s |
+| LZMA2 -mx9 | 48.7 MB | 4.35x | 35.14 s | 1.21 s |
 
 Axiom at level 9 lands between zstd's high-ratio settings and LZMA2. It is 2.8%
-smaller than zstd -19 at about the same packing time. It is 5.6% larger than
-LZMA2 -mx9, but packs 2.2x faster and unpacks 5.1x faster.
+smaller than zstd -19 and packs 1.4x faster. It is 5.5% larger than LZMA2 -mx9,
+but packs 2.9x faster and unpacks 5.3x faster.
 
 Full tables, charts, and the enwik8 results:
 [docs/PERFORMANCE.md](docs/PERFORMANCE.md). To measure on your own machine:

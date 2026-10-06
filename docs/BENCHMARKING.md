@@ -107,7 +107,11 @@ every row before reporting a ratio.
 .\tools\bench_enwik8.ps1
 .\tools\bench_enwik8.ps1 -Quick
 .\tools\bench_enwik8.ps1 -Axiomc out\Release\axiomc.exe
+.\tools\bench_enwik8.ps1 -OutputCsv bench\results\enwik8-level-window-<version>.csv
 ```
+
+`-OutputCsv` keeps the verified rows; the full-window diagnostic in
+[PERFORMANCE.md](PERFORMANCE.md#full-window-diagnostic) links to that file.
 
 Leave `-Scratch` at its default unless you know the replacement is equally
 fast. This sweep writes the full decoded corpus once per row and times it, so
@@ -295,12 +299,21 @@ publishing controlled results. See
 
 ## Publishing a new snapshot
 
-1. Run the cross-codec harness on both standing corpora.
+1. Run the cross-codec harness on both standing corpora, then the enwik8 sweep
+   above. Run them one at a time, on an otherwise idle machine, with the corpora
+   and scratch files on a local drive that is not synced. Write down the exact
+   version of every reference tool: the harness does not record them.
 2. Commit the verified CSVs under `bench/results/`, with the version in the
-   filename.
-3. Regenerate the charts: `python tools\generate_readme_charts.py`.
-4. Update the tables in [PERFORMANCE.md](PERFORMANCE.md) and the headline table
-   in the README from those same CSVs.
+   filename: `silesia-<version>.csv`, `enwik8-<version>.csv`, and
+   `enwik8-level-window-<version>.csv`.
+3. Point the `BENCHMARKS` list at the top of `tools\generate_readme_charts.py`
+   at the new CSVs. It names them explicitly, so otherwise it quietly redraws
+   the old snapshot. Then regenerate the charts with
+   `python tools\generate_readme_charts.py` and look at them: the label
+   positions are fixed, and new timings can put two markers next to each other.
+4. Update the tables and the test-environment details in
+   [PERFORMANCE.md](PERFORMANCE.md), and the headline table in the README, from
+   those same CSVs.
 
 Keep all four in sync. The chart generator reads the CSVs directly and rejects
 missing, unknown, or unverified rows, so the charts and the raw data cannot
