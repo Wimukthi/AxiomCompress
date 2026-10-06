@@ -14,6 +14,17 @@ Entries are condensed from the
 
 ## [Unreleased]
 
+### Documentation
+
+- Expanded the Windows GUI guide to cover the browser, every options and
+  settings page, search, information and estimates, archive maintenance,
+  snapshots, self-extractor windows, updates, setup, and confirmation/result
+  dialogs. Corrected extraction scope, toolbar ordering, temporary-file
+  cleanup, and cancellation instructions against the GUI implementation.
+- Added current-release screenshots for all six Add pages, all eleven
+  Settings pages, browser menus, search, information, extraction, progress,
+  update review, snapshots, signing, recovery, volumes, and full self-extractors.
+
 ## [0.14.0.0] - 2026-10-05
 
 Extraction is stricter about links and privileged metadata, and several
