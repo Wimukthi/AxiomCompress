@@ -2,6 +2,7 @@
 #include "gui/compression_estimate_dialog.hpp"
 
 #include "gui/dialog_support.hpp"
+#include "gui/estimate_presentation.hpp"
 
 #include <shellapi.h>
 
@@ -33,6 +34,9 @@ constexpr UINT kSnapshotMessage = WM_APP + 61;
 constexpr UINT kDoneMessage = WM_APP + 62;
 constexpr UINT kMetadataProgressMessage = WM_APP + 63;
 constexpr UINT kMetadataDoneMessage = WM_APP + 64;
+// Advances the progress strip between estimator updates.
+constexpr UINT_PTR kEstimateTickTimer = 0x6104;
+constexpr UINT kEstimateTickMilliseconds = 100;
 constexpr int kDialogClientWidth = 680;
 constexpr int kDialogClientHeight = 600;
 constexpr DWORD kEstimateDialogStyle =
@@ -43,38 +47,6 @@ constexpr std::array<const wchar_t*, 9> kCompressionLevelNames{
     L"1 - Fastest", L"2 - Very fast", L"3 - Fast", L"4 - Normal",
     L"5 - Balanced", L"6 - Strong", L"7 - High", L"8 - Very high",
     L"9 - Maximum"};
-
-std::wstring format_bytes(std::uint64_t bytes) {
-    constexpr const wchar_t* units[] = {L"B", L"KB", L"MB", L"GB", L"TB"};
-    double value = static_cast<double>(bytes);
-    std::size_t unit = 0;
-    while (value >= 1024.0 && unit + 1 < std::size(units)) {
-        value /= 1024.0;
-        ++unit;
-    }
-    std::wstringstream stream;
-    stream << std::fixed << std::setprecision(unit == 0 ? 0 : 1)
-           << value << L' ' << units[unit];
-    return stream.str();
-}
-
-std::wstring format_duration(std::uint64_t seconds) {
-    const std::uint64_t hours = seconds / 3600;
-    const std::uint64_t minutes = (seconds % 3600) / 60;
-    const std::uint64_t remainder = seconds % 60;
-    std::wstringstream stream;
-    if (hours != 0) stream << hours << L"h ";
-    if (hours != 0 || minutes != 0) stream << minutes << L"m ";
-    stream << remainder << L's';
-    return stream.str();
-}
-
-std::wstring format_decimal(double value, int precision, wchar_t suffix = L'\0') {
-    std::wstringstream stream;
-    stream << std::fixed << std::setprecision(precision) << value;
-    if (suffix != L'\0') stream << suffix;
-    return stream.str();
-}
 
 std::wstring widen_utf8(std::string_view text) {
     if (text.empty()) return {};
@@ -322,6 +294,7 @@ struct EstimateDialogState {
     std::jthread metadata_worker;
     std::mutex result_mutex;
     std::optional<CompressionEstimateSnapshot> snapshot;
+    std::chrono::steady_clock::time_point snapshot_time{};
     std::optional<CompressionEstimateResult> result;
     std::optional<MetadataProgress> metadata_progress;
     std::optional<FilesystemInformation> information;
@@ -440,11 +413,14 @@ void paint_dialog(EstimateDialogState& state) {
     bool has_metadata = false;
     bool has_information = false;
     std::wstring error;
+    double since_snapshot = 0.0;
     {
         std::lock_guard lock(state.result_mutex);
         if (state.snapshot) {
             snapshot = *state.snapshot;
             has_snapshot = true;
+            since_snapshot = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - state.snapshot_time).count();
         }
         if (state.result) {
             result = *state.result;
@@ -468,8 +444,8 @@ void paint_dialog(EstimateDialogState& state) {
         : state.inputs.size() == 1 ? state.inputs.front().parent_path().wstring()
                                    : L"Calculating common location...";
     const std::wstring size_text = has_metadata
-        ? format_bytes(metadata.logical_bytes) + L"  (" +
-              format_bytes(metadata.allocated_bytes) + L" on disk)"
+        ? format_estimate_bytes(metadata.logical_bytes) + L"  (" +
+              format_estimate_bytes(metadata.allocated_bytes) + L" on disk)"
         : L"Scanning...";
     const std::wstring contains_label = has_information && information.contains_directories
         ? L"Contains: " : L"Items: ";
@@ -517,30 +493,35 @@ void paint_dialog(EstimateDialogState& state) {
                    {right - scale(state, 205), scale(state, 330),
                     right - scale(state, 158), scale(state, 354)});
 
-    double savings = has_result ? result.estimated_savings_percent
-                                : has_snapshot ? snapshot.estimated_savings_percent : 0.0;
-    std::wstring headline = state.metadata_running
+    // The estimate lines come from the shared presentation, word for word
+    // what the create-archive preview shows for the same level.
+    std::optional<EstimateFigures> figures;
+    if (has_result) {
+        figures = estimate_figures(result);
+        if (has_snapshot) {
+            // The result carries no timings; the final snapshot does.
+            figures->elapsed_ms = snapshot.elapsed_ms;
+            figures->window_ms = snapshot.window_ms;
+        }
+    } else if (has_snapshot) {
+        figures = estimate_figures(snapshot);
+    }
+    const EstimatePresentation text =
+        figures ? present_estimate(*figures) : EstimatePresentation{};
+    std::wstring status = state.metadata_running
         ? L"Estimate becomes available after the filesystem scan"
         : L"Ready to estimate compression";
-    if (state.running && !has_snapshot) headline = L"Calibrating samples...";
-    if (has_result) {
-        const double compressed = 100.0 - savings;
-        headline = savings >= 0.0
-            ? L"Estimate complete - compressed: " + format_decimal(compressed, 1, L'%') +
-                  L"  |  saved: " + format_decimal(savings, 1, L'%')
-            : L"Estimate complete - compressed: " + format_decimal(compressed, 1, L'%') +
-                  L"  |  growth: " + format_decimal(-savings, 1, L'%');
-    } else if (has_snapshot) {
-        const double compressed = 100.0 - savings;
-        headline = savings >= 0.0
-            ? L"Provisional - compressed: " + format_decimal(compressed, 1, L'%') +
-                  L"  |  saved: " + format_decimal(savings, 1, L'%')
-            : L"Provisional - compressed: " + format_decimal(compressed, 1, L'%') +
-                  L"  |  growth: " + format_decimal(-savings, 1, L'%');
+    if (state.running) status = L"Estimating...";
+    if (figures) {
+        status = state.running
+            ? present_estimate(live_estimate_figures(*figures, since_snapshot)).status
+            : text.status;
     }
-    if (state.cancelled.load(std::memory_order_acquire)) headline = L"Estimation cancelled";
-    if (!error.empty()) headline = L"Estimation failed";
-    draw_text_line(dc, state.font, colors.text, headline,
+    if (state.cancelled.load(std::memory_order_acquire)) status = L"Estimation cancelled";
+    if (!error.empty()) status = L"Estimation failed";
+    const bool show_estimate = figures.has_value() && error.empty();
+    draw_text_line(dc, state.font, colors.text,
+                   show_estimate ? text.headline : status,
                    {margin, scale(state, 364), right, scale(state, 388)});
 
     RECT track{margin, scale(state, 396), right, scale(state, 424)};
@@ -548,18 +529,16 @@ void paint_dialog(EstimateDialogState& state) {
     frame_rect(dc, track, colors.border);
     RECT inner = track;
     InflateRect(&inner, -scale(state, 2), -scale(state, 2));
-    const bool has_estimate = has_snapshot || has_result;
     const COLORREF compressed_color = state.dark ? RGB(0, 122, 220) : RGB(0, 102, 190);
     const COLORREF saved_color = state.dark ? RGB(46, 178, 93) : RGB(38, 148, 76);
-    fill_rect(dc, inner, has_estimate ? saved_color : colors.control_background);
-    if (has_estimate) {
-        const double compressed_fraction = std::clamp(1.0 - savings / 100.0, 0.0, 1.0);
+    fill_rect(dc, inner, show_estimate ? saved_color : colors.control_background);
+    if (show_estimate) {
         RECT compressed = inner;
         compressed.right = compressed.left + static_cast<int>(
-            (inner.right - inner.left) * compressed_fraction);
+            (inner.right - inner.left) * text.compressed_fraction);
         if (compressed.right > compressed.left) {
             fill_rect(dc, compressed,
-                      savings >= 0.0 ? compressed_color : RGB(210, 135, 55));
+                      text.grows ? RGB(210, 135, 55) : compressed_color);
         }
         if (compressed.right > inner.left && compressed.right < inner.right) {
             const int divider_width = (std::max)(1, scale(state, 2));
@@ -569,44 +548,38 @@ void paint_dialog(EstimateDialogState& state) {
         }
     }
 
-    std::wstring archive = L"Estimated archive: -";
-    std::wstring ratio = L"Compression ratio: -";
-    std::wstring sampling = L"Sampling: not started";
-    std::wstring confidence = L"Confidence: -";
-    if (has_snapshot) {
-        archive = L"Estimated archive: " + format_bytes(snapshot.estimated_archive_bytes);
-        ratio = L"Compression ratio: " + format_decimal(snapshot.estimated_ratio, 2) + L"x";
-        sampling = L"Sampled " + format_bytes(snapshot.sampled_bytes) + L" of " +
-                   format_bytes(snapshot.planned_sample_bytes);
-    }
-    if (has_result) {
-        archive = L"Estimated archive: " + format_bytes(result.estimated_archive_bytes) +
-                  L"  (range " + format_bytes(result.estimated_low_bytes) + L" - " +
-                  format_bytes(result.estimated_high_bytes) + L")";
-        ratio = L"Compression ratio: " + format_decimal(result.estimated_ratio, 2) +
-                L"x  |  Estimated time: " + format_duration(result.estimated_seconds);
-        sampling = L"Sampled " + format_bytes(result.sampled_bytes) + L"  |  " +
-                   std::to_wstring(result.warnings.size()) + L" warnings";
-        confidence = std::wstring(L"Confidence: ") +
-            (result.confidence == EstimateConfidence::high ? L"High"
-             : result.confidence == EstimateConfidence::medium ? L"Medium" : L"Low") +
-            L"  |  95% margin: +/- " +
-            format_decimal(result.confidence_margin_percent, 1) + L" percentage points";
-    }
-    if (!error.empty()) {
-        archive = error;
-        ratio.clear();
-        sampling.clear();
-        confidence.clear();
-    }
-    draw_text_line(dc, state.font, colors.text, archive,
+    draw_text_line(dc, state.font, colors.text,
+                   show_estimate ? text.range : error,
                    {margin, scale(state, 434), right, scale(state, 458)});
-    draw_text_line(dc, state.font, colors.disabled_text, ratio,
+    draw_text_line(dc, state.font, colors.disabled_text,
+                   show_estimate ? text.detail : std::wstring{},
                    {margin, scale(state, 462), right, scale(state, 486)});
-    draw_text_line(dc, state.font, colors.disabled_text, sampling,
+    draw_text_line(dc, state.font, colors.disabled_text,
+                   show_estimate || state.running ? status : std::wstring{},
                    {margin, scale(state, 490), right, scale(state, 514)});
-    draw_text_line(dc, state.font, colors.disabled_text, confidence,
-                   {margin, scale(state, 518), right, scale(state, 538)});
+
+    // Thin progress strip under the status while the estimate refines.
+    if (state.running) {
+        RECT strip{margin, scale(state, 516), right,
+                   scale(state, 516) + (std::max)(2, scale(state, 3))};
+        fill_rect(dc, strip, colors.control_background);
+        const int span = strip.right - strip.left;
+        RECT fill = strip;
+        if (!figures || figures->phase == EstimatePhase::scanning) {
+            // Unknown length while the file list is read: a sweep.
+            const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+            const int segment = (std::max)(1, span / 4);
+            const int offset = static_cast<int>(
+                (now_ms % 1400) * (span + segment) / 1400) - segment;
+            fill.left = strip.left + (std::max)(0, offset);
+            fill.right = strip.left + (std::min)(span, offset + segment);
+        } else {
+            fill.right = strip.left + static_cast<int>(
+                span * displayed_estimate_progress(*figures, since_snapshot));
+        }
+        if (fill.right > fill.left) fill_rect(dc, fill, compressed_color);
+    }
 
     if (buffered) {
         BitBlt(paint_dc, paint.rcPaint.left, paint.rcPaint.top,
@@ -624,6 +597,7 @@ void paint_dialog(EstimateDialogState& state) {
 void finish_worker(EstimateDialogState& state) {
     if (state.worker.joinable()) state.worker.join();
     state.running = false;
+    KillTimer(state.hwnd, kEstimateTickTimer);
     state.operation.reset();
     if (state.closing && !state.metadata_running) {
         save_named_window_placement(L"CompressionEstimateDialog", state.hwnd);
@@ -718,6 +692,7 @@ void start_estimate(EstimateDialogState& state) {
     SetWindowTextW(state.estimate_button, L"Cancel");
     EnableWindow(state.estimate_button, TRUE);
     EnableWindow(state.level_combo, FALSE);
+    SetTimer(state.hwnd, kEstimateTickTimer, kEstimateTickMilliseconds, nullptr);
     InvalidateRect(state.hwnd, nullptr, FALSE);
 
     const HWND target = state.hwnd;
@@ -731,6 +706,7 @@ void start_estimate(EstimateDialogState& state) {
             {
                 std::lock_guard lock(state.result_mutex);
                 state.snapshot = value;
+                state.snapshot_time = std::chrono::steady_clock::now();
             }
             PostMessageW(target, kSnapshotMessage, 0, 0);
         };
@@ -787,8 +763,6 @@ void select_compression_level(EstimateDialogState& state) {
     compression.input_open_retries = previous.input_open_retries;
     compression.enable_file_filters = previous.enable_file_filters;
     state.options.compression = std::move(compression);
-    state.options.sample_budget = level >= 8 ? 24u << 20
-        : level >= 6 ? 48u << 20 : 64u << 20;
     state.compression_level = level;
     {
         std::lock_guard lock(state.result_mutex);
@@ -912,6 +886,16 @@ LRESULT CALLBACK estimate_dialog_proc(HWND hwnd, UINT message,
         case kSnapshotMessage:
             invalidate_dialog_band(*state, 360, 540);
             return 0;
+        case WM_TIMER:
+            if (wparam == kEstimateTickTimer) {
+                if (state->running) {
+                    invalidate_dialog_band(*state, 486, 522);
+                } else {
+                    KillTimer(hwnd, kEstimateTickTimer);
+                }
+                return 0;
+            }
+            break;
         case kDoneMessage:
             finish_worker(*state);
             return 0;

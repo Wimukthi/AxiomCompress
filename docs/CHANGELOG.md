@@ -14,6 +14,46 @@ Entries are condensed from the
 
 ## [Unreleased]
 
+## [0.15.0.0] - 2026-11-11
+
+Compression estimates are rebuilt. They are measured the way the archive is
+written, show a figure the moment they start and refine it while you watch,
+and state a range that matches their real error. The archive format is
+unchanged, and for the same input and settings the same archive bytes are
+produced.
+
+### Changed
+
+- Compression estimates are measured the way the archive is written. Probes
+  are cut from the same type-sorted solid stream the AXAR writer builds, so a
+  folder of small files is estimated as packed together rather than one file
+  at a time; byte-identical files are counted once; probes run in parallel on
+  the writer's own coding path; and the gain of the longer blocks used by
+  levels 8 and 9 is measured instead of ignored. On the test sets, error fell
+  from 4-33% (and around 200% on a duplicated tree) to under 1% at levels 1-7
+  when fully sampled, typically 1-2% at level 9, and an estimate now takes a
+  second or two instead of five to thirty.
+- The stated range is a real 95% interval. It widens when few probes were
+  possible, narrows to the model margin when every byte was measured, and
+  confidence is rated from the width of that range.
+- The Add to archive preview and the Information dialog now run the same
+  estimator with the same limits and show the same three lines in the same
+  units: size with share of original and saving, the range with confidence,
+  then ratio, expected time, and how much was sampled.
+- Estimates show a figure at once instead of a "Scanning selected files"
+  message. While the file list is read, the preview shows a first guess from
+  file types and sizes with a wide range; measured figures replace it level by
+  level as probes land, and the range then narrows as sampling continues. A
+  thin progress strip and a status line ("Refining • 4s of up to 30s") show how
+  far through its time window the estimate is; it stops early once every level
+  is confident.
+- Estimate ranges on folders of large files are no longer several times too
+  wide. Each file of 4 MB or more is now its own stratum instead of sharing one
+  with every file of the same (or no) extension, and the GUI lets fast levels
+  sample up to 128 MB within the time window instead of stopping at 32 MB. On
+  the Silesia files, level 5 went from +/-24% (low confidence) to +/-5% (high
+  confidence), against an actual error of 1.5%.
+
 ### Documentation
 
 - Expanded the Windows GUI guide to cover the browser, every options and
@@ -949,7 +989,8 @@ First published release: the Inno Setup installer and portable zip, carrying
 update/repair/remove maintenance handling, and dynamic light/dark setup
 styling.
 
-[Unreleased]: https://github.com/Wimukthi/AxiomCompress/compare/0.14.0.0...HEAD
+[Unreleased]: https://github.com/Wimukthi/AxiomCompress/compare/0.15.0.0...HEAD
+[0.15.0.0]: https://github.com/Wimukthi/AxiomCompress/releases/tag/0.15.0.0
 [0.14.0.0]: https://github.com/Wimukthi/AxiomCompress/releases/tag/0.14.0.0
 [0.13.1.0]: https://github.com/Wimukthi/AxiomCompress/releases/tag/0.13.1.0
 [0.13.0.0]: https://github.com/Wimukthi/AxiomCompress/releases/tag/0.13.0.0

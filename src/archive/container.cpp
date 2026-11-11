@@ -55,11 +55,8 @@ bool open_input_with_retry(std::ifstream& input, const std::filesystem::path& pa
                            unsigned retries,
                            const std::shared_ptr<OperationControl>& operation);
 
-namespace {
-
-int compression_type_class(const ScanItem& item) {
-    if (item.is_directory || item.is_symlink || item.is_reparse_point) return 0;
-    const auto extension = lower_ascii(item.absolute.extension().wstring());
+int compression_type_class(const std::filesystem::path& path) {
+    const auto extension = lower_ascii(path.extension().wstring());
     static constexpr std::array<std::wstring_view, 17> text{
         L".txt", L".md", L".csv", L".tsv", L".json", L".xml", L".html",
         L".htm", L".css", L".js", L".ts", L".cpp", L".c", L".hpp",
@@ -81,6 +78,13 @@ int compression_type_class(const ScanItem& item) {
     if (in(raw_media)) return 3;
     if (in(compressed)) return 5;
     return 4;
+}
+
+namespace {
+
+int compression_type_class(const ScanItem& item) {
+    if (item.is_directory || item.is_symlink || item.is_reparse_point) return 0;
+    return axiom::compression_type_class(item.absolute);
 }
 
 std::vector<const ScanItem*> compression_order(const std::vector<ScanItem>& items) {
@@ -258,6 +262,25 @@ std::size_t effective_solid_block_size(const CompressionOptions& options) {
         return block_size;
     }
     return std::max(block_size, threads * per_worker);
+}
+
+// The usual pipeline overlaps one reader with a codec that consumes all
+// cores. Thorough profiles are different: their ratio is limited by the
+// per-codec-block window, so feeding every core from one solid block turns
+// a 64 MiB solid block into many 4 MiB match windows. Split the core budget
+// across a few independent solid-block jobs instead.
+std::size_t solid_outer_worker_count(const CompressionOptions& options,
+                                     std::size_t block_size,
+                                     std::size_t geometry_budget) {
+    const bool use_outer_parallelism =
+        options.enable_optimal_parser && block_size >= (std::size_t{4} << 20) &&
+        geometry_budget >= 8;
+    // Two outer jobs keep 8 MiB-or-larger inner windows on a 16-core
+    // machine without multiplying the optimal parser's large working set
+    // into a cache and memory-bandwidth bottleneck.
+    return use_outer_parallelism
+        ? std::min<std::size_t>(2, geometry_budget / 4)
+        : std::size_t{1};
 }
 
 bool requests_large_solid_blocks(std::size_t block_size) {
@@ -448,9 +471,46 @@ private:
     std::size_t cursor_;
 };
 
-// ---- timestamps ------------------------------------------------------------
-
 }  // namespace
+
+SolidWriterGeometry solid_writer_geometry(const CompressionOptions& options) {
+    SolidWriterGeometry geometry;
+    geometry.solid_block_size = effective_solid_block_size(options);
+    const auto geometry_budget = selected_geometry_thread_count(options.thread_count);
+    geometry.outer_workers = solid_outer_worker_count(
+        options, geometry.solid_block_size, geometry_budget);
+    geometry.inner_threads =
+        std::max<std::size_t>(1, geometry_budget / geometry.outer_workers);
+
+    auto block_options = options;
+    block_options.thread_count = geometry.inner_threads;
+    geometry.codec_unit_size =
+        codec_unit_size(geometry.solid_block_size, block_options);
+    return geometry;
+}
+
+std::size_t codec_unit_size(std::size_t input_size,
+                            const CompressionOptions& block_options) {
+    // Mirror compress(): external codecs and stored data see the whole input,
+    // the Axiom codec cuts it into independent per-worker blocks.
+    if (input_size == 0) return 0;
+    const bool external =
+        block_options.method == CompressionMethod::zstandard ||
+        block_options.method == CompressionMethod::lzma2 ||
+        block_options.method == CompressionMethod::deflate;
+    if (external || block_options.force_store ||
+        block_options.method == CompressionMethod::store) {
+        return input_size;
+    }
+    auto unit = codec::effective_parallel_block_size(input_size, block_options);
+    if (block_options.enable_optimal_parser) {
+        unit = std::max(unit, std::min(std::size_t{4} << 20,
+                                       std::max<std::size_t>(1, block_options.block_size)));
+    }
+    return std::clamp<std::size_t>(unit, 1, input_size);
+}
+
+// ---- timestamps ------------------------------------------------------------
 
 namespace {
 
@@ -4916,15 +4976,8 @@ void compress_items_into(Output& out, std::uint64_t& written,
     const auto execution_budget = selected_thread_count(options.thread_count);
     const auto geometry_budget =
         selected_geometry_thread_count(options.thread_count);
-    const bool use_outer_parallelism =
-        options.enable_optimal_parser && block_size >= (std::size_t{4} << 20) &&
-        geometry_budget >= 8;
-    const auto outer_worker_count = use_outer_parallelism
-        // Two outer jobs keep 8 MiB-or-larger inner windows on a 16-core
-        // machine without multiplying the optimal parser's large working set
-        // into a cache and memory-bandwidth bottleneck.
-        ? std::min<std::size_t>(2, geometry_budget / 4)
-        : std::size_t{1};
+    const auto outer_worker_count =
+        solid_outer_worker_count(options, block_size, geometry_budget);
     const auto inner_thread_count = std::max<std::size_t>(
         1, geometry_budget / outer_worker_count);
     const auto max_inflight_blocks = outer_worker_count * 2;

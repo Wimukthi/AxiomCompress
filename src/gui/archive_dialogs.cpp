@@ -3,6 +3,7 @@
 #include "core/cpu.hpp"
 #include "core/path_text.hpp"
 #include "gui/dialog_support.hpp"
+#include "gui/estimate_presentation.hpp"
 #include "gui/main_window_internal.hpp"
 #include "gui/message_dialog.hpp"
 
@@ -185,6 +186,9 @@ constexpr std::uint64_t kSigningSecretKeySize = 64;
 constexpr UINT kCompressionCurveUpdated = WM_APP + 91;
 constexpr UINT kCompressionCurveFinished = WM_APP + 92;
 constexpr UINT_PTR kCompressionCurveDebounceTimer = 0xA711;
+// Advances the preview's progress bar between estimator updates.
+constexpr UINT_PTR kCompressionCurveTickTimer = 0xA712;
+constexpr UINT kCompressionCurveTickMilliseconds = 100;
 
 constexpr std::array<const wchar_t*, 9> kLevelNames{
     L"1 - Fastest", L"2 - Very fast", L"3 - Fast", L"4 - Normal",
@@ -386,34 +390,10 @@ COLORREF compression_graph_saved_color(COLORREF accent) {
     return distance(green) < 6000 ? amber : green;
 }
 
-std::wstring format_preview_bytes(std::uint64_t bytes) {
-    static constexpr std::array<const wchar_t*, 6> units{
-        L"B", L"KiB", L"MiB", L"GiB", L"TiB", L"PiB"};
-    long double value = static_cast<long double>(bytes);
-    std::size_t unit = 0;
-    while (value >= 1024.0L && unit + 1 < units.size()) {
-        value /= 1024.0L;
-        ++unit;
-    }
-    std::wostringstream output;
-    output << std::fixed << std::setprecision(unit == 0 ? 0 : 1)
-           << static_cast<double>(value) << L' ' << units[unit];
-    return output.str();
-}
-
 std::wstring format_preview_percent(double value) {
     std::wostringstream output;
     output << std::fixed << std::setprecision(1) << value << L'%';
     return output.str();
-}
-
-const wchar_t* estimate_confidence_name(EstimateConfidence confidence) {
-    switch (confidence) {
-        case EstimateConfidence::high: return L"high confidence";
-        case EstimateConfidence::medium: return L"medium confidence";
-        case EstimateConfidence::low: return L"low confidence";
-    }
-    return L"low confidence";
 }
 
 int archive_format_index(axiom::ArchiveFormat format) {
@@ -6537,6 +6517,7 @@ private:
         }
         compression_curve_operation_.reset();
         compression_curve_running_ = false;
+        if (window_ != nullptr) KillTimer(window_, kCompressionCurveTickTimer);
     }
 
     void start_compression_curve() {
@@ -6584,16 +6565,10 @@ private:
         }
 
         const auto candidates = compression_curve_candidates();
-        auto estimate_options = CompressionEstimateOptions{};
-        estimate_options.format = format;
-        // Keep enough headroom to reach high confidence on heterogeneous
-        // inputs, while bounding the total work across every curve point.
-        estimate_options.sample_budget = candidates.size() > 16
-            ? 16u << 20
-            : 32u << 20;
-        estimate_options.sample_chunk_size = 256u << 10;
-        estimate_options.time_budget = std::chrono::seconds(30);
-        estimate_options.stop_when_high_confidence = true;
+        // Same sampling limits as every other estimate display, so one
+        // selection shows the same figures wherever it is estimated.
+        auto estimate_options =
+            gui_estimate_options(format, candidates.size());
         compression_curve_operation_ =
             std::make_shared<OperationControl>();
         estimate_options.compression.operation =
@@ -6609,8 +6584,12 @@ private:
             std::lock_guard lock(compression_curve_mutex_);
             compression_curve_result_.reset();
             compression_curve_error_.clear();
-            compression_curve_status_ = L"Scanning selected files...";
+            // Replaced within a moment by a first guess from file types.
+            compression_curve_status_ = L"Estimating...";
+            compression_curve_updated_at_ = std::chrono::steady_clock::now();
         }
+        SetTimer(window_, kCompressionCurveTickTimer,
+                 kCompressionCurveTickMilliseconds, nullptr);
         InvalidateRect(compression_preview_, nullptr, FALSE);
 
         compression_curve_worker_ = std::jthread(
@@ -6625,6 +6604,8 @@ private:
                                     compression_curve_mutex_);
                                 compression_curve_result_ = value;
                                 compression_curve_result_key_ = key;
+                                compression_curve_updated_at_ =
+                                    std::chrono::steady_clock::now();
                                 compression_curve_status_ =
                                     !value.complete
                                         ? L"Estimating codec levels..."
@@ -6644,6 +6625,8 @@ private:
                         std::lock_guard lock(compression_curve_mutex_);
                         compression_curve_result_ = std::move(result);
                         compression_curve_result_key_ = key;
+                        compression_curve_updated_at_ =
+                            std::chrono::steady_clock::now();
                         compression_curve_status_ =
                             compression_curve_result_->reached_high_confidence ||
                                     compression_curve_result_->sampled_bytes >=
@@ -6679,6 +6662,7 @@ private:
         compression_curve_operation_.reset();
         compression_curve_update_posted_.store(
             false, std::memory_order_release);
+        KillTimer(window_, kCompressionCurveTickTimer);
         InvalidateRect(compression_preview_, nullptr, FALSE);
         if (compression_curve_restart_pending_) {
             compression_curve_restart_pending_ = false;
@@ -6711,12 +6695,16 @@ private:
         std::optional<CompressionEstimateCurveResult> result;
         std::wstring status;
         std::wstring error;
+        std::chrono::steady_clock::time_point updated_at;
         {
             std::lock_guard lock(compression_curve_mutex_);
             result = compression_curve_result_;
             status = compression_curve_status_;
             error = compression_curve_error_;
+            updated_at = compression_curve_updated_at_;
         }
+        const double since_update = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - updated_at).count();
 
         HFONT old_font = reinterpret_cast<HFONT>(
             SelectObject(memory, font_));
@@ -6730,14 +6718,13 @@ private:
                 kCompressionMethodNames[
                     static_cast<std::size_t>(method)]) +
             L" compression preview";
-        DrawTextW(
-            memory, title.c_str(), -1, &title_rect,
-            DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
 
         std::vector<CompressionEstimateCurvePoint> points;
         if (result) {
+            // Unmeasured levels carry the file-type guess, so the curve is
+            // there from the first update and tightens as probes land.
             for (const auto& point : result->points) {
-                if (point.completed_probes != 0 ||
+                if (point.completed_probes != 0 || point.provisional ||
                     result->source_bytes == 0) {
                     points.push_back(point);
                 }
@@ -6756,82 +6743,125 @@ private:
                 return point.level == selected_level;
             });
 
+        // The three estimate lines are the shared presentation, word for
+        // word what the Information dialog shows for the same level.
         SetTextColor(memory, palette_.muted);
         RECT summary_rect{
-            inset, scale(38), width - inset, scale(66)};
+            inset, scale(38), width - inset, scale(62)};
+        RECT range_rect{
+            inset, scale(60), width - inset, scale(84)};
+        RECT detail_rect{
+            inset, scale(82), width - inset, scale(106)};
         std::wstring summary = status;
+        std::wstring range;
+        std::wstring detail;
+        std::wstring progress_text = error.empty() ? status : std::wstring{};
+        double progress = compression_curve_running_ ? 0.0 : 1.0;
+        bool indeterminate = compression_curve_running_ && !result;
+        if (result && error.empty()) {
+            if (!result->points.empty()) {
+                // Phase and progress are run-wide; any point carries them.
+                const auto& reference = selected != points.end()
+                    ? *selected : result->points.front();
+                const auto figures = estimate_figures(*result, reference);
+                progress_text = present_estimate(
+                    compression_curve_running_
+                        ? live_estimate_figures(figures, since_update)
+                        : figures).status;
+                progress = compression_curve_running_
+                    ? displayed_estimate_progress(figures, since_update)
+                    : 1.0;
+                indeterminate = compression_curve_running_ &&
+                                result->phase == EstimatePhase::scanning;
+            }
+        }
         if (selected != points.end() && result &&
             result->source_bytes != 0) {
-            const double compressed_percent =
-                100.0 *
-                static_cast<double>(
-                    selected->estimated_archive_bytes) /
-                static_cast<double>(result->source_bytes);
-            summary =
-                L"Level " + std::to_wstring(selected->level) +
-                L"  \u2022  " +
-                format_preview_bytes(
-                    selected->estimated_archive_bytes) +
-                L"  \u2022  " +
-                format_preview_percent(compressed_percent) +
-                L" of original  \u2022  " +
-                format_preview_percent(
-                    selected->estimated_savings_percent) +
-                L" saved";
+            const EstimatePresentation text =
+                present_estimate(estimate_figures(*result, *selected));
+            summary = L"Level " + std::to_wstring(selected->level) +
+                      L"  \u2022  " + text.headline;
+            range = text.range;
+            detail = text.detail;
+        } else if (!error.empty()) {
+            range = error;
+        } else {
+            range = L"Each level is measured on the same sampled data.";
         }
+        const UINT line_format =
+            DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS |
+            DT_NOPREFIX;
+        DrawTextW(memory, summary.c_str(), -1, &summary_rect, line_format);
+        DrawTextW(memory, range.c_str(), -1, &range_rect, line_format);
+        DrawTextW(memory, detail.c_str(), -1, &detail_rect, line_format);
+
+        // Status on the right of the title row, the title takes the rest.
+        RECT status_rect = title_rect;
+        if (!progress_text.empty()) {
+            SIZE extent{};
+            GetTextExtentPoint32W(
+                memory, progress_text.c_str(),
+                static_cast<int>(progress_text.size()), &extent);
+            const int status_width = std::min<int>(
+                extent.cx, (title_rect.right - title_rect.left) * 3 / 5);
+            status_rect.left = title_rect.right - status_width;
+            DrawTextW(memory, progress_text.c_str(), -1, &status_rect,
+                      DT_RIGHT | DT_SINGLELINE | DT_VCENTER |
+                          DT_END_ELLIPSIS | DT_NOPREFIX);
+            title_rect.right = std::max(
+                title_rect.left, status_rect.left - scale(12));
+        }
+        SetTextColor(memory, palette_.text);
         DrawTextW(
-            memory, summary.c_str(), -1, &summary_rect,
+            memory, title.c_str(), -1, &title_rect,
             DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
 
-        RECT detail_rect{
-            inset, scale(62), width - inset, scale(86)};
-        std::wstring detail;
-        if (selected != points.end() && result) {
-            detail =
-                estimate_confidence_name(selected->confidence) +
-                std::wstring(L"  \u2022  sampled ") +
-                format_preview_bytes(result->sampled_bytes);
-            if (result->planned_sample_bytes != 0 &&
-                result->sampled_bytes < result->planned_sample_bytes) {
-                if (result->reached_high_confidence) {
-                    detail += L"  •  high confidence reached";
-                } else {
-                    detail += L" of " +
-                        format_preview_bytes(
-                            result->planned_sample_bytes);
-                }
+        // Thin progress strip along the top edge while the estimate refines.
+        if (compression_curve_running_) {
+            const int strip_height = std::max(2, scale(3));
+            const RECT track{1, 1, width - 1, 1 + strip_height};
+            HBRUSH track_brush = CreateSolidBrush(
+                blend_color(palette_.button, palette_.border, 60));
+            FillRect(memory, &track, track_brush);
+            DeleteObject(track_brush);
+            RECT fill = track;
+            const int span = track.right - track.left;
+            if (indeterminate) {
+                // Unknown length while the file list is read: a sweep.
+                const auto now_ms = std::chrono::duration_cast<
+                    std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count();
+                const int segment = std::max(1, span / 4);
+                const int offset = static_cast<int>(
+                    (now_ms % 1400) * (span + segment) / 1400) - segment;
+                fill.left = track.left + std::max(0, offset);
+                fill.right = track.left + std::min(span, offset + segment);
+            } else {
+                fill.right = track.left + static_cast<int>(
+                    span * std::clamp(progress, 0.0, 1.0));
             }
-            if (!result->warnings.empty()) {
-                detail += L"  \u2022  " +
-                    std::to_wstring(result->warnings.size()) +
-                    L" warning";
-                if (result->warnings.size() != 1) detail += L"s";
+            if (fill.right > fill.left) {
+                HBRUSH fill_brush = CreateSolidBrush(palette_.accent);
+                FillRect(memory, &fill, fill_brush);
+                DeleteObject(fill_brush);
             }
-        } else if (!error.empty()) {
-            detail = error;
-        } else {
-            detail =
-                L"Each point uses the same sampled source regions.";
         }
-        DrawTextW(
-            memory, detail.c_str(), -1, &detail_rect,
-            DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
 
         const RECT chart{
-            scale(48), scale(96),
+            scale(48), scale(118),
             width - scale(18), height - scale(42)};
         if (points.empty() || !result ||
             result->source_bytes == 0 ||
             chart.right <= chart.left ||
             chart.bottom <= chart.top) {
             RECT empty_rect{
-                inset, scale(105), width - inset,
+                inset, scale(127), width - inset,
                 height - scale(20)};
             SetTextColor(memory, palette_.muted);
             const std::wstring empty_text =
                 !error.empty() ? error
                                : status.empty()
-                                   ? L"Preparing compression preview..."
+                                   ? L"Estimating..."
                                    : status;
             DrawTextW(
                 memory, empty_text.c_str(), -1, &empty_rect,
@@ -7127,7 +7157,7 @@ private:
         const int left = scale(48);
         const int right = client.right - scale(18);
         if (cursor.x < left || cursor.x > right ||
-            cursor.y < scale(88) ||
+            cursor.y < scale(110) ||
             cursor.y > client.bottom - scale(20)) {
             return;
         }
@@ -7983,6 +8013,15 @@ private:
                     layered_reveal_pending_ = false;
                     return 0;
                 }
+                if (wparam == kCompressionCurveTickTimer) {
+                    if (compression_curve_running_ &&
+                        compression_preview_ != nullptr) {
+                        InvalidateRect(compression_preview_, nullptr, FALSE);
+                    } else {
+                        KillTimer(window_, kCompressionCurveTickTimer);
+                    }
+                    return 0;
+                }
                 if (wparam == kCompressionCurveDebounceTimer &&
                     mode_ == DialogMode::create_archive) {
                     KillTimer(
@@ -8512,6 +8551,7 @@ private:
         compression_curve_operation_;
     std::jthread compression_curve_worker_;
     std::atomic_bool compression_curve_update_posted_{false};
+    std::chrono::steady_clock::time_point compression_curve_updated_at_{};
     bool compression_curve_running_ = false;
     bool compression_curve_restart_pending_ = false;
 };

@@ -768,13 +768,9 @@ void MainWindow::show_tree_context_menu(POINT point) {
                 navigate_to(axiom::gui::BrowserLocation::archive(*archive_path));
                 on_info();
             } else if (is_filesystem) {
-                axiom::CompressionEstimateOptions options;
-                options.format = axiom::ArchiveFormat::axar;
+                auto options = axiom::gui::gui_estimate_options(
+                    axiom::ArchiveFormat::axar, 1);
                 options.compression = compression_options();
-                options.sample_budget = selected_level() >= 8 ? 24u << 20
-                    : selected_level() >= 6 ? 48u << 20 : 64u << 20;
-                options.sample_chunk_size = 512u << 10;
-                options.time_budget = std::chrono::seconds(5);
                 axiom::gui::show_filesystem_information_dialog(
                     hwnd_, {node.filesystem_path}, std::move(options),
                     selected_level());
@@ -877,15 +873,11 @@ void MainWindow::on_copy_crc32() {
 void MainWindow::on_info() {
     const auto indices = selected_browser_indices();
     const auto make_estimate_options = [this] {
-        axiom::CompressionEstimateOptions options;
-        options.format = axiom::ArchiveFormat::axar;
+        // Shared with the create-archive preview, so both show the same
+        // figures for the same selection and settings.
+        auto options = axiom::gui::gui_estimate_options(
+            axiom::ArchiveFormat::axar, 1);
         options.compression = compression_options();
-        // This is an adaptive ceiling, not a fixed cost. Higher codec levels
-        // use a smaller cap because each representative probe takes longer.
-        options.sample_budget = selected_level() >= 8 ? 24u << 20
-            : selected_level() >= 6 ? 48u << 20 : 64u << 20;
-        options.sample_chunk_size = 512u << 10;
-        options.time_budget = std::chrono::seconds(5);
         return options;
     };
 

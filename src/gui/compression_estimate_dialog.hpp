@@ -1,6 +1,7 @@
 #pragma once
 
 #include "axiom/archive.hpp"
+#include "gui/estimate_presentation.hpp"
 
 #include <windows.h>
 

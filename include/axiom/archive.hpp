@@ -111,15 +111,39 @@ enum class EstimateConfidence {
     high,
 };
 
+// Where an estimate run is. Figures are published from the first moment:
+// while the file list is read they are a guess from file types, then they
+// are measured and refined until the run completes.
+enum class EstimatePhase {
+    scanning,
+    measuring,
+    complete,
+};
+
 struct CompressionEstimateSnapshot {
+    EstimateConfidence confidence = EstimateConfidence::low;
+    EstimatePhase phase = EstimatePhase::scanning;
+    // True while the figures are a guess from file types and sizes: no data
+    // has been compressed yet.
+    bool provisional = false;
+    // Share of the refinement window used, 0..1; 1 once the run completes.
+    double progress = 0.0;
+    // Time spent measuring and the window it may use, in milliseconds.
+    std::uint64_t elapsed_ms = 0;
+    std::uint64_t window_ms = 0;
+    std::uint64_t file_count = 0;
     std::uint64_t source_bytes = 0;
     std::uint64_t sampled_bytes = 0;
     std::uint64_t planned_sample_bytes = 0;
     std::uint64_t estimated_archive_bytes = 0;
+    std::uint64_t estimated_low_bytes = 0;
+    std::uint64_t estimated_high_bytes = 0;
+    std::uint64_t estimated_seconds = 0;
     std::uint64_t completed_probes = 0;
     std::uint64_t total_probes = 0;
     double estimated_ratio = 0.0;
     double estimated_savings_percent = 0.0;
+    double estimated_margin_fraction = 0.0;
 };
 
 // A bounded, read-only compression prognosis. The estimator samples source data
@@ -128,12 +152,15 @@ struct CompressionEstimateOptions {
     ArchiveFormat format = ArchiveFormat::axar;
     CompressionOptions compression;
     // Hard ceiling for adaptive sampling. The estimator may stop earlier once
-    // representative batches converge or the time budget expires.
-    std::size_t sample_budget = 8u << 20;
-    std::size_t sample_chunk_size = 512u << 10;
+    // the estimate converges or the time budget expires.
+    std::size_t sample_budget = 32u << 20;
+    // Size of one probe. AXAR probes are cut from the type-sorted solid stream
+    // and may span files; 1 MiB matches the codec's usual independent unit.
+    std::size_t sample_chunk_size = 1u << 20;
     std::chrono::milliseconds time_budget{5000};
     std::uint64_t volume_size = 0;
-    // Called after each completed probe. It reports the cumulative prognosis,
+    // Called while the file list is read (with a guess from file types) and
+    // after each completed probe batch. It reports the cumulative prognosis,
     // not operation completion; frontends can render a live savings meter.
     std::function<void(const CompressionEstimateSnapshot&)> progress_callback;
     // Curve estimation may stop as soon as every candidate reaches high
@@ -154,10 +181,15 @@ struct CompressionEstimateResult {
     std::uint64_t item_count = 0;
     std::uint64_t volume_count = 0;
     std::uint64_t final_volume_bytes = 0;
+    // Whole-file duplicates an AXAR archive stores once; excluded from sampling.
+    std::uint64_t duplicate_bytes = 0;
     double estimated_ratio = 0.0;
     double estimated_savings_percent = 0.0;
+    // Half-width of the low/high range as a fraction of estimated_archive_bytes.
+    double estimated_margin_fraction = 0.0;
     // 95% half-width in percentage points for the sampled payload ratio.
     double confidence_margin_percent = 0.0;
+    // Share of the bytes the archive would encode that were probed.
     double sample_coverage = 0.0;
     std::vector<OperationWarning> warnings;
 };
@@ -182,8 +214,11 @@ struct CompressionEstimateCurvePoint {
     std::uint64_t total_probes = 0;
     double estimated_ratio = 0.0;
     double estimated_savings_percent = 0.0;
+    double estimated_margin_fraction = 0.0;
     double confidence_margin_percent = 0.0;
     bool complete = false;
+    // Guessed from file types; this level has not been measured yet.
+    bool provisional = false;
 };
 
 struct CompressionEstimateCurveResult {
@@ -193,6 +228,16 @@ struct CompressionEstimateCurveResult {
     std::uint64_t planned_sample_bytes = 0;
     std::uint64_t file_count = 0;
     std::uint64_t item_count = 0;
+    std::uint64_t duplicate_bytes = 0;
+    double sample_coverage = 0.0;
+    EstimatePhase phase = EstimatePhase::scanning;
+    // True while every point is a guess from file types.
+    bool provisional = false;
+    // Share of the refinement window used, 0..1; 1 once complete.
+    double progress = 0.0;
+    // Time spent measuring and the window it may use, in milliseconds.
+    std::uint64_t elapsed_ms = 0;
+    std::uint64_t window_ms = 0;
     std::uint64_t completed_evaluations = 0;
     std::uint64_t total_evaluations = 0;
     // complete means the estimator stopped; it may be true before all planned

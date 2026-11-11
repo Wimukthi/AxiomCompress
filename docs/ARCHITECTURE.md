@@ -755,15 +755,55 @@ results are in [PERFORMANCE.md](PERFORMANCE.md).
 
 ### Compression prognosis
 
-`estimate_compression_curve()` is the shared multi-level estimator behind the
-Add-to-archive preview. It scans the selected inputs once, plans one set of
-representative regions, reads and transforms each region once, then evaluates
-every requested codec level against those identical bytes. Each point carries
-projected archive bytes, ratio, saving, confidence interval, sample coverage,
-and completion counters.
+`estimate_compression_curve()` is the estimator behind both the
+Add-to-archive preview and the Information dialog; `estimate_compression()` is
+the same engine run with one level. It scans the selected inputs once, plans
+one set of probes, reads each probe once, then evaluates every requested codec
+level against those identical bytes. Each point carries projected archive
+bytes, ratio, saving, a 95% range, confidence, and completion counters.
 
 A point is never compared with another point sampled from a different part of
 the input. That constraint is the entire reason the curve is trustworthy.
+
+The estimate is only as good as its resemblance to the writer, so the engine
+copies what the writer does rather than approximating it:
+
+- **Same stream.** Files are ordered by type as the AXAR writer orders them,
+  byte-identical files are dropped as the writer drops them, and probes are
+  cut from that solid stream across file boundaries. ZIP probes compress each
+  file on its own, as ZIP does.
+- **Same unit.** `solid_writer_geometry()` and `codec_unit_size()` report how
+  the writer cuts solid blocks into independently coded units on this machine.
+  Probes are sized to that unit, take the same codec path (parallel block
+  codec or whole-input analysis), and carry the same per-file filters.
+- **Longer units are measured.** Where the writer's unit is larger than a
+  probe (levels 8 and 9, a manual solid block, one thread), a few regions are
+  coded whole and probe by probe, and the difference is applied. Exact
+  long-range repeats are counted separately with a content-defined scan,
+  because they depend on where the copies lie rather than on a smooth curve.
+- **Slow levels borrow coverage.** A level too slow to visit enough probes in
+  its share of the time runs on a spread subset and is tied to a fast runner
+  on the probes they share; the fast runner supplies the spread across the
+  rest. The ratio between two codecs on the same bytes is far steadier than
+  either codec's ratio across different data.
+
+The range comes from the spread of probe results within each file type (each
+file of 4 MB or more counts as its own type), a
+Student-t factor for the number of probes, and a small model margin. It
+collapses to the model margin when every byte was probed.
+
+Figures are published from the first moment, so a frontend never waits on a
+blank. While the inputs are scanned (`EstimatePhase::scanning`), each update
+carries a guess from file types: a typical packed share per kind of content,
+scaled for method and effort, with a fixed wide margin and `provisional` set.
+Once some levels are measured, the guess for each remaining level is rescaled by
+how far it missed on the nearest measured level.
+Scan updates are throttled to one per 100 ms, and the last one goes out before
+duplicate detection. During `measuring`, a level that has no probes yet keeps
+the guess; the rest are measured. Every update reports `progress`, the share of
+the time window used or of the level-probe evaluations finished (whichever is
+further), and the elapsed and window milliseconds, so a frontend can advance a progress bar
+between updates.
 
 The estimator is cooperative rather than GUI-aware: it reports immutable curve
 snapshots through a callback and checks `OperationControl` between bounded

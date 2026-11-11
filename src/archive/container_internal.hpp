@@ -223,6 +223,26 @@ inline std::wstring lower_ascii(std::wstring text) {
     return text;
 }
 
+// ---- solid writer layout (shared with the compression estimator) ----------------
+
+// Ordering class the AXAR writer sorts regular files by before filling solid
+// blocks: 1 text, 2 executable, 3 raw media, 4 other, 5 already compressed.
+int compression_type_class(const std::filesystem::path& path);
+
+// How the AXAR writer cuts a solid stream for these options on this machine.
+struct SolidWriterGeometry {
+    std::size_t solid_block_size = 0;  // bytes gathered before each compress() call
+    std::size_t outer_workers = 1;     // solid blocks encoded concurrently
+    std::size_t inner_threads = 1;     // thread_count handed to each compress() call
+    std::size_t codec_unit_size = 0;   // largest span that shares one match history
+};
+SolidWriterGeometry solid_writer_geometry(const CompressionOptions& options);
+
+// Largest span of an input_size-byte compress() call that shares one match
+// history. block_options carries the thread_count the call would receive.
+std::size_t codec_unit_size(std::size_t input_size,
+                            const CompressionOptions& block_options);
+
 // ---- decode-only ZIP entry points -----------------------------------------------
 
 // These entry points deliberately bypass ArchiveProvider. The SFX decode library

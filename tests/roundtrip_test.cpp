@@ -5765,10 +5765,25 @@ void test_compression_estimator() {
     std::size_t snapshot_count = 0;
     bool snapshots_monotonic = true;
     axiom::CompressionEstimateSnapshot final_snapshot;
+    std::optional<axiom::CompressionEstimateSnapshot> first_snapshot;
+    bool phases_monotonic = true;
+    bool progress_monotonic = true;
+    bool saw_measured_refinement = false;
     options.progress_callback = [&](const axiom::CompressionEstimateSnapshot& snapshot) {
         snapshots_monotonic = snapshots_monotonic &&
             snapshot.sampled_bytes >= last_snapshot_bytes;
         last_snapshot_bytes = snapshot.sampled_bytes;
+        if (!first_snapshot) first_snapshot = snapshot;
+        if (snapshot_count != 0) {
+            phases_monotonic = phases_monotonic &&
+                static_cast<int>(snapshot.phase) >=
+                    static_cast<int>(final_snapshot.phase);
+            progress_monotonic = progress_monotonic &&
+                snapshot.progress + 1e-9 >= final_snapshot.progress;
+        }
+        saw_measured_refinement = saw_measured_refinement ||
+            (snapshot.phase == axiom::EstimatePhase::measuring &&
+             !snapshot.provisional);
         final_snapshot = snapshot;
         ++snapshot_count;
     };
@@ -5789,6 +5804,25 @@ void test_compression_estimator() {
     AXIOM_CHECK(final_snapshot.sampled_bytes == estimate.sampled_bytes);
     AXIOM_CHECK(final_snapshot.estimated_archive_bytes ==
                 estimate.estimated_archive_bytes);
+    // A figure is on screen before any byte is compressed: the first update
+    // is a file-type guess published while the file list is read.
+    AXIOM_CHECK(first_snapshot.has_value());
+    AXIOM_CHECK(first_snapshot->phase == axiom::EstimatePhase::scanning);
+    AXIOM_CHECK(first_snapshot->provisional);
+    AXIOM_CHECK(first_snapshot->sampled_bytes == 0);
+    AXIOM_CHECK(first_snapshot->estimated_archive_bytes > 0);
+    AXIOM_CHECK(first_snapshot->estimated_low_bytes <=
+                first_snapshot->estimated_archive_bytes);
+    AXIOM_CHECK(first_snapshot->estimated_high_bytes >=
+                first_snapshot->estimated_archive_bytes);
+    AXIOM_CHECK(first_snapshot->window_ms == 10000);
+    AXIOM_CHECK(saw_measured_refinement);
+    AXIOM_CHECK(phases_monotonic);
+    AXIOM_CHECK(progress_monotonic);
+    AXIOM_CHECK(final_snapshot.phase == axiom::EstimatePhase::complete);
+    AXIOM_CHECK(!final_snapshot.provisional);
+    AXIOM_CHECK(final_snapshot.progress == 1.0);
+    AXIOM_CHECK(final_snapshot.file_count == 3);
 
     auto actual_options = options.compression;
     actual_options.operation.reset();
@@ -5826,6 +5860,8 @@ void test_compression_estimator() {
             ++curve_snapshot_count;
         });
     AXIOM_CHECK(curve.complete);
+    AXIOM_CHECK(curve.phase == axiom::EstimatePhase::complete);
+    AXIOM_CHECK(!curve.provisional);
     AXIOM_CHECK(curve.source_bytes == estimate.source_bytes);
     AXIOM_CHECK(curve.sampled_bytes == estimate.source_bytes);
     AXIOM_CHECK(curve.points.size() == curve_candidates.size());
@@ -5940,6 +5976,40 @@ void test_compression_estimator() {
         [](const auto& point) {
             return point.confidence != axiom::EstimateConfidence::high;
         }));
+
+    // Many small files are measured as the solid stream packs them, and
+    // byte-identical files are counted once, as the writer stores them.
+    const auto tree = root / "estimate-tree";
+    fs::create_directories(tree / "copy");
+    std::uint64_t tree_bytes = 0;
+    for (int index = 0; index < 96; ++index) {
+        std::string text;
+        for (int line = 0; line < 60; ++line) {
+            text += "record " + std::to_string(index * 131 + line * 17) +
+                    ": the quick brown fox jumps over the lazy dog\n";
+        }
+        const auto name = "note-" + std::to_string(index) + ".txt";
+        write_all(tree / name, bytes_from_string(text));
+        write_all(tree / "copy" / name, bytes_from_string(text));
+        tree_bytes += text.size();
+    }
+    axiom::CompressionEstimateOptions tree_options;
+    axiom::apply_compression_level(tree_options.compression, 5);
+    tree_options.time_budget = std::chrono::seconds(20);
+    const auto tree_estimate = axiom::estimate_compression({tree}, tree_options);
+    AXIOM_CHECK(tree_estimate.source_bytes == tree_bytes * 2);
+    AXIOM_CHECK(tree_estimate.duplicate_bytes == tree_bytes);
+    AXIOM_CHECK(tree_estimate.sampled_bytes == tree_bytes);
+    AXIOM_CHECK(tree_estimate.sample_coverage == 1.0);
+    AXIOM_CHECK(tree_estimate.estimated_margin_fraction > 0.0);
+    AXIOM_CHECK(tree_estimate.estimated_margin_fraction < 0.25);
+    const auto tree_archive = root / "estimate-tree.axar";
+    axiom::create_archive({tree}, tree_archive, tree_options.compression);
+    const std::uint64_t tree_archive_size = fs::file_size(tree_archive);
+    // Directory metadata dominates an archive this small and differs by
+    // platform, so the size bound stays loose; the counts above are exact.
+    AXIOM_CHECK(tree_estimate.estimated_archive_bytes * 3 >= tree_archive_size * 2);
+    AXIOM_CHECK(tree_estimate.estimated_archive_bytes * 2 <= tree_archive_size * 3);
 
     auto zip = repeated;
     zip.format = axiom::ArchiveFormat::zip;

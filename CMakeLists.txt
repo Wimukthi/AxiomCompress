@@ -351,6 +351,7 @@ if(WIN32)
         src/gui/main_window_views.cpp
         src/gui/custom_menu.cpp
         src/gui/compression_estimate_dialog.cpp
+        src/gui/estimate_presentation.cpp
         src/gui/toolbar_icons.cpp
         src/gui/archive_dialogs.cpp
         src/gui/archive_update_dialog.cpp

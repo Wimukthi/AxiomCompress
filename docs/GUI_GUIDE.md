@@ -273,11 +273,15 @@ timestamps, attributes, and any scan warnings. A multiple selection can show
 **Multiple values** where there is no single shared value.
 
 To estimate how well the inputs will compress, choose a level from 1 through 9
-and press **Estimate**. Read the predicted archive size, size range, ratio,
-estimated time, sampled bytes, and confidence. The estimate creates no archive.
-Press **Cancel** while estimation is running, **Re-estimate** to try again, or
-**Close** to leave the window. This sampled estimate is separate from the
-multi-level preview in Add to archive.
+and press **Estimate**. The result is three lines: the predicted archive size
+with its share of the original and the saving; the range that size is expected
+to fall in, with a confidence rating; and the ratio, expected compression time,
+and how much data was sampled. The estimate creates no archive. Press
+**Cancel** while estimation is running, **Re-estimate** to try again, or
+**Close** to leave the window. The multi-level preview in Add to archive uses
+the same estimator and shows the same three lines for the selected level.
+Figures appear as soon as the estimate starts and improve while it runs; see
+[Watching the size before you commit](#watching-the-size-before-you-commit).
 
 ### Archive information
 
@@ -389,14 +393,26 @@ Blue is the predicted compressed size, green is the predicted saving, and the
 pale band around them is how uncertain the estimate still is. Click any point to
 select that level.
 
+Above the graph, the selected level is summarized in the same three lines the
+Information dialog uses: size, share of original and saving; the expected range
+and confidence; then ratio, expected time, and sampled data.
+
 All the points come from the same sampled regions of your files, so the curve
 compares *levels* rather than comparing different parts of your data. Changing
 something that affects which bytes are read cancels the estimate and restarts it
 after a short pause; changing only the level just moves the marker.
 
+The preview shows numbers from the first moment. While the file list is still
+being read, the curve is a first guess from file types and sizes, labelled
+**First guess from file types**, with a wide band. As each level's first
+samples are compressed, its point moves to a measured figure, and the band
+narrows as more samples land. A thin strip along the top of the preview and the
+status at the right of its title ("Refining • 4s of up to 30s") show how far
+through its time window the estimate is.
+
 The preview keeps sampling until every visible level is confident, or until it
-hits its own time and sample limits. If the limits win, it says the confidence
-is bounded rather than presenting a guess as a fact.
+hits its own time and sample limits, and then says which ended it. If the limits
+win, the range and confidence say so rather than presenting a guess as a fact.
 
 ### Profiles
 
