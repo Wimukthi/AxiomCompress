@@ -1354,18 +1354,29 @@ int run_list(const std::vector<std::string>& args) {
                                  axiom::core::path_to_utf8(archive));
     }
 
-    const axiom::ArchiveCapabilities capabilities = provider->capabilities(archive, password);
-    if (provider->info().native) {
-        const std::string comment = axiom::archive_comment(archive, password);
-        if (!comment.empty()) {
-            std::cout << "Comment: " << comment << '\n';
+    const auto print_state = [](const axiom::ArchiveCapabilities& capabilities) {
+        if (capabilities.locked) std::cout << "[locked: read-only]\n";
+        if (capabilities.encrypted) {
+            std::cout << "[encrypted: password required to extract]\n";
         }
+    };
+    // One directory read yields the comment, the state, and the entries; asking
+    // for each separately read a large archive's directory three times.
+    axiom::ArchiveContents contents;
+    try {
+        contents = provider->open(archive, password);
+    } catch (...) {
+        // A native directory that cannot be read (a wrong or missing password)
+        // reports only the error, as before. Other formats still say what the
+        // probe could tell before their listing failed.
+        if (!provider->info().native) print_state(provider->capabilities(archive, password));
+        throw;
     }
-    if (capabilities.locked) std::cout << "[locked: read-only]\n";
-    if (capabilities.encrypted) {
-        std::cout << "[encrypted: password required to extract]\n";
+    if (!contents.comment.empty()) {
+        std::cout << "Comment: " << contents.comment << '\n';
     }
-    const auto entries = provider->list(archive, password);
+    print_state(contents.capabilities);
+    const auto& entries = contents.entries;
 
     std::uint64_t total_bytes = 0;
     for (const auto& entry : entries) {

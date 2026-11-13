@@ -278,6 +278,7 @@ void sfx_zip_extract_selected(const std::filesystem::path& archive_path,
 // capabilities() and list() from one pass rather than four.
 struct AxarDirectoryState {
     std::vector<ArchiveEntry> entries;
+    std::string comment;
     bool snapshot_repository = false;
     bool deduplicated = false;
     bool locked = false;

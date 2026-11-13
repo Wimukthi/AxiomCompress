@@ -131,7 +131,8 @@ public:
         result.directory_encrypted = state.directory_encrypted;
         result.locked = state.locked;
         apply_snapshot_restrictions(result);
-        return ArchiveContents{std::move(result), std::move(state.entries)};
+        return ArchiveContents{std::move(result), std::move(state.entries),
+                               std::move(state.comment)};
     }
 
     std::vector<ArchiveEntry> list(const std::filesystem::path& archive_path,

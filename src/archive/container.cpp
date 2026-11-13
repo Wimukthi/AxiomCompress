@@ -11401,6 +11401,7 @@ AxarDirectoryState read_axar_directory_state(const std::filesystem::path& archiv
     state.directory_encrypted = (layout.flags & kFlagEncryptedDirectory) != 0;
     state.encrypted = state.directory_encrypted || index.meta.encryption.enabled;
     state.locked = index.meta.locked;
+    state.comment = index.meta.comment;
     state.entries = entries_from_index(index);
     return state;
 }

@@ -4729,6 +4729,12 @@ void test_archive_comment_lock() {
     const std::string note = "release build \xE2\x9C\x93 keep me";  // includes a UTF-8 check mark
     axiom::set_archive_comment(archive, note);
     AXIOM_CHECK(axiom::archive_comment(archive) == note);
+    // Opening for browsing or listing carries the comment from the same read.
+    if (const auto* provider = axiom::archive_provider_for_path(archive)) {
+        AXIOM_CHECK(provider->open(archive).comment == note);
+    } else {
+        AXIOM_CHECK(false);
+    }
 
     // The comment survives a later edit.
     write_all(src / "b.txt", bytes_from_string("more"));

@@ -396,10 +396,13 @@ struct ArchiveMove {
     std::string destination_path;
 };
 
-// What a browser needs to open an archive: its capabilities and its entries.
+// What a browser needs to open an archive: its capabilities and its entries,
+// plus the archive comment where the format keeps one in the same directory
+// (empty otherwise, including for providers that do not override open()).
 struct ArchiveContents {
     ArchiveCapabilities capabilities;
     std::vector<ArchiveEntry> entries;
+    std::string comment;
 };
 
 class ArchiveProvider {
