@@ -2140,6 +2140,7 @@ public:
             std::int64_t mtime = 0;
         };
         std::vector<DeferredDir> deferred_dirs;
+        ExtractionPathCache paths;
 
         for (const auto* selected_plan : selected) {
             const auto& plan = *selected_plan;
@@ -2153,14 +2154,14 @@ public:
             if (!is_within(dest_norm, target)) {
                 throw FormatError("ZIP archive path escapes the destination: " + entry.path);
             }
-            reject_symlinked_ancestor(dest_norm, target);
+            paths.reject_symlinked_ancestor(dest_norm, target);
 
             if (entry.is_directory) {
                 if (core::is_reparse_point(target)) {
                     throw FormatError("refusing to restore a directory over a symlink: " +
                                       entry.path);
                 }
-                fs::create_directories(target, ec);
+                paths.ensure_directory(target, ec);
                 deferred_dirs.push_back({target, entry.mtime});
                 ++completed_items;
                 report_operation(options.operation, OperationStage::extracting,
@@ -2169,7 +2170,7 @@ public:
                 continue;
             }
 
-            fs::create_directories(target.parent_path(), ec);
+            paths.ensure_directory(target.parent_path(), ec);
             // A link at the target counts as an existing entry, even a dangling one.
             if (fs::exists(fs::symlink_status(target, ec))) {
                 if (options.overwrite == ExtractOptions::Overwrite::skip) {

@@ -657,6 +657,27 @@ void reject_symlinked_ancestor(const fs::path& dest_norm, const fs::path& target
     }
 }
 
+void ExtractionPathCache::reject_symlinked_ancestor(const fs::path& dest_norm,
+                                                    const fs::path& target) {
+    std::vector<fs::path> chain;
+    for (fs::path p = target.parent_path(); p != dest_norm; p = p.parent_path()) {
+        // The nearest ancestor already known good means every one above it was
+        // checked on the same earlier visit.
+        if (checked_ancestors_.contains(p.native())) break;
+        chain.push_back(p);
+        if (p == p.parent_path()) break;
+    }
+    for (auto it = chain.rbegin(); it != chain.rend(); ++it) {
+        if (core::is_reparse_point(*it)) {
+            throw FormatError("refusing to extract through a symlinked directory: " +
+                              core::generic_path_to_utf8(
+                                  it->lexically_relative(dest_norm)));
+        }
+    }
+    for (const auto& checked : chain) checked_ancestors_.insert(checked.native());
+}
+
+
 namespace {
 
 // ---- archive model ---------------------------------------------------------
@@ -11823,6 +11844,7 @@ void extract_entries_impl(const std::filesystem::path& archive_path,
     // Regular files this run created, by entry index: the only things a hard link
     // may be made to. Anything else is rebuilt from the archive's own bytes.
     std::vector<bool> written(index.entries.size(), false);
+    ExtractionPathCache paths;
 
     for (std::size_t entry_index = 0; entry_index < index.entries.size(); ++entry_index) {
         if (!selected[entry_index]) {
@@ -11840,7 +11862,7 @@ void extract_entries_impl(const std::filesystem::path& archive_path,
         }
         // Real directory components must not be symlinks, or a write could be
         // redirected outside the destination through one of them.
-        reject_symlinked_ancestor(dest_norm, target);
+        paths.reject_symlinked_ancestor(dest_norm, target);
 
         if (entry.type == kEntrySymlink) {
             deferred_symlinks.push_back({&entry, target});
@@ -11872,8 +11894,8 @@ void extract_entries_impl(const std::filesystem::path& archive_path,
                 throw FormatError("hardlink target escapes the destination: " +
                                   entry.link_target);
             }
-            reject_symlinked_ancestor(dest_norm, link_to);
-            fs::create_directories(target.parent_path(), ec);
+            paths.reject_symlinked_ancestor(dest_norm, link_to);
+            paths.ensure_directory(target.parent_path(), ec);
             if (fs::exists(fs::symlink_status(target, ec))) {
                 if (options.overwrite == ExtractOptions::Overwrite::skip) {
                     ++completed_items;
@@ -11905,7 +11927,7 @@ void extract_entries_impl(const std::filesystem::path& archive_path,
             if (core::is_reparse_point(target)) {
                 throw FormatError("refusing to restore a directory over a symlink: " + entry.path);
             }
-            fs::create_directories(target, ec);
+            paths.ensure_directory(target, ec);
             // All directory metadata is deferred until descendants are written;
             // restoring a restrictive ACL/read-only attribute first could make a
             // later child write fail. Only a real directory gets it: if a file is
@@ -11920,7 +11942,7 @@ void extract_entries_impl(const std::filesystem::path& archive_path,
             continue;
         }
 
-        fs::create_directories(target.parent_path(), ec);
+        paths.ensure_directory(target.parent_path(), ec);
         // symlink_status: a link at the target is an existing entry (even a dangling
         // one) and is judged by the overwrite policy like any other.
         if (fs::exists(fs::symlink_status(target, ec))) {
@@ -12079,6 +12101,8 @@ void extract_entries_impl(const std::filesystem::path& archive_path,
             }
         }
         if (file_entry->meta.has_reparse_data) {
+            // The path may now redirect; nothing remembered about paths holds.
+            paths.clear();
             std::string reparse_error;
             if (!core::apply_reparse_point(target, file_entry->meta.reparse_tag,
                                            file_entry->meta.reparse_data,

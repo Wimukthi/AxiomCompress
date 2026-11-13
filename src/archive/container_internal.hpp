@@ -5,6 +5,7 @@
 // archive engine and is not part of the public API in include/axiom.
 
 #include "axiom/archive.hpp"
+#include "core/ensured_directories.hpp"
 
 #include <array>
 #include <cstdint>
@@ -12,6 +13,8 @@
 #include <fstream>
 #include <memory>
 #include <optional>
+#include <unordered_set>
+#include <system_error>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -165,6 +168,34 @@ std::string join_archive_path(std::string_view parent, std::string_view child);
 bool is_within(const std::filesystem::path& base, const std::filesystem::path& target);
 void reject_symlinked_ancestor(const std::filesystem::path& dest_norm,
                                const std::filesystem::path& target);
+
+// The directory checks one extraction run repeats for every file, made once per
+// directory. Checking each ancestor for a link cost one lookup per level, and
+// fs::create_directories on a parent that already exists retried every level,
+// together most of a millisecond per extracted file.
+//
+// What the cache remembers stays true while the run itself adds no links: an
+// ancestor found to be absent or a real directory is only ever created as a real
+// directory by the run. Links an archive stores are made after every file, and
+// go through the uncached reject_symlinked_ancestor; anything else that can make
+// a reparse point must call clear() first.
+class ExtractionPathCache {
+public:
+    void reject_symlinked_ancestor(const std::filesystem::path& dest_norm,
+                                   const std::filesystem::path& target);
+    // fs::create_directories(directory, error), at most once per directory.
+    void ensure_directory(const std::filesystem::path& directory, std::error_code& error) {
+        directories_.ensure(directory, error);
+    }
+    void clear() noexcept {
+        checked_ancestors_.clear();
+        directories_.clear();
+    }
+
+private:
+    std::unordered_set<std::filesystem::path::string_type> checked_ancestors_;
+    core::EnsuredDirectories directories_;
+};
 
 // ---- misc shared utilities -------------------------------------------------------
 

@@ -1,5 +1,6 @@
 #include "archive/system_provider.hpp"
 #include "archive/seven_zip_library.hpp"
+#include "core/ensured_directories.hpp"
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -1242,19 +1243,20 @@ private:
 
         std::uint64_t completed_bytes = 0;
         std::uint64_t completed_items = 0;
+        core::EnsuredDirectories directories;
         for (const auto& entry : selected) {
             operation_checkpoint(options.operation);
             const fs::path relative = fs::path(utf8_to_wide(entry.path));
             const fs::path source = (staging.path() / relative).lexically_normal();
             const fs::path target = (dest_dir / relative).lexically_normal();
             if (entry.is_directory) {
-                fs::create_directories(target, ec);
+                directories.ensure(target, ec);
             } else {
                 if (!fs::exists(source, ec)) {
                     throw std::runtime_error("system archive reader did not extract: " +
                                              entry.path);
                 }
-                fs::create_directories(target.parent_path(), ec);
+                directories.ensure(target.parent_path(), ec);
                 if (fs::exists(target, ec)) {
                     if (options.overwrite == ExtractOptions::Overwrite::skip) {
                         completed_bytes += entry.size;

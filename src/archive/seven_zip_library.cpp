@@ -3,6 +3,7 @@
 #ifdef _WIN32
 
 #include "archive/seven_zip_abi.hpp"
+#include "core/ensured_directories.hpp"
 #include "core/path_text.hpp"
 
 #define WIN32_LEAN_AND_MEAN
@@ -1350,7 +1351,7 @@ public:
                 (destination_ / relative).lexically_normal();
             std::error_code error;
             if (found->second.entry.is_directory) {
-                fs::create_directories(target, error);
+                directories_.ensure(target, error);
                 if (error) {
                     throw std::runtime_error(
                         "could not create extracted directory: " +
@@ -1358,7 +1359,7 @@ public:
                 }
                 return S_OK;
             }
-            fs::create_directories(target.parent_path(), error);
+            directories_.ensure(target.parent_path(), error);
             if (error) {
                 throw std::runtime_error(
                     "could not create extracted parent directory: " +
@@ -1531,6 +1532,7 @@ private:
     }
 
     fs::path destination_;
+    core::EnsuredDirectories directories_;
     std::wstring password_;
     bool password_defined_ = false;
     std::shared_ptr<OperationControl> operation_;
