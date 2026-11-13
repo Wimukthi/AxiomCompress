@@ -1559,6 +1559,9 @@ StagedArchiveEntries MainWindow::extract_archive_entries_to_staging(
             options.overwrite = axiom::ExtractOptions::Overwrite::overwrite;
             options.password = password;
             options.io_buffer_size = io_buffer_size;
+            // Files opened or dragged out of a downloaded archive are the
+            // ones SmartScreen and Protected View most need to see marked.
+            options.mark_of_the_web = configured_mark_of_the_web(application_options_);
             options.operation = control;
             provider->extract_selected(archive, entries, staging, options);
         } catch (...) {
@@ -4135,6 +4138,7 @@ void MainWindow::on_extract() {
     axiom::ExtractOptions options;
     options.thread_count = dialog_options.thread_count;
     options.io_buffer_size = configured_io_buffer_size(application_options_);
+    options.mark_of_the_web = configured_mark_of_the_web(application_options_);
     options.restore_mtime = dialog_options.restore_mtime;
     options.overwrite = dialog_options.overwrite
         ? axiom::ExtractOptions::Overwrite::overwrite
@@ -4375,6 +4379,7 @@ void MainWindow::on_extract_multiple_ready(
     ExtractOptions common_options;
     common_options.thread_count = dialog_options.thread_count;
     common_options.io_buffer_size = configured_io_buffer_size(application_options_);
+    common_options.mark_of_the_web = configured_mark_of_the_web(application_options_);
     common_options.restore_mtime = dialog_options.restore_mtime;
     common_options.overwrite = dialog_options.overwrite
         ? ExtractOptions::Overwrite::overwrite

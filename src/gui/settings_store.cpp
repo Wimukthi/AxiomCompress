@@ -413,6 +413,8 @@ PersistedGuiSettings load_gui_settings() {
     settings.application.verify_signatures = read_bool(key, L"VerifySignatures", true);
     settings.application.wipe_encrypted_temp_files =
         read_bool(key, L"WipeEncryptedTempFiles", true);
+    settings.application.mark_of_the_web_mode =
+        read_clamped_int(key, L"MarkOfTheWebMode", 0, 0, 2);
     settings.application.trusted_keys_folder = read_string(key, L"TrustedKeysFolder");
     settings.application.associate_axar = read_bool(key, L"AssociateAxar", false);
     settings.application.associate_zip = read_bool(key, L"AssociateZip", false);
@@ -630,6 +632,8 @@ void save_gui_settings(const PersistedGuiSettings& settings) {
     write_dword(key, L"VerifySignatures", settings.application.verify_signatures ? 1 : 0);
     write_dword(key, L"WipeEncryptedTempFiles",
                 settings.application.wipe_encrypted_temp_files ? 1 : 0);
+    write_dword(key, L"MarkOfTheWebMode",
+                static_cast<DWORD>(std::clamp(settings.application.mark_of_the_web_mode, 0, 2)));
     write_string(key, L"TrustedKeysFolder", settings.application.trusted_keys_folder);
     write_dword(key, L"AssociateAxar", settings.application.associate_axar ? 1 : 0);
     write_dword(key, L"AssociateZip", settings.application.associate_zip ? 1 : 0);

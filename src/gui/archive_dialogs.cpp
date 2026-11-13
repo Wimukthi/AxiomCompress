@@ -145,6 +145,7 @@ constexpr int kVerifySignatures = 2452;
 constexpr int kWipeEncryptedTempFiles = 2453;
 constexpr int kTrustedKeysFolder = 2454;
 constexpr int kBrowseTrustedKeysFolder = 2455;
+constexpr int kMarkOfTheWebMode = 2456;
 constexpr int kAssociateAxar = 2500;
 constexpr int kAssociateZip = 2501;
 constexpr int kAssociate7z = 2502;
@@ -315,6 +316,8 @@ constexpr std::array<const wchar_t*, 2> kFileOpenModeNames{
     L"Extract to temp and open", L"Prompt before opening"};
 constexpr std::array<const wchar_t*, 2> kPasswordPromptModeNames{
     L"Once per archive session", L"Every operation"};
+constexpr std::array<const wchar_t*, 3> kMarkOfTheWebModeNames{
+    L"Mark every extracted file", L"Mark programs, scripts and documents", L"Do not mark"};
 constexpr std::array<const wchar_t*, 2> kUpdateChannelNames{
     L"Stable/custom feed", L"Preview/custom feed"};
 constexpr std::array<const wchar_t*, 3> kWorkerPriorityNames{
@@ -3177,13 +3180,15 @@ private:
                          L"Verify signed archives before extraction by default", 180, 114);
         setting_checkbox(5, kWipeEncryptedTempFiles,
                          L"Wipe temporary files extracted from encrypted archives", 180, 148);
-        setting_label(5, L"Trusted keys folder path", 0, 198, 170);
-        setting_edit(5, kTrustedKeysFolder, 180, 192, 470);
-        setting_browse(5, kBrowseTrustedKeysFolder, 660, 192);
+        setting_label(5, L"Downloaded archives", 0, 194, 170);
+        setting_combo(5, kMarkOfTheWebMode, kMarkOfTheWebModeNames, 180, 188, 280);
+        setting_label(5, L"Trusted keys folder path", 0, 244, 170);
+        setting_edit(5, kTrustedKeysFolder, 180, 238, 470);
+        setting_browse(5, kBrowseTrustedKeysFolder, 660, 238);
         setting_label(5,
                       L"Passwords are never written to settings. These options only control "
                       L"prompting, in-memory reuse, verification, and temporary-file handling.",
-                      0, 252, 660, 54, true);
+                      0, 298, 660, 54, true);
 
         setting_label(6, L"Windows integration", 0, 0, 660);
         setting_checkbox(6, kAssociateAxar, L"Associate .axar files with Axiom", 0, 42);
@@ -3436,6 +3441,10 @@ private:
         add_dialog_tooltip(
             tooltip_, item(kWipeEncryptedTempFiles),
             L"Overwrite temporary plaintext files produced from encrypted archives before deleting them.");
+        add_dialog_tooltip(
+            tooltip_, item(kMarkOfTheWebMode),
+            L"When an archive was downloaded from the Internet, give the files extracted from it the same "
+            L"Mark of the Web, so SmartScreen and Office Protected View still check them.");
         add_dialog_tooltip(tooltip_, item(kTrustedKeysFolder),
                            L"Windows folder path containing trusted Axiom public-key files.");
         add_dialog_tooltip(tooltip_, item(kBrowseTrustedKeysFolder),
@@ -4399,6 +4408,8 @@ private:
 
         set_selected_index(kPasswordPromptMode,
                            std::clamp(application_options.password_prompt_mode, 0, 1));
+        set_selected_index(kMarkOfTheWebMode,
+                           std::clamp(application_options.mark_of_the_web_mode, 0, 2));
         set_window_text(item(kTrustedKeysFolder), application_options.trusted_keys_folder);
 
         set_selected_index(kUpdateChannel,
@@ -4713,6 +4724,7 @@ private:
             trim_dialog_input(window_text(item(kExternalEditor)));
 
         application_options.password_prompt_mode = selected_index(kPasswordPromptMode, 0);
+        application_options.mark_of_the_web_mode = selected_index(kMarkOfTheWebMode, 0);
         application_options.trusted_keys_folder =
             trim_dialog_input(window_text(item(kTrustedKeysFolder)));
 

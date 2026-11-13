@@ -267,6 +267,8 @@ std::wstring quote_argument(const fs::path& path);
 std::optional<std::uint64_t> parse_size_setting(std::wstring text);
 std::size_t configured_io_buffer_size(
     const axiom::gui::ApplicationDialogOptions& options);
+axiom::ExtractOptions::MarkOfTheWeb configured_mark_of_the_web(
+    const axiom::gui::ApplicationDialogOptions& options);
 bool has_executable_extension(const fs::path& path);
 void wipe_file_best_effort(const fs::path& path);
 void remove_temp_directory(const fs::path& path, bool sensitive);

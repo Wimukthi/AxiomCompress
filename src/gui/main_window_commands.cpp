@@ -1205,6 +1205,7 @@ void MainWindow::on_snapshots() {
                     options.password = std::move(password);
                     options.thread_count = selected_thread_count_;
                     options.io_buffer_size = configured_io_buffer_size(application_options_);
+                    options.mark_of_the_web = configured_mark_of_the_web(application_options_);
                     options.restore_mtime = true;
                     options.overwrite = axiom::ExtractOptions::Overwrite::fail;
                     const std::wstring snapshot_name = widen(*snapshot);

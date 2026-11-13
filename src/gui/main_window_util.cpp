@@ -211,6 +211,15 @@ if (value > std::numeric_limits<std::uint64_t>::max() / multiplier) {
 return value * multiplier;
 }
 
+axiom::ExtractOptions::MarkOfTheWeb configured_mark_of_the_web(
+const axiom::gui::ApplicationDialogOptions& options) {
+switch (options.mark_of_the_web_mode) {
+    case 1: return axiom::ExtractOptions::MarkOfTheWeb::risky;
+    case 2: return axiom::ExtractOptions::MarkOfTheWeb::off;
+    default: return axiom::ExtractOptions::MarkOfTheWeb::all;
+}
+}
+
 std::size_t configured_io_buffer_size(
 const axiom::gui::ApplicationDialogOptions& options) {
 if (options.io_buffer_mode != 1) {

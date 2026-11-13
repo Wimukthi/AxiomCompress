@@ -999,6 +999,7 @@ private:
         axiom::ExtractOptions options;
         options.thread_count = dialog_options.thread_count;
         options.io_buffer_size = configured_io_buffer_size(application_options_);
+        options.mark_of_the_web = configured_mark_of_the_web(application_options_);
         options.restore_mtime = dialog_options.restore_mtime;
         options.overwrite = dialog_options.overwrite
             ? axiom::ExtractOptions::Overwrite::overwrite

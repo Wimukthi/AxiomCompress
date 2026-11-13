@@ -319,6 +319,9 @@ struct ApplicationDialogOptions {
     bool cache_passwords = true;
     bool verify_signatures = true;
     bool wipe_encrypted_temp_files = true;
+    // Mark of the Web for files extracted from a downloaded archive:
+    // 0 = every file, 1 = risky types only, 2 = none.
+    int mark_of_the_web_mode = 0;
     std::wstring trusted_keys_folder;
     bool associate_axar = false;
     bool associate_zip = false;
