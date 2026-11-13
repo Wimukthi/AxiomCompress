@@ -1,5 +1,7 @@
 #include "core/file_meta.hpp"
 
+#include "core/exclusive_file.hpp"
+
 #include <algorithm>
 #include <cerrno>
 #include <cstring>
@@ -164,6 +166,40 @@ FileMetadata capture_metadata(const std::filesystem::path& path) {
     return meta;
 }
 
+// Restore only the user-meaningful attributes; never replay structural bits
+// (directory, reparse point, etc.) that the filesystem already manages.
+static DWORD restorable_attributes(const FileMetadata& meta) {
+    constexpr DWORD kRestorable = FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_HIDDEN |
+                                  FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_ARCHIVE |
+                                  FILE_ATTRIBUTE_NOT_CONTENT_INDEXED;
+    const DWORD attributes = meta.windows_attributes & kRestorable;
+    return attributes == 0 ? FILE_ATTRIBUTE_NORMAL : attributes;
+}
+
+// Ownership is restored whenever the extracting user may change it, as on POSIX.
+// Setting an owner or group needs WRITE_OWNER (or the restore privilege for
+// someone else's SID), which an unelevated user does not hold even for their own
+// files, and one failed component fails the whole call. So when only the
+// ownership is refused, restore the access list on its own; a refused ownership
+// change is not worth a warning per file. `set` applies the stored descriptor
+// for the given parts; returns ERROR_SUCCESS or the error that defeated it.
+template <typename SetSecurity>
+static DWORD restore_security_descriptor(const FileMetadata& meta, SetSecurity set) {
+    auto* descriptor = reinterpret_cast<PSECURITY_DESCRIPTOR>(
+        const_cast<std::uint8_t*>(meta.windows_security_descriptor.data()));
+    if (set(OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION |
+                DACL_SECURITY_INFORMATION,
+            descriptor)) {
+        return ERROR_SUCCESS;
+    }
+    const DWORD error = GetLastError();
+    if (error != ERROR_ACCESS_DENIED && error != ERROR_INVALID_OWNER &&
+        error != ERROR_INVALID_PRIMARY_GROUP && error != ERROR_PRIVILEGE_NOT_HELD) {
+        return error;
+    }
+    return set(DACL_SECURITY_INFORMATION, descriptor) ? ERROR_SUCCESS : GetLastError();
+}
+
 std::vector<std::string> apply_metadata(const std::filesystem::path& path,
                                         const FileMetadata& meta,
                                         bool restore_times,
@@ -195,14 +231,7 @@ std::vector<std::string> apply_metadata(const std::filesystem::path& path,
     }
 
     if (meta.has_windows_attributes) {
-        // Restore only the user-meaningful attributes; never replay structural bits
-        // (directory, reparse point, etc.) that the filesystem already manages.
-        constexpr DWORD kRestorable = FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_HIDDEN |
-                                      FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_ARCHIVE |
-                                      FILE_ATTRIBUTE_NOT_CONTENT_INDEXED;
-        const DWORD attributes = meta.windows_attributes & kRestorable;
-        const DWORD desired_attributes = attributes == 0 ? FILE_ATTRIBUTE_NORMAL : attributes;
-        if (!SetFileAttributesW(path.c_str(), desired_attributes)) {
+        if (!SetFileAttributesW(path.c_str(), restorable_attributes(meta))) {
             warnings.push_back("file attributes could not be restored (error " +
                                std::to_string(GetLastError()) + ")");
         }
@@ -213,28 +242,73 @@ std::vector<std::string> apply_metadata(const std::filesystem::path& path,
     // link is the target's descriptor anyway (capture follows the link), so a link
     // is left with the default security of the folder it was created in.
     if (meta.has_windows_security_descriptor && !is_reparse_point(path)) {
-        auto* descriptor = reinterpret_cast<PSECURITY_DESCRIPTOR>(
-            const_cast<std::uint8_t*>(meta.windows_security_descriptor.data()));
-        // Ownership is restored whenever the extracting user may change it, as
-        // on POSIX. Setting an owner or group needs WRITE_OWNER (or the restore
-        // privilege for someone else's SID), which an unelevated user does not
-        // hold even for their own files, and one failed component fails the whole
-        // call. So when only the ownership is refused, restore the access list on
-        // its own; a refused ownership change is not worth a warning per file.
-        bool restored = SetFileSecurityW(
-            path.c_str(),
-            OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION |
-                DACL_SECURITY_INFORMATION,
-            descriptor) != FALSE;
-        DWORD error = restored ? ERROR_SUCCESS : GetLastError();
-        if (!restored &&
-            (error == ERROR_ACCESS_DENIED || error == ERROR_INVALID_OWNER ||
-             error == ERROR_INVALID_PRIMARY_GROUP || error == ERROR_PRIVILEGE_NOT_HELD)) {
-            restored = SetFileSecurityW(path.c_str(), DACL_SECURITY_INFORMATION,
-                                        descriptor) != FALSE;
-            error = restored ? ERROR_SUCCESS : GetLastError();
+        const DWORD error = restore_security_descriptor(
+            meta, [&](SECURITY_INFORMATION parts, PSECURITY_DESCRIPTOR descriptor) {
+                return SetFileSecurityW(path.c_str(), parts, descriptor) != FALSE;
+            });
+        if (error != ERROR_SUCCESS) {
+            warnings.push_back("security descriptor could not be restored (error " +
+                               std::to_string(error) + ")");
         }
-        if (!restored) {
+    }
+    return warnings;
+}
+
+std::uint32_t staged_finish_access(bool with_ownership) {
+    return DELETE | READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES |
+           (with_ownership ? WRITE_OWNER : 0);
+}
+
+std::optional<std::vector<std::string>> finish_staged_file(
+    ExclusiveFile& file, const std::filesystem::path& target, const FileMetadata& meta,
+    bool restore_times) {
+    if (!file.extra_access_granted()) return std::nullopt;
+    const HANDLE handle = file.native_handle();
+
+    // Rename first, as the path-based finish does, so the metadata lands in the
+    // same order. Renaming through the handle saves reopening the file by name.
+    const std::wstring& name = target.native();
+    const std::size_t name_bytes = name.size() * sizeof(wchar_t);
+    if (name_bytes > MAXDWORD - sizeof(FILE_RENAME_INFO)) return std::nullopt;
+    std::vector<std::uint8_t> buffer(sizeof(FILE_RENAME_INFO) + name_bytes);
+    auto* rename = reinterpret_cast<FILE_RENAME_INFO*>(buffer.data());
+    rename->ReplaceIfExists = TRUE;
+    rename->RootDirectory = nullptr;
+    rename->FileNameLength = static_cast<DWORD>(name_bytes);
+    std::memcpy(rename->FileName, name.data(), name_bytes);
+    if (!SetFileInformationByHandle(handle, FileRenameInfo, rename,
+                                    static_cast<DWORD>(buffer.size()))) {
+        return std::nullopt;
+    }
+
+    // What apply_metadata(target, meta, restore_times) does, through the handle.
+    // The staging file was created new and never through a link, so it is not a
+    // reparse point and its descriptor is always applied.
+    std::vector<std::string> warnings;
+    if (restore_times && meta.has_windows_times) {
+        const FILETIME creation = u64_to_filetime(meta.windows_creation_time);
+        const FILETIME access = u64_to_filetime(meta.windows_access_time);
+        const FILETIME write = u64_to_filetime(meta.windows_write_time);
+        if (!SetFileTime(handle, &creation, &access, &write)) {
+            warnings.push_back("file timestamps could not be restored (error " +
+                               std::to_string(GetLastError()) + ")");
+        }
+    }
+    if (meta.has_windows_attributes) {
+        // Zero times in FILE_BASIC_INFO leave the ones just restored alone.
+        FILE_BASIC_INFO basic{};
+        basic.FileAttributes = restorable_attributes(meta);
+        if (!SetFileInformationByHandle(handle, FileBasicInfo, &basic, sizeof(basic))) {
+            warnings.push_back("file attributes could not be restored (error " +
+                               std::to_string(GetLastError()) + ")");
+        }
+    }
+    if (meta.has_windows_security_descriptor) {
+        const DWORD error = restore_security_descriptor(
+            meta, [&](SECURITY_INFORMATION parts, PSECURITY_DESCRIPTOR descriptor) {
+                return SetKernelObjectSecurity(handle, parts, descriptor) != FALSE;
+            });
+        if (error != ERROR_SUCCESS) {
             warnings.push_back("security descriptor could not be restored (error " +
                                std::to_string(error) + ")");
         }
@@ -1158,6 +1232,15 @@ bool restore_sparse_file([[maybe_unused]] const std::filesystem::path& path,
 
 SourceFileProbe probe_source_file(const std::filesystem::path&) {
     return {};
+}
+
+std::uint32_t staged_finish_access(bool) {
+    return 0;
+}
+
+std::optional<std::vector<std::string>> finish_staged_file(
+    ExclusiveFile&, const std::filesystem::path&, const FileMetadata&, bool) {
+    return std::nullopt;
 }
 
 bool walk_source_tree(const std::filesystem::path& root,

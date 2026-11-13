@@ -6399,6 +6399,24 @@ void test_windows_metadata() {
         SetFileTime(handle, nullptr, nullptr, &write_time);
         CloseHandle(handle);
     }
+    FILETIME creation_time{};
+    {
+        // A creation time distinct from the write time, so restoring them
+        // through the staging handle cannot pass by mixing them up.
+        SYSTEMTIME created{};
+        created.wYear = 2019;
+        created.wMonth = 3;
+        created.wDay = 2;
+        created.wHour = 8;
+        created.wMilliseconds = 250;
+        SystemTimeToFileTime(&created, &creation_time);
+        const HANDLE handle = CreateFileW(file.c_str(), FILE_WRITE_ATTRIBUTES,
+                                          FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                                          OPEN_EXISTING, 0, nullptr);
+        AXIOM_CHECK(handle != INVALID_HANDLE_VALUE);
+        SetFileTime(handle, &creation_time, nullptr, nullptr);
+        CloseHandle(handle);
+    }
 
     const auto archive = root / "meta.axar";
     axiom::create_archive({src}, archive, {});
@@ -6423,6 +6441,28 @@ void test_windows_metadata() {
     AXIOM_CHECK((data.dwFileAttributes & FILE_ATTRIBUTE_HIDDEN) != 0);
     AXIOM_CHECK(data.ftLastWriteTime.dwLowDateTime == write_time.dwLowDateTime &&
                 data.ftLastWriteTime.dwHighDateTime == write_time.dwHighDateTime);
+    AXIOM_CHECK(data.ftCreationTime.dwLowDateTime == creation_time.dwLowDateTime &&
+                data.ftCreationTime.dwHighDateTime == creation_time.dwHighDateTime);
+
+    // Extracting again over the now read-only file: replacing it by handle is
+    // refused, and the by-name path must still put the file and its metadata
+    // in place.
+    axiom::ExtractOptions overwrite;
+    overwrite.overwrite = axiom::ExtractOptions::Overwrite::overwrite;
+    overwrite.operation = std::make_shared<axiom::OperationControl>();
+    axiom::extract_archive(archive, dest, overwrite);
+    AXIOM_CHECK(read_all(extracted) == bytes_from_string("read-only hidden content"));
+    data = {};
+    AXIOM_CHECK(GetFileAttributesExW(extracted.c_str(), GetFileExInfoStandard, &data));
+    AXIOM_CHECK((data.dwFileAttributes & FILE_ATTRIBUTE_READONLY) != 0);
+    AXIOM_CHECK(data.ftLastWriteTime.dwLowDateTime == write_time.dwLowDateTime &&
+                data.ftLastWriteTime.dwHighDateTime == write_time.dwHighDateTime);
+    AXIOM_CHECK(overwrite.operation->warnings().empty());
+    std::size_t staging_leftovers = 0;
+    for (const auto& item : fs::directory_iterator(dest / "src")) {
+        if (item.path().extension() == ".axtmp") ++staging_leftovers;
+    }
+    AXIOM_CHECK(staging_leftovers == 0);
 
     // Clear read-only so the temp tree can be removed.
     SetFileAttributesW(file.c_str(), FILE_ATTRIBUTE_NORMAL);

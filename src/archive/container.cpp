@@ -11845,6 +11845,10 @@ void extract_entries_impl(const std::filesystem::path& archive_path,
     // may be made to. Anything else is rebuilt from the archive's own bytes.
     std::vector<bool> written(index.entries.size(), false);
     ExtractionPathCache paths;
+    // Access for finishing staged files through their handles. Ownership is
+    // asked for until creating a file refuses it, then the rest until that is
+    // refused too, after which this run finishes files by path as before.
+    std::uint32_t staging_access = core::staged_finish_access(true);
 
     for (std::size_t entry_index = 0; entry_index < index.entries.size(); ++entry_index) {
         if (!selected[entry_index]) {
@@ -11961,7 +11965,17 @@ void extract_entries_impl(const std::filesystem::path& archive_path,
 
         // The file is staged under a name nobody can have prepared: created new and
         // never through a link, so the bytes can only land in the file made here.
-        core::StagedFile staged(target);
+        // A file whose metadata has nothing to wait for (no named streams, sparse
+        // ranges, or reparse data, which must land before the times) is renamed
+        // and re-permissioned through the handle it was written with.
+        const bool finish_by_handle = staging_access != 0 && file_entry->ads.empty() &&
+            !file_entry->sparse.is_sparse && !file_entry->meta.has_reparse_data;
+        core::StagedFile staged(target, finish_by_handle ? staging_access : 0);
+        if (finish_by_handle && !staged.file().extra_access_granted()) {
+            staging_access = staging_access == core::staged_finish_access(true)
+                ? core::staged_finish_access(false)
+                : 0;
+        }
         const fs::path& temp_target = staged.path();
         {
             std::uint64_t current_file_bytes = 0;
@@ -12050,17 +12064,33 @@ void extract_entries_impl(const std::filesystem::path& archive_path,
                 throw FormatError("BLAKE3 mismatch for extracted file: " + entry.path);
             }
         }
-        // A close error means buffered data never reached the disk.
-        if (!staged.close()) {
-            throw std::runtime_error("failed writing file: " + core::path_to_utf8(temp_target));
+        std::optional<std::vector<std::string>> finished;
+        if (finish_by_handle) {
+            finished = core::finish_staged_file(staged.file(), target, file_entry->meta,
+                                                options.restore_mtime);
         }
+        if (finished) {
+            // Already under its final name: a close error means buffered data
+            // never reached the disk, so the file must not stay there.
+            if (!staged.close()) {
+                fs::remove(target, ec);
+                throw std::runtime_error("failed writing file: " + core::path_to_utf8(target));
+            }
+        } else {
+            // A close error means buffered data never reached the disk.
+            if (!staged.close()) {
+                throw std::runtime_error("failed writing file: " +
+                                         core::path_to_utf8(temp_target));
+            }
 
-        fs::rename(temp_target, target, ec);
-        if (ec) {
-            fs::remove(target, ec);
             fs::rename(temp_target, target, ec);
             if (ec) {
-                throw std::runtime_error("failed to move extracted file into place: " + ec.message());
+                fs::remove(target, ec);
+                fs::rename(temp_target, target, ec);
+                if (ec) {
+                    throw std::runtime_error("failed to move extracted file into place: " +
+                                             ec.message());
+                }
             }
         }
         staged.dismiss();
@@ -12092,9 +12122,11 @@ void extract_entries_impl(const std::filesystem::path& archive_path,
             }
         }
         // High-precision Windows times (when present) supersede the seconds mtime.
-        for (const auto& warning : core::apply_metadata(
-                 target, file_entry->meta, options.restore_mtime,
-                 options.restore_privileged_metadata)) {
+        const auto metadata_warnings = finished
+            ? std::move(*finished)
+            : core::apply_metadata(target, file_entry->meta, options.restore_mtime,
+                                   options.restore_privileged_metadata);
+        for (const auto& warning : metadata_warnings) {
             if (operation) operation->add_warning({entry.path, warning});
             if (options.strict_metadata) {
                 throw std::runtime_error(warning + ": " + entry.path);

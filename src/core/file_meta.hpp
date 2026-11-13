@@ -217,6 +217,28 @@ std::vector<std::string> apply_metadata(const std::filesystem::path& path,
                                         bool restore_times,
                                         bool restore_privileged = false);
 
+class ExclusiveFile;
+
+// The extra access a staging file needs for finish_staged_file(), to pass to
+// StagedFile; 0 where finishing through the handle does not apply. Ownership
+// can only be restored through a handle that holds WRITE_OWNER, which creating
+// the file may refuse.
+std::uint32_t staged_finish_access(bool with_ownership);
+
+// Move a freshly written staging file to `target` through its still-open handle,
+// then apply what apply_metadata(target, meta, restore_times) would, through the
+// same handle, and return its messages. Renaming and re-permissioning by name
+// reopened the file for each step, the larger part of extracting a small file.
+// Returns nullopt, having changed nothing, when the handle lacks the access or
+// the rename is refused; the caller then closes, renames, and applies metadata
+// by path. The caller must still close the file and treat a failed close as a
+// failed write. For a regular file without named streams, sparse ranges, or
+// reparse data, whose metadata has nothing to wait for.
+std::optional<std::vector<std::string>> finish_staged_file(ExclusiveFile& file,
+                                                           const std::filesystem::path& target,
+                                                           const FileMetadata& meta,
+                                                           bool restore_times);
+
 // Apply an opaque Windows reparse point after the target has been created. On
 // platforms without Windows reparse controls this reports a single failure.
 bool apply_reparse_point(const std::filesystem::path& path, std::uint32_t tag,

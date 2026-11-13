@@ -53,14 +53,18 @@ public:
 
     ExclusiveFile(const ExclusiveFile&) = delete;
     ExclusiveFile& operator=(const ExclusiveFile&) = delete;
-    ExclusiveFile(ExclusiveFile&& other) noexcept : handle_(other.handle_) {
+    ExclusiveFile(ExclusiveFile&& other) noexcept
+        : handle_(other.handle_), extra_access_granted_(other.extra_access_granted_) {
         other.handle_ = invalid_handle();
+        other.extra_access_granted_ = false;
     }
     ExclusiveFile& operator=(ExclusiveFile&& other) noexcept {
         if (this != &other) {
             release();
             handle_ = other.handle_;
+            extra_access_granted_ = other.extra_access_granted_;
             other.handle_ = invalid_handle();
+            other.extra_access_granted_ = false;
         }
         return *this;
     }
@@ -71,10 +75,16 @@ public:
     // alone (mode 0600; on Windows a protected ACL granting only the owner and
     // SYSTEM, and creation fails if that cannot be set), with no moment at which
     // it exists with broader access.
+    //
+    // `extra_access` (Windows access rights, ignored elsewhere) asks for more
+    // than write access, such as what renaming and re-permissioning the file
+    // through this handle needs. If those rights are refused the file is
+    // created with write access alone; extra_access_granted() says which.
     Create create_new(const std::filesystem::path& path, std::error_code& error,
-                      bool owner_only = false) {
+                      bool owner_only = false, std::uint32_t extra_access = 0) {
         release();
         error.clear();
+        extra_access_granted_ = false;
 #if defined(_WIN32)
         SECURITY_ATTRIBUTES attributes{};
         PSECURITY_DESCRIPTOR descriptor = nullptr;
@@ -92,13 +102,25 @@ public:
         // CREATE_NEW fails when the name exists. FILE_FLAG_OPEN_REPARSE_POINT
         // stops a symlink or junction at the final component from being
         // resolved first, so a dangling link also reads as "exists".
-        handle_ = CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ,
-                              owner_only ? &attributes : nullptr, CREATE_NEW,
-                              FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
-                              nullptr);
+        const auto create = [&](DWORD access) {
+            return CreateFileW(path.c_str(), access, FILE_SHARE_READ,
+                               owner_only ? &attributes : nullptr, CREATE_NEW,
+                               FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+                               nullptr);
+        };
+        handle_ = create(GENERIC_WRITE | extra_access);
+        // Captured at once: the calls below may overwrite the thread's last error.
+        DWORD native = handle_ == INVALID_HANDLE_VALUE ? GetLastError() : ERROR_SUCCESS;
+        if (handle_ != INVALID_HANDLE_VALUE) {
+            extra_access_granted_ = extra_access != 0;
+        } else if (extra_access != 0 && native == ERROR_ACCESS_DENIED &&
+                   GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES) {
+            // The extra rights were refused and nothing was created.
+            handle_ = create(GENERIC_WRITE);
+            native = handle_ == INVALID_HANDLE_VALUE ? GetLastError() : ERROR_SUCCESS;
+        }
         if (descriptor != nullptr) LocalFree(descriptor);
         if (handle_ == INVALID_HANDLE_VALUE) {
-            const DWORD native = GetLastError();
             if (native == ERROR_FILE_EXISTS || native == ERROR_ALREADY_EXISTS) {
                 return Create::exists;
             }
@@ -121,6 +143,7 @@ public:
 #ifdef O_CLOEXEC
         flags |= O_CLOEXEC;
 #endif
+        (void)extra_access;
         handle_ = ::open(path.c_str(), flags, owner_only ? 0600 : 0666);
         if (handle_ < 0) {
             const int native = errno;
@@ -134,6 +157,13 @@ public:
     }
 
     bool is_open() const noexcept { return handle_ != invalid_handle(); }
+
+    // Whether the handle holds the `extra_access` create_new() asked for.
+    bool extra_access_granted() const noexcept { return is_open() && extra_access_granted_; }
+
+#if defined(_WIN32)
+    HANDLE native_handle() const noexcept { return handle_; }
+#endif
 
     // Writes every byte or returns false.
     bool write(std::span<const std::uint8_t> bytes) noexcept {
@@ -198,6 +228,7 @@ private:
     void release() noexcept { (void)close(); }
 
     Handle handle_ = invalid_handle();
+    bool extra_access_granted_ = false;
 };
 
 // The part of `target`'s file name that is kept in its staging name. Long names
@@ -223,7 +254,8 @@ inline std::filesystem::path::string_type staging_stem(const std::filesystem::pa
 // cannot be guessed. The suffix still ends in ".axtmp" so leftovers from an
 // interrupted run are recognisable. Returns the path that was created.
 inline std::filesystem::path create_staging_file(const std::filesystem::path& target,
-                                                 ExclusiveFile& file) {
+                                                 ExclusiveFile& file,
+                                                 std::uint32_t extra_access = 0) {
     constexpr char kHex[] = "0123456789abcdef";
     const std::filesystem::path directory = target.parent_path();
     const auto stem = staging_stem(target);
@@ -239,7 +271,7 @@ inline std::filesystem::path create_staging_file(const std::filesystem::path& ta
         std::filesystem::path candidate = directory / (stem + std::filesystem::path(suffix).native());
 
         std::error_code error;
-        switch (file.create_new(candidate, error)) {
+        switch (file.create_new(candidate, error, false, extra_access)) {
             case ExclusiveFile::Create::created:
                 return candidate;
             case ExclusiveFile::Create::exists:
@@ -258,8 +290,9 @@ inline std::filesystem::path create_staging_file(const std::filesystem::path& ta
 // removed (Windows cannot delete an open file).
 class StagedFile {
 public:
-    explicit StagedFile(const std::filesystem::path& target)
-        : path_(create_staging_file(target, file_)) {}
+    // `extra_access` is passed to ExclusiveFile::create_new.
+    explicit StagedFile(const std::filesystem::path& target, std::uint32_t extra_access = 0)
+        : path_(create_staging_file(target, file_, extra_access)) {}
     ~StagedFile() {
         (void)file_.close();
         if (active_) {
