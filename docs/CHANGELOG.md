@@ -14,6 +14,15 @@ Entries are condensed from the
 
 ## [Unreleased]
 
+## [0.16.0.0] - 2026-11-13
+
+Archiving and extracting many small files is several times faster on Windows,
+files extracted from a downloaded archive keep its Mark of the Web, the bundled
+7-Zip engine is 26.06, and extracting without elevation restores access lists
+again. The archive format is unchanged, and for the same input and settings the
+same archive bytes are produced, except where an earlier build rounded a
+seconds-only timestamp to the wrong second.
+
 ### Performance
 
 - Archiving and extracting many small files is several times faster on
@@ -1046,7 +1055,8 @@ First published release: the Inno Setup installer and portable zip, carrying
 update/repair/remove maintenance handling, and dynamic light/dark setup
 styling.
 
-[Unreleased]: https://github.com/Wimukthi/AxiomCompress/compare/0.15.0.0...HEAD
+[Unreleased]: https://github.com/Wimukthi/AxiomCompress/compare/0.16.0.0...HEAD
+[0.16.0.0]: https://github.com/Wimukthi/AxiomCompress/releases/tag/0.16.0.0
 [0.15.0.0]: https://github.com/Wimukthi/AxiomCompress/releases/tag/0.15.0.0
 [0.14.0.0]: https://github.com/Wimukthi/AxiomCompress/releases/tag/0.14.0.0
 [0.13.1.0]: https://github.com/Wimukthi/AxiomCompress/releases/tag/0.13.1.0
