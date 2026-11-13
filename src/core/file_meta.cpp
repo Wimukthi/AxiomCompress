@@ -4,6 +4,8 @@
 #include <cerrno>
 #include <cstring>
 #include <limits>
+#include <string_view>
+#include <utility>
 
 #if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
@@ -56,18 +58,15 @@ void append_warning(FileMetadata& meta, std::string message) {
     meta.capture_warnings.push_back(std::move(message));
 }
 
-void capture_windows_security_descriptor(const std::filesystem::path& path,
-                                         FileMetadata& meta) {
-    PSECURITY_DESCRIPTOR descriptor = nullptr;
-    PSID owner = nullptr;
-    PSID group = nullptr;
-    PACL dacl = nullptr;
-    const auto status = GetNamedSecurityInfoW(
-        path.c_str(), SE_FILE_OBJECT,
-        OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION |
-            DACL_SECURITY_INFORMATION,
-        &owner, &group, &dacl, nullptr, &descriptor);
+constexpr SECURITY_INFORMATION kCapturedSecurityInformation =
+    OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION;
+
+// Keep a descriptor returned by GetNamedSecurityInfoW or GetSecurityInfo, or say
+// why there is none, the same way whichever query produced it. Frees it.
+void store_windows_security_descriptor(DWORD status, PSECURITY_DESCRIPTOR descriptor,
+                                       FileMetadata& meta) {
     if (status != ERROR_SUCCESS || descriptor == nullptr) {
+        if (descriptor != nullptr) LocalFree(descriptor);
         if (status != ERROR_FILE_NOT_FOUND && status != ERROR_PATH_NOT_FOUND &&
             status != ERROR_INVALID_FUNCTION) {
             append_warning(meta, "security descriptor could not be captured (error " +
@@ -86,6 +85,18 @@ void capture_windows_security_descriptor(const std::filesystem::path& path,
             static_cast<const std::uint8_t*>(descriptor) + length);
     }
     LocalFree(descriptor);
+}
+
+void capture_windows_security_descriptor(const std::filesystem::path& path,
+                                         FileMetadata& meta) {
+    PSECURITY_DESCRIPTOR descriptor = nullptr;
+    PSID owner = nullptr;
+    PSID group = nullptr;
+    PACL dacl = nullptr;
+    const auto status = GetNamedSecurityInfoW(
+        path.c_str(), SE_FILE_OBJECT, kCapturedSecurityInformation,
+        &owner, &group, &dacl, nullptr, &descriptor);
+    store_windows_security_descriptor(status, descriptor, meta);
 }
 
 void capture_windows_reparse_data(const std::filesystem::path& path,
@@ -637,6 +648,181 @@ bool restore_sparse_file(const std::filesystem::path& path,
 #endif
 }
 
+SourceFileProbe probe_source_file(const std::filesystem::path& path) {
+    SourceFileProbe probe;
+    // READ_CONTROL for the security descriptor and FILE_READ_ATTRIBUTES for the
+    // rest. Opening follows a link, as GetNamedSecurityInfoW did; a reparse
+    // point is refused below so the path-based capture keeps handling those.
+    const HANDLE handle = CreateFileW(
+        path.c_str(), READ_CONTROL | FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+        OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+    if (handle == INVALID_HANDLE_VALUE) return probe;
+    struct HandleCloser {
+        HANDLE handle;
+        ~HandleCloser() { CloseHandle(handle); }
+    } closer{handle};
+
+    BY_HANDLE_FILE_INFORMATION info{};
+    if (!GetFileInformationByHandle(handle, &info) ||
+        (info.dwFileAttributes &
+         (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) != 0) {
+        return probe;
+    }
+
+    // The same fields capture_metadata() takes from GetFileAttributesExW.
+    probe.meta.has_windows_attributes = true;
+    probe.meta.windows_attributes = info.dwFileAttributes;
+    probe.meta.has_windows_times = true;
+    probe.meta.windows_creation_time = filetime_to_u64(info.ftCreationTime);
+    probe.meta.windows_access_time = filetime_to_u64(info.ftLastAccessTime);
+    probe.meta.windows_write_time = filetime_to_u64(info.ftLastWriteTime);
+    {
+        PSECURITY_DESCRIPTOR descriptor = nullptr;
+        PSID owner = nullptr;
+        PSID group = nullptr;
+        PACL dacl = nullptr;
+        const DWORD status = GetSecurityInfo(handle, SE_FILE_OBJECT,
+                                             kCapturedSecurityInformation, &owner,
+                                             &group, &dacl, nullptr, &descriptor);
+        store_windows_security_descriptor(status, descriptor, probe.meta);
+    }
+
+    // std::filesystem's file_time_type counts FILETIME ticks on Windows, so this
+    // is the value fs::last_write_time() reports for the same file.
+    probe.write_time = std::filesystem::file_time_type(
+        std::filesystem::file_time_type::duration(
+            static_cast<std::filesystem::file_time_type::rep>(
+                filetime_to_u64(info.ftLastWriteTime))));
+    probe.size = (static_cast<std::uint64_t>(info.nFileSizeHigh) << 32) |
+                 info.nFileSizeLow;
+    if (info.nNumberOfLinks > 1) {
+        FileId id;
+        id.volume = info.dwVolumeSerialNumber;
+        id.index_high = info.nFileIndexHigh;
+        id.index_low = info.nFileIndexLow;
+        probe.hardlink = id;
+    }
+    probe.sparse = (info.dwFileAttributes & FILE_ATTRIBUTE_SPARSE_FILE) != 0;
+
+    // Almost every file has only its unnamed data stream. Confirming that here
+    // saves capture_ads() a lookup of its own; a file with named streams, or a
+    // list that does not fit, still goes through capture_ads().
+    alignas(FILE_STREAM_INFO) std::uint8_t streams[1024];
+    if (GetFileInformationByHandleEx(handle, FileStreamInfo, streams, sizeof(streams))) {
+        bool named = false;
+        std::size_t offset = 0;
+        for (;;) {
+            const auto* stream = reinterpret_cast<const FILE_STREAM_INFO*>(streams + offset);
+            const std::wstring_view name(stream->StreamName,
+                                         stream->StreamNameLength / sizeof(wchar_t));
+            if (name != L"::$DATA") named = true;
+            if (stream->NextEntryOffset == 0) break;
+            offset += stream->NextEntryOffset;
+            if (offset + sizeof(FILE_STREAM_INFO) > sizeof(streams)) {
+                named = true;
+                break;
+            }
+        }
+        probe.named_streams = named;
+    }
+
+    probe.opened = true;
+    return probe;
+}
+
+bool walk_source_tree(const std::filesystem::path& root,
+                      const std::function<void(const SourceEntry&)>& visit,
+                      std::error_code& error) {
+    error.clear();
+    struct Level {
+        HANDLE find = INVALID_HANDLE_VALUE;
+        std::filesystem::path directory;
+        Level() = default;
+        Level(Level&& other) noexcept
+            : find(std::exchange(other.find, INVALID_HANDLE_VALUE)),
+              directory(std::move(other.directory)) {}
+        Level& operator=(Level&&) = delete;
+        ~Level() {
+            if (find != INVALID_HANDLE_VALUE) FindClose(find);
+        }
+    };
+    // An explicit stack keeps a very deep tree off the thread's stack, and
+    // visiting a folder's contents before its next sibling gives the same
+    // pre-order as recursive_directory_iterator.
+    std::vector<Level> levels;
+    WIN32_FIND_DATAW data{};
+
+    // Opens `directory` and leaves its first entry in `data`. False means it is
+    // skipped (permission denied, as skip_permission_denied does) or failed.
+    const auto open_level = [&](const std::filesystem::path& directory) {
+        const std::filesystem::path pattern = directory / L"*";
+        const HANDLE find = FindFirstFileExW(pattern.c_str(), FindExInfoBasic, &data,
+                                             FindExSearchNameMatch, nullptr,
+                                             FIND_FIRST_EX_LARGE_FETCH);
+        if (find == INVALID_HANDLE_VALUE) {
+            const DWORD code = GetLastError();
+            if (code != ERROR_ACCESS_DENIED) {
+                error.assign(static_cast<int>(code), std::system_category());
+            }
+            return false;
+        }
+        Level level;
+        level.find = find;
+        level.directory = directory;
+        levels.push_back(std::move(level));
+        return true;
+    };
+
+    if (!open_level(root)) return !error;
+    bool have_entry = true;  // `data` holds an entry of levels.back() not yet visited
+    while (!levels.empty()) {
+        if (!have_entry) {
+            if (!FindNextFileW(levels.back().find, &data)) {
+                const DWORD code = GetLastError();
+                if (code != ERROR_NO_MORE_FILES) {
+                    error.assign(static_cast<int>(code), std::system_category());
+                    return false;
+                }
+                levels.pop_back();
+                continue;
+            }
+        }
+        have_entry = false;
+        if (wcscmp(data.cFileName, L".") == 0 || wcscmp(data.cFileName, L"..") == 0) {
+            continue;
+        }
+
+        const std::filesystem::path path = levels.back().directory / data.cFileName;
+        const DWORD attributes = data.dwFileAttributes;
+        SourceEntryKind kind;
+        std::optional<std::uint64_t> size;
+        if ((attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+            // dwReserved0 carries the reparse tag. Only a true symbolic link is
+            // a symlink to std::filesystem; a junction or any other tag is the
+            // opaque reparse point that is_reparse_point() reported before.
+            kind = data.dwReserved0 == IO_REPARSE_TAG_SYMLINK
+                ? SourceEntryKind::symlink
+                : SourceEntryKind::reparse_point;
+        } else if ((attributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+            kind = SourceEntryKind::directory;
+        } else {
+            kind = SourceEntryKind::regular_file;
+            size = (static_cast<std::uint64_t>(data.nFileSizeHigh) << 32) |
+                   data.nFileSizeLow;
+        }
+        visit(SourceEntry{path, kind, size});
+        if (kind == SourceEntryKind::directory) {
+            if (open_level(path)) {
+                have_entry = true;
+            } else if (error) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 #else
 
 namespace {
@@ -968,6 +1154,37 @@ bool restore_sparse_file([[maybe_unused]] const std::filesystem::path& path,
 #else
     return fail("this platform does not expose sparse-file allocation controls");
 #endif
+}
+
+SourceFileProbe probe_source_file(const std::filesystem::path&) {
+    return {};
+}
+
+bool walk_source_tree(const std::filesystem::path& root,
+                      const std::function<void(const SourceEntry&)>& visit,
+                      std::error_code& error) {
+    namespace fs = std::filesystem;
+    error.clear();
+    for (fs::recursive_directory_iterator it(root, fs::directory_options::skip_permission_denied,
+                                             error),
+         end;
+         it != end && !error; it.increment(error)) {
+        const auto& entry = *it;
+        std::error_code status_error;
+        const fs::file_status status = fs::symlink_status(entry.path(), status_error);
+        if (status_error) continue;
+        if (fs::is_symlink(status)) {
+            visit(SourceEntry{entry.path(), SourceEntryKind::symlink, std::nullopt});
+        } else if (is_reparse_point(entry.path())) {
+            visit(SourceEntry{entry.path(), SourceEntryKind::reparse_point, std::nullopt});
+            it.disable_recursion_pending();
+        } else if (fs::is_directory(status)) {
+            visit(SourceEntry{entry.path(), SourceEntryKind::directory, std::nullopt});
+        } else if (fs::is_regular_file(status)) {
+            visit(SourceEntry{entry.path(), SourceEntryKind::regular_file, std::nullopt});
+        }
+    }
+    return !error;
 }
 
 #endif

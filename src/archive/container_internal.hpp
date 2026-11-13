@@ -116,11 +116,16 @@ struct ScanItem {
     bool is_symlink = false;
     std::string symlink_target{};  // verbatim target when is_symlink
     bool is_reparse_point = false; // non-symlink redirecting filesystem object
+    // A regular file's size from the directory listing that found it, so the
+    // passes that total or match sizes need not ask the filesystem per file.
+    // Absent where the scan did not have it; scanned_size_of() then asks.
+    std::optional<std::uint64_t> scanned_size{};
 };
 
 void scan_input(const std::filesystem::path& input, std::vector<ScanItem>& items);
 void scan_input_at(const ArchiveInput& input, std::vector<ScanItem>& items,
                    const std::shared_ptr<OperationControl>& operation);
+std::optional<std::uint64_t> scanned_size_of(const ScanItem& item);
 std::uint64_t scanned_file_bytes(const std::vector<ScanItem>& items);
 bool open_input_with_retry(std::ifstream& input,
                            const std::filesystem::path& path,

@@ -2383,7 +2383,201 @@ void test_windows_security_descriptor_restore() {
     std::error_code error;
     fs::remove_all(root, error);
 }
+
+// The writer's single-handle probe must answer exactly what the separate path
+// queries it replaced answered, for every shape of regular file it meets.
+void test_source_probe_matches_path_queries() {
+    const auto root = make_temp_dir();
+    const auto plain = root / "plain.txt";
+    write_all(plain, bytes_from_string("plain file content"));
+
+    const auto readonly = root / "readonly.txt";
+    write_all(readonly, bytes_from_string("read-only content"));
+    AXIOM_CHECK(SetFileAttributesW(readonly.c_str(), FILE_ATTRIBUTE_READONLY) != FALSE);
+
+    const auto linked = root / "linked.txt";
+    const auto link = root / "link.txt";
+    write_all(linked, bytes_from_string("two names, one file"));
+    const bool hardlinked = CreateHardLinkW(link.c_str(), linked.c_str(), nullptr) != FALSE;
+
+    const auto streamed = root / "streamed.txt";
+    write_all(streamed, bytes_from_string("host"));
+    {
+        const std::wstring stream = streamed.wstring() + L":Zone.Identifier";
+        const HANDLE handle = CreateFileW(stream.c_str(), GENERIC_WRITE, 0, nullptr,
+                                          CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        AXIOM_CHECK(handle != INVALID_HANDLE_VALUE);
+        const char zone[] = "[ZoneTransfer]\r\nZoneId=3\r\n";
+        DWORD wrote = 0;
+        WriteFile(handle, zone, sizeof(zone) - 1, &wrote, nullptr);
+        CloseHandle(handle);
+    }
+
+    const auto sparse = root / "sparse.bin";
+    bool sparse_made = false;
+    {
+        const HANDLE handle = CreateFileW(sparse.c_str(), GENERIC_READ | GENERIC_WRITE, 0,
+                                          nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL,
+                                          nullptr);
+        AXIOM_CHECK(handle != INVALID_HANDLE_VALUE);
+        DWORD returned = 0;
+        sparse_made = DeviceIoControl(handle, FSCTL_SET_SPARSE, nullptr, 0, nullptr, 0,
+                                      &returned, nullptr) != FALSE;
+        LARGE_INTEGER end{};
+        end.QuadPart = 1 << 20;
+        SetFilePointerEx(handle, end, nullptr, FILE_BEGIN);
+        SetEndOfFile(handle);
+        CloseHandle(handle);
+    }
+
+    std::vector<fs::path> files{plain, readonly, linked, streamed, sparse};
+    if (hardlinked) files.push_back(link);
+    for (const auto& file : files) {
+        const auto probe = axiom::core::probe_source_file(file);
+        AXIOM_CHECK(probe.opened);
+        const auto meta = axiom::core::capture_metadata(file);
+        AXIOM_CHECK(probe.meta.has_windows_attributes == meta.has_windows_attributes);
+        AXIOM_CHECK(probe.meta.windows_attributes == meta.windows_attributes);
+        AXIOM_CHECK(probe.meta.has_windows_times == meta.has_windows_times);
+        AXIOM_CHECK(probe.meta.windows_creation_time == meta.windows_creation_time);
+        AXIOM_CHECK(probe.meta.windows_access_time == meta.windows_access_time);
+        AXIOM_CHECK(probe.meta.windows_write_time == meta.windows_write_time);
+        AXIOM_CHECK(probe.meta.has_windows_security_descriptor ==
+                    meta.has_windows_security_descriptor);
+        AXIOM_CHECK(probe.meta.windows_security_descriptor ==
+                    meta.windows_security_descriptor);
+        AXIOM_CHECK(probe.meta.has_reparse_data == meta.has_reparse_data);
+        AXIOM_CHECK(probe.meta.capture_warnings == meta.capture_warnings);
+
+        std::error_code error;
+        AXIOM_CHECK(probe.write_time == fs::last_write_time(file, error));
+        AXIOM_CHECK(!error);
+        AXIOM_CHECK(probe.size == fs::file_size(file, error));
+        AXIOM_CHECK(!error);
+
+        const auto identity = axiom::core::hardlink_identity(file);
+        AXIOM_CHECK(probe.hardlink.has_value() == identity.has_value());
+        if (probe.hardlink && identity) {
+            AXIOM_CHECK(probe.hardlink->volume == identity->volume);
+            AXIOM_CHECK(probe.hardlink->index_high == identity->index_high);
+            AXIOM_CHECK(probe.hardlink->index_low == identity->index_low);
+        }
+
+        // Skipping capture_ads is allowed only where it would find nothing.
+        if (!probe.named_streams) {
+            AXIOM_CHECK(axiom::core::capture_ads(file).empty());
+        }
+        // Skipping capture_sparse_file likewise.
+        if (!probe.sparse) {
+            const auto captured = axiom::core::capture_sparse_file(file, probe.size);
+            AXIOM_CHECK(!captured.map && captured.warning.empty());
+        }
+    }
+    AXIOM_CHECK(axiom::core::probe_source_file(streamed).named_streams);
+    AXIOM_CHECK(!axiom::core::probe_source_file(plain).named_streams);
+    if (sparse_made) AXIOM_CHECK(axiom::core::probe_source_file(sparse).sparse);
+    if (hardlinked) {
+        AXIOM_CHECK(axiom::core::probe_source_file(link).hardlink.has_value());
+    }
+
+    // Not a regular file: the probe declines and the caller asks by path.
+    AXIOM_CHECK(!axiom::core::probe_source_file(root).opened);
+    AXIOM_CHECK(!axiom::core::probe_source_file(root / "missing.txt").opened);
+
+    SetFileAttributesW(readonly.c_str(), FILE_ATTRIBUTE_NORMAL);
+    std::error_code error;
+    fs::remove_all(root, error);
+}
 #endif
+
+// The source walk reads kinds and sizes from the directory listing instead of
+// asking per path; it must still visit what recursive_directory_iterator with
+// per-path checks visited, in the same order, and descend into nothing that
+// redirects.
+void test_source_tree_walk() {
+    const auto root = make_temp_dir();
+    const auto tree = root / "tree";
+    fs::create_directories(tree / "a" / "b");
+    fs::create_directories(tree / "empty");
+    fs::create_directories(tree / "z");
+    write_all(tree / "top.txt", bytes_from_string("top"));
+    write_all(tree / "a" / "one.bin", std::vector<std::uint8_t>(1234, 7));
+    write_all(tree / "a" / "b" / "deep.txt", bytes_from_string("deep file"));
+    write_all(tree / "z" / "last.txt", bytes_from_string(""));
+    const auto outside = root / "outside";
+    fs::create_directories(outside);
+    write_all(outside / "hidden.txt", bytes_from_string("must not be walked"));
+    bool linked = false;
+#if defined(_WIN32)
+    const std::string command = "cmd /c mklink /J \"" + (tree / "junction").string() +
+                                "\" \"" + outside.string() + "\" >nul 2>&1";
+    linked = std::system(command.c_str()) == 0;
+#else
+    std::error_code link_error;
+    fs::create_directory_symlink(outside, tree / "dirlink", link_error);
+    linked = !link_error;
+#endif
+
+    using Kind = axiom::core::SourceEntryKind;
+    std::vector<std::pair<fs::path, Kind>> walked;
+    std::error_code error;
+    AXIOM_CHECK(axiom::core::walk_source_tree(
+        tree,
+        [&](const axiom::core::SourceEntry& entry) {
+            walked.emplace_back(entry.path, entry.kind);
+            if (entry.kind == Kind::regular_file && entry.size) {
+                AXIOM_CHECK(*entry.size == fs::file_size(entry.path));
+            }
+        },
+        error));
+    AXIOM_CHECK(!error);
+
+    // The classification the scanners made before, one path query at a time.
+    std::vector<std::pair<fs::path, Kind>> expected;
+    std::error_code iteration_error;
+    for (fs::recursive_directory_iterator it(
+             tree, fs::directory_options::skip_permission_denied, iteration_error),
+         end;
+         it != end && !iteration_error; it.increment(iteration_error)) {
+        std::error_code status_error;
+        const auto status = fs::symlink_status(it->path(), status_error);
+        if (status_error) continue;
+        if (fs::is_symlink(status)) {
+            expected.emplace_back(it->path(), Kind::symlink);
+        } else if (axiom::core::is_reparse_point(it->path())) {
+            expected.emplace_back(it->path(), Kind::reparse_point);
+            it.disable_recursion_pending();
+        } else if (fs::is_directory(status)) {
+            expected.emplace_back(it->path(), Kind::directory);
+        } else if (fs::is_regular_file(status)) {
+            expected.emplace_back(it->path(), Kind::regular_file);
+        }
+    }
+    AXIOM_CHECK(walked == expected);
+    AXIOM_CHECK(walked.size() == (linked ? 9u : 8u));
+    for (const auto& [path, kind] : walked) {
+        AXIOM_CHECK(path.filename() != "hidden.txt");
+    }
+
+    // A missing root fails the walk; an empty folder visits nothing.
+    walked.clear();
+    AXIOM_CHECK(!axiom::core::walk_source_tree(
+        root / "missing", [&](const axiom::core::SourceEntry&) {}, error));
+    AXIOM_CHECK(static_cast<bool>(error));
+    AXIOM_CHECK(axiom::core::walk_source_tree(
+        tree / "empty",
+        [&](const axiom::core::SourceEntry& entry) { walked.emplace_back(entry.path, entry.kind); },
+        error));
+    AXIOM_CHECK(walked.empty());
+
+    std::error_code cleanup;
+#if defined(_WIN32)
+    fs::remove(tree / "junction", cleanup);
+#else
+    fs::remove(tree / "dirlink", cleanup);
+#endif
+    fs::remove_all(root, cleanup);
+}
 
 #if defined(_WIN32)
 // Resolve System32's bsdtar explicitly. A bare "tar" picks up whichever tar is
@@ -8644,9 +8838,11 @@ constexpr RegisteredTest kTests[] = {
     {"zip_provider_layer", test_zip_provider_layer},
     {"zip_direct_split_creation", test_zip_direct_split_creation},
     {"safe_file_replacement", test_safe_file_replacement},
+    {"source_tree_walk", test_source_tree_walk},
 #if defined(_WIN32)
     {"skip_unreadable_archive_inputs", test_skip_unreadable_archive_inputs},
     {"windows_security_descriptor_restore", test_windows_security_descriptor_restore},
+    {"source_probe_matches_path_queries", test_source_probe_matches_path_queries},
     {"unicode_path_archive_probe", test_unicode_path_archive_probe},
     {"unicode_archive_entry_names", test_unicode_archive_entry_names},
     {"iso_native_listing_provider_layer", test_iso_native_listing_provider_layer},

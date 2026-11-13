@@ -1570,25 +1570,29 @@ void scan_input(const fs::path& input, std::vector<ScanItem>& items) {
         items.push_back({input, relative_path(input), true});
         // recursive_directory_iterator does not descend into symlinked dirs by
         // default, so recording the symlink here cannot cause an infinite walk.
-        for (fs::recursive_directory_iterator it(input, fs::directory_options::skip_permission_denied, ec), end;
-             it != end && !ec;
-             it.increment(ec)) {
-            const auto& entry = *it;
-            const fs::file_status entry_status = fs::symlink_status(entry.path(), ec);
-            if (ec) {
-                continue;
+        // The walk reports symlinks and other reparse points without descending
+        // into them, so recording one here cannot cause an infinite walk. As
+        // before, a walk that fails part-way keeps what it found.
+        std::error_code walk_error;
+        core::walk_source_tree(input, [&](const core::SourceEntry& entry) {
+            switch (entry.kind) {
+                case core::SourceEntryKind::symlink:
+                    items.push_back(symlink_item(entry.path));
+                    break;
+                case core::SourceEntryKind::reparse_point:
+                    items.push_back(reparse_item(entry.path));
+                    break;
+                case core::SourceEntryKind::directory:
+                    items.push_back({entry.path, relative_path(entry.path), true});
+                    break;
+                case core::SourceEntryKind::regular_file: {
+                    ScanItem item{entry.path, relative_path(entry.path), false};
+                    item.scanned_size = entry.size;
+                    items.push_back(std::move(item));
+                    break;
+                }
             }
-            if (fs::is_symlink(entry_status)) {
-                items.push_back(symlink_item(entry.path()));
-            } else if (core::is_reparse_point(entry.path())) {
-                items.push_back(reparse_item(entry.path()));
-                it.disable_recursion_pending();
-            } else if (fs::is_directory(entry_status)) {
-                items.push_back({entry.path(), relative_path(entry.path()), true});
-            } else if (fs::is_regular_file(entry_status)) {
-                items.push_back({entry.path(), relative_path(entry.path()), false});
-            }
-        }
+        }, walk_error);
         return;
     }
 
@@ -1654,33 +1658,33 @@ void scan_input_at(const ArchiveInput& input, std::vector<ScanItem>& items,
     items.push_back({input.source, destination, true});
     report_operation(operation, OperationStage::scanning, 0, 0,
                      items.size(), 0, destination);
-    for (fs::recursive_directory_iterator it(
-             input.source, fs::directory_options::skip_permission_denied, ec),
-         end;
-         it != end && !ec; it.increment(ec)) {
+    std::error_code walk_error;
+    core::walk_source_tree(input.source, [&](const core::SourceEntry& entry) {
         operation_checkpoint(operation);
-        const auto& entry = *it;
-        const fs::file_status entry_status = fs::symlink_status(entry.path(), ec);
-        if (ec) {
-            continue;
-        }
-        if (fs::is_symlink(entry_status)) {
-            add_symlink(entry.path());
-        } else if (core::is_reparse_point(entry.path())) {
-            add_reparse(entry.path());
-            it.disable_recursion_pending();
-        } else if (fs::is_directory(entry_status)) {
-            items.push_back({entry.path(), archive_path_for(entry.path()), true});
-        } else if (fs::is_regular_file(entry_status)) {
-            items.push_back({entry.path(), archive_path_for(entry.path()), false});
+        switch (entry.kind) {
+            case core::SourceEntryKind::symlink:
+                add_symlink(entry.path);
+                break;
+            case core::SourceEntryKind::reparse_point:
+                add_reparse(entry.path);
+                break;
+            case core::SourceEntryKind::directory:
+                items.push_back({entry.path, archive_path_for(entry.path), true});
+                break;
+            case core::SourceEntryKind::regular_file: {
+                ScanItem item{entry.path, archive_path_for(entry.path), false};
+                item.scanned_size = entry.size;
+                items.push_back(std::move(item));
+                break;
+            }
         }
         if ((items.size() & 255u) == 0) {
             report_operation(
                 operation, OperationStage::scanning, 0, 0, items.size(), 0,
-                core::path_to_utf8(entry.path()));
+                core::path_to_utf8(entry.path));
         }
-    }
-    if (ec) {
+    }, walk_error);
+    if (walk_error) {
         throw std::runtime_error("failed while scanning input: " +
                                  core::path_to_utf8(input.source));
     }
@@ -1775,17 +1779,21 @@ void validate_mapped_items(const std::vector<ScanItem>& items,
 
 }  // namespace
 
+std::optional<std::uint64_t> scanned_size_of(const ScanItem& item) {
+    if (item.scanned_size) return item.scanned_size;
+    std::error_code ec;
+    const auto size = fs::file_size(item.absolute, ec);
+    if (ec) return std::nullopt;
+    return static_cast<std::uint64_t>(size);
+}
+
 std::uint64_t scanned_file_bytes(const std::vector<ScanItem>& items) {
     std::uint64_t total = 0;
     for (const auto& item : items) {
         if (item.is_directory || item.is_reparse_point) {
             continue;
         }
-        std::error_code ec;
-        const auto size = fs::file_size(item.absolute, ec);
-        if (!ec) {
-            total += static_cast<std::uint64_t>(size);
-        }
+        if (const auto size = scanned_size_of(item)) total += *size;
     }
     return total;
 }
@@ -1963,11 +1971,10 @@ ArchiveReuseByPath prepare_reuse_by_path(
     std::uint64_t candidate_items = 0;
     for (const auto& item : items) {
         if (item.is_directory || item.is_symlink || item.is_reparse_point) continue;
-        std::error_code ec;
-        const auto size = fs::file_size(item.absolute, ec);
-        if (!ec && candidate_sizes.contains(static_cast<std::uint64_t>(size))) {
+        const auto size = scanned_size_of(item);
+        if (size && candidate_sizes.contains(*size)) {
             ++candidate_items;
-            candidate_total += static_cast<std::uint64_t>(size);
+            candidate_total += *size;
         }
     }
     if (candidate_items == 0) return reuse;
@@ -1979,9 +1986,8 @@ ArchiveReuseByPath prepare_reuse_by_path(
     for (const auto& item : items) {
         operation_checkpoint(operation);
         if (item.is_directory || item.is_symlink || item.is_reparse_point) continue;
-        std::error_code ec;
-        const auto size = fs::file_size(item.absolute, ec);
-        if (ec || !candidate_sizes.contains(static_cast<std::uint64_t>(size))) continue;
+        const auto size = scanned_size_of(item);
+        if (!size || !candidate_sizes.contains(*size)) continue;
 
         const auto hashed = try_hash_input_for_reuse(item, options, operation);
         if (!hashed) continue;
@@ -5385,7 +5391,16 @@ void compress_items_into(Output& out, std::uint64_t& written,
 
         EntryRec entry;
         entry.path = item.archive_path;
-        entry.meta = core::capture_metadata(item.absolute);
+        // One handle answers the metadata, time, size, hard-link and stream
+        // questions for a regular file; asked one by one by path they cost
+        // seven lookups per file. The path-based queries remain the fallback,
+        // and the only route for directories, links and reparse points.
+        core::SourceFileProbe source_probe;
+        if (!item.is_directory && !item.is_symlink && !item.is_reparse_point) {
+            source_probe = core::probe_source_file(item.absolute);
+        }
+        entry.meta = source_probe.opened ? std::move(source_probe.meta)
+                                         : core::capture_metadata(item.absolute);
         for (const auto& message : entry.meta.capture_warnings) {
             record_capture_warning({item.archive_path, message});
         }
@@ -5425,7 +5440,8 @@ void compress_items_into(Output& out, std::uint64_t& written,
         std::error_code ec;
         std::int64_t source_stamp = 0;
         bool source_stamp_valid = false;
-        const auto stamp = fs::last_write_time(item.absolute, ec);
+        const auto stamp = source_probe.opened ? source_probe.write_time
+                                               : fs::last_write_time(item.absolute, ec);
         if (!ec) {
             source_stamp =
                 static_cast<std::int64_t>(stamp.time_since_epoch().count());
@@ -5477,7 +5493,8 @@ void compress_items_into(Output& out, std::uint64_t& written,
 
         // A regular file that shares its identity with one already stored is a hard
         // link: record a reference to the first path instead of duplicating bytes.
-        if (auto id = core::hardlink_identity(item.absolute)) {
+        if (auto id = source_probe.opened ? source_probe.hardlink
+                                          : core::hardlink_identity(item.absolute)) {
             const auto identity = std::make_tuple(id->volume, id->index_high, id->index_low);
             const auto found = hardlinks.find(identity);
             if (found != hardlinks.end()) {
@@ -5498,7 +5515,9 @@ void compress_items_into(Output& out, std::uint64_t& written,
         }
 
         std::error_code size_error;
-        std::uint64_t file_total = fs::file_size(item.absolute, size_error);
+        std::uint64_t file_total = source_probe.opened
+            ? source_probe.size
+            : static_cast<std::uint64_t>(fs::file_size(item.absolute, size_error));
         if (size_error) {
             file_total = 0;
         }
@@ -5583,7 +5602,8 @@ void compress_items_into(Output& out, std::uint64_t& written,
             entry.has_blake3 = true;
             entry.first_block = reuse_candidate->data.first_block;
             entry.offset = reuse_candidate->data.offset;
-            if (options.preserve_sparse_files && file_total != 0) {
+            if (options.preserve_sparse_files && file_total != 0 &&
+                (!source_probe.opened || source_probe.sparse)) {
                 const auto sparse_capture =
                     core::capture_sparse_file(item.absolute, file_total);
                 if (sparse_capture.map) {
@@ -5602,7 +5622,9 @@ void compress_items_into(Output& out, std::uint64_t& written,
                     }
                 }
             }
-            entry.ads = core::capture_ads(item.absolute);
+            if (!source_probe.opened || source_probe.named_streams) {
+                entry.ads = core::capture_ads(item.absolute);
+            }
             entries.push_back(std::move(entry));
             reused_items.fetch_add(1, std::memory_order_relaxed);
             reused_bytes.fetch_add(file_total, std::memory_order_relaxed);
@@ -5628,7 +5650,8 @@ void compress_items_into(Output& out, std::uint64_t& written,
         std::uint64_t total = 0;
         codec::TransformHint transform_hint;
         bool transform_classified = false;
-        if (options.preserve_sparse_files && file_total != 0) {
+        if (options.preserve_sparse_files && file_total != 0 &&
+            (!source_probe.opened || source_probe.sparse)) {
             const auto sparse_capture =
                 core::capture_sparse_file(item.absolute, file_total);
             if (sparse_capture.map) {
@@ -5779,7 +5802,9 @@ void compress_items_into(Output& out, std::uint64_t& written,
         entry.crc = spooled_identity ? spooled_identity->crc : core::crc32_final(crc);
         entry.blake3 = spooled_identity ? spooled_identity->blake3 : hasher.finalize();
         entry.has_blake3 = true;
-        entry.ads = core::capture_ads(item.absolute);  // NTFS named streams (Win32 only)
+        if (!source_probe.opened || source_probe.named_streams) {
+            entry.ads = core::capture_ads(item.absolute);  // NTFS named streams (Win32 only)
+        }
         batch_reuse_candidates.emplace(
             content_identity(entry),
             ArchiveDataReference{entry.first_block, entry.offset});
@@ -7278,7 +7303,14 @@ void append_items_to_archive_indexed(
                 continue;
             }
 
-            const auto metadata = core::capture_metadata(item.absolute);
+            // The same single-handle probe the writer uses, for the same reason.
+            core::SourceFileProbe source_probe;
+            if (!item.is_directory && !item.is_symlink) {
+                source_probe = core::probe_source_file(item.absolute);
+            }
+            const auto metadata = source_probe.opened
+                ? std::move(source_probe.meta)
+                : core::capture_metadata(item.absolute);
             if (probe_capture && !metadata.capture_warnings.empty()) {
                 predicted_capture_report = true;
             }
@@ -7292,8 +7324,11 @@ void append_items_to_archive_indexed(
                 !options.preserve_sparse_files) {
                 continue;
             }
+            if (source_probe.opened && !source_probe.sparse) continue;
             std::error_code size_error;
-            const auto file_size = fs::file_size(item.absolute, size_error);
+            const auto file_size = source_probe.opened
+                ? source_probe.size
+                : static_cast<std::uint64_t>(fs::file_size(item.absolute, size_error));
             if (size_error || file_size == 0) continue;
             const auto sparse = core::capture_sparse_file(item.absolute, file_size);
             if (sparse.map) {
@@ -8076,7 +8111,16 @@ std::vector<EntryRec> build_chunked_entries(
         operation_checkpoint(operation);
         EntryRec entry;
         entry.path = normalize_archive_path(item.archive_path, "snapshot archive path");
-        entry.meta = core::capture_metadata(item.absolute);
+        // One handle answers the metadata, time, size, hard-link and stream
+        // questions for a regular file; asked one by one by path they cost
+        // seven lookups per file. The path-based queries remain the fallback,
+        // and the only route for directories, links and reparse points.
+        core::SourceFileProbe source_probe;
+        if (!item.is_directory && !item.is_symlink && !item.is_reparse_point) {
+            source_probe = core::probe_source_file(item.absolute);
+        }
+        entry.meta = source_probe.opened ? std::move(source_probe.meta)
+                                         : core::capture_metadata(item.absolute);
         for (const auto& message : entry.meta.capture_warnings) {
             record_capture_warning({item.archive_path, message});
         }
@@ -8099,7 +8143,8 @@ std::vector<EntryRec> build_chunked_entries(
             continue;
         }
         std::error_code stamp_error;
-        const auto stamp = fs::last_write_time(item.absolute, stamp_error);
+        const auto stamp = source_probe.opened ? source_probe.write_time
+                                               : fs::last_write_time(item.absolute, stamp_error);
         if (!stamp_error) {
             try {
                 entry.mtime = to_unix_seconds(stamp);
@@ -8129,7 +8174,8 @@ std::vector<EntryRec> build_chunked_entries(
         }
         probe.close();
 
-        if (auto id = core::hardlink_identity(item.absolute)) {
+        if (auto id = source_probe.opened ? source_probe.hardlink
+                                          : core::hardlink_identity(item.absolute)) {
             const auto identity = std::make_tuple(id->volume, id->index_high, id->index_low);
             const auto found = hardlinks.find(identity);
             if (found != hardlinks.end()) {
@@ -8145,7 +8191,9 @@ std::vector<EntryRec> build_chunked_entries(
         }
 
         std::error_code size_error;
-        const auto declared_size = fs::file_size(item.absolute, size_error);
+        const auto declared_size = source_probe.opened
+            ? source_probe.size
+            : static_cast<std::uint64_t>(fs::file_size(item.absolute, size_error));
         if (size_error) {
             throw std::runtime_error("cannot stat input file: " +
                                      core::path_to_utf8(item.absolute));
@@ -8154,7 +8202,8 @@ std::vector<EntryRec> build_chunked_entries(
         auto crc = core::crc32_init();
         core::Blake3 hasher;
         std::uint64_t total = 0;
-        if (options.preserve_sparse_files && declared_size != 0) {
+        if (options.preserve_sparse_files && declared_size != 0 &&
+            (!source_probe.opened || source_probe.sparse)) {
             const auto sparse_capture = core::capture_sparse_file(item.absolute, declared_size);
             if (sparse_capture.map) {
                 entry.sparse = std::move(*sparse_capture.map);
@@ -8218,7 +8267,9 @@ std::vector<EntryRec> build_chunked_entries(
         entry.crc = core::crc32_final(crc);
         entry.blake3 = hasher.finalize();
         entry.has_blake3 = true;
-        entry.ads = core::capture_ads(item.absolute);
+        if (!source_probe.opened || source_probe.named_streams) {
+            entry.ads = core::capture_ads(item.absolute);
+        }
         entries.push_back(std::move(entry));
         ++completed_items;
         report_operation(operation, OperationStage::writing, completed_bytes, total_bytes,
@@ -9236,9 +9287,10 @@ void add_archive_snapshot(
         fs::resize_file(archive_path, previous_end, error);
         throw;
     }
-    report_operation(operation, OperationStage::finalizing, scanned_file_bytes(items),
-                     scanned_file_bytes(items), items.size(), items.size(), {}, 0, 0,
-                     scanned_file_bytes(items),
+    const auto finalized_bytes = scanned_file_bytes(items);
+    report_operation(operation, OperationStage::finalizing, finalized_bytes,
+                     finalized_bytes, items.size(), items.size(), {}, 0, 0,
+                     finalized_bytes,
                      static_cast<std::uint64_t>(fs::file_size(archive_path)),
                      scanned_file_bytes(items), reuse_stats.reused_items,
                      reuse_stats.reused_bytes);

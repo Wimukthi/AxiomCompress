@@ -2,9 +2,11 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <vector>
 
 namespace axiom::core {
@@ -147,6 +149,51 @@ struct FileMetadata {
 // recoverable query failures are returned as capture_warnings so callers can show
 // them or enforce strict metadata mode.
 FileMetadata capture_metadata(const std::filesystem::path& path);
+
+// What the archive writer asks about one regular source file, answered through
+// a single open handle. Asked one by one, by path, these took seven filesystem
+// lookups per file, which dominated archiving many small files. `opened` is
+// false when the probe does not apply (a platform without it, a file that cannot
+// be opened this way, or one that turns out to be a directory or reparse point);
+// the caller then asks the individual path-based questions, which keep their
+// own warnings.
+struct SourceFileProbe {
+    bool opened = false;
+    FileMetadata meta;  // what capture_metadata(path) returns
+    std::filesystem::file_time_type write_time{};  // as fs::last_write_time(path)
+    std::uint64_t size = 0;                        // as fs::file_size(path)
+    std::optional<FileId> hardlink;                // as hardlink_identity(path)
+    bool sparse = false;         // marked sparse, so capture_sparse_file has work
+    bool named_streams = true;   // false only when the stream list was read and
+                                 // holds nothing but the file's own data
+};
+
+SourceFileProbe probe_source_file(const std::filesystem::path& path);
+
+enum class SourceEntryKind {
+    symlink,
+    reparse_point,  // any other redirecting object; never descended into
+    directory,
+    regular_file,
+};
+
+struct SourceEntry {
+    const std::filesystem::path& path;
+    SourceEntryKind kind;
+    std::optional<std::uint64_t> size;  // for a regular file, when the listing had it
+};
+
+// Visit every descendant of the directory `root`, depth first in directory
+// order, as recursive_directory_iterator with skip_permission_denied would: a
+// folder that cannot be opened for lack of permission is skipped, symlinks and
+// other reparse points are reported but never descended into, and anything
+// that is none of the four kinds is left out. On Windows the kind and size come
+// from the directory listing itself; asking per path cost two lookups per entry.
+// Returns false with `error` set when enumeration fails for another reason; the
+// entries visited before the failure stand. `visit` may throw.
+bool walk_source_tree(const std::filesystem::path& root,
+                      const std::function<void(const SourceEntry&)>& visit,
+                      std::error_code& error);
 
 // Reapply metadata to an extracted path, best-effort. Attributes are always
 // restored when present; timestamps are restored only when `restore_times` is set.
