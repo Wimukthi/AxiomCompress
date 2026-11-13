@@ -11,10 +11,10 @@ with it and retain their own licenses.
 | [Wimukthi.Win32Theme](#wimukthiwin32theme) | pinned commit | MIT | Native Windows theme integration |
 | [Darkmodelib](#darkmodelib) | 0.75.0 | MPL-2.0, with MIT parts | Dark mode, via the theme framework |
 | [Zstandard](#zstandard) | 1.5.7 | BSD-3-Clause | Optional AXAR Zstandard block codec |
-| [LZMA SDK](#lzma-sdk) | 26.02 | Public domain | Optional AXAR LZMA2 block codec |
+| [LZMA SDK](#lzma-sdk) | 26.06 | Public domain | Optional AXAR LZMA2 block codec |
 | [miniz](#miniz) | 3.1.2 | MIT | Raw Deflate/Inflate for ZIP and AXAR |
 | [minizip-ng](#minizip-ng) | 4.2.2 | zlib | Unified ordinary, split, and SFX ZIP container core |
-| [7-Zip engine](#7-zip-engine) | 26.02 | LGPL-2.1+, BSD parts, unRAR restriction | Read-only 7z/RAR/ISO/CAB support |
+| [7-Zip engine](#7-zip-engine) | 26.06 | LGPL-2.1+, BSD parts, unRAR restriction | Read-only 7z/RAR/ISO/CAB support |
 | [Monocypher](#monocypher) | 4.0.3 | BSD-2-Clause / CC0-1.0 | Argon2id, XChaCha20-Poly1305, EdDSA |
 | [BLAKE3](#blake3) | 1.8.5 | CC0-1.0 or Apache-2.0 | Content hashing and integrity |
 | [Fluent UI System Icons](#fluent-ui-system-icons) | icon subset | MIT | GUI toolbar icons |
@@ -96,7 +96,7 @@ Axiom loads the 64-bit 7-Zip engine DLL directly, so read-only support for 7z,
 RAR/RAR5, ISO/UDF, and CAB works on Windows without launching a console helper
 or requiring 7-Zip to be installed.
 
-- Version: 26.02, pinned in `dependencies.lock.json`
+- Version: 26.06, pinned in `dependencies.lock.json`
 - Shipped: `backends/7zip/7z.dll`, `License.txt`, `readme.txt`
 - Copyright © 1999-2026 Igor Pavlov
 - Mainly GNU LGPL, with BSD-licensed parts and the upstream **unRAR

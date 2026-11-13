@@ -14,6 +14,15 @@ Entries are condensed from the
 
 ## [Unreleased]
 
+### Security
+
+- The bundled 7-Zip engine, which reads 7z, RAR, ISO and CAB archives, is
+  7-Zip 26.06 (was 26.02). Releases 26.03 to 26.06 each fix bugs and
+  vulnerabilities, including the archive parsers this engine runs on archives
+  you open. The LZMA SDK sources behind the AXAR LZMA2 method move to 26.06 as
+  well; their changes are refactors and compiler support, and encoded output
+  is unchanged.
+
 ### Fixed
 
 - Extracting on Windows without elevation restores each file's access list

@@ -27,12 +27,12 @@
     },
     "lzma-sdk": {
       "repository": "https://github.com/ip7z/7zip.git",
-      "version": "26.02",
-      "commit": "f9d78aff31a5f2521ae7ddbdc97c4a8855808959",
+      "version": "26.06",
+      "commit": "d3296e39e1f1f92c7b41c0c3848e65640428d42d",
       "path": "src/third_party/lzma-sdk",
-      "profile": "LZMA SDK C sources from the 7-Zip 26.02 release",
+      "profile": "LZMA SDK C sources from the 7-Zip 26.06 release",
       "artifacts": {
-        "LICENSE.txt": "31D4008125D2916A561B34C2652C07AE99128785CCAD1C8FA83F675584178083"
+        "LICENSE.txt": "13113581A2DF6DC7A17417CE0080EB2857C1B6874C949165DBB0D1E2FFF50617"
       },
       "local_patches": [
         "Built single-threaded inside each Axiom block."
@@ -98,16 +98,16 @@
     },
     "7zip-engine": {
       "repository": "https://github.com/ip7z/7zip.git",
-      "version": "26.02",
-      "commit": "f9d78aff31a5f2521ae7ddbdc97c4a8855808959",
+      "version": "26.06",
+      "commit": "d3296e39e1f1f92c7b41c0c3848e65640428d42d",
       "path": "third_party/7zip/win-x64",
       "release_asset": {
-        "url": "https://github.com/ip7z/7zip/releases/download/26.02/7z2602-x64.exe",
-        "sha256": "6745FA76DC2EA031596D8678F6F6B99C3C1B435B4164A63485ADBBC7B8D82EF0"
+        "url": "https://github.com/ip7z/7zip/releases/download/26.06/7z2606-x64.exe",
+        "sha256": "9B697F65ECC2D9B0152F5EE96D72DDE522A7827690349D9307935DACF40F42EC"
       },
       "artifacts": {
-        "7z.dll": "69FD4DF057985C40E510E2FAC182881C7F85E90AA13EC703F763A8FDB2CE61F8",
-        "7z.exe": "83967F1B02B43C4EFEDA302795722C809E0E81B8307DE73558D10484D5676A7D"
+        "7z.dll": "500DB9EB17F3C21B729BA41DD02ECFE1823DA05028C7E4BA129084CC74CC364E",
+        "7z.exe": "DC0493429FE28136FCB177A0E77C9875CBB3B0BFF5F2F8EEBA4DF302E98CEF76"
       },
       "local_patches": []
     },
