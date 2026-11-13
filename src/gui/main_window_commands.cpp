@@ -298,7 +298,7 @@ void MainWindow::update_filter_popup_summary() {
             [](const BrowserItem& item) { return !item.is_parent(); }));
     };
     const std::size_t visible = count_items(browser_items_);
-    const std::size_t complete = count_items(browser_all_items_);
+    const std::size_t complete = count_items(all_browser_items());
     std::wstring summary;
     if (browser_filter_.empty()) {
         summary = L"Type to filter • wildcards, quotes, -exclude, and fields supported";

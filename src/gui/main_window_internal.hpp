@@ -1500,8 +1500,19 @@ private:
     std::vector<axiom::gui::BrowserItem> browser_items_;
 
     // The table vector is a filtered projection. Keeping the complete snapshot
-    // separate avoids filesystem/archive reloads while the user types.
+    // separate avoids filesystem/archive reloads while the user types. With no
+    // filter the projection is everything, so the snapshot is moved into
+    // browser_items_ instead of copied (a copy of every item, strings and all,
+    // on the UI thread for each load and sort) and browser_all_items_ stays
+    // empty; all_browser_items() names whichever vector holds the snapshot.
     std::vector<axiom::gui::BrowserItem> browser_all_items_;
+    bool browser_items_hold_all_ = false;
+    std::vector<axiom::gui::BrowserItem>& all_browser_items() {
+        return browser_items_hold_all_ ? browser_items_ : browser_all_items_;
+    }
+    const std::vector<axiom::gui::BrowserItem>& all_browser_items() const {
+        return browser_items_hold_all_ ? browser_items_ : browser_all_items_;
+    }
 
     std::wstring browser_filter_;
 

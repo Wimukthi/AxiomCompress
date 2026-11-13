@@ -764,7 +764,7 @@ void MainWindow::update_browser_status(const std::vector<int>* selected_indices)
     }
     if (!browser_filter_.empty()) {
         const std::size_t complete_count = static_cast<std::size_t>(std::count_if(
-            browser_all_items_.begin(), browser_all_items_.end(),
+            all_browser_items().begin(), all_browser_items().end(),
             [](const BrowserItem& item) { return !item.is_parent(); }));
         text += L" | Filtered ";
         text += std::to_wstring(browser_status_totals_.items);
@@ -977,6 +977,7 @@ void MainWindow::navigate_to(axiom::gui::BrowserLocation location, bool record_h
     table_.clear();
     browser_items_.clear();
     browser_all_items_.clear();
+    browser_items_hold_all_ = false;
     set_status(L"Loading " + location.display_name() + L"...");
 
     const std::uint64_t generation = ++browser_generation_;
@@ -1040,7 +1041,8 @@ void MainWindow::sort_browser_items_for_table() {
             item.kind == axiom::gui::BrowserItemKind::directory) return 1;
         return 2;
     };
-    std::stable_sort(browser_all_items_.begin(), browser_all_items_.end(),
+    auto& all_items = all_browser_items();
+    std::stable_sort(all_items.begin(), all_items.end(),
                      [&](const auto& left, const auto& right) {
         if (rank(left) != rank(right)) return rank(left) < rank(right);
         int comparison = 0;
@@ -1065,11 +1067,22 @@ std::vector<fs::path> MainWindow::selected_filesystem_archives() const {
 }
 
 void MainWindow::rebuild_filtered_browser_items() {
-    browser_items_.clear();
-    browser_items_.reserve(browser_all_items_.size());
-    for (const BrowserItem& item : browser_all_items_) {
-        if (browser_item_matches_filter(item, browser_filter_)) {
-            browser_items_.push_back(item);
+    if (browser_filter_.empty()) {
+        if (!browser_items_hold_all_) {
+            browser_items_ = std::move(browser_all_items_);
+            browser_all_items_.clear();
+            browser_items_hold_all_ = true;
+        }
+    } else {
+        if (browser_items_hold_all_) {
+            browser_all_items_ = std::move(browser_items_);
+            browser_items_hold_all_ = false;
+        }
+        browser_items_.clear();
+        for (const BrowserItem& item : browser_all_items_) {
+            if (browser_item_matches_filter(item, browser_filter_)) {
+                browser_items_.push_back(item);
+            }
         }
     }
     browser_status_totals_ = {};
@@ -1312,6 +1325,8 @@ void MainWindow::on_browser_loaded(LPARAM lparam) {
 
     if (result->archive_catalog) archive_catalog_ = std::move(result->archive_catalog);
     browser_all_items_ = std::move(result->snapshot.items);
+    browser_items_.clear();
+    browser_items_hold_all_ = false;
     if (!application_options_.show_parent_entry) {
         std::erase_if(browser_all_items_, [](const auto& item) { return item.is_parent(); });
     }
