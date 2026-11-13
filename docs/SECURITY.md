@@ -66,12 +66,21 @@ extraction would refuse, and warns about a path that more than one entry uses.
 These are gaps in what Axiom does on Windows, or behaviour that its tests
 cover only where noted.
 
-- **The Mark of the Web isn't passed on.** Windows marks a file you download as
-  coming from the internet, which SmartScreen and Office's Protected View read.
-  Axiom stores and restores the alternate data streams of the files it archives,
-  so a file that carried the mark when it was archived carries it again. It does
-  not copy the mark of the archive itself onto the files it extracts from it.
-  Some other tools, including Windows Explorer's built-in ZIP extraction, do.
+- **The Mark of the Web is passed on, unless you turn it off.** Windows marks a
+  file you download as coming from the internet, which SmartScreen and Office's
+  Protected View read. When the archive itself carries that mark (zone 3,
+  Internet, or 4, Restricted), every file extracted from it gets the same mark,
+  as Windows Explorer's built-in ZIP extraction does: AXAR, ZIP, 7z, RAR, ISO,
+  CAB and TAR, the self-extractor, and files opened or dragged out of an archive
+  in the file manager. The copied mark keeps only `ZoneId`, `ReferrerUrl` and
+  `HostUrl`, and writing it does not move the restored timestamps. Under a
+  marked archive a file's own stored `Zone.Identifier` is never restored over
+  the archive's mark, so an archive cannot pass its contents off as local.
+  `--mark-of-the-web risky` (or **Mark programs, scripts and documents** in
+  Settings) limits the mark to programs, scripts, shortcuts, Office and PDF
+  documents, disk images and archives; `off` turns it off. An archive with no
+  mark, or one from the local machine, the intranet or a trusted site, adds
+  nothing.
 - **Links and junctions are restored as stored.** Like any archiver, Axiom
   recreates the symbolic links and junctions an archive holds, and they can
   point anywhere. Extraction never writes through them, but you can open a file

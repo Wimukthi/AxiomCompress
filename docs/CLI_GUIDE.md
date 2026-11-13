@@ -402,7 +402,20 @@ The default is 4 GiB, the largest block a standard archive can hold. A refused
 archive can still be listed and extracted with a larger limit.
 
 Extract into a new, empty folder, run `test` first (it reports repeated paths
-and refuses unsafe ones), and leave `--restore-privileged` off. Key derivation
+and refuses unsafe ones), and leave `--restore-privileged` off.
+
+On Windows, files extracted from a downloaded archive get the archive's Mark of
+the Web, so SmartScreen and Office's Protected View still check them. Choose
+which files with `--mark-of-the-web` on `x` and `snapshot restore`:
+
+```powershell
+axiomc x download.zip unpacked                           # every file (default)
+axiomc x --mark-of-the-web risky download.zip unpacked   # programs, scripts, documents
+axiomc x --mark-of-the-web off backup.axar restored      # none
+```
+
+An archive with no mark, or a local, intranet or trusted-site one, adds
+nothing. Key derivation
 for password-protected archives is bounded by the format regardless: a header
 that asks for more than about six seconds of work per derivation is refused
 before any of it is done. [SECURITY.md](SECURITY.md) lists what extraction

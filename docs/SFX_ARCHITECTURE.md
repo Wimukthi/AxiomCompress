@@ -395,6 +395,10 @@ already provides.
   a default.
 - **Signature verification stays mandatory.** A payload carrying an invalid
   signature refuses to extract.
+- **A downloaded extractor passes its Mark of the Web on.** When the `.exe`
+  carries an Internet or Restricted zone mark, every file it extracts gets the
+  same mark, as with any other Axiom extraction, so SmartScreen and Protected
+  View still check what it unpacks.
 - **Input is bounded before it reaches the extractor.** PE geometry, descriptor
   version, flags, and reserved fields, descriptor ranges, config size, TLV
   lengths, duplicate tags, enum and boolean values, UTF-8 validity, worker

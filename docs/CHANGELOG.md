@@ -39,6 +39,16 @@ Entries are condensed from the
 
 ### Security
 
+- Files extracted from a downloaded archive now carry its Mark of the Web, as
+  Windows Explorer's own ZIP extraction does, so SmartScreen, Office Protected
+  View and attachment warnings still check them. When the archive's
+  `Zone.Identifier` puts it in the Internet or Restricted zone, AXAR, ZIP, 7z,
+  RAR, ISO, CAB and TAR extraction, the self-extractor, and files opened or
+  dragged out of an archive in the file manager all write the same mark, reduced
+  to `ZoneId`, `ReferrerUrl` and `HostUrl`, without moving restored timestamps.
+  A file's own stored mark is never restored over the archive's. Choose every
+  file (the default), only risky types, or none with `--mark-of-the-web
+  all|risky|off` or **Settings > Security > Downloaded archives**.
 - The bundled 7-Zip engine, which reads 7z, RAR, ISO and CAB archives, is
   7-Zip 26.06 (was 26.02). Releases 26.03 to 26.06 each fix bugs and
   vulnerabilities, including the archive parsers this engine runs on archives
@@ -48,6 +58,10 @@ Entries are condensed from the
 
 ### Fixed
 
+- Restored Unix timestamps on Windows are exact. They went through the gap
+  between two clocks' current times, which moved ZIP and seconds-only times by
+  up to 100 ns from run to run and could round a stored time to the wrong
+  second.
 - Extracting on Windows without elevation restores each file's access list
   again, and no longer warns "security descriptor could not be restored (error
   5)" for every file. The owner, group, and access list were set in one call,

@@ -1049,6 +1049,12 @@ open. Enable default signature verification before extraction and choose a
 trusted-keys folder containing Axiom public keys. The verification result
 distinguishes a valid signature from a signer trusted by that folder.
 
+**Downloaded archives** decides which extracted files get the Mark of the Web
+of an archive you downloaded: **Mark every extracted file** (the default, as
+Windows Explorer does), **Mark programs, scripts and documents**, or **Do not
+mark**. It applies to every extraction, including files you open or drag out
+of an archive, so SmartScreen and Office's Protected View still check them.
+
 **Wipe temporary files extracted from encrypted archives** overwrites their
 temporary plaintext before deleting it. It controls temporary-file cleanup, not
 the ordinary files you deliberately extract to a destination. Passwords are
