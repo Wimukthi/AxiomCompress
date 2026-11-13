@@ -327,6 +327,8 @@ void draw_solid_line(HDC dc, int x1, int y1, int x2, int y2, COLORREF color);
 std::wstring folded_text(std::wstring_view text);
 bool starts_with_folded(std::wstring_view text, std::wstring_view prefix);
 bool contains_folded(std::wstring_view text, std::wstring_view needle);
+// Orders like comparing folded_text() results, without allocating them.
+int compare_folded(std::wstring_view left, std::wstring_view right);
 class PaintBuffer {
 public:
     ~PaintBuffer() {

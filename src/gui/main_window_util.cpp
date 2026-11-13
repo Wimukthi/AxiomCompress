@@ -621,14 +621,42 @@ std::transform(result.begin(), result.end(), result.begin(),
 return result;
 }
 
+namespace {
+
+wchar_t fold_char(wchar_t value) {
+return static_cast<wchar_t>(std::towlower(value));
+}
+
+}  // namespace
+
+// These run per row on every type-ahead keystroke and filter pass, so they fold
+// one character at a time instead of allocating folded copies of both strings.
 bool starts_with_folded(std::wstring_view text, std::wstring_view prefix) {
 if (prefix.size() > text.size()) return false;
-return folded_text(text.substr(0, prefix.size())) == folded_text(prefix);
+for (std::size_t index = 0; index < prefix.size(); ++index) {
+    if (fold_char(text[index]) != fold_char(prefix[index])) return false;
+}
+return true;
 }
 
 bool contains_folded(std::wstring_view text, std::wstring_view needle) {
 if (needle.empty()) return true;
-return folded_text(text).find(folded_text(needle)) != std::wstring::npos;
+if (needle.size() > text.size()) return false;
+for (std::size_t start = 0; start + needle.size() <= text.size(); ++start) {
+    if (starts_with_folded(text.substr(start), needle)) return true;
+}
+return false;
+}
+
+int compare_folded(std::wstring_view left, std::wstring_view right) {
+const std::size_t common = std::min(left.size(), right.size());
+for (std::size_t index = 0; index < common; ++index) {
+    const wchar_t a = fold_char(left[index]);
+    const wchar_t b = fold_char(right[index]);
+    if (a != b) return a < b ? -1 : 1;
+}
+if (left.size() == right.size()) return 0;
+return left.size() < right.size() ? -1 : 1;
 }
 
 }  // namespace axiom::gui

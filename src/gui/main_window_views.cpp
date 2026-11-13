@@ -771,12 +771,14 @@ int DarkTableView::find_typeahead_match(std::wstring_view needle, bool cycle) co
         return row;
     }
 
-    const std::wstring folded_needle = folded_text(needle);
+    // Nearest name at or after the needle. Row names stay alive for the scan, so
+    // compare folded views rather than allocating a folded copy of every row.
     int best = -1;
-    std::wstring best_text;
+    std::wstring_view best_text;
     for (int row = 0; row < count; ++row) {
-        const std::wstring text = folded_text(row_match_text(row));
-        if (text >= folded_needle && (best < 0 || text < best_text)) {
+        const std::wstring_view text = row_match_text(row);
+        if (compare_folded(text, needle) >= 0 &&
+            (best < 0 || compare_folded(text, best_text) < 0)) {
             best = row;
             best_text = text;
         }
@@ -928,20 +930,29 @@ void DarkTableView::update_marquee_selection(POINT point) {
     std::vector<bool> next = marquee_base_selection_;
     int first_selected = -1;
     int last_selected = -1;
-    if (visible) {
-        for (std::size_t row = 0; row < count; ++row) {
-            const int row_index = static_cast<int>(row);
-            const int top =
-                header_height() + row_index * row_height() - scroll_y_;
-            const RECT row_rect{rows_area.left, top, rows_area.right, top + row_height()};
-            RECT overlap{};
-            if (IntersectRect(&overlap, &row_rect, &clipped)) {
-                next[row] = !marquee_base_selection_[row];
-                if (next[row]) {
+    const int row_h = row_height();
+    if (visible && row_h > 0 && count > 0) {
+        // Rows are a uniform stack, so the rows under the marquee are a range
+        // that follows from its top and bottom; scanning every row on each mouse
+        // move made dragging over a large folder lag. A row overlaps when its
+        // content-space span [row * h, row * h + h) meets [top, bottom).
+        const std::int64_t content_top =
+            static_cast<std::int64_t>(clipped.top) - header_height() + scroll_y_;
+        const std::int64_t content_bottom =
+            static_cast<std::int64_t>(clipped.bottom) - header_height() + scroll_y_;
+        if (content_bottom > 0) {
+            const std::int64_t first_row =
+                content_top > 0 ? content_top / row_h : 0;
+            const std::int64_t last_row = std::min<std::int64_t>(
+                (content_bottom - 1) / row_h, static_cast<std::int64_t>(count) - 1);
+            for (std::int64_t row = first_row; row <= last_row; ++row) {
+                const auto index = static_cast<std::size_t>(row);
+                next[index] = !marquee_base_selection_[index];
+                if (next[index]) {
                     if (first_selected < 0) {
-                        first_selected = row_index;
+                        first_selected = static_cast<int>(row);
                     }
-                    last_selected = row_index;
+                    last_selected = static_cast<int>(row);
                 }
             }
         }
