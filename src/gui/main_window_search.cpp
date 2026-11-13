@@ -321,8 +321,9 @@ void FileSearchDialog::run_search() {
         return;
     }
     search_started_ = true;
-    search_thread_.request_stop();
-    if (search_thread_.joinable()) search_thread_.join();
+    // The previous search is told to stop but not waited for: one scanning an
+    // archive cannot stop mid-open, and waiting froze typing in the search box.
+    // Its results carry an older generation and are dropped.
     const std::uint64_t generation = ++search_generation_;
     result_targets_.clear();
     results_.clear();
@@ -346,7 +347,7 @@ void FileSearchDialog::run_search() {
     const auto location = location_;
     const auto active_catalog = archive_catalog_;
     HWND target = hwnd_;
-    search_thread_ = std::jthread(
+    search_thread_.start(
         [source, location, active_catalog, target, generation, query, folded_query,
          archive_patterns, search_area,
          include_files, include_folders, include_archives,
@@ -965,8 +966,7 @@ LRESULT FileSearchDialog::handle_message(UINT message, WPARAM wparam, LPARAM lpa
             return 0;
         case WM_NCDESTROY: {
             KillTimer(hwnd_, kSearchDebounceTimer);
-            search_thread_.request_stop();
-            if (search_thread_.joinable()) search_thread_.join();
+            search_thread_.join_all();
             MSG queued{};
             while (PeekMessageW(&queued, hwnd_, kSearchResultsMessage,
                                 kSearchResultsMessage, PM_REMOVE)) {

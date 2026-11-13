@@ -994,7 +994,9 @@ void MainWindow::navigate_to(axiom::gui::BrowserLocation location, bool record_h
     HWND target = hwnd_;
     const int load_sort_column = sort_column_;
     const bool load_sort_ascending = sort_ascending_;
-    browser_thread_ = std::jthread(
+    // A load still opening a slow archive is asked to stop and left to finish
+    // on its own; its result is discarded by generation in on_browser_loaded.
+    browser_thread_.start(
         [target, generation, location = std::move(location), catalog = std::move(catalog),
          archive_password = std::move(archive_password), load_sort_column,
          load_sort_ascending](

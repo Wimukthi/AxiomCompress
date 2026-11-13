@@ -144,6 +144,7 @@
     <ClInclude Include="src\gui\archive_feature_dialogs.hpp" />
     <ClInclude Include="src\gui\archive_feature_options.hpp" />
     <ClInclude Include="src\gui\directory_watcher.hpp" />
+    <ClInclude Include="src\gui\retiring_thread.hpp" />
     <ClInclude Include="src\gui\drag_drop.hpp" />
     <ClInclude Include="src\gui\settings_store.hpp" />
     <ClInclude Include="src\gui\benchmark_dialog.hpp" />

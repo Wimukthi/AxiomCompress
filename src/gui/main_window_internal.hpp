@@ -22,6 +22,7 @@
 #include "gui/operation_runner.hpp"
 #include "gui/operation_progress_window.hpp"
 #include "gui/resource.hpp"
+#include "gui/retiring_thread.hpp"
 #include "gui/settings_store.hpp"
 #include "gui/sfx_dialog.hpp"
 #include "sfx/module_file.hpp"
@@ -943,7 +944,7 @@ private:
 
     DarkTableView results_;
 
-    std::jthread search_thread_;
+    RetiringThread search_thread_;
 
     std::uint64_t search_generation_ = 0;
 
@@ -1540,7 +1541,7 @@ private:
 
     std::string pending_archive_password_;
 
-    std::jthread browser_thread_;
+    RetiringThread browser_thread_;
 
     std::uint64_t browser_generation_ = 0;
 

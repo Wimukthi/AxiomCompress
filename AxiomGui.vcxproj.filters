@@ -124,6 +124,7 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="src\gui\drag_drop.hpp"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="src\gui\retiring_thread.hpp"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="src\gui\settings_store.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
