@@ -6056,8 +6056,25 @@ void test_archive_timestamp_conversion() {
              std::int64_t{1609459200}, std::int64_t{4102444800}}) {
         const auto restored = axiom::to_unix_seconds(
             axiom::from_unix_seconds(seconds));
+#if defined(_WIN32)
+        // Windows converts by the fixed FILETIME offset: exact, every time.
+        AXIOM_CHECK(restored == seconds);
+        AXIOM_CHECK(axiom::from_unix_seconds(seconds) == axiom::from_unix_seconds(seconds));
+#else
         AXIOM_CHECK(std::llabs(restored - seconds) <= 1);
+#endif
     }
+#if defined(_WIN32)
+    // 1970-01-01 is 11,644,473,600 s after 1601-01-01, the FILETIME epoch.
+    AXIOM_CHECK(axiom::from_unix_seconds(0).time_since_epoch().count() == 116444736000000000);
+    // Part of a second is dropped toward the past, also before 1970.
+    using Ticks = fs::file_time_type::duration;
+    AXIOM_CHECK(axiom::to_unix_seconds(fs::file_time_type(Ticks(116444736000000000 + 9999999))) == 0);
+    AXIOM_CHECK(axiom::to_unix_seconds(fs::file_time_type(Ticks(116444736000000000 - 1))) == -1);
+    // A hostile stored value clamps instead of overflowing.
+    (void)axiom::from_unix_seconds(std::numeric_limits<std::int64_t>::max());
+    (void)axiom::from_unix_seconds(std::numeric_limits<std::int64_t>::min());
+#endif
 }
 
 void test_compression_estimator() {

@@ -542,6 +542,34 @@ auto system_time_to_file(
 }  // namespace
 
 // Shared with the other archive TUs via container_internal.hpp.
+#if defined(_WIN32)
+// On Windows file_time_type counts FILETIME ticks: 100 ns since 1601-01-01 UTC,
+// without leap seconds, so Unix time is a fixed offset away. The library offers
+// no file_clock::to_sys/from_sys there, and converting through the gap between
+// the two clocks' now() jittered by a tick and could land on the wrong second.
+namespace {
+constexpr std::int64_t kTicksPerSecond = 10'000'000;
+constexpr std::int64_t kFiletimeToUnixSeconds = 11'644'473'600;
+}  // namespace
+
+std::int64_t to_unix_seconds(fs::file_time_type stamp) {
+    const std::int64_t ticks = stamp.time_since_epoch().count();
+    std::int64_t seconds = ticks / kTicksPerSecond;
+    if (ticks % kTicksPerSecond < 0) --seconds;  // floor, as for times before 1601
+    return seconds - kFiletimeToUnixSeconds;
+}
+
+fs::file_time_type from_unix_seconds(std::int64_t seconds) {
+    // An archive can store any value; clamp what FILETIME ticks cannot hold.
+    constexpr std::int64_t kMaxSeconds =
+        std::numeric_limits<std::int64_t>::max() / kTicksPerSecond - kFiletimeToUnixSeconds;
+    constexpr std::int64_t kMinSeconds =
+        std::numeric_limits<std::int64_t>::min() / kTicksPerSecond + kFiletimeToUnixSeconds;
+    seconds = std::clamp(seconds, kMinSeconds, kMaxSeconds);
+    return fs::file_time_type(fs::file_time_type::duration(
+        (seconds + kFiletimeToUnixSeconds) * kTicksPerSecond));
+}
+#else
 std::int64_t to_unix_seconds(fs::file_time_type stamp) {
     const auto system = file_time_to_system(stamp);
     return std::chrono::duration_cast<std::chrono::seconds>(system.time_since_epoch()).count();
@@ -551,6 +579,7 @@ fs::file_time_type from_unix_seconds(std::int64_t seconds) {
     const std::chrono::system_clock::time_point system{std::chrono::seconds{seconds}};
     return system_time_to_file<fs::file_time_type::clock>(system);
 }
+#endif
 
 // ---- path safety -----------------------------------------------------------
 // Shared with the other archive TUs via container_internal.hpp.
