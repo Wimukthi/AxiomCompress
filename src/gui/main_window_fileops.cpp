@@ -2106,15 +2106,22 @@ void MainWindow::queue_selected_archive_capability_probe(const fs::path& archive
                 try {
                     if (const auto* provider = axiom::archive_provider_for_path(archive)) {
                         result->provider = provider;
-                        result->capabilities = provider->capabilities(archive, password);
-                        if (!stop.stop_requested()) {
+                        // The catalog's own directory read already yields the
+                        // capabilities; probing first read the directory twice.
+                        try {
                             result->catalog = axiom::gui::ArchiveCatalog::load(archive, password);
+                            result->capabilities = result->catalog->capabilities();
+                        } catch (...) {
+                            // Encrypted or damaged archives can still have a known
+                            // provider and say what they are (encrypted, say). Keep
+                            // that result; edit commands require a loaded catalog.
+                            if (!stop.stop_requested()) {
+                                result->capabilities = provider->capabilities(archive, password);
+                            }
                         }
                     }
                 } catch (...) {
-                    // Encrypted or damaged archives can still have a known
-                    // provider. Keep that result; edit commands require a
-                    // successfully loaded catalog below.
+                    // capabilities() must not throw; keep whatever was found.
                 }
             }
             secure_clear(password);
