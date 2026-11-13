@@ -1078,7 +1078,10 @@ void read_content_defined_chunks(const fs::path& path,
     const auto hash_start = min_size - 64;
     ByteVector chunk;
     std::uint64_t fingerprint = 0;
-    std::vector<char> buffer(effective_io_buffer_size(options.io_buffer_size));
+    // Kept per thread for the same reason as try_hash_input_stream's: this runs
+    // once per file, and a fresh 1 MiB buffer per file is an OS round trip.
+    thread_local std::vector<char> buffer;
+    buffer.resize(effective_io_buffer_size(options.io_buffer_size));
     const auto emit = [&] {
         callback(chunk);
         chunk.clear();
@@ -1923,7 +1926,11 @@ std::optional<ContentIdentity> try_hash_input_stream(
     ByteVector* spool = nullptr) {
     core::Blake3 hasher;
     auto crc = core::crc32_init();
-    std::vector<std::uint8_t> buffer(effective_io_buffer_size(options.io_buffer_size));
+    // Kept per thread: this runs once per same-sized input, and a fresh
+    // zero-filled 1 MiB vector each time comes straight from the OS, so hashing
+    // a small file paid more to map, zero and free the buffer than to hash it.
+    thread_local std::vector<std::uint8_t> buffer;
+    buffer.resize(effective_io_buffer_size(options.io_buffer_size));
     std::uint64_t actual_size = 0;
     if (spool != nullptr) {
         spool->clear();
