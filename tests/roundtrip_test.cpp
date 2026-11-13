@@ -51,6 +51,11 @@
 #endif
 #include <windows.h>
 #include <winioctl.h>
+#include <aclapi.h>
+// rpcndr.h, pulled in by aclapi.h, defines `small` as a macro.
+#ifdef small
+#undef small
+#endif
 #endif
 
 #if !defined(_WIN32)
@@ -2257,6 +2262,126 @@ void test_skip_unreadable_archive_inputs() {
     CloseHandle(lock);
     std::error_code ec;
     fs::remove_all(root, ec);
+}
+
+// An unelevated user cannot set a file's owner or group, not even to themselves.
+// That must not cost the access list, nor raise a warning for every file.
+void test_windows_security_descriptor_restore() {
+    const auto root = make_temp_dir();
+    const auto source = root / "source";
+    fs::create_directories(source);
+    const auto file = source / "acl.txt";
+    write_all(file, bytes_from_string("explicit access entry"));
+
+    BYTE guests_buffer[SECURITY_MAX_SID_SIZE]{};
+    DWORD guests_size = sizeof(guests_buffer);
+    AXIOM_CHECK(CreateWellKnownSid(WinBuiltinGuestsSid, nullptr, guests_buffer,
+                                   &guests_size) != FALSE);
+    const PSID guests = guests_buffer;
+
+    const auto dacl_of = [](const fs::path& path, PSECURITY_DESCRIPTOR& descriptor) {
+        PACL dacl = nullptr;
+        descriptor = nullptr;
+        AXIOM_CHECK(GetNamedSecurityInfoW(path.c_str(), SE_FILE_OBJECT,
+                                          DACL_SECURITY_INFORMATION, nullptr, nullptr,
+                                          &dacl, nullptr, &descriptor) == ERROR_SUCCESS);
+        return dacl;
+    };
+    const auto has_explicit_guest_read = [&](const fs::path& path) {
+        PSECURITY_DESCRIPTOR descriptor = nullptr;
+        const PACL dacl = dacl_of(path, descriptor);
+        bool found = false;
+        for (DWORD index = 0; dacl != nullptr && index < dacl->AceCount; ++index) {
+            void* raw = nullptr;
+            if (!GetAce(dacl, index, &raw)) continue;
+            const auto* header = static_cast<const ACE_HEADER*>(raw);
+            if (header->AceType != ACCESS_ALLOWED_ACE_TYPE ||
+                (header->AceFlags & INHERITED_ACE) != 0) {
+                continue;
+            }
+            const auto* ace = static_cast<const ACCESS_ALLOWED_ACE*>(raw);
+            if (EqualSid(const_cast<DWORD*>(&ace->SidStart), guests) &&
+                (ace->Mask & FILE_READ_DATA) != 0) {
+                found = true;
+            }
+        }
+        if (descriptor != nullptr) LocalFree(descriptor);
+        return found;
+    };
+
+    {
+        PSECURITY_DESCRIPTOR descriptor = nullptr;
+        const PACL existing = dacl_of(file, descriptor);
+        EXPLICIT_ACCESSW access{};
+        access.grfAccessPermissions = FILE_GENERIC_READ;
+        access.grfAccessMode = GRANT_ACCESS;
+        access.grfInheritance = NO_INHERITANCE;
+        access.Trustee.TrusteeForm = TRUSTEE_IS_SID;
+        access.Trustee.TrusteeType = TRUSTEE_IS_WELL_KNOWN_GROUP;
+        access.Trustee.ptstrName = static_cast<LPWSTR>(guests);
+        PACL updated = nullptr;
+        AXIOM_CHECK(SetEntriesInAclW(1, &access, existing, &updated) == ERROR_SUCCESS);
+        AXIOM_CHECK(SetNamedSecurityInfoW(const_cast<LPWSTR>(file.c_str()), SE_FILE_OBJECT,
+                                          DACL_SECURITY_INFORMATION, nullptr, nullptr,
+                                          updated, nullptr) == ERROR_SUCCESS);
+        LocalFree(updated);
+        if (descriptor != nullptr) LocalFree(descriptor);
+    }
+    AXIOM_CHECK(has_explicit_guest_read(file));
+
+    const auto archive = root / "acl.axar";
+    axiom::create_archive({source}, archive);
+
+    // Extract beneath a folder that grants this user Modify and nothing more, as
+    // an ordinary folder outside the user profile does. Full Control (what a temp
+    // folder grants) includes WRITE_OWNER and would hide the failure; a file's
+    // owner still holds WRITE_DAC implicitly, so the access list can be restored.
+    const auto output = root / "output";
+    fs::create_directories(output);
+    {
+        HANDLE token = nullptr;
+        AXIOM_CHECK(OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token) != FALSE);
+        std::vector<std::uint8_t> user_buffer(256);
+        DWORD user_size = 0;
+        if (!GetTokenInformation(token, TokenUser, user_buffer.data(),
+                                 static_cast<DWORD>(user_buffer.size()), &user_size)) {
+            user_buffer.resize(user_size);
+            AXIOM_CHECK(GetTokenInformation(token, TokenUser, user_buffer.data(),
+                                            static_cast<DWORD>(user_buffer.size()),
+                                            &user_size) != FALSE);
+        }
+        CloseHandle(token);
+        const PSID user = reinterpret_cast<TOKEN_USER*>(user_buffer.data())->User.Sid;
+
+        EXPLICIT_ACCESSW modify{};
+        modify.grfAccessPermissions = FILE_GENERIC_READ | FILE_GENERIC_WRITE |
+            FILE_GENERIC_EXECUTE | DELETE | FILE_DELETE_CHILD;
+        modify.grfAccessMode = SET_ACCESS;
+        modify.grfInheritance = SUB_CONTAINERS_AND_OBJECTS_INHERIT;
+        modify.Trustee.TrusteeForm = TRUSTEE_IS_SID;
+        modify.Trustee.TrusteeType = TRUSTEE_IS_USER;
+        modify.Trustee.ptstrName = static_cast<LPWSTR>(user);
+        PACL modify_only = nullptr;
+        AXIOM_CHECK(SetEntriesInAclW(1, &modify, nullptr, &modify_only) == ERROR_SUCCESS);
+        AXIOM_CHECK(SetNamedSecurityInfoW(
+                        const_cast<LPWSTR>(output.c_str()), SE_FILE_OBJECT,
+                        DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                        nullptr, nullptr, modify_only, nullptr) == ERROR_SUCCESS);
+        LocalFree(modify_only);
+    }
+
+    axiom::ExtractOptions options;
+    options.operation = std::make_shared<axiom::OperationControl>();
+    axiom::extract_archive(archive, output, options);
+    const auto extracted = output / "source" / "acl.txt";
+    AXIOM_CHECK(read_all(extracted) == bytes_from_string("explicit access entry"));
+    for (const auto& warning : options.operation->warnings()) {
+        AXIOM_CHECK(warning.message.find("security descriptor") == std::string::npos);
+    }
+    AXIOM_CHECK(has_explicit_guest_read(extracted));
+
+    std::error_code error;
+    fs::remove_all(root, error);
 }
 #endif
 
@@ -8515,6 +8640,7 @@ constexpr RegisteredTest kTests[] = {
     {"safe_file_replacement", test_safe_file_replacement},
 #if defined(_WIN32)
     {"skip_unreadable_archive_inputs", test_skip_unreadable_archive_inputs},
+    {"windows_security_descriptor_restore", test_windows_security_descriptor_restore},
     {"unicode_path_archive_probe", test_unicode_path_archive_probe},
     {"unicode_archive_entry_names", test_unicode_archive_entry_names},
     {"iso_native_listing_provider_layer", test_iso_native_listing_provider_layer},

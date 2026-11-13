@@ -14,6 +14,17 @@ Entries are condensed from the
 
 ## [Unreleased]
 
+### Fixed
+
+- Extracting on Windows without elevation restores each file's access list
+  again, and no longer warns "security descriptor could not be restored (error
+  5)" for every file. The owner, group, and access list were set in one call,
+  and setting an owner needs a right an unelevated user lacks even for their own
+  files, so the whole call failed. When only the ownership is refused, the access
+  list is now restored on its own and nothing is reported. Extracting from an
+  archive made on another machine therefore applies its stored access list
+  where it previously left the destination folder's permissions in place.
+
 ## [0.15.0.0] - 2026-11-11
 
 Compression estimates are rebuilt. They are measured the way the archive is

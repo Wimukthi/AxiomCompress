@@ -204,12 +204,28 @@ std::vector<std::string> apply_metadata(const std::filesystem::path& path,
     if (meta.has_windows_security_descriptor && !is_reparse_point(path)) {
         auto* descriptor = reinterpret_cast<PSECURITY_DESCRIPTOR>(
             const_cast<std::uint8_t*>(meta.windows_security_descriptor.data()));
-        if (!SetFileSecurityW(path.c_str(),
-                              OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION |
-                                  DACL_SECURITY_INFORMATION,
-                              descriptor)) {
+        // Ownership is restored whenever the extracting user may change it, as
+        // on POSIX. Setting an owner or group needs WRITE_OWNER (or the restore
+        // privilege for someone else's SID), which an unelevated user does not
+        // hold even for their own files, and one failed component fails the whole
+        // call. So when only the ownership is refused, restore the access list on
+        // its own; a refused ownership change is not worth a warning per file.
+        bool restored = SetFileSecurityW(
+            path.c_str(),
+            OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION |
+                DACL_SECURITY_INFORMATION,
+            descriptor) != FALSE;
+        DWORD error = restored ? ERROR_SUCCESS : GetLastError();
+        if (!restored &&
+            (error == ERROR_ACCESS_DENIED || error == ERROR_INVALID_OWNER ||
+             error == ERROR_INVALID_PRIMARY_GROUP || error == ERROR_PRIVILEGE_NOT_HELD)) {
+            restored = SetFileSecurityW(path.c_str(), DACL_SECURITY_INFORMATION,
+                                        descriptor) != FALSE;
+            error = restored ? ERROR_SUCCESS : GetLastError();
+        }
+        if (!restored) {
             warnings.push_back("security descriptor could not be restored (error " +
-                               std::to_string(GetLastError()) + ")");
+                               std::to_string(error) + ")");
         }
     }
     return warnings;
