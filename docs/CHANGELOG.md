@@ -14,6 +14,29 @@ Entries are condensed from the
 
 ## [Unreleased]
 
+### Performance
+
+- Archiving and extracting many small files is several times faster on
+  Windows. Measured on 20,000 files of 1 to 8 KB (90 MB) on NVMe, against
+  0.15.0.0: creating the archive takes 3.3 s instead of 12.1 s, and extracting
+  it 14 s instead of 32 s, close to 7-Zip's 1.8 s and 12.9 s for the same
+  files. The time went to the filesystem, not the codec: each source file was
+  looked up seven to eleven times by name, each extracted file retried every
+  parent folder and reopened itself three times after it was written, and
+  hashing a small file allocated a fresh 1 MiB buffer. The scan now takes kinds
+  and sizes from the directory listing, one handle answers every question about
+  a source file, directory checks are made once per extraction, and an
+  extracted file is renamed and given its metadata through the handle that
+  wrote it. Archive contents and listings are unchanged.
+- `axiomc l` reads an archive's directory once instead of three times, and
+  selecting an archive in the file manager reads it once instead of twice.
+- The file manager no longer freezes when you leave an archive that is still
+  opening, or type a new search while the last one is still scanning an
+  archive.
+- Large folders sort and filter without copying every item on the UI thread,
+  and marquee selection and type-ahead no longer scan or copy every row on each
+  mouse move or keystroke.
+
 ### Security
 
 - The bundled 7-Zip engine, which reads 7z, RAR, ISO and CAB archives, is
