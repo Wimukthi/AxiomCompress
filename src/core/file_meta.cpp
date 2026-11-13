@@ -1,11 +1,16 @@
 #include "core/file_meta.hpp"
 
 #include "core/exclusive_file.hpp"
+#include "core/path_text.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <cerrno>
 #include <cstring>
+#include <iterator>
 #include <limits>
+#include <optional>
+#include <string>
 #include <string_view>
 #include <utility>
 
@@ -722,6 +727,135 @@ bool restore_sparse_file(const std::filesystem::path& path,
 #endif
 }
 
+std::optional<std::string> read_download_mark(const std::filesystem::path& archive) {
+    const std::wstring stream_path = archive.native() + L":Zone.Identifier";
+    const HANDLE handle = CreateFileW(stream_path.c_str(), GENERIC_READ,
+                                      FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                      nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (handle == INVALID_HANDLE_VALUE) return std::nullopt;
+    std::string content(64u << 10, '\0');
+    DWORD got = 0;
+    const BOOL ok = ReadFile(handle, content.data(), static_cast<DWORD>(content.size()), &got,
+                             nullptr);
+    CloseHandle(handle);
+    if (!ok) return std::nullopt;
+    content.resize(got);
+
+    // Zone.Identifier is an INI file: a [ZoneTransfer] section with ZoneId and,
+    // from browsers, ReferrerUrl and HostUrl.
+    std::optional<int> zone;
+    std::string referrer;
+    std::string host;
+    bool in_zone_transfer = false;
+    const auto trim = [](std::string_view text) {
+        while (!text.empty() && (text.front() == ' ' || text.front() == '\t')) text.remove_prefix(1);
+        while (!text.empty() && (text.back() == ' ' || text.back() == '\t' || text.back() == '\r')) {
+            text.remove_suffix(1);
+        }
+        return text;
+    };
+    const auto equals_folded = [](std::string_view left, std::string_view right) {
+        return left.size() == right.size() &&
+               std::equal(left.begin(), left.end(), right.begin(), [](char a, char b) {
+                   return std::tolower(static_cast<unsigned char>(a)) ==
+                          std::tolower(static_cast<unsigned char>(b));
+               });
+    };
+    // Only a printable, bounded URL is carried over into another file's mark.
+    const auto plain_value = [](std::string_view value) {
+        if (value.empty() || value.size() > 2048) return false;
+        return std::all_of(value.begin(), value.end(), [](char c) {
+            return static_cast<unsigned char>(c) >= 0x20 && static_cast<unsigned char>(c) < 0x7F;
+        });
+    };
+    std::string_view rest(content);
+    while (!rest.empty()) {
+        const auto end = rest.find('\n');
+        std::string_view line = trim(rest.substr(0, end));
+        rest = end == std::string_view::npos ? std::string_view{} : rest.substr(end + 1);
+        if (line.empty() || line.front() == ';') continue;
+        if (line.front() == '[') {
+            in_zone_transfer = equals_folded(line, "[ZoneTransfer]");
+            continue;
+        }
+        if (!in_zone_transfer) continue;
+        const auto equals = line.find('=');
+        if (equals == std::string_view::npos) continue;
+        const std::string_view key = trim(line.substr(0, equals));
+        const std::string_view value = trim(line.substr(equals + 1));
+        if (equals_folded(key, "ZoneId")) {
+            if (value.size() == 1 && value.front() >= '0' && value.front() <= '9') {
+                zone = value.front() - '0';
+            }
+        } else if (equals_folded(key, "ReferrerUrl") && plain_value(value)) {
+            referrer.assign(value);
+        } else if (equals_folded(key, "HostUrl") && plain_value(value)) {
+            host.assign(value);
+        }
+    }
+    const int zone_id = zone.value_or(3);
+    if (zone_id < 3) return std::nullopt;  // local machine, intranet, trusted sites
+
+    std::string mark = "[ZoneTransfer]\r\nZoneId=" + std::to_string(zone_id) + "\r\n";
+    if (!referrer.empty()) mark += "ReferrerUrl=" + referrer + "\r\n";
+    if (!host.empty()) mark += "HostUrl=" + host + "\r\n";
+    return mark;
+}
+
+std::string write_download_mark(const std::filesystem::path& path, std::string_view mark,
+                                bool keep_times) {
+    HANDLE file = INVALID_HANDLE_VALUE;
+    BY_HANDLE_FILE_INFORMATION before{};
+    if (keep_times) {
+        file = CreateFileW(path.c_str(), FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                           OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+        if (file == INVALID_HANDLE_VALUE || !GetFileInformationByHandle(file, &before)) {
+            const DWORD error = GetLastError();
+            if (file != INVALID_HANDLE_VALUE) CloseHandle(file);
+            return "mark of the web could not be added (error " + std::to_string(error) + ")";
+        }
+        if ((before.dwFileAttributes & FILE_ATTRIBUTE_READONLY) != 0) {
+            FILE_BASIC_INFO writable{};
+            writable.FileAttributes = before.dwFileAttributes & ~FILE_ATTRIBUTE_READONLY;
+            if (writable.FileAttributes == 0) writable.FileAttributes = FILE_ATTRIBUTE_NORMAL;
+            SetFileInformationByHandle(file, FileBasicInfo, &writable, sizeof(writable));
+        }
+    }
+
+    std::string failure;
+    const std::wstring stream_path = path.native() + L":Zone.Identifier";
+    const HANDLE stream = CreateFileW(stream_path.c_str(), GENERIC_WRITE, 0, nullptr,
+                                      CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (stream == INVALID_HANDLE_VALUE) {
+        failure = "mark of the web could not be added (error " +
+                  std::to_string(GetLastError()) + ")";
+    } else {
+        DWORD wrote = 0;
+        if (!WriteFile(stream, mark.data(), static_cast<DWORD>(mark.size()), &wrote, nullptr) ||
+            wrote != mark.size()) {
+            failure = "mark of the web could not be written (error " +
+                      std::to_string(GetLastError()) + ")";
+        }
+        if (!CloseHandle(stream) && failure.empty()) {
+            failure = "mark of the web could not be written (error " +
+                      std::to_string(GetLastError()) + ")";
+        }
+    }
+
+    if (keep_times) {
+        SetFileTime(file, &before.ftCreationTime, &before.ftLastAccessTime,
+                    &before.ftLastWriteTime);
+        if ((before.dwFileAttributes & FILE_ATTRIBUTE_READONLY) != 0) {
+            FILE_BASIC_INFO restored{};
+            restored.FileAttributes = before.dwFileAttributes;
+            SetFileInformationByHandle(file, FileBasicInfo, &restored, sizeof(restored));
+        }
+        CloseHandle(file);
+    }
+    return failure;
+}
+
 SourceFileProbe probe_source_file(const std::filesystem::path& path) {
     SourceFileProbe probe;
     // READ_CONTROL for the security descriptor and FILE_READ_ATTRIBUTES for the
@@ -1230,6 +1364,14 @@ bool restore_sparse_file([[maybe_unused]] const std::filesystem::path& path,
 #endif
 }
 
+std::optional<std::string> read_download_mark(const std::filesystem::path&) {
+    return std::nullopt;
+}
+
+std::string write_download_mark(const std::filesystem::path&, std::string_view, bool) {
+    return {};
+}
+
 SourceFileProbe probe_source_file(const std::filesystem::path&) {
     return {};
 }
@@ -1271,5 +1413,37 @@ bool walk_source_tree(const std::filesystem::path& root,
 }
 
 #endif
+
+bool is_risky_download_type(const std::filesystem::path& name) {
+    // Kept to types that run code, open with active content, or carry other
+    // files; everything else is marked only under the "all" policy.
+    static constexpr std::string_view kRisky[] = {
+        // programs, installers, libraries
+        ".exe", ".com", ".scr", ".pif", ".msi", ".msp", ".msix", ".msixbundle", ".appx",
+        ".appxbundle", ".appinstaller", ".application", ".appref-ms", ".cpl", ".dll", ".ocx",
+        ".sys", ".drv", ".efi", ".jar", ".gadget", ".msc", ".reg", ".inf",
+        // scripts
+        ".bat", ".cmd", ".ps1", ".psm1", ".psd1", ".ps1xml", ".psc1", ".vb", ".vbs", ".vbe",
+        ".js", ".jse", ".ws", ".wsf", ".wsc", ".wsh", ".hta", ".sct", ".py", ".pyw",
+        ".pl", ".rb", ".sh", ".lua",
+        // shortcuts and links
+        ".lnk", ".url", ".website", ".scf", ".library-ms", ".search-ms", ".settingcontent-ms",
+        // documents with active content or a viewer of their own
+        ".doc", ".docx", ".docm", ".dot", ".dotx", ".dotm", ".rtf", ".xls", ".xlsx",
+        ".xlsm", ".xlsb", ".xlt", ".xltx", ".xltm", ".xla", ".xlam", ".ppt", ".pptx",
+        ".pptm", ".pot", ".potx", ".potm", ".pps", ".ppsx", ".ppsm", ".ppa", ".ppam",
+        ".one", ".onepkg", ".pub", ".vsd", ".vsdx", ".vsdm", ".mdb", ".accdb", ".accde",
+        ".odt", ".ods", ".odp", ".pdf", ".xps", ".chm", ".htm", ".html", ".mht", ".mhtml",
+        ".svg", ".xml", ".xsl",
+        // disk images and archives, which would carry their own contents past the mark
+        ".iso", ".img", ".vhd", ".vhdx", ".udf", ".zip", ".7z", ".rar", ".cab", ".tar",
+        ".gz", ".tgz", ".bz2", ".xz", ".zst", ".arj", ".lzh", ".axar", ".axc",
+    };
+    std::string extension = path_to_utf8(name.extension());
+    for (char& c : extension) {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    return std::find(std::begin(kRisky), std::end(kRisky), extension) != std::end(kRisky);
+}
 
 }  // namespace axiom::core

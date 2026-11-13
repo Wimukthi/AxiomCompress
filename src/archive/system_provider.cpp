@@ -1,6 +1,7 @@
 #include "archive/system_provider.hpp"
 #include "archive/seven_zip_library.hpp"
 #include "core/ensured_directories.hpp"
+#include "core/file_meta.hpp"
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -1244,6 +1245,9 @@ private:
         std::uint64_t completed_bytes = 0;
         std::uint64_t completed_items = 0;
         core::EnsuredDirectories directories;
+        const auto mark = options.mark_of_the_web == ExtractOptions::MarkOfTheWeb::off
+            ? std::optional<std::string>{}
+            : core::read_download_mark(archive_path);
         for (const auto& entry : selected) {
             operation_checkpoint(options.operation);
             const fs::path relative = fs::path(utf8_to_wide(entry.path));
@@ -1274,6 +1278,15 @@ private:
                 }
                 fs::copy_file(source, target, fs::copy_options::overwrite_existing, ec);
                 if (ec) throw std::runtime_error("failed to copy extracted file: " + ec.message());
+                // The copy already has its times and attributes, so the mark
+                // keeps them.
+                if (mark && (options.mark_of_the_web == ExtractOptions::MarkOfTheWeb::all ||
+                             core::is_risky_download_type(target))) {
+                    const auto failure = core::write_download_mark(target, *mark, true);
+                    if (!failure.empty() && options.operation) {
+                        options.operation->add_warning({entry.path, failure});
+                    }
+                }
                 completed_bytes += entry.size;
             }
             ++completed_items;

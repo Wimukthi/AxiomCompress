@@ -2897,6 +2897,154 @@ void test_system_archive_provider_layer() {
     fs::remove_all(root, ec);
 }
 
+// Files extracted from a downloaded archive carry its Mark of the Web, so
+// SmartScreen and Protected View still see where they came from.
+void test_mark_of_the_web() {
+    const auto root = make_temp_dir();
+    const auto source = root / "src";
+    fs::create_directories(source);
+    write_all(source / "notes.txt", bytes_from_string("plain text"));
+    write_all(source / "tool.exe", bytes_from_string("MZ not really a program"));
+    write_all(source / "claims-local.txt", bytes_from_string("stored mark"));
+
+    const auto write_stream = [](const fs::path& file, const std::string& stream,
+                                 const std::string& data) {
+        const std::wstring path = file.wstring() + L":" + std::wstring(stream.begin(), stream.end());
+        const HANDLE handle = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr,
+                                          CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        AXIOM_CHECK(handle != INVALID_HANDLE_VALUE);
+        DWORD wrote = 0;
+        WriteFile(handle, data.data(), static_cast<DWORD>(data.size()), &wrote, nullptr);
+        CloseHandle(handle);
+    };
+    const auto read_stream = [](const fs::path& file) -> std::optional<std::string> {
+        const std::wstring path = file.wstring() + L":Zone.Identifier";
+        const HANDLE handle = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                                          OPEN_EXISTING, 0, nullptr);
+        if (handle == INVALID_HANDLE_VALUE) return std::nullopt;
+        std::string data(4096, '\0');
+        DWORD got = 0;
+        ReadFile(handle, data.data(), static_cast<DWORD>(data.size()), &got, nullptr);
+        CloseHandle(handle);
+        data.resize(got);
+        return data;
+    };
+    const auto write_time = [](const fs::path& file) {
+        WIN32_FILE_ATTRIBUTE_DATA data{};
+        GetFileAttributesExW(file.c_str(), GetFileExInfoStandard, &data);
+        return (static_cast<std::uint64_t>(data.ftLastWriteTime.dwHighDateTime) << 32) |
+               data.ftLastWriteTime.dwLowDateTime;
+    };
+
+    // A file that arrived with a stored mark claiming a local origin, and a
+    // second named stream, which sends extraction down the by-name path.
+    write_stream(source / "claims-local.txt", "Zone.Identifier", "[ZoneTransfer]\r\nZoneId=0\r\n");
+    write_stream(source / "claims-local.txt", "note", "other stream");
+
+    const std::string downloaded =
+        "[ZoneTransfer]\r\nZoneId=3\r\nReferrerUrl=https://example.test/\r\n"
+        "HostUrl=https://example.test/files/a.zip\r\nLastWriterPackageFamilyName=x\r\n";
+    const std::string expected_mark =
+        "[ZoneTransfer]\r\nZoneId=3\r\nReferrerUrl=https://example.test/\r\n"
+        "HostUrl=https://example.test/files/a.zip\r\n";
+
+    std::vector<fs::path> archives{root / "marked.axar", root / "marked.zip"};
+    axiom::create_archive({source}, archives[0], {});
+    {
+        axiom::ArchiveCreateRequest request;
+        request.inputs = {source};
+        request.archive_path = archives[1];
+        const auto* zip = axiom::archive_provider_for_path(archives[1]);
+        AXIOM_CHECK(zip != nullptr);
+        zip->create(request);
+    }
+    if (const auto seven_zip = bundled_7z_for_tests()) {
+        const fs::path seven = root / "marked.7z";
+        const std::string command = "cd /d " + quote_for_command(root) + " && " +
+                                    quote_for_command(*seven_zip) + " a -t7z " +
+                                    quote_for_command(seven) + " src >nul 2>nul";
+        if (std::system(command.c_str()) == 0) archives.push_back(seven);
+    }
+    for (const auto& archive : archives) write_stream(archive, "Zone.Identifier", downloaded);
+
+    const auto extract = [&](const fs::path& archive, const fs::path& output,
+                             axiom::ExtractOptions::MarkOfTheWeb policy) {
+        const auto* provider = axiom::archive_provider_for_path(archive);
+        AXIOM_CHECK(provider != nullptr);
+        axiom::ExtractOptions options;
+        options.mark_of_the_web = policy;
+        options.operation = std::make_shared<axiom::OperationControl>();
+        provider->extract_all(archive, output, options);
+        for (const auto& warning : options.operation->warnings()) {
+            std::cerr << archive.filename().string() << ": " << warning.path << ": "
+                      << warning.message << '\n';
+        }
+        AXIOM_CHECK(options.operation->warnings().empty());
+    };
+
+    for (const auto& archive : archives) {
+        const bool native = archive.extension() == ".axar";
+        // Unmarked extraction first: its times are what the marked ones must
+        // match (a ZIP keeps only two-second times, so not the source's).
+        const auto off = root / ("off" + archive.extension().string());
+        extract(archive, off, axiom::ExtractOptions::MarkOfTheWeb::off);
+        AXIOM_CHECK(!read_stream(off / "src" / "notes.txt"));
+        AXIOM_CHECK(!read_stream(off / "src" / "tool.exe"));
+
+        const auto all = root / ("all" + archive.extension().string());
+        extract(archive, all, axiom::ExtractOptions::MarkOfTheWeb::all);
+        for (const char* name : {"notes.txt", "tool.exe", "claims-local.txt"}) {
+            const auto file = all / "src" / name;
+            AXIOM_CHECK(read_stream(file) == expected_mark);
+            // The mark must not move the restored time.
+            AXIOM_CHECK(write_time(file) == write_time(off / "src" / name));
+            if (native) AXIOM_CHECK(write_time(file) == write_time(source / name));
+        }
+        AXIOM_CHECK(read_all(all / "src" / "notes.txt") == bytes_from_string("plain text"));
+
+        const auto risky = root / ("risky" + archive.extension().string());
+        extract(archive, risky, axiom::ExtractOptions::MarkOfTheWeb::risky);
+        AXIOM_CHECK(read_stream(risky / "src" / "tool.exe") == expected_mark);
+        AXIOM_CHECK(!read_stream(risky / "src" / "notes.txt"));
+        // A stored mark claiming a local origin is not restored under a
+        // downloaded archive, even where the policy adds none.
+        if (native) AXIOM_CHECK(!read_stream(risky / "src" / "claims-local.txt"));
+
+    }
+
+    // An archive from the local machine, the intranet or trusted sites adds
+    // nothing, and an unmarked one neither.
+    const auto native_archive = archives[0];
+    write_stream(native_archive, "Zone.Identifier", "[ZoneTransfer]\r\nZoneId=2\r\n");
+    extract(native_archive, root / "trusted", axiom::ExtractOptions::MarkOfTheWeb::all);
+    AXIOM_CHECK(!read_stream(root / "trusted" / "src" / "notes.txt"));
+    DeleteFileW((native_archive.wstring() + L":Zone.Identifier").c_str());
+    AXIOM_CHECK(!axiom::core::read_download_mark(native_archive));
+    extract(native_archive, root / "unmarked", axiom::ExtractOptions::MarkOfTheWeb::all);
+    AXIOM_CHECK(!read_stream(root / "unmarked" / "src" / "notes.txt"));
+    // ... and there the file's own stored mark is restored as it was.
+    AXIOM_CHECK(read_stream(root / "unmarked" / "src" / "claims-local.txt") ==
+                std::string("[ZoneTransfer]\r\nZoneId=0\r\n"));
+
+    // A mark that names no readable zone is honoured as an Internet mark, and
+    // anything outside the three known keys is left behind.
+    write_stream(native_archive, "Zone.Identifier", "garbage\r\nHostUrl=bad\x01value\r\n");
+    AXIOM_CHECK(axiom::core::read_download_mark(native_archive) ==
+                std::string("[ZoneTransfer]\r\nZoneId=3\r\n"));
+    write_stream(native_archive, "Zone.Identifier", "[ZoneTransfer]\r\nZoneId=4\r\n");
+    AXIOM_CHECK(axiom::core::read_download_mark(native_archive) ==
+                std::string("[ZoneTransfer]\r\nZoneId=4\r\n"));
+
+    AXIOM_CHECK(axiom::core::is_risky_download_type("Setup.EXE"));
+    AXIOM_CHECK(axiom::core::is_risky_download_type("report.docm"));
+    AXIOM_CHECK(axiom::core::is_risky_download_type("inner.iso"));
+    AXIOM_CHECK(!axiom::core::is_risky_download_type("photo.jpg"));
+    AXIOM_CHECK(!axiom::core::is_risky_download_type("README"));
+
+    std::error_code error;
+    fs::remove_all(root, error);
+}
+
 void test_bundled_7z_provider_layer() {
     const auto seven_zip = bundled_7z_for_tests();
     if (!seven_zip) {
@@ -8905,6 +9053,7 @@ constexpr RegisteredTest kTests[] = {
     {"iso_native_listing_provider_layer", test_iso_native_listing_provider_layer},
     {"system_archive_provider_layer", test_system_archive_provider_layer},
     {"bundled_7z_provider_layer", test_bundled_7z_provider_layer},
+    {"mark_of_the_web", test_mark_of_the_web},
 #endif
     {"zip_aes256_encryption", test_zip_aes256_encryption},
     {"zip_aes_data_descriptor_compatibility", test_zip_aes_data_descriptor_compatibility},

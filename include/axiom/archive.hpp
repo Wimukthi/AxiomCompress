@@ -323,6 +323,21 @@ struct ExtractOptions {
     // capabilities, SELinux labels, POSIX ACLs). Off by default; enable it only
     // for archives you trust, typically your own backups.
     bool restore_privileged_metadata = false;
+
+    // Windows: when the archive itself was downloaded (its Zone.Identifier
+    // stream puts it in the Internet or Restricted zone), give extracted files
+    // the same Mark of the Web, so SmartScreen, Office Protected View and
+    // attachment warnings still apply to them. `all` marks every file, as
+    // Explorer does; `risky` only programs, scripts, shortcuts, documents,
+    // disk images and archives; `off` none. Under a marked archive a file's own
+    // stored Zone.Identifier never replaces the archive's mark. Ignored on
+    // other platforms and for archives that are not marked.
+    enum class MarkOfTheWeb {
+        all,
+        risky,
+        off,
+    };
+    MarkOfTheWeb mark_of_the_web = MarkOfTheWeb::all;
 };
 
 // A filesystem object mapped to an explicit path in an archive. For a directory,

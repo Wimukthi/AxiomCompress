@@ -6,6 +6,7 @@
 
 #include "axiom/archive.hpp"
 #include "core/ensured_directories.hpp"
+#include "core/file_meta.hpp"
 
 #include <array>
 #include <cstdint>
@@ -168,6 +169,34 @@ std::string join_archive_path(std::string_view parent, std::string_view child);
 bool is_within(const std::filesystem::path& base, const std::filesystem::path& target);
 void reject_symlinked_ancestor(const std::filesystem::path& dest_norm,
                                const std::filesystem::path& target);
+
+// The Mark of the Web one extraction run gives its files, decided once from the
+// archive and the caller's policy.
+class DownloadMarkPolicy {
+public:
+    DownloadMarkPolicy(const std::filesystem::path& archive, const ExtractOptions& options)
+        : policy_(options.mark_of_the_web) {
+        if (policy_ != ExtractOptions::MarkOfTheWeb::off) {
+            mark_ = core::read_download_mark(archive);
+        }
+    }
+
+    // The archive is marked and the policy gives some files a mark.
+    bool active() const noexcept { return mark_.has_value(); }
+    // The mark `target` gets, or nullptr.
+    const std::string* mark_for(const std::filesystem::path& target) const {
+        if (!mark_) return nullptr;
+        if (policy_ == ExtractOptions::MarkOfTheWeb::risky &&
+            !core::is_risky_download_type(target)) {
+            return nullptr;
+        }
+        return &*mark_;
+    }
+
+private:
+    ExtractOptions::MarkOfTheWeb policy_;
+    std::optional<std::string> mark_;
+};
 
 // The directory checks one extraction run repeats for every file, made once per
 // directory. Checking each ancestor for a link cost one lookup per level, and

@@ -686,6 +686,15 @@ void reject_symlinked_ancestor(const fs::path& dest_norm, const fs::path& target
     }
 }
 
+static bool is_zone_identifier(const core::AdsStream& stream) {
+    return stream.name.size() == core::kZoneIdentifierStream.size() &&
+           std::equal(stream.name.begin(), stream.name.end(),
+                      core::kZoneIdentifierStream.begin(), [](char a, char b) {
+                          return std::tolower(static_cast<unsigned char>(a)) ==
+                                 std::tolower(static_cast<unsigned char>(b));
+                      });
+}
+
 void ExtractionPathCache::reject_symlinked_ancestor(const fs::path& dest_norm,
                                                     const fs::path& target) {
     std::vector<fs::path> chain;
@@ -11885,6 +11894,7 @@ void extract_entries_impl(const std::filesystem::path& archive_path,
     // asked for until creating a file refuses it, then the rest until that is
     // refused too, after which this run finishes files by path as before.
     std::uint32_t staging_access = core::staged_finish_access(true);
+    const DownloadMarkPolicy download_mark(archive_path, options);
 
     for (std::size_t entry_index = 0; entry_index < index.entries.size(); ++entry_index) {
         if (!selected[entry_index]) {
@@ -12004,7 +12014,26 @@ void extract_entries_impl(const std::filesystem::path& archive_path,
         // A file whose metadata has nothing to wait for (no named streams, sparse
         // ranges, or reparse data, which must land before the times) is renamed
         // and re-permissioned through the handle it was written with.
-        const bool finish_by_handle = staging_access != 0 && file_entry->ads.empty() &&
+        // Under a downloaded archive the archive's mark is the file's mark: a
+        // Zone.Identifier the entry stores (say, one claiming a local origin) is
+        // not restored over it.
+        const std::vector<core::AdsStream>* streams = &file_entry->ads;
+        std::vector<core::AdsStream> unmarked_streams;
+        if (download_mark.active() &&
+            std::any_of(file_entry->ads.begin(), file_entry->ads.end(), is_zone_identifier)) {
+            unmarked_streams = file_entry->ads;
+            std::erase_if(unmarked_streams, is_zone_identifier);
+            streams = &unmarked_streams;
+        }
+        const std::string* const mark = download_mark.mark_for(target);
+        const auto record_mark_failure = [&](const std::string& failure) {
+            if (failure.empty()) return;
+            if (operation) operation->add_warning({entry.path, failure});
+            if (options.strict_metadata) {
+                throw std::runtime_error(failure + ": " + entry.path);
+            }
+        };
+        const bool finish_by_handle = staging_access != 0 && streams->empty() &&
             !file_entry->sparse.is_sparse && !file_entry->meta.has_reparse_data;
         core::StagedFile staged(target, finish_by_handle ? staging_access : 0);
         if (finish_by_handle && !staged.file().extra_access_granted()) {
@@ -12112,6 +12141,12 @@ void extract_entries_impl(const std::filesystem::path& archive_path,
                 fs::remove(target, ec);
                 throw std::runtime_error("failed writing file: " + core::path_to_utf8(target));
             }
+            // The open handle's sharing keeps out a writer of any of the
+            // file's streams, so the mark follows the close. Its times and
+            // attributes are already restored, and the mark keeps them.
+            if (mark != nullptr) {
+                record_mark_failure(core::write_download_mark(target, *mark, true));
+            }
         } else {
             // A close error means buffered data never reached the disk.
             if (!staged.close()) {
@@ -12151,11 +12186,14 @@ void extract_entries_impl(const std::filesystem::path& archive_path,
 
         // NTFS named streams are written before timestamps so restoring the write
         // time isn't disturbed by the stream writes that follow it.
-        for (const auto& warning : core::apply_ads(target, file_entry->ads)) {
+        for (const auto& warning : core::apply_ads(target, *streams)) {
             if (operation) operation->add_warning({entry.path, warning});
             if (options.strict_metadata) {
                 throw std::runtime_error(warning + ": " + entry.path);
             }
+        }
+        if (mark != nullptr && !finished) {
+            record_mark_failure(core::write_download_mark(target, *mark, false));
         }
         // High-precision Windows times (when present) supersede the seconds mtime.
         const auto metadata_warnings = finished

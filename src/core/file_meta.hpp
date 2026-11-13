@@ -217,6 +217,36 @@ std::vector<std::string> apply_metadata(const std::filesystem::path& path,
                                         bool restore_times,
                                         bool restore_privileged = false);
 
+// ---- Mark of the Web ------------------------------------------------------------
+//
+// Windows marks a downloaded file with a "Zone.Identifier" stream naming the
+// security zone it came from. SmartScreen, Office Protected View and the
+// "this file came from another computer" warnings key off that mark, so files
+// extracted from a downloaded archive must carry it too or those checks never
+// see them. Explorer's own ZIP extraction propagates it; so does Axiom.
+
+inline constexpr std::string_view kZoneIdentifierStream = "Zone.Identifier";
+
+// The mark to give files extracted from `archive`: present only when the
+// archive's own Zone.Identifier puts it in the Internet (3) or Restricted (4)
+// zone, reduced to the [ZoneTransfer] section's ZoneId, ReferrerUrl and HostUrl.
+// A stream that exists but names no readable zone is treated as Internet, since
+// a mark is there to be honoured. Always empty on platforms without the mark.
+std::optional<std::string> read_download_mark(const std::filesystem::path& archive);
+
+// Whether a file of this name is one the "risky" policy marks: programs,
+// scripts and installers, shortcuts, Office and PDF documents, and disk images
+// and archives (which would otherwise carry their contents past the mark).
+bool is_risky_download_type(const std::filesystem::path& name);
+
+// Write `mark` as the Zone.Identifier stream of the regular file `path`.
+// `keep_times` restores the file's times afterwards (writing a stream changes
+// its write time) and lifts a read-only attribute for the write; callers that
+// apply times afterwards anyway pass false. Returns an empty string on success,
+// else what went wrong. A no-op that succeeds on platforms without the mark.
+std::string write_download_mark(const std::filesystem::path& path, std::string_view mark,
+                                bool keep_times);
+
 class ExclusiveFile;
 
 // The extra access a staging file needs for finish_staged_file(), to pass to

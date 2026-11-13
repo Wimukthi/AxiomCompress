@@ -139,6 +139,8 @@ void print_usage() {
         "  --strict-metadata  extract only: fail if sparse fidelity or capture report is incomplete\n"
         "  --restore-privileged  extract/restore only: also restore set-user-ID/set-group-ID bits\n"
         "                     and security.*/trusted.*/system.* xattrs (trusted archives only)\n"
+        "  --mark-of-the-web MODE  extract/restore only, Windows: when the archive was\n"
+        "                     downloaded, mark all (default), risky, or off extracted files\n"
         "  --max-output SIZE  refuse a stream or solid block that declares more decoded bytes\n"
         "                     (default 4G); lower it for archives you do not trust\n";
 }
@@ -1244,6 +1246,14 @@ int run_repack(std::vector<std::string> args) {
     return 0;
 }
 
+// The value of --mark-of-the-web.
+axiom::ExtractOptions::MarkOfTheWeb parse_mark_of_the_web(const std::string& value) {
+    if (value == "all") return axiom::ExtractOptions::MarkOfTheWeb::all;
+    if (value == "risky") return axiom::ExtractOptions::MarkOfTheWeb::risky;
+    if (value == "off") return axiom::ExtractOptions::MarkOfTheWeb::off;
+    throw std::invalid_argument("--mark-of-the-web must be all, risky, or off");
+}
+
 int run_extract(std::vector<std::string> args) {
     axiom::ExtractOptions extract;
     axiom::DecompressionOptions decompression;
@@ -1270,6 +1280,12 @@ int run_extract(std::vector<std::string> args) {
             extract.strict_metadata = true;
         } else if (args[i] == "--restore-privileged") {
             extract.restore_privileged_metadata = true;
+        } else if (args[i] == "--mark-of-the-web") {
+            if (i + 1 >= args.size()) {
+                print_usage();
+                return 2;
+            }
+            extract.mark_of_the_web = parse_mark_of_the_web(args[++i]);
         } else if (args[i] == "--include") {
             if (i + 1 >= args.size() || args[i + 1].empty()) {
                 print_usage();
@@ -1496,6 +1512,12 @@ int run_snapshot(std::vector<std::string> args) {
                 extract.strict_metadata = true;
             } else if (args[i] == "--restore-privileged") {
                 extract.restore_privileged_metadata = true;
+            } else if (args[i] == "--mark-of-the-web") {
+                if (i + 1 >= args.size()) {
+                    print_usage();
+                    return 2;
+                }
+                extract.mark_of_the_web = parse_mark_of_the_web(args[++i]);
             } else if (args[i] == "--threads") {
                 if (i + 1 >= args.size()) {
                     print_usage();

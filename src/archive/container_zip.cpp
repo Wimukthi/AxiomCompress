@@ -2141,6 +2141,7 @@ public:
         };
         std::vector<DeferredDir> deferred_dirs;
         ExtractionPathCache paths;
+        const DownloadMarkPolicy download_mark(archive_path, options);
 
         for (const auto* selected_plan : selected) {
             const auto& plan = *selected_plan;
@@ -2225,6 +2226,13 @@ public:
                 }
             }
             staged.dismiss();
+            // Before the time is restored: writing the stream moves it.
+            if (const std::string* mark = download_mark.mark_for(target)) {
+                const auto failure = core::write_download_mark(target, *mark, false);
+                if (!failure.empty() && options.operation) {
+                    options.operation->add_warning({entry.path, failure});
+                }
+            }
             if (options.restore_mtime && entry.mtime != 0) {
                 try {
                     fs::last_write_time(target, from_unix_seconds(entry.mtime), ec);
