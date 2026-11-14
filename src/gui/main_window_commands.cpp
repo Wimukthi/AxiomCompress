@@ -1363,66 +1363,24 @@ void MainWindow::on_update_download_complete(LPARAM lparam) {
 }
 
 void MainWindow::on_find_files() {
-    std::vector<FileSearchSourceItem> source;
-    source.reserve(browser_items_.size());
-    for (int index = 0; index < static_cast<int>(browser_items_.size()); ++index) {
-        const auto& item = browser_items_[static_cast<std::size_t>(index)];
-        if (item.is_parent()) continue;
-        FileSearchSourceItem source_item;
-        source_item.browser_index = index;
-        source_item.kind = item.kind;
-        source_item.target_location = history_.current();
-        source_item.filesystem_path = item.filesystem_path;
-        source_item.archive_entry_path = item.archive_path;
-        source_item.recurse_directory =
-            item.kind == axiom::gui::BrowserItemKind::directory &&
-            item.attributes.find(L'L') == std::wstring::npos;
-        source_item.name = item.name;
-        source_item.type = item.type;
-        source_item.modified = item.modified;
-        if (item.kind != axiom::gui::BrowserItemKind::directory &&
-            item.kind != axiom::gui::BrowserItemKind::drive) {
-            source_item.size = format_size(item.size);
-        }
-
-        if (!item.filesystem_path.empty()) {
-            source_item.location = item.filesystem_path.parent_path().wstring();
-        } else if (!item.archive_path.empty()) {
-            const auto separator = item.archive_path.find_last_of('/');
-            source_item.location = separator == std::string::npos
-                ? L"/"
-                : L"/" + widen(std::string_view(item.archive_path).substr(0, separator));
-        } else {
-            source_item.location = history_.current().display_name();
-        }
-        source_item.folded_name = folded_text(source_item.name);
-        source_item.folded_search_text = folded_text(
-            source_item.location.empty()
-                ? source_item.name
-                : source_item.location + L"\\" + source_item.name);
-        source.push_back(std::move(source_item));
-    }
-
     FileSearchDialog dialog(instance_, theme_, dpi_, history_.current(), archive_catalog_,
-                            std::move(source));
+                            application_options_.show_hidden);
     const auto result = dialog.show(hwnd_);
     if (!result.accepted) return;
-    const bool direct_index_valid =
-        result.browser_index >= 0 &&
-        result.browser_index < static_cast<int>(browser_items_.size()) &&
-        result.target_location == history_.current();
-    const bool direct_item_matches = direct_index_valid &&
-        ((!result.filesystem_path.empty() &&
-          same_filesystem_path(
-              browser_items_[static_cast<std::size_t>(result.browser_index)].filesystem_path,
-              result.filesystem_path)) ||
-         (!result.archive_entry_path.empty() &&
-          browser_items_[static_cast<std::size_t>(result.browser_index)].archive_path ==
-              result.archive_entry_path));
-    if (direct_item_matches) {
-        table_.select_index(result.browser_index);
-        SetFocus(list_);
-        return;
+    // A result in the folder already shown is selected where it is.
+    if (result.target_location == history_.current()) {
+        for (int index = 0; index < static_cast<int>(browser_items_.size()); ++index) {
+            const auto& item = browser_items_[static_cast<std::size_t>(index)];
+            const bool same = (!result.filesystem_path.empty() &&
+                               same_filesystem_path(item.filesystem_path, result.filesystem_path)) ||
+                              (!result.archive_entry_path.empty() &&
+                               item.archive_path == result.archive_entry_path);
+            if (same) {
+                table_.select_index(index);
+                SetFocus(list_);
+                return;
+            }
+        }
     }
     pending_find_location_ = result.target_location;
     pending_find_filesystem_path_ = result.filesystem_path;

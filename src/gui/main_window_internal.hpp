@@ -23,6 +23,7 @@
 #include "gui/operation_progress_window.hpp"
 #include "gui/resource.hpp"
 #include "gui/retiring_thread.hpp"
+#include "archive/file_search.hpp"
 #include "gui/settings_store.hpp"
 #include "gui/sfx_dialog.hpp"
 #include "sfx/module_file.hpp"
@@ -444,6 +445,9 @@ public:
                           IconProvider icon_provider,
                           MatchTextProvider match_text_provider,
                           HIMAGELIST image_list);
+    // Grow or shrink a virtual table in place, keeping its scroll position and
+    // selection, for a list that fills while it is shown.
+    void set_virtual_row_count(std::size_t row_count);
     std::vector<int> selected_indices() const;
     int focused_index() const;
     int vertical_scroll_position() const;
@@ -754,24 +758,8 @@ private:
     PaintBuffer paint_buffer_;
 
 };
-struct FileSearchSourceItem {
-    int browser_index = -1;
-    axiom::gui::BrowserItemKind kind = axiom::gui::BrowserItemKind::file;
-    axiom::gui::BrowserLocation target_location;
-    fs::path filesystem_path;
-    std::string archive_entry_path;
-    bool recurse_directory = false;
-    std::wstring name;
-    std::wstring location;
-    std::wstring type;
-    std::wstring size;
-    std::wstring modified;
-    std::wstring folded_name;
-    std::wstring folded_search_text;
-};
 struct FileSearchDialogResult {
     bool accepted = false;
-    int browser_index = -1;
     axiom::gui::BrowserLocation target_location;
     fs::path filesystem_path;
     std::string archive_entry_path;
@@ -784,7 +772,7 @@ public:
                      UINT dpi,
                      axiom::gui::BrowserLocation location,
                      std::shared_ptr<const axiom::gui::ArchiveCatalog> archive_catalog,
-                     std::vector<FileSearchSourceItem> source);
+                     bool include_hidden);
     FileSearchDialogResult show(HWND owner);
 
 
@@ -807,17 +795,14 @@ private:
         kIncludeSubfolders = 30113,
         kFindInArchives = 30114,
         kSkipEncrypted = 30115,
-        kSearchResultsMessage = WM_APP + 110,
-        kSearchProgressMessage = WM_APP + 111,
+        kMatchTimer = 30116,
+        kSearchBatchMessage = WM_APP + 110,
+        kSearchDoneMessage = WM_APP + 111,
     };
-    struct SearchPayload {
+    // A batch from the walk, tagged with the walk it belongs to.
+    struct BatchPayload {
         std::uint64_t generation = 0;
-        std::vector<FileSearchDialogResult> targets;
-        std::vector<std::vector<std::wstring>> rows;
-        std::size_t scanned_items = 0;
-        std::size_t skipped_archives = 0;
-        std::size_t read_errors = 0;
-        bool result_limit_reached = false;
+        axiom::search::Batch batch;
     };
     static const wchar_t* class_name();
     static bool register_class(HINSTANCE instance);
@@ -831,14 +816,17 @@ private:
     bool checkbox_checked(int id) const;
     void set_checkbox(int id, bool checked);
     void toggle_checkbox(int id);
-    static bool is_folder_kind(axiom::gui::BrowserItemKind kind);
-    static bool is_archive_kind(axiom::gui::BrowserItemKind kind);
-    static bool is_file_kind(axiom::gui::BrowserItemKind kind);
-    bool type_allowed(const FileSearchSourceItem& item) const;
-    bool text_matches(const FileSearchSourceItem& item, std::wstring_view query,
-                      std::wstring_view folded_query) const;
-    void run_search();
-    void apply_search_results(LPARAM payload);
+    // Refine the results from the index when it covers the current options,
+    // otherwise (or when `rescan`) walk the search area again.
+    void run_search(bool rescan);
+    std::wstring walk_key() const;
+    void start_walk();
+    void on_batch(LPARAM payload);
+    void on_walk_done(WPARAM generation);
+    void match_pending();
+    void update_status();
+    std::vector<std::wstring> result_row(std::size_t row) const;
+    FileSearchDialogResult result_target(std::size_t row) const;
     void accept_selected();
     void layout();
     void create_controls();
@@ -864,9 +852,29 @@ private:
 
     std::shared_ptr<const axiom::gui::ArchiveCatalog> archive_catalog_;
 
-    std::vector<FileSearchSourceItem> source_;
+    bool include_hidden_ = true;
 
-    std::vector<FileSearchDialogResult> result_targets_;
+    // Everything the last walk found, owned by the UI thread. Refining the query
+    // re-matches this instead of walking the disk again.
+    std::unique_ptr<axiom::search::Index> index_;
+
+    std::wstring index_key_;
+
+    std::optional<axiom::search::Query> query_;
+
+    std::wstring query_error_;
+
+    // Indexes into index_->entries() of the current matches, and how far
+    // through the index the current query has been matched.
+    std::vector<std::uint32_t> matches_;
+
+    std::size_t matched_upto_ = 0;
+
+    bool walking_ = false;
+
+    std::chrono::steady_clock::time_point walk_started_{};
+
+    double walk_seconds_ = 0;
 
     FileSearchDialogResult result_;
 

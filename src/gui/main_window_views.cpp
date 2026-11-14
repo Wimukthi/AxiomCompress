@@ -295,6 +295,16 @@ void DarkTableView::set_virtual_rows(std::size_t count,
     invalidate();
 }
 
+void DarkTableView::set_virtual_row_count(std::size_t count) {
+    if (count == virtual_row_count_) return;
+    virtual_row_count_ = count;
+    selected_.resize(count, false);
+    if (selected_row_ >= static_cast<int>(count)) selected_row_ = -1;
+    if (selection_anchor_ >= static_cast<int>(count)) selection_anchor_ = -1;
+    clamp_scroll();
+    invalidate();
+}
+
 std::vector<int> DarkTableView::selected_indices() const {
     std::vector<int> result;
     for (int index = 0; index < static_cast<int>(selected_.size()); ++index) {

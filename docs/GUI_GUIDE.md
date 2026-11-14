@@ -218,14 +218,23 @@ search text inside files.
 
 1. Enter **Name/path text**, or leave it empty to list every matching item.
 2. Choose the search area and whether to include child folders and archives.
-3. Select **Search**. Select a result and choose **Go to**, or double-click it,
-   to open its location and select it in the main browser.
+3. Select **Search**. Results appear while the search is still running. Select
+   one and choose **Go to**, or double-click it, to open its location and
+   select it in the main browser.
+
+The text uses the same language as the instant filter: every term must match,
+`-` excludes, quotes keep a phrase together, `*` and `?` are wildcards, and the
+fields `name:`, `ext:`, `path:`, `size:`, `date:` and `type:` (`file`,
+`folder`, `archive` or `link`) narrow the search. For example,
+`report ext:pdf size:>1MB -draft` finds PDF files over 1 MiB with "report" in
+the name and not "draft". A field the search cannot read, such as `size:huge`,
+is reported in the status line and the previous results stay.
 
 | Control | How to use it |
 |---|---|
 | Match case | Require the same uppercase and lowercase letters |
-| Whole name | Match the complete name, or complete path when searching paths, instead of a substring |
-| Search path | Include each item's relative path in the name search |
+| Whole name | A plain term must be the complete name instead of part of it |
+| Search path | Let plain terms match the item's location as well as its name |
 | Files (names), Folders, Archive files | Choose which kinds of results appear |
 | Search area | Choose Current folder/Current drive, Current archive folder/Entire archive, or This PC, according to the open location |
 | Find in subfolders | Include descendants; filesystem reparse-point folders are not followed |
@@ -233,10 +242,17 @@ search text inside files.
 | Archive types | Enter semicolon-separated filename patterns such as `*.axar;*.zip`; `*` includes all supported types |
 | Skip encrypted | Exclude archives reported as encrypted; unreadable encrypted directories otherwise produce warnings |
 
-Results show Name, Location, Type, Size, and Modified. The window reports scan
-progress, skipped encrypted archives, read warnings, and a result-limit notice
-when the result set is truncated. Narrow the search if that notice appears.
-After the first search, changing the text or search options updates the results.
+Results show Name, Location, Type, Size, and Modified. The status line reports
+how many items were scanned and how long it took, skipped encrypted archives,
+read warnings, and a notice if more than a million results matched.
+
+The search reads folders on several threads and opens each archive once, then
+keeps what it found. After the first search, editing the text or the Match
+case, Whole name, Search path and result-type choices refines those results in
+memory, without reading the disk again. Changing the search area, Find in
+subfolders, Find in archives, Archive types or Skip encrypted searches again,
+and so does **Search** itself, which picks up files that changed since. Hidden
+and system items are searched only when the file list shows them.
 **Close** leaves the main location unchanged; **Go to** clears its instant
 filter so the chosen result is visible.
 

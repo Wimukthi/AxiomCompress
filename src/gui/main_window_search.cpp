@@ -13,98 +13,9 @@ constexpr DWORD kFileSearchStyle =
     WS_CLIPCHILDREN | WS_CLIPSIBLINGS;
 constexpr DWORD kFileSearchExStyle = WS_EX_WINDOWEDGE | WS_EX_CONTROLPARENT;
 
-constexpr std::size_t kFileSearchResultLimit = 100000;
+// Matches beyond this are not listed; the index itself is not capped.
+constexpr std::size_t kFileSearchResultLimit = 1000000;
 
-bool wildcard_match_folded(std::wstring_view pattern, std::wstring_view text) {
-    std::size_t pattern_index = 0;
-    std::size_t text_index = 0;
-    std::size_t star_index = std::wstring_view::npos;
-    std::size_t star_text_index = 0;
-    while (text_index < text.size()) {
-        if (pattern_index < pattern.size() &&
-            (pattern[pattern_index] == L'?' ||
-             std::towlower(pattern[pattern_index]) == std::towlower(text[text_index]))) {
-            ++pattern_index;
-            ++text_index;
-        } else if (pattern_index < pattern.size() && pattern[pattern_index] == L'*') {
-            star_index = pattern_index++;
-            star_text_index = text_index;
-        } else if (star_index != std::wstring_view::npos) {
-            pattern_index = star_index + 1;
-            text_index = ++star_text_index;
-        } else {
-            return false;
-        }
-    }
-    while (pattern_index < pattern.size() && pattern[pattern_index] == L'*') {
-        ++pattern_index;
-    }
-    return pattern_index == pattern.size();
-}
-
-bool archive_type_matches(std::wstring_view patterns, const fs::path& path) {
-    const std::wstring filename = path.filename().wstring();
-    std::size_t start = 0;
-    bool saw_pattern = false;
-    while (start <= patterns.size()) {
-        std::size_t end = patterns.find_first_of(L";,", start);
-        if (end == std::wstring_view::npos) end = patterns.size();
-        std::wstring_view pattern = patterns.substr(start, end - start);
-        while (!pattern.empty() && std::iswspace(pattern.front())) pattern.remove_prefix(1);
-        while (!pattern.empty() && std::iswspace(pattern.back())) pattern.remove_suffix(1);
-        if (!pattern.empty()) {
-            saw_pattern = true;
-            if (pattern == L"*" || pattern == L"*.*" ||
-                wildcard_match_folded(pattern, filename)) {
-                return true;
-            }
-        }
-        if (end == patterns.size()) break;
-        start = end + 1;
-    }
-    return !saw_pattern;
-}
-
-std::string archive_parent_path(std::string_view path) {
-    const std::size_t separator = path.find_last_of('/');
-    return separator == std::string_view::npos
-        ? std::string{}
-        : std::string(path.substr(0, separator));
-}
-
-FileSearchSourceItem search_item_from_browser_item(
-    const axiom::gui::BrowserItem& item,
-    const axiom::gui::BrowserLocation& parent,
-    int browser_index = -1) {
-    FileSearchSourceItem result;
-    result.browser_index = browser_index;
-    result.kind = item.kind;
-    result.target_location = parent;
-    result.filesystem_path = item.filesystem_path;
-    result.archive_entry_path = item.archive_path;
-    result.recurse_directory =
-        item.kind == axiom::gui::BrowserItemKind::directory &&
-        item.attributes.find(L'L') == std::wstring::npos;
-    result.name = item.name;
-    result.type = item.type;
-    result.modified = item.modified;
-    if (item.kind != axiom::gui::BrowserItemKind::directory &&
-        item.kind != axiom::gui::BrowserItemKind::drive) {
-        result.size = format_size(item.size);
-    }
-    if (!item.filesystem_path.empty()) {
-        result.location = item.filesystem_path.parent_path().wstring();
-    } else if (!item.archive_path.empty()) {
-        result.location = axiom::gui::BrowserLocation::archive(
-            parent.archive_path, archive_parent_path(item.archive_path)).display_name();
-    } else {
-        result.location = parent.display_name();
-    }
-    result.folded_name = folded_text(result.name);
-    result.folded_search_text = folded_text(
-        result.location.empty() ? result.name : result.location + L"\\" + result.name);
-    return result;
-}
 }
 
 FileSearchDialog::FileSearchDialog(HINSTANCE instance,
@@ -112,14 +23,14 @@ FileSearchDialog::FileSearchDialog(HINSTANCE instance,
                  UINT dpi,
                  axiom::gui::BrowserLocation location,
                  std::shared_ptr<const axiom::gui::ArchiveCatalog> archive_catalog,
-                 std::vector<FileSearchSourceItem> source)
+                 bool include_hidden)
     : instance_(instance),
       theme_(theme),
       dpi_(dpi == 0 ? USER_DEFAULT_SCREEN_DPI : dpi),
       scope_(L"Scope: " + location.display_name()),
       location_(std::move(location)),
       archive_catalog_(std::move(archive_catalog)),
-      source_(std::move(source)) {}
+      include_hidden_(include_hidden) {}
 
 FileSearchDialogResult FileSearchDialog::show(HWND owner) {
     owner_ = owner;
@@ -266,52 +177,26 @@ void FileSearchDialog::toggle_checkbox(int id) {
         }
     }
     set_checkbox(id, !checkbox_checked(id));
-    if (search_started_) run_search();
+    // Options that change what is searched walk again (the index key changes);
+    // the rest refine what was found.
+    if (search_started_) run_search(false);
 }
 
-bool FileSearchDialog::is_folder_kind(axiom::gui::BrowserItemKind kind) {
-    return kind == axiom::gui::BrowserItemKind::directory ||
-           kind == axiom::gui::BrowserItemKind::drive;
-}
-
-bool FileSearchDialog::is_archive_kind(axiom::gui::BrowserItemKind kind) {
-    return kind == axiom::gui::BrowserItemKind::archive;
-}
-
-bool FileSearchDialog::is_file_kind(axiom::gui::BrowserItemKind kind) {
-    return kind == axiom::gui::BrowserItemKind::file ||
-           kind == axiom::gui::BrowserItemKind::symlink ||
-           kind == axiom::gui::BrowserItemKind::hardlink;
-}
-
-bool FileSearchDialog::type_allowed(const FileSearchSourceItem& item) const {
-    if (is_file_kind(item.kind) && include_files_checked_) return true;
-    if (is_folder_kind(item.kind) && include_folders_checked_) return true;
-    if (is_archive_kind(item.kind) && include_archives_checked_) return true;
-    return false;
-}
-
-bool FileSearchDialog::text_matches(const FileSearchSourceItem& item, std::wstring_view query,
-                                    std::wstring_view folded_query) const {
-    if (query.empty()) return true;
-
-    if (whole_name_checked_) {
-        return match_case_checked_ ? item.name == query
-                                   : item.folded_name == folded_query;
+std::wstring FileSearchDialog::walk_key() const {
+    int area = static_cast<int>(SendMessageW(search_area_, CB_GETCURSEL, 0, 0));
+    if (area < 0) area = 0;
+    std::wstring key = location_.display_name();
+    key += L"|" + std::to_wstring(area);
+    key += include_subfolders_checked_ ? L"|sub" : L"|top";
+    key += include_hidden_ ? L"|hidden" : L"|visible";
+    if (find_in_archives_checked_ && location_.kind != axiom::gui::BrowserLocationKind::archive) {
+        key += L"|archives:" + get_text(archive_types_);
+        key += skip_encrypted_checked_ ? L"|skip" : L"|open";
     }
-    if (match_case_checked_) {
-        const std::wstring haystack = search_path_checked_ && !item.location.empty()
-            ? item.location + L"\\" + item.name
-            : item.name;
-        return haystack.find(query) != std::wstring::npos;
-    }
-    const std::wstring_view haystack = search_path_checked_
-        ? std::wstring_view(item.folded_search_text)
-        : std::wstring_view(item.folded_name);
-    return haystack.find(folded_query) != std::wstring_view::npos;
+    return key;
 }
 
-void FileSearchDialog::run_search() {
+void FileSearchDialog::run_search(bool rescan) {
     if (!include_files_checked_ && !include_folders_checked_ &&
         !include_archives_checked_) {
         MessageBeep(MB_ICONINFORMATION);
@@ -321,241 +206,222 @@ void FileSearchDialog::run_search() {
         return;
     }
     search_started_ = true;
-    // The previous search is told to stop but not waited for: one scanning an
-    // archive cannot stop mid-open, and waiting froze typing in the search box.
-    // Its results carry an older generation and are dropped.
-    const std::uint64_t generation = ++search_generation_;
-    result_targets_.clear();
-    results_.clear();
+
+    axiom::search::QueryOptions options;
+    options.match_case = match_case_checked_;
+    options.whole_name = whole_name_checked_;
+    options.search_path = search_path_checked_;
+    options.files = include_files_checked_;
+    options.folders = include_folders_checked_;
+    options.archives = include_archives_checked_;
+    std::wstring error;
+    auto query = axiom::search::Query::compile(get_text(search_edit_), options, &error);
+    if (!query) {
+        // Keep the last results; say what is wrong with the new query.
+        query_error_ = std::move(error);
+        update_status();
+        return;
+    }
+    query_error_.clear();
+    query_ = std::move(query);
+    matches_.clear();
+    matched_upto_ = 0;
+    results_.set_virtual_row_count(0);
     EnableWindow(go_to_button_, FALSE);
-    set_text(result_count_, L"Searching...");
-    const std::wstring query = get_text(search_edit_);
-    const std::wstring folded_query = folded_text(query);
-    const std::wstring archive_patterns = get_text(archive_types_);
-    int search_area = static_cast<int>(SendMessageW(search_area_, CB_GETCURSEL, 0, 0));
-    if (search_area < 0) search_area = 0;
-    const bool include_files = include_files_checked_;
-    const bool include_folders = include_folders_checked_;
-    const bool include_archives = include_archives_checked_;
-    const bool include_subfolders = include_subfolders_checked_;
-    const bool find_in_archives = find_in_archives_checked_;
-    const bool skip_encrypted = skip_encrypted_checked_;
-    const bool match_case = match_case_checked_;
-    const bool whole_name = whole_name_checked_;
-    const bool search_path = search_path_checked_;
-    const auto source = source_;
-    const auto location = location_;
-    const auto active_catalog = archive_catalog_;
-    HWND target = hwnd_;
-    search_thread_.start(
-        [source, location, active_catalog, target, generation, query, folded_query,
-         archive_patterns, search_area,
-         include_files, include_folders, include_archives,
-         include_subfolders, find_in_archives, skip_encrypted,
-         match_case, whole_name, search_path](std::stop_token stop) {
-            auto payload = std::make_unique<SearchPayload>();
-            payload->generation = generation;
-            payload->targets.reserve(std::min<std::size_t>(source.size(), 4096));
-            payload->rows.reserve(std::min<std::size_t>(source.size(), 4096));
 
-            const auto limit_reached = [&] {
-                if (payload->targets.size() < kFileSearchResultLimit) return false;
-                payload->result_limit_reached = true;
-                return true;
-            };
-            const auto add_match = [&](const FileSearchSourceItem& item) {
-                if (limit_reached()) return;
-                ++payload->scanned_items;
-                if ((payload->scanned_items & 1023u) == 0u) {
-                    PostMessageW(target, kSearchProgressMessage,
-                                 static_cast<WPARAM>(generation),
-                                 static_cast<LPARAM>(payload->scanned_items));
-                }
-                const bool folder = is_folder_kind(item.kind);
-                const bool archive = is_archive_kind(item.kind);
-                const bool file = is_file_kind(item.kind);
-                if ((folder && !include_folders) ||
-                    (archive && !include_archives) ||
-                    (file && !include_files) || (!folder && !archive && !file)) {
-                    return;
-                }
-                bool matches = query.empty();
-                if (!matches && whole_name) {
-                    matches = match_case ? item.name == query
-                                         : item.folded_name == folded_query;
-                } else if (!matches && match_case) {
-                    const std::wstring haystack = search_path && !item.location.empty()
-                        ? item.location + L"\\" + item.name
-                        : item.name;
-                    matches = haystack.find(query) != std::wstring::npos;
-                } else if (!matches) {
-                    const std::wstring_view haystack = search_path
-                        ? std::wstring_view(item.folded_search_text)
-                        : std::wstring_view(item.folded_name);
-                    matches = haystack.find(folded_query) != std::wstring_view::npos;
-                }
-                if (!matches) return;
-                FileSearchDialogResult result;
-                result.browser_index = item.browser_index;
-                result.target_location = item.target_location;
-                result.filesystem_path = item.filesystem_path;
-                result.archive_entry_path = item.archive_entry_path;
-                payload->targets.push_back(std::move(result));
-                payload->rows.push_back(
-                    {item.name, item.location, item.type, item.size, item.modified});
-            };
-
-            const auto scan_catalog = [&](const std::shared_ptr<const axiom::gui::ArchiveCatalog>& catalog,
-                                          std::string base_directory,
-                                          bool recurse) {
-                std::deque<std::string> directories;
-                directories.push_back(std::move(base_directory));
-                while (!directories.empty() && !stop.stop_requested() && !limit_reached()) {
-                    std::string directory = std::move(directories.front());
-                    directories.pop_front();
-                    const auto parent = axiom::gui::BrowserLocation::archive(
-                        catalog->path(), directory);
-                    const auto snapshot = catalog->list(parent, stop);
-                    for (const auto& browser_item : snapshot.items) {
-                        if (stop.stop_requested() || limit_reached()) return;
-                        if (browser_item.is_parent()) continue;
-                        auto item = search_item_from_browser_item(browser_item, parent);
-                        add_match(item);
-                        if (recurse && item.recurse_directory) {
-                            directories.push_back(item.archive_entry_path);
-                        }
-                    }
-                }
-            };
-
-            std::unordered_set<std::wstring> searched_archives;
-            const auto scan_archive = [&](const fs::path& archive_path) {
-                if (!find_in_archives || stop.stop_requested() || limit_reached() ||
-                    !archive_type_matches(archive_patterns, archive_path)) {
-                    return;
-                }
-                const std::wstring key = folded_text(archive_path.lexically_normal().wstring());
-                if (!searched_archives.insert(key).second) return;
-                try {
-                    const auto* provider = axiom::archive_provider_for_path(archive_path);
-                    if (provider == nullptr) return;
-                    const auto capabilities = provider->capabilities(archive_path);
-                    if (skip_encrypted && capabilities.encrypted) {
-                        ++payload->skipped_archives;
-                        return;
-                    }
-                    auto catalog = axiom::gui::ArchiveCatalog::load(archive_path);
-                    scan_catalog(catalog, {}, include_subfolders);
-                } catch (...) {
-                    ++payload->read_errors;
-                }
-            };
-
-            const auto process_item = [&](const FileSearchSourceItem& item) {
-                add_match(item);
-                if (item.kind == axiom::gui::BrowserItemKind::archive &&
-                    !item.filesystem_path.empty()) {
-                    scan_archive(item.filesystem_path);
-                }
-            };
-
-            const auto scan_filesystem = [&](fs::path first_directory, bool recurse) {
-                std::deque<fs::path> directories;
-                directories.push_back(std::move(first_directory));
-                while (!directories.empty() && !stop.stop_requested() && !limit_reached()) {
-                    fs::path directory = std::move(directories.front());
-                    directories.pop_front();
-                    const auto parent = axiom::gui::BrowserLocation::filesystem(directory);
-                    auto loaded = axiom::gui::load_browser_location(
-                        parent, 0, nullptr, stop);
-                    if (!loaded.snapshot.error.empty()) ++payload->read_errors;
-                    for (const auto& browser_item : loaded.snapshot.items) {
-                        if (stop.stop_requested() || limit_reached()) return;
-                        if (browser_item.is_parent()) continue;
-                        auto item = search_item_from_browser_item(browser_item, parent);
-                        process_item(item);
-                        if (recurse && item.recurse_directory) {
-                            directories.push_back(item.filesystem_path);
-                        }
-                    }
-                }
-            };
-
-            if (location.kind == axiom::gui::BrowserLocationKind::archive &&
-                active_catalog && search_area == 1) {
-                scan_catalog(active_catalog, {}, include_subfolders);
-            } else if (location.kind == axiom::gui::BrowserLocationKind::filesystem &&
-                       search_area == 1) {
-                fs::path root = location.filesystem_path.root_path();
-                if (root.empty()) root = location.filesystem_path;
-                scan_filesystem(std::move(root), include_subfolders);
-            } else {
-                for (const auto& item : source) {
-                    if (stop.stop_requested()) return;
-                    if (limit_reached()) break;
-                    process_item(item);
-                }
-                if (include_subfolders) {
-                    if (location.kind == axiom::gui::BrowserLocationKind::archive &&
-                        active_catalog) {
-                        for (const auto& item : source) {
-                            if (stop.stop_requested()) return;
-                            if (limit_reached()) break;
-                            if (item.recurse_directory) {
-                                scan_catalog(active_catalog, item.archive_entry_path, true);
-                            }
-                        }
-                    } else {
-                        for (const auto& item : source) {
-                            if (stop.stop_requested()) return;
-                            if (limit_reached()) break;
-                            if (item.recurse_directory && !item.filesystem_path.empty()) {
-                                scan_filesystem(item.filesystem_path, true);
-                            } else if (item.kind == axiom::gui::BrowserItemKind::drive &&
-                                       !item.filesystem_path.empty()) {
-                                scan_filesystem(item.filesystem_path, true);
-                            }
-                        }
-                    }
-                }
-            }
-            if (stop.stop_requested()) return;
-            SearchPayload* raw = payload.release();
-            if (!PostMessageW(target, kSearchResultsMessage, 0,
-                              reinterpret_cast<LPARAM>(raw))) {
-                delete raw;
-            }
-        });
+    if (rescan || !index_ || index_key_ != walk_key()) {
+        start_walk();
+    }
+    match_pending();
+    if (walking_ || (index_ && matched_upto_ < index_->entries().size())) {
+        SetTimer(hwnd_, kMatchTimer, 15, nullptr);
+    }
+    update_status();
 }
 
-void FileSearchDialog::apply_search_results(LPARAM value) {
-    std::unique_ptr<SearchPayload> payload(reinterpret_cast<SearchPayload*>(value));
-    if (!payload || payload->generation != search_generation_) return;
-    result_targets_ = std::move(payload->targets);
-    results_.set_rows(std::move(payload->rows), {}, nullptr);
-    if (!result_targets_.empty()) {
-        results_.select_index(0);
+void FileSearchDialog::start_walk() {
+    // A walk still running is told to stop and left to finish on its own; its
+    // batches carry an older generation and are dropped.
+    const std::uint64_t generation = ++search_generation_;
+    index_ = std::make_unique<axiom::search::Index>();
+    index_key_ = walk_key();
+    walk_started_ = std::chrono::steady_clock::now();
+    walk_seconds_ = 0;
+
+    int area = static_cast<int>(SendMessageW(search_area_, CB_GETCURSEL, 0, 0));
+    if (area < 0) area = 0;
+    const bool recurse = include_subfolders_checked_;
+
+    if (location_.kind == axiom::gui::BrowserLocationKind::archive) {
+        // The open archive's directory is already in memory: list it at once.
+        walking_ = false;
+        if (archive_catalog_) {
+            axiom::search::Batch batch;
+            axiom::search::add_archive_entries(
+                batch, archive_catalog_->path(), archive_catalog_->entries(),
+                area == 1 ? std::string_view{} : std::string_view(location_.archive_directory),
+                recurse);
+            index_->append(std::move(batch));
+        }
+        walk_seconds_ = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - walk_started_).count();
+        return;
     }
-    std::wstring status = quote_count(result_targets_.size(), L"match", L"matches") +
-        L"  |  " + quote_count(payload->scanned_items, L"item scanned", L"items scanned");
-    if (payload->skipped_archives != 0) {
-        status += L"  |  " + quote_count(payload->skipped_archives,
-                                          L"encrypted archive skipped",
-                                          L"encrypted archives skipped");
+
+    std::vector<fs::path> roots;
+    if (location_.kind == axiom::gui::BrowserLocationKind::filesystem) {
+        fs::path root = location_.filesystem_path;
+        if (area == 1) {
+            root = location_.filesystem_path.root_path();
+            if (root.empty()) root = location_.filesystem_path;
+        }
+        roots.push_back(std::move(root));
+    } else {
+        const DWORD required = GetLogicalDriveStringsW(0, nullptr);
+        std::wstring drives(static_cast<std::size_t>(required) + 1, L'\0');
+        GetLogicalDriveStringsW(static_cast<DWORD>(drives.size()), drives.data());
+        for (const wchar_t* drive = drives.c_str(); *drive != L'\0'; drive += wcslen(drive) + 1) {
+            roots.emplace_back(drive);
+        }
     }
-    if (payload->read_errors != 0) {
-        status += L"  |  " + quote_count(payload->read_errors,
-                                          L"read warning", L"read warnings");
+
+    axiom::search::WalkOptions options;
+    options.recurse = recurse;
+    options.include_hidden = include_hidden_;
+    options.search_archives = find_in_archives_checked_;
+    options.archive_patterns = get_text(archive_types_);
+    options.skip_encrypted = skip_encrypted_checked_;
+    walking_ = true;
+    const HWND target = hwnd_;
+    search_thread_.start([target, generation, roots = std::move(roots),
+                          options = std::move(options)](std::stop_token stop) {
+        axiom::search::walk(roots, options, stop, [&](axiom::search::Batch&& batch) {
+            auto* payload = new BatchPayload{generation, std::move(batch)};
+            if (!PostMessageW(target, kSearchBatchMessage, 0, reinterpret_cast<LPARAM>(payload))) {
+                delete payload;
+            }
+        });
+        PostMessageW(target, kSearchDoneMessage, static_cast<WPARAM>(generation), 0);
+    });
+}
+
+void FileSearchDialog::on_batch(LPARAM value) {
+    std::unique_ptr<BatchPayload> payload(reinterpret_cast<BatchPayload*>(value));
+    if (!payload || payload->generation != search_generation_ || !index_) return;
+    index_->append(std::move(payload->batch));
+    SetTimer(hwnd_, kMatchTimer, 15, nullptr);
+}
+
+void FileSearchDialog::on_walk_done(WPARAM generation) {
+    if (static_cast<std::uint64_t>(generation) != search_generation_) return;
+    walking_ = false;
+    walk_seconds_ = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - walk_started_).count();
+    match_pending();
+    update_status();
+}
+
+void FileSearchDialog::match_pending() {
+    if (!index_ || !query_) return;
+    // Matched in slices so a large index never stalls the window: what is left
+    // continues on the next timer tick.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(12);
+    const auto& entries = index_->entries();
+    const std::size_t before = matches_.size();
+    while (matched_upto_ < entries.size() && matches_.size() < kFileSearchResultLimit) {
+        const std::size_t end = std::min(entries.size(), matched_upto_ + 2048);
+        for (; matched_upto_ < end; ++matched_upto_) {
+            if (query_->matches(*index_, entries[matched_upto_]) &&
+                matches_.size() < kFileSearchResultLimit) {
+                matches_.push_back(static_cast<std::uint32_t>(matched_upto_));
+            }
+        }
+        if (std::chrono::steady_clock::now() >= deadline) break;
     }
-    if (payload->result_limit_reached) status += L"  |  result limit reached";
+    if (matches_.size() != before) {
+        results_.set_virtual_row_count(matches_.size());
+        if (before == 0) {
+            results_.select_index(0);
+            EnableWindow(go_to_button_, TRUE);
+        }
+    }
+    const bool caught_up = matched_upto_ >= entries.size() ||
+                           matches_.size() >= kFileSearchResultLimit;
+    if (caught_up && !walking_) KillTimer(hwnd_, kMatchTimer);
+}
+
+void FileSearchDialog::update_status() {
+    std::wstring status;
+    if (!query_error_.empty()) {
+        status = L"Query: " + query_error_;
+    } else {
+        status = quote_count(matches_.size(), L"match", L"matches");
+        if (index_) {
+            status += L"  |  " + quote_count(index_->entries().size(),
+                                             L"item scanned", L"items scanned");
+            if (walking_) {
+                status += L"  |  searching...";
+            } else if (matched_upto_ < index_->entries().size() &&
+                       matches_.size() < kFileSearchResultLimit) {
+                status += L"  |  matching...";
+            } else {
+                wchar_t seconds[32]{};
+                swprintf_s(seconds, L" in %.1f s", walk_seconds_);
+                status += seconds;
+            }
+            if (index_->skipped_encrypted() != 0) {
+                status += L"  |  " + quote_count(index_->skipped_encrypted(),
+                                                  L"encrypted archive skipped",
+                                                  L"encrypted archives skipped");
+            }
+            if (index_->read_errors() != 0) {
+                status += L"  |  " + quote_count(index_->read_errors(),
+                                                  L"read warning", L"read warnings");
+            }
+        }
+        if (matches_.size() >= kFileSearchResultLimit) status += L"  |  result limit reached";
+    }
     set_text(result_count_, status);
-    EnableWindow(go_to_button_, !result_targets_.empty());
+}
+
+std::vector<std::wstring> FileSearchDialog::result_row(std::size_t row) const {
+    if (!index_ || row >= matches_.size()) return {};
+    const auto& entry = index_->entries()[matches_[row]];
+    const auto& folder = index_->folder(entry.folder);
+    const bool folder_kind = entry.kind == axiom::search::EntryKind::folder;
+    std::wstring type;
+    if (entry.kind == axiom::search::EntryKind::link) {
+        type = L"Link";
+    } else {
+        type = axiom::gui::browser_type_text(fs::path(entry.name), folder_kind);
+    }
+    return {entry.name,
+            folder.display,
+            std::move(type),
+            folder_kind ? std::wstring{} : format_size(entry.size),
+            axiom::gui::browser_time_text(entry.modified)};
+}
+
+FileSearchDialogResult FileSearchDialog::result_target(std::size_t row) const {
+    FileSearchDialogResult result;
+    if (!index_ || row >= matches_.size()) return result;
+    const auto& entry = index_->entries()[matches_[row]];
+    const auto& folder = index_->folder(entry.folder);
+    if (folder.archive != axiom::search::kNoArchive) {
+        result.target_location = axiom::gui::BrowserLocation::archive(
+            index_->archive(folder.archive), folder.archive_directory);
+        result.archive_entry_path = entry.archive_path;
+    } else {
+        result.target_location = axiom::gui::BrowserLocation::filesystem(folder.filesystem);
+        result.filesystem_path = folder.filesystem / entry.name;
+    }
+    return result;
 }
 
 void FileSearchDialog::accept_selected() {
     const int row = results_.focused_index();
-    if (row < 0 || row >= static_cast<int>(result_targets_.size())) return;
-    result_ = result_targets_[static_cast<std::size_t>(row)];
+    if (row < 0 || row >= static_cast<int>(matches_.size())) return;
+    result_ = result_target(static_cast<std::size_t>(row));
     result_.accepted = true;
     destroy_modal_dialog(hwnd_);
 }
@@ -775,6 +641,15 @@ void FileSearchDialog::create_controls() {
         {L"Name", 220}, {L"Location", 260}, {L"Type", 110},
         {L"Size", 90}, {L"Modified", 140},
     });
+    results_.set_virtual_rows(
+        0,
+        [this](std::size_t row) { return result_row(row); },
+        [](std::size_t) { return -1; },
+        [this](std::size_t row) -> std::wstring_view {
+            if (!index_ || row >= matches_.size()) return {};
+            return index_->entries()[matches_[row]].name;
+        },
+        nullptr);
 
     for (HWND control : controls()) {
         if (control != nullptr) {
@@ -845,9 +720,11 @@ LRESULT FileSearchDialog::handle_message(UINT message, WPARAM wparam, LPARAM lpa
             const int notification = HIWORD(wparam);
             switch (id) {
                 case kSearchText:
+                    // Refining only re-matches the index in memory, so it can
+                    // follow typing closely.
                     if (notification == EN_CHANGE && search_started_) {
                         KillTimer(hwnd_, kSearchDebounceTimer);
-                        SetTimer(hwnd_, kSearchDebounceTimer, 300, nullptr);
+                        SetTimer(hwnd_, kSearchDebounceTimer, 120, nullptr);
                     }
                     return 0;
                 case kMatchCase:
@@ -865,7 +742,7 @@ LRESULT FileSearchDialog::handle_message(UINT message, WPARAM wparam, LPARAM lpa
                     }
                     return 0;
                 case kSearchArea:
-                    if (notification == CBN_SELCHANGE && search_started_) run_search();
+                    if (notification == CBN_SELCHANGE && search_started_) run_search(false);
                     return 0;
                 case kArchiveTypes:
                     if (search_started_ &&
@@ -876,8 +753,9 @@ LRESULT FileSearchDialog::handle_message(UINT message, WPARAM wparam, LPARAM lpa
                     return 0;
                 case kSearchButton:
                 case IDOK:
+                    // An explicit search reads the disk again.
                     KillTimer(hwnd_, kSearchDebounceTimer);
-                    run_search();
+                    run_search(true);
                     return 0;
                 case kGoToButton:
                     accept_selected();
@@ -893,23 +771,23 @@ LRESULT FileSearchDialog::handle_message(UINT message, WPARAM wparam, LPARAM lpa
         case WM_TIMER:
             if (wparam == kSearchDebounceTimer) {
                 KillTimer(hwnd_, kSearchDebounceTimer);
-                run_search();
+                run_search(false);
+                return 0;
+            }
+            if (wparam == kMatchTimer) {
+                match_pending();
+                update_status();
                 return 0;
             }
             break;
         case kTableActivateMessage:
             accept_selected();
             return 0;
-        case kSearchResultsMessage:
-            apply_search_results(lparam);
+        case kSearchBatchMessage:
+            on_batch(lparam);
             return 0;
-        case kSearchProgressMessage:
-            if (static_cast<std::uint64_t>(wparam) == search_generation_) {
-                set_text(result_count_,
-                         L"Searching... " +
-                             quote_count(static_cast<std::size_t>(lparam),
-                                         L"item scanned", L"items scanned"));
-            }
+        case kSearchDoneMessage:
+            on_walk_done(wparam);
             return 0;
         case WM_CTLCOLORSTATIC:
         case WM_CTLCOLORBTN:
@@ -966,11 +844,12 @@ LRESULT FileSearchDialog::handle_message(UINT message, WPARAM wparam, LPARAM lpa
             return 0;
         case WM_NCDESTROY: {
             KillTimer(hwnd_, kSearchDebounceTimer);
+            KillTimer(hwnd_, kMatchTimer);
             search_thread_.join_all();
             MSG queued{};
-            while (PeekMessageW(&queued, hwnd_, kSearchResultsMessage,
-                                kSearchResultsMessage, PM_REMOVE)) {
-                delete reinterpret_cast<SearchPayload*>(queued.lParam);
+            while (PeekMessageW(&queued, hwnd_, kSearchBatchMessage,
+                                kSearchBatchMessage, PM_REMOVE)) {
+                delete reinterpret_cast<BatchPayload*>(queued.lParam);
             }
             axiom::gui::save_named_window_placement(L"FileSearchDialog", hwnd_);
             if (font_ != nullptr) axiom::gui::delete_dialog_font(font_);

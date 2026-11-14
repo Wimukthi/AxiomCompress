@@ -554,6 +554,15 @@ const BrowserLocation& NavigationHistory::current() const {
     return entries_.empty() ? computer_location : entries_[index_];
 }
 
+std::wstring browser_type_text(const fs::path& name, bool directory) {
+    return extension_type(name, directory);
+}
+
+std::wstring browser_time_text(std::int64_t unix_seconds) {
+    thread_local core::LocalTimeConverter converter;
+    return unix_time_text(unix_seconds, &converter);
+}
+
 bool is_axiom_archive(const fs::path& path) {
     return axiom::is_native_archive(path);
 }

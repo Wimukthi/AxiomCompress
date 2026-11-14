@@ -118,6 +118,11 @@ private:
     std::size_t index_ = 0;
 };
 
+// The Type and Modified texts the file list shows, for views that list items
+// without building a BrowserItem for each (the Find results).
+std::wstring browser_type_text(const std::filesystem::path& name, bool directory);
+std::wstring browser_time_text(std::int64_t unix_seconds);
+
 bool is_axiom_archive(const std::filesystem::path& path);
 bool is_supported_archive(const std::filesystem::path& path);
 bool path_has_supported_archive_extension(const std::filesystem::path& path);

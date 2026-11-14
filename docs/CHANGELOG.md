@@ -14,6 +14,21 @@ Entries are condensed from the
 
 ## [Unreleased]
 
+### Changed
+
+- Find files is several times faster and refines without searching again. It
+  reads folders on eight threads and opens each archive once, shows results
+  while it runs, and keeps what it found, so editing the query or the match
+  options re-matches those results in memory. Searching `C:\Program Files`
+  (316,830 items, including archives) took 0.7 s instead of 4.2 s, and changing
+  the query then took about 0.2 s instead of another full search.
+- Find files understands the instant filter's language: several terms, quoted
+  phrases, `-` to exclude, `*` and `?` wildcards, and the `name:`, `ext:`,
+  `path:`, `size:`, `date:` and `type:` fields. A plain phrase with spaces now
+  needs quotes to match as one piece. A field it cannot read is reported instead
+  of silently matching nothing. Hidden and system items are searched only when
+  the file list shows them.
+
 ## [0.16.0.0] - 2026-11-13
 
 Archiving and extracting many small files is several times faster on Windows,
