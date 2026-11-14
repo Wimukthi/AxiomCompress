@@ -39,7 +39,7 @@ FileSearchDialogResult FileSearchDialog::show(HWND owner) {
     }
 
     const SIZE window_size = dialog_window_size_for_client(
-        820, 650, kFileSearchStyle, kFileSearchExStyle, dpi_);
+        820, 690, kFileSearchStyle, kFileSearchExStyle, dpi_);
     const int width = window_size.cx;
     const int height = window_size.cy;
     const POINT position = axiom::gui::centered_window_position(owner, width, height);
@@ -118,8 +118,9 @@ HWND FileSearchDialog::make_control(const wchar_t* class_name,
     return control;
 }
 
-std::array<HWND, 22> FileSearchDialog::controls() const {
+std::array<HWND, 26> FileSearchDialog::controls() const {
     return {title_, scope_label_, query_label_, search_edit_,
+            content_label_, content_edit_, max_size_label_, max_size_edit_,
             match_case_, whole_name_, search_path_,
             include_files_, include_folders_, include_archives_,
             result_count_, search_button_, go_to_button_, close_button_,
@@ -193,6 +194,18 @@ std::wstring FileSearchDialog::walk_key() const {
         key += L"|archives:" + get_text(archive_types_);
         key += skip_encrypted_checked_ ? L"|skip" : L"|open";
     }
+    const std::wstring content = get_text(content_edit_);
+    if (!content.empty()) {
+        // Only files whose names match are read, so with a content search every
+        // part of the query decides what is searched.
+        key += L"|content:" + content + L"|max:" + get_text(max_size_edit_);
+        key += L"|query:" + get_text(search_edit_);
+        key += match_case_checked_ ? L"|case" : L"|nocase";
+        key += whole_name_checked_ ? L"|whole" : L"|part";
+        key += search_path_checked_ ? L"|path" : L"|name";
+        key += include_files_checked_ ? L"f" : L"-";
+        key += include_archives_checked_ ? L"a" : L"-";
+    }
     return key;
 }
 
@@ -222,8 +235,15 @@ void FileSearchDialog::run_search(bool rescan) {
         update_status();
         return;
     }
+    const std::wstring content_text = get_text(content_edit_);
+    if (!content_text.empty() && !axiom::search::parse_size_text(get_text(max_size_edit_))) {
+        query_error_ = L"Skip files over needs a size such as 64 MB or 1 GB";
+        update_status();
+        return;
+    }
     query_error_.clear();
     query_ = std::move(query);
+    content_active_ = !content_text.empty();
     matches_.clear();
     matched_upto_ = 0;
     results_.set_virtual_row_count(0);
@@ -252,19 +272,53 @@ void FileSearchDialog::start_walk() {
     if (area < 0) area = 0;
     const bool recurse = include_subfolders_checked_;
 
+    axiom::search::WalkOptions options;
+    options.recurse = recurse;
+    options.include_hidden = include_hidden_;
+    options.search_archives = find_in_archives_checked_;
+    options.archive_patterns = get_text(archive_types_);
+    options.skip_encrypted = skip_encrypted_checked_;
+    // The name query decides which files are read for the content, so the walk
+    // keeps its own copy.
+    std::shared_ptr<const axiom::search::Query> content_filter;
+    if (content_active_) {
+        options.content = axiom::search::ContentPattern::compile(get_text(content_edit_),
+                                                                 match_case_checked_);
+        options.content_max_size =
+            axiom::search::parse_size_text(get_text(max_size_edit_)).value_or(64ull << 20);
+        content_filter = std::make_shared<const axiom::search::Query>(*query_);
+    }
+    const HWND target = hwnd_;
+
     if (location_.kind == axiom::gui::BrowserLocationKind::archive) {
         // The open archive's directory is already in memory: list it at once.
-        walking_ = false;
+        axiom::search::Batch batch;
         if (archive_catalog_) {
-            axiom::search::Batch batch;
             axiom::search::add_archive_entries(
                 batch, archive_catalog_->path(), archive_catalog_->entries(),
                 area == 1 ? std::string_view{} : std::string_view(location_.archive_directory),
                 recurse);
-            index_->append(std::move(batch));
         }
-        walk_seconds_ = std::chrono::duration<double>(
-            std::chrono::steady_clock::now() - walk_started_).count();
+        if (!content_active_ || !archive_catalog_) {
+            walking_ = false;
+            index_->append(std::move(batch));
+            walk_seconds_ = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - walk_started_).count();
+            return;
+        }
+        // Reading its contents is not: that runs on the worker.
+        walking_ = true;
+        search_thread_.start([target, generation, batch = std::move(batch),
+                              archive = archive_catalog_->path(), options = std::move(options),
+                              content_filter](std::stop_token stop) mutable {
+            options.content_filter = content_filter.get();
+            axiom::search::search_archive_contents(batch, archive, 0, options, stop);
+            auto* payload = new BatchPayload{generation, std::move(batch)};
+            if (!PostMessageW(target, kSearchBatchMessage, 0, reinterpret_cast<LPARAM>(payload))) {
+                delete payload;
+            }
+            PostMessageW(target, kSearchDoneMessage, static_cast<WPARAM>(generation), 0);
+        });
         return;
     }
 
@@ -285,16 +339,11 @@ void FileSearchDialog::start_walk() {
         }
     }
 
-    axiom::search::WalkOptions options;
-    options.recurse = recurse;
-    options.include_hidden = include_hidden_;
-    options.search_archives = find_in_archives_checked_;
-    options.archive_patterns = get_text(archive_types_);
-    options.skip_encrypted = skip_encrypted_checked_;
     walking_ = true;
-    const HWND target = hwnd_;
     search_thread_.start([target, generation, roots = std::move(roots),
-                          options = std::move(options)](std::stop_token stop) {
+                          options = std::move(options),
+                          content_filter](std::stop_token stop) mutable {
+        options.content_filter = content_filter.get();
         axiom::search::walk(roots, options, stop, [&](axiom::search::Batch&& batch) {
             auto* payload = new BatchPayload{generation, std::move(batch)};
             if (!PostMessageW(target, kSearchBatchMessage, 0, reinterpret_cast<LPARAM>(payload))) {
@@ -331,8 +380,9 @@ void FileSearchDialog::match_pending() {
     while (matched_upto_ < entries.size() && matches_.size() < kFileSearchResultLimit) {
         const std::size_t end = std::min(entries.size(), matched_upto_ + 2048);
         for (; matched_upto_ < end; ++matched_upto_) {
-            if (query_->matches(*index_, entries[matched_upto_]) &&
-                matches_.size() < kFileSearchResultLimit) {
+            const auto& entry = entries[matched_upto_];
+            if ((!content_active_ || entry.content == axiom::search::ContentState::found) &&
+                query_->matches(*index_, entry) && matches_.size() < kFileSearchResultLimit) {
                 matches_.push_back(static_cast<std::uint32_t>(matched_upto_));
             }
         }
@@ -373,6 +423,14 @@ void FileSearchDialog::update_status() {
                 status += L"  |  " + quote_count(index_->skipped_encrypted(),
                                                   L"encrypted archive skipped",
                                                   L"encrypted archives skipped");
+            }
+            if (content_active_) {
+                status += L"  |  " + quote_count(index_->content_read(),
+                                                  L"file read", L"files read");
+                if (index_->content_skipped() != 0) {
+                    status += L" (" + quote_count(index_->content_skipped(),
+                                                  L"skipped", L"skipped") + L")";
+                }
             }
             if (index_->read_errors() != 0) {
                 status += L"  |  " + quote_count(index_->read_errors(),
@@ -452,7 +510,20 @@ void FileSearchDialog::layout() {
     MoveWindow(search_button_, client.right - margin - button_width, query_top,
                button_width, edit_height, TRUE);
 
-    const int options_top = query_top + scale(42);
+    const int content_top = query_top + scale(40);
+    const int size_edit_width = scale(96);
+    const int size_label_width = scale(108);
+    MoveWindow(content_label_, margin, content_top + scale(5), scale(120),
+               label_height, TRUE);
+    MoveWindow(content_edit_, margin + scale(126), content_top,
+               client.right - margin * 2 - scale(126) - size_label_width - size_edit_width - gap,
+               edit_height, TRUE);
+    MoveWindow(max_size_label_, client.right - margin - size_edit_width - size_label_width,
+               content_top + scale(5), size_label_width, label_height, TRUE);
+    MoveWindow(max_size_edit_, client.right - margin - size_edit_width, content_top,
+               size_edit_width, edit_height, TRUE);
+
+    const int options_top = content_top + scale(42);
     const int check_width = std::max(
         scale(128),
         (static_cast<int>(client.right) - margin * 2 - gap * 2) / 3);
@@ -524,6 +595,13 @@ void FileSearchDialog::create_controls() {
     search_edit_ = make_control(L"EDIT", L"", WS_TABSTOP | ES_AUTOHSCROLL,
                                 kSearchText);
     SendMessageW(search_edit_, EM_SETLIMITTEXT, 1024, 0);
+    content_label_ = make_control(L"STATIC", L"Containing text", SS_NOPREFIX);
+    content_edit_ = make_control(L"EDIT", L"", WS_TABSTOP | ES_AUTOHSCROLL, kContentText);
+    SendMessageW(content_edit_, EM_SETLIMITTEXT, 512, 0);
+    max_size_label_ = make_control(L"STATIC", L"Skip files over", SS_NOPREFIX);
+    max_size_edit_ = make_control(L"EDIT", L"64 MB", WS_TABSTOP | ES_AUTOHSCROLL,
+                                  kContentMaxSize);
+    SendMessageW(max_size_edit_, EM_SETLIMITTEXT, 32, 0);
     match_case_ = make_control(L"BUTTON", L"Match case",
                                WS_TABSTOP | BS_OWNERDRAW | BS_CHECKBOX,
                                kMatchCase);
@@ -574,6 +652,13 @@ void FileSearchDialog::create_controls() {
     close_button_ = make_control(L"BUTTON", L"Close",
                                  WS_TABSTOP | BS_OWNERDRAW,
                                  IDCANCEL);
+    axiom::gui::add_dialog_tooltip(
+        tooltip_, content_edit_,
+        L"Text to find inside files whose names match, in folders and inside archives. "
+        L"Found as UTF-8 or UTF-16 text; Match case applies.");
+    axiom::gui::add_dialog_tooltip(
+        tooltip_, max_size_edit_,
+        L"Files larger than this are not read for the containing text, such as 64 MB or 1 GB.");
     axiom::gui::add_dialog_tooltip(
         tooltip_, search_edit_,
         L"Unicode text matched against item names, and against paths when Search path is enabled.");
@@ -697,7 +782,7 @@ LRESULT FileSearchDialog::handle_message(UINT message, WPARAM wparam, LPARAM lpa
         case WM_GETMINMAXINFO: {
             auto* info = reinterpret_cast<MINMAXINFO*>(lparam);
             const SIZE minimum = dialog_window_size_for_client(
-                700, 540, kFileSearchStyle, kFileSearchExStyle, dpi_);
+                700, 580, kFileSearchStyle, kFileSearchExStyle, dpi_);
             info->ptMinTrackSize.x = minimum.cx;
             info->ptMinTrackSize.y = minimum.cy;
             return 0;
@@ -725,6 +810,14 @@ LRESULT FileSearchDialog::handle_message(UINT message, WPARAM wparam, LPARAM lpa
                     if (notification == EN_CHANGE && search_started_) {
                         KillTimer(hwnd_, kSearchDebounceTimer);
                         SetTimer(hwnd_, kSearchDebounceTimer, 120, nullptr);
+                    }
+                    return 0;
+                case kContentText:
+                case kContentMaxSize:
+                    // A content search reads files again, so it waits for a pause.
+                    if (notification == EN_CHANGE && search_started_) {
+                        KillTimer(hwnd_, kSearchDebounceTimer);
+                        SetTimer(hwnd_, kSearchDebounceTimer, 450, nullptr);
                     }
                     return 0;
                 case kMatchCase:

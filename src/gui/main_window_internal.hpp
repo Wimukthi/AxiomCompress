@@ -796,6 +796,8 @@ private:
         kFindInArchives = 30114,
         kSkipEncrypted = 30115,
         kMatchTimer = 30116,
+        kContentText = 30117,
+        kContentMaxSize = 30118,
         kSearchBatchMessage = WM_APP + 110,
         kSearchDoneMessage = WM_APP + 111,
     };
@@ -812,7 +814,7 @@ private:
                       DWORD style,
                       int id = 0,
                       DWORD ex_style = 0);
-    std::array<HWND, 22> controls() const;
+    std::array<HWND, 26> controls() const;
     bool checkbox_checked(int id) const;
     void set_checkbox(int id, bool checked);
     void toggle_checkbox(int id);
@@ -925,6 +927,17 @@ private:
     HWND archive_types_ = nullptr;
 
     HWND search_edit_ = nullptr;
+
+    HWND content_label_ = nullptr;
+
+    HWND content_edit_ = nullptr;
+
+    HWND max_size_label_ = nullptr;
+
+    HWND max_size_edit_ = nullptr;
+
+    // Whether the current results must also contain the "Containing text".
+    bool content_active_ = false;
 
     HWND match_case_ = nullptr;
 

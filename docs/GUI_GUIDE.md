@@ -213,8 +213,8 @@ they do not go to the Recycle Bin.
 ![Find files showing text-file matches in the sample project](images/axiom-find.png)
 
 Choose **Edit > Find files...** (`Ctrl+F`) when the instant filter is too
-narrow. The search window looks for names and, optionally, paths; it does not
-search text inside files.
+narrow. The search window looks for names and paths, and optionally for text
+inside files, in folders and inside archives.
 
 1. Enter **Name/path text**, or leave it empty to list every matching item.
 2. Choose the search area and whether to include child folders and archives.
@@ -232,7 +232,9 @@ is reported in the status line and the previous results stay.
 
 | Control | How to use it |
 |---|---|
-| Match case | Require the same uppercase and lowercase letters |
+| Containing text | Text the file must contain, looked for in files whose names match, in folders and inside archives |
+| Skip files over | Files larger than this, such as `64 MB` or `1 GB`, are not read for the containing text |
+| Match case | Require the same uppercase and lowercase letters, in names and in the containing text |
 | Whole name | A plain term must be the complete name instead of part of it |
 | Search path | Let plain terms match the item's location as well as its name |
 | Files (names), Folders, Archive files | Choose which kinds of results appear |
@@ -253,6 +255,17 @@ memory, without reading the disk again. Changing the search area, Find in
 subfolders, Find in archives, Archive types or Skip encrypted searches again,
 and so does **Search** itself, which picks up files that changed since. Hidden
 and system items are searched only when the file list shows them.
+
+With **Containing text** filled in, only files whose names and types match the
+query are read, so any change to the query or to the content options searches
+again. Text is found whether a file stores it as UTF-8 (which covers plain
+ASCII) or UTF-16, the two encodings Windows text files use. Without Match case,
+letters match in either case; in UTF-8 text that applies to the ASCII letters
+only, so type other letters as they appear in the file. Contents are read
+straight from AXAR and ZIP archives; for 7z, RAR, ISO, CAB and TAR archives the
+matching files are unpacked to a private temporary folder, read, and deleted,
+up to 1 GiB per archive. The status line counts the files read and those
+skipped as too large or unreadable.
 **Close** leaves the main location unchanged; **Go to** clears its instant
 filter so the chosen result is visible.
 

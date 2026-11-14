@@ -29,6 +29,24 @@ Entries are condensed from the
   of silently matching nothing. Hidden and system items are searched only when
   the file list shows them.
 
+### Added
+
+- Find files searches inside files. Fill in **Containing text** and it reads the
+  files whose names match, in folders and inside archives, and lists those that
+  contain the text, as UTF-8 or UTF-16. AXAR and ZIP contents are read in
+  memory, each solid block decoded once; 7z, RAR, ISO, CAB and TAR entries are
+  unpacked to a private temporary folder and deleted again. **Skip files over**
+  (64 MB by default) bounds what is read. Looking for "license" in the `.txt`
+  files under `C:\Program Files` (3,694 read) took 3.1 s, against 7.4 s for
+  `grep -rli`, and found every file grep found, 10 that its walk missed, and
+  12 inside archives.
+
+### Fixed
+
+- Find files folds letters other than A to Z when matching names without Match
+  case, so "Ärger" finds "ärger". It used the C locale, which folds ASCII only.
+- Find results on Linux and macOS showed paths joined with a backslash.
+
 ## [0.16.0.0] - 2026-11-13
 
 Archiving and extracting many small files is several times faster on Windows,
