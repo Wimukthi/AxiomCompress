@@ -2553,7 +2553,8 @@ void test_file_search_query() {
     AXIOM_CHECK(matching(L"kind:archive") == Names{L"backup.zip"});
     AXIOM_CHECK(matching(L"date:2026-03-15").size() == 3);
     AXIOM_CHECK(matching(L"date:<2026-03-01") == Names{L"notes.txt"});
-    AXIOM_CHECK(matching(L"path:reports\\notes") == Names{L"notes.txt"});
+    // '?' stands for the separator, which differs between platforms.
+    AXIOM_CHECK(matching(L"path:*reports?notes*") == Names{L"notes.txt"});
     AXIOM_CHECK(matching(L"work").empty());
 
     QueryOptions match_case;

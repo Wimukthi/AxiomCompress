@@ -284,7 +284,9 @@ std::wstring Index::display_path(const Entry& entry) const {
     if (location.display.empty()) return entry.name;
     std::wstring result = location.display;
     const bool in_archive = location.archive != kNoArchive;
-    const wchar_t separator = in_archive ? L'/' : L'\\';
+    // Archive paths always use '/'; a folder on disk uses the platform's own.
+    const wchar_t separator =
+        in_archive ? L'/' : static_cast<wchar_t>(fs::path::preferred_separator);
     if (result.back() != separator && result.back() != L'\\' && result.back() != L'/') {
         result.push_back(separator);
     }
