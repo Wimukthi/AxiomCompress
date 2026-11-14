@@ -14,6 +14,13 @@ Entries are condensed from the
 
 ## [Unreleased]
 
+## [0.17.0.0] - 2026-11-15
+
+Find files is rebuilt: it searches several times faster, refines results
+without reading the disk again, finds text inside files in folders and inside
+archives, and sorts, exports and leaves out folders. The archive format and the
+archives Axiom writes are unchanged.
+
 ### Changed
 
 - Find files is several times faster and refines without searching again. It
@@ -1101,7 +1108,8 @@ First published release: the Inno Setup installer and portable zip, carrying
 update/repair/remove maintenance handling, and dynamic light/dark setup
 styling.
 
-[Unreleased]: https://github.com/Wimukthi/AxiomCompress/compare/0.16.0.0...HEAD
+[Unreleased]: https://github.com/Wimukthi/AxiomCompress/compare/0.17.0.0...HEAD
+[0.17.0.0]: https://github.com/Wimukthi/AxiomCompress/releases/tag/0.17.0.0
 [0.16.0.0]: https://github.com/Wimukthi/AxiomCompress/releases/tag/0.16.0.0
 [0.15.0.0]: https://github.com/Wimukthi/AxiomCompress/releases/tag/0.15.0.0
 [0.14.0.0]: https://github.com/Wimukthi/AxiomCompress/releases/tag/0.14.0.0
