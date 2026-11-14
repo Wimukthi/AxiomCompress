@@ -53,10 +53,15 @@ struct Entry {
     std::uint32_t folder = 0;  // into Index::folder()
     EntryKind kind = EntryKind::file;
     bool hidden = false;
+    ContentState content = ContentState::unchecked;
+    // What an archive records about an entry inside it, when the format has it.
+    bool has_packed = false;
+    bool has_crc32 = false;
+    std::uint32_t crc32 = 0;
+    std::uint64_t packed = 0;   // compressed bytes
     std::uint64_t size = 0;
     std::int64_t modified = 0;  // seconds since the Unix epoch; 0 when unknown
     std::string archive_path;   // the entry's UTF-8 path inside its archive, if any
-    ContentState content = ContentState::unchecked;
 };
 
 // What one walker thread hands over at a time. Folder and archive numbers are
@@ -183,8 +188,24 @@ private:
     bool found_ = false;
 };
 
+// Folders a search leaves out, with everything beneath them: ';'-separated
+// wildcards matched against a folder's name or, for a pattern that holds a path
+// separator, against its whole path ('\' and '/' alike). Letters match in
+// either case.
+class FolderExcludes {
+public:
+    explicit FolderExcludes(std::wstring_view patterns = {});
+    bool empty() const noexcept { return names_.empty() && paths_.empty(); }
+    bool excludes(std::wstring_view name, std::wstring_view path) const;
+
+private:
+    std::vector<std::wstring> names_;
+    std::vector<std::wstring> paths_;  // with '/' for every separator
+};
+
 struct WalkOptions {
     bool recurse = true;
+    std::wstring exclude_folders;  // FolderExcludes patterns
     bool include_hidden = true;    // hidden and system files and folders
     bool search_archives = false;  // list the contents of archives found on the way
     std::wstring archive_patterns; // ';'-separated wildcards; empty means every archive
@@ -219,10 +240,28 @@ std::optional<std::uint64_t> parse_size_text(std::wstring_view text);
 
 // Add an archive's already-read entries beneath `directory` ("" for its root):
 // direct children only unless `recurse`. Folders the entry list only implies are
-// added as folders, as the archive browser shows them.
+// added as folders, as the archive browser shows them. Folders `excludes`
+// names are left out with their contents.
 void add_archive_entries(Batch& batch, const std::filesystem::path& archive,
                          const std::vector<ArchiveEntry>& entries, std::string_view directory,
-                         bool recurse);
+                         bool recurse, const FolderExcludes* excludes = nullptr);
+
+// The orders the Find results can be listed in.
+enum class SortKey : std::uint8_t { name, location, type, size, packed, modified, crc32 };
+
+// Names as Explorer orders them: letters in either case, and runs of digits by
+// their value, so "file2" comes before "file10".
+int compare_names(std::wstring_view left, std::wstring_view right);
+
+// Put `matches`, indexes into index.entries(), in order by `key`. Ties go by
+// name, then location. Type orders folders first, then by extension. Items
+// without a packed size or CRC-32 come after those with one.
+void sort_matches(const Index& index, std::vector<std::uint32_t>& matches, SortKey key,
+                  bool ascending);
+// The same when the first `sorted` matches are already in that order and the
+// rest were appended since: sorts only those and merges them in.
+void merge_matches(const Index& index, std::vector<std::uint32_t>& matches, std::size_t sorted,
+                   SortKey key, bool ascending);
 
 // Whether a file name marks an archive the browser opens: .axar, .zip and its
 // relatives, .7z, .rar and RAR volumes, the tar family, .iso and .cab.

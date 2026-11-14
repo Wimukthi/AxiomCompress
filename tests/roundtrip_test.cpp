@@ -2703,6 +2703,27 @@ void test_file_search_walk() {
     AXIOM_CHECK(!run(only_zip).second.contains(
         display(tree / "a" / "plain.axar") + L" :: /inner/sub/needle.txt"));
 
+    // Excluded folders are left out with their contents, on disk by name or
+    // path and inside archives.
+    {
+        axiom::search::WalkOptions excluding = everything;
+        excluding.threads = 0;
+        excluding.exclude_folders = L"B; sub";
+        const auto [index, paths] = run(excluding);
+        AXIOM_CHECK(!paths.contains(display(tree / "a" / "b")));
+        AXIOM_CHECK(!paths.contains(display(tree / "a" / "b" / "deep.txt")));
+        AXIOM_CHECK(paths.contains(display(tree / "a" / "one.bin")));
+        AXIOM_CHECK(paths.contains(display(tree / "a" / "plain.axar") + L" :: /inner"));
+        AXIOM_CHECK(!paths.contains(display(tree / "a" / "plain.axar") + L" :: /inner/sub"));
+        AXIOM_CHECK(!paths.contains(
+            display(tree / "a" / "plain.axar") + L" :: /inner/sub/needle.txt"));
+        excluding.exclude_folders = L"*/a/b";
+        const auto by_path = run(excluding).second;
+        AXIOM_CHECK(!by_path.contains(display(tree / "a" / "b" / "deep.txt")));
+        AXIOM_CHECK(by_path.contains(display(tree / "a" / "one.bin")));
+        AXIOM_CHECK(by_path.contains(display(tree / "empty")));
+    }
+
     // A stopped walk returns promptly with what it has.
     std::stop_source stopped;
     stopped.request_stop();
@@ -2717,6 +2738,106 @@ void test_file_search_walk() {
 #endif
     fs::remove(tree / "jump", cleanup);
     fs::remove_all(root, cleanup);
+}
+
+// Find results: name order, folder excludes, archive details, and sorting.
+void test_file_search_sort_exclude() {
+    using axiom::search::compare_names;
+    AXIOM_CHECK(compare_names(L"file2", L"file10") < 0);
+    AXIOM_CHECK(compare_names(L"file10", L"file2") > 0);
+    AXIOM_CHECK(compare_names(L"File2", L"file2") == 0);
+    AXIOM_CHECK(compare_names(L"img007", L"img7") == 0);
+    AXIOM_CHECK(compare_names(L"abc", L"abcd") < 0);
+    AXIOM_CHECK(compare_names(L"a9z", L"a10a") < 0);
+    AXIOM_CHECK(compare_names(L"beta", L"Alpha") > 0);
+
+    const axiom::search::FolderExcludes none(L" ; ");
+    AXIOM_CHECK(none.empty());
+    const axiom::search::FolderExcludes excludes(L"node_modules; .git ;build\\;C:\\Temp\\*");
+    AXIOM_CHECK(!excludes.empty());
+    AXIOM_CHECK(excludes.excludes(L"Node_Modules", L""));
+    AXIOM_CHECK(excludes.excludes(L".git", L"D:\\work\\.git"));
+    AXIOM_CHECK(excludes.excludes(L"build", L""));
+    AXIOM_CHECK(!excludes.excludes(L"builds", L""));
+    AXIOM_CHECK(excludes.excludes(L"x", L"c:\\temp\\x"));
+    AXIOM_CHECK(excludes.excludes(L"x", L"C:/Temp/x/"));
+    AXIOM_CHECK(!excludes.excludes(L"x", L"D:\\Temp\\x"));
+
+    // Inside an archive: what it records about each entry is kept, and an
+    // excluded folder goes with everything beneath it, wherever it is.
+    std::vector<axiom::ArchiveEntry> listed(4);
+    listed[0].path = "src/main.cpp";
+    listed[0].size = 100;
+    listed[0].packed_size = 40;
+    listed[0].crc32 = 0xABCD1234u;
+    listed[0].has_crc32 = true;
+    listed[1].path = "node_modules/pkg/index.js";
+    listed[2].path = "a/node_modules/x.js";
+    listed[3].path = "docs";
+    listed[3].is_directory = true;
+    axiom::search::Batch archived;
+    axiom::search::add_archive_entries(archived, "pack.zip", listed, {}, true, &excludes);
+    std::set<std::string> inside;
+    for (const auto& entry : archived.entries) {
+        inside.insert(entry.archive_path);
+        if (entry.archive_path == "src/main.cpp") {
+            AXIOM_CHECK(entry.has_packed && entry.packed == 40);
+            AXIOM_CHECK(entry.has_crc32 && entry.crc32 == 0xABCD1234u);
+            AXIOM_CHECK(entry.size == 100);
+        }
+        if (entry.archive_path == "src") AXIOM_CHECK(!entry.has_packed && !entry.has_crc32);
+    }
+    AXIOM_CHECK((inside == std::set<std::string>{"src", "src/main.cpp", "a", "docs"}));
+
+    // Sorting.
+    axiom::search::Batch batch;
+    batch.folders.resize(2);
+    batch.folders[0].display = L"C:\\one";
+    batch.folders[1].display = L"C:\\Two";
+    const auto add = [&](const wchar_t* name, std::uint32_t folder, axiom::search::EntryKind kind,
+                         std::uint64_t size, std::int64_t modified) {
+        axiom::search::Entry entry;
+        entry.name = name;
+        entry.folder = folder;
+        entry.kind = kind;
+        entry.size = size;
+        entry.modified = modified;
+        batch.entries.push_back(std::move(entry));
+    };
+    using Kind = axiom::search::EntryKind;
+    add(L"file10", 0, Kind::file, 5, 300);     // 0
+    add(L"file2", 1, Kind::file, 50, 100);     // 1
+    add(L"alpha", 1, Kind::folder, 0, 200);    // 2
+    add(L"beta.zip", 0, Kind::archive, 20, 0); // 3
+    batch.entries[3].has_packed = true;
+    batch.entries[3].packed = 7;
+    axiom::search::Index index;
+    index.append(std::move(batch));
+    using Key = axiom::search::SortKey;
+    const auto sorted = [&](Key key, bool ascending) {
+        std::vector<std::uint32_t> matches{0, 1, 2, 3};
+        axiom::search::sort_matches(index, matches, key, ascending);
+        return matches;
+    };
+    using Order = std::vector<std::uint32_t>;
+    AXIOM_CHECK((sorted(Key::name, true) == Order{2, 3, 1, 0}));
+    AXIOM_CHECK((sorted(Key::name, false) == Order{0, 1, 3, 2}));
+    AXIOM_CHECK((sorted(Key::size, true) == Order{0, 3, 1, 2}));
+    AXIOM_CHECK((sorted(Key::type, true) == Order{2, 1, 0, 3}));
+    AXIOM_CHECK((sorted(Key::location, true) == Order{3, 0, 2, 1}));
+    AXIOM_CHECK((sorted(Key::modified, true) == Order{1, 2, 0, 3}));
+    AXIOM_CHECK((sorted(Key::packed, true) == Order{3, 2, 1, 0}));
+    // Matches that arrive later merge into the order already shown.
+    for (const Key key : {Key::name, Key::size, Key::location}) {
+        for (const bool ascending : {true, false}) {
+            std::vector<std::uint32_t> matches{3, 0};
+            axiom::search::sort_matches(index, matches, key, ascending);
+            matches.push_back(2);
+            matches.push_back(1);
+            axiom::search::merge_matches(index, matches, 2, key, ascending);
+            AXIOM_CHECK(matches == sorted(key, ascending));
+        }
+    }
 }
 
 // Content search: the text as UTF-8 or UTF-16LE, across read boundaries.
@@ -9405,6 +9526,7 @@ constexpr RegisteredTest kTests[] = {
     {"source_tree_walk", test_source_tree_walk},
     {"file_search_query", test_file_search_query},
     {"file_search_walk", test_file_search_walk},
+    {"file_search_sort_exclude", test_file_search_sort_exclude},
     {"file_search_content_pattern", test_file_search_content_pattern},
 #if defined(_WIN32)
     {"skip_unreadable_archive_inputs", test_skip_unreadable_archive_inputs},

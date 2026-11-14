@@ -662,15 +662,172 @@ bool matches_archive_patterns(std::wstring_view patterns, const fs::path& path) 
     return !saw_pattern;
 }
 
+// ---- excludes ------------------------------------------------------------------
+
+namespace {
+
+std::wstring with_forward_slashes(std::wstring_view text) {
+    std::wstring result(text);
+    std::replace(result.begin(), result.end(), L'\\', L'/');
+    return result;
+}
+
+}  // namespace
+
+FolderExcludes::FolderExcludes(std::wstring_view patterns) {
+    std::size_t start = 0;
+    while (start <= patterns.size()) {
+        std::size_t end = patterns.find(L';', start);
+        if (end == std::wstring_view::npos) end = patterns.size();
+        std::wstring_view pattern = patterns.substr(start, end - start);
+        while (!pattern.empty() && std::iswspace(pattern.front())) pattern.remove_prefix(1);
+        while (!pattern.empty() && std::iswspace(pattern.back())) pattern.remove_suffix(1);
+        // "node_modules\" names the folder as plainly as "node_modules".
+        while (pattern.size() > 1 && (pattern.back() == L'\\' || pattern.back() == L'/')) {
+            pattern.remove_suffix(1);
+        }
+        if (!pattern.empty()) {
+            if (pattern.find_first_of(L"\\/") == std::wstring_view::npos) {
+                names_.emplace_back(pattern);
+            } else {
+                paths_.push_back(with_forward_slashes(pattern));
+            }
+        }
+        if (end == patterns.size()) break;
+        start = end + 1;
+    }
+}
+
+bool FolderExcludes::excludes(std::wstring_view name, std::wstring_view path) const {
+    for (const auto& pattern : names_) {
+        if (wildcard_match(pattern, name, true)) return true;
+    }
+    if (paths_.empty() || path.empty()) return false;
+    std::wstring normalized = with_forward_slashes(path);
+    while (normalized.size() > 1 && normalized.back() == L'/') normalized.pop_back();
+    for (const auto& pattern : paths_) {
+        if (wildcard_match(pattern, normalized, true)) return true;
+    }
+    return false;
+}
+
+// ---- sorting -------------------------------------------------------------------
+
+int compare_names(std::wstring_view left, std::wstring_view right) {
+    const auto digit = [](wchar_t c) { return c >= L'0' && c <= L'9'; };
+    std::size_t i = 0;
+    std::size_t j = 0;
+    while (i < left.size() && j < right.size()) {
+        if (digit(left[i]) && digit(right[j])) {
+            // Compare the runs by value: past the leading zeros, the longer run
+            // is the larger number, and runs of one length go digit by digit.
+            std::size_t a = i;
+            std::size_t b = j;
+            while (a < left.size() && left[a] == L'0') ++a;
+            while (b < right.size() && right[b] == L'0') ++b;
+            std::size_t a_end = a;
+            std::size_t b_end = b;
+            while (a_end < left.size() && digit(left[a_end])) ++a_end;
+            while (b_end < right.size() && digit(right[b_end])) ++b_end;
+            if (a_end - a != b_end - b) return a_end - a < b_end - b ? -1 : 1;
+            for (; a < a_end; ++a, ++b) {
+                if (left[a] != right[b]) return left[a] < right[b] ? -1 : 1;
+            }
+            i = a_end;
+            j = b_end;
+            continue;
+        }
+        const wchar_t a = fold_char(left[i]);
+        const wchar_t b = fold_char(right[j]);
+        if (a != b) return a < b ? -1 : 1;
+        ++i;
+        ++j;
+    }
+    if (i < left.size()) return 1;
+    if (j < right.size()) return -1;
+    return 0;
+}
+
+namespace {
+
+template <typename T>
+int compare_numbers(T left, T right) {
+    return left < right ? -1 : (right < left ? 1 : 0);
+}
+
+// Known values first, in order, then the unknown ones.
+template <typename T>
+int compare_known(bool left_known, T left, bool right_known, T right) {
+    if (left_known != right_known) return left_known ? -1 : 1;
+    return left_known ? compare_numbers(left, right) : 0;
+}
+
+struct MatchOrder {
+    const Index& index;
+    SortKey key;
+    bool ascending;
+
+    int compare_location(const Entry& a, const Entry& b) const {
+        if (a.folder == b.folder) return 0;
+        return compare_names(index.folder(a.folder).display, index.folder(b.folder).display);
+    }
+
+    int compare_key(const Entry& a, const Entry& b) const {
+        const bool a_folder = a.kind == EntryKind::folder;
+        const bool b_folder = b.kind == EntryKind::folder;
+        switch (key) {
+            case SortKey::name: return 0;
+            case SortKey::location: return compare_location(a, b);
+            case SortKey::type:
+                if (a_folder != b_folder) return a_folder ? -1 : 1;
+                return a_folder ? 0 : compare_names(extension_of(a.name), extension_of(b.name));
+            case SortKey::size: return compare_known(!a_folder, a.size, !b_folder, b.size);
+            case SortKey::packed: return compare_known(a.has_packed, a.packed, b.has_packed, b.packed);
+            case SortKey::modified:
+                return compare_known(a.modified != 0, a.modified, b.modified != 0, b.modified);
+            case SortKey::crc32: return compare_known(a.has_crc32, a.crc32, b.has_crc32, b.crc32);
+        }
+        return 0;
+    }
+
+    bool operator()(std::uint32_t left, std::uint32_t right) const {
+        const auto& entries = index.entries();
+        const Entry& a = entries[left];
+        const Entry& b = entries[right];
+        int order = compare_key(a, b);
+        if (order == 0) order = compare_names(a.name, b.name);
+        if (order == 0 && key != SortKey::location) order = compare_location(a, b);
+        if (order == 0) order = compare_numbers(left, right);
+        return ascending ? order < 0 : order > 0;
+    }
+};
+
+}  // namespace
+
+void sort_matches(const Index& index, std::vector<std::uint32_t>& matches, SortKey key,
+                  bool ascending) {
+    std::sort(matches.begin(), matches.end(), MatchOrder{index, key, ascending});
+}
+
+void merge_matches(const Index& index, std::vector<std::uint32_t>& matches, std::size_t sorted,
+                   SortKey key, bool ascending) {
+    if (sorted >= matches.size()) return;
+    const MatchOrder order{index, key, ascending};
+    const auto middle = matches.begin() + static_cast<std::ptrdiff_t>(sorted);
+    std::sort(middle, matches.end(), order);
+    std::inplace_merge(matches.begin(), middle, matches.end(), order);
+}
+
 // ---- archives ------------------------------------------------------------------
 
 void add_archive_entries(Batch& batch, const fs::path& archive,
                          const std::vector<ArchiveEntry>& entries, std::string_view directory,
-                         bool recurse) {
+                         bool recurse, const FolderExcludes* excludes) {
     const auto archive_id = static_cast<std::uint32_t>(batch.archives.size());
     batch.archives.push_back(archive);
     const std::wstring archive_display = path_text(archive) + L" :: /";
     const std::string base = normalize_archive_path(std::string(directory));
+    if (excludes != nullptr && excludes->empty()) excludes = nullptr;
 
     std::unordered_map<std::string, std::uint32_t> folder_ids;
     const auto folder_for = [&](const std::string& parent) {
@@ -684,6 +841,25 @@ void add_archive_entries(Batch& batch, const fs::path& archive,
         batch.folders.push_back(std::move(folder));
         folder_ids.emplace(parent, id);
         return id;
+    };
+
+    // Whether a folder in the archive is excluded, itself or through a parent.
+    std::unordered_map<std::string, bool> excluded_folders;
+    const std::function<bool(const std::string&)> excluded = [&](const std::string& folder) {
+        if (excludes == nullptr || folder.empty()) return false;
+        if (const auto found = excluded_folders.find(folder); found != excluded_folders.end()) {
+            return found->second;
+        }
+        const std::size_t slash = folder.find_last_of('/');
+        bool result = slash != std::string::npos && excluded(folder.substr(0, slash));
+        if (!result) {
+            const std::wstring name = widen_utf8(slash == std::string::npos
+                                                     ? std::string_view(folder)
+                                                     : std::string_view(folder).substr(slash + 1));
+            result = excludes->excludes(name, archive_display + widen_utf8(folder));
+        }
+        excluded_folders.emplace(folder, result);
+        return result;
     };
 
     // Every path met so far and its entry (npos when it lies outside the scope),
@@ -701,8 +877,7 @@ void add_archive_entries(Batch& batch, const fs::path& archive,
         return static_cast<std::size_t>(
             std::count(path.begin() + static_cast<std::ptrdiff_t>(start), path.end(), '/'));
     };
-    const auto add = [&](const std::string& path, EntryKind kind, std::uint64_t size,
-                         std::int64_t modified) {
+    const auto add = [&](const std::string& path, EntryKind kind, const ArchiveEntry* source) {
         if (!within(path) || (!recurse && relative_depth(path) != 0)) {
             seen.emplace(path, kOutside);
             return;
@@ -715,20 +890,35 @@ void add_archive_entries(Batch& batch, const fs::path& archive,
                                                            : std::string_view(path).substr(slash + 1));
         entry.folder = folder_for(parent);
         entry.kind = kind;
-        entry.size = kind == EntryKind::folder ? 0 : size;
-        entry.modified = modified;
         entry.archive_path = path;
+        if (source != nullptr) {
+            entry.modified = source->mtime;
+            if (kind != EntryKind::folder) {
+                entry.size = source->size;
+                entry.has_packed = source->packed_size.has_value();
+                entry.packed = source->packed_size.value_or(0);
+                entry.has_crc32 = source->has_crc32;
+                entry.crc32 = source->crc32;
+            }
+        }
         batch.entries.push_back(std::move(entry));
     };
     for (const auto& source : entries) {
         const std::string path = normalize_archive_path(source.path);
         if (path.empty()) continue;
-        // Parents first, so an implied folder is listed even if nothing names it.
+        // Parents first, so an implied folder is listed even if nothing names
+        // it; an excluded one ends the walk up the path, and the entry with it.
+        bool blocked = false;
         for (std::size_t slash = path.find('/'); slash != std::string::npos;
              slash = path.find('/', slash + 1)) {
             const std::string parent = path.substr(0, slash);
-            if (!seen.contains(parent)) add(parent, EntryKind::folder, 0, 0);
+            if (excluded(parent)) {
+                blocked = true;
+                break;
+            }
+            if (!seen.contains(parent)) add(parent, EntryKind::folder, nullptr);
         }
+        if (blocked || (source.is_directory && excluded(path))) continue;
         const EntryKind kind = source.is_directory ? EntryKind::folder
             : (source.is_symlink || source.is_hardlink) ? EntryKind::link
                                                         : EntryKind::file;
@@ -739,7 +929,7 @@ void add_archive_entries(Batch& batch, const fs::path& archive,
             }
             continue;
         }
-        add(path, kind, source.size, source.mtime);
+        add(path, kind, &source);
     }
 }
 
@@ -907,7 +1097,7 @@ void search_archive_content(Batch& batch, const WalkOptions& options,
 class Walker {
 public:
     Walker(const WalkOptions& options, std::stop_token stop, const std::function<void(Batch&&)>& sink)
-        : options_(options), stop_(std::move(stop)), sink_(sink) {}
+        : options_(options), excludes_(options.exclude_folders), stop_(std::move(stop)), sink_(sink) {}
 
     void run(const std::vector<fs::path>& roots) {
         for (const auto& root : roots) queue_.push_back({root, false});
@@ -1026,7 +1216,8 @@ private:
                 return;
             }
             const std::size_t first = local.batch.entries.size();
-            add_archive_entries(local.batch, path, contents.entries, {}, options_.recurse);
+            add_archive_entries(local.batch, path, contents.entries, {}, options_.recurse,
+                                &excludes_);
             local.current_folder = kNoArchive;  // archive folders were added after it
             if (options_.content) {
                 search_archive_content(local.batch, options_, stop_, path, *provider, first);
@@ -1057,6 +1248,7 @@ private:
             const bool hidden = (attributes & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM)) != 0;
             if (hidden && !options_.include_hidden) continue;
             const bool directory_entry = (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+            if (directory_entry && excluded(data.cFileName, directory)) continue;
             Entry entry;
             entry.name = data.cFileName;
             entry.folder = folder_id(local, directory);
@@ -1102,6 +1294,7 @@ private:
             std::error_code status_error;
             const auto status = item.symlink_status(status_error);
             if (status_error) continue;
+            if (fs::is_directory(status) && excluded(widen_utf8(name), directory)) continue;
             Entry entry;
             entry.name = widen_utf8(name);
             entry.folder = folder_id(local, directory);
@@ -1128,7 +1321,17 @@ private:
 #endif
     }
 
+    // Whether a folder found in `parent` is left out, with its contents.
+    bool excluded(std::wstring_view name, const fs::path& parent) const {
+        if (excludes_.empty()) return false;
+        std::wstring path = path_text(parent);
+        if (!path.empty() && path.back() != L'\\' && path.back() != L'/') path.push_back(L'/');
+        path += name;
+        return excludes_.excludes(name, path);
+    }
+
     const WalkOptions& options_;
+    const FolderExcludes excludes_;
     std::stop_token stop_;
     const std::function<void(Batch&&)>& sink_;
     std::mutex lock_;
