@@ -93,6 +93,9 @@
     <ClInclude Include="src\core\ensured_directories.hpp">
       <Filter>Core</Filter>
     </ClInclude>
+    <ClInclude Include="src\archive\file_search.hpp">
+      <Filter>Archive</Filter>
+    </ClInclude>
     <ClInclude Include="src\core\exclusive_file.hpp">
       <Filter>Core</Filter>
     </ClInclude>
@@ -156,6 +159,9 @@
       <Filter>Archive</Filter>
     </ClCompile>
     <ClCompile Include="src\archive\container_formats.cpp">
+      <Filter>Archive</Filter>
+    </ClCompile>
+    <ClCompile Include="src\archive\file_search.cpp">
       <Filter>Archive</Filter>
     </ClCompile>
     <ClCompile Include="src\archive\sfx_image.cpp">

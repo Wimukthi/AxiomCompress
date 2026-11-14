@@ -1,6 +1,7 @@
 #include "axiom/archive.hpp"
 #include "axiom/axiom.hpp"
 #include "archive/container_internal.hpp"
+#include "archive/file_search.hpp"
 #include "archive/decoded_block_budget.hpp"
 #include "archive/sfx_image.hpp"
 #include "sfx/sfx_config.hpp"
@@ -69,6 +70,7 @@
 #endif
 
 #include <algorithm>
+#include <mutex>
 #include <atomic>
 #include <chrono>
 #include <cerrno>
@@ -2493,6 +2495,225 @@ void test_source_probe_matches_path_queries() {
 // The source walk reads kinds and sizes from the directory listing instead of
 // asking per path; it must still visit what recursive_directory_iterator with
 // per-path checks visited, in the same order, and descend into nothing that
+
+// The Find query language: the instant filter's terms, compiled once.
+void test_file_search_query() {
+    using axiom::search::Entry;
+    using axiom::search::EntryKind;
+    using axiom::search::Query;
+    using axiom::search::QueryOptions;
+
+    axiom::search::Batch batch;
+    axiom::search::Folder reports;
+    reports.display = L"C:\\Work\\Reports";
+    reports.filesystem = "C:\\Work\\Reports";
+    batch.folders.push_back(reports);
+    const auto add = [&](std::wstring name, EntryKind kind, std::uint64_t size, std::int64_t modified) {
+        Entry entry;
+        entry.name = std::move(name);
+        entry.kind = kind;
+        entry.size = size;
+        entry.modified = modified;
+        batch.entries.push_back(std::move(entry));
+    };
+    // 2026-03-15 12:00 UTC sits on 2026-03-15 in every time zone from -11 to +11.
+    constexpr std::int64_t kMarch15 = 1773576000;
+    add(L"Annual Report.docx", EntryKind::file, 2u << 20, kMarch15);
+    add(L"notes.txt", EntryKind::file, 512, kMarch15 - 40 * 86400);
+    add(L"Drafts", EntryKind::folder, 0, kMarch15);
+    add(L"backup.zip", EntryKind::archive, 30u << 20, kMarch15);
+    axiom::search::Index index;
+    index.append(std::move(batch));
+
+    const auto matching = [&](std::wstring_view text, QueryOptions options = {}) {
+        std::wstring error;
+        const auto query = Query::compile(text, options, &error);
+        AXIOM_CHECK(query.has_value());
+        std::vector<std::wstring> names;
+        if (!query) return names;
+        for (const auto& entry : index.entries()) {
+            if (query->matches(index, entry)) names.push_back(entry.name);
+        }
+        return names;
+    };
+    using Names = std::vector<std::wstring>;
+    AXIOM_CHECK(matching(L"").size() == 4);
+    AXIOM_CHECK(matching(L"REPORT") == Names{L"Annual Report.docx"});
+    AXIOM_CHECK(matching(L"annual docx") == Names{L"Annual Report.docx"});
+    AXIOM_CHECK(matching(L"\"annual report\"") == Names{L"Annual Report.docx"});
+    AXIOM_CHECK(matching(L"\"report annual\"").empty());
+    AXIOM_CHECK(matching(L"-report").size() == 3);
+    AXIOM_CHECK(matching(L"*.txt") == Names{L"notes.txt"});
+    AXIOM_CHECK(matching(L"n?tes*") == Names{L"notes.txt"});
+    AXIOM_CHECK(matching(L"ext:zip") == Names{L"backup.zip"});
+    AXIOM_CHECK(matching(L"ext:.DOCX") == Names{L"Annual Report.docx"});
+    AXIOM_CHECK(matching(L"size:>1M") == (Names{L"Annual Report.docx", L"backup.zip"}));
+    AXIOM_CHECK(matching(L"size:<=512") == Names{L"notes.txt"});
+    AXIOM_CHECK(matching(L"type:folder") == Names{L"Drafts"});
+    AXIOM_CHECK(matching(L"kind:archive") == Names{L"backup.zip"});
+    AXIOM_CHECK(matching(L"date:2026-03-15").size() == 3);
+    AXIOM_CHECK(matching(L"date:<2026-03-01") == Names{L"notes.txt"});
+    AXIOM_CHECK(matching(L"path:reports\\notes") == Names{L"notes.txt"});
+    AXIOM_CHECK(matching(L"work").empty());
+
+    QueryOptions match_case;
+    match_case.match_case = true;
+    AXIOM_CHECK(matching(L"report", match_case).empty());
+    AXIOM_CHECK(matching(L"Report", match_case) == Names{L"Annual Report.docx"});
+    QueryOptions whole;
+    whole.whole_name = true;
+    AXIOM_CHECK(matching(L"notes", whole).empty());
+    AXIOM_CHECK(matching(L"NOTES.TXT", whole) == Names{L"notes.txt"});
+    QueryOptions with_path;
+    with_path.search_path = true;
+    AXIOM_CHECK(matching(L"work", with_path).size() == 4);
+    QueryOptions folders_only;
+    folders_only.files = false;
+    folders_only.archives = false;
+    AXIOM_CHECK(matching(L"", folders_only) == Names{L"Drafts"});
+
+    std::wstring error;
+    AXIOM_CHECK(!Query::compile(L"size:huge", {}, &error) && !error.empty());
+    AXIOM_CHECK(!Query::compile(L"date:yesterday", {}, &error));
+    AXIOM_CHECK(!Query::compile(L"type:spreadsheet", {}, &error));
+
+    AXIOM_CHECK(axiom::search::looks_like_archive_name("a.axar"));
+    AXIOM_CHECK(axiom::search::looks_like_archive_name("A.TAR.GZ"));
+    AXIOM_CHECK(axiom::search::looks_like_archive_name("set.r07"));
+    AXIOM_CHECK(!axiom::search::looks_like_archive_name("photo.gz.jpg"));
+    AXIOM_CHECK(axiom::search::matches_archive_patterns(L"", "x.zip"));
+    AXIOM_CHECK(axiom::search::matches_archive_patterns(L"*.7z; *.ZIP", "x.zip"));
+    AXIOM_CHECK(!axiom::search::matches_archive_patterns(L"*.7z;*.rar", "x.zip"));
+}
+
+// The Find walk: everything beneath the roots, folders on several threads,
+// archives opened once, links listed but never followed.
+void test_file_search_walk() {
+    const auto root = make_temp_dir();
+    const auto tree = root / "tree";
+    fs::create_directories(tree / "a" / "b");
+    fs::create_directories(tree / "empty");
+    write_all(tree / "top.txt", bytes_from_string("top"));
+    write_all(tree / "a" / "one.bin", std::vector<std::uint8_t>(777, 1));
+    write_all(tree / "a" / "b" / "deep.txt", bytes_from_string("deep"));
+    const fs::path hidden_name =
+#if defined(_WIN32)
+        "secret.txt";
+#else
+        ".secret";
+#endif
+    write_all(tree / hidden_name, bytes_from_string("hidden"));
+#if defined(_WIN32)
+    SetFileAttributesW((tree / hidden_name).c_str(), FILE_ATTRIBUTE_HIDDEN);
+#endif
+
+    const auto packed = root / "packed";
+    fs::create_directories(packed / "inner" / "sub");
+    write_all(packed / "inner" / "sub" / "needle.txt", bytes_from_string("found inside"));
+    axiom::create_archive({packed / "inner"}, tree / "a" / "plain.axar");
+    axiom::CompressionOptions locked;
+    locked.password = "walk-secret";
+    locked.encrypt_header = true;
+    axiom::create_archive({packed / "inner"}, tree / "locked.axar", locked);
+
+    const auto outside = root / "outside";
+    fs::create_directories(outside);
+    write_all(outside / "never.txt", bytes_from_string("not beneath the tree"));
+#if defined(_WIN32)
+    const std::string link_command = "cmd /c mklink /J \"" + (tree / "jump").string() + "\" \"" +
+                                     outside.string() + "\" >nul 2>&1";
+    const bool linked = std::system(link_command.c_str()) == 0;
+#else
+    std::error_code link_error;
+    fs::create_directory_symlink(outside, tree / "jump", link_error);
+    const bool linked = !link_error;
+#endif
+
+    const auto run = [&](axiom::search::WalkOptions options) {
+        axiom::search::Index index;
+        std::mutex lock;
+        axiom::search::walk({tree}, options, {}, [&](axiom::search::Batch&& batch) {
+            std::lock_guard guard(lock);
+            index.append(std::move(batch));
+        });
+        std::set<std::wstring> paths;
+        for (const auto& entry : index.entries()) paths.insert(index.display_path(entry));
+        return std::make_pair(std::move(index), std::move(paths));
+    };
+    const auto display = [](const fs::path& path) {
+        return std::wstring(path.wstring());
+    };
+
+    axiom::search::WalkOptions everything;
+    everything.search_archives = true;
+    for (unsigned threads : {1u, 4u}) {
+        everything.threads = threads;
+        const auto [index, paths] = run(everything);
+        AXIOM_CHECK(paths.contains(display(tree / "top.txt")));
+        AXIOM_CHECK(paths.contains(display(tree / "a" / "b" / "deep.txt")));
+        AXIOM_CHECK(paths.contains(display(tree / "empty")));
+        AXIOM_CHECK(paths.contains(display(tree / hidden_name)));
+        AXIOM_CHECK(!paths.contains(display(tree / "jump" / "never.txt")));
+        if (linked) AXIOM_CHECK(paths.contains(display(tree / "jump")));
+        // Inside the archive, with its implied folder.
+        const std::wstring inside = display(tree / "a" / "plain.axar") + L" :: /inner/sub/needle.txt";
+        AXIOM_CHECK(paths.contains(inside));
+        AXIOM_CHECK(paths.contains(display(tree / "a" / "plain.axar") + L" :: /inner/sub"));
+        // The encrypted archive is listed as a file but not opened.
+        AXIOM_CHECK(paths.contains(display(tree / "locked.axar")));
+        AXIOM_CHECK(index.skipped_encrypted() == 1);
+        const std::size_t expected = (linked ? 1u : 0u) + 12u;
+        AXIOM_CHECK(index.entries().size() == expected);
+        for (const auto& entry : index.entries()) {
+            if (entry.name == L"one.bin") AXIOM_CHECK(entry.size == 777 && entry.modified > 0);
+            if (entry.name == L"plain.axar") {
+                AXIOM_CHECK(entry.kind == axiom::search::EntryKind::archive);
+            }
+            if (entry.name == L"needle.txt") {
+                AXIOM_CHECK(entry.archive_path == "inner/sub/needle.txt");
+                const auto& folder = index.folder(entry.folder);
+                AXIOM_CHECK(folder.archive != axiom::search::kNoArchive);
+                AXIOM_CHECK(folder.archive_directory == "inner/sub");
+                AXIOM_CHECK(index.archive(folder.archive) == tree / "a" / "plain.axar");
+            }
+        }
+    }
+
+    // One level, no hidden files, no archives.
+    axiom::search::WalkOptions shallow;
+    shallow.recurse = false;
+    shallow.include_hidden = false;
+    {
+        const auto [index, paths] = run(shallow);
+        AXIOM_CHECK(paths.contains(display(tree / "top.txt")));
+        AXIOM_CHECK(paths.contains(display(tree / "a")));
+        AXIOM_CHECK(!paths.contains(display(tree / "a" / "one.bin")));
+        AXIOM_CHECK(!paths.contains(display(tree / hidden_name)));
+        AXIOM_CHECK(index.skipped_encrypted() == 0);
+    }
+
+    // Archive types restrict which archives are opened.
+    axiom::search::WalkOptions only_zip = everything;
+    only_zip.archive_patterns = L"*.zip";
+    AXIOM_CHECK(!run(only_zip).second.contains(
+        display(tree / "a" / "plain.axar") + L" :: /inner/sub/needle.txt"));
+
+    // A stopped walk returns promptly with what it has.
+    std::stop_source stopped;
+    stopped.request_stop();
+    std::size_t delivered = 0;
+    axiom::search::walk({tree}, everything, stopped.get_token(),
+                        [&](axiom::search::Batch&& batch) { delivered += batch.entries.size(); });
+    AXIOM_CHECK(delivered == 0);
+
+    std::error_code cleanup;
+#if defined(_WIN32)
+    SetFileAttributesW((tree / hidden_name).c_str(), FILE_ATTRIBUTE_NORMAL);
+#endif
+    fs::remove(tree / "jump", cleanup);
+    fs::remove_all(root, cleanup);
+}
+
 // redirects.
 void test_source_tree_walk() {
     const auto root = make_temp_dir();
@@ -9044,6 +9265,8 @@ constexpr RegisteredTest kTests[] = {
     {"zip_direct_split_creation", test_zip_direct_split_creation},
     {"safe_file_replacement", test_safe_file_replacement},
     {"source_tree_walk", test_source_tree_walk},
+    {"file_search_query", test_file_search_query},
+    {"file_search_walk", test_file_search_walk},
 #if defined(_WIN32)
     {"skip_unreadable_archive_inputs", test_skip_unreadable_archive_inputs},
     {"windows_security_descriptor_restore", test_windows_security_descriptor_restore},

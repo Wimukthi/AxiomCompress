@@ -97,6 +97,7 @@ endif()
 add_library(axiom STATIC
     src/archive/container.cpp
     src/archive/container_formats.cpp
+    src/archive/file_search.cpp
     src/archive/container_zip.cpp
     src/archive/sfx_image.cpp
     src/sfx/sfx_config.cpp

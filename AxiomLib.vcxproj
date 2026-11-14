@@ -95,6 +95,7 @@
     <ClInclude Include="src\core\benchmark_statistics.hpp" />
     <ClInclude Include="src\core\crypto.hpp" />
     <ClInclude Include="src\core\ensured_directories.hpp" />
+    <ClInclude Include="src\archive\file_search.hpp" />
     <ClInclude Include="src\core\exclusive_file.hpp" />
     <ClInclude Include="src\core\file_meta.hpp" />
     <ClInclude Include="src\core\path_text.hpp" />
@@ -134,6 +135,7 @@
   <ItemGroup>
     <ClCompile Include="src\archive\container.cpp" />
     <ClCompile Include="src\archive\container_formats.cpp" />
+    <ClCompile Include="src\archive\file_search.cpp" />
     <ClCompile Include="src\archive\sfx_image.cpp" />
     <ClCompile Include="src\sfx\sfx_config.cpp" />
     <ClCompile Include="src\sfx\sfx_options.cpp" />
