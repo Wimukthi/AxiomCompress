@@ -10751,6 +10751,42 @@ void write_volume(const fs::path& path, const VolumeHeader& header,
 
 }  // namespace
 
+void read_axar_files(const std::filesystem::path& archive_path, const std::string& password,
+                     const ArchiveFileVisitor& visitor,
+                     const std::shared_ptr<OperationControl>& operation) {
+    std::uint64_t file_size = 0;
+    auto stream = open_archive(archive_path, file_size);
+    const ByteSource bytes(stream, file_size);
+    auto loaded = load_index(bytes, password);
+    OptionalKeyWipeGuard key_wipe{loaded.key};
+    const auto& index = loaded.index;
+    if (index.meta.encryption.enabled && !loaded.key) {
+        throw std::runtime_error("archive is encrypted; a password is required");
+    }
+    std::vector<const EntryRec*> selected;
+    for (const auto& entry : index.entries) {
+        if (entry.type == kEntryFile && visitor.select(entry.path, entry.size)) {
+            selected.push_back(&entry);
+        }
+    }
+    if (selected.empty()) return;
+    // One decoding thread: the caller already reads several archives at once.
+    BlockSource source(bytes, index, 1, operation, loaded.key, index.meta.large_solid_blocks);
+    std::vector<std::uint64_t> reads;
+    for (const auto* entry : selected) source.append_entry_reads(*entry, reads);
+    source.plan(std::move(reads));
+    for (const auto* entry : selected) {
+        operation_checkpoint(operation);
+        visitor.begin(entry->path);
+        bool wanted = true;
+        read_file_bytes(source, index.blocks.size(), *entry, operation,
+                        [&](std::span<const std::uint8_t> file_bytes) {
+                            if (wanted) wanted = visitor.bytes(file_bytes);
+                        });
+        visitor.end(entry->path);
+    }
+}
+
 ArchiveRecoveryInfo archive_recovery_info(const std::filesystem::path& archive_path) {
     std::uint64_t file_size = 0;
     auto stream = open_archive(archive_path, file_size);

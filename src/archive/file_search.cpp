@@ -1,5 +1,8 @@
 #include "archive/file_search.hpp"
 
+#include "archive/container_internal.hpp"
+#include "core/path_text.hpp"
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -7,6 +10,10 @@
 #include <cmath>
 #include <condition_variable>
 #include <ctime>
+#include <cstdio>
+#include <cstring>
+#include <fstream>
+#include <random>
 #include <cwctype>
 #include <limits>
 #include <map>
@@ -31,7 +38,30 @@ namespace fs = std::filesystem;
 
 namespace {
 
+#if defined(_WIN32)
+// Lowercase for every UTF-16 unit, from the invariant locale: towlower in the C
+// locale folds ASCII only, so a capital A-umlaut never met a small one. Built once.
+const std::array<wchar_t, 65536>& lowercase_table() {
+    static const std::array<wchar_t, 65536> table = [] {
+        std::array<wchar_t, 65536> units{};
+        for (std::size_t k = 0; k < units.size(); ++k) units[k] = static_cast<wchar_t>(k);
+        std::array<wchar_t, 65536> lower = units;
+        // Surrogates are not characters on their own; leave them as they are.
+        LCMapStringEx(LOCALE_NAME_INVARIANT, LCMAP_LOWERCASE, units.data(), 0xD800,
+                      lower.data(), 0xD800, nullptr, nullptr, 0);
+        LCMapStringEx(LOCALE_NAME_INVARIANT, LCMAP_LOWERCASE, units.data() + 0xE000, 0x2000,
+                      lower.data() + 0xE000, 0x2000, nullptr, nullptr, 0);
+        return lower;
+    }();
+    return table;
+}
+
+wchar_t fold_char(wchar_t value) {
+    return lowercase_table()[static_cast<std::uint16_t>(value)];
+}
+#else
 wchar_t fold_char(wchar_t value) { return static_cast<wchar_t>(std::towlower(value)); }
+#endif
 
 std::wstring folded(std::wstring_view text) {
     std::wstring result(text);
@@ -168,7 +198,9 @@ std::optional<std::uint64_t> parse_size(std::wstring_view text) {
     wchar_t* end = nullptr;
     const long double number = std::wcstold(owned.c_str(), &end);
     if (end == owned.c_str() || !std::isfinite(number) || number < 0.0L) return std::nullopt;
-    const std::wstring suffix = folded(std::wstring_view(end));
+    std::wstring_view unit(end);
+    while (!unit.empty() && std::iswspace(unit.front())) unit.remove_prefix(1);  // "64 MB"
+    const std::wstring suffix = folded(unit);
     std::uint64_t multiplier = 1;
     if (suffix.empty() || suffix == L"b") {
         multiplier = 1;
@@ -277,6 +309,8 @@ void Index::append(Batch&& batch) {
     }
     read_errors_ += batch.read_errors;
     skipped_encrypted_ += batch.skipped_encrypted;
+    content_read_ += batch.content_read;
+    content_skipped_ += batch.content_skipped;
 }
 
 std::wstring Index::display_path(const Entry& entry) const {
@@ -379,20 +413,20 @@ bool Query::text_matches(const Term& term, std::wstring_view value, bool whole) 
     return whole ? equals(value, term.text, fold) : contains(value, term.text, fold);
 }
 
-bool Query::term_matches(const Term& term, const Index& index, const Entry& entry) const {
+bool Query::term_matches(const Term& term, const Entry& entry,
+                         const std::function<std::wstring()>& path) const {
     switch (term.field) {
         case Field::plain:
             if (options_.whole_name) return text_matches(term, entry.name, true);
             if (text_matches(term, entry.name, false)) return true;
-            return options_.search_path &&
-                   text_matches(term, index.display_path(entry), false);
+            return options_.search_path && text_matches(term, path(), false);
         case Field::name:
             return text_matches(term, entry.name, options_.whole_name);
         case Field::ext:
             return entry.kind != EntryKind::folder &&
                    text_matches(term, extension_of(entry.name), true);
         case Field::path:
-            return text_matches(term, index.display_path(entry), false);
+            return text_matches(term, path(), false);
         case Field::size:
             return entry.kind != EntryKind::folder &&
                    compare_values(entry.size, term.number, term.compare);
@@ -406,6 +440,22 @@ bool Query::term_matches(const Term& term, const Index& index, const Entry& entr
 }
 
 bool Query::matches(const Index& index, const Entry& entry) const {
+    return matches_with(entry, [&] { return index.display_path(entry); });
+}
+
+bool Query::matches(const Entry& entry, std::wstring_view folder_display) const {
+    return matches_with(entry, [&] {
+        std::wstring path(folder_display);
+        if (!path.empty() && path.back() != L'\\' && path.back() != L'/') {
+            path.push_back(path.find(L" :: /") != std::wstring::npos
+                               ? L'/'
+                               : static_cast<wchar_t>(fs::path::preferred_separator));
+        }
+        return path + entry.name;
+    });
+}
+
+bool Query::matches_with(const Entry& entry, const std::function<std::wstring()>& path) const {
     switch (entry.kind) {
         case EntryKind::file:
         case EntryKind::link:
@@ -419,9 +469,155 @@ bool Query::matches(const Index& index, const Entry& entry) const {
             break;
     }
     for (const Term& term : terms_) {
-        if (term_matches(term, index, entry) == term.negate) return false;
+        if (term_matches(term, entry, path) == term.negate) return false;
     }
     return true;
+}
+
+// ---- content -------------------------------------------------------------------
+
+namespace {
+
+std::uint8_t fold_byte(std::uint8_t value) {
+    return value >= 'A' && value <= 'Z' ? static_cast<std::uint8_t>(value + ('a' - 'A')) : value;
+}
+
+std::uint16_t fold_unit(std::uint16_t value) {
+    if (value >= 0xD800 && value <= 0xDFFF) return value;  // surrogates stand as written
+    return static_cast<std::uint16_t>(fold_char(static_cast<wchar_t>(value)));
+}
+
+// Code points of the text, from UTF-16 or UTF-32 wchar_t.
+std::vector<std::uint32_t> code_points(std::wstring_view text) {
+    std::vector<std::uint32_t> points;
+    for (std::size_t k = 0; k < text.size(); ++k) {
+        std::uint32_t c = static_cast<std::uint32_t>(text[k]);
+        if constexpr (sizeof(wchar_t) == 2) {
+            if (c >= 0xD800 && c <= 0xDBFF && k + 1 < text.size()) {
+                const std::uint32_t low = static_cast<std::uint32_t>(text[k + 1]);
+                if (low >= 0xDC00 && low <= 0xDFFF) {
+                    c = 0x10000 + ((c - 0xD800) << 10) + (low - 0xDC00);
+                    ++k;
+                }
+            }
+        }
+        points.push_back(c);
+    }
+    return points;
+}
+
+}  // namespace
+
+std::optional<ContentPattern> ContentPattern::compile(std::wstring_view text, bool match_case) {
+    if (text.empty()) return std::nullopt;
+    ContentPattern pattern;
+    pattern.match_case_ = match_case;
+    for (const std::uint32_t c : code_points(text)) {
+        if (c < 0x80) {
+            pattern.utf8_.push_back(static_cast<std::uint8_t>(c));
+        } else if (c < 0x800) {
+            pattern.utf8_.push_back(static_cast<std::uint8_t>(0xC0 | (c >> 6)));
+            pattern.utf8_.push_back(static_cast<std::uint8_t>(0x80 | (c & 0x3F)));
+        } else if (c < 0x10000) {
+            pattern.utf8_.push_back(static_cast<std::uint8_t>(0xE0 | (c >> 12)));
+            pattern.utf8_.push_back(static_cast<std::uint8_t>(0x80 | ((c >> 6) & 0x3F)));
+            pattern.utf8_.push_back(static_cast<std::uint8_t>(0x80 | (c & 0x3F)));
+        } else {
+            pattern.utf8_.push_back(static_cast<std::uint8_t>(0xF0 | (c >> 18)));
+            pattern.utf8_.push_back(static_cast<std::uint8_t>(0x80 | ((c >> 12) & 0x3F)));
+            pattern.utf8_.push_back(static_cast<std::uint8_t>(0x80 | ((c >> 6) & 0x3F)));
+            pattern.utf8_.push_back(static_cast<std::uint8_t>(0x80 | (c & 0x3F)));
+        }
+        if (c < 0x10000) {
+            pattern.utf16_.push_back(static_cast<std::uint16_t>(c));
+        } else {
+            const std::uint32_t v = c - 0x10000;
+            pattern.utf16_.push_back(static_cast<std::uint16_t>(0xD800 + (v >> 10)));
+            pattern.utf16_.push_back(static_cast<std::uint16_t>(0xDC00 + (v & 0x3FF)));
+        }
+    }
+    if (!match_case) {
+        for (auto& b : pattern.utf8_) b = fold_byte(b);
+        for (auto& u : pattern.utf16_) u = fold_unit(u);
+    }
+    // Horspool shift tables. UTF-16 units share a 256-entry table keyed by their
+    // low byte, taking the smallest shift of the units that share a key, which
+    // keeps every skip safe.
+    const std::size_t m8 = pattern.utf8_.size();
+    pattern.utf8_shift_.fill(m8);
+    for (std::size_t k = 0; k + 1 < m8; ++k) pattern.utf8_shift_[pattern.utf8_[k]] = m8 - 1 - k;
+    const std::size_t m16 = pattern.utf16_.size();
+    pattern.utf16_shift_.fill(m16);
+    for (std::size_t k = 0; k + 1 < m16; ++k) {
+        auto& shift = pattern.utf16_shift_[pattern.utf16_[k] & 0xFF];
+        shift = std::min(shift, m16 - 1 - k);
+    }
+    pattern.overlap_ = std::max(m8, 2 * m16 + 1);
+    return pattern;
+}
+
+bool ContentPattern::find_utf8(const std::uint8_t* data, std::size_t size) const {
+    const std::size_t m = utf8_.size();
+    if (size < m) return false;
+    std::size_t i = 0;
+    while (i + m <= size) {
+        std::size_t k = m;
+        if (match_case_) {
+            while (k > 0 && data[i + k - 1] == utf8_[k - 1]) --k;
+        } else {
+            while (k > 0 && fold_byte(data[i + k - 1]) == utf8_[k - 1]) --k;
+        }
+        if (k == 0) return true;
+        const std::uint8_t last = match_case_ ? data[i + m - 1] : fold_byte(data[i + m - 1]);
+        i += utf8_shift_[last];
+    }
+    return false;
+}
+
+bool ContentPattern::find_utf16(const std::uint8_t* data, std::size_t size,
+                                std::size_t parity) const {
+    const std::size_t m = utf16_.size();
+    if (size < parity) return false;
+    const std::size_t units = (size - parity) / 2;
+    if (units < m) return false;
+    const auto unit = [&](std::size_t j) {
+        const std::size_t at = parity + 2 * j;
+        const auto value = static_cast<std::uint16_t>(data[at] | (data[at + 1] << 8));
+        return match_case_ ? value : fold_unit(value);
+    };
+    std::size_t i = 0;
+    while (i + m <= units) {
+        std::size_t k = m;
+        while (k > 0 && unit(i + k - 1) == utf16_[k - 1]) --k;
+        if (k == 0) return true;
+        i += utf16_shift_[unit(i + m - 1) & 0xFF];
+    }
+    return false;
+}
+
+bool ContentPattern::find(const std::uint8_t* data, std::size_t size) const {
+    return find_utf8(data, size) || find_utf16(data, size, 0) || find_utf16(data, size, 1);
+}
+
+bool ContentScan::feed(std::span<const std::uint8_t> bytes) {
+    if (found_ || bytes.empty()) return found_;
+    const std::size_t overlap = pattern_.overlap();
+    // The carry is the last `overlap` bytes seen; only the seam between it and
+    // this piece needs searching together.
+    seam_.assign(carry_.begin(), carry_.end());
+    const std::size_t head = std::min(bytes.size(), overlap);
+    seam_.insert(seam_.end(), bytes.begin(), bytes.begin() + static_cast<std::ptrdiff_t>(head));
+    if (!carry_.empty() && pattern_.find(seam_.data(), seam_.size())) return found_ = true;
+    if (pattern_.find(bytes.data(), bytes.size())) return found_ = true;
+    if (bytes.size() >= overlap) {
+        carry_.assign(bytes.end() - static_cast<std::ptrdiff_t>(overlap), bytes.end());
+    } else {
+        carry_.insert(carry_.end(), bytes.begin(), bytes.end());
+        if (carry_.size() > overlap) {
+            carry_.erase(carry_.begin(), carry_.end() - static_cast<std::ptrdiff_t>(overlap));
+        }
+    }
+    return false;
 }
 
 // ---- names ---------------------------------------------------------------------
@@ -559,6 +755,155 @@ struct Task {
     bool archive = false;
 };
 
+// Whether a file's contents are wanted: a content search is on, its name and
+// type pass the filter, and it is small enough.
+bool wants_content(Batch& batch, const WalkOptions& options, Entry& entry,
+                   std::wstring_view folder_display) {
+    if (!options.content) return false;
+    if (options.content_filter != nullptr &&
+        !options.content_filter->matches(entry, folder_display)) {
+        return false;
+    }
+    if (entry.size > options.content_max_size) {
+        entry.content = ContentState::skipped;
+        ++batch.content_skipped;
+        return false;
+    }
+    return true;
+}
+
+void search_file_content(Batch& batch, const WalkOptions& options, const std::stop_token& stop,
+                         Entry& entry, const fs::path& path) {
+    if (!options.content) return;
+    if (!wants_content(batch, options, entry, batch.folders[entry.folder].display)) return;
+    thread_local std::vector<char> buffer(1u << 20);
+    std::ifstream input(path, std::ios::binary);
+    if (!input) {
+        entry.content = ContentState::skipped;
+        ++batch.content_skipped;
+        return;
+    }
+    ContentScan scan(*options.content);
+    while (input && !stop.stop_requested()) {
+        input.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+        const auto got = input.gcount();
+        if (got <= 0) break;
+        if (scan.feed({reinterpret_cast<const std::uint8_t*>(buffer.data()),
+                       static_cast<std::size_t>(got)})) {
+            break;
+        }
+    }
+    entry.content = scan.found() ? ContentState::found : ContentState::absent;
+    ++batch.content_read;
+}
+
+// Formats read through 7z.dll or tar: extract just the wanted entries to a
+// private temporary folder, read them there, and remove it.
+void read_by_extracting(const fs::path& archive, const ArchiveProvider& provider,
+                        const std::unordered_map<std::string, std::size_t>& wanted,
+                        std::uint64_t wanted_bytes, const ArchiveFileVisitor& visitor,
+                        const std::shared_ptr<OperationControl>& operation) {
+    // Bounded so one search cannot fill the disk with an archive's contents.
+    constexpr std::uint64_t kMaxExtractedBytes = 1ull << 30;
+    if (wanted_bytes > kMaxExtractedBytes) return;
+    std::random_device random;
+    const fs::path folder = fs::temp_directory_path() /
+        ("axiom-find-" + std::to_string(random()) + std::to_string(random()));
+    std::error_code error;
+    fs::create_directories(folder, error);
+    if (error) return;
+    struct Remove {
+        fs::path folder;
+        ~Remove() {
+            std::error_code ignored;
+            fs::remove_all(folder, ignored);
+        }
+    } remove{folder};
+    std::vector<std::string> paths;
+    paths.reserve(wanted.size());
+    for (const auto& [entry_path, k] : wanted) paths.push_back(entry_path);
+    ExtractOptions options;
+    options.operation = operation;
+    options.overwrite = ExtractOptions::Overwrite::overwrite;
+    options.mark_of_the_web = ExtractOptions::MarkOfTheWeb::off;
+    options.restore_mtime = false;
+    provider.extract_selected(archive, paths, folder, options);
+    thread_local std::vector<char> buffer(1u << 20);
+    for (const auto& entry_path : paths) {
+        operation_checkpoint(operation);
+        if (!visitor.select(entry_path, 0)) continue;
+        std::ifstream input(folder / core::path_from_utf8(entry_path), std::ios::binary);
+        if (!input) continue;  // stays unread, and is counted as skipped
+        visitor.begin(entry_path);
+        bool more = true;
+        while (more && input) {
+            input.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+            const auto got = input.gcount();
+            if (got <= 0) break;
+            more = visitor.bytes({reinterpret_cast<const std::uint8_t*>(buffer.data()),
+                                  static_cast<std::size_t>(got)});
+        }
+        visitor.end(entry_path);
+    }
+}
+
+// Search the contents of the archive's entries just added at `first`.
+void search_archive_content(Batch& batch, const WalkOptions& options,
+                            const std::stop_token& stop, const fs::path& path,
+                            const ArchiveProvider& provider, std::size_t first) {
+    std::unordered_map<std::string, std::size_t> wanted;
+    std::uint64_t wanted_bytes = 0;
+    for (std::size_t k = first; k < batch.entries.size(); ++k) {
+        Entry& entry = batch.entries[k];
+        if (entry.kind == EntryKind::folder || entry.kind == EntryKind::link) continue;
+        if (!wants_content(batch, options, entry, batch.folders[entry.folder].display)) continue;
+        wanted.emplace(entry.archive_path, k);
+        wanted_bytes += entry.size;
+    }
+    if (wanted.empty()) return;
+
+    auto operation = std::make_shared<OperationControl>();
+    std::stop_callback cancel(stop, [&] { operation->request_cancel(); });
+    std::optional<ContentScan> scan;
+    std::size_t current = 0;
+    ArchiveFileVisitor visitor;
+    visitor.select = [&](const std::string& entry_path, std::uint64_t) {
+        return wanted.contains(entry_path);
+    };
+    visitor.begin = [&](const std::string& entry_path) {
+        current = wanted.at(entry_path);
+        scan.emplace(*options.content);
+    };
+    visitor.bytes = [&](std::span<const std::uint8_t> bytes) { return !scan->feed(bytes); };
+    visitor.end = [&](const std::string&) {
+        Entry& entry = batch.entries[current];
+        entry.content = scan->found() ? ContentState::found : ContentState::absent;
+        ++batch.content_read;
+    };
+    const auto mark_unread = [&] {
+        for (const auto& [entry_path, k] : wanted) {
+            Entry& entry = batch.entries[k];
+            if (entry.content == ContentState::unchecked) {
+                entry.content = ContentState::skipped;
+                ++batch.content_skipped;
+            }
+        }
+    };
+    try {
+        if (provider.info().native) {
+            read_axar_files(path, {}, visitor, operation);
+        } else if (provider.info().format == ArchiveFormat::zip) {
+            read_zip_files(path, visitor, operation);
+        } else {
+            read_by_extracting(path, provider, wanted, wanted_bytes, visitor, operation);
+        }
+    } catch (...) {
+        // Cancelled, or the archive could not be read: what was not read is
+        // counted as skipped below.
+    }
+    mark_unread();
+}
+
 class Walker {
 public:
     Walker(const WalkOptions& options, std::stop_token stop, const std::function<void(Batch&&)>& sink)
@@ -680,8 +1025,12 @@ private:
                 ++local.batch.skipped_encrypted;
                 return;
             }
+            const std::size_t first = local.batch.entries.size();
             add_archive_entries(local.batch, path, contents.entries, {}, options_.recurse);
             local.current_folder = kNoArchive;  // archive folders were added after it
+            if (options_.content) {
+                search_archive_content(local.batch, options_, stop_, path, *provider, first);
+            }
         } catch (...) {
             ++local.batch.read_errors;
         }
@@ -730,6 +1079,9 @@ private:
                 entry.kind = looks_like_archive_name(child) ? EntryKind::archive : EntryKind::file;
                 if (entry.kind == EntryKind::archive) consider_archive(child, found);
             }
+            if (entry.kind != EntryKind::folder) {
+                search_file_content(local.batch, options_, stop_, entry, child);
+            }
             local.batch.entries.push_back(std::move(entry));
             if (local.batch.entries.size() >= kBatchEntries) flush(local, false);
         } while (FindNextFileW(find, &data));
@@ -767,6 +1119,9 @@ private:
                 entry.kind = looks_like_archive_name(item.path()) ? EntryKind::archive : EntryKind::file;
                 if (entry.kind == EntryKind::archive) consider_archive(item.path(), found);
             }
+            if (entry.kind != EntryKind::folder) {
+                search_file_content(local.batch, options_, stop_, entry, item.path());
+            }
             local.batch.entries.push_back(std::move(entry));
             if (local.batch.entries.size() >= kBatchEntries) flush(local, false);
         }
@@ -788,6 +1143,18 @@ void walk(const std::vector<fs::path>& roots, const WalkOptions& options, std::s
           const std::function<void(Batch&&)>& sink) {
     Walker walker(options, std::move(stop), sink);
     walker.run(roots);
+}
+
+void search_archive_contents(Batch& batch, const fs::path& archive, std::size_t first,
+                             const WalkOptions& options, std::stop_token stop) {
+    if (!options.content) return;
+    const auto* provider = archive_provider_for_path(archive);
+    if (provider == nullptr) return;
+    search_archive_content(batch, options, stop, archive, *provider, first);
+}
+
+std::optional<std::uint64_t> parse_size_text(std::wstring_view text) {
+    return parse_size(text);
 }
 
 }  // namespace axiom::search

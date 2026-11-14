@@ -1482,6 +1482,8 @@ void move_zip_entries(const fs::path& archive_path,
 
 struct ZipExtractCallbackContext {
     core::ExclusiveFile* output = nullptr;
+    // Receives the decoded bytes instead of a file, when set.
+    const std::function<void(std::span<const std::uint8_t>)>* sink = nullptr;
     std::shared_ptr<OperationControl> operation;
     OperationStage stage = OperationStage::extracting;
     std::uint64_t* completed_bytes = nullptr;
@@ -1497,6 +1499,7 @@ void zip_emit_plain(ZipExtractCallbackContext& context,
                     std::span<const std::uint8_t> bytes) {
     if (bytes.empty()) return;
     operation_checkpoint(context.operation);
+    if (context.sink != nullptr) (*context.sink)(bytes);
     if (context.output != nullptr && !context.output->write(bytes)) {
         throw std::runtime_error("failed writing file: " + context.current_path);
     }
@@ -1756,6 +1759,36 @@ void extract_zip_entry(ZipReader& reader,
     });
     decoder.finish();
 }
+
+}  // namespace
+
+void read_zip_files(const std::filesystem::path& archive_path,
+                    const ArchiveFileVisitor& visitor,
+                    const std::shared_ptr<OperationControl>& operation) {
+    ZipReader reader(archive_path, operation);
+    const auto plans = read_zip_entry_plans(reader);
+    for (const auto& plan : plans) {
+        operation_checkpoint(operation);
+        if (plan.entry.is_directory || plan.entry.is_symlink || !plan.supported ||
+            plan.encrypted || !visitor.select(plan.entry.path, plan.entry.size)) {
+            continue;
+        }
+        bool wanted = true;
+        const std::function<void(std::span<const std::uint8_t>)> sink =
+            [&](std::span<const std::uint8_t> bytes) {
+                if (wanted) wanted = visitor.bytes(bytes);
+            };
+        ZipExtractCallbackContext context;
+        context.operation = operation;
+        context.sink = &sink;
+        context.current_path = plan.entry.path;
+        visitor.begin(plan.entry.path);
+        extract_zip_entry(reader, plan, {}, context, "ZIP entry could not be read");
+        visitor.end(plan.entry.path);
+    }
+}
+
+namespace {
 
 void update_zip_items(const std::vector<ScanItem>& items,
                       const fs::path& archive_path,

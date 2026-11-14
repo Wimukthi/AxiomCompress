@@ -14,6 +14,8 @@
 #include <fstream>
 #include <memory>
 #include <optional>
+#include <span>
+#include <functional>
 #include <unordered_set>
 #include <system_error>
 #include <string>
@@ -169,6 +171,28 @@ std::string join_archive_path(std::string_view parent, std::string_view child);
 bool is_within(const std::filesystem::path& base, const std::filesystem::path& target);
 void reject_symlinked_ancestor(const std::filesystem::path& dest_norm,
                                const std::filesystem::path& target);
+
+// Read the contents of chosen files in an archive straight into memory, for
+// searching inside them. `select` picks a file by its archive path and size,
+// possibly for every file before any is read. Each selected file is then read
+// in turn: `begin`, its contents in order through `bytes` (returning false
+// ignores the rest of that file), then `end`. Directories and links are never
+// offered. Throws what opening or decoding throws, and OperationCancelled once
+// `operation` is cancelled.
+struct ArchiveFileVisitor {
+    std::function<bool(const std::string& path, std::uint64_t size)> select;
+    std::function<void(const std::string& path)> begin;
+    std::function<bool(std::span<const std::uint8_t> bytes)> bytes;
+    std::function<void(const std::string& path)> end;
+};
+// AXAR: each solid block is decoded once however many selected files it holds.
+void read_axar_files(const std::filesystem::path& archive_path, const std::string& password,
+                     const ArchiveFileVisitor& visitor,
+                     const std::shared_ptr<OperationControl>& operation);
+// ZIP: unencrypted Store and Deflate entries; others are not offered.
+void read_zip_files(const std::filesystem::path& archive_path,
+                    const ArchiveFileVisitor& visitor,
+                    const std::shared_ptr<OperationControl>& operation);
 
 // The Mark of the Web one extraction run gives its files, decided once from the
 // archive and the caller's policy.

@@ -9,10 +9,12 @@
 
 #include "axiom/archive.hpp"
 
+#include <array>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
 #include <optional>
+#include <span>
 #include <stop_token>
 #include <string>
 #include <string_view>
@@ -28,6 +30,14 @@ enum class EntryKind : std::uint8_t {
 };
 
 inline constexpr std::uint32_t kNoArchive = 0xFFFFFFFFu;
+
+// What a content search learned about an entry.
+enum class ContentState : std::uint8_t {
+    unchecked,  // not read: no content search, or its name did not qualify
+    found,
+    absent,
+    skipped,    // too large, or it could not be read
+};
 
 // Where entries live. A filesystem folder has `filesystem`; a folder inside an
 // archive has `archive` and its '/'-separated `archive_directory`.
@@ -46,6 +56,7 @@ struct Entry {
     std::uint64_t size = 0;
     std::int64_t modified = 0;  // seconds since the Unix epoch; 0 when unknown
     std::string archive_path;   // the entry's UTF-8 path inside its archive, if any
+    ContentState content = ContentState::unchecked;
 };
 
 // What one walker thread hands over at a time. Folder and archive numbers are
@@ -56,6 +67,8 @@ struct Batch {
     std::vector<Entry> entries;
     std::size_t read_errors = 0;
     std::size_t skipped_encrypted = 0;
+    std::size_t content_read = 0;     // files whose contents were searched
+    std::size_t content_skipped = 0;  // files too large or unreadable to search
 };
 
 class Index {
@@ -67,6 +80,8 @@ public:
     const std::filesystem::path& archive(std::uint32_t id) const { return archives_[id]; }
     std::size_t read_errors() const noexcept { return read_errors_; }
     std::size_t skipped_encrypted() const noexcept { return skipped_encrypted_; }
+    std::size_t content_read() const noexcept { return content_read_; }
+    std::size_t content_skipped() const noexcept { return content_skipped_; }
 
     // The full display path of an entry: its folder's location and its name.
     std::wstring display_path(const Entry& entry) const;
@@ -77,6 +92,8 @@ private:
     std::vector<Entry> entries_;
     std::size_t read_errors_ = 0;
     std::size_t skipped_encrypted_ = 0;
+    std::size_t content_read_ = 0;
+    std::size_t content_skipped_ = 0;
 };
 
 struct QueryOptions {
@@ -101,6 +118,8 @@ public:
                                         std::wstring* error = nullptr);
 
     bool matches(const Index& index, const Entry& entry) const;
+    // The same test for an entry not yet in an index, given its folder's text.
+    bool matches(const Entry& entry, std::wstring_view folder_display) const;
 
 private:
     enum class Field : std::uint8_t { plain, name, ext, path, size, date, kind };
@@ -115,12 +134,53 @@ private:
         EntryKind kind = EntryKind::file;
     };
 
-    bool term_matches(const Term& term, const Index& index, const Entry& entry) const;
+    bool matches_with(const Entry& entry, const std::function<std::wstring()>& path) const;
+    bool term_matches(const Term& term, const Entry& entry,
+                      const std::function<std::wstring()>& path) const;
     bool text_matches(const Term& term, std::wstring_view value, bool whole) const;
 
     std::vector<Term> terms_;
     QueryOptions options_;
     bool needs_date_ = false;
+};
+
+// Text to find inside files, in the two encodings text files on Windows use:
+// UTF-8 (which covers ASCII) and UTF-16LE. Without match_case, letters fold:
+// all of them in UTF-16, and the ASCII ones in UTF-8, where other letters must
+// match as written.
+class ContentPattern {
+public:
+    static std::optional<ContentPattern> compile(std::wstring_view text, bool match_case);
+
+    // Bytes a scan keeps between reads so a match across them is still seen.
+    std::size_t overlap() const noexcept { return overlap_; }
+    bool find(const std::uint8_t* data, std::size_t size) const;
+
+private:
+    bool find_utf8(const std::uint8_t* data, std::size_t size) const;
+    bool find_utf16(const std::uint8_t* data, std::size_t size, std::size_t parity) const;
+
+    bool match_case_ = false;
+    std::vector<std::uint8_t> utf8_;
+    std::array<std::size_t, 256> utf8_shift_{};
+    std::vector<std::uint16_t> utf16_;
+    std::array<std::size_t, 256> utf16_shift_{};
+    std::size_t overlap_ = 0;
+};
+
+// One file's contents, fed in pieces.
+class ContentScan {
+public:
+    explicit ContentScan(const ContentPattern& pattern) : pattern_(pattern) {}
+    // True once the text has been seen; later calls do nothing.
+    bool feed(std::span<const std::uint8_t> bytes);
+    bool found() const noexcept { return found_; }
+
+private:
+    const ContentPattern& pattern_;
+    std::vector<std::uint8_t> carry_;
+    std::vector<std::uint8_t> seam_;
+    bool found_ = false;
 };
 
 struct WalkOptions {
@@ -130,6 +190,13 @@ struct WalkOptions {
     std::wstring archive_patterns; // ';'-separated wildcards; empty means every archive
     bool skip_encrypted = true;
     unsigned threads = 0;          // 0 picks a count for the machine
+
+    // Search the contents of each file, in folders and inside archives, that
+    // `content_filter` accepts (by name and type) and that is no larger than
+    // content_max_size; the result lands in Entry::content.
+    std::optional<ContentPattern> content;
+    const Query* content_filter = nullptr;
+    std::uint64_t content_max_size = 64ull << 20;
 };
 
 // Visit everything beneath each root folder, not the roots themselves, on a pool
@@ -139,6 +206,16 @@ struct WalkOptions {
 // followed. Returns early, with whatever was found, once `stop` is requested.
 void walk(const std::vector<std::filesystem::path>& roots, const WalkOptions& options,
           std::stop_token stop, const std::function<void(Batch&&)>& sink);
+
+// Search the contents of an archive's entries that are already in `batch`, from
+// `first` on, as walk() does for archives it meets; for an archive that is open
+// in the browser, whose entries did not come from a walk.
+void search_archive_contents(Batch& batch, const std::filesystem::path& archive,
+                             std::size_t first, const WalkOptions& options,
+                             std::stop_token stop);
+
+// A size such as "64 MB", "1.5G" or "512" in bytes, as size: reads it.
+std::optional<std::uint64_t> parse_size_text(std::wstring_view text);
 
 // Add an archive's already-read entries beneath `directory` ("" for its root):
 // direct children only unless `recurse`. Folders the entry list only implies are

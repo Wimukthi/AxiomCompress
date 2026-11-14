@@ -2575,6 +2575,10 @@ void test_file_search_query() {
 
     std::wstring error;
     AXIOM_CHECK(!Query::compile(L"size:huge", {}, &error) && !error.empty());
+    AXIOM_CHECK(axiom::search::parse_size_text(L"64 MB") == (64ull << 20));
+    AXIOM_CHECK(axiom::search::parse_size_text(L"1.5g") == (3ull << 29));
+    AXIOM_CHECK(axiom::search::parse_size_text(L"512") == 512u);
+    AXIOM_CHECK(!axiom::search::parse_size_text(L"lots"));
     AXIOM_CHECK(!Query::compile(L"date:yesterday", {}, &error));
     AXIOM_CHECK(!Query::compile(L"type:spreadsheet", {}, &error));
 
@@ -2713,6 +2717,54 @@ void test_file_search_walk() {
 #endif
     fs::remove(tree / "jump", cleanup);
     fs::remove_all(root, cleanup);
+}
+
+// Content search: the text as UTF-8 or UTF-16LE, across read boundaries.
+void test_file_search_content_pattern() {
+    using axiom::search::ContentPattern;
+    using axiom::search::ContentScan;
+    const auto bytes_of = [](std::string_view text) {
+        return std::vector<std::uint8_t>(text.begin(), text.end());
+    };
+    const auto utf16 = [](std::u16string_view text, bool odd) {
+        std::vector<std::uint8_t> out;
+        if (odd) out.push_back('x');
+        for (const char16_t unit : text) {
+            out.push_back(static_cast<std::uint8_t>(unit & 0xFF));
+            out.push_back(static_cast<std::uint8_t>(unit >> 8));
+        }
+        return out;
+    };
+    const auto finds = [](const ContentPattern& pattern, const std::vector<std::uint8_t>& data,
+                          std::size_t piece) {
+        ContentScan scan(pattern);
+        for (std::size_t at = 0; at < data.size(); at += piece) {
+            const std::size_t size = std::min(piece, data.size() - at);
+            if (scan.feed({data.data() + at, size})) break;
+        }
+        return scan.found();
+    };
+    const auto folded = ContentPattern::compile(L"Needle", false);
+    const auto exact = ContentPattern::compile(L"Needle", true);
+    AXIOM_CHECK(folded && exact);
+    const auto text = bytes_of("a haystack with a NEEDLE in it");
+    for (const std::size_t piece : {std::size_t{1}, std::size_t{3}, std::size_t{4096}}) {
+        AXIOM_CHECK(finds(*folded, text, piece));
+        AXIOM_CHECK(!finds(*exact, text, piece));
+        AXIOM_CHECK(finds(*exact, bytes_of("...Needle..."), piece));
+        AXIOM_CHECK(finds(*folded, utf16(u"UTF-16 text: needle here", false), piece));
+        AXIOM_CHECK(finds(*folded, utf16(u"UTF-16 text: needle here", true), piece));
+        AXIOM_CHECK(!finds(*folded, bytes_of("no match: needl e"), piece));
+    }
+    // Non-ASCII letters fold in UTF-16 (on Windows, from the invariant locale)
+    // and must be written as is in UTF-8. Escapes keep the source ASCII.
+    const auto umlaut = ContentPattern::compile(L"\u00c4rger", false);
+    AXIOM_CHECK(umlaut);
+#if defined(_WIN32)
+    AXIOM_CHECK(finds(*umlaut, utf16(u"kein \u00e4rger", false), 7));
+#endif
+    AXIOM_CHECK(finds(*umlaut, bytes_of("kein \xC3\x84rger"), 7));
+    AXIOM_CHECK(!ContentPattern::compile(L"", false));
 }
 
 // redirects.
@@ -3265,6 +3317,91 @@ void test_mark_of_the_web() {
 
     std::error_code error;
     fs::remove_all(root, error);
+}
+
+// Content search during the walk, in folders and inside archives.
+void test_file_search_content_walk() {
+    const auto root = make_temp_dir();
+    const auto tree = root / "tree";
+    fs::create_directories(tree / "docs");
+    write_all(tree / "docs" / "hit.txt", bytes_from_string("line one\nthe Secret Word\n"));
+    write_all(tree / "docs" / "miss.txt", bytes_from_string("nothing to see"));
+    write_all(tree / "docs" / "hit.log", bytes_from_string("secret word, but not a .txt"));
+    {
+        std::vector<std::uint8_t> wide;
+        for (const char c : std::string_view("UTF-16 secret word")) {
+            wide.push_back(static_cast<std::uint8_t>(c));
+            wide.push_back(0);
+        }
+        write_all(tree / "docs" / "wide.txt", wide);
+    }
+    std::vector<std::uint8_t> large(300000, 'z');
+    const std::string phrase = "secret word";
+    std::copy(phrase.begin(), phrase.end(), large.end() - static_cast<std::ptrdiff_t>(phrase.size()));
+    write_all(tree / "docs" / "large.txt", large);
+
+    const auto packed = root / "packed";
+    fs::create_directories(packed);
+    write_all(packed / "inside.txt", bytes_from_string("archived secret word"));
+    write_all(packed / "other.txt", bytes_from_string("archived but unrelated"));
+    axiom::create_archive({packed}, tree / "box.axar");
+    {
+        axiom::ArchiveCreateRequest request;
+        request.inputs = {packed};
+        request.archive_path = tree / "box.zip";
+        axiom::archive_provider_for_path(request.archive_path)->create(request);
+    }
+    bool have_7z = false;
+#if defined(_WIN32)
+    if (const auto seven_zip = bundled_7z_for_tests()) {
+        const std::string command = "cd /d " + quote_for_command(root) + " && " +
+                                    quote_for_command(*seven_zip) + " a -t7z " +
+                                    quote_for_command(tree / "box.7z") + " packed >nul 2>nul";
+        have_7z = std::system(command.c_str()) == 0;
+    }
+#endif
+
+    const auto filter = axiom::search::Query::compile(L"*.txt", {});
+    AXIOM_CHECK(filter.has_value());
+    axiom::search::WalkOptions options;
+    options.search_archives = true;
+    options.content = axiom::search::ContentPattern::compile(L"SECRET WORD", false);
+    options.content_filter = &*filter;
+    options.content_max_size = 100000;
+    axiom::search::Index index;
+    std::mutex lock;
+    axiom::search::walk({tree}, options, {}, [&](axiom::search::Batch&& batch) {
+        std::lock_guard guard(lock);
+        index.append(std::move(batch));
+    });
+    std::set<std::wstring> found;
+    std::map<std::wstring, axiom::search::ContentState> states;
+    for (const auto& entry : index.entries()) {
+        const std::wstring path = index.display_path(entry);
+        states[path] = entry.content;
+        if (entry.content == axiom::search::ContentState::found) found.insert(path);
+    }
+    const auto disk = [&](const fs::path& path) { return std::wstring(path.wstring()); };
+    using State = axiom::search::ContentState;
+    AXIOM_CHECK(found.contains(disk(tree / "docs" / "hit.txt")));
+    AXIOM_CHECK(found.contains(disk(tree / "docs" / "wide.txt")));
+    AXIOM_CHECK(states[disk(tree / "docs" / "miss.txt")] == State::absent);
+    // Not a .txt: its name keeps it from being read at all.
+    AXIOM_CHECK(states[disk(tree / "docs" / "hit.log")] == State::unchecked);
+    AXIOM_CHECK(states[disk(tree / "docs" / "large.txt")] == State::skipped);
+    AXIOM_CHECK(found.contains(disk(tree / "box.axar") + L" :: /packed/inside.txt"));
+    AXIOM_CHECK(states[disk(tree / "box.axar") + L" :: /packed/other.txt"] == State::absent);
+    AXIOM_CHECK(found.contains(disk(tree / "box.zip") + L" :: /packed/inside.txt"));
+    AXIOM_CHECK(states[disk(tree / "box.zip") + L" :: /packed/other.txt"] == State::absent);
+    if (have_7z) {
+        AXIOM_CHECK(found.contains(disk(tree / "box.7z") + L" :: /packed/inside.txt"));
+    }
+    const std::size_t expected_found = have_7z ? 5u : 4u;
+    AXIOM_CHECK(found.size() == expected_found);
+    AXIOM_CHECK(index.content_skipped() == 1);
+
+    std::error_code cleanup;
+    fs::remove_all(root, cleanup);
 }
 
 void test_bundled_7z_provider_layer() {
@@ -9268,6 +9405,7 @@ constexpr RegisteredTest kTests[] = {
     {"source_tree_walk", test_source_tree_walk},
     {"file_search_query", test_file_search_query},
     {"file_search_walk", test_file_search_walk},
+    {"file_search_content_pattern", test_file_search_content_pattern},
 #if defined(_WIN32)
     {"skip_unreadable_archive_inputs", test_skip_unreadable_archive_inputs},
     {"windows_security_descriptor_restore", test_windows_security_descriptor_restore},
@@ -9278,6 +9416,7 @@ constexpr RegisteredTest kTests[] = {
     {"system_archive_provider_layer", test_system_archive_provider_layer},
     {"bundled_7z_provider_layer", test_bundled_7z_provider_layer},
     {"mark_of_the_web", test_mark_of_the_web},
+    {"file_search_content_walk", test_file_search_content_walk},
 #endif
     {"zip_aes256_encryption", test_zip_aes256_encryption},
     {"zip_aes_data_descriptor_compatibility", test_zip_aes_data_descriptor_compatibility},
