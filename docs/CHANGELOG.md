@@ -40,6 +40,19 @@ Entries are condensed from the
   files under `C:\Program Files` (3,694 read) took 3.1 s, against 7.4 s for
   `grep -rli`, and found every file grep found, 10 that its walk missed, and
   12 inside archives.
+- Find files sorts its results: click a column heading, and again to reverse.
+  Names sort as Explorer sorts them (`file2` before `file10`), and results
+  found while the search runs merge into the order shown.
+- Find files shows the packed size and CRC-32 of items inside archives, in new
+  Packed and CRC-32 columns.
+- Find files has a menu on its results (Go to, Open, Open containing folder,
+  Copy path, Copy name, Select all) and exports them as CSV, tab-separated
+  values or a list of paths. Exported cells that a spreadsheet would read as a
+  formula get a leading apostrophe.
+- Find files can leave folders out: **Exclude folders** takes names or paths
+  with wildcards, such as `node_modules; .git`, on disk and inside archives.
+- Find files remembers the last 20 names and containing texts in drop-down
+  lists, and keeps the sort order, column widths and excluded folders.
 
 ### Fixed
 

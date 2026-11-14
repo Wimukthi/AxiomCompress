@@ -911,6 +911,12 @@ UINT CustomMenuBar::show_context_menu(std::vector<CustomMenuItem> items, POINT s
                       std::move(items), screen_point).command;
 }
 
+UINT show_custom_context_menu(HWND owner, HINSTANCE instance, UINT dpi, HFONT font,
+                              const CustomMenuTheme& theme, std::vector<CustomMenuItem> items,
+                              POINT screen_point) {
+    return show_popup(owner, instance, dpi, font, theme, std::move(items), screen_point).command;
+}
+
 LRESULT CustomMenuBar::handle_message(UINT message, WPARAM wparam, LPARAM lparam) {
     switch (message) {
         case WM_PAINT: paint(); return 0;

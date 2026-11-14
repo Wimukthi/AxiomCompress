@@ -33,4 +33,17 @@ struct PersistedGuiSettings {
 PersistedGuiSettings load_gui_settings();
 void save_gui_settings(const PersistedGuiSettings& settings);
 
+// What the Find files window remembers between uses.
+struct FindFilesSettings {
+    std::vector<std::wstring> name_history;     // most recent first
+    std::vector<std::wstring> content_history;
+    std::wstring exclude_folders;
+    std::vector<int> column_widths;
+    int sort_column = -1;  // -1 lists results in the order they were found
+    bool sort_ascending = true;
+};
+
+FindFilesSettings load_find_files_settings();
+void save_find_files_settings(const FindFilesSettings& settings);
+
 }  // namespace axiom::gui

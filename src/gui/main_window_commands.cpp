@@ -790,8 +790,12 @@ void MainWindow::show_tree_context_menu(POINT point) {
 }
 
 bool MainWindow::copy_text_to_clipboard(const std::wstring& text) const {
+    return set_clipboard_text(hwnd_, text);
+}
+
+bool set_clipboard_text(HWND owner, const std::wstring& text) {
     if (text.empty()) return false;
-    if (!OpenClipboard(hwnd_)) return false;
+    if (!OpenClipboard(owner)) return false;
     struct ClipboardGuard {
         ~ClipboardGuard() { CloseClipboard(); }
     } guard;

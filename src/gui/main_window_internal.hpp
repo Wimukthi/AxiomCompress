@@ -230,6 +230,10 @@ std::wstring get_text(HWND hwnd);
 void set_text(HWND hwnd, const std::wstring& text);
 std::wstring quote_count(std::size_t count, const wchar_t* singular, const wchar_t* plural);
 std::wstring format_size(std::uint64_t size);
+// Put text on the clipboard as Unicode text; false when it is empty or the
+// clipboard is busy.
+bool set_clipboard_text(HWND owner, const std::wstring& text);
+CustomMenuTheme make_custom_menu_theme(const ThemePalette& theme);
 std::wstring format_packed_size(const std::optional<std::uint64_t>& size,
                                 bool estimated);
 std::wstring format_ratio(std::uint64_t packed, std::uint64_t unpacked);
@@ -458,6 +462,8 @@ public:
                                   int horizontal_scroll,
                                   int vertical_scroll);
     void select_index(int row);
+    // Scroll the focused row into view.
+    void reveal_focused();
     int row_at_screen_point(POINT point) const;
     void select_all();
 
@@ -798,13 +804,27 @@ private:
         kMatchTimer = 30116,
         kContentText = 30117,
         kContentMaxSize = 30118,
+        kExcludeFolders = 30119,
+        kExportButton = 30120,
+        kResultOpen = 30121,
+        kResultOpenFolder = 30122,
+        kResultCopyPath = 30123,
+        kResultCopyName = 30124,
+        kResultSelectAll = 30125,
         kSearchBatchMessage = WM_APP + 110,
         kSearchDoneMessage = WM_APP + 111,
+        kExportDoneMessage = WM_APP + 112,
     };
     // A batch from the walk, tagged with the walk it belongs to.
     struct BatchPayload {
         std::uint64_t generation = 0;
         axiom::search::Batch batch;
+    };
+    // How an export went, posted back from the thread that wrote it.
+    struct ExportResult {
+        fs::path path;
+        std::size_t rows = 0;
+        std::wstring error;
     };
     static const wchar_t* class_name();
     static bool register_class(HINSTANCE instance);
@@ -814,7 +834,7 @@ private:
                       DWORD style,
                       int id = 0,
                       DWORD ex_style = 0);
-    std::array<HWND, 26> controls() const;
+    std::array<HWND, 29> controls() const;
     bool checkbox_checked(int id) const;
     void set_checkbox(int id, bool checked);
     void toggle_checkbox(int id);
@@ -830,6 +850,26 @@ private:
     std::vector<std::wstring> result_row(std::size_t row) const;
     FileSearchDialogResult result_target(std::size_t row) const;
     void accept_selected();
+    // Sorting: a header click orders every match, and matches found later are
+    // merged into that order as they arrive.
+    axiom::search::SortKey sort_key() const;
+    void on_sort(int column);
+    void sort_new_matches(bool force);
+    std::vector<std::uint32_t> selected_entries() const;
+    std::optional<std::uint32_t> focused_entry() const;
+    void restore_selection(const std::vector<std::uint32_t>& entries,
+                           std::optional<std::uint32_t> focused, bool reveal);
+    // What can be done with results.
+    void show_results_menu(POINT screen_point);
+    void open_result(bool containing_folder);
+    void copy_results(bool names_only);
+    bool can_export() const;
+    void export_results();
+    void on_export_done(LPARAM result);
+    bool handle_shortcut(const MSG& message);
+    // The name and content fields keep what was searched for before.
+    void remember_history();
+    void save_settings();
     void layout();
     void create_controls();
     void rebuild_font_for_dpi();
@@ -856,9 +896,12 @@ private:
 
     bool include_hidden_ = true;
 
+    FindFilesSettings settings_;
+
     // Everything the last walk found, owned by the UI thread. Refining the query
-    // re-matches this instead of walking the disk again.
-    std::unique_ptr<axiom::search::Index> index_;
+    // re-matches this instead of walking the disk again. Shared so an export can
+    // keep reading it after a new search replaces it.
+    std::shared_ptr<axiom::search::Index> index_;
 
     std::wstring index_key_;
 
@@ -872,11 +915,25 @@ private:
 
     std::size_t matched_upto_ = 0;
 
+    // The column the results are ordered by (-1 for the order found), and how
+    // many of matches_ are in that order already.
+    int sort_column_ = -1;
+
+    bool sort_ascending_ = true;
+
+    std::size_t sorted_count_ = 0;
+
+    std::chrono::steady_clock::time_point last_merge_{};
+
     bool walking_ = false;
 
     std::chrono::steady_clock::time_point walk_started_{};
 
     double walk_seconds_ = 0;
+
+    bool exporting_ = false;
+
+    std::wstring export_status_;
 
     FileSearchDialogResult result_;
 
@@ -926,6 +983,12 @@ private:
 
     HWND archive_types_ = nullptr;
 
+    HWND exclude_label_ = nullptr;
+
+    HWND exclude_edit_ = nullptr;
+
+    // The name/path and containing-text fields: combo boxes that drop down the
+    // recent searches.
     HWND search_edit_ = nullptr;
 
     HWND content_label_ = nullptr;
@@ -961,6 +1024,8 @@ private:
 
     HWND search_button_ = nullptr;
 
+    HWND export_button_ = nullptr;
+
     HWND go_to_button_ = nullptr;
 
     HWND close_button_ = nullptr;
@@ -968,6 +1033,8 @@ private:
     DarkTableView results_;
 
     RetiringThread search_thread_;
+
+    RetiringThread export_thread_;
 
     std::uint64_t search_generation_ = 0;
 

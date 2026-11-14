@@ -14,6 +14,7 @@ namespace axiom::gui {
 namespace {
 
 constexpr const wchar_t* kRegistryPath = L"Software\\AxiomCompress\\GUI";
+constexpr const wchar_t* kFindFilesRegistryPath = L"Software\\AxiomCompress\\GUI\\FindFiles";
 
 DWORD read_dword(HKEY key, const wchar_t* name, DWORD fallback) {
     DWORD value = fallback;
@@ -691,6 +692,38 @@ void save_gui_settings(const PersistedGuiSettings& settings) {
                     settings.placement_dpi >= 48 && settings.placement_dpi <= 768
                         ? settings.placement_dpi : USER_DEFAULT_SCREEN_DPI);
     }
+    RegCloseKey(key);
+}
+
+FindFilesSettings load_find_files_settings() {
+    FindFilesSettings settings;
+    HKEY key = nullptr;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, kFindFilesRegistryPath, 0, KEY_QUERY_VALUE, &key) !=
+        ERROR_SUCCESS) {
+        return settings;
+    }
+    settings.name_history = read_string_list(key, L"NameHistory");
+    settings.content_history = read_string_list(key, L"ContentHistory");
+    settings.exclude_folders = read_string(key, L"ExcludeFolders");
+    settings.column_widths = read_int_list(key, L"ColumnWidths");
+    settings.sort_column = static_cast<int>(read_dword(key, L"SortColumn", 0xFFFFFFFFu));
+    settings.sort_ascending = read_bool(key, L"SortAscending", true);
+    RegCloseKey(key);
+    return settings;
+}
+
+void save_find_files_settings(const FindFilesSettings& settings) {
+    HKEY key = nullptr;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, kFindFilesRegistryPath, 0, nullptr, 0,
+                        KEY_SET_VALUE, nullptr, &key, nullptr) != ERROR_SUCCESS) {
+        return;
+    }
+    write_string_list(key, L"NameHistory", settings.name_history);
+    write_string_list(key, L"ContentHistory", settings.content_history);
+    write_string(key, L"ExcludeFolders", settings.exclude_folders);
+    write_string(key, L"ColumnWidths", join_int_list(settings.column_widths));
+    write_dword(key, L"SortColumn", static_cast<DWORD>(settings.sort_column));
+    write_dword(key, L"SortAscending", settings.sort_ascending ? 1u : 0u);
     RegCloseKey(key);
 }
 

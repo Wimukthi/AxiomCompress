@@ -397,6 +397,11 @@ void DarkTableView::select_index(int row) {
     select_row(row, false, false);
 }
 
+void DarkTableView::reveal_focused() {
+    ensure_selected_visible();
+    invalidate();
+}
+
 int DarkTableView::row_at_screen_point(POINT point) const {
     if (hwnd_ == nullptr) return -1;
     ScreenToClient(hwnd_, &point);

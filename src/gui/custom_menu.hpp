@@ -28,6 +28,12 @@ struct CustomMenuItem {
     bool checked{false};
 };
 
+// A themed context menu for a window that has no menu bar of its own; returns
+// the chosen command, or 0.
+UINT show_custom_context_menu(HWND owner, HINSTANCE instance, UINT dpi, HFONT font,
+                              const CustomMenuTheme& theme, std::vector<CustomMenuItem> items,
+                              POINT screen_point);
+
 class CustomMenuBar {
 public:
     using ItemProvider = std::function<std::vector<CustomMenuItem>(UINT)>;

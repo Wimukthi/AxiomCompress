@@ -254,15 +254,7 @@ void MainWindow::apply_theme() {
         apply_theme_to_control(button.window);
     }
     tooltip_.apply_theme(theme_.dark);
-    menu_bar_.set_theme({
-        theme_.dark ? RGB(31, 31, 31) : theme_.panel,
-        theme_.button_hot,
-        theme_.button_pressed,
-        theme_.text,
-        theme_.muted_text,
-        theme_.dark ? RGB(42, 42, 42) : theme_.border,
-        theme_.dark ? RGB(54, 54, 54) : theme_.border,
-    });
+    menu_bar_.set_theme(make_custom_menu_theme(theme_));
     table_.set_theme(theme_);
     tree_view_.set_theme(theme_);
     operation_window_.set_theme(make_operation_window_theme(theme_));
@@ -440,6 +432,18 @@ void MainWindow::paint_filter_popup() const {
     const bool active = GetFocus() == filter_edit_ || !browser_filter_.empty();
     frame_rect(dc, rect, active ? theme_.focus : theme_.border);
     EndPaint(filter_popup_, &paint);
+}
+
+CustomMenuTheme make_custom_menu_theme(const ThemePalette& theme) {
+    return {
+        theme.dark ? RGB(31, 31, 31) : theme.panel,
+        theme.button_hot,
+        theme.button_pressed,
+        theme.text,
+        theme.muted_text,
+        theme.dark ? RGB(42, 42, 42) : theme.border,
+        theme.dark ? RGB(54, 54, 54) : theme.border,
+    };
 }
 
 }  // namespace axiom::gui

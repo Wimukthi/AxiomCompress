@@ -217,6 +217,8 @@ narrow. The search window looks for names and paths, and optionally for text
 inside files, in folders and inside archives.
 
 1. Enter **Name/path text**, or leave it empty to list every matching item.
+   Its drop-down list, and the one for **Containing text**, hold the last 20
+   searches.
 2. Choose the search area and whether to include child folders and archives.
 3. Select **Search**. Results appear while the search is still running. Select
    one and choose **Go to**, or double-click it, to open its location and
@@ -242,17 +244,44 @@ is reported in the status line and the previous results stay.
 | Find in subfolders | Include descendants; filesystem reparse-point folders are not followed |
 | Find in archives | Inspect supported archives encountered in the search area |
 | Archive types | Enter semicolon-separated filename patterns such as `*.axar;*.zip`; `*` includes all supported types |
+| Exclude folders | Semicolon-separated folder names or paths to leave out with everything in them, such as `node_modules; .git; C:\Windows`; `*` and `?` work, and names apply inside archives too |
 | Skip encrypted | Exclude archives reported as encrypted; unreadable encrypted directories otherwise produce warnings |
 
-Results show Name, Location, Type, Size, and Modified. The status line reports
-how many items were scanned and how long it took, skipped encrypted archives,
-read warnings, and a notice if more than a million results matched.
+Results show Name, Location, Type, Size, Packed, Modified and CRC-32; Packed
+and CRC-32 are filled for items inside archives whose format records them.
+Click a column heading to sort by it, and again to reverse the order. Names
+sort as Explorer sorts them, so `file2` comes before `file10`; Type puts
+folders first and then orders by extension. Results found later are merged
+into the order shown, and the window remembers the order, the column widths and
+the excluded folders for next time. The status line reports how many items
+were scanned and how long it took, skipped encrypted archives, read warnings,
+and a notice if more than a million results matched.
+
+Right-click a result, or press the menu key, for:
+
+| Command | What it does |
+|---|---|
+| Go to | The same as the **Go to** button |
+| Open | Open a file or folder on disk with its default program; items inside archives open with Go to |
+| Open containing folder | Show the item in File Explorer, or the archive that holds it |
+| Copy path, Copy name | Copy the selected results, one per line; `Ctrl+C` copies paths |
+| Select all | Select every result (`Ctrl+A`) |
+| Export results... | The same as the **Export...** button (`Ctrl+S`) |
+
+**Export...** saves every result, in the order shown, once the search has
+finished: as comma-separated values (`.csv`), tab-separated values (`.tsv`), or
+a list of full paths (`.txt`), chosen by the file type in the Save dialog. The
+tables hold Name, Location, Path, Type, Size and Packed in bytes, Modified and
+CRC-32, in UTF-8 that spreadsheets read correctly. A cell that would begin with
+`=`, `+`, `-` or `@` gets a leading apostrophe so a spreadsheet does not run it
+as a formula.
 
 The search reads folders on several threads and opens each archive once, then
 keeps what it found. After the first search, editing the text or the Match
 case, Whole name, Search path and result-type choices refines those results in
 memory, without reading the disk again. Changing the search area, Find in
-subfolders, Find in archives, Archive types or Skip encrypted searches again,
+subfolders, Find in archives, Archive types, Exclude folders or Skip encrypted
+searches again,
 and so does **Search** itself, which picks up files that changed since. Hidden
 and system items are searched only when the file list shows them.
 
@@ -1326,6 +1355,7 @@ defaults:
 | Information | `Alt+Enter` |
 | Snapshot timeline | `Ctrl+Shift+T` |
 | Find files | `Ctrl+F` |
+| Copy result paths / export results, in Find files | `Ctrl+C` / `Ctrl+S` |
 | Benchmark | `Ctrl+B` |
 | Delete Axiom temporary files | `Ctrl+Shift+Delete` |
 | Settings | `Ctrl+,` |
