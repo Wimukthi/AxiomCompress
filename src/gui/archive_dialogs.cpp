@@ -611,7 +611,8 @@ std::optional<COLORREF> color_from_hex(std::wstring text) {
 
 std::optional<std::uint64_t> parse_size_text(std::wstring text) {
     text = trim_color_text(std::move(text));
-    if (text.empty()) return std::nullopt;
+    // _wcstoui64 reads "-1" as 2^64-1 without reporting a range error.
+    if (text.empty() || !std::iswdigit(text.front())) return std::nullopt;
     wchar_t* end = nullptr;
     errno = 0;
     const unsigned long long value = _wcstoui64(text.c_str(), &end, 10);
@@ -7292,7 +7293,7 @@ private:
 
     void accept_create() {
         fs::path requested_output =
-            trim_dialog_input(window_text(path_edit_));
+            normalize_dialog_path_text(window_text(path_edit_));
         if (!requested_output.empty()) {
             if (create_options.features.create_sfx) {
                 requested_output.replace_extension(L".exe");
@@ -7435,8 +7436,14 @@ private:
             return;
         }
         try {
-            const std::wstring recovery = window_text(recovery_percent_edit_);
-            create_options.features.recovery_percent = recovery.empty() ? 0 : std::stoi(recovery);
+            const std::wstring recovery = trim_dialog_input(window_text(recovery_percent_edit_));
+            std::size_t consumed = 0;
+            create_options.features.recovery_percent =
+                recovery.empty() ? 0 : std::stoi(recovery, &consumed);
+            // "12.5" or "10%" would otherwise be read as 12 or 10.
+            if (!recovery.empty() && consumed != recovery.size()) {
+                create_options.features.recovery_percent = -1;
+            }
         } catch (...) {
             create_options.features.recovery_percent = -1;
         }

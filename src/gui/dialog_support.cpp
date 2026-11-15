@@ -1423,14 +1423,45 @@ std::wstring trim_dialog_input(std::wstring text) {
     return std::wstring(first, last);
 }
 
+std::wstring normalize_dialog_path_text(std::wstring text) {
+    text = trim_dialog_input(std::move(text));
+    if (text.size() >= 2 && text.front() == L'"' && text.back() == L'"') {
+        text = trim_dialog_input(text.substr(1, text.size() - 2));
+    }
+    if (text.find(L'%') != std::wstring::npos) {
+        const DWORD needed = ExpandEnvironmentStringsW(text.c_str(), nullptr, 0);
+        if (needed > 0) {
+            std::wstring expanded(needed, L'\0');
+            if (ExpandEnvironmentStringsW(text.c_str(), expanded.data(), needed) == needed) {
+                expanded.resize(needed - 1);
+                text = std::move(expanded);
+            }
+        }
+    }
+    return text;
+}
+
 DialogPathValidation validate_dialog_path(
     std::wstring text, DialogPathKind kind) {
-    text = trim_dialog_input(std::move(text));
+    text = normalize_dialog_path_text(std::move(text));
     if (text.empty()) {
         return {{}, L"Enter a path."};
     }
 
     std::filesystem::path path(text);
+    // "D:" or "D:folder" means the drive's root here, not the folder the
+    // process last used on that drive.
+    if (path.has_root_name() && !path.has_root_directory() && text.size() >= 2 &&
+        text[1] == L':') {
+        path = path.root_name() / std::filesystem::path(L"\\") / path.relative_path();
+    }
+    // A relative path would land wherever the process started, which nothing
+    // on screen shows.
+    if (path.is_relative()) {
+        return {std::move(path),
+                L"Enter a full path that starts with a drive or network share, such as D:\\Folder."};
+    }
+    path = path.lexically_normal();
     if (const auto invalid = invalid_windows_path_message(path)) {
         return {std::move(path), *invalid};
     }

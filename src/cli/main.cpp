@@ -665,10 +665,12 @@ std::vector<std::string> split_interactive_command(std::string_view line) {
 }
 
 std::size_t parse_size(const std::string& value) {
+    // A whole number with an optional K, M or G. std::stoull alone would take
+    // "-1" as 2^64-1, "12abc" as 12 and "1.5m" as 1 MiB without a word.
     std::string digits = value;
     std::size_t multiplier = 1;
     if (!digits.empty()) {
-        const auto suffix = digits.back();
+        const char suffix = digits.back();
         if (suffix == 'k' || suffix == 'K') {
             multiplier = 1024;
             digits.pop_back();
@@ -680,9 +682,18 @@ std::size_t parse_size(const std::string& value) {
             digits.pop_back();
         }
     }
-    const auto parsed_value = std::stoull(digits);
-    if (multiplier != 0 &&
-        parsed_value > std::numeric_limits<std::size_t>::max() / multiplier) {
+    if (digits.empty() ||
+        !std::all_of(digits.begin(), digits.end(), [](char c) { return c >= '0' && c <= '9'; })) {
+        throw std::runtime_error("'" + value +
+                                 "' is not a size: use a whole number, optionally with K, M or G");
+    }
+    unsigned long long parsed_value = 0;
+    try {
+        parsed_value = std::stoull(digits);
+    } catch (const std::out_of_range&) {
+        throw std::runtime_error("'" + value + "' is too large");
+    }
+    if (parsed_value > std::numeric_limits<std::size_t>::max() / multiplier) {
         throw std::invalid_argument("size exceeds this build's address space");
     }
     return static_cast<std::size_t>(parsed_value * multiplier);
@@ -2104,6 +2115,11 @@ int run_interactive_shell() {
 }  // namespace
 
 int main(int argc, char** argv) {
+#if defined(_WIN32)
+    // An empty card reader or DVD drive must fail quietly, not stop the
+    // program with Windows' "There is no disk in the drive" box.
+    SetErrorMode(GetErrorMode() | SEM_FAILCRITICALERRORS | SEM_NOOPENFILEERRORBOX);
+#endif
     executable_path = fs::absolute(argv[0]);
     if (argc < 2) {
         return run_interactive_shell();

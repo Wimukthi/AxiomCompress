@@ -120,6 +120,9 @@ inline void add_dialog_tooltip(TooltipManager& tooltips, HWND control,
 void apply_dialog_input_filter(HWND control, DialogInputFilter filter,
                                UINT maximum_characters = 0);
 std::wstring trim_dialog_input(std::wstring text);
+// A path as typed or pasted: trimmed, without the quotes "Copy as path" adds,
+// and with %VARIABLES% expanded.
+std::wstring normalize_dialog_path_text(std::wstring text);
 DialogPathValidation validate_dialog_path(
     std::wstring text, DialogPathKind kind);
 void draw_dialog_button(const DRAWITEMSTRUCT& draw, bool dark);
