@@ -14,6 +14,13 @@ Entries are condensed from the
 
 ## [Unreleased]
 
+### Fixed
+
+- Axiom started with "This PC" as its location, the default, reported that
+  `C:\Program Files\Axiom\This PC` does not exist. 0.17.1.0 read the start
+  location as a folder beside Axiom.exe; it now does so only for a relative
+  path that exists there.
+
 ## [0.17.1.0] - 2026-11-15
 
 Dragging files out of an archive to Explorer is several times faster and shows

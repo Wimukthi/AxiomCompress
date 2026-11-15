@@ -555,13 +555,17 @@ void MainWindow::on_initial_navigate() {
         navigate_to(history_.current(), false);
     } else {
         // "Axiom.exe ." means the folder it was started in; the address bar
-        // reads relative text against the folder shown, and none is yet.
+        // reads relative text against the folder shown, and none is yet. Only
+        // a relative path that exists there is taken that way: the saved
+        // start location may be "This PC", and a name such as "Downloads" or
+        // "DATA-A (D:)" means a place, not a folder beside Axiom.exe.
         std::wstring initial = initial_path_;
         std::error_code error;
         const fs::path typed(initial);
         if (typed.is_relative() && initial.find(L"::") == std::wstring::npos) {
             const fs::path absolute = fs::absolute(typed, error);
-            if (!error) initial = absolute.wstring();
+            std::error_code exists_error;
+            if (!error && fs::exists(absolute, exists_error)) initial = absolute.wstring();
         }
         set_text(address_edit_, initial);
         on_address_go();
