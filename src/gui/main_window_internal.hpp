@@ -95,6 +95,7 @@ constexpr UINT kTableColumnReorderMessage = WM_APP + 14;
 constexpr UINT kAddressSyncMessage = WM_APP + 15;
 constexpr UINT_PTR kBrowserPopulateTimer = 42;
 constexpr UINT_PTR kDirectoryRefreshTimer = 41;
+constexpr UINT_PTR kDragTransferTimer = 43;
 enum ControlId : int {
     kAddFiles = 1005,
     kOpenArchive = 1008,
@@ -265,6 +266,19 @@ struct TempDirectoryRecord {
     fs::path path;
     bool sensitive = false;
 };
+// Entries dragged out of an archive to Explorer. The drop target reads the
+// temporary copy through streams, and may go on doing so after DoDragDrop
+// returns, so the transfer is followed until the target has let go of it.
+struct DragOutSession {
+    std::shared_ptr<axiom::OperationControl> control;
+    std::shared_ptr<axiom::gui::DragTransferStatus> status;
+    std::wstring error;
+    fs::path staging;
+    bool drag_returned = false;
+    bool transfer_started = false;  // the target asked for the contents
+    bool window_open = false;
+    bool error_shown = false;
+};
 struct StagedArchiveEntries {
     fs::path directory;
     std::vector<fs::path> paths;
@@ -280,6 +294,9 @@ axiom::ExtractOptions::MarkOfTheWeb configured_mark_of_the_web(
 bool has_executable_extension(const fs::path& path);
 void wipe_file_best_effort(const fs::path& path);
 void remove_temp_directory(const fs::path& path, bool sensitive);
+// Remove each folder, reporting the files and bytes removed to `progress`.
+void remove_temp_directories(const std::vector<TempDirectoryRecord>& directories,
+                             bool wipe_sensitive, const axiom::OperationControl& progress);
 bool key_file_contains_public_key(const fs::path& path,
                                   const std::array<std::uint8_t, 32>& public_key);
 bool set_registry_string(HKEY root, const std::wstring& subkey,
@@ -1307,6 +1324,13 @@ private:
         const std::string& password, bool for_drag, bool sensitive,
         bool for_clipboard = false);
     void on_table_begin_drag();
+    // Follow drag-out transfers: close the progress window when the target has
+    // read everything or given up, then remove the temporary copy.
+    void poll_drag_transfers();
+    bool drag_transfer_running() const;
+    // Remove what is left in temporary folders before the window closes,
+    // showing progress if it takes more than a moment.
+    void remove_temp_directories_at_exit();
     std::optional<fs::path> active_archive_path() const;
     axiom::gui::ArchiveCapabilities active_archive_capabilities() const;
     bool active_archive_catalog_ready() const;
@@ -1495,6 +1519,8 @@ private:
     // progress window has to live on its own thread to stay alive. See
     // ThreadedOperationProgressWindow and on_table_begin_drag().
     axiom::gui::ThreadedOperationProgressWindow drag_transfer_window_;
+    std::vector<std::shared_ptr<DragOutSession>> drag_sessions_;
+    bool polling_drag_transfers_ = false;
 
     ThemePalette theme_;
 

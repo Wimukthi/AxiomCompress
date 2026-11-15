@@ -39,6 +39,14 @@ Entries are condensed from the
   disk in the drive" box while Axiom lists drives or searches This PC, and the
   folder tree and address list no longer wait on a disconnected network drive
   for its label. This PC names network and CD drives as such.
+- Dragging entries out of an archive to Explorer shows the copy into the
+  destination, not only the extraction before it. The progress window used to
+  close when the drop returned, and Explorer can go on reading the files after
+  that, so a large copy ran with nothing on screen. It now stays until Explorer
+  has read everything, skipped the rest or been cancelled. The temporary copy
+  is then removed in the background instead of waiting for Axiom to exit, and
+  closing Axiom during such a copy asks first. Temporary files left at exit are
+  removed with a progress window when that takes more than a moment.
 
 ## [0.17.0.0] - 2026-11-15
 

@@ -178,13 +178,7 @@ HRESULT stream_for_file(const std::filesystem::path& path, IStream** stream) {
                                   FALSE, nullptr, stream);
 }
 
-struct TransferProgressState {
-    std::shared_ptr<OperationControl> operation;
-    std::uint64_t total_bytes = 0;
-    std::uint64_t total_files = 0;
-    std::atomic_uint64_t completed_bytes{0};
-    std::atomic_uint64_t completed_files{0};
-};
+using TransferProgressState = DragTransferStatus;
 
 class ProgressReadStream final : public IStream {
 public:
@@ -194,6 +188,7 @@ public:
                        std::uint64_t size)
         : inner_(inner), progress_(std::move(progress)),
           relative_path_(std::move(relative_path)), size_(size) {
+        if (progress_) progress_->open_streams.fetch_add(1, std::memory_order_relaxed);
         const int needed = WideCharToMultiByte(
             CP_UTF8, WC_ERR_INVALID_CHARS, relative_path_.data(),
             static_cast<int>(relative_path_.size()), nullptr, 0, nullptr, nullptr);
@@ -207,6 +202,7 @@ public:
 
     ~ProgressReadStream() {
         if (inner_ != nullptr) inner_->Release();
+        if (progress_) progress_->open_streams.fetch_sub(1, std::memory_order_release);
     }
 
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** object) override {
@@ -478,7 +474,9 @@ class FileDataObject final : public IDataObject {
 public:
     explicit FileDataObject(FileDragSource source) : source_(std::move(source)) {
         if (source_.transfer_operation && !source_.virtual_files.empty()) {
-            transfer_progress_ = std::make_shared<TransferProgressState>();
+            transfer_progress_ = source_.transfer_status
+                ? source_.transfer_status
+                : std::make_shared<TransferProgressState>();
             transfer_progress_->operation = source_.transfer_operation;
             for (const auto& item : source_.virtual_files) {
                 if (item.is_directory) continue;
@@ -495,6 +493,10 @@ public:
             initial.total_items = transfer_progress_->total_files;
             transfer_progress_->operation->report(initial);
         }
+    }
+
+    ~FileDataObject() {
+        if (transfer_progress_) transfer_progress_->released.store(true, std::memory_order_release);
     }
 
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** object) override {

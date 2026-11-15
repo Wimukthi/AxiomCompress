@@ -6,6 +6,7 @@
 
 #include "axiom/axiom.hpp"
 
+#include <atomic>
 #include <filesystem>
 #include <functional>
 #include <string>
@@ -25,11 +26,27 @@ struct VirtualFileDragItem {
     bool is_directory = false;
 };
 
+// How far the drop target has read the dragged files. The target may go on
+// reading after DoDragDrop returns, so this outlives the drag: `released` says
+// the target let go of the data, and `open_streams` how many files it still has
+// open.
+struct DragTransferStatus {
+    std::shared_ptr<OperationControl> operation;
+    std::uint64_t total_bytes = 0;
+    std::uint64_t total_files = 0;
+    std::atomic_uint64_t completed_bytes{0};
+    std::atomic_uint64_t completed_files{0};
+    std::atomic_int open_streams{0};
+    std::atomic_bool released{false};
+};
+
 struct FileDragSource {
     std::function<std::vector<std::filesystem::path>()> files;
     std::vector<VirtualFileDragItem> virtual_files;
     std::function<std::vector<std::filesystem::path>()> virtual_file_paths;
     std::shared_ptr<OperationControl> transfer_operation;
+    // Optional: shared with the caller to follow the transfer to its end.
+    std::shared_ptr<DragTransferStatus> transfer_status;
     ArchiveDragPayload archive_payload;
     DWORD preferred_effect = DROPEFFECT_COPY;
     std::wstring* error_message = nullptr;

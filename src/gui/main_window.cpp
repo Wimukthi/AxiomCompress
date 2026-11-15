@@ -1119,6 +1119,10 @@ LRESULT MainWindow::handle_message(UINT message, WPARAM wparam, LPARAM lparam) {
                 on_browser_populate_timer();
                 return 0;
             }
+            if (wparam == kDragTransferTimer) {
+                poll_drag_transfers();
+                return 0;
+            }
             break;
         case WM_COMMAND:
             switch (LOWORD(wparam)) {
@@ -1271,10 +1275,23 @@ LRESULT MainWindow::handle_message(UINT message, WPARAM wparam, LPARAM lparam) {
             return 0;
         }
         case WM_CLOSE:
+            if (drag_transfer_running() &&
+                show_app_message(L"Files dragged out of the archive are still being copied. "
+                                 L"Closing Axiom stops the copy.\n\nClose anyway?",
+                                 axiom::gui::MessageDialogIcon::question, L"Close Axiom",
+                                 axiom::gui::MessageDialogButtons::yes_no, IDNO) != IDYES) {
+                return 0;
+            }
+            for (auto& session : drag_sessions_) session->control->request_cancel();
+            drag_transfer_window_.stop();
+            drag_sessions_.clear();
+            KillTimer(hwnd_, kDragTransferTimer);
             save_current_settings();
+            remove_temp_directories_at_exit();
             DestroyWindow(hwnd_);
             return 0;
         case WM_DESTROY:
+            KillTimer(hwnd_, kDragTransferTimer);
             KillTimer(hwnd_, kDirectoryRefreshTimer);
             KillTimer(hwnd_, kBrowserPopulateTimer);
             drop_target_.revoke();

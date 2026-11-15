@@ -4,6 +4,8 @@
 
 #include "gui/main_window_internal.hpp"
 
+#include "core/path_text.hpp"
+
 namespace axiom::gui {
 
 std::wstring widen(std::string_view text, UINT code_page) {
@@ -276,6 +278,54 @@ if (sensitive) {
 }
 std::error_code remove_error;
 fs::remove_all(path, remove_error);
+}
+
+void remove_temp_directories(const std::vector<TempDirectoryRecord>& directories,
+                             bool wipe_sensitive, const axiom::OperationControl& progress) {
+// Count first, so the window can show how far along it is.
+axiom::OperationProgress report;
+report.stage = axiom::OperationStage::finalizing;
+std::vector<std::pair<fs::path, std::uint64_t>> files;
+for (const auto& directory : directories) {
+    std::error_code iterate_error;
+    for (fs::recursive_directory_iterator it(
+             directory.path, fs::directory_options::skip_permission_denied, iterate_error), end;
+         !iterate_error && it != end; it.increment(iterate_error)) {
+        std::error_code status_error;
+        if (!it->is_regular_file(status_error)) continue;
+        std::error_code size_error;
+        const std::uint64_t size = it->file_size(size_error);
+        files.emplace_back(it->path(), size_error ? 0 : size);
+        report.total_bytes += size_error ? 0 : size;
+    }
+}
+report.total_items = files.size();
+progress.report(report);
+auto last_report = std::chrono::steady_clock::now();
+for (const auto& [file, size] : files) {
+    const bool sensitive = wipe_sensitive &&
+        std::any_of(directories.begin(), directories.end(), [&](const TempDirectoryRecord& record) {
+            return record.sensitive && file.native().starts_with(record.path.native());
+        });
+    if (sensitive) wipe_file_best_effort(file);
+    std::error_code remove_error;
+    fs::remove(file, remove_error);
+    report.completed_bytes += size;
+    ++report.completed_items;
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last_report > std::chrono::milliseconds(100)) {
+        last_report = now;
+        report.current_path = core::path_to_utf8(file.filename());
+        progress.report(report);
+    }
+}
+for (const auto& directory : directories) {
+    std::error_code remove_error;
+    fs::remove_all(directory.path, remove_error);
+}
+report.completed_bytes = report.total_bytes;
+report.completed_items = report.total_items;
+progress.report(report);
 }
 
 bool key_file_contains_public_key(const fs::path& path,
