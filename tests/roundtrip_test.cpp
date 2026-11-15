@@ -9326,6 +9326,63 @@ void test_stream_checksum_validation() {
     AXIOM_CHECK(failed);
 }
 
+// The address bar: what people type and paste, and the labels the drop-down shows.
+void test_address_text() {
+    using axiom::gui::AddressTarget;
+    using axiom::gui::parse_address_text;
+    using Kind = AddressTarget::Kind;
+    const auto base = fs::temp_directory_path() / "axiom-address" / "here";
+    const auto path_of = [&](std::wstring_view text) {
+        const auto target = parse_address_text(text, base);
+        AXIOM_CHECK(target.has_value() && target->kind == Kind::path);
+        return target ? target->path : fs::path{};
+    };
+
+    AXIOM_CHECK(!parse_address_text(L"", base));
+    AXIOM_CHECK(!parse_address_text(L"   \"  \" ", base));
+    AXIOM_CHECK(parse_address_text(L"  this pc ", base)->kind == Kind::computer);
+    // Relative to the folder shown, with "." and ".." resolved.
+    AXIOM_CHECK(path_of(L"child") == (base / "child").lexically_normal());
+    AXIOM_CHECK(path_of(L"..") == base.parent_path());
+    AXIOM_CHECK(path_of(L"./a/../b") == (base / "b").lexically_normal());
+    // Nothing to be relative to.
+    AXIOM_CHECK(!parse_address_text(L"child", fs::path{}));
+    // Quotes from "Copy as path", and a trailing separator.
+    const fs::path absolute = (base / "sub").lexically_normal();
+    AXIOM_CHECK(path_of(L"\"" + absolute.wstring() + L"\"") == absolute);
+    AXIOM_CHECK(path_of(absolute.wstring() + std::wstring(1, fs::path::preferred_separator)) ==
+                absolute);
+
+    // Inside an archive.
+    const fs::path archive = (base / "pack.zip").lexically_normal();
+    auto inside = parse_address_text(archive.wstring() + L" :: /docs/./old/../new/", base);
+    AXIOM_CHECK(inside && inside->kind == Kind::archive && inside->path == archive &&
+                inside->archive_directory == L"docs/new");
+    inside = parse_address_text(L"pack.zip :: \\docs\\", base);
+    AXIOM_CHECK(inside && inside->path == archive && inside->archive_directory == L"docs");
+    inside = parse_address_text(archive.wstring() + L" :: /", base);
+    AXIOM_CHECK(inside && inside->archive_directory.empty());
+    AXIOM_CHECK(!parse_address_text(L" :: /docs", base));
+
+#if defined(_WIN32)
+    AXIOM_CHECK(path_of(L"DATA-A (D:)") == fs::path(L"D:\\"));
+    AXIOM_CHECK(path_of(L"Local Disk (c:)") == fs::path(L"C:\\"));
+    AXIOM_CHECK(path_of(L"D:") == fs::path(L"D:\\"));
+    AXIOM_CHECK(path_of(L"d:projects") == fs::path(L"d:\\projects"));
+    AXIOM_CHECK(path_of(L"C:/Users/./Public/") == fs::path(L"C:\\Users\\Public"));
+    AXIOM_CHECK(path_of(L"C:\\") == fs::path(L"C:\\"));
+    AXIOM_CHECK(path_of(L"\\\\server\\share\\folder\\") == fs::path(L"\\\\server\\share\\folder"));
+    AXIOM_CHECK(path_of(L"file:///C:/My%20Files/%C3%A4rger") == fs::path(L"C:\\My Files\\\u00e4rger"));
+    AXIOM_CHECK(path_of(L"FILE://localhost/C:/x") == fs::path(L"C:\\x"));
+    AXIOM_CHECK(path_of(L"file://server/share/x") == fs::path(L"\\\\server\\share\\x"));
+    // A folder name may hold brackets; only "(X:)" alone names a drive.
+    AXIOM_CHECK(path_of(L"C:\\Backups (D:)") == fs::path(L"C:\\Backups (D:)"));
+#else
+    AXIOM_CHECK(path_of(L"file:///tmp/My%20Files") == fs::path("/tmp/My Files"));
+    AXIOM_CHECK(!parse_address_text(L"file://server/share", base));
+#endif
+}
+
 void test_file_manager_model() {
     axiom::gui::BrowserItem item;
     item.kind = axiom::gui::BrowserItemKind::file;
@@ -9500,6 +9557,7 @@ constexpr RegisteredTest kTests[] = {
     {"codec_random_corpus", test_codec_random_corpus},
     {"stream_checksum_validation", test_stream_checksum_validation},
     {"file_manager_model", test_file_manager_model},
+    {"address_text", test_address_text},
     {"archive_update_plan_model", test_archive_update_plan_model},
     {"compression_level_presets", test_compression_level_presets},
     {"swarm_extended_levels", test_swarm_extended_levels},

@@ -168,15 +168,7 @@ void MainWindow::populate_address_dropdown() {
             for (const wchar_t* drive = drives.c_str(); *drive != L'\0';
                  drive += wcslen(drive) + 1) {
                 const fs::path path(drive);
-                wchar_t volume[MAX_PATH]{};
-                std::wstring label;
-                if (GetVolumeInformationW(drive, volume, MAX_PATH, nullptr, nullptr,
-                                          nullptr, nullptr, 0) && volume[0] != L'\0') {
-                    label = std::wstring(volume) + L" (" +
-                            path.root_name().wstring() + L")";
-                } else {
-                    label = path.root_name().wstring();
-                }
+                std::wstring label = drive_display_name(drive, false);
                 add_address_entry(std::move(label), path.wstring(),
                                   shell_icon_for_path(path, true));
             }
@@ -252,45 +244,107 @@ void MainWindow::update_navigation_buttons() {
     update_toolbar_button_states();
 }
 
+std::optional<std::wstring> MainWindow::named_address(const std::wstring& text) const {
+    for (const auto& entry : address_entries_) {
+        std::wstring label = entry.label;
+        label.erase(0, label.find_first_not_of(L' '));
+        if (same_location_text(label, text)) return entry.value;
+    }
+    struct KnownName {
+        const wchar_t* name;
+        const KNOWNFOLDERID* id;
+    };
+    static constexpr KnownName kKnown[] = {
+        {L"Home", &FOLDERID_Profile},         {L"Desktop", &FOLDERID_Desktop},
+        {L"Documents", &FOLDERID_Documents},  {L"Downloads", &FOLDERID_Downloads},
+        {L"Pictures", &FOLDERID_Pictures},    {L"Music", &FOLDERID_Music},
+        {L"Videos", &FOLDERID_Videos},        {L"OneDrive", &FOLDERID_SkyDrive},
+    };
+    for (const auto& known : kKnown) {
+        if (_wcsicmp(text.c_str(), known.name) != 0) continue;
+        if (const auto path = known_folder_path(*known.id)) return path->wstring();
+    }
+    return std::nullopt;
+}
+
+void MainWindow::reveal_filesystem_item(const fs::path& file) {
+    const fs::path parent = file.parent_path();
+    if (parent.empty()) return;
+    const auto location = axiom::gui::BrowserLocation::filesystem(parent);
+    if (location == history_.current()) {
+        for (int index = 0; index < static_cast<int>(browser_items_.size()); ++index) {
+            if (same_filesystem_path(browser_items_[static_cast<std::size_t>(index)].filesystem_path,
+                                     file)) {
+                table_.select_index(index);
+                SetFocus(list_);
+                set_text(address_edit_, location.display_name());
+                return;
+            }
+        }
+    }
+    pending_find_location_ = location;
+    pending_find_filesystem_path_ = file;
+    pending_find_archive_entry_path_.clear();
+    navigate_to(location);
+}
+
 void MainWindow::on_address_go() {
     std::wstring text = trim_dialog_input(get_text(address_edit_));
+    const auto restore = [this] { set_text(address_edit_, history_.current().display_name()); };
     if (text.empty()) {
         show_app_message(L"Enter a folder or supported archive path.",
                          axiom::gui::MessageDialogIcon::information,
                          L"Open location");
-        set_text(address_edit_, history_.current().display_name());
+        restore();
         return;
     }
-    set_text(address_edit_, text);
-    if (_wcsicmp(text.c_str(), L"This PC") == 0) {
-        navigate_to(axiom::gui::BrowserLocation::computer());
-        return;
-    }
-    const std::wstring separator = L" :: /";
-    if (const auto split = text.find(separator); split != std::wstring::npos) {
-        const fs::path archive = text.substr(0, split);
-        const std::wstring inner = text.substr(split + separator.size());
-        const int needed = WideCharToMultiByte(CP_UTF8, 0, inner.data(),
-                                               static_cast<int>(inner.size()),
-                                               nullptr, 0, nullptr, nullptr);
-        std::string utf8(static_cast<std::size_t>(std::max(needed, 0)), '\0');
+    if (const auto named = named_address(text)) text = *named;
+    if (text.find(L'%') != std::wstring::npos) {
+        // %USERPROFILE%\Downloads and the like.
+        const DWORD needed = ExpandEnvironmentStringsW(text.c_str(), nullptr, 0);
         if (needed > 0) {
-            WideCharToMultiByte(CP_UTF8, 0, inner.data(), static_cast<int>(inner.size()),
-                                utf8.data(), needed, nullptr, nullptr);
+            std::wstring expanded(needed, L'\0');
+            if (ExpandEnvironmentStringsW(text.c_str(), expanded.data(), needed) == needed) {
+                expanded.resize(needed - 1);
+                text = std::move(expanded);
+            }
         }
-        navigate_to(axiom::gui::BrowserLocation::archive(archive, std::move(utf8)));
+    }
+    const auto& current = history_.current();
+    const fs::path base = current.kind == axiom::gui::BrowserLocationKind::filesystem
+        ? current.filesystem_path
+        : fs::path{};
+    const auto target = axiom::gui::parse_address_text(text, base);
+    const auto not_found = [&] {
+        show_app_message(L"\"" + text + L"\" does not exist or cannot be opened.",
+                         axiom::gui::MessageDialogIcon::warning, L"Open location");
+        restore();
+    };
+    if (!target) {
+        not_found();
         return;
     }
-    const fs::path path(text);
+    switch (target->kind) {
+        case axiom::gui::AddressTarget::Kind::computer:
+            navigate_to(axiom::gui::BrowserLocation::computer());
+            return;
+        case axiom::gui::AddressTarget::Kind::archive:
+            navigate_to(axiom::gui::BrowserLocation::archive(target->path,
+                                                             utf8(target->archive_directory)));
+            return;
+        case axiom::gui::AddressTarget::Kind::path:
+            break;
+    }
+    const fs::path path = target->path;
     std::error_code error;
-    if (fs::is_regular_file(path, error) && open_archive_path(path)) {
-        return;
-    } else if (fs::is_directory(path, error)) {
+    if (fs::is_directory(path, error)) {
         navigate_to(axiom::gui::BrowserLocation::filesystem(path));
+    } else if (fs::is_regular_file(path, error)) {
+        // An archive opens; any other file is shown, selected, in its folder.
+        set_text(address_edit_, path.wstring());
+        open_archive_path(path, [this, path] { reveal_filesystem_item(path); });
     } else {
-        show_app_message(L"The location does not exist or cannot be opened.",
-                         axiom::gui::MessageDialogIcon::warning);
-        set_text(address_edit_, history_.current().display_name());
+        not_found();
     }
 }
 

@@ -328,14 +328,7 @@ void MainWindow::populate_tree_computer_children(DirectoryTreeItem& item) {
     for (const wchar_t* drive = drives.c_str(); *drive != L'\0';
          drive += wcslen(drive) + 1) {
         const fs::path path(drive);
-        wchar_t volume[MAX_PATH]{};
-        std::wstring label;
-        if (GetVolumeInformationW(drive, volume, MAX_PATH, nullptr, nullptr,
-                                  nullptr, nullptr, 0) && volume[0] != L'\0') {
-            label = std::wstring(volume) + L" (" + path.root_name().wstring() + L")";
-        } else {
-            label = path.root_name().wstring();
-        }
+        std::wstring label = drive_display_name(drive, false);
         DirectoryTreeNode node;
         node.kind = DirectoryTreeNodeKind::filesystem;
         node.filesystem_path = path;
@@ -618,14 +611,11 @@ void MainWindow::on_tree_selection_changed(const DirectoryTreeItem& item) {
         case DirectoryTreeNodeKind::filesystem:
             navigate_to(axiom::gui::BrowserLocation::filesystem(node.filesystem_path));
             break;
-        case DirectoryTreeNodeKind::file:
-            if (!open_archive_path(node.filesystem_path)) {
-                const fs::path parent = node.filesystem_path.parent_path();
-                if (!parent.empty()) {
-                    navigate_to(axiom::gui::BrowserLocation::filesystem(parent));
-                }
-            }
+        case DirectoryTreeNodeKind::file: {
+            const fs::path file = node.filesystem_path;
+            open_archive_path(file, [this, file] { reveal_filesystem_item(file); });
             break;
+        }
         case DirectoryTreeNodeKind::archive:
             open_archive_path(node.filesystem_path);
             break;
@@ -1510,15 +1500,14 @@ void MainWindow::activate_browser_item(int index) {
     } else if (item.kind == axiom::gui::BrowserItemKind::archive) {
         open_archive_path(item.filesystem_path);
     } else if (!item.filesystem_path.empty()) {
-        if (joined_archive_path_for_volume(item.filesystem_path) &&
-            open_archive_path(item.filesystem_path)) {
-            return;
-        }
-        if (open_archive_path(item.filesystem_path)) {
-            return;
-        }
-        ShellExecuteW(hwnd_, L"open", item.filesystem_path.c_str(), nullptr,
-                      item.filesystem_path.parent_path().c_str(), SW_SHOWNORMAL);
+        // An archive Axiom recognizes by its contents opens here; anything else
+        // opens with its own program.
+        const fs::path file = item.filesystem_path;
+        open_archive_path(file, [this, file] {
+            const auto launched = reinterpret_cast<INT_PTR>(ShellExecuteW(
+                hwnd_, L"open", file.c_str(), nullptr, file.parent_path().c_str(), SW_SHOWNORMAL));
+            if (launched <= 32) set_status(L"Could not open " + file.filename().wstring());
+        });
     } else if (history_.current().kind == axiom::gui::BrowserLocationKind::archive &&
                !item.archive_path.empty()) {
         const fs::path archive = history_.current().archive_path;

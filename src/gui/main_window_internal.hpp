@@ -90,6 +90,9 @@ constexpr UINT kTreeArchiveProbeMessage = WM_APP + 11;
 constexpr UINT kSelectedArchiveCapabilitiesMessage = WM_APP + 12;
 constexpr UINT kBackgroundUiTaskMessage = WM_APP + 13;
 constexpr UINT kTableColumnReorderMessage = WM_APP + 14;
+// Puts the current location back in the address bar once a drop-down pick has
+// finished: the combo box writes the picked item's label there afterwards.
+constexpr UINT kAddressSyncMessage = WM_APP + 15;
 constexpr UINT_PTR kBrowserPopulateTimer = 42;
 constexpr UINT_PTR kDirectoryRefreshTimer = 41;
 enum ControlId : int {
@@ -1330,6 +1333,10 @@ private:
     void on_navigate_up();
     void on_navigate_refresh();
     void on_address_go();
+    // A drop-down label or a known folder's name ("Downloads") as a location.
+    std::optional<std::wstring> named_address(const std::wstring& text) const;
+    // Show a file's folder with the file selected.
+    void reveal_filesystem_item(const fs::path& file);
     bool launch_viewed_archive_file(const fs::path& file, const fs::path& staging_root,
                                     bool sensitive_temp);
     bool signature_key_is_trusted(const axiom::ArchiveSignatureInfo& info) const;
@@ -1384,7 +1391,10 @@ private:
     void on_settings();
     void apply_shell_integration() const;
     bool maybe_execute_sfx_archive(const fs::path& path);
-    bool open_archive_path(const fs::path& path);
+    // Open `path` as an archive once a background probe has looked at it. A
+    // file that is not an archive runs `not_archive` if given, and otherwise
+    // reports that it is not one. False only for an empty path.
+    bool open_archive_path(const fs::path& path, std::function<void()> not_archive = {});
     void on_open_archive();
     void on_drop_files(HDROP drop);
     void save_current_settings();

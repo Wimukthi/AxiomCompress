@@ -1778,10 +1778,11 @@ bool MainWindow::maybe_execute_sfx_archive(const fs::path& path) {
     return true;
 }
 
-bool MainWindow::open_archive_path(const fs::path& path) {
+bool MainWindow::open_archive_path(const fs::path& path, std::function<void()> not_archive) {
     if (path.empty()) return false;
     const auto joined = joined_archive_path_for_volume(path);
-    begin_background_ui_task(L"Inspecting archive...", [this, path, joined] {
+    begin_background_ui_task(L"Inspecting archive...",
+                             [this, path, joined, not_archive = std::move(not_archive)]() mutable {
         struct OpenProbe {
             const axiom::ArchiveProvider* provider = nullptr;
             bool sfx = false;
@@ -1808,7 +1809,7 @@ bool MainWindow::open_archive_path(const fs::path& path) {
             probe.provider = axiom::archive_provider_for_path(path);
             if (probe.provider != nullptr) probe.sfx = axiom::is_axiom_sfx_archive(path);
         }
-        return [this, path, joined, probe] {
+        return [this, path, joined, probe, not_archive = std::move(not_archive)] {
             if (probe.volume && joined && !probe.volume_data_complete) {
                 std::wstring prompt =
                     L"One or more data volumes are missing or incomplete. Reconstruct and "
@@ -1835,6 +1836,10 @@ bool MainWindow::open_archive_path(const fs::path& path) {
                 return;
             }
             if (probe.provider == nullptr) {
+                if (not_archive) {
+                    not_archive();
+                    return;
+                }
                 show_app_message(L"The selected file is not a supported archive or Axiom volume.",
                                  axiom::gui::MessageDialogIcon::warning, L"Open archive");
                 return;
@@ -1864,7 +1869,12 @@ void MainWindow::on_drop_files(HDROP drop) {
         paths.emplace_back(std::move(path));
     }
     DragFinish(drop);
-    if (paths.size() == 1 && open_archive_path(paths.front())) {
+    // One archive dropped opens; anything else, a folder or an ordinary file
+    // included, goes into a new archive.
+    std::error_code error;
+    if (paths.size() == 1 && fs::is_regular_file(paths.front(), error)) {
+        const fs::path dropped = paths.front();
+        open_archive_path(dropped, [this, dropped] { create_archive_from_paths({dropped}); });
         return;
     }
     create_archive_from_paths(std::move(paths));

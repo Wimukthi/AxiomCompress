@@ -7,6 +7,7 @@
 #include <limits>
 #include <optional>
 #include <unordered_set>
+#include <vector>
 
 namespace axiom::gui {
 namespace fs = std::filesystem;
@@ -409,6 +410,149 @@ std::vector<fs::path> batch_extraction_destinations(
         result.push_back(root / candidate);
     }
     return result;
+}
+
+// ---- address bar ---------------------------------------------------------------
+
+namespace {
+
+int hex_value(wchar_t ch) {
+    if (ch >= L'0' && ch <= L'9') return ch - L'0';
+    if (ch >= L'a' && ch <= L'f') return ch - L'a' + 10;
+    if (ch >= L'A' && ch <= L'F') return ch - L'A' + 10;
+    return -1;
+}
+
+// "file:///C:/My%20Files" as a path; nullopt for a URL that names no local file.
+std::optional<std::wstring> file_url_path(std::wstring_view url) {
+    std::wstring_view rest = url.substr(5);  // after "file:"
+    std::wstring host;
+    if (rest.starts_with(L"//")) {
+        rest.remove_prefix(2);
+        const std::size_t slash = rest.find(L'/');
+        host = std::wstring(rest.substr(0, slash));
+        rest = slash == std::wstring_view::npos ? std::wstring_view{} : rest.substr(slash);
+        if (fold(host) == L"localhost") host.clear();
+    }
+    // A run of percent escapes is UTF-8 bytes; other characters stay as typed.
+    std::wstring path;
+    std::string escaped;
+    const auto flush = [&] {
+        if (!escaped.empty()) path += widen_utf8(escaped);
+        escaped.clear();
+    };
+    for (std::size_t k = 0; k < rest.size(); ++k) {
+        if (rest[k] == L'%' && k + 2 < rest.size() && hex_value(rest[k + 1]) >= 0 &&
+            hex_value(rest[k + 2]) >= 0) {
+            escaped.push_back(static_cast<char>(hex_value(rest[k + 1]) * 16 + hex_value(rest[k + 2])));
+            k += 2;
+            continue;
+        }
+        flush();
+        path.push_back(rest[k]);
+    }
+    flush();
+#if defined(_WIN32)
+    if (!host.empty()) return L"\\\\" + host + path;
+    // "/C:/folder" names a drive.
+    if (path.size() >= 3 && path[0] == L'/' && std::iswalpha(path[1]) && path[2] == L':') {
+        path.erase(path.begin());
+    }
+#else
+    if (!host.empty()) return std::nullopt;
+#endif
+    if (path.empty()) return std::nullopt;
+    return path;
+}
+
+std::optional<fs::path> resolve_address_path(const std::wstring& text, const fs::path& base) {
+    fs::path path(text);
+#if defined(_WIN32)
+    // "D:" or "D:folder" without a backslash means the drive's root, not
+    // whatever folder the process last used on that drive.
+    if (path.has_root_name() && !path.has_root_directory() &&
+        text.size() >= 2 && text[1] == L':') {
+        path = path.root_name() / fs::path(L"\\") / path.relative_path();
+    }
+#endif
+    if (path.is_relative()) {
+        if (base.empty()) return std::nullopt;
+        path = base / path;
+    }
+    path = path.lexically_normal();
+    path.make_preferred();
+    // "C:\folder\" names the same folder as "C:\folder".
+    if (path.has_relative_path() && !path.has_filename()) path = path.parent_path();
+    return path;
+}
+
+// The part after " :: " as a '/'-separated path inside the archive, with "."
+// and ".." resolved and no leading or trailing separator.
+std::wstring normalize_archive_directory(std::wstring_view text) {
+    std::vector<std::wstring> parts;
+    std::size_t start = 0;
+    while (start <= text.size()) {
+        std::size_t end = text.find_first_of(L"/\\", start);
+        if (end == std::wstring_view::npos) end = text.size();
+        const std::wstring part = trim(text.substr(start, end - start));
+        if (part == L"..") {
+            if (!parts.empty()) parts.pop_back();
+        } else if (!part.empty() && part != L".") {
+            parts.push_back(part);
+        }
+        if (end == text.size()) break;
+        start = end + 1;
+    }
+    std::wstring result;
+    for (const auto& part : parts) {
+        if (!result.empty()) result += L'/';
+        result += part;
+    }
+    return result;
+}
+
+}  // namespace
+
+std::optional<AddressTarget> parse_address_text(std::wstring_view input, const fs::path& base_folder) {
+    std::wstring text = trim(input);
+    // "Copy as path" in Explorer wraps the path in quotes.
+    if (text.size() >= 2 && text.front() == L'"' && text.back() == L'"') {
+        text = trim(std::wstring_view(text).substr(1, text.size() - 2));
+    }
+    if (text.empty()) return std::nullopt;
+    AddressTarget target;
+    if (fold(text) == L"this pc") {
+        target.kind = AddressTarget::Kind::computer;
+        return target;
+    }
+#if defined(_WIN32)
+    // A drive as the drop-down list and Explorer name it: "DATA-A (D:)".
+    if (text.size() >= 4 && text.back() == L')' && text[text.size() - 2] == L':' &&
+        std::iswalpha(text[text.size() - 3]) && text[text.size() - 4] == L'(' &&
+        text.find_first_of(L"\\/") == std::wstring::npos) {
+        text = std::wstring(1, static_cast<wchar_t>(std::towupper(text[text.size() - 3]))) + L":\\";
+    }
+#endif
+    if (fold(text.substr(0, 5)) == L"file:") {
+        auto path = file_url_path(text);
+        if (!path) return std::nullopt;
+        text = std::move(*path);
+    }
+    std::wstring inner;
+    bool in_archive = false;
+    // "archive :: /folder", spaces optional: a Windows name cannot hold ':'.
+    if (const std::size_t split = text.find(L"::"); split != std::wstring::npos) {
+        in_archive = true;
+        inner = normalize_archive_directory(std::wstring_view(text).substr(split + 2));
+        text = trim(std::wstring_view(text).substr(0, split));
+        if (text.empty()) return std::nullopt;
+    }
+    auto path = resolve_address_path(text, base_folder);
+    if (!path) return std::nullopt;
+    target.kind = in_archive ? AddressTarget::Kind::archive : AddressTarget::Kind::path;
+    target.path = std::move(*path);
+    target.archive_directory = std::move(inner);
+    return target;
 }
 
 }  // namespace axiom::gui

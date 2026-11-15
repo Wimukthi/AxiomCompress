@@ -80,6 +80,10 @@ You can:
   only — Axiom will not modify those.
 - Type or pick a location in the address bar. It accepts paths, drives, shell
   locations such as Documents, your favorites, recent folders, and history.
+  It also reads a drive as the list names it (`DATA-A (D:)`), `D:` for a
+  drive's root, quoted paths from **Copy as path**, `%VARIABLES%`, `file:`
+  links, and a path relative to the folder shown, such as `..` or `sub`. A
+  file that is not an archive opens its folder with the file selected.
 - Sort by any column, and show, hide, resize, or reorder columns. Your layout
   is remembered.
 - Narrow the current list as you type in the instant filter. This works the

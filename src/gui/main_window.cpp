@@ -554,7 +554,16 @@ void MainWindow::on_initial_navigate() {
     if (initial_path_.empty()) {
         navigate_to(history_.current(), false);
     } else {
-        set_text(address_edit_, initial_path_);
+        // "Axiom.exe ." means the folder it was started in; the address bar
+        // reads relative text against the folder shown, and none is yet.
+        std::wstring initial = initial_path_;
+        std::error_code error;
+        const fs::path typed(initial);
+        if (typed.is_relative() && initial.find(L"::") == std::wstring::npos) {
+            const fs::path absolute = fs::absolute(typed, error);
+            if (!error) initial = absolute.wstring();
+        }
+        set_text(address_edit_, initial);
         on_address_go();
     }
     if (startup_command_.kind == AxiomGuiStartupCommand::Kind::extract_archive) {
@@ -1180,6 +1189,7 @@ LRESULT MainWindow::handle_message(UINT message, WPARAM wparam, LPARAM lparam) {
                     }
                     if (HIWORD(wparam) == CBN_SELENDOK) {
                         select_address_entry();
+                        PostMessageW(hwnd_, kAddressSyncMessage, 0, 0);
                         return 0;
                     }
                     break;
@@ -1191,6 +1201,12 @@ LRESULT MainWindow::handle_message(UINT message, WPARAM wparam, LPARAM lparam) {
                     break;
             }
             break;
+        case kAddressSyncMessage:
+            if (GetFocus() == nullptr || !IsChild(address_edit_, GetFocus()) ||
+                SendMessageW(address_edit_, CB_GETDROPPEDSTATE, 0, 0) == FALSE) {
+                set_text(address_edit_, history_.current().display_name());
+            }
+            return 0;
         case kOperationDoneMessage:
             on_operation_done(lparam);
             return 0;
