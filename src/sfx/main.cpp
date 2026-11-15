@@ -14,6 +14,9 @@
 #include <vector>
 
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
+    // An empty card reader or DVD drive must fail quietly, not stop the
+    // program with Windows' "There is no disk in the drive" box.
+    SetErrorMode(GetErrorMode() | SEM_FAILCRITICALERRORS | SEM_NOOPENFILEERRORBOX);
     if (!SetProcessDpiAwarenessContext(
             DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)) {
         SetProcessDPIAware();

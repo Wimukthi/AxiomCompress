@@ -122,6 +122,12 @@ private:
 // without building a BrowserItem for each (the Find results).
 std::wstring browser_type_text(const std::filesystem::path& name, bool directory);
 std::wstring browser_time_text(std::int64_t unix_seconds);
+// A drive as Explorer names it, "DATA-A (D:)", or "D:" without a label. A
+// network drive is named without asking its server unless `ask_network`: a
+// disconnected one can take many seconds to answer, too long for the UI thread.
+std::wstring drive_display_name(const std::wstring& root, bool ask_network);
+// "Local drive", "Removable drive", "Network drive", "CD drive" or "RAM disk".
+std::wstring drive_type_text(const std::wstring& root);
 
 bool is_axiom_archive(const std::filesystem::path& path);
 bool is_supported_archive(const std::filesystem::path& path);

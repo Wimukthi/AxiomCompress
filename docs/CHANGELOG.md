@@ -14,6 +14,32 @@ Entries are condensed from the
 
 ## [Unreleased]
 
+### Fixed
+
+- Pressing Enter in the address bar after picking a drive from its list
+  reported "The location does not exist": the field kept the drive's label,
+  such as `DATA-A (D:)`, instead of its path. The field now shows the path,
+  and the address bar reads labels, `D:`, quoted paths, `%VARIABLES%`, `file:`
+  links, relative paths and archive paths without spaces around `::`.
+- Double-clicking an ordinary file such as a `.txt` in the file list said it
+  was not a supported archive instead of opening it with its program.
+  Dropping a single folder or ordinary file on the window said the same
+  instead of offering to add it to an archive, and choosing a file in the
+  folder tree did the same instead of showing it in its folder.
+- Path fields in dialogs accept quoted paths and `%VARIABLES%`, read `D:` as
+  the drive's root, and refuse a relative path, which used to land in
+  whichever folder Axiom was started from.
+- Size fields refuse negative numbers; a volume size of `-1` was read as
+  16 EiB. A recovery percentage such as `12.5` or `10%` is refused instead of
+  read as 12 or 10.
+- `axiomc` size and count options refuse signs, decimals and trailing text:
+  `--block-size 1.5m` was read as 1 MiB, `12abc` as 12, and `--threads -1`
+  failed with "vector too long".
+- An empty card reader or DVD drive no longer brings up Windows' "There is no
+  disk in the drive" box while Axiom lists drives or searches This PC, and the
+  folder tree and address list no longer wait on a disconnected network drive
+  for its label. This PC names network and CD drives as such.
+
 ## [0.17.0.0] - 2026-11-15
 
 Find files is rebuilt: it searches several times faster, refines results

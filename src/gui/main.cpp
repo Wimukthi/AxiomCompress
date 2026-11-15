@@ -160,6 +160,9 @@ bool coordinate_shell_add(std::vector<std::wstring>& paths) {
 }  // namespace
 
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show_command) {
+    // An empty card reader or DVD drive must fail quietly, not stop the
+    // program with Windows' "There is no disk in the drive" box.
+    SetErrorMode(GetErrorMode() | SEM_FAILCRITICALERRORS | SEM_NOOPENFILEERRORBOX);
     int argument_count = 0;
     LPWSTR* arguments = CommandLineToArgvW(GetCommandLineW(), &argument_count);
     std::wstring initial_path;

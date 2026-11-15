@@ -208,6 +208,33 @@ std::wstring windows_error_message(DWORD error) {
     return message;
 }
 
+}  // namespace
+
+std::wstring drive_display_name(const std::wstring& root, bool ask_network) {
+    const std::wstring name = root.size() >= 2 ? root.substr(0, 2) : root;
+    const UINT type = GetDriveTypeW(root.c_str());
+    if (type == DRIVE_NO_ROOT_DIR || (type == DRIVE_REMOTE && !ask_network)) return name;
+    wchar_t volume[MAX_PATH]{};
+    if (!GetVolumeInformationW(root.c_str(), volume, MAX_PATH, nullptr, nullptr, nullptr,
+                               nullptr, 0) ||
+        volume[0] == L'\0') {
+        return name;
+    }
+    return std::wstring(volume) + L" (" + name + L")";
+}
+
+std::wstring drive_type_text(const std::wstring& root) {
+    switch (GetDriveTypeW(root.c_str())) {
+        case DRIVE_REMOVABLE: return L"Removable drive";
+        case DRIVE_REMOTE: return L"Network drive";
+        case DRIVE_CDROM: return L"CD drive";
+        case DRIVE_RAMDISK: return L"RAM disk";
+        default: return L"Local drive";
+    }
+}
+
+namespace {
+
 BrowserSnapshot load_computer(const BrowserLocation& location, std::stop_token stop) {
     BrowserSnapshot snapshot;
     snapshot.location = location;
@@ -220,15 +247,13 @@ BrowserSnapshot load_computer(const BrowserLocation& location, std::stop_token s
     GetLogicalDriveStringsW(static_cast<DWORD>(drives.size()), drives.data());
     for (const wchar_t* drive = drives.c_str(); *drive != L'\0'; drive += wcslen(drive) + 1) {
         if (stop.stop_requested()) return snapshot;
-        wchar_t volume[MAX_PATH]{};
-        GetVolumeInformationW(drive, volume, MAX_PATH, nullptr, nullptr, nullptr, nullptr, 0);
         BrowserItem item;
         item.kind = BrowserItemKind::drive;
         item.filesystem_path = drive;
-        item.name = volume[0] == L'\0'
-            ? std::wstring(drive)
-            : std::wstring(volume) + L" (" + drive[0] + L":)";
-        item.type = GetDriveTypeW(drive) == DRIVE_REMOVABLE ? L"Removable drive" : L"Local drive";
+        // This runs off the UI thread, so a network drive may take its time.
+        item.name = drive_display_name(drive, true);
+        if (item.name.size() == 2) item.name = drive;  // unlabelled: "D:\\" as before
+        item.type = drive_type_text(drive);
         ULARGE_INTEGER available{}, total{}, free{};
         if (GetDiskFreeSpaceExW(drive, &available, &total, &free)) item.size = total.QuadPart;
         item.id = stable_id(item.filesystem_path.wstring());

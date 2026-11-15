@@ -16,6 +16,9 @@
 // size difference against the full stub comes from. Everything the full stub
 // would prompt for must arrive on the command line or in the embedded config.
 int wmain(int argument_count, wchar_t** argument_values) {
+    // An empty card reader or DVD drive must fail quietly, not stop the
+    // program with Windows' "There is no disk in the drive" box.
+    SetErrorMode(GetErrorMode() | SEM_FAILCRITICALERRORS | SEM_NOOPENFILEERRORBOX);
     // COM is still needed: SHGetKnownFolderPath backs the destination
     // templates, and ShellExecuteEx backs run-after-extract and elevation.
     const HRESULT com = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
