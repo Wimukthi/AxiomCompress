@@ -1276,14 +1276,13 @@ LRESULT MainWindow::handle_message(UINT message, WPARAM wparam, LPARAM lparam) {
         }
         case WM_CLOSE:
             if (drag_transfer_running() &&
-                show_app_message(L"Files dragged out of the archive are still being copied. "
-                                 L"Closing Axiom stops the copy.\n\nClose anyway?",
+                show_app_message(L"Windows is still copying files dragged out of the archive. "
+                                 L"Closing Axiom removes the temporary copy it is reading, "
+                                 L"which stops that copy.\n\nClose anyway?",
                                  axiom::gui::MessageDialogIcon::question, L"Close Axiom",
                                  axiom::gui::MessageDialogButtons::yes_no, IDNO) != IDYES) {
                 return 0;
             }
-            for (auto& session : drag_sessions_) session->control->request_cancel();
-            drag_transfer_window_.stop();
             drag_sessions_.clear();
             KillTimer(hwnd_, kDragTransferTimer);
             save_current_settings();

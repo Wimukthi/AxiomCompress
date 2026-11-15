@@ -266,17 +266,16 @@ struct TempDirectoryRecord {
     fs::path path;
     bool sensitive = false;
 };
-// Entries dragged out of an archive to Explorer. The drop target reads the
-// temporary copy through streams, and may go on doing so after DoDragDrop
-// returns, so the transfer is followed until the target has let go of it.
+// Entries dragged out of an archive. They are extracted to `staging` when the
+// mouse is released, and the drop target copies them from there, often on a
+// thread of its own after DoDragDrop has returned; the folder is removed once
+// the target says it has finished.
 struct DragOutSession {
-    std::shared_ptr<axiom::OperationControl> control;
     std::shared_ptr<axiom::gui::DragTransferStatus> status;
     std::wstring error;
     fs::path staging;
     bool drag_returned = false;
-    bool transfer_started = false;  // the target asked for the contents
-    bool window_open = false;
+    bool copy_reported = false;
     bool error_shown = false;
 };
 struct StagedArchiveEntries {
@@ -1322,10 +1321,10 @@ private:
     StagedArchiveEntries extract_archive_entries_to_staging(
         const fs::path& archive, const std::vector<std::string>& entries,
         const std::string& password, bool for_drag, bool sensitive,
-        bool for_clipboard = false);
+        bool for_clipboard = false, const fs::path& into = {});
     void on_table_begin_drag();
-    // Follow drag-out transfers: close the progress window when the target has
-    // read everything or given up, then remove the temporary copy.
+    // Follow drag-out transfers until the drop target has finished copying,
+    // then remove the temporary copy.
     void poll_drag_transfers();
     bool drag_transfer_running() const;
     // Remove what is left in temporary folders before the window closes,

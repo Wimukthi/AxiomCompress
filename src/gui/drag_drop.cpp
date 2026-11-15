@@ -470,9 +470,10 @@ private:
     std::size_t index_ = 0;
 };
 
-class FileDataObject final : public IDataObject {
+class FileDataObject final : public IDataObject, public IDataObjectAsyncCapability {
 public:
     explicit FileDataObject(FileDragSource source) : source_(std::move(source)) {
+        if (source_.transfer_status) transfer_progress_ = source_.transfer_status;
         if (source_.transfer_operation && !source_.virtual_files.empty()) {
             transfer_progress_ = source_.transfer_status
                 ? source_.transfer_status
@@ -507,6 +508,14 @@ public:
             AddRef();
             return S_OK;
         }
+        // Offered only when the source follows the copy: a target that copies
+        // on its own thread then lets DoDragDrop return at once and reports
+        // the end, instead of holding the source until it is done.
+        if (iid == IID_IDataObjectAsyncCapability && transfer_progress_ && source_.prepare_drop) {
+            *object = static_cast<IDataObjectAsyncCapability*>(this);
+            AddRef();
+            return S_OK;
+        }
         return E_NOINTERFACE;
     }
     ULONG STDMETHODCALLTYPE AddRef() override { return ++references_; }
@@ -515,6 +524,35 @@ public:
         if (references == 0) delete this;
         return references;
     }
+
+    HRESULT STDMETHODCALLTYPE SetAsyncMode(BOOL async) override {
+        async_mode_ = async != FALSE;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE GetAsyncMode(BOOL* async) override {
+        if (async == nullptr) return E_POINTER;
+        *async = async_mode_ ? TRUE : FALSE;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE StartOperation(IBindCtx*) override {
+        in_operation_ = true;
+        if (transfer_progress_) transfer_progress_->async_started.store(true, std::memory_order_release);
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE InOperation(BOOL* in_operation) override {
+        if (in_operation == nullptr) return E_POINTER;
+        *in_operation = in_operation_ ? TRUE : FALSE;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE EndOperation(HRESULT result, IBindCtx*, DWORD) override {
+        in_operation_ = false;
+        if (transfer_progress_) {
+            transfer_progress_->async_result.store(result, std::memory_order_relaxed);
+            transfer_progress_->async_ended.store(true, std::memory_order_release);
+        }
+        return S_OK;
+    }
+
     HRESULT STDMETHODCALLTYPE GetData(FORMATETC* format, STGMEDIUM* medium) override {
         if (format == nullptr || medium == nullptr) return E_POINTER;
         *medium = {};
@@ -651,10 +689,15 @@ private:
     bool virtual_paths_ready_ = false;
     std::vector<std::filesystem::path> virtual_paths_;
     std::shared_ptr<TransferProgressState> transfer_progress_;
+    bool async_mode_ = true;
+    bool in_operation_ = false;
 };
 
 class DropSource final : public IDropSource {
 public:
+    explicit DropSource(std::function<bool()> prepare_drop = {})
+        : prepare_drop_(std::move(prepare_drop)) {}
+
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** object) override {
         if (object == nullptr) return E_POINTER;
         *object = nullptr;
@@ -673,15 +716,38 @@ public:
     }
     HRESULT STDMETHODCALLTYPE QueryContinueDrag(BOOL escape, DWORD key_state) override {
         if (escape) return DRAGDROP_S_CANCEL;
-        if ((key_state & MK_LBUTTON) == 0) return DRAGDROP_S_DROP;
-        return S_OK;
+        if ((key_state & MK_LBUTTON) != 0) return S_OK;
+        // The button is up: the drop happens when this returns. Files the
+        // target is to copy are made now, as 7-Zip and WinRAR do, unless the
+        // target refused the drop or is this program itself.
+        if (prepare_drop_ && !prepared_ && last_effect_ != DROPEFFECT_NONE && !over_own_window()) {
+            prepared_ = true;
+            // The drag holds the mouse; let go so the progress window's
+            // Cancel button can be clicked while the files are extracted.
+            ReleaseCapture();
+            if (!prepare_drop_()) return DRAGDROP_S_CANCEL;
+        }
+        return DRAGDROP_S_DROP;
     }
-    HRESULT STDMETHODCALLTYPE GiveFeedback(DWORD) override {
+    HRESULT STDMETHODCALLTYPE GiveFeedback(DWORD effect) override {
+        last_effect_ = effect;
         return DRAGDROP_S_USEDEFAULTCURSORS;
     }
 
 private:
+    static bool over_own_window() {
+        POINT cursor{};
+        if (!GetCursorPos(&cursor)) return false;
+        const HWND window = WindowFromPoint(cursor);
+        DWORD process = 0;
+        if (window != nullptr) GetWindowThreadProcessId(window, &process);
+        return process == GetCurrentProcessId();
+    }
+
     std::atomic<ULONG> references_{1};
+    std::function<bool()> prepare_drop_;
+    DWORD last_effect_ = DROPEFFECT_NONE;
+    bool prepared_ = false;
 };
 
 DWORD clamp_effect(DWORD effect, DWORD allowed) {
@@ -785,8 +851,9 @@ bool read_archive_entries(IDataObject* data_object, ArchiveDragPayload& payload)
 
 HRESULT do_file_drag(FileDragSource source, DWORD allowed_effects, DWORD& performed_effect) {
     performed_effect = DROPEFFECT_NONE;
+    auto prepare_drop = source.prepare_drop;
     auto* data = new (std::nothrow) FileDataObject(std::move(source));
-    auto* source_object = new (std::nothrow) DropSource();
+    auto* source_object = new (std::nothrow) DropSource(std::move(prepare_drop));
     if (data == nullptr || source_object == nullptr) {
         if (data != nullptr) data->Release();
         if (source_object != nullptr) source_object->Release();

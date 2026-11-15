@@ -1518,12 +1518,12 @@ DWORD MainWindow::perform_file_drop(IDataObject* object, POINT point, DWORD, DWO
 StagedArchiveEntries MainWindow::extract_archive_entries_to_staging(
     const fs::path& archive, const std::vector<std::string>& entries,
     const std::string& password, bool for_drag, bool sensitive,
-    bool for_clipboard) {
+    bool for_clipboard, const fs::path& into) {
     const auto active = active_archive_path();
     const auto* provider = active && same_filesystem_path(*active, archive)
         ? active_archive_provider() : nullptr;
     if (provider == nullptr) throw std::runtime_error("unsupported archive format");
-    const fs::path staging = create_drag_staging_directory(sensitive);
+    const fs::path staging = into.empty() ? create_drag_staging_directory(sensitive) : into;
     const HANDLE completed = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     if (completed == nullptr) throw std::runtime_error("could not start temporary extraction");
     auto control = std::make_shared<axiom::OperationControl>();
@@ -1932,72 +1932,50 @@ void MainWindow::on_table_begin_drag() {
     }
     if (virtual_items.empty()) return;
 
-    std::uint64_t transfer_total_bytes = 0;
-    std::uint64_t transfer_total_files = 0;
-    for (const auto& item : virtual_items) {
-        if (item.is_directory) continue;
-        transfer_total_bytes = item.size >
-                std::numeric_limits<std::uint64_t>::max() - transfer_total_bytes
-            ? std::numeric_limits<std::uint64_t>::max()
-            : transfer_total_bytes + item.size;
-        ++transfer_total_files;
-    }
-
     auto password = password_for_archive_edit(archive);
     if (!password) return;
 
-    // Everything the data object needs lives in the session, which it shares:
-    // the target may ask for the files after this function has returned.
+    // The target is handed ordinary files in a folder of their own, extracted
+    // when the mouse is released, and copies them with its own copy engine and
+    // progress, as it does for files dragged from 7-Zip or WinRAR. Streaming
+    // each file to it instead took minutes for what a file copy does in seconds.
     auto session = std::make_shared<DragOutSession>();
-    session->control = std::make_shared<axiom::OperationControl>();
     session->status = std::make_shared<axiom::gui::DragTransferStatus>();
-    session->status->operation = session->control;
+    try {
+        session->staging = create_drag_staging_directory(!password->empty());
+    } catch (const std::exception& error) {
+        secure_clear(*password);
+        show_app_message(widen(error.what()), axiom::gui::MessageDialogIcon::error,
+                         L"Drag from archive");
+        return;
+    }
+    std::vector<fs::path> paths;
+    paths.reserve(materialized_archive_paths.size());
+    for (const auto& path : materialized_archive_paths) {
+        paths.push_back(session->staging / fs::path(widen(path)));
+    }
     axiom::gui::FileDragSource source;
+    source.files = [paths = std::move(paths)] { return paths; };
     source.archive_payload = {archive, entries};
-    source.virtual_files = virtual_items;
     source.preferred_effect = DROPEFFECT_COPY;
-    source.transfer_operation = session->control;
     source.transfer_status = session->status;
     source.error_message = &session->error;
-    source.virtual_file_paths =
-        [this, archive, entries, session,
-         materialized_archive_paths = std::move(materialized_archive_paths),
-         password = std::move(*password)]() mutable {
+    source.prepare_drop = [this, archive, entries, session,
+                           password = std::move(*password)]() mutable {
         try {
-            auto staged = extract_archive_entries_to_staging(
-                archive, entries, password, true, !password.empty());
+            extract_archive_entries_to_staging(archive, entries, password, true, !password.empty(),
+                                               false, session->staging);
             secure_clear(password);
-            session->staging = staged.directory;
-            std::vector<fs::path> paths;
-            paths.reserve(materialized_archive_paths.size());
-            for (const auto& path : materialized_archive_paths) {
-                paths.push_back(staged.directory / fs::path(widen(path)));
-            }
-            set_busy(true);
-            set_status(L"Copying the dropped archive entries to their destination...");
-            // The shell copies these staged files by calling back into our
-            // IStream on this thread, which therefore dispatches neither
-            // WM_TIMER nor input until the whole transfer finishes. A progress
-            // window owned by this thread would freeze, so host it on its own.
-            // Pause stays unavailable: blocking inside an OLE stream read would
-            // stall the shell's copy with no way to resume it.
-            if (!drag_transfer_window_.start(
-                    hwnd_, instance_, L"Copying dropped files...", {},
-                    make_operation_window_theme(theme_),
-                    {},
-                    [control = session->control] { control->request_cancel(); },
-                    false, session->control)) {
-                set_busy(false);
-                throw std::runtime_error(
-                    "could not create the drag transfer progress window");
-            }
-            session->transfer_started = true;
-            session->window_open = true;
-            SetTimer(hwnd_, kDragTransferTimer, 200, nullptr);
-            return paths;
-        } catch (...) {
+            return true;
+        } catch (const axiom::OperationCancelled&) {
             secure_clear(password);
-            throw;
+            set_status(L"Drag and drop cancelled.");
+            return false;
+        } catch (const std::exception& error) {
+            secure_clear(password);
+            session->error = L"Axiom could not extract the dragged entries.\n\n" +
+                             widen(error.what());
+            return false;
         }
     };
     drag_sessions_.push_back(session);
@@ -2005,15 +1983,16 @@ void MainWindow::on_table_begin_drag() {
     axiom::gui::do_file_drag(std::move(source),
                              DROPEFFECT_COPY | DROPEFFECT_MOVE, effect);
     session->drag_returned = true;
-    // Ends at once when the target copied everything inside the drop;
-    // otherwise the timer follows the copy it goes on with.
+    // Ends at once when the target copied inside the drop; otherwise the timer
+    // waits for the target to report the end of its own copy.
     poll_drag_transfers();
-    if (!drag_sessions_.empty()) SetTimer(hwnd_, kDragTransferTimer, 200, nullptr);
+    if (!drag_sessions_.empty()) SetTimer(hwnd_, kDragTransferTimer, 250, nullptr);
 }
 
 bool MainWindow::drag_transfer_running() const {
-    return std::any_of(drag_sessions_.begin(), drag_sessions_.end(),
-                       [](const auto& session) { return session->window_open; });
+    return std::any_of(drag_sessions_.begin(), drag_sessions_.end(), [](const auto& session) {
+        return session->status->async_started.load() && !session->status->async_ended.load();
+    });
 }
 
 void MainWindow::poll_drag_transfers() {
@@ -2024,40 +2003,25 @@ void MainWindow::poll_drag_transfers() {
     for (auto it = drag_sessions_.begin(); it != drag_sessions_.end();) {
         DragOutSession& session = **it;
         const auto& status = *session.status;
-        const bool released = status.released.load(std::memory_order_acquire);
-        const bool streams_open = status.open_streams.load(std::memory_order_acquire) > 0;
-        const bool all_read = status.total_files != 0 &&
-            status.completed_files.load(std::memory_order_relaxed) >= status.total_files;
-        const bool cancelled = session.control->cancel_requested();
         if (session.drag_returned && !session.error.empty() && !session.error_shown) {
             session.error_shown = true;
             errors.push_back(session.error);
         }
-        if (session.window_open &&
-            (cancelled || ((all_read || released) && !streams_open))) {
-            if (!cancelled) {
-                axiom::OperationProgress completed;
-                completed.stage = axiom::OperationStage::transferring;
-                completed.completed_bytes = status.total_bytes;
-                completed.total_bytes = status.total_bytes;
-                completed.completed_items = status.total_files;
-                completed.total_items = status.total_files;
-                session.control->report(completed);
+        const bool copying = status.async_started.load(std::memory_order_acquire) &&
+                             !status.async_ended.load(std::memory_order_acquire);
+        if (!session.drag_returned || copying) {
+            if (copying && !session.copy_reported) {
+                session.copy_reported = true;
+                set_status(L"Windows is copying the dropped files and shows its own progress.");
             }
-            drag_transfer_window_.stop();
-            session.window_open = false;
-            set_busy(false);
-            operation_paused_ = false;
-            set_status(cancelled || !all_read ? L"Drag and drop transfer cancelled."
-                                              : L"Drag and drop transfer completed.");
-        }
-        // A target that took the drop may still ask for the contents later, so
-        // a session ends only once the target has let go of everything.
-        const bool finished = session.drag_returned && !session.window_open && !streams_open &&
-                              (released || (session.transfer_started && all_read));
-        if (!finished) {
             ++it;
             continue;
+        }
+        std::wstring outcome;
+        if (status.async_ended.load(std::memory_order_acquire)) {
+            outcome = SUCCEEDED(status.async_result.load())
+                ? L"Drag and drop transfer completed."
+                : L"Windows reported a problem copying the dropped files.";
         }
         if (!session.staging.empty()) {
             const fs::path staging = session.staging;
@@ -2066,7 +2030,7 @@ void MainWindow::poll_drag_transfers() {
                             [&](const TempDirectoryRecord& record) {
                                 return record.sensitive && record.path == staging;
                             });
-            const std::wstring outcome = get_text(status_);
+            if (outcome.empty()) outcome = get_text(status_);
             begin_background_ui_task(
                 L"Removing the temporary copy of the dragged files...",
                 [this, staging, wipe, outcome] {

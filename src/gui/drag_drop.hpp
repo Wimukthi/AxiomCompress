@@ -38,6 +38,11 @@ struct DragTransferStatus {
     std::atomic_uint64_t completed_files{0};
     std::atomic_int open_streams{0};
     std::atomic_bool released{false};
+    // A target that copies on its own thread says when it starts and ends
+    // (IDataObjectAsyncCapability), so the source knows when its files are free.
+    std::atomic_bool async_started{false};
+    std::atomic_bool async_ended{false};
+    std::atomic<HRESULT> async_result{S_OK};
 };
 
 struct FileDragSource {
@@ -47,6 +52,10 @@ struct FileDragSource {
     std::shared_ptr<OperationControl> transfer_operation;
     // Optional: shared with the caller to follow the transfer to its end.
     std::shared_ptr<DragTransferStatus> transfer_status;
+    // Optional: called once when the mouse is released over another program
+    // that accepts the drop, before the drop reaches it, to create the files
+    // `files` names. False cancels the drop.
+    std::function<bool()> prepare_drop;
     ArchiveDragPayload archive_payload;
     DWORD preferred_effect = DROPEFFECT_COPY;
     std::wstring* error_message = nullptr;
