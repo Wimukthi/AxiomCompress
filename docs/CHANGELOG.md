@@ -14,6 +14,11 @@ Entries are condensed from the
 
 ## [Unreleased]
 
+## [0.17.2.0] - 2026-11-15
+
+Fixes the start-up error 0.17.1.0 showed when Axiom opens at This PC. The archive
+format and the archives Axiom writes are unchanged.
+
 ### Fixed
 
 - Axiom started with "This PC" as its location, the default, reported that
@@ -1158,7 +1163,8 @@ First published release: the Inno Setup installer and portable zip, carrying
 update/repair/remove maintenance handling, and dynamic light/dark setup
 styling.
 
-[Unreleased]: https://github.com/Wimukthi/AxiomCompress/compare/0.17.1.0...HEAD
+[Unreleased]: https://github.com/Wimukthi/AxiomCompress/compare/0.17.2.0...HEAD
+[0.17.2.0]: https://github.com/Wimukthi/AxiomCompress/releases/tag/0.17.2.0
 [0.17.1.0]: https://github.com/Wimukthi/AxiomCompress/releases/tag/0.17.1.0
 [0.17.0.0]: https://github.com/Wimukthi/AxiomCompress/releases/tag/0.17.0.0
 [0.16.0.0]: https://github.com/Wimukthi/AxiomCompress/releases/tag/0.16.0.0
