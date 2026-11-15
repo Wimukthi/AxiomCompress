@@ -6818,8 +6818,13 @@ void test_compression_estimator() {
     std::size_t curve_snapshot_count = 0;
     std::uint64_t last_curve_evaluations = 0;
     bool curve_progress_monotonic = true;
+    // Every evaluation is checked below, so the curve must not race the clock:
+    // under a sanitizer build the time budget ran out first and the estimator
+    // rightly left candidates unvisited.
+    auto unhurried = repeated;
+    unhurried.time_budget = std::chrono::milliseconds{0};
     const auto curve = axiom::estimate_compression_curve(
-        {src}, repeated, curve_candidates,
+        {src}, unhurried, curve_candidates,
         [&](const axiom::CompressionEstimateCurveResult& snapshot) {
             curve_progress_monotonic =
                 curve_progress_monotonic &&
