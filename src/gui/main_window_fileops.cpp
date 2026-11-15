@@ -1898,8 +1898,11 @@ void MainWindow::poll_drag_transfers() {
             session.error_shown = true;
             errors.push_back(session.error);
         }
+        // The target holds the data for as long as it copies; letting go of it
+        // ends the copy too, whether or not it said so first.
         const bool copying = status.async_started.load(std::memory_order_acquire) &&
-                             !status.async_ended.load(std::memory_order_acquire);
+                             !status.async_ended.load(std::memory_order_acquire) &&
+                             !status.released.load(std::memory_order_acquire);
         if (!session.drag_returned || copying) {
             if (copying && !session.copy_reported) {
                 session.copy_reported = true;

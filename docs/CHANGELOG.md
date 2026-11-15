@@ -46,7 +46,7 @@ Entries are condensed from the
   WinRAR. Explorer used to read every file back through a stream instead: the
   970 MB Ghidra distribution took over two minutes to arrive, with no progress
   on screen. Axiom stays usable while Explorer copies, removes the temporary
-  copy as soon as Explorer reports it has finished instead of at exit, and asks
+  copy as soon as Explorer has finished with it instead of at exit, and asks
   before closing during such a copy. Temporary files left at exit are removed
   with a progress window when that takes more than a moment.
 
