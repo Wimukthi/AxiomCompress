@@ -14,6 +14,13 @@ Entries are condensed from the
 
 ## [Unreleased]
 
+## [0.17.1.0] - 2026-11-15
+
+Dragging files out of an archive to Explorer is several times faster and shows
+its progress, the address bar opens drives picked from its list, and typed paths
+and sizes are checked more carefully across the program. The archive format and
+the archives Axiom writes are unchanged.
+
 ### Fixed
 
 - Pressing Enter in the address bar after picking a drive from its list
@@ -1144,7 +1151,8 @@ First published release: the Inno Setup installer and portable zip, carrying
 update/repair/remove maintenance handling, and dynamic light/dark setup
 styling.
 
-[Unreleased]: https://github.com/Wimukthi/AxiomCompress/compare/0.17.0.0...HEAD
+[Unreleased]: https://github.com/Wimukthi/AxiomCompress/compare/0.17.1.0...HEAD
+[0.17.1.0]: https://github.com/Wimukthi/AxiomCompress/releases/tag/0.17.1.0
 [0.17.0.0]: https://github.com/Wimukthi/AxiomCompress/releases/tag/0.17.0.0
 [0.16.0.0]: https://github.com/Wimukthi/AxiomCompress/releases/tag/0.16.0.0
 [0.15.0.0]: https://github.com/Wimukthi/AxiomCompress/releases/tag/0.15.0.0
