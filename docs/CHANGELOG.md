@@ -14,6 +14,32 @@ Entries are condensed from the
 
 ## [Unreleased]
 
+## [0.17.3.0] - 2026-11-23
+
+7z, RAR, ISO, CAB and TAR archives whose paths run past 260 characters extract,
+and those archives extract in about half the time and disk space. The archive
+format and the archives Axiom writes are unchanged.
+
+### Fixed
+
+- Extracting a 7z, RAR, ISO, CAB or TAR archive failed outright when a path in
+  it came near Windows' 260-character limit, as a Python install inside one
+  does: the ComfyUI portable 7z failed with "could not create extracted file",
+  from the command line and when dragged out of the window, and nothing was
+  extracted. Axiom staged these archives in the temp folder, whose prefix
+  pushed such paths over the limit, and its programs did not declare
+  themselves long-path aware, so Windows refused long paths even with long
+  paths turned on. Every Axiom program now declares long-path awareness, and
+  when Windows has long paths turned off the error says how long the path is
+  and how to turn them on.
+
+### Performance
+
+- 7z, RAR, ISO, CAB and TAR archives are staged inside the destination and each
+  file moved into place, instead of staged in the temp folder and copied: half
+  the disk space and much less time. The 6.3 GB ComfyUI portable 7z extracts
+  in 108 s.
+
 ## [0.17.2.0] - 2026-11-15
 
 Fixes the start-up error 0.17.1.0 showed when Axiom opens at This PC. The archive
@@ -1163,7 +1189,8 @@ First published release: the Inno Setup installer and portable zip, carrying
 update/repair/remove maintenance handling, and dynamic light/dark setup
 styling.
 
-[Unreleased]: https://github.com/Wimukthi/AxiomCompress/compare/0.17.2.0...HEAD
+[Unreleased]: https://github.com/Wimukthi/AxiomCompress/compare/0.17.3.0...HEAD
+[0.17.3.0]: https://github.com/Wimukthi/AxiomCompress/releases/tag/0.17.3.0
 [0.17.2.0]: https://github.com/Wimukthi/AxiomCompress/releases/tag/0.17.2.0
 [0.17.1.0]: https://github.com/Wimukthi/AxiomCompress/releases/tag/0.17.1.0
 [0.17.0.0]: https://github.com/Wimukthi/AxiomCompress/releases/tag/0.17.0.0
