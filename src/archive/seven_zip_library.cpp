@@ -1194,9 +1194,18 @@ public:
             path.c_str(), GENERIC_WRITE, FILE_SHARE_READ,
             nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
         if (handle_ == INVALID_HANDLE_VALUE) {
-            throw std::runtime_error(
-                "could not create extracted file: " +
-                core::path_to_utf8(path));
+            const DWORD error = GetLastError();
+            std::string message = "could not create extracted file: " + core::path_to_utf8(path);
+            const std::size_t length = path.native().size();
+            if (length >= MAX_PATH &&
+                (error == ERROR_PATH_NOT_FOUND || error == ERROR_FILENAME_EXCED_RANGE ||
+                 error == ERROR_INVALID_NAME)) {
+                message += " (the path is " + std::to_string(length) +
+                           " characters; Windows refuses paths over 260 unless long paths are "
+                           "enabled: extract to a shorter folder, or turn on \"Enable Win32 long "
+                           "paths\" in Group Policy)";
+            }
+            throw std::runtime_error(message);
         }
     }
 

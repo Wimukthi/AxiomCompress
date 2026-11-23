@@ -952,6 +952,17 @@ fs::path unique_temp_path(std::wstring_view prefix) {
     throw std::runtime_error("could not allocate a temporary path");
 }
 
+// A short, unused, hidden-to-be folder name inside `dest_dir` for staging.
+fs::path unique_staging_path(const fs::path& dest_dir) {
+    for (int attempt = 0; attempt < 100; ++attempt) {
+        fs::path candidate = dest_dir / (L".axiom-" + std::to_wstring(GetCurrentProcessId() % 100000) +
+                                         L"-" + std::to_wstring(attempt));
+        std::error_code ec;
+        if (!fs::exists(candidate, ec)) return candidate;
+    }
+    throw std::runtime_error("could not allocate an extraction staging folder");
+}
+
 void write_selection_file(const fs::path& path,
                           const std::vector<std::string>& entries) {
     std::ofstream out(path, std::ios::binary | std::ios::trunc);
@@ -1204,9 +1215,15 @@ private:
         report_operation(options.operation, OperationStage::extracting, 0, total_bytes,
                          0, selected.size());
 
-        const fs::path staging_path = unique_temp_path(L"AxiomSystemArchive");
+        // Staged in the destination itself rather than the temp folder: on the
+        // same volume each file is then moved into place, not copied, which
+        // halves the time and the disk space, and its path is barely longer
+        // than its final one. A temp-folder prefix pushed deep entries past
+        // Windows' 260-character limit.
+        const fs::path staging_path = unique_staging_path(dest_dir);
         fs::create_directories(staging_path, ec);
         if (ec) throw std::runtime_error("cannot create extraction staging directory: " + ec.message());
+        SetFileAttributesW(staging_path.c_str(), FILE_ATTRIBUTE_HIDDEN);
         TempDirectoryGuard staging(staging_path);
 
         std::vector<std::wstring> arguments;
@@ -1276,8 +1293,15 @@ private:
                     }
                     fs::remove(target, ec);
                 }
-                fs::copy_file(source, target, fs::copy_options::overwrite_existing, ec);
-                if (ec) throw std::runtime_error("failed to copy extracted file: " + ec.message());
+                fs::rename(source, target, ec);
+                if (ec) {
+                    ec.clear();
+                    fs::copy_file(source, target, fs::copy_options::overwrite_existing, ec);
+                }
+                if (ec) {
+                    throw std::runtime_error("failed to place extracted file " + entry.path +
+                                             ": " + ec.message());
+                }
                 // The copy already has its times and attributes, so the mark
                 // keeps them.
                 if (mark && (options.mark_of_the_web == ExtractOptions::MarkOfTheWeb::all ||

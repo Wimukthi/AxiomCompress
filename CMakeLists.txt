@@ -384,6 +384,15 @@ if(WIN32)
     add_dependencies(axiomc axiom_sfx_module)
 endif()
 
+# Long paths: merged into each program's manifest (see the file).
+if(MSVC)
+    foreach(axiom_program axiomc axiom_gui axiom_sfx_module axiom_sfx_mini_module)
+        if(TARGET ${axiom_program})
+            target_sources(${axiom_program} PRIVATE src/long_path_aware.manifest)
+        endif()
+    endforeach()
+endif()
+
 enable_testing()
 
 # miniz's container module is test-only: it creates and inspects independent
@@ -394,6 +403,9 @@ add_executable(axiom_roundtrip
     src/gui/archive_update_plan.cpp
     src/third_party/miniz/miniz_zip.c)
 target_link_libraries(axiom_roundtrip PRIVATE axiom)
+if(MSVC)
+    target_sources(axiom_roundtrip PRIVATE src/long_path_aware.manifest)
+endif()
 target_include_directories(axiom_roundtrip PRIVATE src)
 axiom_set_warning_level(axiom_roundtrip)
 if(MSVC)

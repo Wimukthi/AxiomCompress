@@ -113,6 +113,9 @@
       <Project>{C438F5C4-7D14-4A4D-8FCB-1F2F0A6A8B90}</Project>
     </ProjectReference>
   </ItemGroup>
+  <ItemGroup>
+    <Manifest Include="src\long_path_aware.manifest" />
+  </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets" />
 </Project>

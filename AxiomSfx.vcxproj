@@ -135,6 +135,9 @@
       <Project>{C438F5C4-7D14-4A4D-8FCB-1F2F0A6A8B90}</Project>
     </ProjectReference>
   </ItemGroup>
+  <ItemGroup>
+    <Manifest Include="src\long_path_aware.manifest" />
+  </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <Target Name="ValidateWimukthiWin32Theme" BeforeTargets="PrepareForBuild" Condition="!Exists('$(WimukthiWin32ThemeRoot)\Wimukthi.Win32Theme.props')">
     <Error Text="Wimukthi.Win32Theme was not found at '$(WimukthiWin32ThemeRoot)'. Clone it beside AxiomCompress or set WimukthiWin32ThemeRoot." />

@@ -3032,6 +3032,67 @@ std::optional<fs::path> bundled_7z_for_tests() {
     return std::nullopt;
 }
 
+// A 7z whose paths run past 260 characters once extracted, as a Python
+// install inside one does. Axiom used to stage it in the temp folder, whose
+// prefix pushed such entries past the limit and failed the whole extraction.
+void test_seven_zip_long_paths() {
+    const auto seven_zip = bundled_7z_for_tests();
+    if (!seven_zip) return;
+    DWORD long_paths = 0;
+    DWORD size = sizeof(long_paths);
+    RegGetValueW(HKEY_LOCAL_MACHINE, L"SYSTEM\\CurrentControlSet\\Control\\FileSystem",
+                 L"LongPathsEnabled", RRF_RT_REG_DWORD, nullptr, &long_paths, &size);
+
+    const auto root = make_temp_dir();
+    // Each level 40 characters: six levels and the name pass 260 with the root.
+    fs::path relative = "src";
+    for (int level = 0; level < 6; ++level) {
+        relative /= std::string(36, static_cast<char>('a' + level)) + "_dir";
+    }
+    const fs::path inner = relative / "deep_file_with_a_long_name.txt";
+    const fs::path shallow = fs::path("src") / "top.txt";
+    if (long_paths == 1) {
+        fs::create_directories(root / relative);
+        write_all(root / inner, bytes_from_string("deep contents"));
+    }
+    fs::create_directories(root / "src");
+    write_all(root / shallow, bytes_from_string("top contents"));
+    const fs::path archive = root / "long.7z";
+    const std::string command = "cd /d " + quote_for_command(root) + " && " +
+                                quote_for_command(*seven_zip) + " a -t7z -mx=1 " +
+                                quote_for_command(archive) + " src >nul 2>nul";
+    if (std::system(command.c_str()) != 0) return;
+    const auto* provider = axiom::archive_provider_for_path(archive);
+    AXIOM_CHECK(provider != nullptr);
+
+    const auto no_staging_left = [](const fs::path& folder) {
+        std::error_code ec;
+        for (const auto& item : fs::directory_iterator(folder, ec)) {
+            if (item.path().filename().wstring().starts_with(L".axiom-")) return false;
+        }
+        return true;
+    };
+    const fs::path everything = root / "all";
+    axiom::ExtractOptions options;
+    provider->extract_all(archive, everything, options);
+    AXIOM_CHECK(read_all(everything / shallow) == bytes_from_string("top contents"));
+    AXIOM_CHECK(no_staging_left(everything));
+    if (long_paths == 1) {
+        AXIOM_CHECK((everything / inner).native().size() > 260);
+        AXIOM_CHECK(read_all(everything / inner) == bytes_from_string("deep contents"));
+
+        // A selection, as a drag out of the window extracts.
+        const fs::path selected = root / "selected";
+        provider->extract_selected(archive, {"src/" + std::string(36, 'a') + "_dir"}, selected,
+                                   options);
+        AXIOM_CHECK(read_all(selected / inner) == bytes_from_string("deep contents"));
+        AXIOM_CHECK(!fs::exists(selected / shallow));
+        AXIOM_CHECK(no_staging_left(selected));
+    }
+    std::error_code cleanup;
+    fs::remove_all(root, cleanup);
+}
+
 void test_unicode_path_archive_probe() {
     const auto root = make_temp_dir();
     const auto unicode_file = root / L"\u0dc3\u0dd2\u0d82\u0dc4\u0dbd-not-archive.txt";
@@ -9602,6 +9663,7 @@ constexpr RegisteredTest kTests[] = {
     {"bundled_7z_provider_layer", test_bundled_7z_provider_layer},
     {"mark_of_the_web", test_mark_of_the_web},
     {"file_search_content_walk", test_file_search_content_walk},
+    {"seven_zip_long_paths", test_seven_zip_long_paths},
 #endif
     {"zip_aes256_encryption", test_zip_aes256_encryption},
     {"zip_aes_data_descriptor_compatibility", test_zip_aes_data_descriptor_compatibility},
