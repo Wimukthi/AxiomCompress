@@ -518,6 +518,15 @@ std::optional<AddressTarget> parse_address_text(std::wstring_view input, const f
     // "Copy as path" in Explorer wraps the path in quotes.
     if (text.size() >= 2 && text.front() == L'"' && text.back() == L'"') {
         text = trim(std::wstring_view(text).substr(1, text.size() - 2));
+#if defined(_WIN32)
+    } else if (!text.empty() && text.back() == L'"') {
+        // "C:\" or "D:\Folder\" passed on a command line arrives as C:" or
+        // D:\Folder": Windows reads the backslash before the closing quote as
+        // escaping it. A quote cannot be part of a Windows name.
+        text.back() = L'\\';
+    } else if (!text.empty() && text.front() == L'"') {
+        text = trim(std::wstring_view(text).substr(1));
+#endif
     }
     if (text.empty()) return std::nullopt;
     AddressTarget target;

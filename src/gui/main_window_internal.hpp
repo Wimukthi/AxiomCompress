@@ -864,6 +864,8 @@ private:
     void start_walk();
     void on_batch(LPARAM payload);
     void on_walk_done(WPARAM generation);
+    // End the running search now, keeping what it has found.
+    void stop_search();
     void match_pending();
     void update_status();
     std::vector<std::wstring> result_row(std::size_t row) const;
@@ -945,6 +947,9 @@ private:
     std::chrono::steady_clock::time_point last_merge_{};
 
     bool walking_ = false;
+
+    // The last search was stopped before it finished.
+    bool stopped_ = false;
 
     std::chrono::steady_clock::time_point walk_started_{};
 

@@ -442,6 +442,7 @@ void FileSearchDialog::start_walk() {
     index_key_ = walk_key();
     walk_started_ = std::chrono::steady_clock::now();
     walk_seconds_ = 0;
+    stopped_ = false;
 
     int area = static_cast<int>(SendMessageW(search_area_, CB_GETCURSEL, 0, 0));
     if (area < 0) area = 0;
@@ -490,6 +491,8 @@ void FileSearchDialog::start_walk() {
                               content_filter](std::stop_token stop) mutable {
             options.content_filter = content_filter.get();
             axiom::search::search_archive_contents(batch, archive, 0, options, stop);
+            // Stopped means its window may be gone: deliver nothing.
+            if (stop.stop_requested()) return;
             auto* payload = new BatchPayload{generation, std::move(batch)};
             if (!PostMessageW(target, kSearchBatchMessage, 0, reinterpret_cast<LPARAM>(payload))) {
                 delete payload;
@@ -522,12 +525,16 @@ void FileSearchDialog::start_walk() {
                           content_filter](std::stop_token stop) mutable {
         options.content_filter = content_filter.get();
         axiom::search::walk(roots, options, stop, [&](axiom::search::Batch&& batch) {
+            // Stopped means its window may be gone: deliver nothing.
+            if (stop.stop_requested()) return;
             auto* payload = new BatchPayload{generation, std::move(batch)};
             if (!PostMessageW(target, kSearchBatchMessage, 0, reinterpret_cast<LPARAM>(payload))) {
                 delete payload;
             }
         });
-        PostMessageW(target, kSearchDoneMessage, static_cast<WPARAM>(generation), 0);
+        if (!stop.stop_requested()) {
+            PostMessageW(target, kSearchDoneMessage, static_cast<WPARAM>(generation), 0);
+        }
     });
 }
 
@@ -541,6 +548,23 @@ void FileSearchDialog::on_batch(LPARAM value) {
 void FileSearchDialog::on_walk_done(WPARAM generation) {
     if (static_cast<std::uint64_t>(generation) != search_generation_) return;
     walking_ = false;
+    walk_seconds_ = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - walk_started_).count();
+    match_pending();
+    update_status();
+}
+
+void FileSearchDialog::stop_search() {
+    if (!walking_) return;
+    // The threads finish on their own; whatever they still send carries an
+    // older generation and is dropped.
+    search_thread_.request_stop();
+    ++search_generation_;
+    walking_ = false;
+    stopped_ = true;
+    // What was found is kept, but it is not the whole area: the next search
+    // reads the disk again rather than refining it.
+    index_key_.clear();
     walk_seconds_ = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - walk_started_).count();
     match_pending();
@@ -596,8 +620,9 @@ void FileSearchDialog::update_status() {
                        matches_.size() < kFileSearchResultLimit) {
                 status += L"  |  matching...";
             } else {
-                wchar_t seconds[32]{};
-                swprintf_s(seconds, L" in %.1f s", walk_seconds_);
+                wchar_t seconds[48]{};
+                swprintf_s(seconds, stopped_ ? L"  |  stopped after %.1f s" : L" in %.1f s",
+                           walk_seconds_);
                 status += seconds;
             }
             if (index_->skipped_encrypted() != 0) {
@@ -623,6 +648,9 @@ void FileSearchDialog::update_status() {
     }
     set_text(result_count_, status);
     EnableWindow(export_button_, can_export());
+    // While a search runs, its button stops it.
+    const wchar_t* label = walking_ ? L"Stop" : L"Search";
+    if (get_text(search_button_) != label) set_text(search_button_, label);
 }
 
 std::vector<std::wstring> FileSearchDialog::result_row(std::size_t row) const {
@@ -1126,6 +1154,9 @@ void FileSearchDialog::create_controls() {
         L"Semicolon-separated folder names or paths to leave out with everything in them, "
         L"for example node_modules; .git; C:\\Windows. Wildcards * and ? work; inside archives too.");
     axiom::gui::add_dialog_tooltip(
+        tooltip_, search_button_,
+        L"Search the area again. While a search runs, stop it and keep what it has found.");
+    axiom::gui::add_dialog_tooltip(
         tooltip_, export_button_,
         L"Save the results, in the order shown, as CSV, tab-separated values or a list of paths.");
     axiom::gui::add_dialog_tooltip(tooltip_, match_case_,
@@ -1330,6 +1361,11 @@ LRESULT FileSearchDialog::handle_message(UINT message, WPARAM wparam, LPARAM lpa
                     }
                     return 0;
                 case kSearchButton:
+                    if (walking_) {
+                        stop_search();
+                        return 0;
+                    }
+                    [[fallthrough]];
                 case IDOK:
                     // An explicit search reads the disk again.
                     KillTimer(hwnd_, kSearchDebounceTimer);
@@ -1457,7 +1493,10 @@ LRESULT FileSearchDialog::handle_message(UINT message, WPARAM wparam, LPARAM lpa
         case WM_NCDESTROY: {
             KillTimer(hwnd_, kSearchDebounceTimer);
             KillTimer(hwnd_, kMatchTimer);
-            search_thread_.join_all();
+            // Closing never waits for the search: a thread can sit for a
+            // long time opening a file an antivirus is scanning, and waiting
+            // here froze the whole program with it.
+            search_thread_.abandon();
             export_thread_.request_stop();
             export_thread_.join_all();
             MSG queued{};

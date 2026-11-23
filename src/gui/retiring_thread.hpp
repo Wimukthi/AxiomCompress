@@ -49,6 +49,21 @@ public:
         for (auto& worker : retired_) worker.thread.request_stop();
     }
 
+    // Ask every thread to stop and let them finish on their own, without
+    // waiting: for a window that is closing, whose threads may be stuck in a
+    // call nothing can interrupt, such as opening a file an antivirus scans.
+    // The work owns what it uses and reports only by posting, so it may
+    // outlive its owner.
+    void abandon() {
+        request_stop();
+        if (current_.thread.joinable()) current_.thread.detach();
+        for (auto& worker : retired_) {
+            if (worker.thread.joinable()) worker.thread.detach();
+        }
+        retired_.clear();
+        current_ = {};
+    }
+
     void join_all() {
         request_stop();
         if (current_.thread.joinable()) current_.thread.join();

@@ -1248,6 +1248,10 @@ private:
             const bool hidden = (attributes & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM)) != 0;
             if (hidden && !options_.include_hidden) continue;
             const bool directory_entry = (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+            // A OneDrive or Dropbox placeholder: opening it downloads it.
+            const bool cloud_only = (attributes & (FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS |
+                                                   FILE_ATTRIBUTE_RECALL_ON_OPEN |
+                                                   FILE_ATTRIBUTE_OFFLINE)) != 0;
             if (directory_entry && excluded(data.cFileName, directory)) continue;
             Entry entry;
             entry.name = data.cFileName;
@@ -1269,10 +1273,19 @@ private:
             } else {
                 entry.size = (static_cast<std::uint64_t>(data.nFileSizeHigh) << 32) | data.nFileSizeLow;
                 entry.kind = looks_like_archive_name(child) ? EntryKind::archive : EntryKind::file;
-                if (entry.kind == EntryKind::archive) consider_archive(child, found);
+                if (entry.kind == EntryKind::archive && !cloud_only) consider_archive(child, found);
             }
             if (entry.kind != EntryKind::folder) {
-                search_file_content(local.batch, options_, stop_, entry, child);
+                if (cloud_only) {
+                    // Counted as too costly to read, like a file over the size limit.
+                    if (wants_content(local.batch, options_, entry,
+                                      local.batch.folders[entry.folder].display)) {
+                        entry.content = ContentState::skipped;
+                        ++local.batch.content_skipped;
+                    }
+                } else {
+                    search_file_content(local.batch, options_, stop_, entry, child);
+                }
             }
             local.batch.entries.push_back(std::move(entry));
             if (local.batch.entries.size() >= kBatchEntries) flush(local, false);

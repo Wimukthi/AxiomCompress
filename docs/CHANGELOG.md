@@ -14,6 +14,25 @@ Entries are condensed from the
 
 ## [Unreleased]
 
+### Added
+
+- Find files can stop a search: while one runs, **Search** reads **Stop**, which
+  ends it at once and keeps what it has found.
+
+### Fixed
+
+- Closing Find files during a search froze Axiom until the search noticed:
+  12 seconds for a content search of a drive here, over two minutes once, while
+  a thread waited for Windows to open a file, which an antivirus scan can hold
+  up for that long. The window now closes at once and the search ends on its
+  own.
+- A content search no longer opens OneDrive or other cloud-only placeholder
+  files, which downloaded them, nor opens such files as archives; they count
+  as skipped.
+- Opening Axiom on `"C:\"` from a command line or Explorer reported that `C:"`
+  does not exist: Windows reads the backslash before a closing quote as
+  escaping it. A trailing quote is now read as that backslash.
+
 ## [0.17.3.0] - 2026-11-23
 
 7z, RAR, ISO, CAB and TAR archives whose paths run past 260 characters extract,

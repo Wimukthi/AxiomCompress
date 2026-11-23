@@ -9434,6 +9434,10 @@ void test_address_text() {
     AXIOM_CHECK(path_of(L"DATA-A (D:)") == fs::path(L"D:\\"));
     AXIOM_CHECK(path_of(L"Local Disk (c:)") == fs::path(L"C:\\"));
     AXIOM_CHECK(path_of(L"D:") == fs::path(L"D:\\"));
+    // "C:\" and "D:\Folder\" as a command line delivers them.
+    AXIOM_CHECK(path_of(L"C:\"") == fs::path(L"C:\\"));
+    AXIOM_CHECK(path_of(L"D:\\Folder\"") == fs::path(L"D:\\Folder"));
+    AXIOM_CHECK(path_of(L"\"C:\\Users") == fs::path(L"C:\\Users"));
     AXIOM_CHECK(path_of(L"d:projects") == fs::path(L"d:\\projects"));
     AXIOM_CHECK(path_of(L"C:/Users/./Public/") == fs::path(L"C:\\Users\\Public"));
     AXIOM_CHECK(path_of(L"C:\\") == fs::path(L"C:\\"));
