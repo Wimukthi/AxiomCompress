@@ -14,6 +14,12 @@ Entries are condensed from the
 
 ## [Unreleased]
 
+## [0.17.4.0] - 2026-11-23
+
+Find files can stop a search and closes without freezing Axiom, content search
+leaves cloud-only files alone, and Axiom opens on `"C:\"`. The archive format
+and the archives Axiom writes are unchanged.
+
 ### Added
 
 - Find files can stop a search: while one runs, **Search** reads **Stop**, which
@@ -1208,7 +1214,8 @@ First published release: the Inno Setup installer and portable zip, carrying
 update/repair/remove maintenance handling, and dynamic light/dark setup
 styling.
 
-[Unreleased]: https://github.com/Wimukthi/AxiomCompress/compare/0.17.3.0...HEAD
+[Unreleased]: https://github.com/Wimukthi/AxiomCompress/compare/0.17.4.0...HEAD
+[0.17.4.0]: https://github.com/Wimukthi/AxiomCompress/releases/tag/0.17.4.0
 [0.17.3.0]: https://github.com/Wimukthi/AxiomCompress/releases/tag/0.17.3.0
 [0.17.2.0]: https://github.com/Wimukthi/AxiomCompress/releases/tag/0.17.2.0
 [0.17.1.0]: https://github.com/Wimukthi/AxiomCompress/releases/tag/0.17.1.0
