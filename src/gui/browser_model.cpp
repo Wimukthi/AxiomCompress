@@ -6,8 +6,12 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
+#include <condition_variable>
 #include <cwctype>
+#include <mutex>
 #include <optional>
+#include <thread>
 #include <string_view>
 #include <unordered_map>
 #include <unordered_set>
@@ -210,17 +214,74 @@ std::wstring windows_error_message(DWORD error) {
 
 }  // namespace
 
+namespace {
+
+// What the last query of each drive answered, so the UI thread can name a
+// drive without asking it. Asking a hard disk that has spun down for its
+// label or size waits seconds for it to spin up, and a PC with several such
+// disks would otherwise show nothing until every one of them had answered.
+struct CachedDrive {
+    std::wstring display_name;
+    std::uint64_t total_size = 0;
+    bool has_total_size = false;
+};
+
+struct DriveCache {
+    std::mutex mutex;
+    std::unordered_map<std::wstring, CachedDrive> drives;
+};
+
+DriveCache& drive_cache() {
+    // Leaked on purpose: drive queries run on detached threads that may still
+    // be writing here while the process exits.
+    static DriveCache* cache = new DriveCache;
+    return *cache;
+}
+
+std::wstring drive_cache_key(const std::wstring& root) {
+    std::wstring key = root.size() >= 2 ? root.substr(0, 2) : root;
+    for (wchar_t& ch : key) ch = static_cast<wchar_t>(std::towupper(ch));
+    return key;
+}
+
+std::wstring short_drive_name(const std::wstring& root) {
+    return root.size() >= 2 ? root.substr(0, 2) : root;
+}
+
+// The list names an unlabelled drive "D:\", the tree and address bar "D:".
+std::wstring browser_drive_name(const std::wstring& root, std::wstring display_name) {
+    return display_name.size() == 2 ? root : std::move(display_name);
+}
+
+}  // namespace
+
 std::wstring drive_display_name(const std::wstring& root, bool ask_network) {
-    const std::wstring name = root.size() >= 2 ? root.substr(0, 2) : root;
+    const std::wstring name = short_drive_name(root);
     const UINT type = GetDriveTypeW(root.c_str());
     if (type == DRIVE_NO_ROOT_DIR || (type == DRIVE_REMOTE && !ask_network)) return name;
     wchar_t volume[MAX_PATH]{};
-    if (!GetVolumeInformationW(root.c_str(), volume, MAX_PATH, nullptr, nullptr, nullptr,
-                               nullptr, 0) ||
-        volume[0] == L'\0') {
-        return name;
+    std::wstring result = name;
+    if (GetVolumeInformationW(root.c_str(), volume, MAX_PATH, nullptr, nullptr, nullptr,
+                              nullptr, 0) &&
+        volume[0] != L'\0') {
+        result = std::wstring(volume) + L" (" + name + L")";
     }
-    return std::wstring(volume) + L" (" + name + L")";
+    {
+        auto& cache = drive_cache();
+        std::scoped_lock lock(cache.mutex);
+        cache.drives[drive_cache_key(root)].display_name = result;
+    }
+    return result;
+}
+
+std::wstring cached_drive_display_name(const std::wstring& root) {
+    auto& cache = drive_cache();
+    std::scoped_lock lock(cache.mutex);
+    if (const auto found = cache.drives.find(drive_cache_key(root));
+        found != cache.drives.end() && !found->second.display_name.empty()) {
+        return found->second.display_name;
+    }
+    return short_drive_name(root);
 }
 
 std::wstring drive_type_text(const std::wstring& root) {
@@ -245,17 +306,26 @@ BrowserSnapshot load_computer(const BrowserLocation& location, std::stop_token s
     }
     std::wstring drives(static_cast<std::size_t>(required) + 1, L'\0');
     GetLogicalDriveStringsW(static_cast<DWORD>(drives.size()), drives.data());
+    // Only what Windows knows without touching the disks: the drive letters,
+    // their types, and whatever an earlier query left in the cache. Labels and
+    // sizes follow from load_computer_details().
+    auto& cache = drive_cache();
+    std::scoped_lock lock(cache.mutex);
     for (const wchar_t* drive = drives.c_str(); *drive != L'\0'; drive += wcslen(drive) + 1) {
         if (stop.stop_requested()) return snapshot;
+        const std::wstring root = drive;
         BrowserItem item;
         item.kind = BrowserItemKind::drive;
-        item.filesystem_path = drive;
-        // This runs off the UI thread, so a network drive may take its time.
-        item.name = drive_display_name(drive, true);
-        if (item.name.size() == 2) item.name = drive;  // unlabelled: "D:\\" as before
-        item.type = drive_type_text(drive);
-        ULARGE_INTEGER available{}, total{}, free{};
-        if (GetDiskFreeSpaceExW(drive, &available, &total, &free)) item.size = total.QuadPart;
+        item.filesystem_path = root;
+        item.name = root;
+        if (const auto found = cache.drives.find(drive_cache_key(root));
+            found != cache.drives.end()) {
+            if (!found->second.display_name.empty()) {
+                item.name = browser_drive_name(root, found->second.display_name);
+            }
+            if (found->second.has_total_size) item.size = found->second.total_size;
+        }
+        item.type = drive_type_text(root);
         item.id = stable_id(item.filesystem_path.wstring());
         snapshot.items.push_back(std::move(item));
     }
@@ -543,6 +613,67 @@ BrowserLoadResult load_browser_location(
     }
     result.snapshot.generation = generation;
     return result;
+}
+
+void load_computer_details(
+    const std::vector<BrowserItem>& drives, std::stop_token stop,
+    const std::function<void(std::vector<BrowserItem>)>& publish) {
+    struct Shared {
+        std::mutex mutex;
+        std::condition_variable_any changed;
+        std::vector<BrowserItem> finished;
+    };
+    auto shared = std::make_shared<Shared>();
+    std::size_t expected = 0;
+    for (const BrowserItem& drive : drives) {
+        if (drive.kind != BrowserItemKind::drive) continue;
+        ++expected;
+        // One thread per drive: each sleeping disk spins up at the same time
+        // instead of one after another. Detached, because a disconnected
+        // network drive can hold its thread far longer than anyone should wait
+        // for, at shutdown included; the thread owns everything it touches.
+        std::thread([shared, item = drive]() mutable {
+            const std::wstring root = item.filesystem_path.wstring();
+            item.name = browser_drive_name(root, drive_display_name(root, true));
+            ULARGE_INTEGER available{}, total{}, free{};
+            const bool has_total =
+                GetDiskFreeSpaceExW(root.c_str(), &available, &total, &free) != FALSE;
+            if (has_total) {
+                item.size = total.QuadPart;
+                auto& cache = drive_cache();
+                std::scoped_lock lock(cache.mutex);
+                auto& cached = cache.drives[drive_cache_key(root)];
+                cached.total_size = total.QuadPart;
+                cached.has_total_size = true;
+            }
+            std::scoped_lock lock(shared->mutex);
+            shared->finished.push_back(std::move(item));
+            shared->changed.notify_all();
+        }).detach();
+    }
+
+    std::size_t published = 0;
+    while (published < expected) {
+        std::vector<BrowserItem> batch;
+        {
+            std::unique_lock lock(shared->mutex);
+            if (!shared->changed.wait(lock, stop, [&] {
+                    return shared->finished.size() > published;
+                })) {
+                return;
+            }
+            // Drives that were already spinning answer within a few ms of each
+            // other; gather them into one update rather than one per drive.
+            shared->changed.wait_for(lock, stop, std::chrono::milliseconds(30), [&] {
+                return shared->finished.size() >= expected;
+            });
+            batch.assign(shared->finished.begin() + static_cast<std::ptrdiff_t>(published),
+                         shared->finished.end());
+            published = shared->finished.size();
+        }
+        if (stop.stop_requested()) return;
+        publish(std::move(batch));
+    }
 }
 
 void NavigationHistory::reset(BrowserLocation location) {

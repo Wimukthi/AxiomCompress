@@ -307,9 +307,12 @@ void MainWindow::add_known_tree_folder(DirectoryTreeItem& parent, const wchar_t*
         DirectoryTreeNode node;
         node.kind = DirectoryTreeNodeKind::filesystem;
         node.filesystem_path = *path;
+        // Assume children rather than list the folder to find out: this runs
+        // on the UI thread at startup, and a known folder may live on a hard
+        // disk that has spun down (OneDrive often does). Expanding it settles
+        // the chevron.
         insert_tree_item(&parent, label, std::move(node),
-                         tree_icon_for_filesystem(*path, false, true),
-                         filesystem_has_tree_children(*path));
+                         tree_icon_for_filesystem(*path, false, true), true);
     }
 }
 
@@ -328,7 +331,10 @@ void MainWindow::populate_tree_computer_children(DirectoryTreeItem& item) {
     for (const wchar_t* drive = drives.c_str(); *drive != L'\0';
          drive += wcslen(drive) + 1) {
         const fs::path path(drive);
-        std::wstring label = drive_display_name(drive, false);
+        // From the cache: asking the drive here would hold the UI thread while
+        // a sleeping disk spins up. The This PC load fills it in and
+        // refresh_tree_drive_labels() catches the tree up.
+        std::wstring label = axiom::gui::cached_drive_display_name(drive);
         DirectoryTreeNode node;
         node.kind = DirectoryTreeNodeKind::filesystem;
         node.filesystem_path = path;
@@ -600,6 +606,20 @@ void MainWindow::rebuild_directory_tree() {
     }
 }
 
+void MainWindow::apply_deferred_tree_sync() {
+    if (!tree_sync_pending_ || !tree_pane_visible_) return;
+    tree_sync_pending_ = false;
+    if (restore_persisted_tree_state_) {
+        DirectoryTreeViewState persisted_tree;
+        persisted_tree.expanded_keys = persisted_settings_.tree_expanded_nodes;
+        persisted_tree.selected_key = persisted_settings_.tree_selected_node;
+        persisted_tree.vertical_scroll = persisted_settings_.tree_scroll_position;
+        tree_view_.restore_state(persisted_tree);
+        restore_persisted_tree_state_ = false;
+    }
+    if (displayed_browser_location_) sync_tree_to_location(*displayed_browser_location_);
+}
+
 void MainWindow::on_tree_selection_changed(const DirectoryTreeItem& item) {
     if (syncing_tree_ || busy_) return;
     const auto& node = item.node;
@@ -828,6 +848,13 @@ ShellIconRef MainWindow::cached_shell_icon_for_item(const axiom::gui::BrowserIte
     if (const auto found = shell_icon_cache_.find(key); found != shell_icon_cache_.end()) {
         return found->second;
     }
+    if (!prefer_generic_unique_icon && item_needs_real_shell_icon(item)) {
+        // This runs on the UI thread for every row painted and every tree
+        // node inserted; reading the file for its own icon could wait seconds
+        // on a sleeping disk. The generic icon now, the real one shortly.
+        queue_real_shell_icon(key, item.filesystem_path);
+        return cached_shell_icon_for_item(item, true);
+    }
     axiom::gui::BrowserItem icon_item = item;
     if (prefer_generic_unique_icon && item_needs_real_shell_icon(icon_item)) {
         icon_item.filesystem_path.clear();
@@ -835,6 +862,103 @@ ShellIconRef MainWindow::cached_shell_icon_for_item(const axiom::gui::BrowserIte
     ShellIconRef icon = shell_icon_for_item(icon_item);
     shell_icon_cache_.emplace(key, icon);
     return icon;
+}
+
+struct ShellIconLoaderState {
+    std::mutex mutex;
+    std::condition_variable changed;
+    std::deque<std::pair<std::wstring, fs::path>> queue;
+    HWND target = nullptr;  // nullptr once the window is going away
+};
+
+namespace {
+
+// Detached and owning its state, so a read stuck on a slow disk never holds up
+// the window closing; it finds `target` cleared and ends.
+void shell_icon_loader_loop(std::shared_ptr<ShellIconLoaderState> state) {
+    const HRESULT com =
+        CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    auto batch = std::make_unique<ShellIconBatch>();
+    for (;;) {
+        std::pair<std::wstring, fs::path> job;
+        {
+            std::unique_lock lock(state->mutex);
+            state->changed.wait(lock, [&] {
+                return state->target == nullptr || !state->queue.empty();
+            });
+            if (state->target == nullptr) break;
+            job = std::move(state->queue.front());
+            state->queue.pop_front();
+        }
+        axiom::gui::BrowserItem item;
+        item.kind = axiom::gui::BrowserItemKind::file;
+        item.filesystem_path = job.second;
+        item.name = job.second.filename().wstring();
+        batch->icons.push_back({std::move(job.first), std::move(job.second),
+                                shell_icon_for_item(item)});
+        HWND target = nullptr;
+        {
+            std::scoped_lock lock(state->mutex);
+            // Post when caught up, or every 32 icons in a long folder of
+            // programs, so they appear as they are read.
+            if (!state->queue.empty() && batch->icons.size() < 32) continue;
+            target = state->target;
+        }
+        if (target == nullptr) break;
+        ShellIconBatch* raw = batch.release();
+        if (!PostMessageW(target, kShellIconsMessage, 0, reinterpret_cast<LPARAM>(raw))) {
+            delete raw;
+        }
+        batch = std::make_unique<ShellIconBatch>();
+    }
+    if (SUCCEEDED(com)) CoUninitialize();
+}
+
+}  // namespace
+
+void MainWindow::queue_real_shell_icon(const std::wstring& key, const fs::path& path) {
+    if (hwnd_ == nullptr || !shell_icon_pending_.insert(key).second) return;
+    if (!shell_icon_loader_) {
+        shell_icon_loader_ = std::make_shared<ShellIconLoaderState>();
+        shell_icon_loader_->target = hwnd_;
+        std::thread(shell_icon_loader_loop, shell_icon_loader_).detach();
+    }
+    {
+        std::scoped_lock lock(shell_icon_loader_->mutex);
+        shell_icon_loader_->queue.emplace_back(key, path);
+    }
+    shell_icon_loader_->changed.notify_one();
+}
+
+void MainWindow::on_shell_icons(LPARAM lparam) {
+    std::unique_ptr<ShellIconBatch> batch(reinterpret_cast<ShellIconBatch*>(lparam));
+    if (!batch) return;
+    bool tree_changed = false;
+    for (auto& entry : batch->icons) {
+        shell_icon_pending_.erase(entry.key);
+        if (entry.icon.image_list == nullptr) continue;  // keep the generic one
+        shell_icon_cache_[entry.key] = entry.icon;
+        if (DirectoryTreeItem* node = tree_view_.find_filesystem_item(entry.path);
+            node != nullptr && node->node.kind == DirectoryTreeNodeKind::file) {
+            node->icon = entry.icon;
+            tree_changed = true;
+        }
+    }
+    if (tree_changed) tree_view_.refresh();
+    // The list asks for each row's icon as it paints.
+    if (list_ != nullptr) InvalidateRect(list_, nullptr, FALSE);
+}
+
+void MainWindow::stop_shell_icon_loader() {
+    if (!shell_icon_loader_) return;
+    {
+        std::scoped_lock lock(shell_icon_loader_->mutex);
+        shell_icon_loader_->target = nullptr;
+        shell_icon_loader_->queue.clear();
+    }
+    shell_icon_loader_->changed.notify_all();
+    shell_icon_loader_.reset();
 }
 
 std::vector<int> MainWindow::selected_browser_indices() const {
@@ -1016,12 +1140,77 @@ void MainWindow::navigate_to(axiom::gui::BrowserLocation location, bool record_h
                     return load_sort_ascending ? comparison < 0 : comparison > 0;
                 });
             if (stop.stop_requested()) return;
+            const bool computer =
+                result->snapshot.location.kind == axiom::gui::BrowserLocationKind::computer;
+            std::vector<axiom::gui::BrowserItem> drives;
+            if (computer) drives = result->snapshot.items;
             auto* payload = result.release();
             if (!PostMessageW(target, kBrowserLoadedMessage, 0,
                               reinterpret_cast<LPARAM>(payload))) {
                 delete payload;
+                return;
             }
+            if (!computer) return;
+            // The drives are on screen; now their labels and sizes, which can
+            // wait on disks that have to spin up first.
+            axiom::gui::load_computer_details(
+                drives, stop, [&](std::vector<axiom::gui::BrowserItem> answered) {
+                    auto details = std::make_unique<axiom::gui::BrowserDriveDetails>();
+                    details->generation = generation;
+                    details->drives = std::move(answered);
+                    auto* raw = details.release();
+                    if (!PostMessageW(target, kBrowserDriveDetailsMessage, 0,
+                                      reinterpret_cast<LPARAM>(raw))) {
+                        delete raw;
+                    }
+                });
         });
+}
+
+void MainWindow::on_browser_drive_details(LPARAM lparam) {
+    std::unique_ptr<axiom::gui::BrowserDriveDetails> details(
+        reinterpret_cast<axiom::gui::BrowserDriveDetails*>(lparam));
+    if (!details || details->generation != browser_generation_ ||
+        !displayed_browser_location_ ||
+        displayed_browser_location_->kind != axiom::gui::BrowserLocationKind::computer) {
+        return;
+    }
+    bool changed = false;
+    auto& items = all_browser_items();
+    for (const auto& drive : details->drives) {
+        const auto found = std::find_if(items.begin(), items.end(), [&](const BrowserItem& item) {
+            return item.id == drive.id;
+        });
+        if (found == items.end()) continue;
+        if (found->name != drive.name || found->size != drive.size) {
+            found->name = drive.name;
+            found->size = drive.size;
+            changed = true;
+        }
+    }
+    refresh_tree_drive_labels();
+    if (!changed) return;
+    // Re-sort (a label can move a drive when sorted by name) and keep the
+    // selection, focus and scroll position the user may already have.
+    begin_browser_table_population(capture_browser_view_state(), true);
+}
+
+void MainWindow::refresh_tree_drive_labels() {
+    if (tree_computer_item_ == nullptr) return;
+    bool changed = false;
+    for (auto& child : tree_computer_item_->children) {
+        const auto& path = child->node.filesystem_path;
+        if (child->node.kind != DirectoryTreeNodeKind::filesystem || path.empty() ||
+            path != path.root_path()) {
+            continue;
+        }
+        std::wstring label = axiom::gui::cached_drive_display_name(path.wstring());
+        if (child->text != label) {
+            child->text = std::move(label);
+            changed = true;
+        }
+    }
+    if (changed) tree_view_.refresh();
 }
 
 void MainWindow::sort_browser_items_for_table() {
@@ -1084,9 +1273,11 @@ void MainWindow::rebuild_filtered_browser_items() {
 
 std::vector<std::wstring> MainWindow::browser_row_for_item(
     const axiom::gui::BrowserItem& item) const {
+    // A drive's size is 0 until load_computer_details() has heard from it.
     const bool show_size = item.kind == axiom::gui::BrowserItemKind::file ||
                            item.kind == axiom::gui::BrowserItemKind::archive ||
-                           item.kind == axiom::gui::BrowserItemKind::drive;
+                           (item.kind == axiom::gui::BrowserItemKind::drive &&
+                            item.size != 0);
     std::vector<std::wstring> row;
     row.reserve(visible_file_columns_.size());
     for (const auto column : visible_file_columns_) {
@@ -1375,6 +1566,13 @@ void MainWindow::on_browser_loaded(LPARAM lparam) {
                                      kDirectoryChangedMessage);
         }
     }
+    if (!tree_pane_visible_) {
+        // Nothing to see: skip listing folders for it until the pane is shown.
+        tree_sync_pending_ = true;
+        update_navigation_buttons();
+        return;
+    }
+    tree_sync_pending_ = false;
     if (restore_persisted_tree_state_) {
         DirectoryTreeViewState persisted_tree;
         persisted_tree.expanded_keys = persisted_settings_.tree_expanded_nodes;

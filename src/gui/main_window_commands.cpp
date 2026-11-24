@@ -1892,14 +1892,18 @@ void MainWindow::save_current_settings() {
                                                       : dpi_))
                         : 0;
     persisted_settings_.tree_pane_visible = tree_pane_visible_;
-    DirectoryTreeViewState tree_state = tree_view_.capture_state();
-    constexpr std::size_t kMaximumPersistedTreeNodes = 256;
-    if (tree_state.expanded_keys.size() > kMaximumPersistedTreeNodes) {
-        tree_state.expanded_keys.resize(kMaximumPersistedTreeNodes);
+    // A saved tree not yet restored (the pane stayed hidden) is still the tree
+    // to restore next time; the unexpanded one on screen would overwrite it.
+    if (!restore_persisted_tree_state_) {
+        DirectoryTreeViewState tree_state = tree_view_.capture_state();
+        constexpr std::size_t kMaximumPersistedTreeNodes = 256;
+        if (tree_state.expanded_keys.size() > kMaximumPersistedTreeNodes) {
+            tree_state.expanded_keys.resize(kMaximumPersistedTreeNodes);
+        }
+        persisted_settings_.tree_expanded_nodes = std::move(tree_state.expanded_keys);
+        persisted_settings_.tree_selected_node = std::move(tree_state.selected_key);
+        persisted_settings_.tree_scroll_position = std::max(tree_state.vertical_scroll, 0);
     }
-    persisted_settings_.tree_expanded_nodes = std::move(tree_state.expanded_keys);
-    persisted_settings_.tree_selected_node = std::move(tree_state.selected_key);
-    persisted_settings_.tree_scroll_position = std::max(tree_state.vertical_scroll, 0);
     persisted_settings_.column_widths = table_.logical_column_widths();
     persisted_settings_.recent_locations = recent_addresses_;
     persisted_settings_.recent_archives = recent_archives_;

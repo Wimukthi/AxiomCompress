@@ -93,6 +93,10 @@ constexpr UINT kTableColumnReorderMessage = WM_APP + 14;
 // Puts the current location back in the address bar once a drop-down pick has
 // finished: the combo box writes the picked item's label there afterwards.
 constexpr UINT kAddressSyncMessage = WM_APP + 15;
+// Labels and sizes for the This PC drives, posted after the drives themselves.
+constexpr UINT kBrowserDriveDetailsMessage = WM_APP + 16;
+// Real icons of programs and shortcuts, read off the UI thread (ShellIconBatch).
+constexpr UINT kShellIconsMessage = WM_APP + 17;
 constexpr UINT_PTR kBrowserPopulateTimer = 42;
 constexpr UINT_PTR kDirectoryRefreshTimer = 41;
 constexpr UINT_PTR kDragTransferTimer = 43;
@@ -256,6 +260,17 @@ std::wstring format_crc32(const std::optional<std::uint32_t>& crc);
 struct ShellIconRef {
     HIMAGELIST image_list = nullptr;
     int index = -1;
+};
+// The background loader's queue (main_window_browser.cpp).
+struct ShellIconLoaderState;
+// What it read, posted to the window as kShellIconsMessage.
+struct ShellIconBatch {
+    struct Icon {
+        std::wstring key;
+        fs::path path;
+        ShellIconRef icon;
+    };
+    std::vector<Icon> icons;
 };
 struct AddressEntry {
     std::wstring label;
@@ -1356,6 +1371,11 @@ private:
     void on_table_sort(int column);
     void on_table_column_reorder(int from, int to);
     void on_browser_loaded(LPARAM lparam);
+    void on_browser_drive_details(LPARAM lparam);
+    void refresh_tree_drive_labels();
+    // Brings a hidden tree pane up to date when it is shown (see
+    // tree_sync_pending_).
+    void apply_deferred_tree_sync();
     void on_navigate_back();
     void on_navigate_forward();
     void on_navigate_up();
@@ -1612,6 +1632,11 @@ private:
     std::uint64_t next_background_ui_task_id_ = 1;
 
     bool restore_persisted_tree_state_ = false;
+    // While the tree pane is hidden, the tree is not expanded to follow the
+    // file pane: that lists every folder on the way, on the UI thread, which on
+    // a disk that has spun down waits seconds for nothing anyone can see. Set
+    // when a location loaded while hidden; showing the pane catches up.
+    bool tree_sync_pending_ = false;
 
     std::vector<AddressEntry> address_entries_;
 
@@ -1649,6 +1674,15 @@ private:
     BrowserStatusTotals browser_status_totals_;
 
     std::unordered_map<std::wstring, ShellIconRef> shell_icon_cache_;
+    // Programs, shortcuts and icon files carry their own icon, which the shell
+    // reads from the file itself. On a hard disk that has spun down that waits
+    // seconds per file, so those icons are read by a background loader: the
+    // generic icon for the type shows until the real one arrives.
+    std::shared_ptr<ShellIconLoaderState> shell_icon_loader_;
+    std::unordered_set<std::wstring> shell_icon_pending_;
+    void queue_real_shell_icon(const std::wstring& key, const fs::path& path);
+    void on_shell_icons(LPARAM lparam);
+    void stop_shell_icon_loader();
 
     std::shared_ptr<const axiom::gui::ArchiveCatalog> archive_catalog_;
 

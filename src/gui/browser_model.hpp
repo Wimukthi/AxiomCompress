@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <stop_token>
@@ -122,10 +123,30 @@ private:
 // without building a BrowserItem for each (the Find results).
 std::wstring browser_type_text(const std::filesystem::path& name, bool directory);
 std::wstring browser_time_text(std::int64_t unix_seconds);
+// The This PC listing above names drives only from what Windows knows without
+// touching them, so it is immediate. This fills in each drive's label and size,
+// querying every drive at once, and calls `publish` (on the calling thread)
+// with the drives that have answered, as they answer. A spun-down hard disk
+// takes seconds; the others are not held up behind it.
+void load_computer_details(
+    const std::vector<BrowserItem>& drives, std::stop_token stop,
+    const std::function<void(std::vector<BrowserItem>)>& publish);
+
+// The drives as load_computer_details() last found them, posted to the window.
+struct BrowserDriveDetails {
+    std::uint64_t generation = 0;
+    std::vector<BrowserItem> drives;
+};
+
 // A drive as Explorer names it, "DATA-A (D:)", or "D:" without a label. A
 // network drive is named without asking its server unless `ask_network`: a
 // disconnected one can take many seconds to answer, too long for the UI thread.
+// Asking a spun-down hard disk waits for it to spin up, too long as well: the
+// UI thread uses cached_drive_display_name().
 std::wstring drive_display_name(const std::wstring& root, bool ask_network);
+// The name drive_display_name() last found for this drive, or "D:" if it has
+// not been asked yet. Never touches the drive.
+std::wstring cached_drive_display_name(const std::wstring& root);
 // "Local drive", "Removable drive", "Network drive", "CD drive" or "RAM disk".
 std::wstring drive_type_text(const std::wstring& root);
 

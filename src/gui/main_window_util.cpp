@@ -457,7 +457,10 @@ std::wstring query = item.filesystem_path.empty()
     : item.filesystem_path.wstring();
 UINT flags = SHGFI_SYSICONINDEX | SHGFI_SMALLICON;
 const bool needs_real_file = item_needs_real_shell_icon(item);
-if (item.kind != axiom::gui::BrowserItemKind::drive && !needs_real_file) {
+// Drives too: the shell still picks the right icon for a drive root by its
+// type from the attributes alone, while asking for the real one reads the
+// drive and waits for a spun-down disk to spin up, on the UI thread.
+if (!needs_real_file) {
     flags |= SHGFI_USEFILEATTRIBUTES;
 }
 auto image_list = reinterpret_cast<HIMAGELIST>(

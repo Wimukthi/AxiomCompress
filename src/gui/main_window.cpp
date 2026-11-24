@@ -839,6 +839,7 @@ void MainWindow::toggle_tree_pane() {
         SetFocus(list_);
     }
     EnableWindow(tree_view_.hwnd(), !busy_ && tree_pane_visible_);
+    apply_deferred_tree_sync();
     layout();
     invalidate_browser_panes();
     save_current_settings();
@@ -1227,6 +1228,12 @@ LRESULT MainWindow::handle_message(UINT message, WPARAM wparam, LPARAM lparam) {
         case kBrowserLoadedMessage:
             on_browser_loaded(lparam);
             return 0;
+        case kBrowserDriveDetailsMessage:
+            on_browser_drive_details(lparam);
+            return 0;
+        case kShellIconsMessage:
+            on_shell_icons(lparam);
+            return 0;
         case kTreeArchiveProbeMessage:
             on_tree_archive_probe(lparam);
             return 0;
@@ -1300,6 +1307,7 @@ LRESULT MainWindow::handle_message(UINT message, WPARAM wparam, LPARAM lparam) {
             drop_target_.revoke();
             directory_watcher_.stop();
             browser_thread_.request_stop();
+            stop_shell_icon_loader();
             operation_runner_.cancel();
             operation_runner_.finish();
             for (auto& task : background_ui_tasks_) task.worker.request_stop();
@@ -1333,6 +1341,14 @@ LRESULT MainWindow::handle_message(UINT message, WPARAM wparam, LPARAM lparam) {
                 while (PeekMessageW(&queued, hwnd_, kBackgroundUiTaskMessage,
                                     kBackgroundUiTaskMessage, PM_REMOVE)) {
                     delete reinterpret_cast<BackgroundUiTaskResult*>(queued.lParam);
+                }
+                while (PeekMessageW(&queued, hwnd_, kShellIconsMessage,
+                                    kShellIconsMessage, PM_REMOVE)) {
+                    delete reinterpret_cast<ShellIconBatch*>(queued.lParam);
+                }
+                while (PeekMessageW(&queued, hwnd_, kBrowserDriveDetailsMessage,
+                                    kBrowserDriveDetailsMessage, PM_REMOVE)) {
+                    delete reinterpret_cast<axiom::gui::BrowserDriveDetails*>(queued.lParam);
                 }
             }
             PostQuitMessage(0);

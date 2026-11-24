@@ -168,7 +168,7 @@ void MainWindow::populate_address_dropdown() {
             for (const wchar_t* drive = drives.c_str(); *drive != L'\0';
                  drive += wcslen(drive) + 1) {
                 const fs::path path(drive);
-                std::wstring label = drive_display_name(drive, false);
+                std::wstring label = cached_drive_display_name(drive);
                 add_address_entry(std::move(label), path.wstring(),
                                   shell_icon_for_path(path, true));
             }
