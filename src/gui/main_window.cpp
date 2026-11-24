@@ -4,8 +4,6 @@
 
 #include "gui/main_window_internal.hpp"
 
-#include "axiom/version.hpp"
-
 namespace axiom::gui {
 
 MainWindow::~MainWindow() {
@@ -82,8 +80,7 @@ bool MainWindow::create(HINSTANCE instance,
         return false;
     }
 
-    const std::wstring initial_title = L"Axiom " + widen(axiom::kVersion);
-    hwnd_ = CreateWindowExW(0, wc.lpszClassName, initial_title.c_str(),
+    hwnd_ = CreateWindowExW(0, wc.lpszClassName, L"Axiom",
                             WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
                             CW_USEDEFAULT, CW_USEDEFAULT, initial_width, initial_height,
                             nullptr, nullptr, instance, this);
@@ -822,10 +819,8 @@ void MainWindow::position_filter_popup() const {
 }
 
 void MainWindow::update_window_title(const axiom::gui::BrowserLocation& location) {
-    // Location first, as Windows titles a window: it is the part that tells
-    // windows apart on the taskbar, where long titles are cut short.
-    const std::wstring title = location.display_name() + L" - Axiom " + widen(axiom::kVersion);
-    SetWindowTextW(hwnd_, title.c_str());
+    // The location alone, as 7-Zip's file manager titles its window.
+    SetWindowTextW(hwnd_, location.display_name().c_str());
 }
 
 void MainWindow::set_status(const std::wstring& text) {
