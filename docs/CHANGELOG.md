@@ -14,6 +14,28 @@ Entries are condensed from the
 
 ## [Unreleased]
 
+## [0.17.5.0] - 2026-11-24
+
+Axiom starts at once on PCs whose hard disks spin down, and its title bar shows
+the folder or archive on screen. The archive format and the archives Axiom
+writes are unchanged.
+
+### Changed
+
+- The title bar shows the location on screen, such as `D:\Downloads` or
+  `backup.7z :: /docs`, as 7-Zip's file manager does, instead of just "Axiom".
+
+### Performance
+
+- Opening Axiom on a PC with sleeping hard disks no longer leaves the file list
+  empty for many seconds while each disk spins up in turn. This PC lists the
+  drives from what Windows already knows and fills in labels and sizes as each
+  drive answers, all at once; the folder tree and address list name drives from
+  that and take drive icons from the drive type instead of reading each drive.
+  A hidden folder tree is no longer restored or followed until it is shown, the
+  icons of programs, shortcuts and icon files are read in the background, and
+  known folders are not listed at start-up just to draw an expand arrow.
+
 ## [0.17.4.0] - 2026-11-23
 
 Find files can stop a search and closes without freezing Axiom, content search
@@ -1214,7 +1236,8 @@ First published release: the Inno Setup installer and portable zip, carrying
 update/repair/remove maintenance handling, and dynamic light/dark setup
 styling.
 
-[Unreleased]: https://github.com/Wimukthi/AxiomCompress/compare/0.17.4.0...HEAD
+[Unreleased]: https://github.com/Wimukthi/AxiomCompress/compare/0.17.5.0...HEAD
+[0.17.5.0]: https://github.com/Wimukthi/AxiomCompress/releases/tag/0.17.5.0
 [0.17.4.0]: https://github.com/Wimukthi/AxiomCompress/releases/tag/0.17.4.0
 [0.17.3.0]: https://github.com/Wimukthi/AxiomCompress/releases/tag/0.17.3.0
 [0.17.2.0]: https://github.com/Wimukthi/AxiomCompress/releases/tag/0.17.2.0
