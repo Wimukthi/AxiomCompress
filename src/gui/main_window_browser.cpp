@@ -1087,6 +1087,7 @@ void MainWindow::navigate_to(axiom::gui::BrowserLocation location, bool record_h
     pending_browser_view_state_ = std::move(restore_state);
     update_navigation_buttons();
     set_text(address_edit_, location.display_name());
+    update_window_title(location);
     remember_address(location.display_name());
     table_.clear();
     browser_items_.clear();

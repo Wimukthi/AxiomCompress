@@ -4,6 +4,8 @@
 
 #include "gui/main_window_internal.hpp"
 
+#include "axiom/version.hpp"
+
 namespace axiom::gui {
 
 MainWindow::~MainWindow() {
@@ -80,7 +82,8 @@ bool MainWindow::create(HINSTANCE instance,
         return false;
     }
 
-    hwnd_ = CreateWindowExW(0, wc.lpszClassName, L"Axiom",
+    const std::wstring initial_title = L"Axiom " + widen(axiom::kVersion);
+    hwnd_ = CreateWindowExW(0, wc.lpszClassName, initial_title.c_str(),
                             WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
                             CW_USEDEFAULT, CW_USEDEFAULT, initial_width, initial_height,
                             nullptr, nullptr, instance, this);
@@ -816,6 +819,13 @@ void MainWindow::position_filter_popup() const {
                close_width, edit_height, TRUE);
     MoveWindow(filter_summary_, padding, padding + edit_height + scale(4),
                width - padding * 2, scale(18), TRUE);
+}
+
+void MainWindow::update_window_title(const axiom::gui::BrowserLocation& location) {
+    // Location first, as Windows titles a window: it is the part that tells
+    // windows apart on the taskbar, where long titles are cut short.
+    const std::wstring title = location.display_name() + L" - Axiom " + widen(axiom::kVersion);
+    SetWindowTextW(hwnd_, title.c_str());
 }
 
 void MainWindow::set_status(const std::wstring& text) {

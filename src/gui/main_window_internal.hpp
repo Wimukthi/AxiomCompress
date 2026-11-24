@@ -1252,6 +1252,8 @@ private:
     void select_address_entry();
     void draw_address_entry(const DRAWITEMSTRUCT& draw) const;
     void update_navigation_buttons();
+    // "D:\Downloads - Axiom 0.17.4.0": the location shown, then the version.
+    void update_window_title(const axiom::gui::BrowserLocation& location);
 
 
     struct BrowserStatusTotals {
